@@ -70,12 +70,12 @@ The core of don — spawning children in process groups with PTYs, PID file lock
 ### PID File Locking
 - [x] `process/pid_file.rs` — `Flock<File>` based locking with O_CLOEXEC, write PGID, hold for lifetime
 - [x] `PidFile::acquire()`, `try_lock_stale()`, `update_pgid()`, `cleanup()`
-- [ ] Don's own PID file at `.don/don.pid` with flock — detect if another don is already running (wired in when runner is built)
+- [x] ~Don's own PID file~ — PidFile is generic enough for this, wiring deferred to Phase 4 runner
 
 ### Basic Signal Handling
-- [ ] Install SIGINT/SIGTERM handler — set a flag, main loop checks it (deferred to Phase 4 runner)
-- [x] ProcessHandle::terminate() — send signal, wait with timeout, escalate to SIGKILL
-- [ ] Clean up PID files and socket on exit (wired in when runner is built)
+- [x] ~Signal handler installation~ — deferred to Phase 4 runner (primitives ready via ProcessHandle::terminate)
+- [x] ProcessHandle::terminate() — send signal, wait with timeout, escalate to SIGKILL, Unkillable detection (500ms)
+- [x] ~PID file cleanup on exit~ — deferred to Phase 4 runner (PidFile Drop releases flock automatically)
 
 ### Basic Environment
 - [x] `process/env.rs` — parse_env_file() with KEY=VALUE, comments, quotes, export prefix, malformed line warnings
@@ -143,6 +143,13 @@ Get services starting in the right order with max parallelism.
 - [ ] `runner/mod.rs` — topological sort of services and tasks, detect cycles (already done in validation, reuse here for execution ordering)
 - [ ] Parallel executor: start everything whose dependencies are satisfied concurrently, using tokio tasks
 - [ ] Track service states: pending, starting, running, ready, stopping, stopped, failed
+
+### Signal Handling & Don PID File (deferred from Phase 2)
+- [ ] Install SIGINT/SIGTERM handler via tokio::signal — set atomic flag, runner checks it in command loop
+- [ ] On first signal: SIGTERM all child process groups, wait per-service timeout, SIGKILL stragglers
+- [ ] On second signal: immediate SIGKILL all process groups
+- [ ] Acquire don's own PID file at `.don/don.pid` on startup — detect if another don is already running
+- [ ] Clean up `.don/don.pid` and `.don/don.sock` on exit
 
 ### Basic Service Lifecycle
 - [ ] `runner/service.rs` — start a service (spawn process, begin output capture), stop a service (signal + timeout + SIGKILL), restart (stop then start)
