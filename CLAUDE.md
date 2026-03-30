@@ -62,6 +62,9 @@ Don manages external resources (child processes, PID files, sockets, docker cont
 - **Tests may use `unwrap()`.** Panicking in tests is expected behavior.
 - **Test the library, not the binary.** Business logic lives in `lib.rs` and its modules. The binary is a thin CLI wrapper.
 - **Use temp directories for filesystem tests.** Clean up after yourself. Don't leave test artifacts in the working directory.
+- **Integration tests live in `tests/`.** Use the helpers in `tests/helpers/` (TempDir, ConfigBuilder, free_port, run_with_timeout).
+- **Tests must work without a real TTY.** PTY allocation can fail in CI/headless environments. Process spawning code must have a pipe-based fallback, and tests must not assume a PTY is available.
+- **Every integration test gets a timeout.** Use `run_with_timeout()` to prevent hangs from blocking CI.
 
 ### Code Organization
 
@@ -69,6 +72,7 @@ Don manages external resources (child processes, PID files, sockets, docker cont
 src/
   lib.rs                    # library root — re-exports public API
   main.rs                   # CLI binary — thin wrapper around the library
+  duration.rs               # human-readable duration string parsing ("200ms", "1s", "5m")
   config/
     mod.rs                  # Config struct, parsing, validation, FromStr
     service.rs              # Service, ServiceOverride, ResolvedService, presets
@@ -116,6 +120,27 @@ Lean hard towards small, focused modules. Each file should do one thing. If a fi
 - If module A needs something from module B, B should expose a clean function or type for it — not have A poke at B's fields directly.
 - Prefer passing values and references over shared mutable state. When shared state is unavoidable, contain it in one module that owns the state and exposes an API for it.
 
+### Cross-Module Communication
+
+Modules communicate via **tokio channels**, not shared mutable state:
+
+- **`mpsc`** for commands into the runner (CLI/API -> runner). The runner owns an `mpsc::Receiver<RunnerCommand>` and processes commands sequentially. This gives it a clean command loop with no shared mutable state.
+- **`broadcast`** for events out of the runner (runner -> output/API/watch). Service state changes (started, ready, stopped, failed) are broadcast so multiple consumers can observe without coupling.
+- **`oneshot`** for request/reply (e.g., status queries). The API sends a command with a `oneshot::Sender` for the reply, the runner fills it.
+
+**No `Arc<Mutex<_>>` for shared state.** The runner owns all service state in a plain `HashMap<String, ServiceState>`. Status queries go through the command channel. This avoids deadlocks and contention.
+
+```rust
+// Example command enum (created in Phase 4, but the pattern is established now)
+enum RunnerCommand {
+    Start { name: String },
+    Stop { name: String },
+    Restart { name: String },
+    Status { reply: oneshot::Sender<Vec<ServiceStatus>> },
+    Shutdown,
+}
+```
+
 ### Async
 
 The runtime is tokio. All I/O operations should be async. Avoid `block_on` inside async contexts. CPU-heavy work (like hashing files for task state) should use `tokio::task::spawn_blocking`.
@@ -147,7 +172,7 @@ Specifically:
 
 ## Platform Support
 
-Don targets Unix systems (Linux and macOS). Windows is explicitly out of scope due to reliance on Unix sockets, process groups, signals, and `LISTEN_FDS`. Platform-specific code should use `cfg(target_os)` guards where needed.
+Don targets Unix systems (Linux and macOS). Windows is not supported due to reliance on Unix sockets, process groups, signals, and `LISTEN_FDS`. Platform-specific code should use `cfg(target_os)` guards where needed.
 
 ## State Directory
 

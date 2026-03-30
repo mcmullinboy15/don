@@ -1,576 +1,43 @@
+//! Configuration parsing, validation, and platform resolution for don.
+//!
+//! The config is loaded from a `don.toml` file and defines services, tasks,
+//! and profiles for a dev environment.
+
+mod download;
+mod platform;
+mod profile;
+mod service;
+mod task;
+mod types;
+
+pub use self::download::{DownloadConfig, PlatformDownload};
+pub use self::platform::Platform;
+pub use self::profile::Profile;
+pub use self::service::{
+    DockerBuildConfig, DockerConfig, Preset, ResolvedService, RustConfig, Service,
+};
+pub use self::task::Task;
+pub use self::types::{Command, LogConfig, ReadyCheck, ShutdownConfig};
+
+pub use self::service::ServiceOverride;
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Top-level don configuration, typically loaded from `don.toml`.
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// Long-running services (databases, APIs, workers, etc.).
     #[serde(default)]
     pub services: HashMap<String, Service>,
-    /// One-shot tasks (migrations, codegen, etc).
+    /// One-shot tasks (migrations, codegen, etc.).
     /// Only re-run when watched files change since last successful run.
     #[serde(default)]
     pub tasks: HashMap<String, Task>,
     /// Named profiles — subsets of services/tasks to run.
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
-}
-
-/// A named subset of services and tasks to run.
-/// Transitive dependencies are automatically included.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Profile {
-    #[serde(default)]
-    pub services: Vec<String>,
-    #[serde(default)]
-    pub tasks: Vec<String>,
-}
-
-/// A one-shot task that runs to completion.
-/// Tasks can depend on services (waits for ready) and other tasks.
-/// File watching determines whether the task needs to re-run.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Task {
-    /// The command to execute
-    pub cmd: String,
-    /// Arguments to pass to the command
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Working directory
-    pub dir: Option<PathBuf>,
-    /// Environment variables
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// Services or tasks that must be ready/complete before this task runs
-    #[serde(default)]
-    pub depends_on: Vec<String>,
-    /// File glob patterns — task only re-runs if these files changed since last success.
-    /// If empty, the task always runs.
-    #[serde(default)]
-    pub watch: Vec<String>,
-    /// Maximum time the task is allowed to run (e.g. "5m", "30s"). No timeout by default.
-    pub timeout: Option<String>,
-    /// Where to send stdout/stderr. Defaults to stdout.
-    #[serde(default)]
-    pub log: LogConfig,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Service {
-    /// Working directory for the service
-    pub dir: Option<PathBuf>,
-    /// Environment variables
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// Paths to env files to load. Don also auto-loads `.env.<service-name>` if it exists.
-    #[serde(default)]
-    pub env_file: Vec<PathBuf>,
-    /// File glob patterns to watch for rebuilding/restarting
-    #[serde(default)]
-    pub watch: Vec<String>,
-    /// Debounce window for file watch events (e.g. "500ms"). Defaults to "200ms".
-    pub debounce: Option<String>,
-    /// Services that must be started before this one
-    #[serde(default)]
-    pub depends_on: Vec<String>,
-    /// Addresses for don to listen on and pass to the service via LISTEN_FDS.
-    /// Don holds the sockets open across restarts so traffic is never dropped.
-    #[serde(default)]
-    pub listen: Vec<String>,
-    /// Optional binary download configuration for this service
-    pub download: Option<DownloadConfig>,
-    /// Ready check — used to gate dependents until this service is accepting traffic
-    pub ready: Option<ReadyCheck>,
-    /// Shutdown behavior
-    pub shutdown: Option<ShutdownConfig>,
-    /// Where to send stdout/stderr. Defaults to stdout.
-    #[serde(default)]
-    pub log: LogConfig,
-    /// Per-platform overrides. If the current platform has an entry here,
-    /// its fields are merged on top of the base service config.
-    #[serde(default)]
-    pub platform: HashMap<Platform, ServiceOverride>,
-
-    // -- Preset: docker --
-    pub docker: Option<DockerConfig>,
-
-    // -- Preset: rust --
-    pub rust: Option<RustConfig>,
-
-    // -- Custom service (no preset) --
-    /// Command to run the service
-    pub run: Option<Command>,
-    /// Command to build the service before running
-    pub build: Option<Command>,
-}
-
-/// A command to execute: a binary/program name plus arguments.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Command {
-    /// The binary or program to execute
-    pub cmd: String,
-    /// Arguments to pass to the binary
-    #[serde(default)]
-    pub args: Vec<String>,
-}
-
-/// Ready check configuration. Exactly one of `exec`, `tcp`, or `http` must be set.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReadyCheck {
-    /// Run a command — exit code 0 means ready
-    pub exec: Option<Command>,
-    /// Connect to a TCP address — successful connection means ready
-    pub tcp: Option<String>,
-    /// Hit an HTTP endpoint — 2xx response means ready
-    pub http: Option<String>,
-    /// How often to check (e.g. "1s", "500ms"). Defaults to "1s".
-    #[serde(default = "ReadyCheck::default_interval")]
-    pub interval: String,
-    /// How many times to retry before giving up. Defaults to 30.
-    #[serde(default = "ReadyCheck::default_retries")]
-    pub retries: u32,
-}
-
-impl ReadyCheck {
-    fn default_interval() -> String {
-        "1s".to_string()
-    }
-
-    fn default_retries() -> u32 {
-        30
-    }
-}
-
-/// Shutdown behavior for a service.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ShutdownConfig {
-    /// Signal to send for graceful shutdown (e.g. "SIGTERM", "SIGINT"). Defaults to "SIGTERM".
-    #[serde(default = "ShutdownConfig::default_signal")]
-    pub signal: String,
-    /// Time to wait for graceful shutdown before sending SIGKILL (e.g. "10s"). Defaults to "10s".
-    #[serde(default = "ShutdownConfig::default_timeout")]
-    pub timeout: String,
-}
-
-impl ShutdownConfig {
-    fn default_signal() -> String {
-        "SIGTERM".to_string()
-    }
-
-    fn default_timeout() -> String {
-        "10s".to_string()
-    }
-}
-
-/// Where to send a service's stdout/stderr.
-///
-/// In TOML, this is either a string shorthand or a table:
-/// - `log = "stdout"` (default)
-/// - `log = "ignore"`
-/// - `log = "path/to/file.log"`
-/// - `log = { file = "path/to/file.log" }` (equivalent to the string form)
-#[derive(Debug, Clone, Default)]
-pub enum LogConfig {
-    /// Print to don's stdout, prefixed with the service name
-    #[default]
-    Stdout,
-    /// Discard all output
-    Ignore,
-    /// Write to a file
-    File(PathBuf),
-}
-
-impl<'de> Deserialize<'de> for LogConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            String(String),
-            Table { file: PathBuf },
-        }
-
-        match Raw::deserialize(deserializer)? {
-            Raw::String(s) => match s.as_str() {
-                "stdout" => Ok(Self::Stdout),
-                "ignore" => Ok(Self::Ignore),
-                path => Ok(Self::File(PathBuf::from(path))),
-            },
-            Raw::Table { file } => Ok(Self::File(file)),
-        }
-    }
-}
-
-/// Platform-specific overrides for a service. Any field set here replaces the
-/// corresponding base field. For `env`, entries are merged (override wins on conflict).
-/// If any preset field (docker/rust/run) is set, it completely replaces the base preset.
-#[derive(Debug, Deserialize)]
-pub struct ServiceOverride {
-    pub dir: Option<PathBuf>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    pub env_file: Option<Vec<PathBuf>>,
-    pub watch: Option<Vec<String>>,
-    pub debounce: Option<String>,
-    pub depends_on: Option<Vec<String>>,
-    pub listen: Option<Vec<String>>,
-    pub download: Option<DownloadConfig>,
-    pub ready: Option<ReadyCheck>,
-    pub shutdown: Option<ShutdownConfig>,
-    pub log: Option<LogConfig>,
-
-    pub docker: Option<DockerConfig>,
-    pub rust: Option<RustConfig>,
-    pub run: Option<Command>,
-    pub build: Option<Command>,
-}
-
-/// A fully resolved service with platform overrides applied.
-#[derive(Debug)]
-pub struct ResolvedService {
-    pub dir: Option<PathBuf>,
-    pub env: HashMap<String, String>,
-    pub env_file: Vec<PathBuf>,
-    pub watch: Vec<String>,
-    pub debounce: Option<String>,
-    pub depends_on: Vec<String>,
-    pub listen: Vec<String>,
-    pub download: Option<DownloadConfig>,
-    pub ready: Option<ReadyCheck>,
-    pub shutdown: Option<ShutdownConfig>,
-    pub log: LogConfig,
-
-    pub docker: Option<DockerConfig>,
-    pub rust: Option<RustConfig>,
-    pub run: Option<Command>,
-    pub build: Option<Command>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerConfig {
-    /// Docker image to run (e.g. "postgres:16").
-    /// For built images, this is also used as the tag for `docker build -t`.
-    pub image: String,
-    /// Container name — used to check if it's already running
-    pub container: Option<String>,
-    /// Port mappings (e.g. ["5432:5432"])
-    #[serde(default)]
-    pub ports: Vec<String>,
-    /// Volume mounts (e.g. ["pgdata:/var/lib/postgresql/data"])
-    #[serde(default)]
-    pub volumes: Vec<String>,
-    /// Docker network to attach to
-    pub network: Option<String>,
-    /// Override the container's default command / entrypoint args
-    #[serde(default)]
-    pub command: Vec<String>,
-    /// Env files to pass to docker via --env-file
-    #[serde(default)]
-    pub env_file: Vec<PathBuf>,
-    /// Build configuration — if set, don builds the image before running
-    pub build: Option<DockerBuildConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DockerBuildConfig {
-    /// Build context path (e.g. "." or "./services/api")
-    pub context: String,
-    /// Path to the Dockerfile, relative to context. Defaults to "Dockerfile".
-    pub dockerfile: Option<String>,
-    /// Build target for multi-stage builds (e.g. "development")
-    pub target: Option<String>,
-    /// Build arguments passed via --build-arg
-    #[serde(default)]
-    pub args: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RustConfig {
-    /// Name of the binary target to build and run
-    pub binary: String,
-    /// Cargo features to enable
-    #[serde(default)]
-    pub features: Vec<String>,
-    /// Build in release mode (default: false)
-    #[serde(default)]
-    pub release: bool,
-    /// Extra arguments to pass to `cargo build`
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-    /// Override the cargo target directory
-    pub target_dir: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DownloadConfig {
-    /// Per-platform download artifacts. Keys are "{os}-{arch}" using Rust conventions:
-    /// linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, windows-x86_64, windows-aarch64
-    pub platform: HashMap<Platform, PlatformDownload>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Platform {
-    LinuxX86_64,
-    LinuxAarch64,
-    MacosX86_64,
-    MacosAarch64,
-    WindowsX86_64,
-    WindowsAarch64,
-}
-
-impl Platform {
-    /// Returns the platform matching the current machine, or None if unsupported.
-    pub fn current() -> Option<Self> {
-        Self::from_os_arch(std::env::consts::OS, std::env::consts::ARCH)
-    }
-
-    fn from_os_arch(os: &str, arch: &str) -> Option<Self> {
-        match (os, arch) {
-            ("linux", "x86_64") => Some(Self::LinuxX86_64),
-            ("linux", "aarch64") => Some(Self::LinuxAarch64),
-            ("macos", "x86_64") => Some(Self::MacosX86_64),
-            ("macos", "aarch64") => Some(Self::MacosAarch64),
-            ("windows", "x86_64") => Some(Self::WindowsX86_64),
-            ("windows", "aarch64") => Some(Self::WindowsAarch64),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::LinuxX86_64 => "linux-x86_64",
-            Self::LinuxAarch64 => "linux-aarch64",
-            Self::MacosX86_64 => "macos-x86_64",
-            Self::MacosAarch64 => "macos-aarch64",
-            Self::WindowsX86_64 => "windows-x86_64",
-            Self::WindowsAarch64 => "windows-aarch64",
-        }
-    }
-
-    const ALL: &[Self] = &[
-        Self::LinuxX86_64,
-        Self::LinuxAarch64,
-        Self::MacosX86_64,
-        Self::MacosAarch64,
-        Self::WindowsX86_64,
-        Self::WindowsAarch64,
-    ];
-}
-
-impl std::fmt::Display for Platform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for Platform {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        for p in Self::ALL {
-            if p.as_str() == s {
-                return Ok(*p);
-            }
-        }
-        Err(serde::de::Error::custom(format!(
-            "unknown platform '{s}', expected one of: {}",
-            Self::ALL
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlatformDownload {
-    /// URL to download the artifact from
-    pub url: String,
-    /// SHA-256 hash of the downloaded file
-    pub sha256: String,
-    /// Path to the binary inside the archive (for .tar.gz, .zip).
-    /// If not set, the downloaded file is treated as the binary itself.
-    pub path: Option<String>,
-    /// Optional setup command to run after download/extraction.
-    /// Executed with cwd set to the cache directory for this artifact.
-    /// Only runs once — don writes a marker file after successful setup.
-    pub setup: Option<Command>,
-}
-
-/// Default base cache directory: .don/cache (project-local)
-fn default_cache_base() -> PathBuf {
-    PathBuf::from(".don").join("cache")
-}
-
-impl DownloadConfig {
-    /// Get the download artifact for a specific platform.
-    pub fn for_platform(&self, platform: Platform) -> Option<&PlatformDownload> {
-        self.platform.get(&platform)
-    }
-}
-
-impl PlatformDownload {
-    /// The directory where this artifact is cached: `<cache_base>/<sha256>/`
-    pub fn cache_dir(&self, cache_base: &std::path::Path) -> PathBuf {
-        cache_base.join(&self.sha256)
-    }
-
-    /// The full path to the downloaded binary.
-    ///
-    /// - If `path` is set (archive): `<cache_base>/<sha256>/<path>`
-    /// - If `path` is not set (bare binary): `<cache_base>/<sha256>/<filename from url>`
-    ///
-    /// Returns `None` if the URL has no path component (shouldn't happen with valid URLs,
-    /// but we don't panic on bad input).
-    pub fn binary_path(&self, cache_base: &std::path::Path) -> Option<PathBuf> {
-        let dir = self.cache_dir(cache_base);
-        match &self.path {
-            Some(p) => Some(dir.join(p)),
-            None => {
-                let filename = self.url.rsplit('/').next().filter(|s| !s.is_empty())?;
-                Some(dir.join(filename))
-            }
-        }
-    }
-}
-
-/// The resolved preset for a service, after validation.
-#[derive(Debug)]
-pub enum Preset<'a> {
-    Docker(&'a DockerConfig),
-    Rust(&'a RustConfig),
-    Custom {
-        run: &'a Command,
-        build: Option<&'a Command>,
-    },
-}
-
-fn resolve_preset<'a>(
-    docker: &'a Option<DockerConfig>,
-    rust: &'a Option<RustConfig>,
-    run: &'a Option<Command>,
-    build: &'a Option<Command>,
-) -> Result<Preset<'a>, String> {
-    match (docker, rust, run) {
-        (Some(docker), None, None) => Ok(Preset::Docker(docker)),
-        (None, Some(rust), None) => Ok(Preset::Rust(rust)),
-        (None, None, Some(run)) => Ok(Preset::Custom {
-            run,
-            build: build.as_ref(),
-        }),
-        (None, None, None) => Err("service must have one of: docker, rust, or run".to_string()),
-        _ => Err("service must have only one of: docker, rust, or run".to_string()),
-    }
-}
-
-impl Service {
-    /// Resolve which preset the base service uses (ignoring platform overrides).
-    pub fn preset(&self) -> Result<Preset<'_>, String> {
-        resolve_preset(&self.docker, &self.rust, &self.run, &self.build)
-    }
-
-    /// Resolve the service for a specific platform, applying overrides if present.
-    pub fn resolve(&self, platform: Platform) -> ResolvedService {
-        match self.platform.get(&platform) {
-            None => ResolvedService {
-                dir: self.dir.clone(),
-                env: self.env.clone(),
-                env_file: self.env_file.clone(),
-                watch: self.watch.clone(),
-                debounce: self.debounce.clone(),
-                depends_on: self.depends_on.clone(),
-                listen: self.listen.clone(),
-                download: self.download.clone(),
-                ready: self.ready.clone(),
-                shutdown: self.shutdown.clone(),
-                log: self.log.clone(),
-                docker: self.docker.clone(),
-                rust: self.rust.clone(),
-                run: self.run.clone(),
-                build: self.build.clone(),
-            },
-            Some(ov) => {
-                let mut env = self.env.clone();
-                env.extend(ov.env.clone());
-
-                let has_preset_override =
-                    ov.docker.is_some() || ov.rust.is_some() || ov.run.is_some();
-
-                let (docker, rust, run, build) = if has_preset_override {
-                    (
-                        ov.docker.clone(),
-                        ov.rust.clone(),
-                        ov.run.clone(),
-                        ov.build.clone(),
-                    )
-                } else {
-                    (
-                        self.docker.clone(),
-                        self.rust.clone(),
-                        self.run.clone(),
-                        ov.build.clone().or_else(|| self.build.clone()),
-                    )
-                };
-
-                ResolvedService {
-                    dir: ov.dir.clone().or_else(|| self.dir.clone()),
-                    env,
-                    env_file: ov
-                        .env_file
-                        .clone()
-                        .unwrap_or_else(|| self.env_file.clone()),
-                    watch: ov.watch.clone().unwrap_or_else(|| self.watch.clone()),
-                    debounce: ov.debounce.clone().or_else(|| self.debounce.clone()),
-                    depends_on: ov
-                        .depends_on
-                        .clone()
-                        .unwrap_or_else(|| self.depends_on.clone()),
-                    listen: ov.listen.clone().unwrap_or_else(|| self.listen.clone()),
-                    download: ov.download.clone().or_else(|| self.download.clone()),
-                    ready: ov.ready.clone().or_else(|| self.ready.clone()),
-                    shutdown: ov.shutdown.clone().or_else(|| self.shutdown.clone()),
-                    log: ov.log.clone().unwrap_or_else(|| self.log.clone()),
-                    docker,
-                    rust,
-                    run,
-                    build,
-                }
-            }
-        }
-    }
-}
-
-impl ResolvedService {
-    pub fn preset(&self) -> Result<Preset<'_>, String> {
-        resolve_preset(&self.docker, &self.rust, &self.run, &self.build)
-    }
-
-    /// Resolve the run command for a custom service, taking downloads into account.
-    ///
-    /// If a download exists for this platform, the binary path from the download
-    /// replaces `run.cmd`. The original `run.args` are preserved.
-    /// Returns `(executable_path, args)`.
-    pub fn resolved_run_cmd(
-        &self,
-        platform: Platform,
-        cache_base: Option<&std::path::Path>,
-    ) -> Result<(PathBuf, &[String]), String> {
-        let run = self.run.as_ref().ok_or("service has no run command")?;
-
-        let cache_base = cache_base
-            .map(PathBuf::from)
-            .unwrap_or_else(default_cache_base);
-
-        let executable = match &self.download {
-            Some(dl) => match dl.for_platform(platform) {
-                Some(artifact) => artifact
-                    .binary_path(&cache_base)
-                    .ok_or_else(|| format!("download url has no filename: {}", artifact.url))?,
-                None => PathBuf::from(&run.cmd),
-            },
-            None => PathBuf::from(&run.cmd),
-        };
-
-        Ok((executable, &run.args))
-    }
 }
 
 impl std::str::FromStr for Config {
@@ -581,9 +48,21 @@ impl std::str::FromStr for Config {
     }
 }
 
+const VALID_SIGNALS: &[&str] = &[
+    "SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2",
+];
+
+fn is_valid_signal(s: &str) -> bool {
+    VALID_SIGNALS.contains(&s)
+}
+
 impl Config {
-    pub fn from_file(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path)?;
+    /// Load and parse a config from a file path.
+    pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(content.parse()?)
     }
 
@@ -597,16 +76,17 @@ impl Config {
     }
 
     /// Validate the entire config for a given platform.
-    pub fn validate(&self, platform: Platform) -> Result<(), Vec<String>> {
+    ///
+    /// Checks preset validity, ready check configuration, dependency references,
+    /// profile references, and dependency cycles.
+    pub fn validate(&self, platform: Platform) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
         let all_names = self.all_names();
 
         // Check for name collisions between services and tasks
         for name in self.services.keys() {
             if self.tasks.contains_key(name) {
-                errors.push(format!(
-                    "'{name}' is defined as both a service and a task"
-                ));
+                errors.push(format!("'{name}' is defined as both a service and a task"));
             }
         }
 
@@ -637,6 +117,28 @@ impl Config {
                     ));
                 }
             }
+            // Validate duration strings
+            if let Some(ref debounce) = resolved.debounce
+                && let Err(e) = crate::duration::parse_duration(debounce)
+            {
+                errors.push(format!("service '{name}': invalid debounce: {e}"));
+            }
+            if let Some(ref ready) = resolved.ready
+                && let Err(e) = crate::duration::parse_duration(&ready.interval)
+            {
+                errors.push(format!("service '{name}': invalid ready interval: {e}"));
+            }
+            if let Some(ref shutdown) = resolved.shutdown {
+                if let Err(e) = crate::duration::parse_duration(&shutdown.timeout) {
+                    errors.push(format!("service '{name}': invalid shutdown timeout: {e}"));
+                }
+                if !is_valid_signal(&shutdown.signal) {
+                    errors.push(format!(
+                        "service '{name}': unknown shutdown signal '{}' (expected SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGUSR1, or SIGUSR2)",
+                        shutdown.signal
+                    ));
+                }
+            }
         }
 
         // Validate tasks
@@ -647,6 +149,11 @@ impl Config {
                         "task '{name}': depends on unknown service or task '{dep}'"
                     ));
                 }
+            }
+            if let Some(ref timeout) = task.timeout
+                && let Err(e) = crate::duration::parse_duration(timeout)
+            {
+                errors.push(format!("task '{name}': invalid timeout: {e}"));
             }
         }
 
@@ -676,13 +183,12 @@ impl Config {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(errors)
+            Err(ConfigError::Validation { errors })
         }
     }
 
     /// Detect dependency cycles using DFS. Returns the cycle path if one exists.
     fn detect_cycle(&self, platform: Platform) -> Option<Vec<String>> {
-        // Build adjacency list: name -> list of dependencies (all owned)
         let mut deps: HashMap<String, Vec<String>> = HashMap::new();
         for (name, svc) in &self.services {
             let resolved = svc.resolve(platform);
@@ -716,7 +222,7 @@ impl Config {
                 for dep in neighbors {
                     match state.get(dep.as_str()) {
                         Some(State::Visiting) => {
-                            let cycle_start = path.iter().position(|n| n == dep).unwrap();
+                            let cycle_start = path.iter().position(|n| n == dep)?;
                             let mut cycle: Vec<String> = path[cycle_start..].to_vec();
                             cycle.push(dep.clone());
                             return Some(cycle);
@@ -747,6 +253,23 @@ impl Config {
 
         None
     }
+}
+
+/// Errors that can occur when loading or validating a don config.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The config file could not be read from disk.
+    #[error("failed to read config file '{}': {source}", path.display())]
+    ReadFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The config file contains invalid TOML or doesn't match the expected schema.
+    #[error("failed to parse config: {0}")]
+    Parse(#[from] toml::de::Error),
+    /// The config is syntactically valid but contains semantic errors.
+    #[error("config validation failed:\n{}", errors.join("\n"))]
+    Validation { errors: Vec<String> },
 }
 
 #[cfg(test)]
@@ -888,12 +411,11 @@ mod tests {
                     assert_eq!(ready.http.as_deref(), Some("http://localhost:3000/healthz"));
                     assert!(ready.exec.is_none());
                     assert!(ready.tcp.is_none());
-                    // Check defaults
                     assert_eq!(ready.interval, "1s");
                     assert_eq!(ready.retries, 30);
 
                     let shutdown = resolved.shutdown.as_ref().unwrap();
-                    assert_eq!(shutdown.signal, "SIGTERM"); // default
+                    assert_eq!(shutdown.signal, "SIGTERM");
                     assert_eq!(shutdown.timeout, "5s");
                 },
             },
@@ -1082,8 +604,9 @@ mod tests {
                     };
                     assert_eq!(docker.image, "cockroachdb/cockroach:v24.1.0");
 
-                    let windows = config.services["crdb"].resolve(Platform::WindowsX86_64);
-                    assert!(windows.preset().is_err());
+                    // Platform without an override and no base preset should fail
+                    let other = config.services["crdb"].resolve(Platform::LinuxAarch64);
+                    assert!(other.preset().is_err());
                 },
             },
             ConfigTestCase {
@@ -1252,7 +775,10 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors[0].contains("unknown service or task 'nonexistent'"));
                 },
             },
@@ -1267,7 +793,10 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors[0].contains("both a service and a task"));
                 },
             },
@@ -1280,7 +809,10 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors[0].contains("unknown service or task 'ghost'"));
                 },
             },
@@ -1301,7 +833,10 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors.iter().any(|e| e.contains("dependency cycle")));
                 },
             },
@@ -1314,7 +849,10 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors.iter().any(|e| e.contains("dependency cycle")));
                 },
             },
@@ -1354,7 +892,10 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors[0].contains("unknown service 'nonexistent'"));
                 },
             },
@@ -1369,7 +910,10 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors[0].contains("unknown task 'ghost'"));
                 },
             },
@@ -1428,7 +972,10 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors[0].contains("ready check must have one of"));
                 },
             },
@@ -1443,8 +990,108 @@ mod tests {
                 "#,
                 expect_err: false,
                 check: |config| {
-                    let errors = config.validate(TEST_PLATFORM).unwrap_err();
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
                     assert!(errors[0].contains("ready check must have only one of"));
+                },
+            },
+            ConfigTestCase {
+                name: "invalid debounce duration is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    debounce = "banana"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("invalid debounce")));
+                },
+            },
+            ConfigTestCase {
+                name: "invalid ready interval is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    [services.api.ready]
+                    tcp = "localhost:3000"
+                    interval = "nope"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("invalid ready interval")));
+                },
+            },
+            ConfigTestCase {
+                name: "invalid shutdown timeout is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    [services.api.shutdown]
+                    timeout = "forever"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("invalid shutdown timeout")));
+                },
+            },
+            ConfigTestCase {
+                name: "invalid task timeout is a validation error",
+                input: r#"
+                    [tasks.build]
+                    cmd = "make"
+                    timeout = "lots"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("invalid timeout")));
+                },
+            },
+            ConfigTestCase {
+                name: "invalid shutdown signal is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    [services.api.shutdown]
+                    signal = "SIGBANANA"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("unknown shutdown signal")));
+                },
+            },
+            ConfigTestCase {
+                name: "valid shutdown signals pass validation",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    [services.api.shutdown]
+                    signal = "SIGINT"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
                 },
             },
         ];

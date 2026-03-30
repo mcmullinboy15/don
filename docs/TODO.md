@@ -14,48 +14,47 @@ After completing any phase, run `cargo clippy -- -D warnings && cargo test` and 
 Get the existing code into the right module structure, fix known bugs, and establish the testing patterns that all future phases will use.
 
 ### Restructure
-- [ ] Restructure `config.rs` into `config/` module directory (mod.rs, service.rs, task.rs, profile.rs, platform.rs, download.rs, types.rs)
-- [ ] Move `task_state.rs` to its final location
-- [ ] Set up `lib.rs` with clean public re-exports
-- [ ] Define error types with `thiserror` for each module
+- [x] Restructure `config.rs` into `config/` module directory (mod.rs, service.rs, task.rs, profile.rs, platform.rs, download.rs, types.rs)
+- [x] Move `task_state.rs` to its final location
+- [x] Set up `lib.rs` with clean public re-exports
+- [x] Define error types with `thiserror` for each module (ConfigError, DurationError, TaskStateError)
 
 ### Fix Known Bugs
 - [x] Fix `PlatformDownload::binary_path` — had an `expect()`, now returns `Option`
-- [ ] Fix task state glob resolution — globs must resolve relative to `task.dir`, not don's cwd
-- [ ] Validate duration strings (`interval`, `timeout`, `debounce`, `shutdown.timeout`) during config validation — reject invalid values like `"banana"` at parse time, not runtime
+- [x] Fix task state glob resolution — globs now resolve relative to `base_dir` parameter
+- [x] Validate duration strings (`interval`, `timeout`, `debounce`, `shutdown.timeout`) during config validation — rejects invalid values at validation time
 
 ### Duration Parsing
-- [ ] Implement duration string parser (e.g. "200ms", "1s", "5m", "30s") — shared utility used by ready checks, shutdown, debounce, and task timeout
-- [ ] Wire into config validation
+- [x] Implement duration string parser (e.g. "200ms", "1s", "5m", "30s") — `src/duration.rs`, shared utility
+- [x] Wire into config validation — validates debounce, ready.interval, shutdown.timeout, task.timeout
 
 ### CLI Skeleton
-- [ ] Stub out all clap subcommands (start, stop, restart, status, logs, cleanup, validate) — they can print "not implemented" for now, but the argument structure should be final
-- [ ] Add `--profile` flag on `start`
-- [ ] `don validate` — wire to existing `Config::from_file` + `Config::validate`, this is already implementable
+- [x] Stub out all clap subcommands (start, stop, restart, status, logs, cleanup, validate)
+- [x] Add `--profile` flag on `start`
+- [x] `don validate` — fully wired to Config::from_file + Config::validate
 
 ### Architectural Decisions
-- [ ] Decide and document cross-module communication pattern (tokio channels vs Arc<Mutex> vs actor model) — this affects every phase going forward
-- [ ] Add the decision to CLAUDE.md so all agents follow it
+- [x] Decided on tokio channels (mpsc + broadcast + oneshot) — no Arc<Mutex>
+- [x] Documented in CLAUDE.md under "Cross-Module Communication"
 
 ### Test Infrastructure
-- [ ] Create `tests/` directory for integration tests
-- [ ] Build a test harness crate or helper module (`tests/helpers/`) with:
-  - Temp directory management (project-local `.don/` state)
-  - Config builder — programmatic `don.toml` generation for tests
-  - Process assertions — helper to verify a process started, check its output, wait for ready
-  - Port allocation — find free ports for tests to avoid conflicts
-  - Timeout wrapper — every integration test gets a max runtime to prevent hangs
-- [ ] Write a basic integration test: parse a config, validate it, verify the result — proves the harness works
-- [ ] Add integration test CI guidance to CLAUDE.md (PTY fallback for headless environments — tests must work without a real terminal)
+- [x] Create `tests/` directory for integration tests
+- [x] Build test helpers (`tests/helpers/`):
+  - `tempdir.rs` — TempDir with auto-cleanup
+  - `config.rs` — ConfigBuilder with ServiceBuilder/TaskBuilder sub-builders
+  - `port.rs` — free_port() for ephemeral port allocation
+  - `timeout.rs` — run_with_timeout() for async test timeouts
+- [x] 11 integration tests proving the harness works (valid/invalid configs, CLI binary tests)
+- [x] Added CI test guidance to CLAUDE.md (PTY fallback, test timeouts)
 
 ### Test Coverage Checkpoint
-- [ ] All existing config parsing tests still pass after restructure
-- [ ] All existing task_state tests still pass after restructure
-- [ ] Duration parser has table-driven tests covering: valid inputs ("1s", "200ms", "5m", "1h"), invalid inputs ("banana", "", "-1s", "5"), edge cases ("0s", "0ms")
-- [ ] Config validation tests cover invalid duration strings
-- [ ] Integration test harness is proven working with at least one end-to-end test
-- [ ] `cargo clippy -- -D warnings` passes
-- [ ] No `unwrap()`/`expect()`/`panic!()` outside `#[cfg(test)]`
+- [x] All existing config parsing tests pass after restructure (6 unit tests)
+- [x] All existing task_state tests pass + new base_dir test
+- [x] Duration parser: 18 table-driven test cases (valid, invalid, edge cases)
+- [x] Config validation tests cover invalid duration strings (4 new test cases)
+- [x] Integration test harness proven with 11 end-to-end tests
+- [x] `cargo clippy -- -D warnings` passes
+- [x] No `unwrap()`/`expect()`/`panic!()` outside `#[cfg(test)]`
 
 ---
 
@@ -414,6 +413,7 @@ Final touches for a great dev experience.
 - [ ] Color-coded service prefixes with aligned columns (verify this works well with 10+ services)
 - [ ] Verify all `[don]` lifecycle messages are consistent and helpful
 - [ ] Write README.md with quickstart, example config, and feature overview
+- [ ] Detect terminal control sequences (alternate screen, cursor movement) in service output — suppress from prefixed output and show `[don] api: interactive output suppressed — use 'don attach api' to view`
 
 ### Final Test Coverage Checkpoint
 - [ ] Verify no `unwrap()`/`expect()`/`panic!()` outside test code (final audit)
@@ -423,3 +423,41 @@ Final touches for a great dev experience.
 - [ ] Review test coverage: every user-facing feature has at least one integration test
 - [ ] Review test coverage: every error path has at least one test (invalid config, missing files, failed builds, crashed services, stale state, etc.)
 - [ ] Create a sample `don.toml` in `examples/` with all features demonstrated and commented
+
+---
+
+## Phase 17: Interactive Attach
+
+Connect your terminal directly to a running service's PTY for interactive stdin/stdout access. Depends on Phases 2 (PTY), 3 (output), and 10 (unix socket API).
+
+### WebSocket Endpoint
+- [ ] `GET /attach/:name` endpoint on the unix socket API that upgrades to a WebSocket
+- [ ] Replay recent output from ring buffer on connect (so the user has context)
+- [ ] Bidirectional bridge: WebSocket frames ↔ PTY stdin/stdout
+- [ ] Terminal resize: CLI sends resize control messages, daemon calls `pty.resize()`
+
+### Attach Lock
+- [ ] Daemon tracks which PID holds the attach lock for each service
+- [ ] CLI sends its PID in the initial WebSocket handshake
+- [ ] Second attach attempt returns error: `"process 82648 is currently attached to 'my-task'"`
+- [ ] Lock auto-released on WebSocket disconnect (process dies or detaches)
+
+### CLI
+- [ ] `don attach <name>` subcommand
+- [ ] Put terminal in raw mode (crossterm) for direct input passthrough
+- [ ] Bridge stdin/stdout to WebSocket
+- [ ] Detect and forward terminal resize events
+- [ ] Escape sequence `~.` to detach without killing the process
+- [ ] Restore terminal from raw mode on detach/exit
+
+### Output Integration
+- [ ] Pause prefixed output for the attached service in the don terminal
+- [ ] Ring buffer continues to be fed during attach
+- [ ] Resume prefixed output on detach
+
+### Test Coverage Checkpoint
+- [ ] Integration test: attach to a running service, send input, verify it reaches the subprocess
+- [ ] Integration test: attempt second attach while first is active — verify rejection with PID
+- [ ] Integration test: first attacher disconnects, second attach succeeds
+- [ ] Integration test: detach with escape sequence, verify service keeps running
+- [ ] Integration test: terminal resize propagates to subprocess PTY

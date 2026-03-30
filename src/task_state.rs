@@ -1,5 +1,11 @@
+//! Task state tracking — determines whether a task needs to re-run
+//! based on file content hashes.
+//!
+//! State is stored in `.don/task-state/<task-name>.sha256`.
+//! A hash is only written after a task exits successfully (exit code 0).
+
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Manages task state — tracks file hashes to determine whether a task needs to re-run.
 ///
@@ -16,6 +22,7 @@ impl Default for TaskState {
 }
 
 impl TaskState {
+    /// Create a new `TaskState` that stores hashes in the given directory.
     pub fn new(state_dir: PathBuf) -> Self {
         Self { state_dir }
     }
@@ -26,12 +33,20 @@ impl TaskState {
     /// - The task has no watch patterns (always runs)
     /// - There is no stored hash (never succeeded before)
     /// - The current file hash differs from the stored hash
-    pub fn needs_run(&self, task_name: &str, watch_patterns: &[String]) -> Result<bool, Error> {
+    ///
+    /// `base_dir` is prepended to glob patterns so they resolve relative to the
+    /// task's working directory, not don's cwd. Pass `None` to resolve from cwd.
+    pub fn needs_run(
+        &self,
+        task_name: &str,
+        watch_patterns: &[String],
+        base_dir: Option<&Path>,
+    ) -> Result<bool, TaskStateError> {
         if watch_patterns.is_empty() {
             return Ok(true);
         }
 
-        let current_hash = self.compute_hash(watch_patterns)?;
+        let current_hash = self.compute_hash(watch_patterns, base_dir)?;
         let stored_hash = self.read_stored_hash(task_name)?;
 
         Ok(stored_hash.as_ref() != Some(&current_hash))
@@ -39,25 +54,32 @@ impl TaskState {
 
     /// Record a successful task run by writing the current file hash.
     /// Only call this after the task exits with code 0.
-    pub fn record_success(&self, task_name: &str, watch_patterns: &[String]) -> Result<(), Error> {
+    ///
+    /// `base_dir` must match what was passed to `needs_run`.
+    pub fn record_success(
+        &self,
+        task_name: &str,
+        watch_patterns: &[String],
+        base_dir: Option<&Path>,
+    ) -> Result<(), TaskStateError> {
         if watch_patterns.is_empty() {
             return Ok(());
         }
 
-        let hash = self.compute_hash(watch_patterns)?;
+        let hash = self.compute_hash(watch_patterns, base_dir)?;
         let path = self.hash_file_path(task_name);
-        std::fs::create_dir_all(&self.state_dir).map_err(Error::Io)?;
-        std::fs::write(&path, hash.as_bytes()).map_err(Error::Io)?;
+        std::fs::create_dir_all(&self.state_dir)?;
+        std::fs::write(&path, hash.as_bytes())?;
         Ok(())
     }
 
     /// Clear stored state for a task, forcing it to re-run next time.
-    pub fn clear(&self, task_name: &str) -> Result<(), Error> {
+    pub fn clear(&self, task_name: &str) -> Result<(), TaskStateError> {
         let path = self.hash_file_path(task_name);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Io(e)),
+            Err(e) => Err(TaskStateError::Io(e)),
         }
     }
 
@@ -66,11 +88,19 @@ impl TaskState {
     /// The hash includes:
     /// - The sorted list of matched file paths (so adding/removing files triggers a change)
     /// - The contents of each file
-    fn compute_hash(&self, watch_patterns: &[String]) -> Result<String, Error> {
+    fn compute_hash(
+        &self,
+        watch_patterns: &[String],
+        base_dir: Option<&Path>,
+    ) -> Result<String, TaskStateError> {
         let mut paths = Vec::new();
         for pattern in watch_patterns {
-            for entry in glob::glob(pattern).map_err(|e| Error::Glob(e.to_string()))? {
-                let path = entry.map_err(|e| Error::Io(e.into_error()))?;
+            let full_pattern = match base_dir {
+                Some(dir) => dir.join(pattern).to_string_lossy().into_owned(),
+                None => pattern.clone(),
+            };
+            for entry in glob::glob(&full_pattern).map_err(|e| TaskStateError::Glob(e.to_string()))? {
+                let path = entry.map_err(|e| TaskStateError::Io(e.into_error()))?;
                 if path.is_file() {
                     paths.push(path);
                 }
@@ -89,7 +119,7 @@ impl TaskState {
 
         // Hash each file's contents
         for path in &paths {
-            let contents = std::fs::read(path).map_err(Error::Io)?;
+            let contents = std::fs::read(path)?;
             hasher.update(&contents);
             hasher.update(b"\0");
         }
@@ -101,20 +131,24 @@ impl TaskState {
         self.state_dir.join(format!("{task_name}.sha256"))
     }
 
-    fn read_stored_hash(&self, task_name: &str) -> Result<Option<String>, Error> {
+    fn read_stored_hash(&self, task_name: &str) -> Result<Option<String>, TaskStateError> {
         let path = self.hash_file_path(task_name);
         match std::fs::read_to_string(&path) {
             Ok(hash) => Ok(Some(hash)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Io(e)),
+            Err(e) => Err(TaskStateError::Io(e)),
         }
     }
 }
 
+/// Errors from task state operations.
+/// Errors from task state operations.
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum TaskStateError {
+    /// A filesystem operation failed (reading files, writing state, etc.).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A watch glob pattern was invalid.
     #[error("glob error: {0}")]
     Glob(String),
 }
@@ -123,7 +157,6 @@ pub enum Error {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::Path;
 
     struct TempDir {
         path: PathBuf,
@@ -255,14 +288,13 @@ mod tests {
 
             (case.setup)(dir.path());
 
-            // Replace PLACEHOLDER with actual temp dir path in patterns
             let patterns: Vec<String> = case
                 .patterns
                 .iter()
                 .map(|p| p.replace("PLACEHOLDER", &dir.path().to_string_lossy()))
                 .collect();
 
-            let needs_run = state.needs_run("test-task", &patterns).unwrap();
+            let needs_run = state.needs_run("test-task", &patterns, None).unwrap();
             assert_eq!(
                 needs_run, case.expect_needs_run_before,
                 "case '{}': needs_run before",
@@ -270,20 +302,48 @@ mod tests {
             );
 
             if case.record_success {
-                state.record_success("test-task", &patterns).unwrap();
+                state.record_success("test-task", &patterns, None).unwrap();
             }
 
             if let Some(mutate) = case.mutate {
                 mutate(dir.path());
             }
 
-            let needs_run = state.needs_run("test-task", &patterns).unwrap();
+            let needs_run = state.needs_run("test-task", &patterns, None).unwrap();
             assert_eq!(
                 needs_run, case.expect_needs_run_after,
                 "case '{}': needs_run after",
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn test_base_dir_resolution() {
+        let dir = TempDir::new("base-dir");
+        let sub = dir.path().join("subdir");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.sql"), "CREATE TABLE a;").unwrap();
+
+        let state = TaskState::new(dir.path().join(".don-state"));
+        let patterns = vec!["*.sql".to_string()];
+
+        // Without base_dir: glob resolves from cwd, won't find files in subdir
+        let needs_run_no_base = state.needs_run("test", &patterns, None).unwrap();
+        // With base_dir pointing to subdir: should find the file
+        let needs_run_with_base = state.needs_run("test", &patterns, Some(&sub)).unwrap();
+
+        // The cwd-relative glob likely finds nothing (no *.sql in cwd), so always needs run
+        assert!(needs_run_no_base);
+        // The subdir glob finds a.sql, and there's no stored hash, so also needs run
+        assert!(needs_run_with_base);
+
+        // Record success with base_dir
+        state.record_success("test", &patterns, Some(&sub)).unwrap();
+        // Now it should skip
+        assert!(!state.needs_run("test", &patterns, Some(&sub)).unwrap());
+        // But without base_dir it still needs run (different glob results)
+        assert!(state.needs_run("test", &patterns, None).unwrap());
     }
 
     #[test]
@@ -294,11 +354,11 @@ mod tests {
         fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let patterns = vec![format!("{}/*.txt", dir.path().to_string_lossy())];
 
-        state.record_success("my-task", &patterns).unwrap();
-        assert!(!state.needs_run("my-task", &patterns).unwrap());
+        state.record_success("my-task", &patterns, None).unwrap();
+        assert!(!state.needs_run("my-task", &patterns, None).unwrap());
 
         state.clear("my-task").unwrap();
-        assert!(state.needs_run("my-task", &patterns).unwrap());
+        assert!(state.needs_run("my-task", &patterns, None).unwrap());
 
         // Clear on non-existent is fine
         state.clear("never-existed").unwrap();

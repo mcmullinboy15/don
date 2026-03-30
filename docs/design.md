@@ -97,6 +97,7 @@ These fields are available on all service presets:
 | `env` | map | Environment variables |
 | `env_file` | list of paths | Env files to load. Don also auto-loads `.env.<service-name>` if it exists |
 | `watch` | list of globs | File patterns to watch for rebuilding/restarting |
+| `debounce` | duration string | Debounce window for watch events (default "200ms") |
 | `depends_on` | list of names | Services or tasks that must be ready/complete first |
 | `listen` | list of addresses | Addresses for don to bind and pass to the service via `LISTEN_FDS` |
 | `ready` | table | Ready check configuration (see below) |
@@ -128,6 +129,7 @@ log = "ignore"
 | `env` | map | Environment variables |
 | `depends_on` | list of names | Services or tasks that must be ready/complete first |
 | `watch` | list of globs | File patterns — task only re-runs if these changed since last success. Empty = always runs |
+| `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
 
 #### Task State Tracking
@@ -243,8 +245,6 @@ Platform keys use Rust's `std::env::consts` naming:
 - `linux-aarch64`
 - `macos-x86_64`
 - `macos-aarch64`
-- `windows-x86_64`
-- `windows-aarch64`
 
 ### Platform Overrides
 
@@ -338,20 +338,115 @@ worker   | connected to queue
 
 The prefix is padded to the length of the longest service/task name so the output columns align.
 
-### Lifecycle Events
+### Lifecycle Messages
 
-Don prints its own status messages for lifecycle events, visually distinct from service output:
+Don prints its own status messages for lifecycle events, always prefixed with `[don]` to be visually distinct from service output. Service-specific events include the service name after the prefix.
+
+**Startup:**
 
 ```
+[don] loading don.toml
+[don] validated 5 services, 2 tasks
 [don] starting postgres...
-[don] postgres ready (tcp check passed)
-[don] running migrate...
-[don] migrate complete (2 files changed)
-[don] migrate skipped (no files changed)
+[don] starting redis...
+[don] postgres ready (tcp localhost:5432)
+[don] redis ready (tcp localhost:6379)
+[don] running migrate... (3 files changed)
+[don] migrate complete (0.8s)
+[don] running seed... (skipped, no changes)
 [don] starting api...
-[don] api exited with code 1
-[don] worker exited with signal SIGTERM
+[don] starting worker...
+[don] api ready (http localhost:3000/healthz)
+[don] worker started
+[don] all services running
 ```
+
+**Watch / rebuild:**
+
+```
+[don] api: file change detected (src/main.rs)
+[don] api: building...
+[don] api: build complete (2.1s)
+[don] api: restarting...
+[don] api: ready (http localhost:3000/healthz)
+```
+
+**Build failure:**
+
+```
+[don] api: file change detected (src/main.rs)
+[don] api: building...
+[don] api: build failed (exit code 1)
+[don] api: keeping current process running
+```
+
+**Service crashes:**
+
+```
+[don] worker exited with code 1
+[don] postgres exited with signal SIGKILL
+```
+
+**Tasks:**
+
+```
+[don] running migrate... (3 files changed)
+[don] migrate complete (0.8s)
+[don] running migrate... (skipped, no changes)
+[don] migrate failed (exit code 1, 0.3s)
+[don] migrate timed out after 5m
+```
+
+**Shutdown (with live remaining count):**
+
+```
+[don] shutting down gracefully... (Ctrl+C again to force)
+[don] stopping worker... (4 remaining)
+[don] worker stopped (3 remaining)
+[don] stopping api... (3 remaining)
+[don] api stopped (2 remaining)
+[don] stopping migrate... (2 remaining)
+[don] migrate stopped (1 remaining)
+[don] stopping postgres... (1 remaining)
+[don] postgres stopped (0 remaining)
+[don] shutdown complete
+```
+
+**Shutdown with stuck process:**
+
+```
+[don] stopping api... (3 remaining)
+[don] api: waiting for graceful shutdown (8s remaining)
+[don] api: waiting for graceful shutdown (3s remaining)
+[don] api: did not exit within 10s, sending SIGKILL
+[don] api stopped (2 remaining)
+```
+
+**Config reload:**
+
+```
+[don] don.toml changed, reloading...
+[don] added service: worker
+[don] removed service: old-api
+[don] restarting api (config changed)
+```
+
+**Stale cleanup:**
+
+```
+[don] cleaning up stale state...
+[don] killed orphaned process group for api (pgid 12345)
+[don] removed stale socket .don/don.sock
+```
+
+**Principles:**
+- Always prefixed with `[don]` — visually distinct from service output
+- Service-specific events include the service name: `[don] api: ...`
+- Include timing where useful (build duration, task duration, shutdown countdown)
+- Include the reason (which file changed, how many files, why skipped)
+- Ready checks say what passed (tcp address, http endpoint)
+- Shutdown shows a live count of remaining processes so it's clear if something is stuck
+- Ring the terminal bell (`\x07`) on error events: build failures, service crashes, task failures, ready check exhaustion. This way the user gets an audible alert even if they're in another window.
 
 ### PTY Allocation
 
@@ -525,6 +620,7 @@ Commands:
   logs <name>               Tail the logs for a specific service
   cleanup                   Kill orphaned processes, remove stale sockets/containers
   validate                  Check the config for errors without running anything
+  attach <name>             Interactively attach stdin/stdout to a running service
 ```
 
 When no subcommand is given, `don` runs `start`.
@@ -583,3 +679,45 @@ Idle ──[file change]──▶ Debouncing ──[200ms]──▶ Building ─
 1. Print `[don] forcing immediate shutdown`
 2. Send `SIGKILL` to all service process groups immediately, no waiting
 3. Clean up PID files and exit
+
+### Interactive Attach
+
+`don attach <name>` connects your terminal directly to a running service's PTY, giving you full interactive stdin/stdout access.
+
+```
+User's terminal ◄──raw mode──► don CLI ◄──WebSocket over unix socket──► don daemon ◄──PTY──► subprocess
+```
+
+**How it works:**
+
+1. CLI sends `GET /attach/:name` to the unix socket API, which upgrades to a WebSocket
+2. Daemon checks the attach lock (see below) — if another process is already attached, returns an error with the holder's PID
+3. Daemon replays recent output from the ring buffer so the user has context (equivalent to `don logs --last N` followed by a live tail)
+4. CLI puts the terminal in raw mode (via crossterm) so keypresses go through immediately
+5. Bidirectional bridge: user input → WebSocket → PTY stdin, PTY stdout → WebSocket → user terminal
+6. Terminal resize events are detected by the CLI and sent as WebSocket control messages, which the daemon translates to PTY resize calls
+
+**Attach lock:**
+
+Only one process can be attached to a service at a time. The daemon tracks which PID holds the attach lock:
+
+- On attach: record the CLI process PID (sent in the initial WebSocket handshake)
+- On detach/disconnect: release the lock
+- If a second process tries to attach: reject with `"process 82648 is currently attached to 'my-task'"`
+- If the holding process dies (WebSocket disconnects), the lock is automatically released
+
+**Detaching:**
+
+The escape sequence `~.` (ssh-style) detaches without killing the process. The CLI intercepts this before sending to the WebSocket. On detach:
+
+1. CLI restores the terminal from raw mode
+2. WebSocket closes cleanly
+3. Daemon releases the attach lock
+4. Normal prefixed output for the service resumes in the don terminal
+
+**Output interaction:**
+
+While a service is attached interactively:
+- Prefixed output in the don terminal pauses for that service (other services continue normally)
+- The ring buffer continues to be fed (so `don logs` still works)
+- When the attach ends, prefixed output resumes
