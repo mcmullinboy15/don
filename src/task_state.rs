@@ -1,0 +1,306 @@
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+
+/// Manages task state — tracks file hashes to determine whether a task needs to re-run.
+///
+/// State is stored in `.don/task-state/<task-name>.sha256`.
+/// A hash is only written after a task exits successfully (exit code 0).
+pub struct TaskState {
+    state_dir: PathBuf,
+}
+
+impl Default for TaskState {
+    fn default() -> Self {
+        Self::new(PathBuf::from(".don").join("task-state"))
+    }
+}
+
+impl TaskState {
+    pub fn new(state_dir: PathBuf) -> Self {
+        Self { state_dir }
+    }
+
+    /// Check whether a task needs to run based on its watch patterns.
+    ///
+    /// Returns `true` if:
+    /// - The task has no watch patterns (always runs)
+    /// - There is no stored hash (never succeeded before)
+    /// - The current file hash differs from the stored hash
+    pub fn needs_run(&self, task_name: &str, watch_patterns: &[String]) -> Result<bool, Error> {
+        if watch_patterns.is_empty() {
+            return Ok(true);
+        }
+
+        let current_hash = self.compute_hash(watch_patterns)?;
+        let stored_hash = self.read_stored_hash(task_name)?;
+
+        Ok(stored_hash.as_ref() != Some(&current_hash))
+    }
+
+    /// Record a successful task run by writing the current file hash.
+    /// Only call this after the task exits with code 0.
+    pub fn record_success(&self, task_name: &str, watch_patterns: &[String]) -> Result<(), Error> {
+        if watch_patterns.is_empty() {
+            return Ok(());
+        }
+
+        let hash = self.compute_hash(watch_patterns)?;
+        let path = self.hash_file_path(task_name);
+        std::fs::create_dir_all(&self.state_dir).map_err(Error::Io)?;
+        std::fs::write(&path, hash.as_bytes()).map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Clear stored state for a task, forcing it to re-run next time.
+    pub fn clear(&self, task_name: &str) -> Result<(), Error> {
+        let path = self.hash_file_path(task_name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    /// Compute a combined SHA-256 hash of all files matching the watch patterns.
+    ///
+    /// The hash includes:
+    /// - The sorted list of matched file paths (so adding/removing files triggers a change)
+    /// - The contents of each file
+    fn compute_hash(&self, watch_patterns: &[String]) -> Result<String, Error> {
+        let mut paths = Vec::new();
+        for pattern in watch_patterns {
+            for entry in glob::glob(pattern).map_err(|e| Error::Glob(e.to_string()))? {
+                let path = entry.map_err(|e| Error::Io(e.into_error()))?;
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+
+        let mut hasher = Sha256::new();
+
+        // Hash the file list itself so adding/removing files is detected
+        for path in &paths {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Hash each file's contents
+        for path in &paths {
+            let contents = std::fs::read(path).map_err(Error::Io)?;
+            hasher.update(&contents);
+            hasher.update(b"\0");
+        }
+
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn hash_file_path(&self, task_name: &str) -> PathBuf {
+        self.state_dir.join(format!("{task_name}.sha256"))
+    }
+
+    fn read_stored_hash(&self, task_name: &str) -> Result<Option<String>, Error> {
+        let path = self.hash_file_path(task_name);
+        match std::fs::read_to_string(&path) {
+            Ok(hash) => Ok(Some(hash)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("glob error: {0}")]
+    Glob(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join("don-test")
+                .join(name)
+                .join(format!("{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn test_task_state() {
+        struct TestCase {
+            name: &'static str,
+            setup: fn(&Path),
+            patterns: Vec<String>,
+            expect_needs_run_before: bool,
+            record_success: bool,
+            mutate: Option<fn(&Path)>,
+            expect_needs_run_after: bool,
+        }
+
+        let cases = vec![
+            TestCase {
+                name: "no watch patterns always needs run",
+                setup: |_| {},
+                patterns: vec![],
+                expect_needs_run_before: true,
+                record_success: true,
+                mutate: None,
+                expect_needs_run_after: true,
+            },
+            TestCase {
+                name: "first run always needs run",
+                setup: |dir| {
+                    fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
+                },
+                patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                expect_needs_run_before: true,
+                record_success: true,
+                mutate: None,
+                expect_needs_run_after: false,
+            },
+            TestCase {
+                name: "unchanged files skip",
+                setup: |dir| {
+                    fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
+                },
+                patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                expect_needs_run_before: true,
+                record_success: true,
+                mutate: None,
+                expect_needs_run_after: false,
+            },
+            TestCase {
+                name: "modified file triggers re-run",
+                setup: |dir| {
+                    fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
+                },
+                patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                expect_needs_run_before: true,
+                record_success: true,
+                mutate: Some(|dir| {
+                    fs::write(dir.join("a.sql"), "CREATE TABLE a_v2;").unwrap();
+                }),
+                expect_needs_run_after: true,
+            },
+            TestCase {
+                name: "new file triggers re-run",
+                setup: |dir| {
+                    fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
+                },
+                patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                expect_needs_run_before: true,
+                record_success: true,
+                mutate: Some(|dir| {
+                    fs::write(dir.join("b.sql"), "CREATE TABLE b;").unwrap();
+                }),
+                expect_needs_run_after: true,
+            },
+            TestCase {
+                name: "deleted file triggers re-run",
+                setup: |dir| {
+                    fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
+                    fs::write(dir.join("b.sql"), "CREATE TABLE b;").unwrap();
+                },
+                patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                expect_needs_run_before: true,
+                record_success: true,
+                mutate: Some(|dir| {
+                    fs::remove_file(dir.join("b.sql")).unwrap();
+                }),
+                expect_needs_run_after: true,
+            },
+            TestCase {
+                name: "failed task still needs run",
+                setup: |dir| {
+                    fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
+                },
+                patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                expect_needs_run_before: true,
+                record_success: false, // simulate failure
+                mutate: None,
+                expect_needs_run_after: true,
+            },
+        ];
+
+        for case in &cases {
+            let dir = TempDir::new(case.name);
+            let state_dir = dir.path().join(".don-state");
+            let state = TaskState::new(state_dir);
+
+            (case.setup)(dir.path());
+
+            // Replace PLACEHOLDER with actual temp dir path in patterns
+            let patterns: Vec<String> = case
+                .patterns
+                .iter()
+                .map(|p| p.replace("PLACEHOLDER", &dir.path().to_string_lossy()))
+                .collect();
+
+            let needs_run = state.needs_run("test-task", &patterns).unwrap();
+            assert_eq!(
+                needs_run, case.expect_needs_run_before,
+                "case '{}': needs_run before",
+                case.name
+            );
+
+            if case.record_success {
+                state.record_success("test-task", &patterns).unwrap();
+            }
+
+            if let Some(mutate) = case.mutate {
+                mutate(dir.path());
+            }
+
+            let needs_run = state.needs_run("test-task", &patterns).unwrap();
+            assert_eq!(
+                needs_run, case.expect_needs_run_after,
+                "case '{}': needs_run after",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_clear() {
+        let dir = TempDir::new("clear");
+        let state = TaskState::new(dir.path().join(".don-state"));
+
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let patterns = vec![format!("{}/*.txt", dir.path().to_string_lossy())];
+
+        state.record_success("my-task", &patterns).unwrap();
+        assert!(!state.needs_run("my-task", &patterns).unwrap());
+
+        state.clear("my-task").unwrap();
+        assert!(state.needs_run("my-task", &patterns).unwrap());
+
+        // Clear on non-existent is fine
+        state.clear("never-existed").unwrap();
+    }
+}

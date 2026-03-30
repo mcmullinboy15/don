@@ -7,3 +7,15 @@ license = "MIT"
 
 
 [dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+notify = "8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+pty-process = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
