@@ -7,6 +7,8 @@ After completing any phase, run `cargo clippy -- -D warnings && cargo test` and 
 
 **Testing is a first-class concern.** Every phase ends with a coverage checkpoint. AI agents will be developing in this codebase, and they need fast, reliable test feedback to work effectively. If a bug can be caught by a test, it must be caught by a test. Prefer integration tests that exercise real behavior over unit tests that mock everything away.
 
+**No backwards compatibility during initial build.** There are no external consumers yet. If a better API replaces an old one, delete the old one and update all callers (including tests) in the same change. Don't keep deprecated APIs, shims, or compatibility wrappers around — they become traps that agents reach for instead of the correct path.
+
 ---
 
 ## Phase 1: Restructure, Foundation & Test Harness
@@ -103,35 +105,35 @@ The core of don — spawning children in process groups with PTYs, PID file lock
 Get service output displaying correctly in the terminal.
 
 ### Line Buffering & Prefixing
-- [ ] `output/mod.rs` — read from PTY async, buffer per-line, apply service name prefix with color coding
-- [ ] Color assignment — assign distinct terminal colors to services deterministically
-- [ ] Align prefix columns to the longest service/task name
-- [ ] Merge stdout/stderr from each child into a single stream (PTY already does this)
+- [x] `output/mod.rs` — read from PTY async, buffer per-line, apply service name prefix with color coding
+- [x] Color assignment — assign distinct terminal colors to services deterministically
+- [x] Align prefix columns to the longest service/task name
+- [x] Merge stdout/stderr from each child into a single stream (PTY already does this)
 
 ### Ring Buffer
-- [ ] `output/ring_buffer.rs` — bounded per-service ring buffer (configurable, default ~10k lines)
-- [ ] All output feeds the ring buffer regardless of log routing
+- [x] `output/ring_buffer.rs` — bounded per-service ring buffer (configurable, default ~10k lines)
+- [x] All output feeds the ring buffer regardless of log routing
 
 ### Log Routing
-- [ ] `output/log_router.rs` — route based on `LogConfig`: stdout (prefixed), file (raw), ignore (discard). All modes feed the ring buffer.
+- [x] `output/log_router.rs` — route based on `LogConfig`: stdout (prefixed), file (raw), ignore (discard). All modes feed the ring buffer.
 
 ### Lifecycle Events
-- [ ] `[don]` prefix for don's own messages: starting, ready, exited, skipped, errors
-- [ ] Consistent formatting across all lifecycle events
+- [x] `[don]` prefix for don's own messages: starting, ready, exited, skipped, errors
+- [x] Consistent formatting across all lifecycle events
 
 ### Test Coverage Checkpoint
-- [ ] Unit test: line buffering — feed partial lines, verify complete lines come out with correct prefix
-- [ ] Unit test: line buffering — concurrent writes from multiple "services" never interleave mid-line
-- [ ] Unit test: prefix alignment — verify columns align when service names have different lengths
-- [ ] Unit test: color assignment — same set of service names always gets same colors (deterministic)
-- [ ] Unit test: ring buffer — write N lines, read back last N, verify order
-- [ ] Unit test: ring buffer — fill past capacity, verify oldest lines evicted, total count correct
-- [ ] Unit test: ring buffer — empty buffer returns empty, single line works
-- [ ] Unit test: log routing — stdout mode: output appears in captured output with prefix
-- [ ] Unit test: log routing — file mode: output written to file without prefix, ring buffer still fed
-- [ ] Unit test: log routing — ignore mode: ring buffer still fed, no output to stdout or file
-- [ ] Integration test: start a service that prints known output, verify prefixed lines appear correctly
-- [ ] Integration test: start a service with `log = "ignore"`, verify output is suppressed but ring buffer has it
+- [x] Unit test: line buffering — feed partial lines, verify complete lines come out with correct prefix
+- [x] Unit test: line buffering — concurrent writes from multiple "services" never interleave mid-line
+- [x] Unit test: prefix alignment — verify columns align when service names have different lengths
+- [x] Unit test: color assignment — same set of service names always gets same colors (deterministic)
+- [x] Unit test: ring buffer — write N lines, read back last N, verify order
+- [x] Unit test: ring buffer — fill past capacity, verify oldest lines evicted, total count correct
+- [x] Unit test: ring buffer — empty buffer returns empty, single line works
+- [x] Unit test: log routing — stdout mode: output appears in captured output with prefix
+- [x] Unit test: log routing — file mode: output written to file without prefix, ring buffer still fed
+- [x] Unit test: log routing — ignore mode: ring buffer still fed, no output to stdout or file
+- [x] Integration test: start a service that prints known output, verify prefixed lines appear correctly
+- [x] Integration test: start a service with `log = "ignore"`, verify output is suppressed but ring buffer has it
 
 ---
 
