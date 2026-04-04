@@ -4,6 +4,7 @@ pub mod output;
 pub mod process;
 pub mod runner;
 pub mod task_state;
+pub mod watch;
 
 pub use config::{Config, ConfigError, Platform};
 pub use duration::{parse_duration, DurationError};

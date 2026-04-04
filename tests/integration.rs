@@ -125,6 +125,36 @@ fn validate_invalid_duration_strings() {
 }
 
 #[test]
+fn validate_invalid_watch_pattern() {
+    let dir = TempDir::new("validate-watch-pattern");
+    let config_path = ConfigBuilder::new()
+        .raw(r#"
+            [services.api]
+            run.cmd = "api"
+            watch = ["src/[*.rs"]
+
+            [tasks.build]
+            cmd = "make"
+            watch = ["lib/[bad"]
+        "#)
+        .write_to(dir.path());
+
+    let config = Config::from_file(&config_path).unwrap();
+    let err = config.validate(TEST_PLATFORM).unwrap_err();
+    let ConfigError::Validation { errors } = &err else {
+        panic!("expected validation error");
+    };
+    assert!(
+        errors.iter().any(|e| e.contains("service 'api'") && e.contains("invalid watch pattern")),
+        "expected service watch pattern error, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("task 'build'") && e.contains("invalid watch pattern")),
+        "expected task watch pattern error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn don_validate_cli_valid_config() {
     let dir = TempDir::new("cli-validate-valid");
     ConfigBuilder::new()

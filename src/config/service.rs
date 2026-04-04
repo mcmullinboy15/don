@@ -20,6 +20,9 @@ pub struct Service {
     /// File glob patterns to watch for rebuilding/restarting.
     #[serde(default)]
     pub watch: Vec<String>,
+    /// File glob patterns to ignore when watching (e.g. "**/*.log", "target/**").
+    #[serde(default)]
+    pub ignore: Vec<String>,
     /// Debounce window for file watch events (e.g. "500ms" or "1s"). Defaults to "200ms".
     pub debounce: Option<String>,
     /// Services that must be started before this one.
@@ -66,6 +69,7 @@ pub struct ServiceOverride {
     pub env: HashMap<String, String>,
     pub env_file: Option<Vec<PathBuf>>,
     pub watch: Option<Vec<String>>,
+    pub ignore: Option<Vec<String>>,
     pub debounce: Option<String>,
     pub depends_on: Option<Vec<String>>,
     pub listen: Option<Vec<String>>,
@@ -87,6 +91,7 @@ pub struct ResolvedService {
     pub env: HashMap<String, String>,
     pub env_file: Vec<PathBuf>,
     pub watch: Vec<String>,
+    pub ignore: Vec<String>,
     pub debounce: Option<String>,
     pub depends_on: Vec<String>,
     pub listen: Vec<String>,
@@ -202,6 +207,7 @@ impl Service {
                 env: self.env.clone(),
                 env_file: self.env_file.clone(),
                 watch: self.watch.clone(),
+                ignore: self.ignore.clone(),
                 debounce: self.debounce.clone(),
                 depends_on: self.depends_on.clone(),
                 listen: self.listen.clone(),
@@ -242,6 +248,7 @@ impl Service {
                     env,
                     env_file: ov.env_file.clone().unwrap_or_else(|| self.env_file.clone()),
                     watch: ov.watch.clone().unwrap_or_else(|| self.watch.clone()),
+                    ignore: ov.ignore.clone().unwrap_or_else(|| self.ignore.clone()),
                     debounce: ov.debounce.clone().or_else(|| self.debounce.clone()),
                     depends_on: ov
                         .depends_on

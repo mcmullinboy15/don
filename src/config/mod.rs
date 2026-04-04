@@ -118,6 +118,16 @@ impl Config {
                 }
             }
             // Validate duration strings
+            for pattern in &resolved.watch {
+                if let Err(e) = glob::Pattern::new(pattern) {
+                    errors.push(format!("service '{name}': invalid watch pattern '{pattern}': {e}"));
+                }
+            }
+            for pattern in &resolved.ignore {
+                if let Err(e) = glob::Pattern::new(pattern) {
+                    errors.push(format!("service '{name}': invalid ignore pattern '{pattern}': {e}"));
+                }
+            }
             if let Some(ref debounce) = resolved.debounce
                 && let Err(e) = crate::duration::parse_duration(debounce)
             {
@@ -148,6 +158,16 @@ impl Config {
                     errors.push(format!(
                         "task '{name}': depends on unknown service or task '{dep}'"
                     ));
+                }
+            }
+            for pattern in &task.watch {
+                if let Err(e) = glob::Pattern::new(pattern) {
+                    errors.push(format!("task '{name}': invalid watch pattern '{pattern}': {e}"));
+                }
+            }
+            for pattern in &task.ignore {
+                if let Err(e) = glob::Pattern::new(pattern) {
+                    errors.push(format!("task '{name}': invalid ignore pattern '{pattern}': {e}"));
                 }
             }
             if let Some(ref timeout) = task.timeout

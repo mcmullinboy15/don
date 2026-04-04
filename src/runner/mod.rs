@@ -13,6 +13,7 @@ use crate::output::OutputManager;
 use crate::process::pid_file::PidFile;
 use crate::runner::service::stop_service;
 use crate::task_state::TaskState;
+use crate::watch::WatchManager;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -109,6 +110,11 @@ pub enum RunnerCommand {
     Stop { name: String },
     /// Restart a specific service.
     Restart { name: String },
+    /// Rebuild a service triggered by a file watch event.
+    /// Runs the build command (if any), then restarts the service.
+    Rebuild { name: String },
+    /// Re-run a task triggered by a file watch event.
+    TaskRerun { name: String },
     /// Query the status of all services and tasks.
     Status {
         reply: oneshot::Sender<Vec<ItemStatus>>,
@@ -132,6 +138,10 @@ pub enum RunnerEvent {
     ServiceStateChanged { name: String, state: ServiceState },
     /// A task changed state.
     TaskStateChanged { name: String, state: TaskItemState },
+    /// A rebuild cycle completed (file watch triggered).
+    RebuildComplete { name: String, success: bool },
+    /// A task re-run completed (file watch triggered).
+    TaskRerunComplete { name: String, success: bool },
     /// Shutdown complete.
     ShutdownComplete,
 }
@@ -503,6 +513,33 @@ impl Runner {
             if task_count == 1 { "" } else { "s" },
         ));
 
+        // Start file watchers before spawning services so we don't miss
+        // changes that happen during startup (slow ready checks, long builds, etc.).
+        match WatchManager::new(
+            &self.config,
+            self.platform,
+            &self.base_dir,
+            self.cmd_tx.clone(),
+            self.event_tx.subscribe(),
+        )
+        .await
+        {
+            Ok((watch_mgr, warnings)) => {
+                for warning in &warnings {
+                    self.output_manager.error_event(warning);
+                }
+                if watch_mgr.has_watches() {
+                    tokio::spawn(async move {
+                        watch_mgr.run().await;
+                    });
+                }
+            }
+            Err(e) => {
+                self.output_manager
+                    .error_event(&format!("file watcher setup failed: {e}"));
+            }
+        }
+
         // Build dependency map and topological order.
         let dep_map = self.build_dep_map();
         let order = topological_sort(&dep_map).map_err(|cycle| RunnerError::Cycle { cycle })?;
@@ -563,6 +600,12 @@ impl Runner {
                         RunnerCommand::Status { reply } => {
                             let statuses = self.collect_status();
                             let _ = reply.send(statuses);
+                        }
+                        RunnerCommand::Rebuild { name } => {
+                            self.handle_rebuild(&name).await;
+                        }
+                        RunnerCommand::TaskRerun { name } => {
+                            self.handle_task_rerun(&name).await;
                         }
                         // Future phases: Start/Stop/Restart via API.
                         _ => {}
@@ -681,64 +724,16 @@ impl Runner {
         self.output_manager
             .lifecycle_event(&format!("starting {name}..."));
 
-        // Spawn the service.
         let pid_dir = self.base_dir.join(".don").join("pids");
 
         match service::start_service(name, &resolved, &self.base_dir, &pid_dir).await {
             Ok(start_result) => {
-                self.service_states
-                    .insert(name.to_string(), ServiceState::Running);
-                self.service_handles
-                    .insert(name.to_string(), start_result.handle);
-
-                // Wire up output processing. The exit_tx fires when the
-                // stream hits EOF (process died), used to cancel the ready check.
-                let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-                if let Some(svc_writer) = self.output_manager.service_writer(name) {
-                    let child_output = start_result.child_output;
-                    tokio::spawn(async move {
-                        let _ = svc_writer.process_stream(child_output).await;
-                        let _ = exit_tx.send(());
-                    });
-                }
-
-                // Spawn ready check in background, racing against process exit.
-                let name_owned = name.to_string();
-                let ready_config = resolved.ready.clone();
-                let event_tx = self.event_tx.clone();
-
-                if let Some(ready) = ready_config {
-                    tokio::spawn(async move {
-                        let ready_result = tokio::select! {
-                            result = service::run_ready_check(&ready) => result,
-                            _ = exit_rx => {
-                                Err(service::ServiceError::ProcessExitedDuringReadyCheck)
-                            }
-                        };
-
-                        let state = if ready_result.is_ok() {
-                            ServiceState::Ready
-                        } else {
-                            ServiceState::Failed
-                        };
-
-                        let _ = event_tx.send(RunnerEvent::ServiceStateChanged {
-                            name: name_owned.clone(),
-                            state,
-                        });
-
-                        let _ = done_tx
-                            .send(ItemDone {
-                                name: name_owned,
-                                kind: NodeKind::Service,
-                                success: ready_result.is_ok(),
-                                message: ready_result.err().map(|e| e.to_string()),
-                                elapsed: None,
-                            })
-                            .await;
-                    });
-                };
-
+                self.wire_service_output_and_ready_check(
+                    name,
+                    start_result,
+                    &resolved,
+                    Some(done_tx),
+                );
                 Ok(())
             }
             Err(e) => {
@@ -759,6 +754,90 @@ impl Runner {
 
                 Ok(())
             }
+        }
+    }
+
+    /// Wire up a started service's output and ready check.
+    ///
+    /// Sets the service to Running, stores the handle, starts output capture,
+    /// and spawns the ready check (if configured). On ready check completion:
+    /// - If `done_tx` is `Some`, sends `ItemDone` (initial startup path).
+    /// - If `done_tx` is `None`, sends `RebuildComplete` (file-watch rebuild path).
+    fn wire_service_output_and_ready_check(
+        &mut self,
+        name: &str,
+        start_result: service::StartResult,
+        resolved: &crate::config::ResolvedService,
+        done_tx: Option<mpsc::Sender<ItemDone>>,
+    ) {
+        self.service_states
+            .insert(name.to_string(), ServiceState::Running);
+        self.service_handles
+            .insert(name.to_string(), start_result.handle);
+
+        // Wire up output processing. The exit_tx fires when the
+        // stream hits EOF (process died), used to cancel the ready check.
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        if let Some(svc_writer) = self.output_manager.service_writer(name) {
+            let child_output = start_result.child_output;
+            tokio::spawn(async move {
+                let _ = svc_writer.process_stream(child_output).await;
+                let _ = exit_tx.send(());
+            });
+        }
+
+        let name_owned = name.to_string();
+        let ready_config = resolved.ready.clone();
+        let event_tx = self.event_tx.clone();
+
+        if let Some(ready) = ready_config {
+            tokio::spawn(async move {
+                let ready_result = tokio::select! {
+                    result = service::run_ready_check(&ready) => result,
+                    _ = exit_rx => {
+                        Err(service::ServiceError::ProcessExitedDuringReadyCheck)
+                    }
+                };
+
+                let success = ready_result.is_ok();
+                let state = if success {
+                    ServiceState::Ready
+                } else {
+                    ServiceState::Failed
+                };
+
+                let _ = event_tx.send(RunnerEvent::ServiceStateChanged {
+                    name: name_owned.clone(),
+                    state,
+                });
+
+                if let Some(done_tx) = done_tx {
+                    let _ = done_tx
+                        .send(ItemDone {
+                            name: name_owned,
+                            kind: NodeKind::Service,
+                            success,
+                            message: ready_result.err().map(|e| e.to_string()),
+                            elapsed: None,
+                        })
+                        .await;
+                } else {
+                    let _ = event_tx.send(RunnerEvent::RebuildComplete {
+                        name: name_owned,
+                        success,
+                    });
+                }
+            });
+        } else if done_tx.is_none() {
+            // No ready check on rebuild path — mark ready immediately.
+            self.service_states
+                .insert(name.to_string(), ServiceState::Ready);
+            self.output_manager
+                .lifecycle_event(&format!("{name}: restarted"));
+            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                name: name.to_string(),
+                success: true,
+            });
         }
     }
 
@@ -830,11 +909,11 @@ impl Runner {
             .insert(name.to_string(), TaskItemState::Running);
 
         // Spawn the task process.
-        let task::TaskSpawn {
-            mut handle,
-            child_output,
-        } = match task::spawn_task(&task_cfg, &self.base_dir).await {
-            Ok(s) => s,
+        match task::spawn_task(&task_cfg, &self.base_dir).await {
+            Ok(spawn) => {
+                self.wire_task_output_and_wait(name, spawn, &task_cfg, Some(done_tx));
+                Ok(())
+            }
             Err(e) => {
                 self.task_states
                     .insert(name.to_string(), TaskItemState::Failed);
@@ -849,11 +928,29 @@ impl Runner {
                         elapsed: None,
                     })
                     .await;
-                return Ok(());
+                Ok(())
             }
-        };
+        }
+    }
 
-        // Wire up output processing.
+    /// Wire up a spawned task's output and wait for completion.
+    ///
+    /// Starts output capture, spawns a background task to wait for exit,
+    /// records success in task state, and sends completion events.
+    /// - If `done_tx` is `Some`, sends `ItemDone` (initial startup path).
+    /// - If `done_tx` is `None`, sends `TaskRerunComplete` (file-watch rerun path).
+    fn wire_task_output_and_wait(
+        &self,
+        name: &str,
+        spawn: task::TaskSpawn,
+        task_cfg: &crate::config::Task,
+        done_tx: Option<mpsc::Sender<ItemDone>>,
+    ) {
+        let task::TaskSpawn {
+            mut handle,
+            child_output,
+        } = spawn;
+
         if let Some(svc_writer) = self.output_manager.service_writer(name) {
             tokio::spawn(async move {
                 let _ = svc_writer.process_stream(child_output).await;
@@ -868,18 +965,22 @@ impl Runner {
 
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result = task::wait_for_task(&mut handle, task_cfg_clone.timeout.as_deref()).await;
+            let result =
+                task::wait_for_task(&mut handle, task_cfg_clone.timeout.as_deref()).await;
             let elapsed = start.elapsed();
 
             let (success, message) = match result {
                 Ok(status) => {
                     if status.success() {
-                        let task_dir = task_cfg_clone.dir.as_deref().unwrap_or(&base_dir_owned);
-                        let _ = task_state.record_success(
-                            &name_owned,
-                            &task_cfg_clone.watch,
-                            Some(task_dir),
-                        ).await;
+                        let task_dir =
+                            task_cfg_clone.dir.as_deref().unwrap_or(&base_dir_owned);
+                        let _ = task_state
+                            .record_success(
+                                &name_owned,
+                                &task_cfg_clone.watch,
+                                Some(task_dir),
+                            )
+                            .await;
                         (true, None)
                     } else {
                         let code = status.code().unwrap_or(-1);
@@ -900,18 +1001,182 @@ impl Runner {
                 state,
             });
 
-            let _ = done_tx
-                .send(ItemDone {
+            if let Some(done_tx) = done_tx {
+                let _ = done_tx
+                    .send(ItemDone {
+                        name: name_owned,
+                        kind: NodeKind::Task,
+                        success,
+                        message,
+                        elapsed: Some(elapsed),
+                    })
+                    .await;
+            } else {
+                let _ = event_tx.send(RunnerEvent::TaskRerunComplete {
                     name: name_owned,
-                    kind: NodeKind::Task,
                     success,
-                    message,
-                    elapsed: Some(elapsed),
-                })
-                .await;
+                });
+            }
         });
+    }
 
-        Ok(())
+    /// Emit an error and broadcast a failed `RebuildComplete` event.
+    fn fail_rebuild(&self, name: &str, message: &str) {
+        self.output_manager.error_event(message);
+        let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+            name: name.to_string(),
+            success: false,
+        });
+    }
+
+    /// Handle a file-watch-triggered rebuild for a service.
+    ///
+    /// Runs the build command (if any), stops the old process, starts a new one.
+    /// If the build fails, the old process is kept running.
+    /// Broadcasts `RebuildComplete` when done.
+    async fn handle_rebuild(&mut self, name: &str) {
+        let svc = match self.config.services.get(name) {
+            Some(s) => s,
+            None => {
+                self.fail_rebuild(name, &format!("{name}: rebuild requested for unknown service"));
+                return;
+            }
+        };
+        let resolved = svc.resolve(self.platform);
+
+        self.output_manager
+            .lifecycle_event(&format!("{name}: rebuilding (file changed)"));
+
+        // Run build command if configured.
+        if let Some(ref build_cmd) = resolved.build {
+            self.output_manager
+                .lifecycle_event(&format!("{name}: running build..."));
+
+            let work_dir = resolved.dir.as_deref().unwrap_or(&self.base_dir);
+            let mut env: HashMap<String, String> = std::env::vars().collect();
+            env.extend(resolved.env.clone());
+
+            match crate::process::spawn_process(crate::process::SpawnConfig {
+                cmd: &build_cmd.cmd,
+                args: &build_cmd.args,
+                dir: Some(work_dir),
+                env,
+                pgid_file_path: None,
+                force_pipe: true,
+            })
+            .await
+            {
+                Ok((mut handle, child_output)) => {
+                    if let Some(svc_writer) = self.output_manager.service_writer(name) {
+                        let output = child_output;
+                        tokio::spawn(async move {
+                            let _ = svc_writer.process_stream(output).await;
+                        });
+                    }
+
+                    match handle.wait().await {
+                        Ok(status) if status.success() => {
+                            self.output_manager
+                                .lifecycle_event(&format!("{name}: build succeeded"));
+                        }
+                        Ok(status) => {
+                            let code = status.code().unwrap_or(-1);
+                            self.fail_rebuild(
+                                name,
+                                &format!("{name}: build failed (exit code {code})"),
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            self.fail_rebuild(name, &format!("{name}: build error: {e}"));
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.fail_rebuild(name, &format!("{name}: failed to start build: {e}"));
+                    return;
+                }
+            }
+        }
+
+        // Stop the old service (if running).
+        if let Some(handle) = self.service_handles.remove(name) {
+            self.service_states
+                .insert(name.to_string(), ServiceState::Stopping);
+            let shutdown_config = resolved.shutdown.as_ref();
+            if let Err(e) = stop_service(handle, shutdown_config, false).await {
+                self.output_manager
+                    .error_event(&format!("{name}: stop failed during rebuild: {e}"));
+            }
+        }
+
+        // Start the service again.
+        let pid_dir = self.base_dir.join(".don").join("pids");
+        match service::start_service(name, &resolved, &self.base_dir, &pid_dir).await {
+            Ok(start_result) => {
+                self.wire_service_output_and_ready_check(name, start_result, &resolved, None);
+            }
+            Err(e) => {
+                self.service_states
+                    .insert(name.to_string(), ServiceState::Failed);
+                self.fail_rebuild(name, &format!("{name}: failed to restart: {e}"));
+            }
+        }
+    }
+
+    /// Handle a file-watch-triggered task re-run.
+    async fn handle_task_rerun(&mut self, name: &str) {
+        let task_cfg = match self.config.tasks.get(name) {
+            Some(t) => t.clone(),
+            None => {
+                self.output_manager
+                    .error_event(&format!("{name}: rerun requested for unknown task"));
+                let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                    name: name.to_string(),
+                    success: false,
+                });
+                return;
+            }
+        };
+
+        let base_dir = task_cfg.dir.as_deref().unwrap_or(&self.base_dir);
+        let needs_run = self
+            .task_state
+            .needs_run(name, &task_cfg.watch, Some(base_dir))
+            .await
+            .unwrap_or(true);
+
+        if !needs_run {
+            self.output_manager
+                .lifecycle_event(&format!("{name}: rerun skipped (no changes)"));
+            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                name: name.to_string(),
+                success: true,
+            });
+            return;
+        }
+
+        self.output_manager
+            .lifecycle_event(&format!("{name}: re-running (file changed)"));
+        self.task_states
+            .insert(name.to_string(), TaskItemState::Running);
+
+        match task::spawn_task(&task_cfg, &self.base_dir).await {
+            Ok(spawn) => {
+                self.wire_task_output_and_wait(name, spawn, &task_cfg, None);
+            }
+            Err(e) => {
+                self.task_states
+                    .insert(name.to_string(), TaskItemState::Failed);
+                self.output_manager
+                    .error_event(&format!("{name}: failed to start: {e}"));
+                let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                    name: name.to_string(),
+                    success: false,
+                });
+            }
+        }
     }
 
     /// Handle an item completion notification.

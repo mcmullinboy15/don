@@ -185,23 +185,23 @@ Get services starting in the right order with max parallelism.
 
 Watch for changes and trigger rebuilds/restarts.
 
-- [ ] `watch/mod.rs` — set up `notify` watchers for each service's `watch` patterns
-- [ ] Debounce: collect events for 200ms (or configured `debounce`), trigger one rebuild cycle
-- [ ] Change-during-build state machine: let build finish, mark stale, trigger another cycle
-- [ ] Build failure handling: keep old process running, log error, stay in watching state
-- [ ] Watch-triggered task re-evaluation: if a task's watch files change, re-run it
+- [x] `watch/mod.rs` — set up `notify` watchers for each service's `watch` patterns, creates missing watch directories via `create_dir_all` on the glob base dir
+- [x] Debounce: collect events for 200ms (or configured `debounce`), trigger one rebuild cycle — sliding window resets on each new event
+- [x] Change-during-build state machine: let build finish, mark stale, trigger another cycle — Idle → Debouncing → Rebuilding → Idle (with stale flag for re-trigger)
+- [x] Build failure handling: keep old process running, log error, stay in watching state — build failure broadcasts RebuildComplete(success=false), transitions back to Idle
+- [x] Watch-triggered task re-evaluation: if a task's watch files change, re-run it — TaskRerun command + TaskRerunComplete event
 
 ### Test Coverage Checkpoint
-- [ ] Unit test: debounce — fire 10 events in 50ms, verify only one rebuild triggered
-- [ ] Unit test: debounce — events after the window trigger a new cycle
-- [ ] Unit test: debounce — custom debounce duration is respected
-- [ ] Unit test: change-during-build — trigger rebuild, fire event during build, verify second rebuild after first completes
-- [ ] Unit test: change-during-build — multiple events during build still result in only one follow-up rebuild
-- [ ] Unit test: state machine transitions — idle -> debouncing -> building -> restarting -> idle, with stale flag handling
-- [ ] Integration test: start a service with watch patterns, modify a watched file, verify service restarts
-- [ ] Integration test: start a service with a build step, modify a watched file, verify build runs then service restarts
-- [ ] Integration test: modify a watched file, make build fail, verify old process stays running and error is logged
-- [ ] Integration test: rapid-fire 5 file changes, verify only one restart cycle
+- [x] Unit test: debounce — fire 10 events in 50ms, verify only one rebuild triggered
+- [x] Unit test: debounce — events after the window trigger a new cycle
+- [x] Unit test: debounce — custom debounce duration is respected
+- [x] Unit test: change-during-build — trigger rebuild, fire event during build, verify second rebuild after first completes
+- [x] Unit test: change-during-build — multiple events during build still result in only one follow-up rebuild
+- [x] Unit test: state machine transitions — idle -> debouncing -> building -> restarting -> idle, with stale flag handling
+- [x] Integration test: start a service with watch patterns, modify a watched file, verify service restarts
+- [x] Integration test: start a service with a build step, modify a watched file, verify build runs then service restarts
+- [x] Integration test: modify a watched file, make build fail, verify old process stays running and error is logged
+- [x] Integration test: rapid-fire 5 file changes, verify only one restart cycle
 
 ---
 

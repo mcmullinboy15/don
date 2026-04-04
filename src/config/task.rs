@@ -27,6 +27,9 @@ pub struct Task {
     /// If empty, the task always runs.
     #[serde(default)]
     pub watch: Vec<String>,
+    /// File glob patterns to ignore when watching (e.g. "**/*.log", "target/**").
+    #[serde(default)]
+    pub ignore: Vec<String>,
     /// Maximum time the task is allowed to run (e.g. "5m", "30s"). No timeout by default.
     pub timeout: Option<String>,
     /// Where to send stdout/stderr. Defaults to stdout.

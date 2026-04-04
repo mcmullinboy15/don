@@ -189,6 +189,39 @@ impl ServiceBuilder {
         self
     }
 
+    /// Set watch patterns.
+    pub fn watch(mut self, patterns: &[&str]) -> Self {
+        let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+        self.lines
+            .push(format!("watch = [{}]", p_str.join(", ")));
+        self
+    }
+
+    /// Set ignore patterns.
+    pub fn ignore(mut self, patterns: &[&str]) -> Self {
+        let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+        self.lines
+            .push(format!("ignore = [{}]", p_str.join(", ")));
+        self
+    }
+
+    /// Set debounce duration.
+    pub fn debounce(mut self, duration: &str) -> Self {
+        self.lines.push(format!("debounce = \"{duration}\""));
+        self
+    }
+
+    /// Set build command.
+    pub fn build_cmd(mut self, cmd: &str, args: &[&str]) -> Self {
+        self.lines.push(format!("build.cmd = \"{cmd}\""));
+        if !args.is_empty() {
+            let args_str: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+            self.lines
+                .push(format!("build.args = [{}]", args_str.join(", ")));
+        }
+        self
+    }
+
     /// Set shutdown config.
     pub fn shutdown(mut self, signal: &str, timeout: &str) -> Self {
         self.lines.push(format!("shutdown.signal = \"{signal}\""));
@@ -253,6 +286,14 @@ impl TaskBuilder {
         let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
         self.lines
             .push(format!("watch = [{}]", p_str.join(", ")));
+        self
+    }
+
+    /// Set ignore patterns.
+    pub fn ignore(mut self, patterns: &[&str]) -> Self {
+        let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+        self.lines
+            .push(format!("ignore = [{}]", p_str.join(", ")));
         self
     }
 
