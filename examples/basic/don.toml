@@ -1,0 +1,23 @@
+# Basic don example — run with: cargo run -- -c examples/basic/don.toml
+
+[services.api]
+run.cmd = "python3"
+run.args = ["-m", "http.server", "8080"]
+ready.tcp = "127.0.0.1:8080"
+ready.interval = "200ms"
+ready.retries = 30
+
+[services.worker]
+run.cmd = "bash"
+run.args = ["-c", "while true; do echo \"processing job $(date +%T)\"; sleep 3; done"]
+depends_on = ["api"]
+
+[tasks.migrate]
+cmd = "echo"
+args = ["migrations applied successfully"]
+depends_on = ["api"]
+
+[tasks.seed]
+cmd = "bash"
+args = ["-c", "echo 'seeding user: alice'; sleep 0.5; echo 'seeding user: bob'; sleep 0.5; echo 'done'"]
+depends_on = ["migrate"]

@@ -142,42 +142,42 @@ Get service output displaying correctly in the terminal.
 Get services starting in the right order with max parallelism.
 
 ### Dependency Graph Engine
-- [ ] `runner/mod.rs` — topological sort of services and tasks, detect cycles (already done in validation, reuse here for execution ordering)
-- [ ] Parallel executor: start everything whose dependencies are satisfied concurrently, using tokio tasks
-- [ ] Track service states: pending, starting, running, ready, stopping, stopped, failed
+- [x] `runner/mod.rs` — topological sort of services and tasks, detect cycles (already done in validation, reuse here for execution ordering)
+- [x] Parallel executor: start everything whose dependencies are satisfied concurrently, using tokio tasks
+- [x] Track service states: pending, starting, running, ready, stopping, stopped, failed
 
 ### Signal Handling & Don PID File (deferred from Phase 2)
-- [ ] Install SIGINT/SIGTERM handler via tokio::signal — set atomic flag, runner checks it in command loop
-- [ ] On first signal: SIGTERM all child process groups, wait per-service timeout, SIGKILL stragglers
-- [ ] On second signal: immediate SIGKILL all process groups
-- [ ] Acquire don's own PID file at `.don/don.pid` on startup — detect if another don is already running
-- [ ] Clean up `.don/don.pid` and `.don/don.sock` on exit
+- [x] Install SIGINT/SIGTERM handler via tokio::signal — set atomic flag, runner checks it in command loop
+- [x] On first signal: SIGTERM all child process groups, wait per-service timeout, SIGKILL stragglers
+- [x] On second signal: immediate SIGKILL all process groups
+- [x] Acquire don's own PID file at `.don/don.pid` on startup — detect if another don is already running
+- [x] Clean up `.don/don.pid` and `.don/don.sock` on exit
 
 ### Basic Service Lifecycle
-- [ ] `runner/service.rs` — start a service (spawn process, begin output capture), stop a service (signal + timeout + SIGKILL), restart (stop then start)
-- [ ] `runner/task.rs` — execute a task: check task_state for skip, run if needed, record_success on exit 0, handle timeout (kill process group on expiry)
+- [x] `runner/service.rs` — start a service (spawn process, begin output capture), stop a service (signal + timeout + SIGKILL), restart (stop then start)
+- [x] `runner/task.rs` — execute a task: check task_state for skip, run if needed, record_success on exit 0, handle timeout (kill process group on expiry)
 
 ### Ready Checks
-- [ ] Exec ready check: spawn command, check exit code 0
-- [ ] TCP ready check: attempt async TCP connect
-- [ ] HTTP ready check: `reqwest` GET, check for 2xx (this is why we added reqwest)
-- [ ] Retry loop with configurable interval and retries
-- [ ] Dependency gating: services/tasks wait for dependencies' ready checks to pass or tasks to complete before starting
+- [x] Exec ready check: spawn command, check exit code 0
+- [x] TCP ready check: attempt async TCP connect
+- [x] HTTP ready check: `reqwest` GET, check for 2xx (this is why we added reqwest)
+- [x] Retry loop with configurable interval and retries
+- [x] Dependency gating: services/tasks wait for dependencies' ready checks to pass or tasks to complete before starting
 
 ### Test Coverage Checkpoint
-- [ ] Unit test: topological sort — linear chain (a -> b -> c), diamond (a -> b, a -> c, b -> d, c -> d), independent nodes
-- [ ] Unit test: topological sort — cycle detection returns the cycle path
-- [ ] Unit test: parallel executor — three independent services start concurrently (verify wall-clock time is ~max, not sum)
-- [ ] Unit test: service state machine — verify valid transitions, reject invalid ones (e.g. stopped -> ready)
-- [ ] Unit test: task skip logic — unchanged files skip, changed files run, no watch patterns always run, failed tasks always retry
-- [ ] Unit test: task timeout — task exceeding timeout is killed, treated as failure
-- [ ] Integration test: start two services where B depends on A, verify A starts and is ready before B starts
-- [ ] Integration test: start a service and a task where the task depends on the service, verify service is ready before task runs
-- [ ] Integration test: TCP ready check — start a service that listens on a port, configure TCP ready check, verify dependent starts after port is open
-- [ ] Integration test: exec ready check — configure a command that fails N times then succeeds, verify retries work
-- [ ] Integration test: HTTP ready check — start an HTTP server, configure health endpoint, verify check passes
-- [ ] Integration test: ready check exhausts retries — verify service is marked failed, dependents don't start
-- [ ] Integration test: task with `watch` files — run once (succeeds), verify skip on second run, modify file, verify re-run
+- [x] Unit test: topological sort — linear chain (a -> b -> c), diamond (a -> b, a -> c, b -> d, c -> d), independent nodes
+- [x] Unit test: topological sort — cycle detection returns the cycle path
+- [x] Unit test: parallel executor — three independent services start concurrently (verify wall-clock time is ~max, not sum)
+- [x] Unit test: service state machine — verify valid transitions, reject invalid ones (e.g. stopped -> ready)
+- [x] Unit test: task skip logic — unchanged files skip, changed files run, no watch patterns always run, failed tasks always retry
+- [x] Unit test: task timeout — task exceeding timeout is killed, treated as failure
+- [x] Integration test: start two services where B depends on A, verify A starts and is ready before B starts
+- [x] Integration test: start a service and a task where the task depends on the service, verify service is ready before task runs
+- [x] Integration test: TCP ready check — start a service that listens on a port, configure TCP ready check, verify dependent starts after port is open
+- [x] Integration test: exec ready check — configure a command that fails N times then succeeds, verify retries work
+- [x] Integration test: HTTP ready check — start an HTTP server, configure health endpoint, verify check passes
+- [x] Integration test: ready check exhausts retries — verify service is marked failed, dependents don't start
+- [x] Integration test: task with `watch` files — run once (succeeds), verify skip on second run, modify file, verify re-run
 
 ---
 

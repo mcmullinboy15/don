@@ -1,0 +1,14 @@
+# Stubborn service example — run with: cargo run -- -c examples/stubborn/don.toml
+#
+# The "stubborn" service traps SIGTERM and refuses to exit.
+# Don will wait 3s for graceful shutdown, then SIGKILL it.
+# The "good" service exits immediately on SIGTERM for contrast.
+
+[services.good]
+run.cmd = "bash"
+run.args = ["-c", "while true; do echo 'good service working'; sleep 2; done"]
+
+[services.stubborn]
+run.cmd = "./ignore_signals.sh"
+shutdown.signal = "SIGTERM"
+shutdown.timeout = "3s"

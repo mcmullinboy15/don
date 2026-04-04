@@ -2,9 +2,10 @@ mod helpers;
 
 use don::config::LogConfig;
 use don::output::OutputManager;
-use don::process::{spawn_process, SpawnConfig};
+use don::process::{SpawnConfig, spawn_process};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Helper to build a SpawnConfig for a simple command.
@@ -14,21 +15,54 @@ fn basic_config<'a>(cmd: &'a str, args: &'a [String], force_pipe: bool) -> Spawn
         args,
         dir: None,
         env: std::env::vars().collect(),
-        pid_file_path: None,
+        pgid_file_path: None,
         force_pipe,
     }
 }
 
-/// Check if a `Vec<&[u8]>` contains a given byte slice.
-fn lines_contain(lines: &[&[u8]], needle: &[u8]) -> bool {
-    lines.iter().any(|l| *l == needle)
+/// A test buffer that implements Write and allows reading back contents.
+#[derive(Clone)]
+struct TestBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl TestBuffer {
+    fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        (TestBuffer(buf.clone()), buf)
+    }
 }
 
-/// Check if any line in a `Vec<&[u8]>` contains a byte subsequence.
-fn any_line_contains(lines: &[&[u8]], needle: &[u8]) -> bool {
-    lines
-        .iter()
-        .any(|l| l.windows(needle.len()).any(|w| w == needle))
+impl tokio::io::AsyncWrite for TestBuffer {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+fn read_buf(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
+}
+
+/// Check if a `Bytes` blob contains a given byte slice as a substring.
+fn logs_contain(logs: &bytes::Bytes, needle: &[u8]) -> bool {
+    logs.windows(needle.len()).any(|w| w == needle)
 }
 
 #[test]
@@ -38,71 +72,79 @@ fn integration_service_output_prefixed() {
             "-e".to_string(),
             "line one\nline two\nline three".to_string(),
         ];
-        let mut handle = spawn_process(basic_config("echo", &args, true)).unwrap();
-        let output = handle.take_output().unwrap();
+        let (_handle, output) = spawn_process(basic_config("echo", &args, true))
+            .await
+            .unwrap();
 
+        let (writer, buf) = TestBuffer::new();
         let config = LogConfig::Stdout;
-        let mut mgr = OutputManager::new(&[("myservice", &config)]).await.unwrap();
-        let mut svc = mgr.take_service_output("myservice").unwrap();
-        let mut stdout = Vec::new();
+        let mgr = OutputManager::new(&[("myservice", &config)], writer)
+            .await
+            .unwrap();
+        let svc = mgr.service_writer("myservice").unwrap();
 
-        svc.process_stream(output, &mut stdout).await.unwrap();
+        svc.process_stream(output).await.unwrap();
 
-        let output_str = String::from_utf8_lossy(&stdout);
-
-        // Each line should be prefixed with the service name.
-        for expected in &["line one", "line two", "line three"] {
-            assert!(
-                output_str.contains(expected),
-                "output should contain {expected:?}, got: {output_str:?}"
-            );
-        }
-
+        let logs = mgr.read_logs("myservice", 10).await.unwrap();
         assert!(
-            output_str.contains("myservice"),
-            "output should contain the service name prefix"
+            logs_contain(&logs, b"line one"),
+            "ring buffer missing 'line one'"
+        );
+        assert!(
+            logs_contain(&logs, b"line two"),
+            "ring buffer missing 'line two'"
+        );
+        assert!(
+            logs_contain(&logs, b"line three"),
+            "ring buffer missing 'line three'"
         );
 
-        // Ring buffer should have the lines too.
-        let lines = svc.ring_buffer().last_n(10);
-        assert!(lines.len() >= 3, "ring buffer should have at least 3 lines");
-        assert!(lines_contain(&lines, b"line one"));
-        assert!(lines_contain(&lines, b"line two"));
-        assert!(lines_contain(&lines, b"line three"));
+        mgr.shutdown().await;
+
+        let output_str = read_buf(&buf);
+        assert!(
+            output_str.contains("myservice"),
+            "should contain service prefix"
+        );
+        for expected in &["line one", "line two", "line three"] {
+            assert!(output_str.contains(expected), "should contain {expected:?}");
+        }
     });
 }
 
 #[test]
 fn integration_service_log_ignore_suppresses_stdout_but_feeds_ring_buffer() {
     run_with_timeout(Duration::from_secs(10), async {
-        let args = [
-            "-e".to_string(),
-            "secret output\nanother line".to_string(),
-        ];
-        let mut handle = spawn_process(basic_config("echo", &args, true)).unwrap();
-        let output = handle.take_output().unwrap();
+        let args = ["-e".to_string(), "secret output\nanother line".to_string()];
+        let (_handle, output) = spawn_process(basic_config("echo", &args, true))
+            .await
+            .unwrap();
 
+        let (writer, buf) = TestBuffer::new();
         let config = LogConfig::Ignore;
-        let mut mgr = OutputManager::new(&[("quiet", &config)]).await.unwrap();
-        let mut svc = mgr.take_service_output("quiet").unwrap();
-        let mut stdout = Vec::new();
+        let mgr = OutputManager::new(&[("quiet", &config)], writer)
+            .await
+            .unwrap();
+        let svc = mgr.service_writer("quiet").unwrap();
 
-        svc.process_stream(output, &mut stdout).await.unwrap();
+        svc.process_stream(output).await.unwrap();
 
+        let logs = mgr.read_logs("quiet", 10).await.unwrap();
         assert!(
-            stdout.is_empty(),
-            "ignore mode should not write to stdout, got {} bytes",
-            stdout.len()
-        );
-
-        let lines = svc.ring_buffer().last_n(10);
-        assert!(
-            lines_contain(&lines, b"secret output"),
-            "ring buffer should have the output even in ignore mode: {lines:?}"
+            logs_contain(&logs, b"secret output"),
+            "ring buffer missing 'secret output'"
         );
         assert!(
-            lines_contain(&lines, b"another line"),
-            "ring buffer should have all lines: {lines:?}"
+            logs_contain(&logs, b"another line"),
+            "ring buffer missing 'another line'"
+        );
+
+        mgr.shutdown().await;
+
+        let output_str = read_buf(&buf);
+        assert!(
+            output_str.is_empty(),
+            "ignore mode should not write to stdout"
         );
     });
 }
@@ -113,121 +155,122 @@ fn integration_service_log_file_writes_raw() {
         let dir = TempDir::new("output-file-test");
         let log_path = dir.path().join("service.log");
 
-        let args = [
-            "-e".to_string(),
-            "file line 1\nfile line 2".to_string(),
-        ];
-        let mut handle = spawn_process(basic_config("echo", &args, true)).unwrap();
-        let output = handle.take_output().unwrap();
+        let args = ["-e".to_string(), "file line 1\nfile line 2".to_string()];
+        let (_handle, output) = spawn_process(basic_config("echo", &args, true))
+            .await
+            .unwrap();
 
+        let (writer, buf) = TestBuffer::new();
         let config = LogConfig::File(log_path.clone());
-        let mut mgr = OutputManager::new(&[("filesvc", &config)]).await.unwrap();
-        let mut svc = mgr.take_service_output("filesvc").unwrap();
-        let mut stdout = Vec::new();
+        let mgr = OutputManager::new(&[("filesvc", &config)], writer)
+            .await
+            .unwrap();
+        let svc = mgr.service_writer("filesvc").unwrap();
 
-        svc.process_stream(output, &mut stdout).await.unwrap();
+        svc.process_stream(output).await.unwrap();
 
-        assert!(stdout.is_empty(), "file mode should not write to stdout");
-
-        let file_content = std::fs::read_to_string(&log_path).unwrap();
+        let logs = mgr.read_logs("filesvc", 10).await.unwrap();
         assert!(
-            file_content.contains("file line 1"),
-            "file should contain raw output"
+            logs_contain(&logs, b"file line 1"),
+            "ring buffer missing 'file line 1'"
         );
+
+        mgr.shutdown().await;
+
+        // Stdout should be empty (file mode).
+        let output_str = read_buf(&buf);
+        assert!(
+            output_str.is_empty(),
+            "file mode should not write to stdout"
+        );
+
+        // File should contain raw output without prefix.
+        let file_content = std::fs::read_to_string(&log_path).unwrap();
+        assert!(file_content.contains("file line 1"));
         assert!(
             !file_content.contains("filesvc"),
-            "file should NOT contain the prefix"
+            "file should not contain prefix"
         );
-
-        assert!(lines_contain(&svc.ring_buffer().last_n(10), b"file line 1"));
     });
 }
 
 #[test]
 fn integration_concurrent_service_outputs() {
     run_with_timeout(Duration::from_secs(10), async {
+        let (writer, buf) = TestBuffer::new();
         let config_a = LogConfig::Stdout;
         let config_b = LogConfig::Stdout;
-        let mut mgr =
-            OutputManager::new(&[("alpha", &config_a), ("beta", &config_b)]).await.unwrap();
+        let mgr = OutputManager::new(&[("alpha", &config_a), ("beta", &config_b)], writer)
+            .await
+            .unwrap();
 
-        let mut alpha = mgr.take_service_output("alpha").unwrap();
-        let mut beta = mgr.take_service_output("beta").unwrap();
+        let alpha = mgr.service_writer("alpha").unwrap();
+        let beta = mgr.service_writer("beta").unwrap();
 
-        let args_a = [
-            "-e".to_string(),
-            "alpha line 1\nalpha line 2\nalpha line 3".to_string(),
-        ];
-        let args_b = [
-            "-e".to_string(),
-            "beta line 1\nbeta line 2\nbeta line 3".to_string(),
-        ];
-        let mut handle_a = spawn_process(basic_config("echo", &args_a, true)).unwrap();
-        let mut handle_b = spawn_process(basic_config("echo", &args_b, true)).unwrap();
-
-        let output_a = handle_a.take_output().unwrap();
-        let output_b = handle_b.take_output().unwrap();
-
-        let mut stdout_a = Vec::new();
-        let mut stdout_b = Vec::new();
+        let args_a = ["-e".to_string(), "alpha line 1\nalpha line 2".to_string()];
+        let args_b = ["-e".to_string(), "beta line 1\nbeta line 2".to_string()];
+        let (_handle_a, output_a) = spawn_process(basic_config("echo", &args_a, true))
+            .await
+            .unwrap();
+        let (_handle_b, output_b) = spawn_process(basic_config("echo", &args_b, true))
+            .await
+            .unwrap();
 
         let (r_a, r_b) = tokio::join!(
-            alpha.process_stream(output_a, &mut stdout_a),
-            beta.process_stream(output_b, &mut stdout_b),
+            alpha.process_stream(output_a),
+            beta.process_stream(output_b),
         );
         r_a.unwrap();
         r_b.unwrap();
 
-        let ring_a = alpha.ring_buffer().last_n(10);
-        let ring_b = beta.ring_buffer().last_n(10);
-        assert!(lines_contain(&ring_a, b"alpha line 1"), "alpha ring buffer: {ring_a:?}");
-        assert!(lines_contain(&ring_b, b"beta line 1"), "beta ring buffer: {ring_b:?}");
+        let logs_a = mgr.read_logs("alpha", 10).await.unwrap();
+        let logs_b = mgr.read_logs("beta", 10).await.unwrap();
+        assert!(
+            logs_contain(&logs_a, b"alpha line 1"),
+            "ring buffer missing 'alpha line 1'"
+        );
+        assert!(
+            logs_contain(&logs_b, b"beta line 1"),
+            "ring buffer missing 'beta line 1'"
+        );
 
-        let out_a = String::from_utf8_lossy(&stdout_a);
-        let out_b = String::from_utf8_lossy(&stdout_b);
-        assert!(out_a.contains("alpha") && !out_a.contains("beta"),
-            "alpha stdout should only have alpha output");
-        assert!(out_b.contains("beta") && !out_b.contains("alpha"),
-            "beta stdout should only have beta output");
+        mgr.shutdown().await;
 
-        for (label, output) in [("alpha", &out_a), ("beta", &out_b)] {
-            for line in output.lines() {
-                assert!(
-                    line.contains(" | "),
-                    "{label}: every line should have prefix separator, got: {line:?}"
-                );
-            }
-        }
+        let output_str = read_buf(&buf);
+        assert!(output_str.contains("alpha"), "should have alpha output");
+        assert!(output_str.contains("beta"), "should have beta output");
     });
 }
 
 #[test]
 fn integration_pty_mode_output_prefixed() {
     run_with_timeout(Duration::from_secs(10), async {
-        let args = [
-            "-e".to_string(),
-            "pty line one\npty line two".to_string(),
-        ];
-        let mut handle = spawn_process(basic_config("echo", &args, false)).unwrap();
-        let output = handle.take_output().unwrap();
+        let args = ["-e".to_string(), "pty line one\npty line two".to_string()];
+        let (_handle, output) = spawn_process(basic_config("echo", &args, false))
+            .await
+            .unwrap();
 
+        let (writer, buf) = TestBuffer::new();
         let config = LogConfig::Stdout;
-        let mut mgr = OutputManager::new(&[("ptysvc", &config)]).await.unwrap();
-        let mut svc = mgr.take_service_output("ptysvc").unwrap();
-        let mut stdout = Vec::new();
+        let mgr = OutputManager::new(&[("ptysvc", &config)], writer)
+            .await
+            .unwrap();
+        let svc = mgr.service_writer("ptysvc").unwrap();
 
-        svc.process_stream(output, &mut stdout).await.unwrap();
+        svc.process_stream(output).await.unwrap();
 
-        let lines = svc.ring_buffer().last_n(10);
+        let logs = mgr.read_logs("ptysvc", 10).await.unwrap();
         assert!(
-            any_line_contains(&lines, b"pty line"),
-            "PTY mode should capture output in ring buffer: {lines:?}"
+            logs_contain(&logs, b"pty line"),
+            "PTY mode should capture output: {logs:?}"
         );
 
-        let output_str = String::from_utf8_lossy(&stdout);
+        mgr.shutdown().await;
+
+        let output_str = read_buf(&buf);
         assert!(
             output_str.contains("ptysvc"),
-            "PTY mode output should contain the service prefix"
+            "should contain service prefix"
         );
     });
 }

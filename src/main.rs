@@ -51,7 +51,8 @@ enum Commands {
     Validate,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Start { profile: None });
 
@@ -64,11 +65,10 @@ fn main() {
             println!("Config is valid.");
         }
         Commands::Start { .. } => {
-            if let Err(e) = validate(&cli.config) {
+            if let Err(e) = run_start(&cli.config).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
-            eprintln!("don start: not yet implemented");
         }
         Commands::Stop { name } => {
             eprintln!("don stop {name}: not yet implemented");
@@ -104,4 +104,71 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
     })?;
 
     config.validate(platform).map_err(|e| format!("Error: {e}"))
+}
+
+async fn run_start(config_path: &std::path::Path) -> Result<(), String> {
+    let config =
+        don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+
+    let platform = don::config::Platform::current().ok_or_else(|| {
+        format!(
+            "Unsupported platform: {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+
+    config
+        .validate(platform)
+        .map_err(|e| format!("Error: {e}"))?;
+
+    // Determine base directory (where don.toml lives).
+    let base_dir = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+
+    // Collect service names and their log configs for OutputManager.
+    let service_configs: Vec<(&str, &don::config::LogConfig)> = config
+        .services
+        .iter()
+        .map(|(name, svc)| {
+            // We need the resolved log config, but OutputManager takes references.
+            // For now, use the base service's log config.
+            (name.as_str(), &svc.log)
+        })
+        .collect();
+
+    // Also include tasks in the output manager so they get prefixed output.
+    let task_configs: Vec<(&str, &don::config::LogConfig)> = config
+        .tasks
+        .iter()
+        .map(|(name, task)| (name.as_str(), &task.log))
+        .collect();
+
+    let all_configs: Vec<(&str, &don::config::LogConfig)> = service_configs
+        .into_iter()
+        .chain(task_configs)
+        .collect();
+
+    let output_manager = don::output::OutputManager::new(&all_configs, tokio::io::stdout())
+        .await
+        .map_err(|e| format!("Error creating output manager: {e}"))?;
+
+    // Install signal handlers.
+    let shutdown_rx = don::runner::install_signal_handlers()
+        .await
+        .map_err(|e| format!("Error installing signal handlers: {e}"))?;
+
+    // Create and run the runner.
+    let runner = don::runner::Runner::new(config, platform, output_manager, base_dir, shutdown_rx)
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
+
+    runner
+        .run()
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
+
+    Ok(())
 }

@@ -1,0 +1,1418 @@
+//! Runner — the orchestrator that starts services and tasks in dependency order.
+//!
+//! The runner builds an execution plan via topological sort, then starts
+//! everything whose dependencies are satisfied concurrently using tokio tasks.
+//! It owns all service/task state in a plain `HashMap` — no `Arc<Mutex<>>`.
+//! Communication uses channels: `mpsc` for commands in, `broadcast` for events out.
+
+pub mod service;
+pub mod task;
+
+use crate::config::{Config, Platform};
+use crate::output::OutputManager;
+use crate::process::pid_file::PidFile;
+use crate::runner::service::stop_service;
+use crate::task_state::TaskState;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinSet;
+
+use self::service::ServiceHandle;
+
+/// Signal counter: 0 = running, 1 = graceful shutdown, 2 = force shutdown.
+static SIGNAL_COUNT: AtomicU8 = AtomicU8::new(0);
+
+/// The state of a service in the runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    Pending,
+    Starting,
+    Running,
+    Ready,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+impl ServiceState {
+    /// Whether this state is considered "satisfied" for dependency resolution.
+    /// A dependency is satisfied when the service is Ready (or for tasks, completed).
+    pub(crate) fn is_satisfied(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Whether this is a terminal state (no further transitions expected).
+    #[cfg(test)]
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self, Self::Stopped | Self::Failed)
+    }
+
+    /// Valid transitions from one state to another.
+    #[cfg(test)]
+    pub(crate) fn can_transition_to(&self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Pending, Self::Starting)
+                | (Self::Starting, Self::Running)
+                | (Self::Starting, Self::Failed)
+                | (Self::Running, Self::Ready)
+                | (Self::Running, Self::Stopping)
+                | (Self::Running, Self::Stopped)
+                | (Self::Running, Self::Failed)
+                | (Self::Ready, Self::Stopping)
+                | (Self::Ready, Self::Stopped)
+                | (Self::Ready, Self::Failed)
+                | (Self::Stopping, Self::Stopped)
+                | (Self::Stopping, Self::Failed)
+                // Restart: from stopped back to pending
+                | (Self::Stopped, Self::Pending)
+                | (Self::Failed, Self::Pending)
+        )
+    }
+}
+
+/// The state of a task in the runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskItemState {
+    Pending,
+    Running,
+    Completed,
+    Skipped,
+    Failed,
+}
+
+impl TaskItemState {
+    pub(crate) fn is_satisfied(&self) -> bool {
+        matches!(self, Self::Completed | Self::Skipped)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Skipped | Self::Failed)
+    }
+}
+
+/// An item in the dependency graph — either a service or a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeKind {
+    Service,
+    Task,
+}
+
+/// A command sent to the runner via its `mpsc` channel.
+pub enum RunnerCommand {
+    /// Start a specific service (future use — CLI/API).
+    Start { name: String },
+    /// Stop a specific service.
+    Stop { name: String },
+    /// Restart a specific service.
+    Restart { name: String },
+    /// Query the status of all services and tasks.
+    Status {
+        reply: oneshot::Sender<Vec<ItemStatus>>,
+    },
+    /// Initiate graceful shutdown.
+    Shutdown,
+}
+
+/// Status of a single item (service or task) for status queries.
+#[derive(Debug, Clone)]
+pub struct ItemStatus {
+    pub name: String,
+    pub kind: String,
+    pub state: String,
+}
+
+/// An event broadcast from the runner for external consumers.
+#[derive(Debug, Clone)]
+pub enum RunnerEvent {
+    /// A service changed state.
+    ServiceStateChanged { name: String, state: ServiceState },
+    /// A task changed state.
+    TaskStateChanged { name: String, state: TaskItemState },
+    /// Shutdown complete.
+    ShutdownComplete,
+}
+
+/// Errors from runner operations.
+#[derive(Debug, thiserror::Error)]
+pub enum RunnerError {
+    #[error("dependency cycle detected: {}", cycle.join(" -> "))]
+    Cycle { cycle: Vec<String> },
+    #[error("another don instance is already running (could not acquire {path})")]
+    AlreadyRunning { path: String },
+    #[error("process error: {0}")]
+    Process(#[from] crate::process::ProcessError),
+    #[error("output error: {0}")]
+    Output(#[from] crate::output::OutputError),
+    #[error("pid file error: {0}")]
+    PidFile(#[from] crate::process::pid_file::PidFileError),
+    #[error("config error: {0}")]
+    Config(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Topologically sort a dependency graph.
+///
+/// Returns node names in an order where every node appears after all
+/// its dependencies. Nodes at the same depth can be started in parallel.
+///
+/// Uses Kahn's algorithm (BFS-based). Returns `Err` with the cycle path
+/// if a cycle is detected.
+pub(crate) fn topological_sort(
+    deps: &HashMap<String, Vec<String>>,
+) -> Result<Vec<String>, Vec<String>> {
+    // Build in-degree map and reverse adjacency list.
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for name in deps.keys() {
+        in_degree.entry(name.as_str()).or_insert(0);
+    }
+
+    for (name, node_deps) in deps {
+        for dep in node_deps {
+            in_degree.entry(dep.as_str()).or_insert(0);
+            dependents
+                .entry(dep.as_str())
+                .or_default()
+                .push(name.as_str());
+            *in_degree.entry(name.as_str()).or_insert(0) += 1;
+        }
+    }
+
+    // Seed queue with nodes that have no dependencies.
+    let mut queue: VecDeque<&str> = in_degree
+        .iter()
+        .filter(|(_, deg)| **deg == 0)
+        .map(|(&name, _)| name)
+        .collect();
+
+    // Sort the queue for deterministic output.
+    let mut sorted_queue: Vec<&str> = queue.drain(..).collect();
+    sorted_queue.sort();
+    queue.extend(sorted_queue);
+
+    let mut result = Vec::new();
+
+    while let Some(node) = queue.pop_front() {
+        result.push(node.to_string());
+        if let Some(children) = dependents.get(node) {
+            let mut ready_children = Vec::new();
+            for &child in children {
+                if let Some(deg) = in_degree.get_mut(child) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        ready_children.push(child);
+                    }
+                }
+            }
+            // Sort for determinism.
+            ready_children.sort();
+            queue.extend(ready_children);
+        }
+    }
+
+    if result.len() != deps.len() {
+        // Cycle detected — find the cycle path for error reporting.
+        let remaining: Vec<String> = deps
+            .keys()
+            .filter(|k| !result.contains(k))
+            .cloned()
+            .collect();
+        // Walk the remaining nodes to find the cycle.
+        if let Some(cycle) = find_cycle(deps, &remaining) {
+            return Err(cycle);
+        }
+        // Fallback: return the remaining nodes as the "cycle".
+        return Err(remaining);
+    }
+
+    Ok(result)
+}
+
+/// Find a cycle in the dependency graph among the given candidate nodes.
+fn find_cycle(deps: &HashMap<String, Vec<String>>, candidates: &[String]) -> Option<Vec<String>> {
+    let candidate_set: HashSet<&str> = candidates.iter().map(|s| s.as_str()).collect();
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Unvisited,
+        Visiting,
+        Visited,
+    }
+
+    let mut state: HashMap<&str, State> = candidates
+        .iter()
+        .map(|n| (n.as_str(), State::Unvisited))
+        .collect();
+    let mut path: Vec<String> = Vec::new();
+
+    fn dfs<'a>(
+        node: &'a str,
+        deps: &'a HashMap<String, Vec<String>>,
+        state: &mut HashMap<&'a str, State>,
+        path: &mut Vec<String>,
+        candidates: &HashSet<&str>,
+    ) -> Option<Vec<String>> {
+        if let Some(s) = state.get_mut(node) {
+            *s = State::Visiting;
+        }
+        path.push(node.to_string());
+
+        if let Some(node_deps) = deps.get(node) {
+            for dep in node_deps {
+                if !candidates.contains(dep.as_str()) {
+                    continue;
+                }
+                match state.get(dep.as_str()) {
+                    Some(State::Visiting) => {
+                        if let Some(cycle_start) = path.iter().position(|n| n == dep) {
+                            let mut cycle: Vec<String> = path[cycle_start..].to_vec();
+                            cycle.push(dep.clone());
+                            return Some(cycle);
+                        }
+                    }
+                    Some(State::Unvisited) | None => {
+                        if let Some(cycle) = dfs(dep, deps, state, path, candidates) {
+                            return Some(cycle);
+                        }
+                    }
+                    Some(State::Visited) => {}
+                }
+            }
+        }
+
+        path.pop();
+        if let Some(s) = state.get_mut(node) {
+            *s = State::Visited;
+        }
+        None
+    }
+
+    for candidate in candidates {
+        if state.get(candidate.as_str()) == Some(&State::Unvisited)
+            && let Some(cycle) = dfs(candidate, deps, &mut state, &mut path, &candidate_set)
+        {
+            return Some(cycle);
+        }
+    }
+
+    None
+}
+
+/// Compute the topological depth of each node (for parallel execution ordering).
+/// Depth 0 = no dependencies. Higher depth = must wait for deeper nodes.
+#[cfg(test)]
+pub(crate) fn compute_depths(
+    order: &[String],
+    deps: &HashMap<String, Vec<String>>,
+) -> HashMap<String, usize> {
+    let mut depths: HashMap<String, usize> = HashMap::new();
+    for name in order {
+        let node_deps = deps.get(name).cloned().unwrap_or_default();
+        let max_dep_depth = node_deps
+            .iter()
+            .filter_map(|d| depths.get(d.as_str()))
+            .max()
+            .copied()
+            .unwrap_or(0);
+        let depth = if node_deps.is_empty() {
+            0
+        } else {
+            max_dep_depth + 1
+        };
+        depths.insert(name.clone(), depth);
+    }
+    depths
+}
+
+/// The main runner that orchestrates services and tasks.
+pub struct Runner {
+    config: Config,
+    platform: Platform,
+    output_manager: OutputManager,
+    base_dir: PathBuf,
+    task_state: TaskState,
+
+    // State tracking — owned by the runner, no Arc<Mutex<>>.
+    service_states: HashMap<String, ServiceState>,
+    task_states: HashMap<String, TaskItemState>,
+    service_handles: HashMap<String, ServiceHandle>,
+
+    // Channels
+    cmd_tx: mpsc::Sender<RunnerCommand>,
+    cmd_rx: mpsc::Receiver<RunnerCommand>,
+    event_tx: broadcast::Sender<RunnerEvent>,
+
+    // Shutdown signal receiver — wakes the select loop when Ctrl+C is pressed.
+    shutdown_rx: mpsc::Receiver<()>,
+
+    // Don's own PID file
+    _don_pid_file: Option<PidFile>,
+}
+
+impl Runner {
+    /// Create a new runner from a validated config.
+    ///
+    /// `base_dir` is the project root (where `don.toml` lives).
+    /// The runner acquires don's PID file at `<base_dir>/.don/don.pid`.
+    pub async fn new(
+        config: Config,
+        platform: Platform,
+        output_manager: OutputManager,
+        base_dir: PathBuf,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) -> Result<Self, RunnerError> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (event_tx, _) = broadcast::channel(256);
+
+        let don_dir = base_dir.join(".don");
+        std::fs::create_dir_all(&don_dir).map_err(RunnerError::Io)?;
+
+        // Acquire don's own PID file.
+        let don_pid_path = don_dir.join("don.pid");
+        let don_pid_file = PidFile::acquire(don_pid_path.clone(), std::process::id() as i32)
+            .await
+            .map_err(|e| match e {
+                crate::process::pid_file::PidFileError::AlreadyLocked => {
+                    RunnerError::AlreadyRunning {
+                        path: don_pid_path.display().to_string(),
+                    }
+                }
+                other => RunnerError::PidFile(other),
+            })?;
+
+        let task_state = TaskState::new(don_dir.join("task-state"));
+
+        let mut service_states = HashMap::new();
+        for name in config.services.keys() {
+            service_states.insert(name.clone(), ServiceState::Pending);
+        }
+
+        let mut task_item_states = HashMap::new();
+        for name in config.tasks.keys() {
+            task_item_states.insert(name.clone(), TaskItemState::Pending);
+        }
+
+        Ok(Self {
+            config,
+            platform,
+            output_manager,
+            base_dir,
+            task_state,
+            service_states,
+            task_states: task_item_states,
+            service_handles: HashMap::new(),
+            cmd_tx,
+            cmd_rx,
+            event_tx,
+            shutdown_rx,
+            _don_pid_file: Some(don_pid_file),
+        })
+    }
+
+    /// Create a runner without acquiring the don PID file (for testing).
+    #[cfg(test)]
+    pub(crate) fn new_without_pid_file(
+        config: Config,
+        platform: Platform,
+        output_manager: OutputManager,
+        base_dir: PathBuf,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) -> Result<Self, RunnerError> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (event_tx, _) = broadcast::channel(256);
+
+        let don_dir = base_dir.join(".don");
+        std::fs::create_dir_all(&don_dir).map_err(RunnerError::Io)?;
+
+        let task_state = TaskState::new(don_dir.join("task-state"));
+
+        let mut service_states = HashMap::new();
+        for name in config.services.keys() {
+            service_states.insert(name.clone(), ServiceState::Pending);
+        }
+
+        let mut task_item_states = HashMap::new();
+        for name in config.tasks.keys() {
+            task_item_states.insert(name.clone(), TaskItemState::Pending);
+        }
+
+        Ok(Self {
+            config,
+            platform,
+            output_manager,
+            base_dir,
+            task_state,
+            service_states,
+            task_states: task_item_states,
+            service_handles: HashMap::new(),
+            cmd_tx,
+            cmd_rx,
+            event_tx,
+            shutdown_rx,
+            _don_pid_file: None,
+        })
+    }
+
+    /// Get a sender for sending commands to this runner.
+    pub fn command_sender(&self) -> mpsc::Sender<RunnerCommand> {
+        self.cmd_tx.clone()
+    }
+
+    /// Subscribe to runner events.
+    pub fn subscribe(&self) -> broadcast::Receiver<RunnerEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Build the dependency map from the config (for topological sorting).
+    fn build_dep_map(&self) -> HashMap<String, Vec<String>> {
+        let mut deps = HashMap::new();
+        for (name, svc) in &self.config.services {
+            let resolved = svc.resolve(self.platform);
+            deps.insert(name.clone(), resolved.depends_on);
+        }
+        for (name, task) in &self.config.tasks {
+            deps.insert(name.clone(), task.depends_on.clone());
+        }
+        deps
+    }
+
+    /// Run the orchestrator: start all services and tasks in dependency order.
+    ///
+    /// This is the main entry point. It:
+    /// 1. Builds a topological sort of the dependency graph.
+    /// 2. Starts items in parallel as their dependencies become satisfied.
+    /// 3. Processes commands from the mpsc channel.
+    /// 4. Handles shutdown signals.
+    pub async fn run(mut self) -> Result<(), RunnerError> {
+        self.output_manager.lifecycle_event("loading don.toml");
+
+        let svc_count = self.config.services.len();
+        let task_count = self.config.tasks.len();
+
+        self.output_manager.lifecycle_event(&format!(
+            "validated {} service{}, {} task{}",
+            svc_count,
+            if svc_count == 1 { "" } else { "s" },
+            task_count,
+            if task_count == 1 { "" } else { "s" },
+        ));
+
+        // Build dependency map and topological order.
+        let dep_map = self.build_dep_map();
+        let order = topological_sort(&dep_map).map_err(|cycle| RunnerError::Cycle { cycle })?;
+
+        // Channel for item completion notifications.
+        let (done_tx, mut done_rx) = mpsc::channel::<ItemDone>(64);
+
+        // Track which items are in flight.
+        let mut pending: HashSet<String> = order.iter().cloned().collect();
+        let mut in_flight: HashSet<String> = HashSet::new();
+
+        // Start items whose dependencies are already satisfied.
+        self.start_ready_items(&order, &dep_map, &mut pending, &mut in_flight, &done_tx)
+            .await?;
+
+        let mut all_started = false;
+
+        // Main loop: wait for completions, commands, and signals.
+        loop {
+            // Emit "all services running" once when startup is complete.
+            if !all_started && pending.is_empty() && in_flight.is_empty() {
+                all_started = true;
+                let has_running_services = self.service_states.values().any(|s| {
+                    matches!(
+                        s,
+                        ServiceState::Running | ServiceState::Ready | ServiceState::Starting
+                    )
+                });
+
+                if has_running_services {
+                    self.output_manager.lifecycle_event("all services running");
+                } else {
+                    // No services to keep alive — exit.
+                    break;
+                }
+            }
+
+            tokio::select! {
+                Some(item_done) = done_rx.recv() => {
+                    in_flight.remove(&item_done.name);
+                    self.handle_item_done(&item_done);
+
+                    // Start newly-unblocked items.
+                    self.start_ready_items(
+                        &order,
+                        &dep_map,
+                        &mut pending,
+                        &mut in_flight,
+                        &done_tx,
+                    ).await?;
+                }
+                Some(cmd) = self.cmd_rx.recv() => {
+                    match cmd {
+                        RunnerCommand::Shutdown => {
+                            self.initiate_shutdown().await;
+                            break;
+                        }
+                        RunnerCommand::Status { reply } => {
+                            let statuses = self.collect_status();
+                            let _ = reply.send(statuses);
+                        }
+                        // Future phases: Start/Stop/Restart via API.
+                        _ => {}
+                    }
+                }
+                _ = self.shutdown_rx.recv() => {
+                    self.initiate_shutdown().await;
+                    break;
+                }
+            }
+        }
+
+        // Wait for any remaining service exits during shutdown.
+        self.wait_for_shutdown().await;
+
+        // Shut down the output system — flush all pending messages to sinks.
+        self.output_manager.shutdown().await;
+
+        Ok(())
+    }
+
+    /// Start items whose dependencies are all satisfied.
+    async fn start_ready_items(
+        &mut self,
+        order: &[String],
+        dep_map: &HashMap<String, Vec<String>>,
+        pending: &mut HashSet<String>,
+        in_flight: &mut HashSet<String>,
+        done_tx: &mpsc::Sender<ItemDone>,
+    ) -> Result<(), RunnerError> {
+        // First pass: mark items whose dependencies have failed.
+        let failed_items: Vec<String> = order
+            .iter()
+            .filter(|name| pending.contains(name.as_str()))
+            .filter(|name| {
+                let node_deps = dep_map.get(name.as_str()).cloned().unwrap_or_default();
+                node_deps.iter().any(|dep| self.is_dep_failed(dep))
+            })
+            .cloned()
+            .collect();
+
+        for name in failed_items {
+            pending.remove(&name);
+            if self.config.services.contains_key(&name) {
+                self.service_states
+                    .insert(name.clone(), ServiceState::Failed);
+            } else {
+                self.task_states.insert(name.clone(), TaskItemState::Failed);
+            }
+            self.output_manager
+                .error_event(&format!("{name}: skipped (dependency failed)"));
+        }
+
+        // Second pass: start items whose dependencies are all satisfied.
+        let ready: Vec<String> = order
+            .iter()
+            .filter(|name| pending.contains(name.as_str()))
+            .filter(|name| {
+                let node_deps = dep_map.get(name.as_str()).cloned().unwrap_or_default();
+                node_deps.iter().all(|dep| self.is_dep_satisfied(dep))
+            })
+            .cloned()
+            .collect();
+
+        for name in ready {
+            pending.remove(&name);
+            in_flight.insert(name.clone());
+
+            if self.config.services.contains_key(&name) {
+                self.start_service(&name, done_tx.clone()).await?;
+            } else if self.config.tasks.contains_key(&name) {
+                self.start_task(&name, done_tx.clone()).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a dependency is satisfied (ready service or completed task).
+    fn is_dep_satisfied(&self, dep: &str) -> bool {
+        if let Some(state) = self.service_states.get(dep) {
+            return state.is_satisfied();
+        }
+        if let Some(state) = self.task_states.get(dep) {
+            return state.is_satisfied();
+        }
+        false
+    }
+
+    /// Check if a dependency has failed.
+    fn is_dep_failed(&self, dep: &str) -> bool {
+        if let Some(state) = self.service_states.get(dep) {
+            return *state == ServiceState::Failed;
+        }
+        if let Some(state) = self.task_states.get(dep) {
+            return *state == TaskItemState::Failed;
+        }
+        false
+    }
+
+    /// Start a service: spawn process, output capture, ready check.
+    async fn start_service(
+        &mut self,
+        name: &str,
+        done_tx: mpsc::Sender<ItemDone>,
+    ) -> Result<(), RunnerError> {
+        self.service_states
+            .insert(name.to_string(), ServiceState::Starting);
+
+        let svc = match self.config.services.get(name) {
+            Some(s) => s,
+            None => return Err(RunnerError::Config(format!("unknown service: {name}"))),
+        };
+        let resolved = svc.resolve(self.platform);
+
+        self.output_manager
+            .lifecycle_event(&format!("starting {name}..."));
+
+        // Spawn the service.
+        let pid_dir = self.base_dir.join(".don").join("pids");
+
+        match service::start_service(name, &resolved, &self.base_dir, &pid_dir).await {
+            Ok(start_result) => {
+                self.service_states
+                    .insert(name.to_string(), ServiceState::Running);
+                self.service_handles
+                    .insert(name.to_string(), start_result.handle);
+
+                // Wire up output processing. The exit_tx fires when the
+                // stream hits EOF (process died), used to cancel the ready check.
+                let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+                if let Some(svc_writer) = self.output_manager.service_writer(name) {
+                    let child_output = start_result.child_output;
+                    tokio::spawn(async move {
+                        let _ = svc_writer.process_stream(child_output).await;
+                        let _ = exit_tx.send(());
+                    });
+                }
+
+                // Spawn ready check in background, racing against process exit.
+                let name_owned = name.to_string();
+                let ready_config = resolved.ready.clone();
+                let event_tx = self.event_tx.clone();
+
+                if let Some(ready) = ready_config {
+                    tokio::spawn(async move {
+                        let ready_result = tokio::select! {
+                            result = service::run_ready_check(&ready) => result,
+                            _ = exit_rx => {
+                                Err(service::ServiceError::ProcessExitedDuringReadyCheck)
+                            }
+                        };
+
+                        let state = if ready_result.is_ok() {
+                            ServiceState::Ready
+                        } else {
+                            ServiceState::Failed
+                        };
+
+                        let _ = event_tx.send(RunnerEvent::ServiceStateChanged {
+                            name: name_owned.clone(),
+                            state,
+                        });
+
+                        let _ = done_tx
+                            .send(ItemDone {
+                                name: name_owned,
+                                kind: NodeKind::Service,
+                                success: ready_result.is_ok(),
+                                message: ready_result.err().map(|e| e.to_string()),
+                                elapsed: None,
+                            })
+                            .await;
+                    });
+                };
+
+                Ok(())
+            }
+            Err(e) => {
+                self.service_states
+                    .insert(name.to_string(), ServiceState::Failed);
+                self.output_manager
+                    .error_event(&format!("{name}: failed to start: {e}"));
+
+                let _ = done_tx
+                    .send(ItemDone {
+                        name: name.to_string(),
+                        kind: NodeKind::Service,
+                        success: false,
+                        message: Some(e.to_string()),
+                        elapsed: None,
+                    })
+                    .await;
+
+                Ok(())
+            }
+        }
+    }
+
+    /// Start a task: check skip, run, handle result.
+    async fn start_task(
+        &mut self,
+        name: &str,
+        done_tx: mpsc::Sender<ItemDone>,
+    ) -> Result<(), RunnerError> {
+        let task_cfg = match self.config.tasks.get(name) {
+            Some(t) => t.clone(),
+            None => return Err(RunnerError::Config(format!("unknown task: {name}"))),
+        };
+
+        // Check if the task needs to run.
+        let base_dir = task_cfg.dir.as_deref().unwrap_or(&self.base_dir);
+        let needs_run = self
+            .task_state
+            .needs_run(name, &task_cfg.watch, Some(base_dir))
+            .await
+            .unwrap_or(true);
+
+        if !needs_run {
+            self.task_states
+                .insert(name.to_string(), TaskItemState::Skipped);
+            self.output_manager
+                .lifecycle_event(&format!("running {name}... (skipped, no changes)"));
+            let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
+                name: name.to_string(),
+                state: TaskItemState::Skipped,
+            });
+            let _ = done_tx
+                .send(ItemDone {
+                    name: name.to_string(),
+                    kind: NodeKind::Task,
+                    success: true,
+                    message: None,
+                    elapsed: None,
+                })
+                .await;
+            return Ok(());
+        }
+
+        let watch_file_count = if task_cfg.watch.is_empty() {
+            None
+        } else {
+            // Count matched files for the lifecycle message.
+            let count: usize = task_cfg
+                .watch
+                .iter()
+                .filter_map(|pattern| {
+                    let full = base_dir.join(pattern).to_string_lossy().into_owned();
+                    glob::glob(&full).ok().map(|g| g.count())
+                })
+                .sum();
+            Some(count)
+        };
+
+        let msg = match watch_file_count {
+            Some(n) => format!(
+                "running {name}... ({n} file{} changed)",
+                if n == 1 { "" } else { "s" }
+            ),
+            None => format!("running {name}..."),
+        };
+        self.output_manager.lifecycle_event(&msg);
+
+        self.task_states
+            .insert(name.to_string(), TaskItemState::Running);
+
+        // Spawn the task process.
+        let task::TaskSpawn {
+            mut handle,
+            child_output,
+        } = match task::spawn_task(&task_cfg, &self.base_dir).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.task_states
+                    .insert(name.to_string(), TaskItemState::Failed);
+                self.output_manager
+                    .error_event(&format!("{name}: failed to start: {e}"));
+                let _ = done_tx
+                    .send(ItemDone {
+                        name: name.to_string(),
+                        kind: NodeKind::Task,
+                        success: false,
+                        message: Some(e.to_string()),
+                        elapsed: None,
+                    })
+                    .await;
+                return Ok(());
+            }
+        };
+
+        // Wire up output processing.
+        if let Some(svc_writer) = self.output_manager.service_writer(name) {
+            tokio::spawn(async move {
+                let _ = svc_writer.process_stream(child_output).await;
+            });
+        }
+
+        let name_owned = name.to_string();
+        let task_cfg_clone = task_cfg.clone();
+        let base_dir_owned = self.base_dir.clone();
+        let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result = task::wait_for_task(&mut handle, task_cfg_clone.timeout.as_deref()).await;
+            let elapsed = start.elapsed();
+
+            let (success, message) = match result {
+                Ok(status) => {
+                    if status.success() {
+                        let task_dir = task_cfg_clone.dir.as_deref().unwrap_or(&base_dir_owned);
+                        let _ = task_state.record_success(
+                            &name_owned,
+                            &task_cfg_clone.watch,
+                            Some(task_dir),
+                        ).await;
+                        (true, None)
+                    } else {
+                        let code = status.code().unwrap_or(-1);
+                        (false, Some(format!("exit code {code}")))
+                    }
+                }
+                Err(e) => (false, Some(e.to_string())),
+            };
+
+            let state = if success {
+                TaskItemState::Completed
+            } else {
+                TaskItemState::Failed
+            };
+
+            let _ = event_tx.send(RunnerEvent::TaskStateChanged {
+                name: name_owned.clone(),
+                state,
+            });
+
+            let _ = done_tx
+                .send(ItemDone {
+                    name: name_owned,
+                    kind: NodeKind::Task,
+                    success,
+                    message,
+                    elapsed: Some(elapsed),
+                })
+                .await;
+        });
+
+        Ok(())
+    }
+
+    /// Handle an item completion notification.
+    fn handle_item_done(&mut self, item: &ItemDone) {
+        match item.kind {
+            NodeKind::Service => {
+                if item.success {
+                    self.service_states
+                        .insert(item.name.clone(), ServiceState::Ready);
+                    // Emit ready message with check details.
+                    if let Some(svc) = self.config.services.get(&item.name) {
+                        let resolved = svc.resolve(self.platform);
+                        let ready_desc = match &resolved.ready {
+                            Some(r) if r.tcp.is_some() => {
+                                format!(" (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
+                            }
+                            Some(r) if r.http.is_some() => {
+                                format!(" (http {})", r.http.as_deref().unwrap_or("unknown"))
+                            }
+                            Some(r) if r.exec.is_some() => " (exec)".to_string(),
+                            _ => " started".to_string(),
+                        };
+                        self.output_manager.lifecycle_event(&format!(
+                            "{}{}",
+                            item.name,
+                            if resolved.ready.is_some() {
+                                format!(" ready{ready_desc}")
+                            } else {
+                                ready_desc
+                            }
+                        ));
+                    }
+                } else {
+                    self.service_states
+                        .insert(item.name.clone(), ServiceState::Failed);
+                    if let Some(ref msg) = item.message {
+                        self.output_manager
+                            .error_event(&format!("{}: {msg}", item.name));
+                    }
+                }
+            }
+            NodeKind::Task => {
+                let timing = item.elapsed.map(format_duration).unwrap_or_default();
+
+                if item.success {
+                    let cur = self.task_states.get(&item.name).copied();
+                    // Don't overwrite Skipped with Completed.
+                    if cur != Some(TaskItemState::Skipped) {
+                        self.task_states
+                            .insert(item.name.clone(), TaskItemState::Completed);
+                    }
+                    if cur != Some(TaskItemState::Skipped) {
+                        let msg = if timing.is_empty() {
+                            format!("{} complete", item.name)
+                        } else {
+                            format!("{} complete ({timing})", item.name)
+                        };
+                        self.output_manager.lifecycle_event(&msg);
+                    }
+                } else {
+                    self.task_states
+                        .insert(item.name.clone(), TaskItemState::Failed);
+                    if let Some(ref err_msg) = item.message {
+                        let msg = if timing.is_empty() {
+                            format!("{} failed ({err_msg})", item.name)
+                        } else {
+                            format!("{} failed ({err_msg}, {timing})", item.name)
+                        };
+                        self.output_manager.error_event(&msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Initiate graceful shutdown of all services.
+    async fn initiate_shutdown(&mut self) {
+        self.output_manager
+            .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");
+
+        // Build reverse dependency order for shutdown.
+        // Services at the same depth (no dependency relationship) stop concurrently.
+        let dep_map = self.build_dep_map();
+        let order = topological_sort(&dep_map).unwrap_or_default();
+
+        // Compute depth of each service node for grouping.
+        let mut depths: HashMap<String, usize> = HashMap::new();
+        for name in &order {
+            let node_deps = dep_map.get(name).cloned().unwrap_or_default();
+            let max_dep_depth = node_deps
+                .iter()
+                .filter_map(|d| depths.get(d))
+                .max()
+                .copied()
+                .unwrap_or(0);
+            let depth = if node_deps.is_empty() {
+                0
+            } else {
+                max_dep_depth + 1
+            };
+            depths.insert(name.clone(), depth);
+        }
+
+        // Group running services by depth, then iterate from highest depth
+        // (most dependent) to lowest (least dependent).
+        let mut by_depth: std::collections::BTreeMap<usize, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for name in &order {
+            if !self.config.services.contains_key(name) {
+                continue;
+            }
+            let state = self.service_states.get(name).copied();
+            if !matches!(
+                state,
+                Some(ServiceState::Running)
+                    | Some(ServiceState::Ready)
+                    | Some(ServiceState::Starting)
+            ) {
+                continue;
+            }
+            let depth = depths.get(name).copied().unwrap_or(0);
+            by_depth.entry(depth).or_default().push(name.clone());
+        }
+
+        let mut remaining: usize = by_depth.values().map(|v| v.len()).sum();
+
+        // Stop from highest depth to lowest (dependents first).
+        for (_depth, names) in by_depth.into_iter().rev() {
+            for name in &names {
+                self.output_manager
+                    .lifecycle_event(&format!("stopping {name}... ({remaining} remaining)"));
+            }
+
+            // Collect handles and configs for this depth level.
+            let mut join_set: JoinSet<String> = JoinSet::new();
+            for name in &names {
+                if let Some(handle) = self.service_handles.remove(name) {
+                    let svc = self.config.services.get(name);
+                    let resolved = svc.map(|s| s.resolve(self.platform));
+                    let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
+                    let force = SIGNAL_COUNT.load(Ordering::SeqCst) >= 2;
+                    let name_owned = name.clone();
+                    join_set.spawn(async move {
+                        let _ = stop_service(handle, shutdown_config.as_ref(), force).await;
+                        name_owned
+                    });
+                }
+            }
+
+            // Stop all services at this depth concurrently, emitting
+            // "stopped" for each one as it finishes.
+            while let Some(result) = join_set.join_next().await {
+                if let Ok(name) = result {
+                    self.service_states
+                        .insert(name.clone(), ServiceState::Stopped);
+                    remaining -= 1;
+                    self.output_manager
+                        .lifecycle_event(&format!("{name} stopped ({remaining} remaining)"));
+                }
+            }
+        }
+
+        self.output_manager.lifecycle_event("shutdown complete");
+    }
+
+    /// Wait for remaining async tasks to finish after shutdown.
+    async fn wait_for_shutdown(&mut self) {
+        // All handles should already be stopped by initiate_shutdown.
+        // Drop remaining handles to release PID files.
+        self.service_handles.clear();
+    }
+
+    /// Collect status of all items.
+    fn collect_status(&self) -> Vec<ItemStatus> {
+        let mut statuses = Vec::new();
+        for (name, state) in &self.service_states {
+            statuses.push(ItemStatus {
+                name: name.clone(),
+                kind: "service".to_string(),
+                state: format!("{state:?}"),
+            });
+        }
+        for (name, state) in &self.task_states {
+            statuses.push(ItemStatus {
+                name: name.clone(),
+                kind: "task".to_string(),
+                state: format!("{state:?}"),
+            });
+        }
+        statuses
+    }
+}
+
+/// Install signal handlers for SIGINT and SIGTERM.
+///
+/// Returns a receiver that gets a message on each signal. Pass this to `Runner::new()`.
+/// First signal triggers graceful shutdown. Second signal sets the force-shutdown flag
+/// (checked by `initiate_shutdown` via `SIGNAL_COUNT`).
+pub async fn install_signal_handlers() -> Result<mpsc::Receiver<()>, std::io::Error> {
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    let (tx, rx) = mpsc::channel(2);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => {},
+                _ = sigterm.recv() => {},
+            }
+
+            let prev = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
+            // Notify the runner. If the channel is full or closed, that's fine.
+            let _ = tx.try_send(());
+
+            if prev >= 1 {
+                // Second signal — force flag is set via SIGNAL_COUNT.
+                break;
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
+/// Format a duration for human display in lifecycle messages.
+/// Examples: "0.3s", "1.2s", "2m 15s"
+fn format_duration(d: std::time::Duration) -> String {
+    let total_secs = d.as_secs_f64();
+    if total_secs < 60.0 {
+        format!("{total_secs:.1}s")
+    } else {
+        let mins = d.as_secs() / 60;
+        let secs = d.as_secs() % 60;
+        format!("{mins}m {secs}s")
+    }
+}
+
+/// Completion notification from a spawned item.
+struct ItemDone {
+    name: String,
+    kind: NodeKind,
+    success: bool,
+    message: Option<String>,
+    /// How long the item took (for tasks).
+    elapsed: Option<std::time::Duration>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_topological_sort() {
+        struct Case {
+            name: &'static str,
+            deps: Vec<(&'static str, Vec<&'static str>)>,
+            expect_ok: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "linear chain a -> b -> c",
+                deps: vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])],
+                expect_ok: true,
+            },
+            Case {
+                name: "diamond: a -> b, a -> c, b -> d, c -> d",
+                deps: vec![
+                    ("a", vec![]),
+                    ("b", vec!["a"]),
+                    ("c", vec!["a"]),
+                    ("d", vec!["b", "c"]),
+                ],
+                expect_ok: true,
+            },
+            Case {
+                name: "independent nodes",
+                deps: vec![("a", vec![]), ("b", vec![]), ("c", vec![])],
+                expect_ok: true,
+            },
+            Case {
+                name: "cycle: a -> b -> c -> a",
+                deps: vec![("a", vec!["c"]), ("b", vec!["a"]), ("c", vec!["b"])],
+                expect_ok: false,
+            },
+            Case {
+                name: "self-cycle: a -> a",
+                deps: vec![("a", vec!["a"])],
+                expect_ok: false,
+            },
+            Case {
+                name: "empty graph",
+                deps: vec![],
+                expect_ok: true,
+            },
+            Case {
+                name: "single node no deps",
+                deps: vec![("a", vec![])],
+                expect_ok: true,
+            },
+        ];
+
+        for case in cases {
+            let dep_map: HashMap<String, Vec<String>> = case
+                .deps
+                .iter()
+                .map(|(name, ds)| (name.to_string(), ds.iter().map(|d| d.to_string()).collect()))
+                .collect();
+
+            let result = topological_sort(&dep_map);
+
+            if case.expect_ok {
+                let order = result.unwrap_or_else(|e| {
+                    panic!("case '{}': expected Ok, got cycle: {:?}", case.name, e)
+                });
+                // Verify: every node appears, and every node appears after its deps.
+                assert_eq!(
+                    order.len(),
+                    dep_map.len(),
+                    "case '{}': all nodes must appear",
+                    case.name
+                );
+                let positions: HashMap<&str, usize> = order
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.as_str(), i))
+                    .collect();
+                for (name, node_deps) in &dep_map {
+                    for dep in node_deps {
+                        assert!(
+                            positions[dep.as_str()] < positions[name.as_str()],
+                            "case '{}': {} should appear before {}",
+                            case.name,
+                            dep,
+                            name
+                        );
+                    }
+                }
+            } else {
+                assert!(
+                    result.is_err(),
+                    "case '{}': expected cycle detection",
+                    case.name
+                );
+                let cycle = result.unwrap_err();
+                assert!(
+                    cycle.len() >= 2,
+                    "case '{}': cycle should have at least 2 elements, got {:?}",
+                    case.name,
+                    cycle
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_service_state_transitions() {
+        struct Case {
+            name: &'static str,
+            from: ServiceState,
+            to: ServiceState,
+            valid: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "pending -> starting",
+                from: ServiceState::Pending,
+                to: ServiceState::Starting,
+                valid: true,
+            },
+            Case {
+                name: "starting -> running",
+                from: ServiceState::Starting,
+                to: ServiceState::Running,
+                valid: true,
+            },
+            Case {
+                name: "starting -> failed",
+                from: ServiceState::Starting,
+                to: ServiceState::Failed,
+                valid: true,
+            },
+            Case {
+                name: "running -> ready",
+                from: ServiceState::Running,
+                to: ServiceState::Ready,
+                valid: true,
+            },
+            Case {
+                name: "running -> stopping",
+                from: ServiceState::Running,
+                to: ServiceState::Stopping,
+                valid: true,
+            },
+            Case {
+                name: "running -> stopped",
+                from: ServiceState::Running,
+                to: ServiceState::Stopped,
+                valid: true,
+            },
+            Case {
+                name: "running -> failed",
+                from: ServiceState::Running,
+                to: ServiceState::Failed,
+                valid: true,
+            },
+            Case {
+                name: "ready -> stopping",
+                from: ServiceState::Ready,
+                to: ServiceState::Stopping,
+                valid: true,
+            },
+            Case {
+                name: "ready -> stopped",
+                from: ServiceState::Ready,
+                to: ServiceState::Stopped,
+                valid: true,
+            },
+            Case {
+                name: "stopping -> stopped",
+                from: ServiceState::Stopping,
+                to: ServiceState::Stopped,
+                valid: true,
+            },
+            Case {
+                name: "stopped -> pending (restart)",
+                from: ServiceState::Stopped,
+                to: ServiceState::Pending,
+                valid: true,
+            },
+            Case {
+                name: "failed -> pending (restart)",
+                from: ServiceState::Failed,
+                to: ServiceState::Pending,
+                valid: true,
+            },
+            // Invalid transitions
+            Case {
+                name: "stopped -> ready",
+                from: ServiceState::Stopped,
+                to: ServiceState::Ready,
+                valid: false,
+            },
+            Case {
+                name: "pending -> ready",
+                from: ServiceState::Pending,
+                to: ServiceState::Ready,
+                valid: false,
+            },
+            Case {
+                name: "pending -> running",
+                from: ServiceState::Pending,
+                to: ServiceState::Running,
+                valid: false,
+            },
+            Case {
+                name: "stopped -> running",
+                from: ServiceState::Stopped,
+                to: ServiceState::Running,
+                valid: false,
+            },
+            Case {
+                name: "failed -> ready",
+                from: ServiceState::Failed,
+                to: ServiceState::Ready,
+                valid: false,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                case.from.can_transition_to(case.to),
+                case.valid,
+                "case '{}': {:?} -> {:?} should be {}",
+                case.name,
+                case.from,
+                case.to,
+                if case.valid { "valid" } else { "invalid" }
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_depths() {
+        let deps: HashMap<String, Vec<String>> = [
+            ("a".to_string(), vec![]),
+            ("b".to_string(), vec!["a".to_string()]),
+            ("c".to_string(), vec!["a".to_string()]),
+            ("d".to_string(), vec!["b".to_string(), "c".to_string()]),
+        ]
+        .into_iter()
+        .collect();
+
+        let order = topological_sort(&deps).unwrap();
+        let depths = compute_depths(&order, &deps);
+
+        assert_eq!(depths["a"], 0);
+        assert_eq!(depths["b"], 1);
+        assert_eq!(depths["c"], 1);
+        assert_eq!(depths["d"], 2);
+    }
+}

@@ -6,9 +6,8 @@ pub mod pid_file;
 #[cfg(test)]
 pub(crate) mod test_util;
 
-use nix::sys::signal::{killpg, Signal};
+use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use pid_file::{PidFile, PidFileError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -42,19 +41,17 @@ impl AsyncRead for ChildOutput {
 
 /// A handle to a spawned child process in its own process group.
 ///
-/// Holds the child process, its output stream, and optionally a PID file lock.
-/// The PID file lock is released when this handle is dropped.
+/// Holds the child process and optionally a PGID file path.
+/// The PGID file is written on spawn and deleted when the handle is dropped.
 pub struct ProcessHandle {
     /// The process group ID. Equal to the child's PID since we use setpgid/setsid.
     pgid: i32,
-    /// The async-readable output stream (PTY or pipe). Taken once via `take_output()`.
-    output: Option<ChildOutput>,
     /// The child process (for waiting on exit).
     child: tokio::process::Child,
     /// The PTY write half, if PTY mode. Used for interactive attach (Phase 17).
     pty_write: Option<pty_process::OwnedWritePty>,
-    /// The PID file lock. Held for the process lifetime, released on drop.
-    _pid_file: Option<PidFile>,
+    /// Path to the PGID file. Cleaned up on drop.
+    pgid_file_path: Option<PathBuf>,
 }
 
 /// Configuration for spawning a process.
@@ -68,8 +65,8 @@ pub struct SpawnConfig<'a> {
     /// Environment variables (complete set for the child).
     /// Must include PATH and other essentials — the child's env is fully replaced.
     pub env: HashMap<String, String>,
-    /// Path for the PID file. None = no PID file (e.g., for tasks).
-    pub pid_file_path: Option<PathBuf>,
+    /// Path for the PGID file. None = no PGID file (e.g., for tasks).
+    pub pgid_file_path: Option<PathBuf>,
     /// Force pipe-based spawning instead of PTY (for testing fallback).
     pub force_pipe: bool,
 }
@@ -90,9 +87,9 @@ pub enum ProcessError {
     /// Child exited before we could read its PID.
     #[error("child process '{cmd}' exited immediately, could not determine PGID")]
     ChildExitedEarly { cmd: String },
-    /// PID file error.
-    #[error("pid file error: {0}")]
-    PidFile(#[from] PidFileError),
+    /// PGID file error.
+    #[error("pgid file error: {0}")]
+    PgidFile(String),
     /// Failed to send signal to process group.
     #[error("failed to send {signal} to pgid {pgid}: {source}")]
     Signal {
@@ -113,11 +110,6 @@ impl ProcessHandle {
     /// The process group ID of this child.
     pub fn pgid(&self) -> i32 {
         self.pgid
-    }
-
-    /// Take the output stream. Can only be called once.
-    pub fn take_output(&mut self) -> Option<ChildOutput> {
-        self.output.take()
     }
 
     /// Take the PTY write half (for interactive attach in Phase 17).
@@ -148,7 +140,13 @@ impl ProcessHandle {
     ) -> Result<ExitStatus, ProcessError> {
         // Send the requested signal. Ignore ESRCH (process already gone).
         if let Err(e) = self.signal(sig)
-            && !matches!(e, ProcessError::Signal { source: nix::Error::ESRCH, .. })
+            && !matches!(
+                e,
+                ProcessError::Signal {
+                    source: nix::Error::ESRCH,
+                    ..
+                }
+            )
         {
             return Err(e);
         }
@@ -159,7 +157,13 @@ impl ProcessHandle {
             Err(_elapsed) => {
                 // Timeout — escalate to SIGKILL
                 if let Err(e) = self.signal(Signal::SIGKILL)
-                    && !matches!(e, ProcessError::Signal { source: nix::Error::ESRCH, .. })
+                    && !matches!(
+                        e,
+                        ProcessError::Signal {
+                            source: nix::Error::ESRCH,
+                            ..
+                        }
+                    )
                 {
                     return Err(e);
                 }
@@ -177,62 +181,65 @@ impl ProcessHandle {
     }
 }
 
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        if let Some(path) = self.pgid_file_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Spawn a child process in its own process group.
 ///
-/// 1. If `pid_file_path` is set, acquires an flock BEFORE spawning.
-/// 2. Tries PTY allocation first (for terminal-like behavior).
-/// 3. Falls back to pipe-based spawning if PTY fails or `force_pipe` is set.
-/// 4. In PTY mode, the child gets its own session via `setsid()` (handled by pty-process).
+/// 1. Tries PTY allocation first (for terminal-like behavior).
+/// 2. Falls back to pipe-based spawning if PTY fails or `force_pipe` is set.
+/// 3. In PTY mode, the child gets its own session via `setsid()` (handled by pty-process).
 ///    In pipe mode, the child gets its own process group via `setpgid(0, 0)`.
-pub fn spawn_process(config: SpawnConfig<'_>) -> Result<ProcessHandle, ProcessError> {
-    // Acquire PID file lock before spawning (if requested).
-    // We write a placeholder PGID of 0, then update after spawn.
-    let pid_file = config
-        .pid_file_path
-        .as_ref()
-        .map(|path| PidFile::acquire(path.clone(), 0))
-        .transpose()?;
-
-    // Try PTY first, fall back to pipe.
-    // If spawn fails and we acquired a PID file, it's dropped here
-    // (releasing the lock). This is correct — no process to track.
+/// 4. If `pgid_file_path` is set, writes the PGID to the file after spawn.
+pub async fn spawn_process(
+    config: SpawnConfig<'_>,
+) -> Result<(ProcessHandle, ChildOutput), ProcessError> {
     if !config.force_pipe {
         match spawn_pty(&config) {
             Ok((child, read_pty, write_pty)) => {
                 let pgid = child_pgid(&child, config.cmd)?;
-                let pid_file = maybe_update_pid_file(pid_file, pgid)?;
-                Ok(ProcessHandle {
+                write_pgid_file(config.pgid_file_path.as_deref(), pgid).await?;
+                let output = ChildOutput::Pty(read_pty);
+                let handle = ProcessHandle {
                     pgid,
-                    output: Some(ChildOutput::Pty(read_pty)),
                     child,
                     pty_write: Some(write_pty),
-                    _pid_file: pid_file,
-                })
+                    pgid_file_path: config.pgid_file_path,
+                };
+                Ok((handle, output))
             }
-            Err(_pty_err) => spawn_pipe_handle(&config, pid_file),
+            Err(_pty_err) => spawn_pipe_handle(&config).await,
         }
     } else {
-        spawn_pipe_handle(&config, pid_file)
+        spawn_pipe_handle(&config).await
     }
 }
 
-/// Build a ProcessHandle from a pipe-mode spawn.
-fn spawn_pipe_handle(
+/// Build a ProcessHandle + ChildOutput from a pipe-mode spawn.
+async fn spawn_pipe_handle(
     config: &SpawnConfig<'_>,
-    pid_file: Option<PidFile>,
-) -> Result<ProcessHandle, ProcessError> {
+) -> Result<(ProcessHandle, ChildOutput), ProcessError> {
     let mut child = spawn_pipe(config)?;
     let pgid = child_pgid(&child, config.cmd)?;
-    let pid_file = maybe_update_pid_file(pid_file, pgid)?;
-    let stdout = child.stdout.take();
+    write_pgid_file(config.pgid_file_path.as_deref(), pgid).await?;
+    let stdout = child.stdout.take().ok_or_else(|| ProcessError::Spawn {
+        cmd: config.cmd.to_string(),
+        source: std::io::Error::other("child process has no stdout"),
+    })?;
 
-    Ok(ProcessHandle {
+    let output = ChildOutput::Pipe(stdout);
+    let handle = ProcessHandle {
         pgid,
-        output: stdout.map(ChildOutput::Pipe),
         child,
         pty_write: None,
-        _pid_file: pid_file,
-    })
+        pgid_file_path: config.pgid_file_path.clone(),
+    };
+    Ok((handle, output))
 }
 
 fn spawn_pty(
@@ -308,19 +315,54 @@ fn child_pgid(child: &tokio::process::Child, cmd: &str) -> Result<i32, ProcessEr
     child
         .id()
         .map(|id| id as i32)
-        .ok_or_else(|| ProcessError::ChildExitedEarly { cmd: cmd.to_string() })
+        .ok_or_else(|| ProcessError::ChildExitedEarly {
+            cmd: cmd.to_string(),
+        })
 }
 
-fn maybe_update_pid_file(
-    pid_file: Option<PidFile>,
-    pgid: i32,
-) -> Result<Option<PidFile>, ProcessError> {
-    match pid_file {
-        Some(mut pf) => {
-            pf.update_pgid(pgid)?;
-            Ok(Some(pf))
+/// Write the PGID to a file. Creates parent directories if needed.
+async fn write_pgid_file(path: Option<&Path>, pgid: i32) -> Result<(), ProcessError> {
+    let Some(path) = path else { return Ok(()) };
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(ProcessError::Io)?;
+    }
+    tokio::fs::write(path, pgid.to_string())
+        .await
+        .map_err(|e| {
+            ProcessError::PgidFile(format!("failed to write pgid to '{}': {e}", path.display()))
+        })?;
+    Ok(())
+}
+
+/// Read the PGID from a file. Returns `None` if the file does not exist.
+pub async fn read_pgid_file(path: &Path) -> Result<Option<i32>, ProcessError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => {
+            let content = content.trim().to_string();
+            if content.is_empty() {
+                return Ok(None);
+            }
+            let pgid: i32 = content.parse().map_err(|_| {
+                ProcessError::PgidFile(format!("invalid pgid in '{}': '{content}'", path.display()))
+            })?;
+            Ok(Some(pgid))
         }
-        None => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ProcessError::PgidFile(format!(
+            "failed to read pgid from '{}': {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Delete a PGID file from disk. Idempotent — does not error if already gone.
+pub async fn cleanup_pgid_file(path: &Path) -> Result<(), std::io::Error> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 

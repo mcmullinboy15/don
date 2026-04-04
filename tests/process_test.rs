@@ -1,7 +1,6 @@
 mod helpers;
 
-use don::process::pid_file::{PidFile, PidFileError};
-use don::process::{spawn_process, ChildOutput, ProcessError, SpawnConfig};
+use don::process::{cleanup_pgid_file, read_pgid_file, spawn_process, ChildOutput, SpawnConfig};
 use helpers::tempdir::TempDir;
 use nix::sys::signal::Signal;
 use std::collections::HashMap;
@@ -17,7 +16,7 @@ fn basic_config<'a>(
         args,
         dir: None,
         env: std::env::vars().collect(),
-        pid_file_path: None,
+        pgid_file_path: None,
         force_pipe,
     }
 }
@@ -25,7 +24,7 @@ fn basic_config<'a>(
 #[tokio::test]
 async fn spawn_process_has_own_pgid() {
     let args = ["300".to_string()];
-    let mut handle = spawn_process(basic_config("sleep", &args, false)).unwrap();
+    let (mut handle, _output) = spawn_process(basic_config("sleep", &args, false)).await.unwrap();
     let don_pgid = nix::unistd::getpgid(None).unwrap();
 
     assert_ne!(handle.pgid(), don_pgid.as_raw());
@@ -38,9 +37,7 @@ async fn spawn_process_has_own_pgid() {
 #[tokio::test]
 async fn spawn_pipe_mode_reads_output() {
     let args = ["hello from pipe".to_string()];
-    let mut handle = spawn_process(basic_config("echo", &args, true)).unwrap();
-
-    let mut output = handle.take_output().unwrap();
+    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, true)).await.unwrap();
     assert!(matches!(output, ChildOutput::Pipe(_)));
 
     let mut buf = Vec::new();
@@ -56,9 +53,7 @@ async fn spawn_pipe_mode_reads_output() {
 #[tokio::test]
 async fn spawn_pty_mode_reads_output() {
     let args = ["hello from pty".to_string()];
-    let mut handle = spawn_process(basic_config("echo", &args, false)).unwrap();
-
-    let mut output = handle.take_output().unwrap();
+    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, false)).await.unwrap();
 
     let mut buf = vec![0u8; 4096];
     let n = tokio::io::AsyncReadExt::read(&mut output, &mut buf)
@@ -73,7 +68,7 @@ async fn spawn_pty_mode_reads_output() {
 #[tokio::test]
 async fn terminate_sends_sigterm_then_waits() {
     let args = ["300".to_string()];
-    let mut handle = spawn_process(basic_config("sleep", &args, true)).unwrap();
+    let (mut handle, _output) = spawn_process(basic_config("sleep", &args, true)).await.unwrap();
 
     let status = handle
         .terminate(Signal::SIGTERM, std::time::Duration::from_secs(5))
@@ -90,7 +85,7 @@ async fn terminate_escalates_to_sigkill_on_timeout() {
         "-c".to_string(),
         "trap '' TERM; while true; do sleep 1 & wait; done".to_string(),
     ];
-    let mut handle = spawn_process(basic_config("sh", &args, true)).unwrap();
+    let (mut handle, _output) = spawn_process(basic_config("sh", &args, true)).await.unwrap();
 
     // Verify the process is actually running
     assert!(handle.pgid() > 0);
@@ -118,90 +113,67 @@ async fn terminate_escalates_to_sigkill_on_timeout() {
 }
 
 #[tokio::test]
-async fn pid_file_blocks_second_spawn() {
-    let dir = TempDir::new("pid-blocks-second");
-    let pid_path = dir.path().join("test.pid");
+async fn pgid_file_written_on_spawn() {
+    let dir = TempDir::new("pgid-file-written");
+    let pgid_path = dir.path().join("test.pid");
     let args = ["300".to_string()];
 
     let config = SpawnConfig {
-        pid_file_path: Some(pid_path.clone()),
+        pgid_file_path: Some(pgid_path.clone()),
         ..basic_config("sleep", &args, true)
     };
-    let mut handle = spawn_process(config).unwrap();
+    let (mut handle, _output) = spawn_process(config).await.unwrap();
 
-    // Verify PID file exists with correct PGID
-    assert!(pid_path.exists());
-    let content = std::fs::read_to_string(&pid_path).unwrap();
-    let stored_pgid: i32 = content.trim().parse().unwrap();
-    assert_eq!(stored_pgid, handle.pgid());
-
-    // Second spawn should fail
-    let config2 = SpawnConfig {
-        pid_file_path: Some(pid_path.clone()),
-        ..basic_config("sleep", &args, true)
-    };
-    let result = spawn_process(config2);
-    assert!(matches!(
-        result,
-        Err(ProcessError::PidFile(PidFileError::AlreadyLocked))
-    ));
+    // Verify PGID file exists with correct PGID
+    assert!(pgid_path.exists());
+    let stored_pgid = read_pgid_file(&pgid_path).await.unwrap();
+    assert_eq!(stored_pgid, Some(handle.pgid()));
 
     handle.signal(Signal::SIGKILL).unwrap();
     handle.wait().await.unwrap();
 }
 
 #[tokio::test]
-async fn pid_file_released_after_drop() {
-    let dir = TempDir::new("pid-released");
-    let pid_path = dir.path().join("test.pid");
+async fn pgid_file_cleaned_up_on_drop() {
+    let dir = TempDir::new("pgid-file-drop");
+    let pgid_path = dir.path().join("test.pid");
     let args = ["300".to_string()];
 
     let config = SpawnConfig {
-        pid_file_path: Some(pid_path.clone()),
+        pgid_file_path: Some(pgid_path.clone()),
         ..basic_config("sleep", &args, true)
     };
-    let mut handle = spawn_process(config).unwrap();
+    let (mut handle, _output) = spawn_process(config).await.unwrap();
     handle.signal(Signal::SIGKILL).unwrap();
     handle.wait().await.unwrap();
     drop(handle);
 
-    // Should succeed after drop
-    let config2 = SpawnConfig {
-        pid_file_path: Some(pid_path),
-        ..basic_config("sleep", &args, true)
-    };
-    let mut handle2 = spawn_process(config2).unwrap();
-    handle2.signal(Signal::SIGKILL).unwrap();
-    handle2.wait().await.unwrap();
+    // PGID file should be cleaned up on drop
+    assert!(!pgid_path.exists());
 }
 
 #[tokio::test]
-async fn stale_pid_file_detected() {
-    let dir = TempDir::new("stale-detection");
-    let pid_path = dir.path().join("test.pid");
-    let args = ["300".to_string()];
+async fn pgid_file_read_and_cleanup() {
+    let dir = TempDir::new("pgid-read-cleanup");
+    let pgid_path = dir.path().join("test.pid");
 
-    // Spawn a process with PID file, kill it, drop the handle
-    let config = SpawnConfig {
-        pid_file_path: Some(pid_path.clone()),
-        ..basic_config("sleep", &args, true)
-    };
-    let mut handle = spawn_process(config).unwrap();
-    let pgid = handle.pgid();
-    handle.signal(Signal::SIGKILL).unwrap();
-    handle.wait().await.unwrap();
-    drop(handle);
+    // Write a PGID file manually
+    std::fs::write(&pgid_path, "12345").unwrap();
 
-    // PID file still exists (not deleted on drop)
-    assert!(pid_path.exists());
-
-    // try_lock_stale should detect it as stale and return the PGID
-    let result = PidFile::try_lock_stale(&pid_path).unwrap();
-    assert_eq!(result, Some(pgid));
+    // Read it back
+    let pgid = read_pgid_file(&pgid_path).await.unwrap();
+    assert_eq!(pgid, Some(12345));
 
     // Clean up
-    PidFile::cleanup(&pid_path).unwrap();
-    assert!(!pid_path.exists());
+    cleanup_pgid_file(&pgid_path).await.unwrap();
+    assert!(!pgid_path.exists());
+
+    // Cleanup is idempotent
+    cleanup_pgid_file(&pgid_path).await.unwrap();
+
+    // Read of nonexistent returns None
+    let pgid = read_pgid_file(&pgid_path).await.unwrap();
+    assert_eq!(pgid, None);
 }
 
 #[tokio::test]
@@ -209,9 +181,7 @@ async fn pty_fallback_to_pipe_on_failure() {
     // We can't easily force PTY failure, but we can verify the force_pipe
     // path produces readable output — proving the fallback mechanism works.
     let args = ["fallback test".to_string()];
-    let mut handle = spawn_process(basic_config("echo", &args, true)).unwrap();
-
-    let mut output = handle.take_output().unwrap();
+    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, true)).await.unwrap();
     assert!(matches!(output, ChildOutput::Pipe(_)));
 
     let mut buf = Vec::new();
@@ -235,12 +205,11 @@ async fn env_passed_to_child() {
         args: &args,
         dir: None,
         env,
-        pid_file_path: None,
+        pgid_file_path: None,
         force_pipe: true,
     };
-    let mut handle = spawn_process(config).unwrap();
+    let (mut handle, mut output) = spawn_process(config).await.unwrap();
 
-    let mut output = handle.take_output().unwrap();
     let mut buf = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut output, &mut buf)
         .await

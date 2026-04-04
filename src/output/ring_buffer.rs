@@ -45,16 +45,13 @@ impl RingBuffer {
         self.lines.push_back(line);
     }
 
-    /// Read the last `n` lines in chronological order.
+    /// Iterate over the last `n` lines in chronological order.
     ///
-    /// If `n` exceeds the number of stored lines, returns all stored lines.
-    pub fn last_n(&self, n: usize) -> Vec<&[u8]> {
+    /// If `n` exceeds the number of stored lines, all stored lines are yielded.
+    pub fn last_n(&self, n: usize) -> impl Iterator<Item = &[u8]> {
         let stored = self.lines.len();
         let count = n.min(stored);
-        self.lines
-            .range(stored - count..)
-            .map(|b| b.as_ref())
-            .collect()
+        self.lines.range(stored - count..).map(|b| b.as_ref())
     }
 
     /// Total number of lines ever pushed (including evicted ones).
@@ -188,7 +185,7 @@ mod tests {
                 buf.push(Bytes::from_static(line));
             }
             assert_eq!(
-                buf.last_n(case.last_n),
+                buf.last_n(case.last_n).collect::<Vec<_>>(),
                 case.expected,
                 "case: {}",
                 case.name

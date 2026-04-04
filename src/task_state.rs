@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 ///
 /// State is stored in `.don/task-state/<task-name>.sha256`.
 /// A hash is only written after a task exits successfully (exit code 0).
+#[derive(Clone)]
 pub struct TaskState {
     state_dir: PathBuf,
 }
@@ -36,7 +37,62 @@ impl TaskState {
     ///
     /// `base_dir` is prepended to glob patterns so they resolve relative to the
     /// task's working directory, not don's cwd. Pass `None` to resolve from cwd.
-    pub fn needs_run(
+    ///
+    /// Runs filesystem I/O on a blocking thread to avoid stalling the tokio runtime.
+    pub async fn needs_run(
+        &self,
+        task_name: &str,
+        watch_patterns: &[String],
+        base_dir: Option<&Path>,
+    ) -> Result<bool, TaskStateError> {
+        let this = self.clone();
+        let task_name = task_name.to_string();
+        let watch_patterns = watch_patterns.to_vec();
+        let base_dir = base_dir.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            this.needs_run_sync(&task_name, &watch_patterns, base_dir.as_deref())
+        })
+        .await
+        .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Record a successful task run by writing the current file hash.
+    /// Only call this after the task exits with code 0.
+    ///
+    /// `base_dir` must match what was passed to `needs_run`.
+    ///
+    /// Runs filesystem I/O on a blocking thread to avoid stalling the tokio runtime.
+    pub async fn record_success(
+        &self,
+        task_name: &str,
+        watch_patterns: &[String],
+        base_dir: Option<&Path>,
+    ) -> Result<(), TaskStateError> {
+        let this = self.clone();
+        let task_name = task_name.to_string();
+        let watch_patterns = watch_patterns.to_vec();
+        let base_dir = base_dir.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            this.record_success_sync(&task_name, &watch_patterns, base_dir.as_deref())
+        })
+        .await
+        .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Clear stored state for a task, forcing it to re-run next time.
+    ///
+    /// Runs filesystem I/O on a blocking thread to avoid stalling the tokio runtime.
+    pub async fn clear(&self, task_name: &str) -> Result<(), TaskStateError> {
+        let task_name = task_name.to_string();
+        let path = self.hash_file_path(&task_name);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(TaskStateError::Io(e)),
+        }
+    }
+
+    fn needs_run_sync(
         &self,
         task_name: &str,
         watch_patterns: &[String],
@@ -52,11 +108,7 @@ impl TaskState {
         Ok(stored_hash.as_ref() != Some(&current_hash))
     }
 
-    /// Record a successful task run by writing the current file hash.
-    /// Only call this after the task exits with code 0.
-    ///
-    /// `base_dir` must match what was passed to `needs_run`.
-    pub fn record_success(
+    fn record_success_sync(
         &self,
         task_name: &str,
         watch_patterns: &[String],
@@ -71,16 +123,6 @@ impl TaskState {
         std::fs::create_dir_all(&self.state_dir)?;
         std::fs::write(&path, hash.as_bytes())?;
         Ok(())
-    }
-
-    /// Clear stored state for a task, forcing it to re-run next time.
-    pub fn clear(&self, task_name: &str) -> Result<(), TaskStateError> {
-        let path = self.hash_file_path(task_name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(TaskStateError::Io(e)),
-        }
     }
 
     /// Compute a combined SHA-256 hash of all files matching the watch patterns.
@@ -99,7 +141,9 @@ impl TaskState {
                 Some(dir) => dir.join(pattern).to_string_lossy().into_owned(),
                 None => pattern.clone(),
             };
-            for entry in glob::glob(&full_pattern).map_err(|e| TaskStateError::Glob(e.to_string()))? {
+            for entry in
+                glob::glob(&full_pattern).map_err(|e| TaskStateError::Glob(e.to_string()))?
+            {
                 let path = entry.map_err(|e| TaskStateError::Io(e.into_error()))?;
                 if path.is_file() {
                     paths.push(path);
@@ -184,8 +228,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_task_state() {
+    #[tokio::test]
+    async fn test_task_state() {
         struct TestCase {
             name: &'static str,
             setup: fn(&Path),
@@ -294,7 +338,7 @@ mod tests {
                 .map(|p| p.replace("PLACEHOLDER", &dir.path().to_string_lossy()))
                 .collect();
 
-            let needs_run = state.needs_run("test-task", &patterns, None).unwrap();
+            let needs_run = state.needs_run("test-task", &patterns, None).await.unwrap();
             assert_eq!(
                 needs_run, case.expect_needs_run_before,
                 "case '{}': needs_run before",
@@ -302,14 +346,17 @@ mod tests {
             );
 
             if case.record_success {
-                state.record_success("test-task", &patterns, None).unwrap();
+                state
+                    .record_success("test-task", &patterns, None)
+                    .await
+                    .unwrap();
             }
 
             if let Some(mutate) = case.mutate {
                 mutate(dir.path());
             }
 
-            let needs_run = state.needs_run("test-task", &patterns, None).unwrap();
+            let needs_run = state.needs_run("test-task", &patterns, None).await.unwrap();
             assert_eq!(
                 needs_run, case.expect_needs_run_after,
                 "case '{}': needs_run after",
@@ -318,8 +365,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_base_dir_resolution() {
+    #[tokio::test]
+    async fn test_base_dir_resolution() {
         let dir = TempDir::new("base-dir");
         let sub = dir.path().join("subdir");
         fs::create_dir_all(&sub).unwrap();
@@ -329,9 +376,12 @@ mod tests {
         let patterns = vec!["*.sql".to_string()];
 
         // Without base_dir: glob resolves from cwd, won't find files in subdir
-        let needs_run_no_base = state.needs_run("test", &patterns, None).unwrap();
+        let needs_run_no_base = state.needs_run("test", &patterns, None).await.unwrap();
         // With base_dir pointing to subdir: should find the file
-        let needs_run_with_base = state.needs_run("test", &patterns, Some(&sub)).unwrap();
+        let needs_run_with_base = state
+            .needs_run("test", &patterns, Some(&sub))
+            .await
+            .unwrap();
 
         // The cwd-relative glob likely finds nothing (no *.sql in cwd), so always needs run
         assert!(needs_run_no_base);
@@ -339,28 +389,39 @@ mod tests {
         assert!(needs_run_with_base);
 
         // Record success with base_dir
-        state.record_success("test", &patterns, Some(&sub)).unwrap();
+        state
+            .record_success("test", &patterns, Some(&sub))
+            .await
+            .unwrap();
         // Now it should skip
-        assert!(!state.needs_run("test", &patterns, Some(&sub)).unwrap());
+        assert!(
+            !state
+                .needs_run("test", &patterns, Some(&sub))
+                .await
+                .unwrap()
+        );
         // But without base_dir it still needs run (different glob results)
-        assert!(state.needs_run("test", &patterns, None).unwrap());
+        assert!(state.needs_run("test", &patterns, None).await.unwrap());
     }
 
-    #[test]
-    fn test_clear() {
+    #[tokio::test]
+    async fn test_clear() {
         let dir = TempDir::new("clear");
         let state = TaskState::new(dir.path().join(".don-state"));
 
         fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let patterns = vec![format!("{}/*.txt", dir.path().to_string_lossy())];
 
-        state.record_success("my-task", &patterns, None).unwrap();
-        assert!(!state.needs_run("my-task", &patterns, None).unwrap());
+        state
+            .record_success("my-task", &patterns, None)
+            .await
+            .unwrap();
+        assert!(!state.needs_run("my-task", &patterns, None).await.unwrap());
 
-        state.clear("my-task").unwrap();
-        assert!(state.needs_run("my-task", &patterns, None).unwrap());
+        state.clear("my-task").await.unwrap();
+        assert!(state.needs_run("my-task", &patterns, None).await.unwrap());
 
         // Clear on non-existent is fine
-        state.clear("never-existed").unwrap();
+        state.clear("never-existed").await.unwrap();
     }
 }

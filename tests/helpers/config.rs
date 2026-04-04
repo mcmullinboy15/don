@@ -113,6 +113,90 @@ impl ServiceBuilder {
         self
     }
 
+    /// Set the working directory.
+    pub fn dir(mut self, dir: &str) -> Self {
+        self.lines.push(format!("dir = \"{dir}\""));
+        self
+    }
+
+    /// Set the log mode.
+    pub fn log(mut self, log: &str) -> Self {
+        self.lines.push(format!("log = \"{log}\""));
+        self
+    }
+
+    /// Add an environment variable.
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.lines.push(format!("env.{key} = \"{value}\""));
+        self
+    }
+
+    /// Add a TCP ready check.
+    pub fn ready_tcp(mut self, addr: &str) -> Self {
+        self.lines.push(format!("ready.tcp = \"{addr}\""));
+        self
+    }
+
+    /// Add a TCP ready check with custom interval and retries.
+    pub fn ready_tcp_with(mut self, addr: &str, interval: &str, retries: u32) -> Self {
+        self.lines.push(format!("ready.tcp = \"{addr}\""));
+        self.lines.push(format!("ready.interval = \"{interval}\""));
+        self.lines.push(format!("ready.retries = {retries}"));
+        self
+    }
+
+    /// Add an HTTP ready check.
+    pub fn ready_http(mut self, url: &str) -> Self {
+        self.lines.push(format!("ready.http = \"{url}\""));
+        self
+    }
+
+    /// Add an HTTP ready check with custom interval and retries.
+    pub fn ready_http_with(mut self, url: &str, interval: &str, retries: u32) -> Self {
+        self.lines.push(format!("ready.http = \"{url}\""));
+        self.lines.push(format!("ready.interval = \"{interval}\""));
+        self.lines.push(format!("ready.retries = {retries}"));
+        self
+    }
+
+    /// Add an exec ready check.
+    pub fn ready_exec(mut self, cmd: &str, args: &[&str]) -> Self {
+        self.lines.push(format!("ready.exec.cmd = \"{cmd}\""));
+        if !args.is_empty() {
+            let args_str: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+            self.lines
+                .push(format!("ready.exec.args = [{}]", args_str.join(", ")));
+        }
+        self
+    }
+
+    /// Add an exec ready check with custom interval and retries.
+    pub fn ready_exec_with(
+        mut self,
+        cmd: &str,
+        args: &[&str],
+        interval: &str,
+        retries: u32,
+    ) -> Self {
+        self.lines.push(format!("ready.exec.cmd = \"{cmd}\""));
+        if !args.is_empty() {
+            let args_str: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+            self.lines
+                .push(format!("ready.exec.args = [{}]", args_str.join(", ")));
+        }
+        self.lines.push(format!("ready.interval = \"{interval}\""));
+        self.lines.push(format!("ready.retries = {retries}"));
+        self
+    }
+
+    /// Set shutdown config.
+    pub fn shutdown(mut self, signal: &str, timeout: &str) -> Self {
+        self.lines.push(format!("shutdown.signal = \"{signal}\""));
+        self.lines
+            .push(format!("shutdown.timeout = \"{timeout}\""));
+        self
+    }
+
     /// Finalize this service and return to the config builder.
     pub fn done(mut self) -> ConfigBuilder {
         writeln!(self.builder.toml, "[services.{}]", self.name).unwrap();
@@ -143,6 +227,38 @@ impl TaskBuilder {
         let deps_str: Vec<String> = deps.iter().map(|d| format!("\"{d}\"")).collect();
         self.lines
             .push(format!("depends_on = [{}]", deps_str.join(", ")));
+        self
+    }
+
+    /// Set the working directory.
+    pub fn dir(mut self, dir: &str) -> Self {
+        self.lines.push(format!("dir = \"{dir}\""));
+        self
+    }
+
+    /// Set the log mode.
+    pub fn log(mut self, log: &str) -> Self {
+        self.lines.push(format!("log = \"{log}\""));
+        self
+    }
+
+    /// Add an environment variable.
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.lines.push(format!("env.{key} = \"{value}\""));
+        self
+    }
+
+    /// Set watch patterns.
+    pub fn watch(mut self, patterns: &[&str]) -> Self {
+        let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+        self.lines
+            .push(format!("watch = [{}]", p_str.join(", ")));
+        self
+    }
+
+    /// Set timeout.
+    pub fn timeout(mut self, timeout: &str) -> Self {
+        self.lines.push(format!("timeout = \"{timeout}\""));
         self
     }
 
