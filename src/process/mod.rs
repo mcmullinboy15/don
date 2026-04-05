@@ -3,6 +3,7 @@
 
 pub mod env;
 pub mod pid_file;
+pub(crate) mod socket;
 #[cfg(test)]
 pub(crate) mod test_util;
 
@@ -69,6 +70,10 @@ pub struct SpawnConfig<'a> {
     pub pgid_file_path: Option<PathBuf>,
     /// Force pipe-based spawning instead of PTY (for testing fallback).
     pub force_pipe: bool,
+    /// Raw fds to pass to the child at fd 3, 4, 5... (LISTEN_FDS protocol).
+    /// Empty means no socket passing. When non-empty, pipe mode is forced
+    /// (pty-process doesn't expose pre_exec for fd placement).
+    pub listen_fds: Vec<std::os::unix::io::RawFd>,
 }
 
 /// Errors from process spawning and management.
@@ -199,7 +204,9 @@ impl Drop for ProcessHandle {
 pub async fn spawn_process(
     config: SpawnConfig<'_>,
 ) -> Result<(ProcessHandle, ChildOutput), ProcessError> {
-    if !config.force_pipe {
+    // Force pipe mode when passing listen fds — pty-process doesn't expose
+    // pre_exec for fd placement. Network services don't need a PTY anyway.
+    if !config.force_pipe && config.listen_fds.is_empty() {
         match spawn_pty(&config) {
             Ok((child, read_pty, write_pty)) => {
                 let pgid = child_pgid(&child, config.cmd)?;
@@ -292,11 +299,29 @@ fn spawn_pipe(config: &SpawnConfig<'_>) -> Result<tokio::process::Child, Process
         cmd.current_dir(dir);
     }
 
-    // Safety: setpgid and dup2 are async-signal-safe.
+    // Clone listen fds for the pre_exec closure.
+    let listen_fds = config.listen_fds.clone();
+
+    // Safety: setpgid, dup2, dup, fcntl, and close are async-signal-safe.
     // dup2(1, 2) merges stderr into stdout. This works because tokio has
     // already set up fd 1 as the pipe's write end before pre_exec runs.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
+            // Place listen fds at fd 3, 4, 5... and clear CLOEXEC.
+            socket::place_fds_for_exec(&listen_fds)?;
+
+            // Set LISTEN_PID to our (child's) PID. getpid() returns the
+            // child's PID after fork, before exec.
+            if !listen_fds.is_empty() {
+                let pid = libc::getpid();
+                let pid_str = format!("{pid}\0");
+                libc::setenv(
+                    c"LISTEN_PID".as_ptr(),
+                    pid_str.as_ptr().cast(),
+                    1,
+                );
+            }
+
             nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
                 .map_err(std::io::Error::other)?;
             nix::unistd::dup2(1, 2).map_err(std::io::Error::other)?;

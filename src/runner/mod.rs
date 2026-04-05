@@ -353,6 +353,10 @@ pub struct Runner {
     task_states: HashMap<String, TaskItemState>,
     service_handles: HashMap<String, ServiceHandle>,
 
+    /// Bound TCP sockets for services with `listen` addresses.
+    /// Outlive service restarts — don holds the sockets so ports are never released.
+    bound_sockets: HashMap<String, crate::process::socket::BoundSockets>,
+
     // Channels
     cmd_tx: mpsc::Sender<RunnerCommand>,
     cmd_rx: mpsc::Receiver<RunnerCommand>,
@@ -417,6 +421,7 @@ impl Runner {
             service_states,
             task_states: task_item_states,
             service_handles: HashMap::new(),
+            bound_sockets: HashMap::new(),
             cmd_tx,
             cmd_rx,
             event_tx,
@@ -461,6 +466,7 @@ impl Runner {
             service_states,
             task_states: task_item_states,
             service_handles: HashMap::new(),
+            bound_sockets: HashMap::new(),
             cmd_tx,
             cmd_rx,
             event_tx,
@@ -724,9 +730,40 @@ impl Runner {
         self.output_manager
             .lifecycle_event(&format!("starting {name}..."));
 
-        let pid_dir = self.base_dir.join(".don").join("pids");
+        // Bind listen sockets if configured and not already bound.
+        if !resolved.listen.is_empty() && !self.bound_sockets.contains_key(name) {
+            match crate::process::socket::bind_sockets(&resolved.listen) {
+                Ok(sockets) => {
+                    self.output_manager.lifecycle_event(&format!(
+                        "{name}: bound {} listen socket{}",
+                        sockets.len(),
+                        if sockets.len() == 1 { "" } else { "s" }
+                    ));
+                    self.bound_sockets.insert(name.to_string(), sockets);
+                }
+                Err(e) => {
+                    self.output_manager
+                        .error_event(&format!("{name}: {e}"));
+                    self.service_states
+                        .insert(name.to_string(), ServiceState::Failed);
+                    let _ = done_tx
+                        .send(ItemDone {
+                            name: name.to_string(),
+                            kind: NodeKind::Service,
+                            success: false,
+                            message: Some(e.to_string()),
+                            elapsed: None,
+                        })
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
 
-        match service::start_service(name, &resolved, &self.base_dir, &pid_dir).await {
+        let pid_dir = self.base_dir.join(".don").join("pids");
+        let sockets = self.bound_sockets.get(name);
+
+        match service::start_service(name, &resolved, &self.base_dir, &pid_dir, sockets).await {
             Ok(start_result) => {
                 self.wire_service_output_and_ready_check(
                     name,
@@ -1063,6 +1100,7 @@ impl Runner {
                 env,
                 pgid_file_path: None,
                 force_pipe: true,
+                listen_fds: vec![],
             })
             .await
             {
@@ -1111,9 +1149,10 @@ impl Runner {
             }
         }
 
-        // Start the service again.
+        // Start the service again. Sockets are already bound (don holds them).
         let pid_dir = self.base_dir.join(".don").join("pids");
-        match service::start_service(name, &resolved, &self.base_dir, &pid_dir).await {
+        let sockets = self.bound_sockets.get(name);
+        match service::start_service(name, &resolved, &self.base_dir, &pid_dir, sockets).await {
             Ok(start_result) => {
                 self.wire_service_output_and_ready_check(name, start_result, &resolved, None);
             }
@@ -1347,6 +1386,8 @@ impl Runner {
         // All handles should already be stopped by initiate_shutdown.
         // Drop remaining handles to release PID files.
         self.service_handles.clear();
+        // Release bound sockets (closes listening ports).
+        self.bound_sockets.clear();
     }
 
     /// Collect status of all items.

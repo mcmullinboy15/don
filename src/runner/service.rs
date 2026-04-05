@@ -6,6 +6,7 @@
 use crate::config::{ReadyCheck, ResolvedService, ShutdownConfig};
 use crate::duration::parse_duration;
 use crate::process::env::merge_env;
+use crate::process::socket::BoundSockets;
 use crate::process::{ProcessHandle, SpawnConfig, spawn_process};
 use nix::sys::signal::Signal;
 use std::collections::HashMap;
@@ -51,6 +52,7 @@ pub(crate) async fn start_service(
     resolved: &ResolvedService,
     base_dir: &Path,
     pid_dir: &Path,
+    bound_sockets: Option<&BoundSockets>,
 ) -> Result<StartResult, ServiceError> {
     // Determine run command.
     let run_cmd = resolved
@@ -64,28 +66,38 @@ pub(crate) async fn start_service(
             ),
         })?;
 
-    // Merge environment.
+    // Merge environment. Inject LISTEN_FDS/LISTEN_FDNAMES if sockets are bound.
     let service_dir = resolved.dir.as_deref().unwrap_or(base_dir);
+    let injected = bound_sockets
+        .map(|s| s.listen_env())
+        .unwrap_or_default();
     let (env, _warnings) = merge_env(
         name,
         Some(service_dir),
         &resolved.env_file,
         &resolved.env,
-        &HashMap::new(),
+        &injected,
     )?;
 
     // Build PGID file path.
     std::fs::create_dir_all(pid_dir).map_err(crate::process::ProcessError::Io)?;
     let pgid_file_path = pid_dir.join(name);
 
-    // Spawn the process.
+    // Get raw fds to pass to the child (empty if no sockets).
+    let listen_fds = bound_sockets
+        .map(|s| s.raw_fds())
+        .unwrap_or_default();
+
+    // Spawn the process. Force pipe mode when passing listen fds
+    // (pty-process doesn't expose pre_exec for fd placement).
     let (handle, child_output) = spawn_process(SpawnConfig {
         cmd: &run_cmd.cmd,
         args: &run_cmd.args,
         dir: Some(service_dir),
         env,
         pgid_file_path: Some(pgid_file_path),
-        force_pipe: false,
+        force_pipe: !listen_fds.is_empty(),
+        listen_fds,
     })
     .await?;
 
@@ -160,6 +172,7 @@ async fn check_exec(cmd: &crate::config::Command) -> Result<(), ServiceError> {
         env,
         pgid_file_path: None,
         force_pipe: true,
+        listen_fds: vec![],
     })
     .await?;
 

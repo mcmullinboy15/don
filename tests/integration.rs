@@ -155,6 +155,40 @@ fn validate_invalid_watch_pattern() {
 }
 
 #[test]
+fn validate_tcp_ready_check_on_listen_address_warns() {
+    let toml = ConfigBuilder::new()
+        .add_custom_service("api", "mybin", &[])
+        .listen(&["0.0.0.0:3000"])
+        .ready_tcp("0.0.0.0:3000")
+        .done()
+        .build();
+
+    let config: Config = toml.parse().unwrap();
+    let warnings = config.validate(TEST_PLATFORM).unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains("TCP ready check") && w.contains("don holds that socket")),
+        "expected warning about TCP ready check on listen address, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn validate_tcp_ready_check_on_different_address_no_warning() {
+    let toml = ConfigBuilder::new()
+        .add_custom_service("api", "mybin", &[])
+        .listen(&["0.0.0.0:3000"])
+        .ready_tcp("0.0.0.0:4000")
+        .done()
+        .build();
+
+    let config: Config = toml.parse().unwrap();
+    let warnings = config.validate(TEST_PLATFORM).unwrap();
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings when TCP check is on a different address, got: {warnings:?}"
+    );
+}
+
+#[test]
 fn don_validate_cli_valid_config() {
     let dir = TempDir::new("cli-validate-valid");
     ConfigBuilder::new()

@@ -79,8 +79,9 @@ impl Config {
     ///
     /// Checks preset validity, ready check configuration, dependency references,
     /// profile references, and dependency cycles.
-    pub fn validate(&self, platform: Platform) -> Result<(), ConfigError> {
+    pub fn validate(&self, platform: Platform) -> Result<Vec<String>, ConfigError> {
         let mut errors = Vec::new();
+        let mut warnings = Vec::new();
         let all_names = self.all_names();
 
         // Check for name collisions between services and tasks
@@ -109,6 +110,20 @@ impl Config {
                         "service '{name}': ready check must have only one of: exec, tcp, or http"
                     ));
                 }
+            }
+            // Warn if a service with listen addresses uses a TCP ready check —
+            // the TCP connect will succeed immediately against don's socket
+            // without proving the service is actually accepting connections.
+            if !resolved.listen.is_empty()
+                && let Some(ref ready) = resolved.ready
+                && let Some(ref tcp_addr) = ready.tcp
+                && resolved.listen.iter().any(|l| l == tcp_addr)
+            {
+                warnings.push(format!(
+                    "service '{name}': TCP ready check on '{tcp_addr}' will pass \
+                     immediately because don holds that socket — use an HTTP or \
+                     exec ready check instead"
+                ));
             }
             for dep in &resolved.depends_on {
                 if !all_names.contains(dep.as_str()) {
@@ -201,7 +216,7 @@ impl Config {
         }
 
         if errors.is_empty() {
-            Ok(())
+            Ok(warnings)
         } else {
             Err(ConfigError::Validation { errors })
         }

@@ -18,6 +18,7 @@ fn basic_config<'a>(
         env: std::env::vars().collect(),
         pgid_file_path: None,
         force_pipe,
+        listen_fds: vec![],
     }
 }
 
@@ -207,6 +208,7 @@ async fn env_passed_to_child() {
         env,
         pgid_file_path: None,
         force_pipe: true,
+        listen_fds: vec![],
     };
     let (mut handle, mut output) = spawn_process(config).await.unwrap();
 

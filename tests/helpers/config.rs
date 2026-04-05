@@ -205,6 +205,14 @@ impl ServiceBuilder {
         self
     }
 
+    /// Set listen addresses.
+    pub fn listen(mut self, addrs: &[&str]) -> Self {
+        let a_str: Vec<String> = addrs.iter().map(|a| format!("\"{a}\"")).collect();
+        self.lines
+            .push(format!("listen = [{}]", a_str.join(", ")));
+        self
+    }
+
     /// Set debounce duration.
     pub fn debounce(mut self, duration: &str) -> Self {
         self.lines.push(format!("debounce = \"{duration}\""));

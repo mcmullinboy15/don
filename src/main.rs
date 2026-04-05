@@ -103,7 +103,13 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
         )
     })?;
 
-    config.validate(platform).map_err(|e| format!("Error: {e}"))
+    let warnings = config
+        .validate(platform)
+        .map_err(|e| format!("Error: {e}"))?;
+    for warning in &warnings {
+        eprintln!("Warning: {warning}");
+    }
+    Ok(())
 }
 
 async fn run_start(config_path: &std::path::Path) -> Result<(), String> {
@@ -118,9 +124,12 @@ async fn run_start(config_path: &std::path::Path) -> Result<(), String> {
         )
     })?;
 
-    config
+    let warnings = config
         .validate(platform)
         .map_err(|e| format!("Error: {e}"))?;
+    for warning in &warnings {
+        eprintln!("Warning: {warning}");
+    }
 
     // Determine base directory (where don.toml lives).
     let base_dir = config_path

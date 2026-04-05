@@ -17,6 +17,7 @@ fn basic_config<'a>(cmd: &'a str, args: &'a [String], force_pipe: bool) -> Spawn
         env: std::env::vars().collect(),
         pgid_file_path: None,
         force_pipe,
+        listen_fds: vec![],
     }
 }
 
