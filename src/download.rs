@@ -386,12 +386,10 @@ async fn download_and_verify(
         source: e,
     })?;
 
-    if !response.status().is_success() {
-        return Err(DownloadError::Http {
-            url: url.to_string(),
-            source: response.error_for_status().unwrap_err(),
-        });
-    }
+    let response = response.error_for_status().map_err(|e| DownloadError::Http {
+        url: url.to_string(),
+        source: e,
+    })?;
 
     let total_size = response.content_length();
     let mut file = std::fs::File::create(dest)?;
@@ -764,6 +762,7 @@ async fn run_setup_if_needed(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::path::PathBuf;

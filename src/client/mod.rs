@@ -1,0 +1,484 @@
+//! HTTP client for the daemon's unix-socket API.
+//!
+//! Speaks the same protocol as `server/routes.rs` — talks raw HTTP/1.1
+//! over a `UnixStream` (no hyper on the client side). Each request opens
+//! a fresh connection and sends `Connection: close`; the server fulfills
+//! and closes. Follow-mode log streams use chunked transfer encoding.
+
+use crate::runner::ItemStatus;
+use serde::Deserialize;
+use std::io;
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+
+/// Errors returned by the client.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    /// The daemon socket does not exist or refuses connections.
+    #[error("don daemon not running — start it with `don start` (socket: {})", path.display())]
+    NotRunning { path: PathBuf },
+    /// A service/task name is not known to the daemon.
+    #[error("{message}")]
+    NotFound { message: String },
+    /// Command rejected because it's misapplied (e.g. stop on a task).
+    #[error("{message}")]
+    BadRequest { message: String },
+    /// Command rejected because the target is in the wrong state.
+    #[error("{message}")]
+    Conflict { message: String },
+    /// Any other non-2xx response.
+    #[error("server error (HTTP {status}): {message}")]
+    Server { status: u16, message: String },
+    /// I/O error talking to the socket.
+    #[error("i/o error: {0}")]
+    Io(#[from] io::Error),
+    /// Malformed HTTP response (protocol-level problem).
+    #[error("invalid response: {0}")]
+    Invalid(String),
+    /// JSON (de)serialisation failure.
+    #[error("invalid json: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// Deserialised body of `GET /status`.
+#[derive(Debug, Deserialize)]
+pub struct StatusResponse {
+    pub items: Vec<ItemStatus>,
+}
+
+/// Deserialised body of `GET /logs/:name`.
+#[derive(Debug, Deserialize)]
+pub struct LogsResponse {
+    pub lines: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorBody {
+    error: String,
+}
+
+/// Client for the don daemon unix-socket API.
+pub struct Client {
+    socket_path: PathBuf,
+}
+
+impl Client {
+    /// Create a client pointed at `<base>/.don/don.sock`.
+    pub fn new(base_dir: &Path) -> Self {
+        Self {
+            socket_path: base_dir.join(".don").join("don.sock"),
+        }
+    }
+
+    /// Directly wrap an existing socket path (tests, non-standard layouts).
+    pub fn with_socket_path(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+
+    /// `GET /status`
+    pub async fn status(&self) -> Result<Vec<ItemStatus>, ClientError> {
+        let (status, body) = self.request("GET", "/status", false).await?;
+        ensure_ok(status, &body)?;
+        let parsed: StatusResponse = serde_json::from_slice(&body)?;
+        Ok(parsed.items)
+    }
+
+    /// `POST /start/:name`
+    pub async fn start(&self, name: &str) -> Result<(), ClientError> {
+        self.control("/start/", name).await
+    }
+
+    /// `POST /stop/:name`
+    pub async fn stop(&self, name: &str) -> Result<(), ClientError> {
+        self.control("/stop/", name).await
+    }
+
+    /// `POST /restart/:name`
+    pub async fn restart(&self, name: &str) -> Result<(), ClientError> {
+        self.control("/restart/", name).await
+    }
+
+    /// `GET /logs/:name?last=N`
+    pub async fn logs(&self, name: &str, last: usize) -> Result<Vec<String>, ClientError> {
+        let path = format!("/logs/{}?last={last}", urlencode(name));
+        let (status, body) = self.request("GET", &path, false).await?;
+        ensure_ok(status, &body)?;
+        let parsed: LogsResponse = serde_json::from_slice(&body)?;
+        Ok(parsed.lines)
+    }
+
+    /// `GET /logs/:name?last=N&follow=true` — opens a streaming connection
+    /// and invokes `on_line` for each NDJSON line the server sends. Returns
+    /// when the server closes the stream or the callback returns `Err`.
+    pub async fn logs_follow<F>(
+        &self,
+        name: &str,
+        last: usize,
+        mut on_line: F,
+    ) -> Result<(), ClientError>
+    where
+        F: FnMut(&str) -> Result<(), ClientError>,
+    {
+        let path = format!("/logs/{}?last={last}&follow=true", urlencode(name));
+        let mut stream = self.connect().await?;
+        write_request(&mut stream, "GET", &path, false).await?;
+        // Parse status line + headers.
+        let (status, headers, mut leftover) = read_head(&mut stream).await?;
+        if status != 200 {
+            // Drain body to read the error payload.
+            let body = drain_body(&mut stream, &headers, leftover).await?;
+            return Err(classify_error(status, &body));
+        }
+        let chunked = headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"));
+
+        // NDJSON: one `{"line":"..."}` per line.
+        // Buffer raw body bytes, decode chunks if needed, split on \n.
+        let mut pending = Vec::<u8>::new();
+        loop {
+            let data: Vec<u8> = if chunked {
+                match read_one_chunk(&mut stream, &mut leftover).await? {
+                    Some(bytes) => bytes,
+                    None => break, // terminator chunk
+                }
+            } else {
+                // Plain body: read directly until EOF.
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                buf[..n].to_vec()
+            };
+            pending.extend_from_slice(&data);
+            while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+                let line_bytes: Vec<u8> = pending.drain(..=nl).collect();
+                let line_slice = &line_bytes[..line_bytes.len() - 1]; // drop \n
+                if line_slice.is_empty() {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(line_slice);
+                on_line(&text)?;
+            }
+        }
+        Ok(())
+    }
+
+    // --- internals ---
+
+    async fn control(&self, prefix: &str, name: &str) -> Result<(), ClientError> {
+        let path = format!("{prefix}{}", urlencode(name));
+        let (status, body) = self.request("POST", &path, false).await?;
+        if status == 204 {
+            return Ok(());
+        }
+        Err(classify_error(status, &body))
+    }
+
+    async fn connect(&self) -> Result<UnixStream, ClientError> {
+        match UnixStream::connect(&self.socket_path).await {
+            Ok(s) => Ok(s),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Err(ClientError::NotRunning {
+                    path: self.socket_path.clone(),
+                })
+            }
+            Err(e) => Err(ClientError::Io(e)),
+        }
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        has_body: bool,
+    ) -> Result<(u16, Vec<u8>), ClientError> {
+        let mut stream = self.connect().await?;
+        write_request(&mut stream, method, path, has_body).await?;
+        let (status, headers, leftover) = read_head(&mut stream).await?;
+        let body = drain_body(&mut stream, &headers, leftover).await?;
+        Ok((status, body))
+    }
+}
+
+fn ensure_ok(status: u16, body: &[u8]) -> Result<(), ClientError> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(classify_error(status, body))
+    }
+}
+
+fn classify_error(status: u16, body: &[u8]) -> ClientError {
+    let message = extract_error_message(body)
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
+    match status {
+        404 => ClientError::NotFound { message },
+        400 => ClientError::BadRequest { message },
+        409 => ClientError::Conflict { message },
+        other => ClientError::Server {
+            status: other,
+            message,
+        },
+    }
+}
+
+fn extract_error_message(body: &[u8]) -> Option<String> {
+    let parsed: ErrorBody = serde_json::from_slice(body).ok()?;
+    Some(parsed.error)
+}
+
+async fn write_request(
+    stream: &mut UnixStream,
+    method: &str,
+    path: &str,
+    has_body: bool,
+) -> Result<(), ClientError> {
+    // Content-Length: 0 makes POSTs unambiguous for servers that want it.
+    let cl = if has_body { "" } else { "Content-Length: 0\r\n" };
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         {cl}Connection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+    Ok(())
+}
+
+/// Read the status line and headers from a fresh response. Returns the
+/// status code, header pairs, and any leftover bytes that belong to the body.
+async fn read_head(
+    stream: &mut UnixStream,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), ClientError> {
+    let mut buf = Vec::<u8>::new();
+    let mut scratch = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut scratch).await?;
+        if n == 0 {
+            return Err(ClientError::Invalid("connection closed before headers".into()));
+        }
+        buf.extend_from_slice(&scratch[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        // Guard against absurd header sizes.
+        if buf.len() > 64 * 1024 {
+            return Err(ClientError::Invalid("headers too large".into()));
+        }
+    }
+    let header_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| ClientError::Invalid("no header terminator".into()))?;
+    let head_bytes = &buf[..header_end];
+    let leftover = buf[header_end + 4..].to_vec();
+    let head_text = std::str::from_utf8(head_bytes)
+        .map_err(|_| ClientError::Invalid("non-utf8 headers".into()))?;
+    let mut lines = head_text.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| ClientError::Invalid("missing status line".into()))?;
+    let status = parse_status(status_line)?;
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    Ok((status, headers, leftover))
+}
+
+fn parse_status(line: &str) -> Result<u16, ClientError> {
+    let mut parts = line.split(' ');
+    let _version = parts.next();
+    let code = parts
+        .next()
+        .ok_or_else(|| ClientError::Invalid(format!("bad status line: {line}")))?;
+    code.parse::<u16>()
+        .map_err(|_| ClientError::Invalid(format!("bad status code: {code}")))
+}
+
+/// Read the entire response body. Supports Content-Length, chunked, or
+/// read-until-close (our server sets `Connection: close` on non-stream
+/// responses).
+async fn drain_body(
+    stream: &mut UnixStream,
+    headers: &[(String, String)],
+    mut leftover: Vec<u8>,
+) -> Result<Vec<u8>, ClientError> {
+    let content_length = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.parse::<usize>().ok());
+    let chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+
+    if chunked {
+        let mut out = Vec::new();
+        while let Some(chunk) = read_one_chunk(stream, &mut leftover).await? {
+            out.extend_from_slice(&chunk);
+        }
+        return Ok(out);
+    }
+
+    if let Some(len) = content_length {
+        while leftover.len() < len {
+            let mut scratch = [0u8; 4096];
+            let n = stream.read(&mut scratch).await?;
+            if n == 0 {
+                break;
+            }
+            leftover.extend_from_slice(&scratch[..n]);
+        }
+        leftover.truncate(len);
+        return Ok(leftover);
+    }
+
+    // Read-until-EOF.
+    let mut out = leftover;
+    let mut scratch = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut scratch).await?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&scratch[..n]);
+    }
+    Ok(out)
+}
+
+/// Read one chunk from a chunked-encoded body, consuming from `leftover` first
+/// and then the stream as needed. Returns `Ok(None)` on the terminator chunk.
+async fn read_one_chunk(
+    stream: &mut UnixStream,
+    leftover: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>, ClientError> {
+    // Read the size line.
+    let size_line = read_line(stream, leftover).await?;
+    let size_str = size_line.trim();
+    // Ignore optional chunk extensions (";...").
+    let size_str = size_str.split(';').next().unwrap_or("").trim();
+    let size = usize::from_str_radix(size_str, 16)
+        .map_err(|_| ClientError::Invalid(format!("bad chunk size: {size_str:?}")))?;
+    if size == 0 {
+        // Consume the trailing CRLF after the zero chunk.
+        let _ = read_line(stream, leftover).await;
+        return Ok(None);
+    }
+    // Read `size` bytes + trailing CRLF.
+    let mut data = Vec::with_capacity(size);
+    while data.len() < size {
+        if !leftover.is_empty() {
+            let need = size - data.len();
+            let take = need.min(leftover.len());
+            data.extend(leftover.drain(..take));
+        } else {
+            let mut scratch = [0u8; 4096];
+            let n = stream.read(&mut scratch).await?;
+            if n == 0 {
+                return Err(ClientError::Invalid("unexpected EOF in chunk body".into()));
+            }
+            leftover.extend_from_slice(&scratch[..n]);
+        }
+    }
+    // Consume trailing CRLF.
+    while leftover.len() < 2 {
+        let mut scratch = [0u8; 16];
+        let n = stream.read(&mut scratch).await?;
+        if n == 0 {
+            break;
+        }
+        leftover.extend_from_slice(&scratch[..n]);
+    }
+    if leftover.len() >= 2 {
+        leftover.drain(..2);
+    }
+    Ok(Some(data))
+}
+
+/// Read a CRLF-terminated line from `leftover` + `stream`.
+async fn read_line(stream: &mut UnixStream, leftover: &mut Vec<u8>) -> Result<String, ClientError> {
+    loop {
+        if let Some(pos) = leftover.windows(2).position(|w| w == b"\r\n") {
+            let line_bytes: Vec<u8> = leftover.drain(..pos).collect();
+            leftover.drain(..2); // consume CRLF
+            return String::from_utf8(line_bytes)
+                .map_err(|_| ClientError::Invalid("non-utf8 chunk line".into()));
+        }
+        let mut scratch = [0u8; 256];
+        let n = stream.read(&mut scratch).await?;
+        if n == 0 {
+            return Err(ClientError::Invalid("unexpected EOF reading line".into()));
+        }
+        leftover.extend_from_slice(&scratch[..n]);
+    }
+}
+
+/// Minimal percent-encoder for the path segment (names may contain `/`, `%`, `?`).
+fn urlencode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        let b = *byte;
+        let ok = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if ok {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urlencode_handles_special_chars() {
+        assert_eq!(urlencode("api"), "api");
+        assert_eq!(urlencode("a/b"), "a%2Fb");
+        assert_eq!(urlencode("ab c"), "ab%20c");
+        assert_eq!(urlencode("foo-bar_baz.v1"), "foo-bar_baz.v1");
+    }
+
+    #[test]
+    fn parse_status_extracts_code() {
+        assert_eq!(parse_status("HTTP/1.1 200 OK").unwrap(), 200);
+        assert_eq!(parse_status("HTTP/1.1 404 Not Found").unwrap(), 404);
+        assert_eq!(parse_status("HTTP/1.1 500 ").unwrap(), 500);
+    }
+
+    #[test]
+    fn classify_error_maps_statuses() {
+        let err = classify_error(404, br#"{"error":"no such name 'ghost'"}"#);
+        assert!(matches!(err, ClientError::NotFound { .. }));
+        let err = classify_error(400, br#"{"error":"not a service"}"#);
+        assert!(matches!(err, ClientError::BadRequest { .. }));
+        let err = classify_error(409, br#"{"error":"already running"}"#);
+        assert!(matches!(err, ClientError::Conflict { .. }));
+        let err = classify_error(500, br#"{"error":"boom"}"#);
+        assert!(matches!(err, ClientError::Server { status: 500, .. }));
+    }
+
+    #[test]
+    fn extract_error_message_handles_missing_field() {
+        assert_eq!(
+            extract_error_message(br#"{"error":"oops"}"#),
+            Some("oops".to_string())
+        );
+        assert_eq!(extract_error_message(b"not json"), None);
+    }
+}
+

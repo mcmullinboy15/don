@@ -1,3 +1,4 @@
+pub mod client;
 pub mod config;
 pub mod docker;
 pub mod download;
@@ -5,6 +6,7 @@ pub mod duration;
 pub mod output;
 pub mod process;
 pub mod runner;
+pub mod server;
 pub mod task_state;
 pub mod watch;
 

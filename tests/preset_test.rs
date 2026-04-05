@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
@@ -181,14 +182,13 @@ func main() {
         .unwrap();
 
         // Use ldflags to inject a version string.
-        let toml = format!(
-            r#"
+        let toml = r#"
 [services.api]
 go.package = "."
 go.ldflags = "-X main.version=1.2.3"
 ready.exec.cmd = "true"
 "#
-        );
+        .to_string();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
 

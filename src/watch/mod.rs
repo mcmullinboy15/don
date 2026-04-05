@@ -513,6 +513,7 @@ async fn sleep_until_or_pending(deadline: Option<Instant>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

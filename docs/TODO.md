@@ -328,8 +328,8 @@ Artifact downloading, verification, and caching.
 
 HTTP API for CLI-to-daemon communication. Build the server first so the CLI can talk to it.
 
-- [ ] `server/mod.rs` — axum app listening on `.don/don.sock`
-- [ ] `server/routes.rs` — endpoints:
+- [x] `server/mod.rs` — axum app listening on `.don/don.sock`
+- [x] `server/routes.rs` — endpoints:
   - `GET /status` — status of all services/tasks
   - `POST /restart/:name` — restart a service
   - `POST /stop/:name` — stop a service
@@ -337,12 +337,12 @@ HTTP API for CLI-to-daemon communication. Build the server first so the CLI can 
   - `GET /logs/:name?last=N` — read from ring buffer
 
 ### Test Coverage Checkpoint
-- [ ] Integration test: start the server, connect to unix socket, hit `GET /status`, verify JSON response with service states
-- [ ] Integration test: start a service, `POST /stop/:name`, verify it stops, `GET /status` shows stopped
-- [ ] Integration test: `POST /restart/:name` on a running service — verify it restarts
-- [ ] Integration test: `POST /stop/:name` with unknown name — verify 404 response
-- [ ] Integration test: `GET /logs/:name?last=5` — verify last 5 lines from ring buffer
-- [ ] Integration test: `GET /logs/:name` for a service with `log = "ignore"` — verify ring buffer still has output
+- [x] Integration test: start the server, connect to unix socket, hit `GET /status`, verify JSON response with service states
+- [x] Integration test: start a service, `POST /stop/:name`, verify it stops, `GET /status` shows stopped
+- [x] Integration test: `POST /restart/:name` on a running service — verify it restarts
+- [x] Integration test: `POST /stop/:name` with unknown name — verify 404 response
+- [x] Integration test: `GET /logs/:name?last=5` — verify last 5 lines from ring buffer
+- [x] Integration test: `GET /logs/:name` for a service with `log = "ignore"` — verify ring buffer still has output
 
 ---
 
@@ -350,24 +350,25 @@ HTTP API for CLI-to-daemon communication. Build the server first so the CLI can 
 
 Wire all subcommands to the unix socket API.
 
-- [ ] `don start` — start the daemon, run everything (or `--profile` subset)
-- [ ] `don start --profile <name>` — resolve profile with transitive deps
-- [ ] `don stop <name>` — connect to socket, POST stop
-- [ ] `don restart <name>` — connect to socket, POST restart
-- [ ] `don status` — connect to socket, GET status, display table
-- [ ] `don logs <name>` — connect to socket, GET logs, stream to terminal
-- [ ] `don logs <name> --last N` — show last N lines from ring buffer
-- [ ] `don cleanup` — run stale state cleanup without starting anything
-- [ ] CLI detects if don is running (try connect to socket) — commands that need it fail with a clear error if not
+- [x] `don start` — start the daemon, run everything (or `--profile` subset)
+- [ ] `don start --profile <name>` — resolve profile with transitive deps (deferred to Phase 15)
+- [x] `don stop <name>` — connect to socket, POST stop
+- [x] `don restart <name>` — connect to socket, POST restart
+- [x] `don start <name>` — connect to socket, POST start (restart a stopped service)
+- [x] `don status` — connect to socket, GET status, display table
+- [x] `don logs <name> --follow` — connect to socket, stream NDJSON to terminal
+- [x] `don logs <name> --last N` — show last N lines from ring buffer
+- [ ] `don cleanup` — run stale state cleanup without starting anything (deferred to Phase 12)
+- [x] CLI detects if don is running (try connect to socket) — commands that need it fail with a clear error if not
 
 ### Test Coverage Checkpoint
-- [ ] Integration test: `don validate` with a valid config — exit 0, no output on stderr
-- [ ] Integration test: `don validate` with an invalid config — exit non-zero, error message on stderr
-- [ ] Integration test: `don validate` with a missing config file — exit non-zero, helpful error
-- [ ] Integration test: start don, run `don status` from another process, verify output lists services
-- [ ] Integration test: run `don stop api` when don is not running — verify clear error message
-- [ ] Integration test: `don start --profile frontend` — verify only profiled services start
-- [ ] Integration test: `don logs api --last 10` — verify correct output
+- [x] Integration test: `don validate` with a valid config — exit 0, no output on stderr
+- [x] Integration test: `don validate` with an invalid config — exit non-zero, error message on stderr
+- [x] Integration test: `don validate` with a missing config file — exit non-zero, helpful error
+- [x] Integration test: start don, run `don status` from another process, verify output lists services
+- [x] Integration test: run `don stop api` when don is not running — verify clear error message
+- [ ] Integration test: `don start --profile frontend` — verify only profiled services start (Phase 15)
+- [x] Integration test: `don logs api --last 10` — verify correct output
 
 ---
 

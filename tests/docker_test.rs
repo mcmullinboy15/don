@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Docker integration tests — require a running Docker daemon.
 //!
 //! Set `DON_TEST_DOCKER=1` to enable. Skipped by default.
@@ -7,7 +8,6 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};

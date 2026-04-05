@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
@@ -105,7 +106,7 @@ fn integration_parallel_services_start_concurrently() {
             .done()
             .build();
 
-        let (mut runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let start = std::time::Instant::now();
 
         let handle = tokio::spawn(async move {
@@ -161,7 +162,7 @@ fn integration_dependency_ordering_a_before_b() {
             .done()
             .build();
 
-        let (mut runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -211,7 +212,7 @@ fn integration_task_depends_on_service() {
             .done()
             .build();
 
-        let (mut runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -258,7 +259,7 @@ fn integration_tcp_ready_check() {
             .done()
             .build();
 
-        let (mut runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -309,7 +310,7 @@ fn integration_exec_ready_check_with_retries() {
             .done()
             .build();
 
-        let (mut runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -352,7 +353,7 @@ fn integration_ready_check_exhausted() {
             .done()
             .build();
 
-        let (mut runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -397,7 +398,7 @@ fn integration_task_watch_skip() {
             .build();
 
         // Task-only config — runner exits on its own when no services remain.
-        let (mut runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         runner.run().await.unwrap();
 
         let output = read_buf(&buf);
@@ -432,7 +433,7 @@ fn integration_task_watch_run_on_change() {
             .done()
             .build();
 
-        let (mut runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         runner.run().await.unwrap();
 
         let output = read_buf(&buf);
@@ -460,7 +461,7 @@ fn integration_task_timeout() {
             .done()
             .build();
 
-        let (mut runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
 
         let start = std::time::Instant::now();
         runner.run().await.unwrap();
@@ -508,7 +509,7 @@ fn integration_http_ready_check() {
             .done()
             .build();
 
-        let (mut runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });

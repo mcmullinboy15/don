@@ -355,6 +355,7 @@ pub(crate) fn go_binary_path(config: &GoConfig, service_name: &str, base_dir: &P
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

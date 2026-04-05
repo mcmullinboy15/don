@@ -33,13 +33,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, DurationError> {
         .ok_or_else(|| DurationError::MissingUnit(s.to_string()))?;
 
     let (num_str, unit) = s.split_at(unit_start);
-    if num_str.is_empty() {
-        return Err(DurationError::InvalidNumber {
-            input: s.to_string(),
-            source: num_str.parse::<f64>().unwrap_err(),
-        });
-    }
-
+    // Empty num_str will itself produce a ParseFloatError — no special case needed.
     let value: f64 = num_str.parse().map_err(|e| DurationError::InvalidNumber {
         input: s.to_string(),
         source: e,
@@ -89,6 +83,7 @@ pub enum DurationError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

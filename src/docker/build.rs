@@ -87,6 +87,7 @@ fn create_tar_context(context_path: &Path) -> Result<Vec<u8>, DockerError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

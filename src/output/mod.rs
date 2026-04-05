@@ -47,7 +47,7 @@ const COLORS: &[Color] = &[
 ];
 
 /// A message to a sink. Sinks receive these and write them to their destination.
-pub(crate) struct SinkLine {
+pub struct SinkLine {
     /// Formatted prefix (color-coded service name, or bold [don] for lifecycle).
     /// Empty for file sinks (raw output).
     pub prefix: Bytes,
@@ -59,6 +59,10 @@ pub(crate) struct SinkLine {
 #[derive(Clone)]
 pub(crate) struct SinkHandle {
     pub tx: mpsc::Sender<SinkLine>,
+    /// When true, use `try_send` and drop the sink if the channel is full.
+    /// Used for follow sinks so that a slow HTTP client can't block the
+    /// service's output pipeline.
+    pub drop_on_full: bool,
 }
 
 /// Per-service output state. Owned by OutputManager, never removed.
@@ -104,20 +108,35 @@ impl ServiceWriter {
                     let line = Bytes::copy_from_slice(&line_buf);
 
                     // Lock: push to ring buffer + snapshot sinks. Released before sends.
+                    // Prune closed sinks (e.g. disconnected follow clients) inline.
                     let (prefix, sinks) = {
                         let mut state = self.state.lock().await;
+                        state.sinks.retain(|s| !s.tx.is_closed());
                         state.ring_buffer.push(line.clone());
                         (state.prefix.clone(), state.sinks.clone())
                     };
 
+                    let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
                     for sink in &sinks {
-                        let _ = sink
-                            .tx
-                            .send(SinkLine {
-                                prefix: prefix.clone(),
-                                line: line.clone(),
-                            })
-                            .await;
+                        let msg = SinkLine {
+                            prefix: prefix.clone(),
+                            line: line.clone(),
+                        };
+                        if sink.drop_on_full {
+                            // Non-blocking: if the client can't keep up, drop
+                            // the sink so the service's output isn't stalled.
+                            if sink.tx.try_send(msg).is_err() {
+                                dropped.push(sink.tx.clone());
+                            }
+                        } else {
+                            let _ = sink.tx.send(msg).await;
+                        }
+                    }
+                    if !dropped.is_empty() {
+                        let mut state = self.state.lock().await;
+                        state
+                            .sinks
+                            .retain(|s| !dropped.iter().any(|d| d.same_channel(&s.tx)));
                     }
                 }
                 Err(e) => return Err(e),
@@ -135,17 +154,29 @@ impl ServiceWriter {
         let line = Bytes::from(line.to_string());
         let (prefix, sinks) = {
             let mut state = self.state.lock().await;
+            state.sinks.retain(|s| !s.tx.is_closed());
             state.ring_buffer.push(line.clone());
             (state.prefix.clone(), state.sinks.clone())
         };
+        let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
         for sink in &sinks {
-            let _ = sink
-                .tx
-                .send(SinkLine {
-                    prefix: prefix.clone(),
-                    line: line.clone(),
-                })
-                .await;
+            let msg = SinkLine {
+                prefix: prefix.clone(),
+                line: line.clone(),
+            };
+            if sink.drop_on_full {
+                if sink.tx.try_send(msg).is_err() {
+                    dropped.push(sink.tx.clone());
+                }
+            } else {
+                let _ = sink.tx.send(msg).await;
+            }
+        }
+        if !dropped.is_empty() {
+            let mut state = self.state.lock().await;
+            state
+                .sinks
+                .retain(|s| !dropped.iter().any(|d| d.same_channel(&s.tx)));
         }
     }
 }
@@ -219,7 +250,7 @@ impl OutputManager {
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
         let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, writer));
-        let stdout_sink = SinkHandle { tx: stdout_tx };
+        let stdout_sink = SinkHandle { tx: stdout_tx, drop_on_full: false };
 
         // Spawn file sink tasks (deduplicated by path).
         let mut file_sinks: HashMap<PathBuf, SinkHandle> = HashMap::new();
@@ -232,7 +263,7 @@ impl OutputManager {
                 let file = open_log_file(path).await?;
                 let (tx, rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
                 writer_handles.push(tokio::spawn(file_sink_task(rx, file)));
-                file_sinks.insert(path.clone(), SinkHandle { tx });
+                file_sinks.insert(path.clone(), SinkHandle { tx, drop_on_full: false });
             }
         }
 
@@ -291,6 +322,43 @@ impl OutputManager {
             .get(name)
             .cloned()
             .map(|state| ServiceWriter { state })
+    }
+
+    /// Attach a follow sink: a freshly-created mpsc channel preloaded with
+    /// the last N buffered lines, then registered as a sink for this service.
+    /// New lines are delivered until the receiver is dropped (or the client
+    /// is too slow and the sink's buffer fills — it then gets disconnected).
+    ///
+    /// `live_capacity` is the headroom for live lines *on top of* the preloaded
+    /// snapshot, so slow readers don't block immediately after connection.
+    ///
+    /// Returns `None` if the service name is unknown.
+    pub async fn add_follow_sink(
+        &self,
+        name: &str,
+        last_n: usize,
+        live_capacity: usize,
+    ) -> Option<mpsc::Receiver<SinkLine>> {
+        let state_arc = self.services.get(name)?.clone();
+        // Channel must hold the preloaded snapshot AND live headroom without
+        // blocking (or dropping the freshly-connected client immediately).
+        let capacity = last_n.saturating_add(live_capacity).max(1);
+        let (tx, rx) = mpsc::channel::<SinkLine>(capacity);
+        let mut state = state_arc.lock().await;
+        let prefix = state.prefix.clone();
+        // Preload last N ring buffer lines. Channel has `capacity` slots and
+        // is empty, so try_send is safe here.
+        for line in state.ring_buffer.last_n(last_n) {
+            let sink_line = SinkLine {
+                prefix: prefix.clone(),
+                line: Bytes::copy_from_slice(line),
+            };
+            if tx.try_send(sink_line).is_err() {
+                break;
+            }
+        }
+        state.sinks.push(SinkHandle { tx, drop_on_full: true });
+        Some(rx)
     }
 
     /// Read the last N lines from a service's ring buffer, joined by newlines.
@@ -418,6 +486,7 @@ async fn read_until_newline<R: AsyncRead + Unpin>(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
 
 use don::process::{cleanup_pgid_file, read_pgid_file, spawn_process, ChildOutput, SpawnConfig};

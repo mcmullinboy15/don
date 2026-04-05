@@ -5,6 +5,7 @@ pub mod env;
 pub mod pid_file;
 pub(crate) mod socket;
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(crate) mod test_util;
 
 use nix::sys::signal::{Signal, killpg};

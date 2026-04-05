@@ -26,7 +26,8 @@ use self::service::ServiceHandle;
 static SIGNAL_COUNT: AtomicU8 = AtomicU8::new(0);
 
 /// The state of a service in the runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ServiceState {
     Pending,
     Starting,
@@ -44,11 +45,6 @@ impl ServiceState {
         matches!(self, Self::Ready)
     }
 
-    /// Whether this is a terminal state (no further transitions expected).
-    #[cfg(test)]
-    pub(crate) fn is_terminal(&self) -> bool {
-        matches!(self, Self::Stopped | Self::Failed)
-    }
 
     /// Valid transitions from one state to another.
     #[cfg(test)]
@@ -75,7 +71,8 @@ impl ServiceState {
 }
 
 /// The state of a task in the runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskItemState {
     Pending,
     Running,
@@ -92,10 +89,6 @@ impl TaskItemState {
         matches!(self, Self::Completed | Self::Skipped | Self::PendingRerun)
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Skipped | Self::Failed)
-    }
 }
 
 /// An item in the dependency graph — either a service or a task.
@@ -105,14 +98,55 @@ pub(crate) enum NodeKind {
     Task,
 }
 
+/// Result of a user-initiated command (Start/Stop/Restart).
+/// `Ok(())` on success, `Err(String)` with a user-facing error message.
+pub type CommandResult = Result<(), CommandError>;
+
+/// Errors returned to API callers for service control commands.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandError {
+    /// No service with this name exists in the config.
+    UnknownService { name: String },
+    /// The name refers to a task, not a service — start/stop/restart only
+    /// apply to services.
+    NotAService { name: String },
+    /// The service is already running (for Start) or already stopped (for Stop).
+    InvalidState { name: String, message: String },
+    /// The operation itself failed.
+    Failed { name: String, message: String },
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownService { name } => write!(f, "unknown service '{name}'"),
+            Self::NotAService { name } => {
+                write!(f, "'{name}' is a task — start/stop/restart only apply to services")
+            }
+            Self::InvalidState { name, message } => write!(f, "{name}: {message}"),
+            Self::Failed { name, message } => write!(f, "{name}: {message}"),
+        }
+    }
+}
+
 /// A command sent to the runner via its `mpsc` channel.
 pub enum RunnerCommand {
-    /// Start a specific service (future use — CLI/API).
-    Start { name: String },
-    /// Stop a specific service.
-    Stop { name: String },
-    /// Restart a specific service.
-    Restart { name: String },
+    /// Start a stopped service.
+    Start {
+        name: String,
+        reply: oneshot::Sender<CommandResult>,
+    },
+    /// Stop a running service.
+    Stop {
+        name: String,
+        reply: oneshot::Sender<CommandResult>,
+    },
+    /// Restart a service.
+    Restart {
+        name: String,
+        reply: oneshot::Sender<CommandResult>,
+    },
     /// Rebuild a service triggered by a file watch event.
     /// Runs the build command (if any), then restarts the service.
     Rebuild { name: String },
@@ -122,16 +156,30 @@ pub enum RunnerCommand {
     Status {
         reply: oneshot::Sender<Vec<ItemStatus>>,
     },
+    /// Read the last N lines from a service or task's ring buffer.
+    /// Returns None if the name is unknown.
+    Logs {
+        name: String,
+        last_n: usize,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Subscribe to live log output. Returns a receiver preloaded with the
+    /// last N lines, then streaming new output. None if name is unknown.
+    LogsFollow {
+        name: String,
+        last_n: usize,
+        reply: oneshot::Sender<Option<mpsc::Receiver<crate::output::SinkLine>>>,
+    },
     /// Initiate graceful shutdown.
     Shutdown,
 }
 
 /// Status of a single item (service or task) for status queries.
-#[derive(Debug, Clone)]
-pub struct ItemStatus {
-    pub name: String,
-    pub kind: String,
-    pub state: String,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ItemStatus {
+    Service { name: String, state: ServiceState },
+    Task { name: String, state: TaskItemState },
 }
 
 /// An event broadcast from the runner for external consumers.
@@ -320,6 +368,7 @@ fn find_cycle(deps: &HashMap<String, Vec<String>>, candidates: &[String]) -> Opt
 /// Compute the topological depth of each node (for parallel execution ordering).
 /// Depth 0 = no dependencies. Higher depth = must wait for deeper nodes.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(crate) fn compute_depths(
     order: &[String],
     deps: &HashMap<String, Vec<String>>,
@@ -359,6 +408,9 @@ pub struct Runner {
     /// Bound TCP sockets for services with `listen` addresses.
     /// Outlive service restarts — don holds the sockets so ports are never released.
     bound_sockets: HashMap<String, crate::process::socket::BoundSockets>,
+
+    /// Signals the API server task to stop accepting connections.
+    server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 
     /// Docker API client. `Some` if any service uses the docker preset.
     docker_client: Option<bollard::Docker>,
@@ -468,58 +520,13 @@ impl Runner {
             task_states: task_item_states,
             service_handles: HashMap::new(),
             bound_sockets: HashMap::new(),
+            server_shutdown_tx: None,
             docker_client,
             cmd_tx,
             cmd_rx,
             event_tx,
             shutdown_rx,
             _don_pid_file: Some(don_pid_file),
-        })
-    }
-
-    /// Create a runner without acquiring the don PID file (for testing).
-    #[cfg(test)]
-    pub(crate) fn new_without_pid_file(
-        config: Config,
-        platform: Platform,
-        output_manager: OutputManager,
-        base_dir: PathBuf,
-        shutdown_rx: mpsc::Receiver<()>,
-    ) -> Result<Self, RunnerError> {
-        let (cmd_tx, cmd_rx) = mpsc::channel(64);
-        let (event_tx, _) = broadcast::channel(256);
-
-        let don_dir = base_dir.join(".don");
-        std::fs::create_dir_all(&don_dir).map_err(RunnerError::Io)?;
-
-        let task_state = TaskState::new(don_dir.join("task-state"));
-
-        let mut service_states = HashMap::new();
-        for name in config.services.keys() {
-            service_states.insert(name.clone(), ServiceState::Pending);
-        }
-
-        let mut task_item_states = HashMap::new();
-        for name in config.tasks.keys() {
-            task_item_states.insert(name.clone(), TaskItemState::Pending);
-        }
-
-        Ok(Self {
-            config,
-            platform,
-            output_manager,
-            base_dir,
-            task_state,
-            service_states,
-            task_states: task_item_states,
-            service_handles: HashMap::new(),
-            bound_sockets: HashMap::new(),
-            docker_client: None,
-            cmd_tx,
-            cmd_rx,
-            event_tx,
-            shutdown_rx,
-            _don_pid_file: None,
         })
     }
 
@@ -566,6 +573,38 @@ impl Runner {
             task_count,
             if task_count == 1 { "" } else { "s" },
         ));
+
+        // Bind the unix socket API synchronously so bind errors surface
+        // visibly at startup. Only spawn the accept loop if bind succeeds.
+        let socket_path = self.base_dir.join(".don").join("don.sock");
+        let socket_display = socket_path.display().to_string();
+        match crate::server::bind_api(&socket_path) {
+            Ok(listener) => {
+                let (server_shutdown_tx, server_shutdown_rx) =
+                    tokio::sync::watch::channel(false);
+                let cmd_tx_for_server = self.cmd_tx.clone();
+                let socket_path_for_server = socket_path.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::server::serve_api(
+                        listener,
+                        socket_path_for_server,
+                        cmd_tx_for_server,
+                        server_shutdown_rx,
+                    )
+                    .await
+                    {
+                        eprintln!("[don] api server error: {e}");
+                    }
+                });
+                self.output_manager
+                    .lifecycle_event(&format!("api listening on {socket_display}"));
+                self.server_shutdown_tx = Some(server_shutdown_tx);
+            }
+            Err(e) => {
+                self.output_manager
+                    .error_event(&format!("api server disabled: {e}"));
+            }
+        }
 
         // Start file watchers before spawning services so we don't miss
         // changes that happen during startup (slow ready checks, long builds, etc.).
@@ -655,14 +694,40 @@ impl Runner {
                             let statuses = self.collect_status();
                             let _ = reply.send(statuses);
                         }
+                        RunnerCommand::Logs { name, last_n, reply } => {
+                            let logs = self.output_manager
+                                .read_logs(&name, last_n)
+                                .await
+                                .map(|b| String::from_utf8_lossy(&b).into_owned());
+                            let _ = reply.send(logs);
+                        }
+                        RunnerCommand::LogsFollow { name, last_n, reply } => {
+                            // 256-line buffer — slow HTTP clients will drop lines
+                            // (and get pruned on disconnect) rather than blocking
+                            // service output.
+                            let sink = self.output_manager
+                                .add_follow_sink(&name, last_n, 256)
+                                .await;
+                            let _ = reply.send(sink);
+                        }
+                        RunnerCommand::Start { name, reply } => {
+                            let result = self.handle_start_cmd(&name).await;
+                            let _ = reply.send(result);
+                        }
+                        RunnerCommand::Stop { name, reply } => {
+                            let result = self.handle_stop_cmd(&name).await;
+                            let _ = reply.send(result);
+                        }
+                        RunnerCommand::Restart { name, reply } => {
+                            let result = self.handle_restart_cmd(&name).await;
+                            let _ = reply.send(result);
+                        }
                         RunnerCommand::Rebuild { name } => {
                             self.handle_rebuild(&name).await;
                         }
                         RunnerCommand::TaskRerun { name } => {
                             self.handle_task_rerun(&name).await;
                         }
-                        // Future phases: Start/Stop/Restart via API.
-                        _ => {}
                     }
                 }
                 _ = self.shutdown_rx.recv() => {
@@ -674,6 +739,11 @@ impl Runner {
 
         // Wait for any remaining service exits during shutdown.
         self.wait_for_shutdown().await;
+
+        // Stop the API server (no-op if already signalled by initiate_shutdown).
+        if let Some(tx) = self.server_shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
 
         // Shut down the output system — flush all pending messages to sinks.
         self.output_manager.shutdown().await;
@@ -1423,6 +1493,82 @@ impl Runner {
             .await;
     }
 
+    /// Look up a service by name, distinguishing tasks from unknown names.
+    fn lookup_service(&self, name: &str) -> Result<&crate::config::Service, CommandError> {
+        if let Some(svc) = self.config.services.get(name) {
+            return Ok(svc);
+        }
+        if self.config.tasks.contains_key(name) {
+            return Err(CommandError::NotAService {
+                name: name.to_string(),
+            });
+        }
+        Err(CommandError::UnknownService {
+            name: name.to_string(),
+        })
+    }
+
+    /// Handle an API-initiated Start command.
+    async fn handle_start_cmd(&mut self, name: &str) -> CommandResult {
+        let svc = self.lookup_service(name)?;
+        // Block if the service is currently active.
+        if self.service_handles.contains_key(name) {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "already running".to_string(),
+            });
+        }
+        let resolved = svc.resolve(self.platform);
+        self.output_manager
+            .lifecycle_event(&format!("starting {name}... (requested)"));
+        self.spawn_and_wire_service(name, &resolved, None)
+            .await
+            .map_err(|e| CommandError::Failed {
+                name: name.to_string(),
+                message: e.to_string(),
+            })
+    }
+
+    /// Handle an API-initiated Stop command.
+    async fn handle_stop_cmd(&mut self, name: &str) -> CommandResult {
+        let resolved = self.lookup_service(name)?.resolve(self.platform);
+        let handle = self.service_handles.remove(name).ok_or_else(|| {
+            CommandError::InvalidState {
+                name: name.to_string(),
+                message: "not running".to_string(),
+            }
+        })?;
+        self.service_states
+            .insert(name.to_string(), ServiceState::Stopping);
+        self.output_manager
+            .lifecycle_event(&format!("stopping {name}... (requested)"));
+        let shutdown_config = resolved.shutdown.as_ref();
+        if let Err(e) = stop_service(handle, shutdown_config, false).await {
+            return Err(CommandError::Failed {
+                name: name.to_string(),
+                message: e.to_string(),
+            });
+        }
+        self.service_states
+            .insert(name.to_string(), ServiceState::Stopped);
+        let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
+            name: name.to_string(),
+            state: ServiceState::Stopped,
+        });
+        Ok(())
+    }
+
+    /// Handle an API-initiated Restart command: stop then start.
+    async fn handle_restart_cmd(&mut self, name: &str) -> CommandResult {
+        // If running, stop first (ignore not-running error).
+        match self.handle_stop_cmd(name).await {
+            Ok(()) => {}
+            Err(CommandError::InvalidState { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        self.handle_start_cmd(name).await
+    }
+
     /// Handle a file-watch-triggered task re-run.
     async fn handle_task_rerun(&mut self, name: &str) {
         let task_cfg = match self.config.tasks.get(name) {
@@ -1574,6 +1720,11 @@ impl Runner {
         self.output_manager
             .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");
 
+        // Tell the API server to stop accepting connections.
+        if let Some(tx) = self.server_shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+
         // Build reverse dependency order for shutdown.
         // Services at the same depth (no dependency relationship) stop concurrently.
         let dep_map = self.build_dep_map();
@@ -1672,17 +1823,15 @@ impl Runner {
     fn collect_status(&self) -> Vec<ItemStatus> {
         let mut statuses = Vec::new();
         for (name, state) in &self.service_states {
-            statuses.push(ItemStatus {
+            statuses.push(ItemStatus::Service {
                 name: name.clone(),
-                kind: "service".to_string(),
-                state: format!("{state:?}"),
+                state: *state,
             });
         }
         for (name, state) in &self.task_states {
-            statuses.push(ItemStatus {
+            statuses.push(ItemStatus::Task {
                 name: name.clone(),
-                kind: "task".to_string(),
-                state: format!("{state:?}"),
+                state: *state,
             });
         }
         statuses
@@ -1745,6 +1894,7 @@ struct ItemDone {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
