@@ -244,7 +244,10 @@ impl OutputManager {
                 crate::config::LogConfig::File(path) => {
                     // File sink always gets the raw line. The stdout sink is not
                     // added for file-mode services (output goes to file only).
-                    vec![file_sinks.get(path).cloned().expect("file sink must exist")]
+                    match file_sinks.get(path).cloned() {
+                        Some(sink) => vec![sink],
+                        None => vec![], // Shouldn't happen — file sinks are created from the same config.
+                    }
                 }
                 crate::config::LogConfig::Ignore => vec![],
             };

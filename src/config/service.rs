@@ -226,7 +226,7 @@ pub(crate) fn resolve_preset<'a>(
             build: build.as_ref(),
         })
     } else {
-        unreachable!()
+        Err("service must have one of: docker, rust, go, or run".to_string())
     }
 }
 

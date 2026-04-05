@@ -72,6 +72,8 @@ impl DockerHandle {
             .signal(signal)
             .t(timeout_secs)
             .build();
+        // Stop error is intentionally ignored — container may already be stopped.
+        // We proceed to force-remove regardless.
         let _ = self
             .client
             .stop_container(&self.container_id, Some(stop_options))
