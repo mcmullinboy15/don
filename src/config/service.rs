@@ -326,6 +326,7 @@ impl ResolvedService {
     pub fn resolved_run_cmd(
         &self,
         platform: Platform,
+        service_name: &str,
         cache_base: Option<&std::path::Path>,
     ) -> Result<(PathBuf, &[String]), String> {
         let run = self.run.as_ref().ok_or("service has no run command")?;
@@ -337,7 +338,7 @@ impl ResolvedService {
         let executable = match &self.download {
             Some(dl) => match dl.for_platform(platform) {
                 Some(artifact) => artifact
-                    .binary_path(&cache_base)
+                    .binary_path(&cache_base, service_name)
                     .ok_or_else(|| format!("download url has no filename: {}", artifact.url))?,
                 None => PathBuf::from(&run.cmd),
             },

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod docker;
+pub mod download;
 pub mod duration;
 pub mod output;
 pub mod process;

@@ -2,6 +2,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use super::download::DownloadConfig;
+use super::platform::Platform;
 use super::types::LogConfig;
 
 /// A one-shot task that runs to completion.
@@ -35,4 +37,43 @@ pub struct Task {
     /// Where to send stdout/stderr. Defaults to stdout.
     #[serde(default)]
     pub log: LogConfig,
+    /// Whether file-watch changes should auto-trigger a re-run.
+    /// When false, changes put the task in a pending state but don't spawn it.
+    /// Defaults to true.
+    #[serde(default = "default_auto_rerun")]
+    pub auto_rerun: bool,
+    /// Optional download configuration — artifacts to fetch before running.
+    /// When a download exists for the current platform, its binary path
+    /// replaces `cmd`. Without a matching platform entry, `cmd` is looked up on PATH.
+    pub download: Option<DownloadConfig>,
+}
+
+impl Task {
+    /// Resolve the task's command path, using the cached download binary
+    /// if one is configured for this platform.
+    pub fn resolved_cmd(
+        &self,
+        platform: Platform,
+        task_name: &str,
+        cache_base: Option<&std::path::Path>,
+    ) -> Result<PathBuf, String> {
+        let cache_base = cache_base
+            .map(PathBuf::from)
+            .unwrap_or_else(super::download::default_cache_base);
+
+        let executable = match &self.download {
+            Some(dl) => match dl.for_platform(platform) {
+                Some(artifact) => artifact
+                    .binary_path(&cache_base, task_name)
+                    .ok_or_else(|| format!("download url has no filename: {}", artifact.url))?,
+                None => PathBuf::from(&self.cmd),
+            },
+            None => PathBuf::from(&self.cmd),
+        };
+        Ok(executable)
+    }
+}
+
+fn default_auto_rerun() -> bool {
+    true
 }

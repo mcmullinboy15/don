@@ -244,3 +244,175 @@ fn don_validate_cli_missing_config() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failed to read config file"));
 }
+
+// --- Download validation ---
+
+fn download_toml(extra_lines: &str) -> String {
+    format!(
+        r#"
+[services.tool]
+run.cmd = "tool"
+
+[services.tool.download.platform.linux-x86_64]
+url = "https://example.com/tool.tar.gz"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+path = "tool"
+{extra_lines}
+"#
+    )
+}
+
+#[test]
+fn validate_download_bad_sha256_length() {
+    let toml = r#"
+[services.tool]
+run.cmd = "tool"
+
+[services.tool.download.platform.linux-x86_64]
+url = "https://example.com/tool"
+sha256 = "tooshort"
+"#;
+    let config: Config = toml.parse().unwrap();
+    let err = config.validate(TEST_PLATFORM).unwrap_err();
+    let ConfigError::Validation { errors } = &err else {
+        panic!("expected validation error");
+    };
+    assert!(
+        errors.iter().any(|e| e.contains("64 hex characters")),
+        "expected sha256 length error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_download_bad_url_scheme() {
+    let toml = r#"
+[services.tool]
+run.cmd = "tool"
+
+[services.tool.download.platform.linux-x86_64]
+url = "file:///etc/passwd"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#;
+    let config: Config = toml.parse().unwrap();
+    let err = config.validate(TEST_PLATFORM).unwrap_err();
+    let ConfigError::Validation { errors } = &err else {
+        panic!("expected validation error");
+    };
+    assert!(
+        errors.iter().any(|e| e.contains("must start with http")),
+        "expected url scheme error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_download_without_run_cmd() {
+    // Download but no run.cmd → should error.
+    let toml = r#"
+[services.tool]
+
+[services.tool.download.platform.linux-x86_64]
+url = "https://example.com/tool"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#;
+    let config: Config = toml.parse().unwrap();
+    let err = config.validate(TEST_PLATFORM).unwrap_err();
+    let ConfigError::Validation { errors } = &err else {
+        panic!("expected validation error");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("download requires a run command")),
+        "expected run command error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_valid_download_config_passes() {
+    let toml = download_toml("");
+    let config: Config = toml.parse().unwrap();
+    assert!(config.validate(TEST_PLATFORM).is_ok());
+}
+
+#[test]
+fn validate_download_bin_name_collision() {
+    // Two services download different binaries that would both link to
+    // `.don/bin/cockroach` — must error unless disambiguated.
+    let toml = r#"
+[services.crdb_v25]
+run.cmd = "cockroach"
+[services.crdb_v25.download.platform.linux-x86_64]
+url = "https://example.com/v25.tgz"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000001"
+path = "cockroach-v25/cockroach"
+
+[services.crdb_v24]
+run.cmd = "cockroach"
+[services.crdb_v24.download.platform.linux-x86_64]
+url = "https://example.com/v24.tgz"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
+path = "cockroach-v24/cockroach"
+"#;
+    let config: Config = toml.parse().unwrap();
+    let err = config.validate(TEST_PLATFORM).unwrap_err();
+    let ConfigError::Validation { errors } = &err else {
+        panic!("expected validation error");
+    };
+    assert!(
+        errors.iter().any(|e| e.contains("bin_name 'cockroach'")
+            && e.contains("crdb_v25")
+            && e.contains("crdb_v24")),
+        "expected bin_name collision error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_download_bin_name_override_resolves_collision() {
+    // Same two-crdb setup but with explicit bin_names → passes.
+    let toml = r#"
+[services.crdb_v25]
+run.cmd = "cockroach"
+[services.crdb_v25.download]
+bin_name = "cockroach-v25"
+[services.crdb_v25.download.platform.linux-x86_64]
+url = "https://example.com/v25.tgz"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000001"
+path = "cockroach-v25/cockroach"
+
+[services.crdb_v24]
+run.cmd = "cockroach"
+[services.crdb_v24.download]
+bin_name = "cockroach-v24"
+[services.crdb_v24.download.platform.linux-x86_64]
+url = "https://example.com/v24.tgz"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
+path = "cockroach-v24/cockroach"
+"#;
+    let config: Config = toml.parse().unwrap();
+    assert!(
+        config.validate(TEST_PLATFORM).is_ok(),
+        "explicit bin_names should resolve the collision"
+    );
+}
+
+#[test]
+fn validate_download_missing_current_platform_warns() {
+    // TEST_PLATFORM is LinuxX86_64. Provide only macos entries — should warn.
+    let toml = r#"
+[services.tool]
+run.cmd = "tool"
+
+[services.tool.download.platform.macos-aarch64]
+url = "https://example.com/tool-mac.tar.gz"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#;
+    let config: Config = toml.parse().unwrap();
+    let warnings = config.validate(TEST_PLATFORM).unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("no download entry for current platform")
+                && w.contains("linux-x86_64")),
+        "expected platform warning, got: {warnings:?}"
+    );
+}

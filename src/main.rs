@@ -132,10 +132,12 @@ async fn run_start(config_path: &std::path::Path) -> Result<(), String> {
     }
 
     // Determine base directory (where don.toml lives).
-    let base_dir = config_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
+    // `parent()` returns `Some("")` for a bare filename like `don.toml` —
+    // treat that as the current directory.
+    let base_dir = match config_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
 
     // Collect service names and their log configs for OutputManager.
     let service_configs: Vec<(&str, &don::config::LogConfig)> = config

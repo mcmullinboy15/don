@@ -109,6 +109,14 @@ impl WatchManager {
             notify::Config::default(),
         )?;
 
+        // Canonicalize base_dir so glob patterns are absolute and match the
+        // absolute paths that notify reports in events. Without this, a base_dir
+        // of `.` produces patterns like `./definitions/**/*.sql` that don't match
+        // the absolute paths notify returns.
+        let base_dir = std::fs::canonicalize(base_dir)
+            .map_err(|e| WatchError::Io(base_dir.to_path_buf(), e))?;
+        let base_dir = base_dir.as_path();
+
         let mut items: HashMap<String, WatchedItem> = HashMap::new();
         // Track which directories we've already registered to avoid duplicates.
         let mut registered_dirs: HashSet<PathBuf> = HashSet::new();
@@ -140,11 +148,12 @@ impl WatchManager {
                 continue;
             }
 
-            let svc_dir = resolved
-                .dir
-                .as_deref()
-                .unwrap_or(base_dir)
-                .to_path_buf();
+            // Resolve svc_dir relative to the (canonical) base_dir so patterns
+            // are absolute and can match notify's absolute event paths.
+            let svc_dir = match resolved.dir.as_deref() {
+                Some(d) => base_dir.join(d),
+                None => base_dir.to_path_buf(),
+            };
 
             let debounce = match &resolved.debounce {
                 Some(d) => parse_duration(d)?,
@@ -217,7 +226,10 @@ impl WatchManager {
                 continue;
             }
 
-            let task_dir = task.dir.as_deref().unwrap_or(base_dir).to_path_buf();
+            let task_dir = match task.dir.as_deref() {
+                Some(d) => base_dir.join(d),
+                None => base_dir.to_path_buf(),
+            };
 
             let mut compiled_patterns = Vec::new();
             for pattern_str in &task.watch {

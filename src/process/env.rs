@@ -124,6 +124,27 @@ fn strip_quotes(s: &str) -> String {
 /// the auto `.env.<name>` lookup.
 ///
 /// Returns the merged map and any warnings from env file parsing.
+/// Prepend a directory to the PATH entry in an env map. Creates PATH if it
+/// doesn't exist. Does nothing if the directory is already the first entry.
+pub fn prepend_to_path(env: &mut HashMap<String, String>, bin_dir: &Path) {
+    let bin_str = bin_dir.to_string_lossy();
+    let current = env.get("PATH").cloned().unwrap_or_default();
+    // Skip prepend if already at the front.
+    if current
+        .split(':')
+        .next()
+        .is_some_and(|first| first == bin_str)
+    {
+        return;
+    }
+    let new_path = if current.is_empty() {
+        bin_str.into_owned()
+    } else {
+        format!("{bin_str}:{current}")
+    };
+    env.insert("PATH".to_string(), new_path);
+}
+
 pub fn merge_env(
     service_name: &str,
     service_dir: Option<&Path>,
@@ -291,6 +312,50 @@ mod tests {
                 "case '{}': warning count mismatch",
                 case.name
             );
+        }
+    }
+
+    #[test]
+    fn test_prepend_to_path() {
+        struct Case {
+            name: &'static str,
+            initial: Option<&'static str>,
+            bin_dir: &'static str,
+            expected: &'static str,
+        }
+        let cases = vec![
+            Case {
+                name: "prepend to existing PATH",
+                initial: Some("/usr/bin:/bin"),
+                bin_dir: "/don/bin",
+                expected: "/don/bin:/usr/bin:/bin",
+            },
+            Case {
+                name: "create PATH when missing",
+                initial: None,
+                bin_dir: "/don/bin",
+                expected: "/don/bin",
+            },
+            Case {
+                name: "idempotent when already at front",
+                initial: Some("/don/bin:/usr/bin"),
+                bin_dir: "/don/bin",
+                expected: "/don/bin:/usr/bin",
+            },
+            Case {
+                name: "prepend even if present later",
+                initial: Some("/usr/bin:/don/bin"),
+                bin_dir: "/don/bin",
+                expected: "/don/bin:/usr/bin:/don/bin",
+            },
+        ];
+        for case in cases {
+            let mut env: HashMap<String, String> = HashMap::new();
+            if let Some(v) = case.initial {
+                env.insert("PATH".to_string(), v.to_string());
+            }
+            prepend_to_path(&mut env, Path::new(case.bin_dir));
+            assert_eq!(env.get("PATH").map(String::as_str), Some(case.expected), "case: {}", case.name);
         }
     }
 

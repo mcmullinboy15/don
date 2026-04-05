@@ -4,7 +4,7 @@
 //! and optional ready checks.
 
 use crate::config::service::{GoConfig, RustConfig};
-use crate::config::{ReadyCheck, ResolvedService, ShutdownConfig};
+use crate::config::{Platform, ReadyCheck, ResolvedService, ShutdownConfig};
 use crate::duration::parse_duration;
 use crate::process::env::merge_env;
 use crate::process::socket::BoundSockets;
@@ -46,6 +46,8 @@ pub enum ServiceError {
     Duration(#[from] crate::duration::DurationError),
     #[error("docker error: {0}")]
     Docker(String),
+    #[error("config error: {0}")]
+    Config(String),
 }
 
 /// Start a service: merge env, spawn process.
@@ -53,6 +55,7 @@ pub enum ServiceError {
 /// Returns a `StartResult` containing the process handle and the child's
 /// output stream. The caller is responsible for wiring up output processing,
 /// the ready check, and state updates.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_service(
     name: &str,
     resolved: &ResolvedService,
@@ -61,6 +64,7 @@ pub(crate) async fn start_service(
     bound_sockets: Option<&BoundSockets>,
     docker_client: Option<&bollard::Docker>,
     service_writer: Option<&crate::output::ServiceWriter>,
+    platform: Platform,
 ) -> Result<StartResult, ServiceError> {
     // Dispatch based on the service preset.
     if let Some(ref docker_config) = resolved.docker {
@@ -92,8 +96,12 @@ pub(crate) async fn start_service(
     } else if let Some(ref go_config) = resolved.go {
         let binary_path = go_binary_path(go_config, name, base_dir);
         (binary_path.to_string_lossy().into_owned(), vec![])
-    } else if let Some(ref run_cmd) = resolved.run {
-        (run_cmd.cmd.clone(), run_cmd.args.clone())
+    } else if resolved.run.is_some() {
+        let cache_base = base_dir.join(".don").join("cache");
+        let (executable, args) = resolved
+            .resolved_run_cmd(platform, name, Some(&cache_base))
+            .map_err(ServiceError::Config)?;
+        (executable.to_string_lossy().into_owned(), args.to_vec())
     } else {
         return Err(crate::process::ProcessError::Spawn {
             cmd: name.to_string(),
@@ -110,13 +118,15 @@ pub(crate) async fn start_service(
     let injected = bound_sockets
         .map(|s| s.listen_env())
         .unwrap_or_default();
-    let (env, _warnings) = merge_env(
+    let (mut env, _warnings) = merge_env(
         name,
         Some(service_dir),
         &resolved.env_file,
         &resolved.env,
         &injected,
     )?;
+    // Expose downloaded binaries on PATH so other services/tasks can call them.
+    crate::process::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
 
     // Build PGID file path.
     std::fs::create_dir_all(pid_dir).map_err(crate::process::ProcessError::Io)?;

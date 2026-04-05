@@ -56,6 +56,31 @@ fn is_valid_signal(s: &str) -> bool {
     VALID_SIGNALS.contains(&s)
 }
 
+/// Check that a PlatformDownload's url and sha256 fields are well-formed.
+fn validate_platform_download(artifact: &PlatformDownload) -> Result<(), String> {
+    // Validate URL shape: must have http:// or https:// scheme.
+    if !artifact.url.starts_with("http://") && !artifact.url.starts_with("https://") {
+        return Err(format!(
+            "url '{}' must start with http:// or https://",
+            artifact.url
+        ));
+    }
+    // Validate sha256 is 64 lowercase hex chars.
+    if artifact.sha256.len() != 64 {
+        return Err(format!(
+            "sha256 must be 64 hex characters, got {} characters",
+            artifact.sha256.len()
+        ));
+    }
+    if !artifact.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "sha256 '{}' must contain only hex characters (0-9, a-f, A-F)",
+            artifact.sha256
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     /// Load and parse a config from a file path.
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
@@ -164,6 +189,41 @@ impl Config {
                     ));
                 }
             }
+            // Validate download config.
+            if let Some(ref download) = resolved.download {
+                // Downloads only apply to custom services (with run.cmd).
+                // Rust/Go/Docker presets have their own binary resolution.
+                if resolved.rust.is_some() || resolved.go.is_some() || resolved.docker.is_some() {
+                    errors.push(format!(
+                        "service '{name}': download is not supported with rust/go/docker presets"
+                    ));
+                } else if resolved.run.is_none() {
+                    errors.push(format!(
+                        "service '{name}': download requires a run command"
+                    ));
+                }
+                for (platform_key, artifact) in &download.platform {
+                    if let Err(msg) = validate_platform_download(artifact) {
+                        errors.push(format!(
+                            "service '{name}': download.platform.{platform_key}: {msg}"
+                        ));
+                    }
+                }
+                // Warn if the current platform has no download entry — the
+                // service will silently fall back to a PATH lookup of run.cmd.
+                if download.for_platform(platform).is_none() && resolved.run.is_some() {
+                    let available: Vec<String> = download
+                        .platform
+                        .keys()
+                        .map(|p| p.to_string())
+                        .collect();
+                    warnings.push(format!(
+                        "service '{name}': no download entry for current platform {platform} \
+                         (available: {}) — will use run.cmd from PATH",
+                        available.join(", ")
+                    ));
+                }
+            }
         }
 
         // Validate tasks
@@ -190,6 +250,29 @@ impl Config {
             {
                 errors.push(format!("task '{name}': invalid timeout: {e}"));
             }
+            // Validate download config.
+            if let Some(ref download) = task.download {
+                for (platform_key, artifact) in &download.platform {
+                    if let Err(msg) = validate_platform_download(artifact) {
+                        errors.push(format!(
+                            "task '{name}': download.platform.{platform_key}: {msg}"
+                        ));
+                    }
+                }
+                // Warn if the current platform has no download entry.
+                if download.for_platform(platform).is_none() {
+                    let available: Vec<String> = download
+                        .platform
+                        .keys()
+                        .map(|p| p.to_string())
+                        .collect();
+                    warnings.push(format!(
+                        "task '{name}': no download entry for current platform {platform} \
+                         (available: {}) — will use cmd from PATH",
+                        available.join(", ")
+                    ));
+                }
+            }
         }
 
         // Validate profiles
@@ -213,6 +296,40 @@ impl Config {
         // Detect dependency cycles
         if let Some(cycle) = self.detect_cycle(platform) {
             errors.push(format!("dependency cycle: {}", cycle.join(" -> ")));
+        }
+
+        // Detect bin_name collisions across all downloads — the symlinks at
+        // .don/bin/<name> must be unique.
+        let mut bin_names: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, svc) in &self.services {
+            let resolved = svc.resolve(platform);
+            if let Some(ref dl) = resolved.download
+                && let Some(bin_name) = dl.effective_bin_name(platform)
+            {
+                bin_names
+                    .entry(bin_name)
+                    .or_default()
+                    .push(format!("service '{name}'"));
+            }
+        }
+        for (name, task) in &self.tasks {
+            if let Some(ref dl) = task.download
+                && let Some(bin_name) = dl.effective_bin_name(platform)
+            {
+                bin_names
+                    .entry(bin_name)
+                    .or_default()
+                    .push(format!("task '{name}'"));
+            }
+        }
+        for (bin_name, owners) in &bin_names {
+            if owners.len() > 1 {
+                errors.push(format!(
+                    "download bin_name '{bin_name}' is used by multiple owners ({}) \
+                     — add an explicit bin_name to disambiguate",
+                    owners.join(", ")
+                ));
+            }
         }
 
         if errors.is_empty() {
@@ -312,6 +429,85 @@ mod tests {
     use super::*;
 
     const TEST_PLATFORM: Platform = Platform::LinuxX86_64;
+
+    #[test]
+    fn test_validate_platform_download() {
+        let good_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        struct Case {
+            name: &'static str,
+            url: String,
+            sha256: String,
+            expect_err: Option<&'static str>,
+        }
+        let cases = vec![
+            Case {
+                name: "valid https url and sha256",
+                url: "https://example.com/tool.tar.gz".to_string(),
+                sha256: good_sha.to_string(),
+                expect_err: None,
+            },
+            Case {
+                name: "valid http url",
+                url: "http://example.com/tool".to_string(),
+                sha256: good_sha.to_string(),
+                expect_err: None,
+            },
+            Case {
+                name: "missing scheme",
+                url: "example.com/tool.tar.gz".to_string(),
+                sha256: good_sha.to_string(),
+                expect_err: Some("must start with http"),
+            },
+            Case {
+                name: "ftp scheme",
+                url: "ftp://example.com/tool".to_string(),
+                sha256: good_sha.to_string(),
+                expect_err: Some("must start with http"),
+            },
+            Case {
+                name: "sha256 too short",
+                url: "https://example.com/tool".to_string(),
+                sha256: "abc123".to_string(),
+                expect_err: Some("64 hex characters"),
+            },
+            Case {
+                name: "sha256 too long",
+                url: "https://example.com/tool".to_string(),
+                sha256: "a".repeat(70),
+                expect_err: Some("64 hex characters"),
+            },
+            Case {
+                name: "sha256 non-hex",
+                url: "https://example.com/tool".to_string(),
+                sha256: "g".repeat(64),
+                expect_err: Some("hex characters"),
+            },
+        ];
+        for case in cases {
+            let artifact = PlatformDownload {
+                url: case.url,
+                sha256: case.sha256,
+                path: None,
+                setup: None,
+            headers: std::collections::HashMap::new(),
+            };
+            let result = validate_platform_download(&artifact);
+            match (result, case.expect_err) {
+                (Ok(()), None) => {}
+                (Err(msg), Some(needle)) => assert!(
+                    msg.contains(needle),
+                    "case '{}': expected error containing '{}', got '{}'",
+                    case.name, needle, msg
+                ),
+                (Ok(()), Some(needle)) => {
+                    panic!("case '{}': expected error containing '{}' but got Ok", case.name, needle)
+                }
+                (Err(msg), None) => {
+                    panic!("case '{}': expected Ok but got error: {}", case.name, msg)
+                }
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct ConfigTestCase {
@@ -1149,12 +1345,20 @@ mod tests {
 
     #[test]
     fn test_resolved_run_cmd() {
+        /// Expected executable path — either a literal (for no-download cases)
+        /// or the archive's relative binary path (composed with the cache base,
+        /// service name, and composite hash at test time).
+        enum Expected {
+            Literal(&'static str),
+            FromDownload { relative_path: &'static str },
+        }
+
         struct RunCmdTestCase {
             name: &'static str,
             input: &'static str,
             platform: Platform,
             cache_base: &'static str,
-            expect_executable: &'static str,
+            expected: Expected,
             expect_args: &'static [&'static str],
         }
 
@@ -1168,7 +1372,7 @@ mod tests {
                 "#,
                 platform: Platform::LinuxX86_64,
                 cache_base: "/tmp/don-cache",
-                expect_executable: "mybin",
+                expected: Expected::Literal("mybin"),
                 expect_args: &["--port", "8080"],
             },
             RunCmdTestCase {
@@ -1185,7 +1389,9 @@ mod tests {
                 "#,
                 platform: Platform::LinuxX86_64,
                 cache_base: "/tmp/don-cache",
-                expect_executable: "/tmp/don-cache/abc123/cockroach-v24/cockroach",
+                expected: Expected::FromDownload {
+                    relative_path: "cockroach-v24/cockroach",
+                },
                 expect_args: &["start-single-node", "--insecure"],
             },
             RunCmdTestCase {
@@ -1201,7 +1407,9 @@ mod tests {
                 "#,
                 platform: Platform::LinuxX86_64,
                 cache_base: "/tmp/don-cache",
-                expect_executable: "/tmp/don-cache/def456/mytool-linux-amd64",
+                expected: Expected::FromDownload {
+                    relative_path: "mytool-linux-amd64",
+                },
                 expect_args: &["serve"],
             },
             RunCmdTestCase {
@@ -1218,7 +1426,7 @@ mod tests {
                 "#,
                 platform: Platform::MacosAarch64,
                 cache_base: "/tmp/don-cache",
-                expect_executable: "cockroach",
+                expected: Expected::Literal("cockroach"),
                 expect_args: &["start"],
             },
         ];
@@ -1228,12 +1436,27 @@ mod tests {
                 .unwrap_or_else(|e| panic!("case '{}': parse error: {e}", case.name));
             let resolved = config.services["svc"].resolve(case.platform);
             let (executable, args) = resolved
-                .resolved_run_cmd(case.platform, Some(std::path::Path::new(case.cache_base)))
+                .resolved_run_cmd(case.platform, "svc", Some(std::path::Path::new(case.cache_base)))
                 .unwrap_or_else(|e| panic!("case '{}': resolve error: {e}", case.name));
 
+            let expected_exec = match &case.expected {
+                Expected::Literal(s) => PathBuf::from(s),
+                Expected::FromDownload { relative_path } => {
+                    // Compute the expected path from the actual download config.
+                    let artifact = resolved
+                        .download
+                        .as_ref()
+                        .expect("download case must have download config")
+                        .for_platform(case.platform)
+                        .expect("download case must match platform");
+                    PathBuf::from(case.cache_base)
+                        .join("svc")
+                        .join(artifact.composite_hash())
+                        .join(relative_path)
+                }
+            };
             assert_eq!(
-                executable,
-                PathBuf::from(case.expect_executable),
+                executable, expected_exec,
                 "case '{}': executable mismatch",
                 case.name
             );

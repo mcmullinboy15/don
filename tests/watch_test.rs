@@ -408,3 +408,71 @@ fn integration_file_edit_during_startup_triggers_rebuild() {
         handle.await.unwrap();
     });
 }
+
+// --- Integration test: task with auto_rerun=false goes pending on change ---
+
+#[test]
+fn integration_task_auto_rerun_false_goes_pending() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-task-manual");
+
+        let defs_dir = dir.path().join("definitions");
+        std::fs::create_dir_all(&defs_dir).unwrap();
+        let schema = defs_dir.join("users.sql");
+        std::fs::write(&schema, "CREATE TABLE users (id INT);").unwrap();
+
+        // A service to keep don running after the task completes,
+        // plus a task with auto_rerun = false.
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "bash", &["-c", "sleep 60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task("migrate", "echo", &["migrating"])
+            .watch(&["definitions/**/*.sql"])
+            .auto_rerun(false)
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // Task should run at startup (first time — no prior state).
+        assert!(
+            wait_for_output(&buf, "migrate complete", Duration::from_secs(5)).await,
+            "migrate should run at startup. output: {}",
+            read_buf(&buf)
+        );
+
+        // Modify the watched file.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(&schema, "CREATE TABLE users (id INT, name TEXT);").unwrap();
+
+        // Should log pending rerun, NOT actually run the task again.
+        assert!(
+            wait_for_output(&buf, "pending rerun", Duration::from_secs(5)).await,
+            "expected pending rerun event. output: {}",
+            read_buf(&buf)
+        );
+
+        // Give any rogue rerun a chance to start.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let output = read_buf(&buf);
+        let complete_count = output.matches("migrate complete").count();
+        assert_eq!(
+            complete_count, 1,
+            "migrate should have only completed once (at startup); output: {output}"
+        );
+        assert!(
+            !output.contains("migrate: re-running"),
+            "migrate should NOT have been re-run; output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}

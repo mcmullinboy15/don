@@ -82,11 +82,14 @@ pub enum TaskItemState {
     Completed,
     Skipped,
     Failed,
+    /// Watch files have changed but the task has `auto_rerun = false`,
+    /// so it's waiting for a manual trigger.
+    PendingRerun,
 }
 
 impl TaskItemState {
     pub(crate) fn is_satisfied(&self) -> bool {
-        matches!(self, Self::Completed | Self::Skipped)
+        matches!(self, Self::Completed | Self::Skipped | Self::PendingRerun)
     }
 
     #[cfg(test)]
@@ -426,6 +429,35 @@ impl Runner {
             task_item_states.insert(name.clone(), TaskItemState::Pending);
         }
 
+        // Prune download cache entries that aren't referenced by the current
+        // config. Collects (owner_name, composite_hash) pairs.
+        let cache_base = don_dir.join("cache");
+        let mut keep: HashSet<(String, String)> = HashSet::new();
+        for (name, svc) in &config.services {
+            let resolved = svc.resolve(platform);
+            if let Some(ref dl) = resolved.download {
+                for artifact in dl.platform.values() {
+                    keep.insert((name.clone(), artifact.composite_hash()));
+                }
+            }
+        }
+        for (name, task) in &config.tasks {
+            if let Some(ref dl) = task.download {
+                for artifact in dl.platform.values() {
+                    keep.insert((name.clone(), artifact.composite_hash()));
+                }
+            }
+        }
+        if let Ok(removed) = crate::download::prune_cache(&cache_base, &keep)
+            && !removed.is_empty()
+        {
+            output_manager.lifecycle_event(&format!(
+                "pruned {} stale cache entr{}",
+                removed.len(),
+                if removed.len() == 1 { "y" } else { "ies" }
+            ));
+        }
+
         Ok(Self {
             config,
             platform,
@@ -752,6 +784,12 @@ impl Runner {
             return Ok(());
         }
 
+        // Phase 1.5: Download artifact (if configured).
+        if let Err(e) = self.ensure_download(name, &resolved).await {
+            self.fail_service_start(name, &format!("download failed: {e}"), done_tx).await;
+            return Ok(());
+        }
+
         // Phase 2: Build (docker, rust, go, or custom build command).
         if let Err(()) = self.run_service_build(name, &resolved).await {
             self.fail_service_start(name, "build failed", done_tx).await;
@@ -857,6 +895,58 @@ impl Runner {
         Ok(())
     }
 
+    /// Download the artifact for a service if it has a download config for this platform.
+    ///
+    /// Skips if no download is configured or if no artifact exists for the current
+    /// platform (falls back to `run.cmd` via PATH).
+    async fn ensure_download(
+        &self,
+        name: &str,
+        resolved: &crate::config::ResolvedService,
+    ) -> Result<(), crate::download::DownloadError> {
+        self.ensure_download_for_config(name, resolved.download.as_ref())
+            .await
+    }
+
+    /// Ensure the download for a task's download config is cached.
+    async fn ensure_task_download(
+        &self,
+        name: &str,
+        task: &crate::config::Task,
+    ) -> Result<(), crate::download::DownloadError> {
+        self.ensure_download_for_config(name, task.download.as_ref())
+            .await
+    }
+
+    /// Shared download resolution for services and tasks.
+    async fn ensure_download_for_config(
+        &self,
+        name: &str,
+        download: Option<&crate::config::DownloadConfig>,
+    ) -> Result<(), crate::download::DownloadError> {
+        let download = match download {
+            Some(dl) => dl,
+            None => return Ok(()),
+        };
+        let artifact = match download.for_platform(self.platform) {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+        let cache_base = self.base_dir.join(".don").join("cache");
+        let bin_dir = self.base_dir.join(".don").join("bin");
+        self.output_manager
+            .lifecycle_event(&format!("{name}: ensuring artifact..."));
+        let writer = self.output_manager.service_writer(name);
+        crate::download::ensure_artifact(artifact, &cache_base, name, writer.as_ref()).await?;
+        // Link the binary into .don/bin so other services/tasks can find it on PATH.
+        if let Some(bin_name) = download.effective_bin_name(self.platform) {
+            crate::download::link_binary(artifact, &cache_base, name, &bin_name, &bin_dir)?;
+        }
+        self.output_manager
+            .lifecycle_event(&format!("{name}: artifact ready"));
+        Ok(())
+    }
+
     /// Spawn a service process, wire output capture, and start the ready check.
     ///
     /// If `done_tx` is `Some`, sends `ItemDone` on completion (initial startup).
@@ -879,6 +969,7 @@ impl Runner {
             sockets,
             self.docker_client.as_ref(),
             writer.as_ref(),
+            self.platform,
         )
         .await
         {
@@ -1087,11 +1178,29 @@ impl Runner {
         };
         self.output_manager.lifecycle_event(&msg);
 
+        // Ensure any downloaded artifact is cached before running.
+        if let Err(e) = self.ensure_task_download(name, &task_cfg).await {
+            self.task_states
+                .insert(name.to_string(), TaskItemState::Failed);
+            self.output_manager
+                .error_event(&format!("{name}: download failed: {e}"));
+            let _ = done_tx
+                .send(ItemDone {
+                    name: name.to_string(),
+                    kind: NodeKind::Task,
+                    success: false,
+                    message: Some(format!("download failed: {e}")),
+                    elapsed: None,
+                })
+                .await;
+            return Ok(());
+        }
+
         self.task_states
             .insert(name.to_string(), TaskItemState::Running);
 
         // Spawn the task process.
-        match task::spawn_task(&task_cfg, &self.base_dir).await {
+        match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
             Ok(spawn) => {
                 self.wire_task_output_and_wait(name, spawn, &task_cfg, Some(done_tx));
                 Ok(())
@@ -1346,12 +1455,31 @@ impl Runner {
             return;
         }
 
+        // If the task has opted out of auto-reruns, mark it pending and don't spawn.
+        // The user will need to trigger a manual rerun when they're ready.
+        if !task_cfg.auto_rerun {
+            self.task_states
+                .insert(name.to_string(), TaskItemState::PendingRerun);
+            let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
+                name: name.to_string(),
+                state: TaskItemState::PendingRerun,
+            });
+            self.output_manager.lifecycle_event(&format!(
+                "{name}: files changed (pending rerun — auto_rerun = false)"
+            ));
+            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                name: name.to_string(),
+                success: true,
+            });
+            return;
+        }
+
         self.output_manager
             .lifecycle_event(&format!("{name}: re-running (file changed)"));
         self.task_states
             .insert(name.to_string(), TaskItemState::Running);
 
-        match task::spawn_task(&task_cfg, &self.base_dir).await {
+        match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
             Ok(spawn) => {
                 self.wire_task_output_and_wait(name, spawn, &task_cfg, None);
             }

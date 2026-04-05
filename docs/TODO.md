@@ -280,22 +280,47 @@ Build command generation, binary path resolution, and default watch patterns for
 
 Artifact downloading, verification, and caching.
 
-- [ ] Download artifacts to `.don/cache/<sha256>/`
-- [ ] SHA-256 verification of downloaded files
-- [ ] Archive extraction (tar.gz, zip)
-- [ ] Setup command execution (with marker file to only run once)
-- [ ] Binary path resolution wired into the runner (via `resolved_run_cmd`)
-- [ ] Skip download if cache hit (sha256 dir already exists)
+- [x] Download artifacts to `.don/cache/<sha256>/`
+- [x] SHA-256 verification of downloaded files
+- [x] Archive extraction (tar.gz, zip)
+- [x] Setup command execution (with marker file to only run once)
+- [x] Binary path resolution wired into the runner (via `resolved_run_cmd`)
+- [x] Skip download if cache hit (sha256 dir already exists)
 
 ### Test Coverage Checkpoint
-- [ ] Unit test: SHA-256 verification — correct hash passes, wrong hash fails, empty file
-- [ ] Unit test: cache path construction — verify `.don/cache/<sha256>/` layout
-- [ ] Unit test: binary path resolution — with `path` (archive), without `path` (bare binary), no download for platform (fallback to cmd)
-- [ ] Integration test: download a small test file from a local HTTP server, verify it's cached at the correct path
-- [ ] Integration test: download with wrong sha256 — verify failure and no partial cache left behind
-- [ ] Integration test: tar.gz extraction — verify files extracted to correct paths
-- [ ] Integration test: setup command runs once (marker file written), second run skips
-- [ ] Integration test: cache hit — second download skips network, uses cached artifact
+- [x] Unit test: SHA-256 verification — correct hash passes, wrong hash fails, empty file
+- [x] Unit test: cache path construction — verify `.don/cache/<sha256>/` layout
+- [x] Unit test: binary path resolution — with `path` (archive), without `path` (bare binary), no download for platform (fallback to cmd)
+- [x] Integration test: download a small test file from a local HTTP server, verify it's cached at the correct path
+- [x] Integration test: download with wrong sha256 — verify failure and no partial cache left behind
+- [x] Integration test: tar.gz extraction — verify files extracted to correct paths
+- [x] Integration test: setup command runs once (marker file written), second run skips
+- [x] Integration test: cache hit — second download skips network, uses cached artifact
+
+### Phase 9 Follow-ups (gaps found in the scurry/cockroach example)
+
+**Usability:**
+- [x] Tasks can't use downloads — add `download` to Task config, wire `ensure_download` into task spawn, resolve task cmd path from cache
+- [x] Downloaded binaries aren't reachable from other services/tasks — symlink to `.don/bin/<name>`, prepend to child PATH
+- [x] Silent fallback when platform missing — warn at startup if a service/task declares `download` but has no entry for the current platform
+- [x] No progress output during download — logs "downloaded X/Y MB" every 10MB
+
+**Robustness:**
+- [x] HTTP timeout — 10-minute request budget via `reqwest::Client::builder().timeout(...)`
+- [x] Download lock — flock on `.don/cache/.lock-<sha256>` serializes concurrent downloads
+- [x] Partial extraction — extract into `.don/cache/.staging-<sha256>/`, then atomic rename to final path
+- [x] Streaming download — writes chunks to temp file + hashes inline (no full response buffered)
+- [x] Tar path traversal guard — rejects entries with `..` or absolute paths
+
+**Features:**
+- [x] Additional archive formats — `.tar.xz`, `.tar.bz2`, `.tar.zst` (plus existing `.tar.gz` / `.zip`)
+- [x] Auth header support — optional `headers` field on PlatformDownload with `${VAR}` env expansion
+- [x] Cache eviction — `prune_cache` removes sha dirs not in current config; runs on Runner startup
+- [x] Rust/Go/Docker preset + download errors at validate time
+
+**Validation:**
+- [x] Download config validated — sha256 format (64 hex chars), URL scheme (http/https)
+- [x] Service with `download` but no `run.cmd` errors at validate time
 
 ---
 

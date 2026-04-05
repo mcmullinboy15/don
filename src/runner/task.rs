@@ -6,7 +6,7 @@
 use nix::sys::signal::Signal;
 use tokio::time;
 
-use crate::config::Task;
+use crate::config::{Platform, Task};
 use crate::duration::parse_duration;
 use crate::process::{ChildOutput, SpawnConfig, spawn_process};
 use std::collections::HashMap;
@@ -34,19 +34,37 @@ pub(crate) struct TaskSpawn {
 
 /// Spawn a task process. Does not wait for completion.
 ///
-/// The caller is responsible for wiring up output processing and
-/// calling `wait_for_task` to get the exit status.
+/// Resolves the task's command path using its download config (if any) so
+/// that tasks with downloads run the cached binary. The caller is
+/// responsible for wiring up output processing and calling `wait_for_task`
+/// to get the exit status.
 pub(crate) async fn spawn_task(
     task: &Task,
+    task_name: &str,
     base_dir: &Path,
+    platform: Platform,
 ) -> Result<TaskSpawn, TaskError> {
     let work_dir = task.dir.as_deref().unwrap_or(base_dir);
 
     let mut env: HashMap<String, String> = std::env::vars().collect();
     env.extend(task.env.clone());
+    // Expose downloaded binaries on PATH.
+    crate::process::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
+
+    // Resolve the command path, using the download binary if configured.
+    let cache_base = base_dir.join(".don").join("cache");
+    let resolved_cmd = task
+        .resolved_cmd(platform, task_name, Some(&cache_base))
+        .map_err(|msg| {
+            TaskError::Process(crate::process::ProcessError::Spawn {
+                cmd: task.cmd.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, msg),
+            })
+        })?;
+    let cmd_str = resolved_cmd.to_string_lossy().into_owned();
 
     let (handle, child_output) = spawn_process(SpawnConfig {
-        cmd: &task.cmd,
+        cmd: &cmd_str,
         args: &task.args,
         dir: Some(work_dir),
         env,

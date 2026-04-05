@@ -320,6 +320,12 @@ impl TaskBuilder {
         self
     }
 
+    /// Set auto_rerun.
+    pub fn auto_rerun(mut self, value: bool) -> Self {
+        self.lines.push(format!("auto_rerun = {value}"));
+        self
+    }
+
     /// Finalize this task and return to the config builder.
     pub fn done(mut self) -> ConfigBuilder {
         writeln!(self.builder.toml, "[tasks.{}]", self.name).unwrap();

@@ -1,0 +1,93 @@
+# CockroachDB + scurry + Rust app example
+#
+# This example demonstrates:
+#   - Downloading CockroachDB and scurry (pjtatlow/scurry) on startup
+#   - A `scurry push` task that watches schema definitions and re-applies on change
+#   - A Rust service that queries the database, dependent on the migration task
+#
+# Run from the repo root:
+#   cargo run -- -c examples/crdb/don.toml
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CockroachDB — single-node insecure cluster for local dev
+# ──────────────────────────────────────────────────────────────────────────────
+[services.crdb]
+run.cmd = "cockroach"
+run.args = [
+    "start-single-node",
+    "--insecure",
+    "--listen-addr=127.0.0.1:26257",
+    "--http-addr=127.0.0.1:8081",
+    "--store=.don/crdb-data",
+]
+ready.tcp = "127.0.0.1:26257"
+ready.interval = "200ms"
+ready.retries = 50
+
+[services.crdb.download.platform.linux-x86_64]
+url = "https://binaries.cockroachdb.com/cockroach-v25.4.0.linux-amd64.tgz"
+sha256 = "c07247f245426f6d94e2f901f848946fa50d179cd8409422608805475bc95c51"
+path = "cockroach-v25.4.0.linux-amd64/cockroach"
+
+[services.crdb.download.platform.linux-aarch64]
+url = "https://binaries.cockroachdb.com/cockroach-v25.4.0.linux-arm64.tgz"
+sha256 = "c41df78efb97a2982251c68b4eeb314c14c111f428a76312503e641be4689c2d"
+path = "cockroach-v25.4.0.linux-arm64/cockroach"
+
+[services.crdb.download.platform.macos-x86_64]
+url = "https://binaries.cockroachdb.com/cockroach-v25.4.0.darwin-10.9-amd64.tgz"
+sha256 = "1c309a8fe36d214176084ba137308b69f75fb380800066d5f1bbf5ed771f52f6"
+path = "cockroach-v25.4.0.darwin-10.9-amd64/cockroach"
+
+[services.crdb.download.platform.macos-aarch64]
+url = "https://binaries.cockroachdb.com/cockroach-v25.4.0.darwin-11.0-arm64.tgz"
+sha256 = "01043ff6fe8b616ea96f53efad89a6081058a13c31b9ecdbab764f0f9de78421"
+path = "cockroach-v25.4.0.darwin-11.0-arm64/cockroach"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# scurry — applies schema definitions via `scurry push`
+# Watches ./definitions/ and re-runs on change.
+# ──────────────────────────────────────────────────────────────────────────────
+[tasks.migrate]
+cmd = "scurry"
+args = [
+    "push",
+    "--db-url=postgres://root@127.0.0.1:26257/defaultdb?sslmode=disable",
+    "--definitions=./definitions",
+    "--force",
+]
+depends_on = ["crdb"]
+watch = ["definitions/**/*.sql"]
+
+[tasks.migrate.download.platform.linux-x86_64]
+url = "https://github.com/pjtatlow/scurry/releases/download/v1.2.2/scurry-linux-amd64.tar.gz"
+sha256 = "763fd6705abccb1cca5072b24536c46ae02445345d25d67550d0f2b5e4c05996"
+path = "scurry"
+
+[tasks.migrate.download.platform.linux-aarch64]
+url = "https://github.com/pjtatlow/scurry/releases/download/v1.2.2/scurry-linux-arm64.tar.gz"
+sha256 = "168643f9b235842bd96e21eabf75abf2a98853cc8a1c97b332a3847ffe9d39d6"
+path = "scurry"
+
+[tasks.migrate.download.platform.macos-x86_64]
+url = "https://github.com/pjtatlow/scurry/releases/download/v1.2.2/scurry-darwin-amd64.tar.gz"
+sha256 = "32e7fe315fe3f6a77f1e74c9c930b9c22ff2d4238cf467411a5188698f99e85f"
+path = "scurry"
+
+[tasks.migrate.download.platform.macos-aarch64]
+url = "https://github.com/pjtatlow/scurry/releases/download/v1.2.2/scurry-darwin-arm64.tar.gz"
+sha256 = "4e12870b4f0dea71200d1e435f9d00c12c866361d2228f78d846a0395240429f"
+path = "scurry"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rust app — queries the database and prints users
+# Starts only after migrations have been applied.
+# ──────────────────────────────────────────────────────────────────────────────
+[services.app]
+preset = "rust"
+rust.binary = "app"
+dir = "./app"
+depends_on = ["migrate"]
+
+[services.app.env]
+DATABASE_URL = "postgres://root@127.0.0.1:26257/defaultdb?sslmode=disable"
