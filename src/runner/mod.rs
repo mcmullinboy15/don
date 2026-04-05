@@ -728,7 +728,7 @@ impl Runner {
         false
     }
 
-    /// Start a service: spawn process, output capture, ready check.
+    /// Start a service: bind sockets, build, spawn, wire output + ready check.
     async fn start_service(
         &mut self,
         name: &str,
@@ -746,81 +746,148 @@ impl Runner {
         self.output_manager
             .lifecycle_event(&format!("starting {name}..."));
 
-        // Bind listen sockets if configured and not already bound.
-        if !resolved.listen.is_empty() && !self.bound_sockets.contains_key(name) {
-            match crate::process::socket::bind_sockets(&resolved.listen) {
-                Ok(sockets) => {
-                    self.output_manager.lifecycle_event(&format!(
-                        "{name}: bound {} listen socket{}",
-                        sockets.len(),
-                        if sockets.len() == 1 { "" } else { "s" }
-                    ));
-                    self.bound_sockets.insert(name.to_string(), sockets);
-                }
-                Err(e) => {
-                    self.output_manager
-                        .error_event(&format!("{name}: {e}"));
-                    self.service_states
-                        .insert(name.to_string(), ServiceState::Failed);
-                    let _ = done_tx
-                        .send(ItemDone {
-                            name: name.to_string(),
-                            kind: NodeKind::Service,
-                            success: false,
-                            message: Some(e.to_string()),
-                            elapsed: None,
-                        })
-                        .await;
-                    return Ok(());
-                }
-            }
+        // Phase 1: Bind listen sockets (idempotent — skips if already bound).
+        if let Err(msg) = self.bind_sockets_if_needed(name, &resolved) {
+            self.fail_service_start(name, &msg, done_tx).await;
+            return Ok(());
         }
 
-        // Run initial build for Rust/Go presets.
-        if let Some(ref rust_config) = resolved.rust {
-            let build_args = service::rust_build_args(rust_config);
-            if let Err(()) = self.run_preset_build(name, "cargo", &build_args, &resolved).await {
-                self.service_states.insert(name.to_string(), ServiceState::Failed);
-                let _ = done_tx.send(ItemDone {
-                    name: name.to_string(),
-                    kind: NodeKind::Service,
-                    success: false,
-                    message: Some("build failed".to_string()),
-                    elapsed: None,
-                }).await;
-                return Ok(());
+        // Phase 2: Build (docker, rust, go, or custom build command).
+        if let Err(()) = self.run_service_build(name, &resolved).await {
+            self.fail_service_start(name, "build failed", done_tx).await;
+            return Ok(());
+        }
+
+        // Phase 3: Spawn process + wire output + ready check.
+        self.spawn_and_wire_service(name, &resolved, Some(done_tx))
+            .await
+    }
+
+    /// Bind listen sockets for a service if configured and not already bound.
+    fn bind_sockets_if_needed(
+        &mut self,
+        name: &str,
+        resolved: &crate::config::ResolvedService,
+    ) -> Result<(), String> {
+        if resolved.listen.is_empty() || self.bound_sockets.contains_key(name) {
+            return Ok(());
+        }
+        match crate::process::socket::bind_sockets(&resolved.listen) {
+            Ok(sockets) => {
+                self.output_manager.lifecycle_event(&format!(
+                    "{name}: bound {} listen socket{}",
+                    sockets.len(),
+                    if sockets.len() == 1 { "" } else { "s" }
+                ));
+                self.bound_sockets.insert(name.to_string(), sockets);
+                Ok(())
+            }
+            Err(e) => {
+                self.output_manager.error_event(&format!("{name}: {e}"));
+                Err(e.to_string())
             }
         }
+    }
+
+    /// Run all build steps for a service based on its preset.
+    ///
+    /// Handles docker image build, cargo build, go build, and custom build
+    /// commands. Returns `Ok(())` on success or if no build is needed.
+    /// Returns `Err(())` if the build failed (already logged + events sent).
+    async fn run_service_build(
+        &self,
+        name: &str,
+        resolved: &crate::config::ResolvedService,
+    ) -> Result<(), ()> {
+        // Docker: build image if docker.build is configured.
+        if let Some(ref docker_config) = resolved.docker
+            && let Some(ref build_config) = docker_config.build
+        {
+            self.output_manager
+                .lifecycle_event(&format!("{name}: building docker image..."));
+            if let Some(ref client) = self.docker_client
+                && let Some(writer) = self.output_manager.service_writer(name)
+            {
+                if let Err(e) = crate::docker::build::build_image(
+                    client,
+                    build_config,
+                    &docker_config.image,
+                    &self.base_dir,
+                    &writer,
+                )
+                .await
+                {
+                    self.output_manager
+                        .error_event(&format!("{name}: docker build failed: {e}"));
+                    return Err(());
+                }
+                self.output_manager
+                    .lifecycle_event(&format!("{name}: docker build succeeded"));
+            }
+            return Ok(());
+        }
+
+        // Rust: cargo build.
+        if let Some(ref rust_config) = resolved.rust {
+            let build_args = service::rust_build_args(rust_config);
+            return self
+                .run_preset_build(name, "cargo", &build_args, resolved)
+                .await;
+        }
+
+        // Go: go build.
         if let Some(ref go_config) = resolved.go {
             let output_path = service::go_binary_path(go_config, name, &self.base_dir);
             if let Some(parent) = output_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let build_args = service::go_build_args(go_config, &output_path);
-            if let Err(()) = self.run_preset_build(name, "go", &build_args, &resolved).await {
-                self.service_states.insert(name.to_string(), ServiceState::Failed);
-                let _ = done_tx.send(ItemDone {
-                    name: name.to_string(),
-                    kind: NodeKind::Service,
-                    success: false,
-                    message: Some("build failed".to_string()),
-                    elapsed: None,
-                }).await;
-                return Ok(());
-            }
+            return self
+                .run_preset_build(name, "go", &build_args, resolved)
+                .await;
         }
 
+        // Custom: run the build command if configured.
+        if let Some(ref build_cmd) = resolved.build {
+            return self
+                .run_preset_build(name, &build_cmd.cmd, &build_cmd.args, resolved)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Spawn a service process, wire output capture, and start the ready check.
+    ///
+    /// If `done_tx` is `Some`, sends `ItemDone` on completion (initial startup).
+    /// If `done_tx` is `None`, sends `RebuildComplete` (file-watch rebuild).
+    async fn spawn_and_wire_service(
+        &mut self,
+        name: &str,
+        resolved: &crate::config::ResolvedService,
+        done_tx: Option<mpsc::Sender<ItemDone>>,
+    ) -> Result<(), RunnerError> {
         let pid_dir = self.base_dir.join(".don").join("pids");
         let sockets = self.bound_sockets.get(name);
-
         let writer = self.output_manager.service_writer(name);
-        match service::start_service(name, &resolved, &self.base_dir, &pid_dir, sockets, self.docker_client.as_ref(), writer.as_ref()).await {
+
+        match service::start_service(
+            name,
+            resolved,
+            &self.base_dir,
+            &pid_dir,
+            sockets,
+            self.docker_client.as_ref(),
+            writer.as_ref(),
+        )
+        .await
+        {
             Ok(start_result) => {
                 self.wire_service_output_and_ready_check(
                     name,
                     start_result,
-                    &resolved,
-                    Some(done_tx),
+                    resolved,
+                    done_tx,
                 );
                 Ok(())
             }
@@ -830,19 +897,46 @@ impl Runner {
                 self.output_manager
                     .error_event(&format!("{name}: failed to start: {e}"));
 
-                let _ = done_tx
-                    .send(ItemDone {
+                if let Some(done_tx) = done_tx {
+                    let _ = done_tx
+                        .send(ItemDone {
+                            name: name.to_string(),
+                            kind: NodeKind::Service,
+                            success: false,
+                            message: Some(e.to_string()),
+                            elapsed: None,
+                        })
+                        .await;
+                } else {
+                    let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
                         name: name.to_string(),
-                        kind: NodeKind::Service,
                         success: false,
-                        message: Some(e.to_string()),
-                        elapsed: None,
-                    })
-                    .await;
+                    });
+                }
 
                 Ok(())
             }
         }
+    }
+
+    /// Helper: mark a service as failed during startup and notify via done_tx.
+    async fn fail_service_start(
+        &mut self,
+        name: &str,
+        message: &str,
+        done_tx: mpsc::Sender<ItemDone>,
+    ) {
+        self.service_states
+            .insert(name.to_string(), ServiceState::Failed);
+        let _ = done_tx
+            .send(ItemDone {
+                name: name.to_string(),
+                kind: NodeKind::Service,
+                success: false,
+                message: Some(message.to_string()),
+                elapsed: None,
+            })
+            .await;
     }
 
     /// Wire up a started service's output and ready check.
@@ -1181,7 +1275,7 @@ impl Runner {
 
     /// Handle a file-watch-triggered rebuild for a service.
     ///
-    /// Runs the build command (if any), stops the old process, starts a new one.
+    /// Runs the build (if any), stops the old process, starts a new one.
     /// If the build fails, the old process is kept running.
     /// Broadcasts `RebuildComplete` when done.
     async fn handle_rebuild(&mut self, name: &str) {
@@ -1197,116 +1291,10 @@ impl Runner {
         self.output_manager
             .lifecycle_event(&format!("{name}: rebuilding (file changed)"));
 
-        // Run docker build if this is a Docker service with a build config.
-        if let Some(ref docker_config) = resolved.docker
-            && let Some(ref build_config) = docker_config.build
-        {
-            self.output_manager
-                .lifecycle_event(&format!("{name}: building docker image..."));
-            if let Some(ref client) = self.docker_client
-                && let Some(writer) = self.output_manager.service_writer(name)
-            {
-                if let Err(e) = crate::docker::build::build_image(
-                    client,
-                    build_config,
-                    &docker_config.image,
-                    &self.base_dir,
-                    &writer,
-                )
-                .await
-                {
-                    self.fail_rebuild(name, &format!("{name}: docker build failed: {e}"));
-                    return;
-                }
-                self.output_manager
-                    .lifecycle_event(&format!("{name}: docker build succeeded"));
-            }
-        }
-
-        // Run cargo build for Rust preset.
-        if let Some(ref rust_config) = resolved.rust {
-            let build_args = service::rust_build_args(rust_config);
-            let build_args_str: Vec<String> = build_args;
-            if let Err(()) = self
-                .run_preset_build(name, "cargo", &build_args_str, &resolved)
-                .await
-            {
-                return;
-            }
-        }
-
-        // Run go build for Go preset.
-        if let Some(ref go_config) = resolved.go {
-            let output_path = service::go_binary_path(go_config, name, &self.base_dir);
-            // Ensure the output directory exists.
-            if let Some(parent) = output_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let build_args = service::go_build_args(go_config, &output_path);
-            if let Err(()) = self
-                .run_preset_build(name, "go", &build_args, &resolved)
-                .await
-            {
-                return;
-            }
-        }
-
-        // Run build command if configured (for custom services).
-        if resolved.docker.is_none()
-            && resolved.rust.is_none()
-            && resolved.go.is_none()
-            && let Some(ref build_cmd) = resolved.build
-        {
-            self.output_manager
-                .lifecycle_event(&format!("{name}: running build..."));
-
-            let work_dir = resolved.dir.as_deref().unwrap_or(&self.base_dir);
-            let mut env: HashMap<String, String> = std::env::vars().collect();
-            env.extend(resolved.env.clone());
-
-            match crate::process::spawn_process(crate::process::SpawnConfig {
-                cmd: &build_cmd.cmd,
-                args: &build_cmd.args,
-                dir: Some(work_dir),
-                env,
-                pgid_file_path: None,
-                force_pipe: true,
-                listen_fds: vec![],
-            })
-            .await
-            {
-                Ok((mut handle, child_output)) => {
-                    if let Some(svc_writer) = self.output_manager.service_writer(name) {
-                        let output = child_output;
-                        tokio::spawn(async move {
-                            let _ = svc_writer.process_stream(output).await;
-                        });
-                    }
-
-                    match handle.wait().await {
-                        Ok(status) if status.success() => {
-                            self.output_manager
-                                .lifecycle_event(&format!("{name}: build succeeded"));
-                        }
-                        Ok(status) => {
-                            let code = status.code().unwrap_or(-1);
-                            self.fail_rebuild(
-                                name,
-                                &format!("{name}: build failed (exit code {code})"),
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            self.fail_rebuild(name, &format!("{name}: build error: {e}"));
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.fail_rebuild(name, &format!("{name}: failed to start build: {e}"));
-                    return;
-                }
-            }
+        // Build (if any). On failure, keep old process running.
+        if let Err(()) = self.run_service_build(name, &resolved).await {
+            self.fail_rebuild(name, &format!("{name}: build failed"));
+            return;
         }
 
         // Stop the old service (if running).
@@ -1321,19 +1309,9 @@ impl Runner {
         }
 
         // Start the service again. Sockets are already bound (don holds them).
-        let pid_dir = self.base_dir.join(".don").join("pids");
-        let sockets = self.bound_sockets.get(name);
-        let writer = self.output_manager.service_writer(name);
-        match service::start_service(name, &resolved, &self.base_dir, &pid_dir, sockets, self.docker_client.as_ref(), writer.as_ref()).await {
-            Ok(start_result) => {
-                self.wire_service_output_and_ready_check(name, start_result, &resolved, None);
-            }
-            Err(e) => {
-                self.service_states
-                    .insert(name.to_string(), ServiceState::Failed);
-                self.fail_rebuild(name, &format!("{name}: failed to restart: {e}"));
-            }
-        }
+        let _ = self
+            .spawn_and_wire_service(name, &resolved, None)
+            .await;
     }
 
     /// Handle a file-watch-triggered task re-run.
@@ -1393,72 +1371,72 @@ impl Runner {
     /// Handle an item completion notification.
     fn handle_item_done(&mut self, item: &ItemDone) {
         match item.kind {
-            NodeKind::Service => {
-                if item.success {
-                    self.service_states
-                        .insert(item.name.clone(), ServiceState::Ready);
-                    // Emit ready message with check details.
-                    if let Some(svc) = self.config.services.get(&item.name) {
-                        let resolved = svc.resolve(self.platform);
-                        let ready_desc = match &resolved.ready {
-                            Some(r) if r.tcp.is_some() => {
-                                format!(" (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
-                            }
-                            Some(r) if r.http.is_some() => {
-                                format!(" (http {})", r.http.as_deref().unwrap_or("unknown"))
-                            }
-                            Some(r) if r.exec.is_some() => " (exec)".to_string(),
-                            _ => " started".to_string(),
-                        };
-                        self.output_manager.lifecycle_event(&format!(
-                            "{}{}",
-                            item.name,
-                            if resolved.ready.is_some() {
-                                format!(" ready{ready_desc}")
-                            } else {
-                                ready_desc
-                            }
-                        ));
-                    }
-                } else {
-                    self.service_states
-                        .insert(item.name.clone(), ServiceState::Failed);
-                    if let Some(ref msg) = item.message {
-                        self.output_manager
-                            .error_event(&format!("{}: {msg}", item.name));
-                    }
-                }
-            }
-            NodeKind::Task => {
-                let timing = item.elapsed.map(format_duration).unwrap_or_default();
+            NodeKind::Service => self.handle_service_done(item),
+            NodeKind::Task => self.handle_task_done(item),
+        }
+    }
 
-                if item.success {
-                    let cur = self.task_states.get(&item.name).copied();
-                    // Don't overwrite Skipped with Completed.
-                    if cur != Some(TaskItemState::Skipped) {
-                        self.task_states
-                            .insert(item.name.clone(), TaskItemState::Completed);
+    fn handle_service_done(&mut self, item: &ItemDone) {
+        if item.success {
+            self.service_states
+                .insert(item.name.clone(), ServiceState::Ready);
+            if let Some(svc) = self.config.services.get(&item.name) {
+                let resolved = svc.resolve(self.platform);
+                let ready_desc = match &resolved.ready {
+                    Some(r) if r.tcp.is_some() => {
+                        format!(" (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
                     }
-                    if cur != Some(TaskItemState::Skipped) {
-                        let msg = if timing.is_empty() {
-                            format!("{} complete", item.name)
-                        } else {
-                            format!("{} complete ({timing})", item.name)
-                        };
-                        self.output_manager.lifecycle_event(&msg);
+                    Some(r) if r.http.is_some() => {
+                        format!(" (http {})", r.http.as_deref().unwrap_or("unknown"))
                     }
+                    Some(r) if r.exec.is_some() => " (exec)".to_string(),
+                    _ => " started".to_string(),
+                };
+                self.output_manager.lifecycle_event(&format!(
+                    "{}{}",
+                    item.name,
+                    if resolved.ready.is_some() {
+                        format!(" ready{ready_desc}")
+                    } else {
+                        ready_desc
+                    }
+                ));
+            }
+        } else {
+            self.service_states
+                .insert(item.name.clone(), ServiceState::Failed);
+            if let Some(ref msg) = item.message {
+                self.output_manager
+                    .error_event(&format!("{}: {msg}", item.name));
+            }
+        }
+    }
+
+    fn handle_task_done(&mut self, item: &ItemDone) {
+        let timing = item.elapsed.map(format_duration).unwrap_or_default();
+
+        if item.success {
+            let cur = self.task_states.get(&item.name).copied();
+            if cur != Some(TaskItemState::Skipped) {
+                self.task_states
+                    .insert(item.name.clone(), TaskItemState::Completed);
+                let msg = if timing.is_empty() {
+                    format!("{} complete", item.name)
                 } else {
-                    self.task_states
-                        .insert(item.name.clone(), TaskItemState::Failed);
-                    if let Some(ref err_msg) = item.message {
-                        let msg = if timing.is_empty() {
-                            format!("{} failed ({err_msg})", item.name)
-                        } else {
-                            format!("{} failed ({err_msg}, {timing})", item.name)
-                        };
-                        self.output_manager.error_event(&msg);
-                    }
-                }
+                    format!("{} complete ({timing})", item.name)
+                };
+                self.output_manager.lifecycle_event(&msg);
+            }
+        } else {
+            self.task_states
+                .insert(item.name.clone(), TaskItemState::Failed);
+            if let Some(ref err_msg) = item.message {
+                let msg = if timing.is_empty() {
+                    format!("{} failed ({err_msg})", item.name)
+                } else {
+                    format!("{} failed ({err_msg}, {timing})", item.name)
+                };
+                self.output_manager.error_event(&msg);
             }
         }
     }

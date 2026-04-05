@@ -191,15 +191,11 @@ fn integration_build_then_restart_on_file_change() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         std::fs::write(src_dir.join("app.rs"), "v2").unwrap();
 
-        // Should see build lifecycle events.
+        // Should see rebuild lifecycle events (the initial build also ran,
+        // so we check for "rebuilding" to confirm the file-watch triggered).
         assert!(
-            wait_for_output(&buf, "running build", Duration::from_secs(5)).await,
-            "timed out waiting for build. output: {}",
-            read_buf(&buf)
-        );
-        assert!(
-            wait_for_output(&buf, "build succeeded", Duration::from_secs(5)).await,
-            "timed out waiting for build success. output: {}",
+            wait_for_output(&buf, "rebuilding (file changed)", Duration::from_secs(5)).await,
+            "timed out waiting for rebuild trigger. output: {}",
             read_buf(&buf)
         );
 
@@ -219,10 +215,27 @@ fn integration_build_failure_keeps_old_process() {
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::write(src_dir.join("app.rs"), "v1").unwrap();
 
-        // Build always fails (exit 1). Service should keep running.
+        // Build script: succeeds the first time (creates marker), fails on subsequent runs.
+        let build_script_path = dir.path().join("build.sh");
+        let marker = dir.path().join("build-done");
+        std::fs::write(
+            &build_script_path,
+            format!(
+                "#!/bin/bash\nif [ -f '{}' ]; then exit 1; fi\ntouch '{}'\n",
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &build_script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
         let toml = ConfigBuilder::new()
             .add_custom_service("api", "bash", &["-c", "echo running && sleep 60"])
-            .build_cmd("bash", &["-c", "exit 1"])
+            .build_cmd(build_script_path.to_str().unwrap(), &[])
             .watch(&["src/**/*.rs"])
             .debounce("100ms")
             .ready_exec("true", &[])
