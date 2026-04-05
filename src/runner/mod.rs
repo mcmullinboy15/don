@@ -776,6 +776,40 @@ impl Runner {
             }
         }
 
+        // Run initial build for Rust/Go presets.
+        if let Some(ref rust_config) = resolved.rust {
+            let build_args = service::rust_build_args(rust_config);
+            if let Err(()) = self.run_preset_build(name, "cargo", &build_args, &resolved).await {
+                self.service_states.insert(name.to_string(), ServiceState::Failed);
+                let _ = done_tx.send(ItemDone {
+                    name: name.to_string(),
+                    kind: NodeKind::Service,
+                    success: false,
+                    message: Some("build failed".to_string()),
+                    elapsed: None,
+                }).await;
+                return Ok(());
+            }
+        }
+        if let Some(ref go_config) = resolved.go {
+            let output_path = service::go_binary_path(go_config, name, &self.base_dir);
+            if let Some(parent) = output_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let build_args = service::go_build_args(go_config, &output_path);
+            if let Err(()) = self.run_preset_build(name, "go", &build_args, &resolved).await {
+                self.service_states.insert(name.to_string(), ServiceState::Failed);
+                let _ = done_tx.send(ItemDone {
+                    name: name.to_string(),
+                    kind: NodeKind::Service,
+                    success: false,
+                    message: Some("build failed".to_string()),
+                    elapsed: None,
+                }).await;
+                return Ok(());
+            }
+        }
+
         let pid_dir = self.base_dir.join(".don").join("pids");
         let sockets = self.bound_sockets.get(name);
 
@@ -1075,6 +1109,68 @@ impl Runner {
     }
 
     /// Emit an error and broadcast a failed `RebuildComplete` event.
+    /// Run a preset build command (cargo/go) and stream output.
+    /// Returns `Ok(())` on success, `Err(())` on failure (already logged + event sent).
+    async fn run_preset_build(
+        &self,
+        name: &str,
+        cmd: &str,
+        args: &[String],
+        resolved: &crate::config::ResolvedService,
+    ) -> Result<(), ()> {
+        self.output_manager
+            .lifecycle_event(&format!("{name}: running {cmd} build..."));
+
+        let work_dir = resolved.dir.as_deref().unwrap_or(&self.base_dir);
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+        env.extend(resolved.env.clone());
+
+        match crate::process::spawn_process(crate::process::SpawnConfig {
+            cmd,
+            args,
+            dir: Some(work_dir),
+            env,
+            pgid_file_path: None,
+            force_pipe: true,
+            listen_fds: vec![],
+        })
+        .await
+        {
+            Ok((mut handle, child_output)) => {
+                if let Some(svc_writer) = self.output_manager.service_writer(name) {
+                    let output = child_output;
+                    tokio::spawn(async move {
+                        let _ = svc_writer.process_stream(output).await;
+                    });
+                }
+
+                match handle.wait().await {
+                    Ok(status) if status.success() => {
+                        self.output_manager
+                            .lifecycle_event(&format!("{name}: {cmd} build succeeded"));
+                        Ok(())
+                    }
+                    Ok(status) => {
+                        let code = status.code().unwrap_or(-1);
+                        self.fail_rebuild(
+                            name,
+                            &format!("{name}: {cmd} build failed (exit code {code})"),
+                        );
+                        Err(())
+                    }
+                    Err(e) => {
+                        self.fail_rebuild(name, &format!("{name}: {cmd} build error: {e}"));
+                        Err(())
+                    }
+                }
+            }
+            Err(e) => {
+                self.fail_rebuild(name, &format!("{name}: failed to start {cmd} build: {e}"));
+                Err(())
+            }
+        }
+    }
+
     fn fail_rebuild(&self, name: &str, message: &str) {
         self.output_manager.error_event(message);
         let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
@@ -1127,8 +1223,40 @@ impl Runner {
             }
         }
 
-        // Run build command if configured (for non-Docker services).
-        if resolved.docker.is_none() && let Some(ref build_cmd) = resolved.build {
+        // Run cargo build for Rust preset.
+        if let Some(ref rust_config) = resolved.rust {
+            let build_args = service::rust_build_args(rust_config);
+            let build_args_str: Vec<String> = build_args;
+            if let Err(()) = self
+                .run_preset_build(name, "cargo", &build_args_str, &resolved)
+                .await
+            {
+                return;
+            }
+        }
+
+        // Run go build for Go preset.
+        if let Some(ref go_config) = resolved.go {
+            let output_path = service::go_binary_path(go_config, name, &self.base_dir);
+            // Ensure the output directory exists.
+            if let Some(parent) = output_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let build_args = service::go_build_args(go_config, &output_path);
+            if let Err(()) = self
+                .run_preset_build(name, "go", &build_args, &resolved)
+                .await
+            {
+                return;
+            }
+        }
+
+        // Run build command if configured (for custom services).
+        if resolved.docker.is_none()
+            && resolved.rust.is_none()
+            && resolved.go.is_none()
+            && let Some(ref build_cmd) = resolved.build
+        {
             self.output_manager
                 .lifecycle_event(&format!("{name}: running build..."));
 

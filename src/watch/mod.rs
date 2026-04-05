@@ -116,7 +116,27 @@ impl WatchManager {
         // Process services.
         for (name, svc) in &config.services {
             let resolved = svc.resolve(platform);
-            if resolved.watch.is_empty() {
+
+            // Use configured watch patterns, or inject preset defaults.
+            let watch_patterns: Vec<String> = if !resolved.watch.is_empty() {
+                resolved.watch.clone()
+            } else if resolved.rust.is_some() {
+                vec![
+                    "src/**/*.rs".to_string(),
+                    "Cargo.toml".to_string(),
+                    "Cargo.lock".to_string(),
+                ]
+            } else if resolved.go.is_some() {
+                vec![
+                    "**/*.go".to_string(),
+                    "go.mod".to_string(),
+                    "go.sum".to_string(),
+                ]
+            } else {
+                // Docker and custom services require explicit watch config.
+                Vec::new()
+            };
+            if watch_patterns.is_empty() {
                 continue;
             }
 
@@ -132,7 +152,7 @@ impl WatchManager {
             };
 
             let mut compiled_patterns = Vec::new();
-            for pattern_str in &resolved.watch {
+            for pattern_str in &watch_patterns {
                 let full_pattern = svc_dir.join(pattern_str);
                 match Pattern::new(&full_pattern.to_string_lossy()) {
                     Ok(pat) => compiled_patterns.push(pat),

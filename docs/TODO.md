@@ -251,21 +251,28 @@ Full docker service lifecycle via bollard (Docker API over Unix socket).
 
 ---
 
-## Phase 8: Rust Preset
+## Phase 8: Rust Preset + Go Preset
 
-Cargo build and run integration.
+Build command generation, binary path resolution, and default watch patterns for Rust and Go services.
 
-- [ ] Generate `cargo build` command from `RustConfig` (binary, features, release, extra_args, target_dir)
-- [ ] Resolve binary path from cargo target directory
-- [ ] Watch defaults: if no `watch` patterns set, default to `src/**/*.rs`, `Cargo.toml`, `Cargo.lock`
+- [x] `GoConfig` struct: package, output, build_flags, ldflags — added to Service/ServiceOverride/ResolvedService
+- [x] Updated `Preset` enum and `resolve_preset()` for 4-way dispatch (docker, rust, go, custom)
+- [x] Rust: generate `cargo build --bin <binary>` with features, release, extra_args, target_dir
+- [x] Rust: resolve binary path from `<target_dir>/<profile>/<binary>`
+- [x] Go: generate `go build -o <output> <flags> <package>` with build_flags, ldflags
+- [x] Go: resolve output path to `.don/bin/<name>` (derived from package or explicit output)
+- [x] Both presets build on initial startup and on file-watch rebuild
+- [x] Default watch patterns: Rust gets `src/**/*.rs, Cargo.toml, Cargo.lock`; Go gets `**/*.go, go.mod, go.sum`
+- [x] Shared `run_preset_build()` helper on Runner for build-then-check pattern
 
 ### Test Coverage Checkpoint
-- [ ] Unit test: `cargo build` command construction — minimal (just binary), full (features, release, extra_args, target_dir)
-- [ ] Unit test: binary path resolution — debug vs release, custom target_dir
-- [ ] Unit test: default watch patterns are applied when `watch` is empty
-- [ ] Unit test: default watch patterns are NOT applied when `watch` is explicitly set
-- [ ] Integration test: create a minimal Rust project in a temp dir, configure as a rust service, verify it builds and runs
-- [ ] Integration test: rust service with `release = true`, verify `--release` flag is passed
+- [x] Unit test: Rust build args — minimal, full (features, release, extra_args, target_dir) — table-driven
+- [x] Unit test: Rust binary path — debug vs release, custom target_dir — table-driven
+- [x] Unit test: Go build args — minimal, full (output, build_flags, ldflags) — table-driven
+- [x] Unit test: Go binary path — derived from package, explicit output, fallback to service name — table-driven
+- [x] Integration test: create a minimal Go project, build and run via go preset, verify output
+- [x] Integration test: Go preset with ldflags, verify injected version string in output
+- [x] Integration test: create a minimal Rust project, build and run via rust preset, verify output
 
 ---
 

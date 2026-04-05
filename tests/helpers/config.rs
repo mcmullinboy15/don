@@ -39,6 +39,15 @@ impl ConfigBuilder {
         }
     }
 
+    /// Add a go service. Call `.done()` to finalize.
+    pub fn add_go_service(self, name: &str, package: &str) -> ServiceBuilder {
+        ServiceBuilder {
+            builder: self,
+            name: name.to_string(),
+            lines: vec![format!("go.package = \"{package}\"")],
+        }
+    }
+
     /// Add a rust service. Call `.done()` to finalize.
     pub fn add_rust_service(self, name: &str, binary: &str) -> ServiceBuilder {
         ServiceBuilder {

@@ -52,6 +52,9 @@ pub struct Service {
     // -- Preset: rust --
     pub rust: Option<RustConfig>,
 
+    // -- Preset: go --
+    pub go: Option<GoConfig>,
+
     // -- Custom service (no preset) --
     /// Command to run the service.
     pub run: Option<Command>,
@@ -80,6 +83,7 @@ pub struct ServiceOverride {
 
     pub docker: Option<DockerConfig>,
     pub rust: Option<RustConfig>,
+    pub go: Option<GoConfig>,
     pub run: Option<Command>,
     pub build: Option<Command>,
 }
@@ -102,6 +106,7 @@ pub struct ResolvedService {
 
     pub docker: Option<DockerConfig>,
     pub rust: Option<RustConfig>,
+    pub go: Option<GoConfig>,
     pub run: Option<Command>,
     pub build: Option<Command>,
 }
@@ -164,11 +169,26 @@ pub struct RustConfig {
     pub target_dir: Option<PathBuf>,
 }
 
+/// Go service configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoConfig {
+    /// Go package path to build (e.g. "./cmd/api").
+    pub package: String,
+    /// Output binary name. Defaults to the last component of the package path.
+    pub output: Option<String>,
+    /// Extra flags to pass to `go build` (e.g. ["-race"]).
+    #[serde(default)]
+    pub build_flags: Vec<String>,
+    /// Linker flags passed via `-ldflags` (e.g. "-X main.version=1.0").
+    pub ldflags: Option<String>,
+}
+
 /// The resolved preset for a service, after validation.
 #[derive(Debug)]
 pub enum Preset<'a> {
     Docker(&'a DockerConfig),
     Rust(&'a RustConfig),
+    Go(&'a GoConfig),
     Custom {
         run: &'a Command,
         build: Option<&'a Command>,
@@ -178,25 +198,42 @@ pub enum Preset<'a> {
 pub(crate) fn resolve_preset<'a>(
     docker: &'a Option<DockerConfig>,
     rust: &'a Option<RustConfig>,
+    go: &'a Option<GoConfig>,
     run: &'a Option<Command>,
     build: &'a Option<Command>,
 ) -> Result<Preset<'a>, String> {
-    match (docker, rust, run) {
-        (Some(docker), None, None) => Ok(Preset::Docker(docker)),
-        (None, Some(rust), None) => Ok(Preset::Rust(rust)),
-        (None, None, Some(run)) => Ok(Preset::Custom {
+    let preset_count = docker.is_some() as u8
+        + rust.is_some() as u8
+        + go.is_some() as u8
+        + run.is_some() as u8;
+
+    if preset_count == 0 {
+        return Err("service must have one of: docker, rust, go, or run".to_string());
+    }
+    if preset_count > 1 {
+        return Err("service must have only one of: docker, rust, go, or run".to_string());
+    }
+
+    if let Some(docker) = docker {
+        Ok(Preset::Docker(docker))
+    } else if let Some(rust) = rust {
+        Ok(Preset::Rust(rust))
+    } else if let Some(go) = go {
+        Ok(Preset::Go(go))
+    } else if let Some(run) = run {
+        Ok(Preset::Custom {
             run,
             build: build.as_ref(),
-        }),
-        (None, None, None) => Err("service must have one of: docker, rust, or run".to_string()),
-        _ => Err("service must have only one of: docker, rust, or run".to_string()),
+        })
+    } else {
+        unreachable!()
     }
 }
 
 impl Service {
     /// Resolve which preset the base service uses (ignoring platform overrides).
     pub fn preset(&self) -> Result<Preset<'_>, String> {
-        resolve_preset(&self.docker, &self.rust, &self.run, &self.build)
+        resolve_preset(&self.docker, &self.rust, &self.go, &self.run, &self.build)
     }
 
     /// Resolve the service for a specific platform, applying overrides if present.
@@ -217,6 +254,7 @@ impl Service {
                 log: self.log.clone(),
                 docker: self.docker.clone(),
                 rust: self.rust.clone(),
+                go: self.go.clone(),
                 run: self.run.clone(),
                 build: self.build.clone(),
             },
@@ -224,13 +262,16 @@ impl Service {
                 let mut env = self.env.clone();
                 env.extend(ov.env.clone());
 
-                let has_preset_override =
-                    ov.docker.is_some() || ov.rust.is_some() || ov.run.is_some();
+                let has_preset_override = ov.docker.is_some()
+                    || ov.rust.is_some()
+                    || ov.go.is_some()
+                    || ov.run.is_some();
 
-                let (docker, rust, run, build) = if has_preset_override {
+                let (docker, rust, go, run, build) = if has_preset_override {
                     (
                         ov.docker.clone(),
                         ov.rust.clone(),
+                        ov.go.clone(),
                         ov.run.clone(),
                         ov.build.clone(),
                     )
@@ -238,6 +279,7 @@ impl Service {
                     (
                         self.docker.clone(),
                         self.rust.clone(),
+                        self.go.clone(),
                         self.run.clone(),
                         ov.build.clone().or_else(|| self.build.clone()),
                     )
@@ -261,6 +303,7 @@ impl Service {
                     log: ov.log.clone().unwrap_or_else(|| self.log.clone()),
                     docker,
                     rust,
+                    go,
                     run,
                     build,
                 }
@@ -272,7 +315,7 @@ impl Service {
 impl ResolvedService {
     /// Resolve which preset this resolved service uses.
     pub fn preset(&self) -> Result<Preset<'_>, String> {
-        resolve_preset(&self.docker, &self.rust, &self.run, &self.build)
+        resolve_preset(&self.docker, &self.rust, &self.go, &self.run, &self.build)
     }
 
     /// Resolve the run command for a custom service, taking downloads into account.

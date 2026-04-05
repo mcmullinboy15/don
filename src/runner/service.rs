@@ -3,6 +3,7 @@
 //! Services are long-running processes with PID files, output capture,
 //! and optional ready checks.
 
+use crate::config::service::{GoConfig, RustConfig};
 use crate::config::{ReadyCheck, ResolvedService, ShutdownConfig};
 use crate::duration::parse_duration;
 use crate::process::env::merge_env;
@@ -10,7 +11,7 @@ use crate::process::socket::BoundSockets;
 use crate::process::{ProcessHandle, SpawnConfig, spawn_process};
 use nix::sys::signal::Signal;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// A running service handle — either a local process or a Docker container.
@@ -84,17 +85,25 @@ pub(crate) async fn start_service(
         });
     }
 
-    // Custom preset: spawn a local process.
-    let run_cmd = resolved
-        .run
-        .as_ref()
-        .ok_or_else(|| crate::process::ProcessError::Spawn {
+    // Determine the run command and args based on preset.
+    let (cmd, args) = if let Some(ref rust_config) = resolved.rust {
+        let binary_path = rust_binary_path(rust_config, base_dir);
+        (binary_path.to_string_lossy().into_owned(), vec![])
+    } else if let Some(ref go_config) = resolved.go {
+        let binary_path = go_binary_path(go_config, name, base_dir);
+        (binary_path.to_string_lossy().into_owned(), vec![])
+    } else if let Some(ref run_cmd) = resolved.run {
+        (run_cmd.cmd.clone(), run_cmd.args.clone())
+    } else {
+        return Err(crate::process::ProcessError::Spawn {
             cmd: name.to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "service has no run command (rust preset not yet implemented)",
+                "service has no run command or preset",
             ),
-        })?;
+        }
+        .into());
+    };
 
     // Merge environment. Inject LISTEN_FDS/LISTEN_FDNAMES if sockets are bound.
     let service_dir = resolved.dir.as_deref().unwrap_or(base_dir);
@@ -121,8 +130,8 @@ pub(crate) async fn start_service(
     // Spawn the process. Force pipe mode when passing listen fds
     // (pty-process doesn't expose pre_exec for fd placement).
     let (handle, child_output) = spawn_process(SpawnConfig {
-        cmd: &run_cmd.cmd,
-        args: &run_cmd.args,
+        cmd: &cmd,
+        args: &args,
         dir: Some(service_dir),
         env,
         pgid_file_path: Some(pgid_file_path),
@@ -271,4 +280,283 @@ pub(crate) async fn stop_service(
         }
     }
     Ok(())
+}
+
+// --- Preset build command and binary path helpers ---
+
+/// Construct `cargo build` arguments from a RustConfig.
+pub(crate) fn rust_build_args(config: &RustConfig) -> Vec<String> {
+    let mut args = vec!["build".to_string(), "--bin".to_string(), config.binary.clone()];
+    if !config.features.is_empty() {
+        args.push("--features".to_string());
+        args.push(config.features.join(","));
+    }
+    if config.release {
+        args.push("--release".to_string());
+    }
+    if let Some(ref target_dir) = config.target_dir {
+        args.push("--target-dir".to_string());
+        args.push(target_dir.to_string_lossy().into_owned());
+    }
+    args.extend(config.extra_args.clone());
+    args
+}
+
+/// Resolve the path to the built Rust binary.
+pub(crate) fn rust_binary_path(config: &RustConfig, base_dir: &Path) -> PathBuf {
+    let target_dir = config
+        .target_dir
+        .clone()
+        .unwrap_or_else(|| base_dir.join("target"));
+    let profile = if config.release { "release" } else { "debug" };
+    target_dir.join(profile).join(&config.binary)
+}
+
+/// Construct `go build` arguments from a GoConfig.
+pub(crate) fn go_build_args(config: &GoConfig, output_path: &Path) -> Vec<String> {
+    let mut args = vec![
+        "build".to_string(),
+        "-o".to_string(),
+        output_path.to_string_lossy().into_owned(),
+    ];
+    args.extend(config.build_flags.clone());
+    if let Some(ref ldflags) = config.ldflags {
+        args.push("-ldflags".to_string());
+        args.push(ldflags.clone());
+    }
+    args.push(config.package.clone());
+    args
+}
+
+/// Resolve the output path for a Go binary.
+///
+/// If `output` is set, uses that relative to `.don/bin/`.
+/// Otherwise derives from the package path (last component).
+pub(crate) fn go_binary_path(config: &GoConfig, service_name: &str, base_dir: &Path) -> PathBuf {
+    let bin_dir = base_dir.join(".don").join("bin");
+    let binary_name = config.output.clone().unwrap_or_else(|| {
+        // Extract last component: "./cmd/api" → "api"
+        Path::new(&config.package)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| service_name.to_string())
+    });
+    bin_dir.join(binary_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rust_build_args() {
+        struct Case {
+            name: &'static str,
+            config: RustConfig,
+            expected: Vec<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "minimal",
+                config: RustConfig {
+                    binary: "myapp".to_string(),
+                    features: vec![],
+                    release: false,
+                    extra_args: vec![],
+                    target_dir: None,
+                },
+                expected: vec!["build", "--bin", "myapp"],
+            },
+            Case {
+                name: "full",
+                config: RustConfig {
+                    binary: "api".to_string(),
+                    features: vec!["feat1".to_string(), "feat2".to_string()],
+                    release: true,
+                    extra_args: vec!["--jobs".to_string(), "4".to_string()],
+                    target_dir: Some(PathBuf::from("./custom-target")),
+                },
+                expected: vec![
+                    "build", "--bin", "api", "--features", "feat1,feat2",
+                    "--release", "--target-dir", "./custom-target", "--jobs", "4",
+                ],
+            },
+            Case {
+                name: "release only",
+                config: RustConfig {
+                    binary: "server".to_string(),
+                    features: vec![],
+                    release: true,
+                    extra_args: vec![],
+                    target_dir: None,
+                },
+                expected: vec!["build", "--bin", "server", "--release"],
+            },
+        ];
+
+        for case in cases {
+            let result = rust_build_args(&case.config);
+            let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(result, expected, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_rust_binary_path() {
+        struct Case {
+            name: &'static str,
+            config: RustConfig,
+            base_dir: &'static str,
+            expected: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "debug default target",
+                config: RustConfig {
+                    binary: "myapp".to_string(),
+                    features: vec![],
+                    release: false,
+                    extra_args: vec![],
+                    target_dir: None,
+                },
+                base_dir: "/project",
+                expected: "/project/target/debug/myapp",
+            },
+            Case {
+                name: "release default target",
+                config: RustConfig {
+                    binary: "myapp".to_string(),
+                    features: vec![],
+                    release: true,
+                    extra_args: vec![],
+                    target_dir: None,
+                },
+                base_dir: "/project",
+                expected: "/project/target/release/myapp",
+            },
+            Case {
+                name: "custom target dir",
+                config: RustConfig {
+                    binary: "api".to_string(),
+                    features: vec![],
+                    release: false,
+                    extra_args: vec![],
+                    target_dir: Some(PathBuf::from("/tmp/build")),
+                },
+                base_dir: "/project",
+                expected: "/tmp/build/debug/api",
+            },
+        ];
+
+        for case in cases {
+            let result = rust_binary_path(&case.config, Path::new(case.base_dir));
+            assert_eq!(result, PathBuf::from(case.expected), "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_go_build_args() {
+        struct Case {
+            name: &'static str,
+            config: GoConfig,
+            output: &'static str,
+            expected: Vec<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "minimal",
+                config: GoConfig {
+                    package: "./cmd/api".to_string(),
+                    output: None,
+                    build_flags: vec![],
+                    ldflags: None,
+                },
+                output: "/tmp/bin/api",
+                expected: vec!["build", "-o", "/tmp/bin/api", "./cmd/api"],
+            },
+            Case {
+                name: "full",
+                config: GoConfig {
+                    package: "./cmd/server".to_string(),
+                    output: Some("server".to_string()),
+                    build_flags: vec!["-race".to_string()],
+                    ldflags: Some("-X main.version=1.0".to_string()),
+                },
+                output: "/tmp/bin/server",
+                expected: vec![
+                    "build", "-o", "/tmp/bin/server", "-race",
+                    "-ldflags", "-X main.version=1.0", "./cmd/server",
+                ],
+            },
+        ];
+
+        for case in cases {
+            let result = go_build_args(&case.config, Path::new(case.output));
+            let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(result, expected, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_go_binary_path() {
+        struct Case {
+            name: &'static str,
+            config: GoConfig,
+            service_name: &'static str,
+            expected_suffix: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "derived from package",
+                config: GoConfig {
+                    package: "./cmd/api".to_string(),
+                    output: None,
+                    build_flags: vec![],
+                    ldflags: None,
+                },
+                service_name: "api-svc",
+                expected_suffix: ".don/bin/api",
+            },
+            Case {
+                name: "explicit output",
+                config: GoConfig {
+                    package: "./cmd/server".to_string(),
+                    output: Some("my-server".to_string()),
+                    build_flags: vec![],
+                    ldflags: None,
+                },
+                service_name: "server",
+                expected_suffix: ".don/bin/my-server",
+            },
+            Case {
+                name: "root package falls back to service name",
+                config: GoConfig {
+                    package: ".".to_string(),
+                    output: None,
+                    build_flags: vec![],
+                    ldflags: None,
+                },
+                service_name: "myapp",
+                // "." has no file_name, but Path::new(".").file_name() is None on some platforms
+                // The fallback should use the service name
+                expected_suffix: ".don/bin/myapp",
+            },
+        ];
+
+        for case in cases {
+            let base = Path::new("/project");
+            let result = go_binary_path(&case.config, case.service_name, base);
+            assert!(
+                result.ends_with(case.expected_suffix),
+                "{}: expected to end with '{}', got '{}'",
+                case.name,
+                case.expected_suffix,
+                result.display()
+            );
+        }
+    }
 }
