@@ -8,9 +8,11 @@ license = "MIT"
 
 [dependencies]
 axum = "0.8"
+bollard = "0.20"
 bytes = "1"
 crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
 glob = "0.3"
 libc = "0.2"
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -21,7 +23,9 @@ pty-process = { version = "0.5", features = ["async"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
+tar = "0.4"
 tokio = { version = "1", features = ["full", "test-util"] }
+tokio-stream = "0.1"
 toml = "0.8"
 
 [dev-dependencies]

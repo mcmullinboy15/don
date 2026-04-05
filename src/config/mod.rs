@@ -6,9 +6,9 @@
 mod download;
 mod platform;
 mod profile;
-mod service;
-mod task;
-mod types;
+pub(crate) mod service;
+pub(crate) mod task;
+pub(crate) mod types;
 
 pub use self::download::{DownloadConfig, PlatformDownload};
 pub use self::platform::Platform;

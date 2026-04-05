@@ -357,6 +357,9 @@ pub struct Runner {
     /// Outlive service restarts — don holds the sockets so ports are never released.
     bound_sockets: HashMap<String, crate::process::socket::BoundSockets>,
 
+    /// Docker API client. `Some` if any service uses the docker preset.
+    docker_client: Option<bollard::Docker>,
+
     // Channels
     cmd_tx: mpsc::Sender<RunnerCommand>,
     cmd_rx: mpsc::Receiver<RunnerCommand>,
@@ -402,6 +405,17 @@ impl Runner {
 
         let task_state = TaskState::new(don_dir.join("task-state"));
 
+        // Connect to Docker if any service uses the docker preset.
+        let has_docker = config.services.values().any(|s| s.docker.is_some());
+        let docker_client = if has_docker {
+            Some(
+                bollard::Docker::connect_with_socket_defaults()
+                    .map_err(|e| RunnerError::Config(format!("docker connection failed: {e}")))?,
+            )
+        } else {
+            None
+        };
+
         let mut service_states = HashMap::new();
         for name in config.services.keys() {
             service_states.insert(name.clone(), ServiceState::Pending);
@@ -422,6 +436,7 @@ impl Runner {
             task_states: task_item_states,
             service_handles: HashMap::new(),
             bound_sockets: HashMap::new(),
+            docker_client,
             cmd_tx,
             cmd_rx,
             event_tx,
@@ -467,6 +482,7 @@ impl Runner {
             task_states: task_item_states,
             service_handles: HashMap::new(),
             bound_sockets: HashMap::new(),
+            docker_client: None,
             cmd_tx,
             cmd_rx,
             event_tx,
@@ -763,7 +779,8 @@ impl Runner {
         let pid_dir = self.base_dir.join(".don").join("pids");
         let sockets = self.bound_sockets.get(name);
 
-        match service::start_service(name, &resolved, &self.base_dir, &pid_dir, sockets).await {
+        let writer = self.output_manager.service_writer(name);
+        match service::start_service(name, &resolved, &self.base_dir, &pid_dir, sockets, self.docker_client.as_ref(), writer.as_ref()).await {
             Ok(start_result) => {
                 self.wire_service_output_and_ready_check(
                     name,
@@ -1084,8 +1101,34 @@ impl Runner {
         self.output_manager
             .lifecycle_event(&format!("{name}: rebuilding (file changed)"));
 
-        // Run build command if configured.
-        if let Some(ref build_cmd) = resolved.build {
+        // Run docker build if this is a Docker service with a build config.
+        if let Some(ref docker_config) = resolved.docker
+            && let Some(ref build_config) = docker_config.build
+        {
+            self.output_manager
+                .lifecycle_event(&format!("{name}: building docker image..."));
+            if let Some(ref client) = self.docker_client
+                && let Some(writer) = self.output_manager.service_writer(name)
+            {
+                if let Err(e) = crate::docker::build::build_image(
+                    client,
+                    build_config,
+                    &docker_config.image,
+                    &self.base_dir,
+                    &writer,
+                )
+                .await
+                {
+                    self.fail_rebuild(name, &format!("{name}: docker build failed: {e}"));
+                    return;
+                }
+                self.output_manager
+                    .lifecycle_event(&format!("{name}: docker build succeeded"));
+            }
+        }
+
+        // Run build command if configured (for non-Docker services).
+        if resolved.docker.is_none() && let Some(ref build_cmd) = resolved.build {
             self.output_manager
                 .lifecycle_event(&format!("{name}: running build..."));
 
@@ -1152,7 +1195,8 @@ impl Runner {
         // Start the service again. Sockets are already bound (don holds them).
         let pid_dir = self.base_dir.join(".don").join("pids");
         let sockets = self.bound_sockets.get(name);
-        match service::start_service(name, &resolved, &self.base_dir, &pid_dir, sockets).await {
+        let writer = self.output_manager.service_writer(name);
+        match service::start_service(name, &resolved, &self.base_dir, &pid_dir, sockets, self.docker_client.as_ref(), writer.as_ref()).await {
             Ok(start_result) => {
                 self.wire_service_output_and_ready_check(name, start_result, &resolved, None);
             }

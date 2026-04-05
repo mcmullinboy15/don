@@ -228,20 +228,26 @@ Zero-downtime restarts for services with `listen` addresses.
 
 ## Phase 7: Docker Support
 
-Full docker service lifecycle.
+Full docker service lifecycle via bollard (Docker API over Unix socket).
 
-- [ ] Build the `docker run` command from `DockerConfig` (image, container, ports, volumes, network, command, env, env_file)
-- [ ] Docker build: `docker build` from `DockerBuildConfig` (context, dockerfile, target, args), tag with `image`
-- [ ] Container status check: `docker inspect` to see if container is already running
-- [ ] Container cleanup: stop and remove containers on shutdown and during stale cleanup
-- [ ] Watch-triggered docker rebuild: rebuild image, recreate container
+- [x] `docker/mod.rs` — DockerHandle, start_docker_service, cleanup_stale_container, container lifecycle (create, start, stop, remove)
+- [x] `docker/parse.rs` — port mapping parsing ("8080:80/tcp"), env var merging (inline + env files), volume pass-through
+- [x] `docker/stream.rs` — DockerLogReader: AsyncRead adapter over bollard's log stream, ChildOutput::DockerLogs variant
+- [x] `docker/build.rs` — image building: tar context creation, streamed build output through ServiceWriter::write_line
+- [x] ServiceHandle converted to enum (Process/Docker) — dispatch in start_service and stop_service
+- [x] Docker client on Runner — lazy initialization, passed through to start_service
+- [x] Watch-triggered docker rebuild: docker build (if configured) → stop container → recreate + start
+- [x] Stale container cleanup: inspect by name on startup, stop + force-remove if exists
 
 ### Test Coverage Checkpoint
-- [ ] Unit test: `docker run` command construction — verify all flags (ports, volumes, network, env, env_file, command) are generated correctly
-- [ ] Unit test: `docker build` command construction — verify context, dockerfile, target, build-args flags
-- [ ] Unit test: command construction with minimal config (just image) vs full config
-- [ ] Integration test (requires docker): start a docker service, verify container is running via `docker inspect`, stop it, verify container is removed
-- [ ] Integration test (requires docker): docker build + run — build from a Dockerfile, verify image is tagged, container runs
+- [x] Unit test: port mapping parsing — host:container, host_ip:host:container, tcp/udp, invalid formats (table-driven)
+- [x] Unit test: env var merging — inline vars, env file loading, overlay precedence
+- [x] Unit test: DockerLogReader — single entry, multiple entries, empty stream EOF, small buffer buffering
+- [x] Unit test: tar context creation — verify expected files in archive
+- [x] Integration test (requires docker, `DON_TEST_DOCKER=1`): start a docker service, verify output, stop, verify removed
+- [x] Integration test (requires docker): docker service with port mapping, HTTP ready check, verify connectivity
+- [x] Integration test (requires docker): stale container cleanup — pre-create container, start don, verify replaced
+- [x] Integration test (requires docker): docker build + run — build from Dockerfile, verify output
 
 ---
 

@@ -126,6 +126,28 @@ impl ServiceWriter {
 
         Ok(())
     }
+
+    /// Write a single line to the ring buffer and sinks.
+    ///
+    /// Used for structured output like Docker build progress that arrives
+    /// as individual text lines rather than a byte stream.
+    pub async fn write_line(&self, line: &str) {
+        let line = Bytes::from(line.to_string());
+        let (prefix, sinks) = {
+            let mut state = self.state.lock().await;
+            state.ring_buffer.push(line.clone());
+            (state.prefix.clone(), state.sinks.clone())
+        };
+        for sink in &sinks {
+            let _ = sink
+                .tx
+                .send(SinkLine {
+                    prefix: prefix.clone(),
+                    line: line.clone(),
+                })
+                .await;
+        }
+    }
 }
 
 /// Assigns a deterministic color index to a service name.

@@ -25,6 +25,8 @@ pub enum ChildOutput {
     Pty(pty_process::OwnedReadPty),
     /// Piped stdout from a non-PTY process (stderr merged via dup2).
     Pipe(tokio::process::ChildStdout),
+    /// Log stream from a Docker container (via bollard).
+    DockerLogs(crate::docker::stream::DockerLogReader),
 }
 
 impl AsyncRead for ChildOutput {
@@ -36,6 +38,7 @@ impl AsyncRead for ChildOutput {
         match self.get_mut() {
             ChildOutput::Pty(pty) => Pin::new(pty).poll_read(cx, buf),
             ChildOutput::Pipe(stdout) => Pin::new(stdout).poll_read(cx, buf),
+            ChildOutput::DockerLogs(reader) => Pin::new(reader).poll_read(cx, buf),
         }
     }
 }

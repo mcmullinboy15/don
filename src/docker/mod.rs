@@ -1,0 +1,240 @@
+//! Docker service lifecycle — container creation, starting, stopping, and log streaming.
+//!
+//! Uses the bollard crate to communicate with the Docker daemon via its Unix socket.
+//! Each Docker service gets a [`DockerHandle`] that wraps the container ID and provides
+//! stop/wait operations analogous to [`crate::process::ProcessHandle`].
+
+pub mod build;
+pub mod parse;
+pub mod stream;
+
+use bollard::Docker;
+use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
+};
+use futures_util::StreamExt;
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::task::JoinHandle;
+
+use crate::config::service::DockerConfig;
+use crate::process::ChildOutput;
+use stream::DockerLogReader;
+
+/// Errors from Docker operations.
+#[derive(Debug, thiserror::Error)]
+pub enum DockerError {
+    #[error("docker API error: {0}")]
+    Api(#[from] bollard::errors::Error),
+    #[error("docker build failed: {0}")]
+    BuildFailed(String),
+    #[error("failed to create build context: {0}")]
+    Tar(#[source] std::io::Error),
+    #[error("container vanished unexpectedly")]
+    ContainerVanished,
+    #[error("invalid port mapping '{0}': {1}")]
+    InvalidPort(String, String),
+    #[error("docker not available")]
+    NotAvailable,
+    #[error("env file error: {0}")]
+    EnvFile(#[source] std::io::Error),
+}
+
+/// Handle to a running Docker container.
+///
+/// Provides stop/wait operations analogous to [`crate::process::ProcessHandle`].
+/// The container is identified by ID and name. A background task waits for
+/// the container to exit so `wait()` can return the exit code.
+pub struct DockerHandle {
+    client: Docker,
+    container_id: String,
+    container_name: String,
+    /// Background task waiting for container exit.
+    wait_handle: Option<JoinHandle<Result<i64, DockerError>>>,
+}
+
+impl std::fmt::Debug for DockerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DockerHandle")
+            .field("container_id", &self.container_id)
+            .field("container_name", &self.container_name)
+            .finish()
+    }
+}
+
+impl DockerHandle {
+    /// Stop the container with the given signal and timeout, then remove it.
+    pub async fn stop(&mut self, signal: &str, timeout: Duration) -> Result<(), DockerError> {
+        let timeout_secs = timeout.as_secs().max(1) as i32;
+        let stop_options = StopContainerOptionsBuilder::new()
+            .signal(signal)
+            .t(timeout_secs)
+            .build();
+        let _ = self
+            .client
+            .stop_container(&self.container_id, Some(stop_options))
+            .await;
+        let remove_options = RemoveContainerOptionsBuilder::new().force(true).build();
+        self.client
+            .remove_container(&self.container_id, Some(remove_options))
+            .await?;
+        Ok(())
+    }
+
+    /// Wait for the container to exit and return the exit code.
+    pub async fn wait(&mut self) -> Result<i64, DockerError> {
+        match self.wait_handle.take() {
+            Some(handle) => match handle.await {
+                Ok(result) => result,
+                Err(_join_err) => Err(DockerError::ContainerVanished),
+            },
+            None => Err(DockerError::ContainerVanished),
+        }
+    }
+
+    /// Force-remove the container (for cleanup).
+    pub async fn remove(&self) -> Result<(), DockerError> {
+        let options = RemoveContainerOptionsBuilder::new().force(true).build();
+        self.client
+            .remove_container(&self.container_id, Some(options))
+            .await?;
+        Ok(())
+    }
+
+    /// The container name.
+    pub fn container_name(&self) -> &str {
+        &self.container_name
+    }
+}
+
+/// Start a Docker service: clean up stale containers, create, start, stream logs.
+///
+/// Returns a `DockerHandle` for lifecycle management and a `ChildOutput` for
+/// log streaming (compatible with the existing output system).
+pub(crate) async fn start_docker_service(
+    client: &Docker,
+    name: &str,
+    config: &DockerConfig,
+    service_env: &HashMap<String, String>,
+    env_files: &[std::path::PathBuf],
+    base_dir: &std::path::Path,
+    writer: Option<&crate::output::ServiceWriter>,
+) -> Result<(DockerHandle, ChildOutput), DockerError> {
+    let container_name = config
+        .container
+        .clone()
+        .unwrap_or_else(|| format!("don-{name}"));
+
+    // Clean up any stale container with the same name.
+    cleanup_stale_container(client, &container_name).await?;
+
+    // Build the image if a build config is present.
+    if let Some(ref build_config) = config.build
+        && let Some(w) = writer
+    {
+        build::build_image(client, build_config, &config.image, base_dir, w).await?;
+    }
+
+    // Build container configuration.
+    let (port_bindings, exposed_ports) = parse::parse_port_mappings(&config.ports)?;
+    let env_vars = parse::build_env_vars(service_env, env_files)?;
+
+    let container_config = ContainerCreateBody {
+        image: Some(config.image.clone()),
+        env: Some(env_vars),
+        exposed_ports: if exposed_ports.is_empty() {
+            None
+        } else {
+            Some(exposed_ports.into_iter().collect())
+        },
+        cmd: if config.command.is_empty() {
+            None
+        } else {
+            Some(config.command.clone())
+        },
+        host_config: Some(HostConfig {
+            port_bindings: if port_bindings.is_empty() {
+                None
+            } else {
+                Some(port_bindings)
+            },
+            binds: if config.volumes.is_empty() {
+                None
+            } else {
+                Some(config.volumes.clone())
+            },
+            network_mode: config.network.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // Create container.
+    let create_options = CreateContainerOptionsBuilder::new()
+        .name(&container_name)
+        .build();
+    let response = client
+        .create_container(Some(create_options), container_config)
+        .await?;
+    let container_id = response.id;
+
+    // Start container.
+    client.start_container(&container_id, None).await?;
+
+    // Spawn a background task to wait for container exit.
+    let wait_client = client.clone();
+    let wait_id = container_id.clone();
+    let wait_handle = tokio::spawn(async move {
+        let wait_options = WaitContainerOptionsBuilder::new()
+            .condition("not-running")
+            .build();
+        let mut stream = wait_client.wait_container(&wait_id, Some(wait_options));
+        match stream.next().await {
+            Some(Ok(response)) => Ok(response.status_code),
+            Some(Err(e)) => Err(DockerError::Api(e)),
+            None => Err(DockerError::ContainerVanished),
+        }
+    });
+
+    // Start log streaming.
+    let log_options = LogsOptionsBuilder::new()
+        .follow(true)
+        .stdout(true)
+        .stderr(true)
+        .build();
+    let log_stream = client.logs(&container_id, Some(log_options));
+    let log_reader = DockerLogReader::new(Box::pin(log_stream));
+    let child_output = ChildOutput::DockerLogs(log_reader);
+
+    let handle = DockerHandle {
+        client: client.clone(),
+        container_id,
+        container_name,
+        wait_handle: Some(wait_handle),
+    };
+
+    Ok((handle, child_output))
+}
+
+/// Clean up a stale container by name (from a previous don run that crashed).
+pub(crate) async fn cleanup_stale_container(
+    client: &Docker,
+    name: &str,
+) -> Result<(), DockerError> {
+    match client.inspect_container(name, None).await {
+        Ok(_) => {
+            // Container exists — stop and remove it.
+            let stop_options = StopContainerOptionsBuilder::new().t(5).build();
+            let _ = client.stop_container(name, Some(stop_options)).await;
+            let remove_options = RemoveContainerOptionsBuilder::new().force(true).build();
+            client.remove_container(name, Some(remove_options)).await?;
+            Ok(())
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(()),
+        Err(e) => Err(DockerError::Api(e)),
+    }
+}

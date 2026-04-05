@@ -13,9 +13,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-/// A running service handle — holds the process and PID file.
-pub struct ServiceHandle {
-    pub(crate) process: ProcessHandle,
+/// A running service handle — either a local process or a Docker container.
+pub enum ServiceHandle {
+    /// A locally spawned process with its own process group.
+    Process(ProcessHandle),
+    /// A Docker container managed via the bollard API.
+    Docker(crate::docker::DockerHandle),
 }
 
 /// Result of starting a service: the handle for lifecycle management
@@ -40,6 +43,8 @@ pub enum ServiceError {
     ReadyCheckError(String),
     #[error("invalid duration: {0}")]
     Duration(#[from] crate::duration::DurationError),
+    #[error("docker error: {0}")]
+    Docker(String),
 }
 
 /// Start a service: merge env, spawn process.
@@ -53,8 +58,33 @@ pub(crate) async fn start_service(
     base_dir: &Path,
     pid_dir: &Path,
     bound_sockets: Option<&BoundSockets>,
+    docker_client: Option<&bollard::Docker>,
+    service_writer: Option<&crate::output::ServiceWriter>,
 ) -> Result<StartResult, ServiceError> {
-    // Determine run command.
+    // Dispatch based on the service preset.
+    if let Some(ref docker_config) = resolved.docker {
+        // Docker preset: start a container via the Docker API.
+        let client = docker_client.ok_or_else(|| {
+            ServiceError::Docker("docker client not available".to_string())
+        })?;
+        let (handle, child_output) = crate::docker::start_docker_service(
+            client,
+            name,
+            docker_config,
+            &resolved.env,
+            &resolved.env_file,
+            base_dir,
+            service_writer,
+        )
+        .await
+        .map_err(|e| ServiceError::Docker(e.to_string()))?;
+        return Ok(StartResult {
+            handle: ServiceHandle::Docker(handle),
+            child_output,
+        });
+    }
+
+    // Custom preset: spawn a local process.
     let run_cmd = resolved
         .run
         .as_ref()
@@ -62,7 +92,7 @@ pub(crate) async fn start_service(
             cmd: name.to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "service has no run command (docker/rust presets not yet implemented)",
+                "service has no run command (rust preset not yet implemented)",
             ),
         })?;
 
@@ -102,7 +132,7 @@ pub(crate) async fn start_service(
     .await?;
 
     Ok(StartResult {
-        handle: ServiceHandle { process: handle },
+        handle: ServiceHandle::Process(handle),
         child_output,
     })
 }
@@ -205,20 +235,40 @@ pub(crate) async fn stop_service(
     shutdown_config: Option<&ShutdownConfig>,
     force: bool,
 ) -> Result<(), ServiceError> {
-    let (signal, timeout) = if force {
-        // Force shutdown: SIGKILL with a short wait.
-        (Signal::SIGKILL, Duration::from_millis(500))
-    } else {
-        (
-            shutdown_config
-                .map(|c| parse_signal(&c.signal))
-                .unwrap_or(Signal::SIGTERM),
-            shutdown_config
-                .and_then(|c| parse_duration(&c.timeout).ok())
-                .unwrap_or(Duration::from_secs(10)),
-        )
-    };
-
-    handle.process.terminate(signal, timeout).await?;
+    match handle {
+        ServiceHandle::Process(ref mut process) => {
+            let (signal, timeout) = if force {
+                (Signal::SIGKILL, Duration::from_millis(500))
+            } else {
+                (
+                    shutdown_config
+                        .map(|c| parse_signal(&c.signal))
+                        .unwrap_or(Signal::SIGTERM),
+                    shutdown_config
+                        .and_then(|c| parse_duration(&c.timeout).ok())
+                        .unwrap_or(Duration::from_secs(10)),
+                )
+            };
+            process.terminate(signal, timeout).await?;
+        }
+        ServiceHandle::Docker(ref mut docker) => {
+            let (signal_name, timeout) = if force {
+                ("SIGKILL", Duration::from_millis(500))
+            } else {
+                (
+                    shutdown_config
+                        .map(|c| c.signal.as_str())
+                        .unwrap_or("SIGTERM"),
+                    shutdown_config
+                        .and_then(|c| parse_duration(&c.timeout).ok())
+                        .unwrap_or(Duration::from_secs(10)),
+                )
+            };
+            docker
+                .stop(signal_name, timeout)
+                .await
+                .map_err(|e| ServiceError::Docker(e.to_string()))?;
+        }
+    }
     Ok(())
 }
