@@ -454,6 +454,7 @@ impl Runner {
         platform: Platform,
         output_manager: OutputManager,
         base_dir: PathBuf,
+        profile: Option<&str>,
         shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -511,14 +512,29 @@ impl Runner {
             None
         };
 
+        // Resolve which items to run: all items, or just the profile subset
+        // with transitive deps included.
+        let active_items: Option<HashSet<String>> = if let Some(profile_name) = profile {
+            let prof = config.profiles.get(profile_name).ok_or_else(|| {
+                RunnerError::Config(format!("unknown profile '{profile_name}'"))
+            })?;
+            Some(resolve_profile_items(&config, prof))
+        } else {
+            None // all items
+        };
+
         let mut service_states = HashMap::new();
         for name in config.services.keys() {
-            service_states.insert(name.clone(), ServiceState::Pending);
+            if active_items.as_ref().is_none_or(|s| s.contains(name)) {
+                service_states.insert(name.clone(), ServiceState::Pending);
+            }
         }
 
         let mut task_item_states = HashMap::new();
         for name in config.tasks.keys() {
-            task_item_states.insert(name.clone(), TaskItemState::Pending);
+            if active_items.as_ref().is_none_or(|s| s.contains(name)) {
+                task_item_states.insert(name.clone(), TaskItemState::Pending);
+            }
         }
 
         // Prune download cache entries that aren't referenced by the current
@@ -688,8 +704,17 @@ impl Runner {
         let (done_tx, mut done_rx) = mpsc::channel::<ItemDone>(64);
         self.done_tx = Some(done_tx.clone());
 
-        // Track which items are in flight.
-        let mut pending: HashSet<String> = order.iter().cloned().collect();
+        // Track which items are in flight. Only include items that are in the
+        // active set (all items, or profile subset). Items not in service_states
+        // or task_states are excluded (e.g. services not in the selected profile).
+        let mut pending: HashSet<String> = order
+            .iter()
+            .filter(|name| {
+                self.service_states.contains_key(*name)
+                    || self.task_states.contains_key(*name)
+            })
+            .cloned()
+            .collect();
         let mut in_flight: HashSet<String> = HashSet::new();
 
         // Start items whose dependencies are already satisfied.
@@ -2177,6 +2202,43 @@ impl Runner {
         }
         statuses
     }
+}
+
+/// Resolve a profile into the full set of items (services + tasks) to run,
+/// including transitive dependencies. Starting with the profile's explicit
+/// services and tasks, walks `depends_on` recursively to include everything
+/// needed.
+pub fn resolve_profile_items(config: &Config, profile: &crate::config::Profile) -> HashSet<String> {
+    let mut result = HashSet::new();
+    let mut queue: Vec<String> = profile
+        .services
+        .iter()
+        .chain(profile.tasks.iter())
+        .cloned()
+        .collect();
+
+    while let Some(name) = queue.pop() {
+        if !result.insert(name.clone()) {
+            continue; // already visited
+        }
+        // Follow deps from services.
+        if let Some(svc) = config.services.get(&name) {
+            for dep in &svc.depends_on {
+                if !result.contains(dep) {
+                    queue.push(dep.clone());
+                }
+            }
+        }
+        // Follow deps from tasks.
+        if let Some(task) = config.tasks.get(&name) {
+            for dep in &task.depends_on {
+                if !result.contains(dep) {
+                    queue.push(dep.clone());
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Install signal handlers for SIGINT and SIGTERM.

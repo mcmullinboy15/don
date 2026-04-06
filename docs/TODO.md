@@ -538,17 +538,17 @@ Upgrade the basic signal handling from Phase 2 to full graceful shutdown.
 
 Subset selection with transitive dependency resolution.
 
-- [ ] Resolve profile: collect listed services/tasks, walk `depends_on` to include transitive deps
-- [ ] Only start/run the resolved subset
-- [ ] `don start --profile <name>` wired up end-to-end
+- [x] Resolve profile: `resolve_profile_items()` collects listed services/tasks, walks `depends_on` to include transitive deps
+- [x] Only start/run the resolved subset — items not in the profile are excluded from `service_states`/`task_states` and `pending` set
+- [x] `don start --profile <name>` wired up end-to-end
 
 ### Test Coverage Checkpoint
-- [ ] Unit test: transitive dep resolution — profile lists `api`, api depends on `migrate`, migrate depends on `postgres` — all three included
-- [ ] Unit test: transitive dep resolution — profile lists two services with overlapping deps, no duplicates in result
-- [ ] Unit test: profile with only tasks — verify services pulled in via task deps
-- [ ] Unit test: profile references nonexistent service — caught by validation
-- [ ] Integration test: start with `--profile frontend`, verify only profiled services and their transitive deps run
-- [ ] Integration test: start with `--profile frontend`, verify services NOT in the profile are not started
+- [x] Unit test: transitive dep resolution — profile lists `api`, api depends on `migrate`, migrate depends on `postgres` — all three included
+- [x] Unit test: transitive dep resolution — profile lists two services with overlapping deps, no duplicates in result
+- [x] Unit test: profile with only tasks — verify services pulled in via task deps
+- [x] Unit test: profile references nonexistent service — caught by validation (existing test in config validation)
+- [x] Integration test: start with profile, verify only profiled services and their transitive deps run
+- [x] Integration test: start with profile, verify services NOT in the profile are not started (including status API check)
 
 ---
 

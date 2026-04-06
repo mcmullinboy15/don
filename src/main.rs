@@ -90,7 +90,7 @@ async fn run(config_path: PathBuf, command: Commands) -> i32 {
                 1
             }
         },
-        Commands::Start { profile: _, name: None } => match run_start(&config_path).await {
+        Commands::Start { profile, name: None } => match run_start(&config_path, profile.as_deref()).await {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{e}");
@@ -420,7 +420,7 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_start(config_path: &std::path::Path) -> Result<(), String> {
+async fn run_start(config_path: &std::path::Path, profile: Option<&str>) -> Result<(), String> {
     let config =
         don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
@@ -470,7 +470,7 @@ async fn run_start(config_path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
 
     // Create and run the runner.
-    let runner = don::runner::Runner::new(config, config_path.to_path_buf(), platform, output_manager, base, shutdown_rx)
+    let runner = don::runner::Runner::new(config, config_path.to_path_buf(), platform, output_manager, base, profile, shutdown_rx)
         .await
         .map_err(|e| format!("Error: {e}"))?;
 

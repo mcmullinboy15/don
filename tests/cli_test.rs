@@ -53,6 +53,7 @@ async fn spawn_runner(
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
+        None,
         shutdown_rx,
     )
     .await
