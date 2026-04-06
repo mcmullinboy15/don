@@ -491,23 +491,25 @@ safe; if not, the entry is stale and we simply delete it.
 
 Watch `don.toml` and apply changes live.
 
-- [ ] Watch `don.toml` for changes (reuse watch/debounce infrastructure)
-- [ ] Parse and validate new config on change
-- [ ] Diff against running config: identify added, removed, and changed services/tasks
-- [ ] Stop removed services
-- [ ] Restart changed services (respecting dependency order)
-- [ ] Start newly added services (respecting dependency order)
-- [ ] If new config is invalid, log errors and keep running with current config
+- [x] Watch `don.toml` for changes — dedicated file watcher with 200ms sliding-window debounce
+- [x] Parse and validate new config on change
+- [x] Diff against running config: `config::diff::diff_configs()` identifies added, removed, and changed services/tasks
+- [x] Stop removed services
+- [x] Restart changed services (stop with old config, start with new)
+- [x] Start newly added services (dependency-aware — waits if deps unsatisfied)
+- [x] If new config is invalid, log errors and keep running with current config
+- [x] `PartialEq` added to all config types for clean equality comparison
+- [x] `OutputManager::register_service()` for dynamically adding new services
 
 ### Test Coverage Checkpoint
-- [ ] Unit test: config diff — added service detected, removed service detected, changed service detected, unchanged service not flagged
-- [ ] Unit test: config diff — changed env var, changed watch patterns, changed preset all detected as changes
-- [ ] Unit test: config diff — added task, removed task, changed task detected
-- [ ] Integration test: start don, modify don.toml to add a new service, verify it starts
-- [ ] Integration test: start don, modify don.toml to remove a service, verify it stops
-- [ ] Integration test: start don, modify don.toml to change a service's env, verify it restarts
-- [ ] Integration test: start don, write an invalid don.toml, verify don keeps running with old config and logs the error
-- [ ] Integration test: start don, rapidly modify don.toml twice, verify debounce prevents thrashing
+- [x] Unit test: config diff — added service detected, removed service detected, changed service detected, unchanged service not flagged
+- [x] Unit test: config diff — changed env var, changed watch patterns, changed preset all detected as changes
+- [x] Unit test: config diff — added task, removed task, changed task detected
+- [x] Integration test: start don, modify don.toml to add a new service, verify it starts
+- [x] Integration test: start don, modify don.toml to remove a service, verify it stops
+- [x] Integration test: start don, modify don.toml to change a service's env, verify it restarts
+- [x] Integration test: start don, write an invalid don.toml, verify don keeps running with old config and logs the error
+- [x] Integration test: start don, rapidly modify don.toml twice, verify debounce prevents thrashing
 
 ---
 

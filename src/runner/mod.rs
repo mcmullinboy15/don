@@ -170,6 +170,12 @@ pub enum RunnerCommand {
         last_n: usize,
         reply: oneshot::Sender<Option<mpsc::Receiver<crate::output::SinkLine>>>,
     },
+    /// Reload the config file (triggered by file watcher on don.toml).
+    ConfigReload,
+    /// Retry starting any Pending services/tasks whose deps are now satisfied.
+    /// Sent by `handle_config_reload` after a delay so newly-spawned deps
+    /// have time to pass their ready checks.
+    StartPending,
     /// Initiate graceful shutdown.
     Shutdown,
 }
@@ -395,6 +401,7 @@ pub(crate) fn compute_depths(
 /// The main runner that orchestrates services and tasks.
 pub struct Runner {
     config: Config,
+    config_path: PathBuf,
     platform: Platform,
     output_manager: OutputManager,
     base_dir: PathBuf,
@@ -420,6 +427,11 @@ pub struct Runner {
     cmd_rx: mpsc::Receiver<RunnerCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
 
+    /// Item-completion sender shared between the initial startup and config
+    /// reload paths. Ready-check and task-completion callbacks send here.
+    /// The main loop's `done_rx` receives these.
+    done_tx: Option<mpsc::Sender<ItemDone>>,
+
     // Shutdown signal receiver — wakes the select loop when Ctrl+C is pressed.
     shutdown_rx: mpsc::Receiver<()>,
 
@@ -434,6 +446,7 @@ impl Runner {
     /// The runner acquires don's PID file at `<base_dir>/.don/don.pid`.
     pub async fn new(
         config: Config,
+        config_path: PathBuf,
         platform: Platform,
         output_manager: OutputManager,
         base_dir: PathBuf,
@@ -535,6 +548,7 @@ impl Runner {
 
         Ok(Self {
             config,
+            config_path,
             platform,
             output_manager,
             base_dir,
@@ -548,6 +562,7 @@ impl Runner {
             cmd_tx,
             cmd_rx,
             event_tx,
+            done_tx: None,
             shutdown_rx,
             _don_pid_file: Some(don_pid_file),
         })
@@ -631,10 +646,12 @@ impl Runner {
 
         // Start file watchers before spawning services so we don't miss
         // changes that happen during startup (slow ready checks, long builds, etc.).
+        let mut _watch_handle: Option<tokio::task::JoinHandle<()>> = None;
         match WatchManager::new(
             &self.config,
             self.platform,
             &self.base_dir,
+            &self.config_path,
             self.cmd_tx.clone(),
             self.event_tx.subscribe(),
         )
@@ -645,9 +662,9 @@ impl Runner {
                     self.output_manager.error_event(warning);
                 }
                 if watch_mgr.has_watches() {
-                    tokio::spawn(async move {
+                    _watch_handle = Some(tokio::spawn(async move {
                         watch_mgr.run().await;
-                    });
+                    }));
                 }
             }
             Err(e) => {
@@ -656,12 +673,15 @@ impl Runner {
             }
         }
 
+
         // Build dependency map and topological order.
         let dep_map = self.build_dep_map();
         let order = topological_sort(&dep_map).map_err(|cycle| RunnerError::Cycle { cycle })?;
 
-        // Channel for item completion notifications.
+        // Channel for item completion notifications. Store the sender on `self`
+        // so config reload can reuse it for newly-started services.
         let (done_tx, mut done_rx) = mpsc::channel::<ItemDone>(64);
+        self.done_tx = Some(done_tx.clone());
 
         // Track which items are in flight.
         let mut pending: HashSet<String> = order.iter().cloned().collect();
@@ -750,6 +770,12 @@ impl Runner {
                         }
                         RunnerCommand::TaskRerun { name } => {
                             self.handle_task_rerun(&name).await;
+                        }
+                        RunnerCommand::ConfigReload => {
+                            self.handle_config_reload().await;
+                        }
+                        RunnerCommand::StartPending => {
+                            self.start_pending_items().await;
                         }
                     }
                 }
@@ -1477,6 +1503,261 @@ impl Runner {
 
     /// Handle a file-watch-triggered rebuild for a service.
     ///
+    /// Handle a config reload triggered by the file watcher on don.toml.
+    ///
+    /// Parses and validates the new config, diffs it against the running config,
+    /// and applies changes: stop removed services, restart changed services,
+    /// start new services. If the new config is invalid, logs an error and
+    /// keeps running with the old config.
+    async fn handle_config_reload(&mut self) {
+        let new_config = match Config::from_file(&self.config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.output_manager
+                    .error_event(&format!("config reload failed: {e}"));
+                return;
+            }
+        };
+
+        if let Err(e) = new_config.validate(self.platform) {
+            self.output_manager
+                .error_event(&format!("config reload rejected (invalid): {e}"));
+            return;
+        }
+
+        let diff = crate::config::diff::diff_configs(&self.config, &new_config);
+        if diff.is_empty() {
+            return;
+        }
+
+        self.output_manager
+            .lifecycle_event(&format!("config changed: {diff}"));
+
+        // 1. Stop removed services.
+        for name in &diff.removed_services {
+            if let Some(handle) = self.service_handles.remove(name) {
+                let svc = self.config.services.get(name);
+                let resolved = svc.map(|s| s.resolve(self.platform));
+                let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
+                self.service_states
+                    .insert(name.clone(), ServiceState::Stopping);
+                let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
+                self.output_manager
+                    .lifecycle_event(&format!("{name}: stopped (removed from config)"));
+            }
+            self.service_states.remove(name);
+            self.bound_sockets.remove(name);
+        }
+
+        // 2. Stop changed services (they'll be restarted with the new config).
+        //    Also release bound sockets so they get re-bound with the new
+        //    listen addresses (if changed).
+        for name in &diff.changed_services {
+            if let Some(handle) = self.service_handles.remove(name) {
+                let svc = self.config.services.get(name);
+                let resolved = svc.map(|s| s.resolve(self.platform));
+                let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
+                self.service_states
+                    .insert(name.clone(), ServiceState::Stopping);
+                let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
+            }
+            self.bound_sockets.remove(name);
+        }
+
+        // 3. Remove state for removed tasks.
+        for name in &diff.removed_tasks {
+            self.task_states.remove(name);
+        }
+
+        // 4. Swap config.
+        self.config = new_config;
+
+        // 5. Register new services/tasks in state maps and output manager.
+        for name in &diff.added_services {
+            self.service_states
+                .insert(name.clone(), ServiceState::Pending);
+            let log_config = self
+                .config
+                .services
+                .get(name)
+                .map(|s| &s.log)
+                .cloned()
+                .unwrap_or_default();
+            self.output_manager
+                .register_service(name, &log_config)
+                .await;
+        }
+        for name in &diff.added_tasks {
+            self.task_states
+                .insert(name.clone(), TaskItemState::Pending);
+            let log_config = self
+                .config
+                .tasks
+                .get(name)
+                .map(|t| &t.log)
+                .cloned()
+                .unwrap_or_default();
+            self.output_manager
+                .register_service(name, &log_config)
+                .await;
+        }
+
+        // 6. Mark changed services as Pending for restart.
+        for name in &diff.changed_services {
+            self.service_states
+                .insert(name.clone(), ServiceState::Pending);
+        }
+
+        // 7. Start all changed + new services and tasks via topo-sorted
+        //    dependency graph. Changed services are included so they respect
+        //    deps on newly-added services (e.g. add `db`, change `api` to
+        //    depend on `db` → db must start before api restarts).
+        let names_to_start: Vec<String> = diff
+            .changed_services
+            .iter()
+            .chain(diff.added_services.iter())
+            .chain(diff.added_tasks.iter())
+            .chain(diff.changed_tasks.iter())
+            .cloned()
+            .collect();
+        if !names_to_start.is_empty() {
+            // Build a dep map for just the new/changed items.
+            let dep_map = self.build_dep_map();
+            // Sort the full graph (including existing items) so we get correct ordering.
+            if let Ok(order) = topological_sort(&dep_map) {
+                // Filter to only the items we need to start.
+                let start_set: HashSet<&str> =
+                    names_to_start.iter().map(|s| s.as_str()).collect();
+                for name in &order {
+                    if !start_set.contains(name.as_str()) {
+                        continue;
+                    }
+                    let deps = dep_map.get(name).cloned().unwrap_or_default();
+                    let deps_ok = deps.iter().all(|dep| {
+                        self.service_states
+                            .get(dep)
+                            .is_some_and(|s| s.is_satisfied())
+                            || self
+                                .task_states
+                                .get(dep)
+                                .is_some_and(|s| s.is_satisfied())
+                    });
+                    if !deps_ok {
+                        self.output_manager.lifecycle_event(&format!(
+                            "{name}: waiting for dependencies"
+                        ));
+                        continue;
+                    }
+                    // Service or task?
+                    if self.config.services.contains_key(name) {
+                        // Use the full start_service flow (bind sockets, download,
+                        // build, spawn, wire output + ready check, lifecycle events).
+                        if let Some(done_tx) = self.done_tx.clone() {
+                            let _ = self.start_service(name, done_tx).await;
+                        }
+                    } else if self.config.tasks.contains_key(name) {
+                        self.task_states
+                            .insert(name.clone(), TaskItemState::Running);
+                        self.handle_task_rerun(name).await;
+                    }
+                }
+            }
+        }
+
+        // If any services/tasks are still Pending (deps not yet Ready),
+        // schedule a deferred retry. Their deps were just spawned and need
+        // time to pass ready checks before we can start the dependents.
+        let has_pending = self
+            .service_states
+            .values()
+            .any(|s| *s == ServiceState::Pending)
+            || self
+                .task_states
+                .values()
+                .any(|s| *s == TaskItemState::Pending);
+        if has_pending {
+            let cmd_tx = self.cmd_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let _ = cmd_tx.send(RunnerCommand::StartPending).await;
+            });
+        }
+    }
+
+    /// Try to start any Pending services/tasks whose dependencies are now satisfied.
+    /// Called on a deferred timer after config reload, and re-schedules itself
+    /// if items remain pending.
+    async fn start_pending_items(&mut self) {
+        let dep_map = self.build_dep_map();
+        let order = match topological_sort(&dep_map) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        let mut started_any = false;
+        for name in &order {
+            let is_pending_svc = self
+                .service_states
+                .get(name)
+                .is_some_and(|s| *s == ServiceState::Pending);
+            let is_pending_task = self
+                .task_states
+                .get(name)
+                .is_some_and(|s| *s == TaskItemState::Pending);
+            if !is_pending_svc && !is_pending_task {
+                continue;
+            }
+
+            let deps = dep_map.get(name).cloned().unwrap_or_default();
+            let deps_ok = deps.iter().all(|dep| {
+                self.service_states
+                    .get(dep)
+                    .is_some_and(|s| s.is_satisfied())
+                    || self
+                        .task_states
+                        .get(dep)
+                        .is_some_and(|s| s.is_satisfied())
+            });
+            if !deps_ok {
+                continue;
+            }
+
+            if is_pending_svc {
+                if self.config.services.contains_key(name)
+                    && let Some(done_tx) = self.done_tx.clone()
+                {
+                    let _ = self.start_service(name, done_tx).await;
+                    started_any = true;
+                }
+            } else if is_pending_task {
+                self.task_states
+                    .insert(name.clone(), TaskItemState::Running);
+                self.handle_task_rerun(name).await;
+                started_any = true;
+            }
+        }
+
+        // If we started something, schedule another check — the newly-started
+        // items might unblock further pending items.
+        if started_any {
+            let still_pending = self
+                .service_states
+                .values()
+                .any(|s| *s == ServiceState::Pending)
+                || self
+                    .task_states
+                    .values()
+                    .any(|s| *s == TaskItemState::Pending);
+            if still_pending {
+                let cmd_tx = self.cmd_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let _ = cmd_tx.send(RunnerCommand::StartPending).await;
+                });
+            }
+        }
+    }
+
     /// Runs the build (if any), stops the old process, starts a new one.
     /// If the build fails, the old process is kept running.
     /// Broadcasts `RebuildComplete` when done.

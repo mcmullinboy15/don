@@ -10,7 +10,7 @@ use super::types::LogConfig;
 ///
 /// Tasks can depend on services (waits for ready) and other tasks.
 /// File watching determines whether the task needs to re-run.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Task {
     /// The command to execute.
     pub cmd: String,

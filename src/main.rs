@@ -470,7 +470,7 @@ async fn run_start(config_path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
 
     // Create and run the runner.
-    let runner = don::runner::Runner::new(config, platform, output_manager, base, shutdown_rx)
+    let runner = don::runner::Runner::new(config, config_path.to_path_buf(), platform, output_manager, base, shutdown_rx)
         .await
         .map_err(|e| format!("Error: {e}"))?;
 

@@ -52,6 +52,17 @@ enum WatchState {
     Rebuilding,
 }
 
+/// What command to send when this item's debounce timer fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchItemKind {
+    /// Send `RunnerCommand::Rebuild { name }`.
+    Service,
+    /// Send `RunnerCommand::TaskRerun { name }`.
+    Task,
+    /// Send `RunnerCommand::ConfigReload` — no rebuild/complete cycle.
+    Config,
+}
+
 /// Per-item watch tracking.
 struct WatchedItem {
     state: WatchState,
@@ -60,8 +71,8 @@ struct WatchedItem {
     debounce_deadline: Option<Instant>,
     /// True when events arrived during a rebuild — triggers another cycle on completion.
     stale: bool,
-    /// Whether this is a service (sends Rebuild) or task (sends TaskRerun).
-    is_task: bool,
+    /// What kind of item this is — determines the command to send.
+    kind: WatchItemKind,
     /// Glob patterns for matching file events.
     patterns: Vec<Pattern>,
     /// Glob patterns for ignoring file events (checked before watch patterns).
@@ -96,6 +107,7 @@ impl WatchManager {
         config: &Config,
         platform: Platform,
         base_dir: &Path,
+        config_path: &Path,
         cmd_tx: mpsc::Sender<RunnerCommand>,
         runner_events: broadcast::Receiver<RunnerEvent>,
     ) -> Result<(Self, Vec<String>), WatchError> {
@@ -213,7 +225,7 @@ impl WatchManager {
                     debounce_duration: debounce,
                     debounce_deadline: None,
                     stale: false,
-                    is_task: false,
+                    kind: WatchItemKind::Service,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
                 },
@@ -281,9 +293,37 @@ impl WatchManager {
                     debounce_duration: DEFAULT_DEBOUNCE, // Tasks use default debounce.
                     debounce_deadline: None,
                     stale: false,
-                    is_task: true,
+                    kind: WatchItemKind::Task,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
+                },
+            );
+        }
+
+        // Watch the config file (don.toml) for auto-reload. We watch the
+        // parent directory because editors like vim replace the file via
+        // rename, which removes the inode the watcher was tracking.
+        if let Ok(canonical_config) = std::fs::canonicalize(config_path)
+            && let Some(config_dir) = canonical_config.parent()
+            && let Ok(pat) = Pattern::new(&canonical_config.to_string_lossy())
+        {
+            let already_covered = registered_dirs
+                .iter()
+                .any(|existing| config_dir.starts_with(existing));
+            if !already_covered {
+                let _ = watcher.watch(config_dir, RecursiveMode::NonRecursive);
+                registered_dirs.insert(config_dir.to_path_buf());
+            }
+            items.insert(
+                "__config__".to_string(),
+                WatchedItem {
+                    state: WatchState::Idle,
+                    debounce_duration: DEFAULT_DEBOUNCE,
+                    debounce_deadline: None,
+                    stale: false,
+                    kind: WatchItemKind::Config,
+                    patterns: vec![pat],
+                    ignore_patterns: vec![],
                 },
             );
         }
@@ -345,7 +385,8 @@ impl WatchManager {
 
     /// Route a notify event to the affected items and update their state machines.
     fn handle_notify_event(&mut self, event: &notify::Event) {
-        // Only care about create, modify, remove, and rename events.
+        // Only care about create, modify, and remove events. Renames
+        // (vim, sed -i) are reported as Modify(Name(_)) by notify.
         if !matches!(
             event.kind,
             EventKind::Create(_)
@@ -400,26 +441,36 @@ impl WatchManager {
     /// Fire debounce timers that have expired — send rebuild/rerun commands.
     async fn fire_debounce_timers(&mut self) {
         let now = Instant::now();
-        let mut to_fire: Vec<(String, bool)> = Vec::new();
+        let mut to_fire: Vec<(String, WatchItemKind)> = Vec::new();
 
         for (name, item) in &self.items {
             if item.state == WatchState::Debouncing
                 && let Some(deadline) = item.debounce_deadline
                 && now >= deadline
             {
-                to_fire.push((name.clone(), item.is_task));
+                to_fire.push((name.clone(), item.kind));
             }
         }
 
-        for (name, is_task) in to_fire {
+        for (name, kind) in to_fire {
             if let Some(item) = self.items.get_mut(&name) {
-                item.state = WatchState::Rebuilding;
                 item.debounce_deadline = None;
 
-                let cmd = if is_task {
-                    RunnerCommand::TaskRerun { name }
-                } else {
-                    RunnerCommand::Rebuild { name }
+                let cmd = match kind {
+                    WatchItemKind::Task => {
+                        item.state = WatchState::Rebuilding;
+                        RunnerCommand::TaskRerun { name }
+                    }
+                    WatchItemKind::Service => {
+                        item.state = WatchState::Rebuilding;
+                        RunnerCommand::Rebuild { name }
+                    }
+                    WatchItemKind::Config => {
+                        // Config reload has no rebuild/complete cycle —
+                        // go straight back to Idle.
+                        item.state = WatchState::Idle;
+                        RunnerCommand::ConfigReload
+                    }
                 };
                 // If the channel is full/closed, the runner is shutting down.
                 let _ = self.cmd_tx.send(cmd).await;
@@ -585,7 +636,7 @@ mod tests {
                 debounce_duration: Duration::from_millis(200),
                 debounce_deadline: None,
                 stale: false,
-                is_task: false,
+                kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
             },
@@ -646,7 +697,7 @@ mod tests {
                 debounce_duration: Duration::from_millis(200),
                 debounce_deadline: None,
                 stale: false,
-                is_task: false,
+                kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
             },
@@ -698,7 +749,7 @@ mod tests {
                 debounce_duration: Duration::from_millis(500),
                 debounce_deadline: None,
                 stale: false,
-                is_task: false,
+                kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
             },
@@ -741,7 +792,7 @@ mod tests {
                 debounce_duration: Duration::from_millis(200),
                 debounce_deadline: None,
                 stale: false,
-                is_task: false,
+                kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
             },
@@ -785,7 +836,7 @@ mod tests {
                 debounce_duration: Duration::from_millis(200),
                 debounce_deadline: None,
                 stale: false,
-                is_task: false,
+                kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
             },
@@ -830,7 +881,7 @@ mod tests {
                 debounce_duration: Duration::from_millis(200),
                 debounce_deadline: None,
                 stale: false,
-                is_task: false,
+                kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
             },
@@ -928,25 +979,33 @@ mod tests {
         cmd_tx: &mpsc::Sender<RunnerCommand>,
     ) {
         let now = Instant::now();
-        let mut to_fire: Vec<(String, bool)> = Vec::new();
+        let mut to_fire: Vec<(String, WatchItemKind)> = Vec::new();
 
         for (name, item) in items.iter() {
             if item.state == WatchState::Debouncing
                 && let Some(deadline) = item.debounce_deadline
                 && now >= deadline
             {
-                to_fire.push((name.clone(), item.is_task));
+                to_fire.push((name.clone(), item.kind));
             }
         }
 
-        for (name, is_task) in to_fire {
+        for (name, kind) in to_fire {
             if let Some(item) = items.get_mut(&name) {
-                item.state = WatchState::Rebuilding;
                 item.debounce_deadline = None;
-                let cmd = if is_task {
-                    RunnerCommand::TaskRerun { name }
-                } else {
-                    RunnerCommand::Rebuild { name }
+                let cmd = match kind {
+                    WatchItemKind::Task => {
+                        item.state = WatchState::Rebuilding;
+                        RunnerCommand::TaskRerun { name }
+                    }
+                    WatchItemKind::Service => {
+                        item.state = WatchState::Rebuilding;
+                        RunnerCommand::Rebuild { name }
+                    }
+                    WatchItemKind::Config => {
+                        item.state = WatchState::Idle;
+                        RunnerCommand::ConfigReload
+                    }
                 };
                 let _ = cmd_tx.send(cmd).await;
             }

@@ -6,7 +6,7 @@ use super::platform::Platform;
 use super::types::Command;
 
 /// Download configuration with per-platform artifacts.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DownloadConfig {
     /// Per-platform download artifacts. Keys are "{os}-{arch}" using Rust conventions:
     /// linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, windows-x86_64, windows-aarch64.
@@ -37,7 +37,7 @@ impl DownloadConfig {
 }
 
 /// A downloadable artifact for a specific platform.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PlatformDownload {
     /// URL to download the artifact from.
     pub url: String,

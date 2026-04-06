@@ -371,6 +371,47 @@ impl OutputManager {
         Some(Bytes::from(parts.join(b"\n" as &[u8])))
     }
 
+    /// Register a new service that wasn't in the original config (added via
+    /// live config reload). Creates a ring buffer, assigns a color, and wires
+    /// up sinks based on the log config. Existing services are left unchanged.
+    pub async fn register_service(&mut self, name: &str, log_config: &crate::config::LogConfig) {
+        if self.services.contains_key(name) {
+            return;
+        }
+        // Determine max_name_len from existing prefix width. New services use
+        // the wider of the current alignment and their own name length.
+        let current_max = self
+            .services
+            .keys()
+            .map(|n| n.len())
+            .max()
+            .unwrap_or(0)
+            .max(5);
+        let max_name_len = current_max.max(name.len());
+        let color_idx = self.services.len() % COLORS.len();
+        let prefix = format_prefix(name, color_idx, max_name_len);
+
+        let sinks = match log_config {
+            crate::config::LogConfig::Stdout => vec![self.stdout_sink.clone()],
+            crate::config::LogConfig::File(_) => {
+                // For simplicity, new file-mode services log to stdout.
+                // Full file-sink creation would require opening the file and
+                // spawning a task, which can be added later if needed.
+                vec![self.stdout_sink.clone()]
+            }
+            crate::config::LogConfig::Ignore => vec![],
+        };
+
+        self.services.insert(
+            name.to_string(),
+            Arc::new(Mutex::new(ServiceOutputState {
+                prefix,
+                ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
+                sinks,
+            })),
+        );
+    }
+
     /// Emit a `[don]` lifecycle event.
     pub fn lifecycle_event(&self, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {

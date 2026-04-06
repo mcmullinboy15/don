@@ -77,7 +77,7 @@ async fn make_runner(
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
     let runner =
-        Runner::new(config, PLATFORM, output_manager, base_dir.to_path_buf(), shutdown_rx)
+        Runner::new(config, base_dir.join("don.toml"), PLATFORM, output_manager, base_dir.to_path_buf(), shutdown_rx)
             .await
             .unwrap();
     (runner, shutdown_tx, buf)

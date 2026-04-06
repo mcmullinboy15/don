@@ -3,6 +3,7 @@
 //! The config is loaded from a `don.toml` file and defines services, tasks,
 //! and profiles for a dev environment.
 
+pub mod diff;
 mod download;
 mod platform;
 mod profile;
@@ -26,7 +27,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Top-level don configuration, typically loaded from `don.toml`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 pub struct Config {
     /// Long-running services (databases, APIs, workers, etc.).
     #[serde(default)]

@@ -7,7 +7,7 @@ use super::platform::Platform;
 use super::types::{Command, LogConfig, ReadyCheck, ShutdownConfig};
 
 /// A long-running service. Uses exactly one preset: docker, rust, or custom (run).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 pub struct Service {
     /// Working directory for the service. Defaults to the current directory.
     pub dir: Option<PathBuf>,
@@ -65,7 +65,7 @@ pub struct Service {
 /// Platform-specific overrides for a service. Any field set here replaces the
 /// corresponding base field. For `env`, entries are merged (override wins on conflict).
 /// If any preset field (docker/rust/run) is set, it completely replaces the base preset.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 pub struct ServiceOverride {
     pub dir: Option<PathBuf>,
     #[serde(default)]
@@ -112,7 +112,7 @@ pub struct ResolvedService {
 }
 
 /// Docker container configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DockerConfig {
     /// Docker image to run (e.g. "postgres:16").
     /// For built images, this is also used as the tag for `docker build -t`.
@@ -138,7 +138,7 @@ pub struct DockerConfig {
 }
 
 /// Docker image build configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DockerBuildConfig {
     /// Build context path (e.g. "." or "./services/api").
     pub context: String,
@@ -152,7 +152,7 @@ pub struct DockerBuildConfig {
 }
 
 /// Rust/Cargo service configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RustConfig {
     /// Name of the binary target to build and run.
     pub binary: String,
@@ -170,7 +170,7 @@ pub struct RustConfig {
 }
 
 /// Go service configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GoConfig {
     /// Go package path to build (e.g. "./cmd/api").
     pub package: String,

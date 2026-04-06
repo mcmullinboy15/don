@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 /// A command to execute: a binary/program name plus arguments.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Command {
     /// The binary or program to execute.
     pub cmd: String,
@@ -14,7 +14,7 @@ pub struct Command {
 /// Ready check configuration. Exactly one of `exec`, `tcp`, or `http` must be set.
 ///
 /// Used to gate dependent services — they won't start until this check passes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ReadyCheck {
     /// Run a command — exit code 0 means ready.
     pub exec: Option<Command>,
@@ -41,7 +41,7 @@ impl ReadyCheck {
 }
 
 /// Shutdown behavior for a service.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ShutdownConfig {
     /// Signal to send for graceful shutdown (e.g. "SIGTERM", "SIGINT"). Defaults to "SIGTERM".
     #[serde(default = "ShutdownConfig::default_signal")]
@@ -68,7 +68,7 @@ impl ShutdownConfig {
 /// - `log = "ignore"`
 /// - `log = "path/to/file.log"`
 /// - `log = { file = "path/to/file.log" }` (equivalent to the string form)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum LogConfig {
     /// Print to don's stdout, prefixed with the service name.
     #[default]
