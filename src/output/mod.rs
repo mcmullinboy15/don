@@ -10,6 +10,7 @@
 //! across restarts, and [`ServiceWriter`] is cloneable for reuse.
 
 pub mod ring_buffer;
+pub(crate) mod sanitize;
 
 use bytes::Bytes;
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
@@ -471,8 +472,17 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
 ) {
     use tokio::io::AsyncWriteExt;
     while let Some(msg) = rx.recv().await {
+        // Sanitize service output before writing to the shared terminal.
+        // Strip dangerous escape sequences (cursor movement, screen clear,
+        // alternate screen) while preserving colors/styles (SGR).
+        // Lifecycle events (from [don]) are trusted and not sanitized.
+        let safe_line = if msg.prefix.is_empty() {
+            msg.line.to_vec()
+        } else {
+            sanitize::sanitize_terminal_output(&msg.line)
+        };
         let _ = writer.write_all(&msg.prefix).await;
-        let _ = writer.write_all(&msg.line).await;
+        let _ = writer.write_all(&safe_line).await;
         let _ = writer.write_all(b"\n").await;
     }
 }
