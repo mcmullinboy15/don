@@ -5,6 +5,7 @@
 //! The runner binds the socket synchronously (so bind errors surface
 //! immediately) and then spawns the accept loop as a background task.
 
+pub mod attach;
 pub mod routes;
 
 use crate::runner::RunnerCommand;
@@ -117,7 +118,7 @@ async fn accept_loop(
                             tower_service.clone().oneshot(req)
                         });
                     let _ = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(io, hyper_service)
+                        .serve_connection_with_upgrades(io, hyper_service)
                         .await;
                 });
             }

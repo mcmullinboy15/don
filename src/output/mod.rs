@@ -72,6 +72,10 @@ struct ServiceOutputState {
     ring_buffer: RingBuffer,
     /// Dynamic list of sinks this service writes to.
     sinks: Vec<SinkHandle>,
+    /// True while the stdout sink is temporarily removed (during attach).
+    /// Used to ensure `resume_stdout_sink` only restores it if it was
+    /// actually present before the pause.
+    stdout_paused: bool,
 }
 
 /// Per-service handle for writing output. Cloneable, reusable across restarts.
@@ -147,6 +151,17 @@ impl ServiceWriter {
         Ok(())
     }
 
+    /// Close all transient (follow/attach) sinks. Called when the process
+    /// stream ends (process exited) so that attach sessions and log followers
+    /// detect the closure and exit instead of blocking forever.
+    ///
+    /// Only removes sinks with `drop_on_full = true` (follow/attach sinks).
+    /// Persistent sinks (stdout, file) are kept for the next process lifecycle.
+    pub async fn close_follow_sinks(&self) {
+        let mut state = self.state.lock().await;
+        state.sinks.retain(|s| !s.drop_on_full);
+    }
+
     /// Write a single line to the ring buffer and sinks.
     ///
     /// Used for structured output like Docker build progress that arrives
@@ -216,6 +231,8 @@ pub struct OutputManager {
     stdout_sink: SinkHandle,
     /// Writer task JoinHandles for clean shutdown.
     writer_handles: Vec<JoinHandle<()>>,
+    /// Verbose mode — enables extra diagnostic lifecycle events.
+    verbose: bool,
 }
 
 /// Errors from output handling.
@@ -244,13 +261,23 @@ impl OutputManager {
         services: &[(&str, &crate::config::LogConfig)],
         writer: W,
     ) -> Result<Self, OutputError> {
+        Self::new_verbose(services, writer, false).await
+    }
+
+    /// Create a new output manager. When `verbose` is true, every output
+    /// line is prefixed with an elapsed timestamp.
+    pub async fn new_verbose<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+        services: &[(&str, &crate::config::LogConfig)],
+        writer: W,
+        verbose: bool,
+    ) -> Result<Self, OutputError> {
         let names: Vec<&str> = services.iter().map(|(n, _)| *n).collect();
         let color_map = assign_colors(&names);
         let max_name_len = names.iter().map(|n| n.len()).max().unwrap_or(0).max(5);
 
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
-        let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, writer));
+        let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, writer, verbose));
         let stdout_sink = SinkHandle { tx: stdout_tx, drop_on_full: false };
 
         // Spawn file sink tasks (deduplicated by path).
@@ -293,6 +320,7 @@ impl OutputManager {
                     prefix,
                     ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
                     sinks,
+                    stdout_paused: false,
                 })),
             );
         }
@@ -310,6 +338,7 @@ impl OutputManager {
             don_prefix,
             stdout_sink,
             writer_handles,
+            verbose,
         })
     }
 
@@ -409,8 +438,18 @@ impl OutputManager {
                 prefix,
                 ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
                 sinks,
+                stdout_paused: false,
             })),
         );
+    }
+
+    /// Get a lightweight, cloneable handle for emitting `[don]` lifecycle
+    /// events from spawned tasks (e.g. build output).
+    pub fn clone_lifecycle_emitter(&self) -> LifecycleEmitter {
+        LifecycleEmitter {
+            don_prefix: self.don_prefix.clone(),
+            stdout_sink: self.stdout_sink.clone(),
+        }
     }
 
     /// Emit a `[don]` lifecycle event.
@@ -419,6 +458,13 @@ impl OutputManager {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(message.to_string()),
         });
+    }
+
+    /// Emit a `[don]` lifecycle event only when verbose mode is enabled.
+    pub fn debug_event(&self, message: &str) {
+        if self.verbose {
+            self.lifecycle_event(message);
+        }
     }
 
     /// Emit a `[don]` lifecycle event for a specific service.
@@ -445,6 +491,46 @@ impl OutputManager {
         });
     }
 
+    /// Temporarily remove the stdout sink from a service so its output
+    /// doesn't appear in the don terminal (e.g. during interactive attach).
+    /// The ring buffer continues to be fed. No-op if the service is unknown
+    /// or the stdout sink is not present.
+    pub async fn pause_stdout_sink(&self, name: &str) {
+        if let Some(state_arc) = self.services.get(name) {
+            let mut state = state_arc.lock().await;
+            let had_stdout = state
+                .sinks
+                .iter()
+                .any(|s| s.tx.same_channel(&self.stdout_sink.tx));
+            if had_stdout {
+                state
+                    .sinks
+                    .retain(|s| !s.tx.same_channel(&self.stdout_sink.tx));
+                state.stdout_paused = true;
+            }
+        }
+    }
+
+    /// Re-add the stdout sink to a service after an attach session ends.
+    /// Only restores the sink if it was previously paused via
+    /// `pause_stdout_sink` — services with `log = "ignore"` won't
+    /// accidentally start writing to stdout.
+    pub async fn resume_stdout_sink(&self, name: &str) {
+        if let Some(state_arc) = self.services.get(name) {
+            let mut state = state_arc.lock().await;
+            if state.stdout_paused {
+                state.stdout_paused = false;
+                let already_present = state
+                    .sinks
+                    .iter()
+                    .any(|s| s.tx.same_channel(&self.stdout_sink.tx));
+                if !already_present {
+                    state.sinks.push(self.stdout_sink.clone());
+                }
+            }
+        }
+    }
+
     /// Shut down the output system. Clears all sink lists, drops senders,
     /// and waits for writer tasks to drain remaining messages.
     pub async fn shutdown(self) {
@@ -464,13 +550,33 @@ impl OutputManager {
     }
 }
 
+/// A lightweight, cloneable handle for emitting `[don]` lifecycle events
+/// from spawned tasks. Does not carry the full `OutputManager` state.
+#[derive(Clone)]
+pub struct LifecycleEmitter {
+    don_prefix: String,
+    stdout_sink: SinkHandle,
+}
+
+impl LifecycleEmitter {
+    /// Emit a `[don]` lifecycle event.
+    pub fn lifecycle_event(&self, message: &str) {
+        let _ = self.stdout_sink.tx.try_send(SinkLine {
+            prefix: Bytes::from(self.don_prefix.clone()),
+            line: Bytes::from(message.to_string()),
+        });
+    }
+}
+
 /// Stdout sink writer task. Receives lines and writes them to the provided writer.
 /// Runs until all senders are dropped.
 async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut rx: mpsc::Receiver<SinkLine>,
     mut writer: W,
+    verbose: bool,
 ) {
     use tokio::io::AsyncWriteExt;
+    let start = std::time::Instant::now();
     while let Some(msg) = rx.recv().await {
         // Sanitize service output before writing to the shared terminal.
         // Strip dangerous escape sequences (cursor movement, screen clear,
@@ -481,6 +587,11 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
         } else {
             sanitize::sanitize_terminal_output(&msg.line)
         };
+        if verbose {
+            let elapsed = start.elapsed();
+            let ts = format!("{:.3}s ", elapsed.as_secs_f64());
+            let _ = writer.write_all(ts.as_bytes()).await;
+        }
         let _ = writer.write_all(&msg.prefix).await;
         let _ = writer.write_all(&safe_line).await;
         let _ = writer.write_all(b"\n").await;

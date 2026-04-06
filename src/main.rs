@@ -14,6 +14,10 @@ struct Cli {
     #[arg(short, long, default_value = "don.toml", global = true)]
     config: PathBuf,
 
+    /// Enable verbose output (timing info for lifecycle events)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -74,11 +78,11 @@ async fn main() {
         name: None,
     });
 
-    let exit_code = run(cli.config, command).await;
+    let exit_code = run(cli.config, cli.verbose, command).await;
     std::process::exit(exit_code);
 }
 
-async fn run(config_path: PathBuf, command: Commands) -> i32 {
+async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
     match command {
         Commands::Validate => match validate(&config_path) {
             Ok(()) => {
@@ -90,7 +94,7 @@ async fn run(config_path: PathBuf, command: Commands) -> i32 {
                 1
             }
         },
-        Commands::Start { profile, name: None } => match run_start(&config_path, profile.as_deref()).await {
+        Commands::Start { profile, name: None } => match run_start(&config_path, profile.as_deref(), verbose).await {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{e}");
@@ -108,10 +112,7 @@ async fn run(config_path: PathBuf, command: Commands) -> i32 {
         }
         Commands::Status => run_status(&config_path).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
-        Commands::Attach { name } => {
-            eprintln!("don attach {name}: not yet implemented (Phase 17)");
-            1
-        }
+        Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
     }
 }
@@ -197,6 +198,21 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
                 eprintln!("{e}");
                 1
             }
+        }
+    }
+}
+
+async fn run_attach(config_path: &Path, name: &str) -> i32 {
+    let base = base_dir(config_path);
+    let socket_path = base.join(".don").join("don.sock");
+    match don::client::attach::run_attach(&socket_path, name).await {
+        Ok(()) => {
+            println!("\r\ndetached from '{name}'");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
         }
     }
 }
@@ -423,7 +439,7 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_start(config_path: &std::path::Path, profile: Option<&str>) -> Result<(), String> {
+async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose: bool) -> Result<(), String> {
     let config =
         don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
@@ -463,7 +479,7 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>) -> Resu
         .chain(task_configs)
         .collect();
 
-    let output_manager = don::output::OutputManager::new(&all_configs, tokio::io::stdout())
+    let output_manager = don::output::OutputManager::new_verbose(&all_configs, tokio::io::stdout(), verbose)
         .await
         .map_err(|e| format!("Error creating output manager: {e}"))?;
 

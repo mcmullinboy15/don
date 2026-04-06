@@ -162,8 +162,15 @@ impl WatchManager {
 
             // Resolve svc_dir relative to the (canonical) base_dir so patterns
             // are absolute and can match notify's absolute event paths.
+            // Canonicalize to eliminate `./` components (e.g. dir = "./app"
+            // joined with base_dir would produce `/foo/./app` which won't
+            // match notify's canonical event paths).
             let svc_dir = match resolved.dir.as_deref() {
-                Some(d) => base_dir.join(d),
+                Some(d) => {
+                    let joined = base_dir.join(d);
+                    std::fs::canonicalize(&joined)
+                        .unwrap_or(joined)
+                }
                 None => base_dir.to_path_buf(),
             };
 
@@ -239,7 +246,11 @@ impl WatchManager {
             }
 
             let task_dir = match task.dir.as_deref() {
-                Some(d) => base_dir.join(d),
+                Some(d) => {
+                    let joined = base_dir.join(d);
+                    std::fs::canonicalize(&joined)
+                        .unwrap_or(joined)
+                }
                 None => base_dir.to_path_buf(),
             };
 
@@ -617,6 +628,67 @@ mod tests {
                 case.pattern,
                 result,
                 case.expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_glob_pattern_matches_files_in_watched_dirs() {
+        struct Case {
+            name: &'static str,
+            pattern: &'static str,
+            path: &'static str,
+            expected: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "** matches nested file",
+                pattern: "/app/src/**/*.rs",
+                path: "/app/src/foo/bar.rs",
+                expected: true,
+            },
+            Case {
+                name: "** matches deeply nested",
+                pattern: "/app/src/**/*.rs",
+                path: "/app/src/a/b/c.rs",
+                expected: true,
+            },
+            Case {
+                name: "** matches file directly in src",
+                pattern: "/app/src/**/*.rs",
+                path: "/app/src/main.rs",
+                expected: true,
+            },
+            Case {
+                name: "literal file matches",
+                pattern: "/app/Cargo.toml",
+                path: "/app/Cargo.toml",
+                expected: true,
+            },
+            Case {
+                name: "literal file does not match other",
+                pattern: "/app/Cargo.toml",
+                path: "/app/Cargo.lock",
+                expected: false,
+            },
+            Case {
+                name: "does not match outside dir",
+                pattern: "/app/src/**/*.rs",
+                path: "/other/src/main.rs",
+                expected: false,
+            },
+        ];
+
+        for case in cases {
+            let pat = Pattern::new(case.pattern).unwrap();
+            assert_eq!(
+                pat.matches(case.path),
+                case.expected,
+                "case: {} — pattern {:?} vs path {:?}",
+                case.name,
+                case.pattern,
+                case.path,
             );
         }
     }

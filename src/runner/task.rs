@@ -44,7 +44,11 @@ pub(crate) async fn spawn_task(
     base_dir: &Path,
     platform: Platform,
 ) -> Result<TaskSpawn, TaskError> {
-    let work_dir = task.dir.as_deref().unwrap_or(base_dir);
+    let work_dir = match task.dir.as_deref() {
+        Some(d) => base_dir.join(d),
+        None => base_dir.to_path_buf(),
+    };
+    let work_dir = work_dir.as_path();
 
     let mut env: HashMap<String, String> = std::env::vars().collect();
     env.extend(task.env.clone());
@@ -69,7 +73,7 @@ pub(crate) async fn spawn_task(
         dir: Some(work_dir),
         env,
         pgid_file_path: None,
-        force_pipe: false,
+        force_pipe: true,
         listen_fds: vec![],
     })
     .await?;

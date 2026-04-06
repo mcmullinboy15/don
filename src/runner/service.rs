@@ -89,12 +89,22 @@ pub(crate) async fn start_service(
         });
     }
 
+    // Resolve working directory: join service's `dir` with base_dir so
+    // relative paths like `./app` resolve correctly regardless of cwd.
+    let service_dir_buf = match resolved.dir.as_deref() {
+        Some(d) => base_dir.join(d),
+        None => base_dir.to_path_buf(),
+    };
+    let service_dir = service_dir_buf.as_path();
+
     // Determine the run command and args based on preset.
+    // For rust/go presets, the binary path is relative to the service's
+    // working directory (where cargo/go build runs), not base_dir.
     let (cmd, args) = if let Some(ref rust_config) = resolved.rust {
-        let binary_path = rust_binary_path(rust_config, base_dir);
+        let binary_path = rust_binary_path(rust_config, service_dir);
         (binary_path.to_string_lossy().into_owned(), vec![])
     } else if let Some(ref go_config) = resolved.go {
-        let binary_path = go_binary_path(go_config, name, base_dir);
+        let binary_path = go_binary_path(go_config, name, service_dir);
         (binary_path.to_string_lossy().into_owned(), vec![])
     } else if resolved.run.is_some() {
         let cache_base = base_dir.join(".don").join("cache");
@@ -112,9 +122,6 @@ pub(crate) async fn start_service(
         }
         .into());
     };
-
-    // Merge environment. Inject LISTEN_FDS/LISTEN_FDNAMES if sockets are bound.
-    let service_dir = resolved.dir.as_deref().unwrap_or(base_dir);
     let injected = bound_sockets
         .map(|s| s.listen_env())
         .unwrap_or_default();

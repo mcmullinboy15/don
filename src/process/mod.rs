@@ -125,9 +125,14 @@ impl ProcessHandle {
         self.pgid
     }
 
-    /// Take the PTY write half (for interactive attach in Phase 17).
+    /// Take the PTY write half for interactive attach.
     pub fn take_pty_write(&mut self) -> Option<pty_process::OwnedWritePty> {
         self.pty_write.take()
+    }
+
+    /// Return the PTY write half after an attach session ends.
+    pub fn set_pty_write(&mut self, pty: pty_process::OwnedWritePty) {
+        self.pty_write = Some(pty);
     }
 
     /// Wait for the child to exit, returning the exit status.
@@ -271,6 +276,10 @@ fn spawn_pty(
     ProcessError,
 > {
     let (pty, pts) = pty_process::open().map_err(ProcessError::PtyAlloc)?;
+
+    // Set a reasonable default size so programs that query terminal
+    // dimensions at startup don't stall on a 0x0 PTY.
+    let _ = pty.resize(pty_process::Size::new(24, 80));
 
     let mut cmd = pty_process::Command::new(config.cmd);
     cmd = cmd.args(config.args);

@@ -5,6 +5,8 @@
 //! a fresh connection and sends `Connection: close`; the server fulfills
 //! and closes. Follow-mode log streams use chunked transfer encoding.
 
+pub mod attach;
+
 use crate::runner::ItemStatus;
 use serde::Deserialize;
 use std::io;
@@ -426,7 +428,7 @@ async fn read_line(stream: &mut UnixStream, leftover: &mut Vec<u8>) -> Result<St
 }
 
 /// Minimal percent-encoder for the path segment (names may contain `/`, `%`, `?`).
-fn urlencode(input: &str) -> String {
+pub(crate) fn urlencode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.as_bytes() {
         let b = *byte;

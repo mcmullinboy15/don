@@ -7,10 +7,10 @@ license = "MIT"
 
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 bollard = "0.20"
 bytes = "1"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 bzip2 = "0.5"
 flate2 = "1"
 clap = { version = "4", features = ["derive"] }
@@ -35,6 +35,7 @@ xz2 = "0.1"
 zip = "2"
 zstd = "0.13"
 tokio-stream = "0.1"
+tokio-tungstenite = "0.26"
 toml = "0.8"
 
 [dev-dependencies]

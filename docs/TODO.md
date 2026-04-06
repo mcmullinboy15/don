@@ -580,33 +580,33 @@ Final touches for a great dev experience.
 Connect your terminal directly to a running service's PTY for interactive stdin/stdout access. Depends on Phases 2 (PTY), 3 (output), and 10 (unix socket API).
 
 ### WebSocket Endpoint
-- [ ] `GET /attach/:name` endpoint on the unix socket API that upgrades to a WebSocket
-- [ ] Replay recent output from ring buffer on connect (so the user has context)
-- [ ] Bidirectional bridge: WebSocket frames ↔ PTY stdin/stdout
-- [ ] Terminal resize: CLI sends resize control messages, daemon calls `pty.resize()`
+- [x] `GET /attach/:name` endpoint on the unix socket API that upgrades to a WebSocket
+- [x] Replay recent output from ring buffer on connect (so the user has context)
+- [x] Bidirectional bridge: WebSocket frames ↔ PTY stdin/stdout
+- [x] Terminal resize: CLI sends resize control messages, daemon calls `pty.resize()`
 
 ### Attach Lock
-- [ ] Daemon tracks which PID holds the attach lock for each service
-- [ ] CLI sends its PID in the initial WebSocket handshake
-- [ ] Second attach attempt returns error: `"process 82648 is currently attached to 'my-task'"`
-- [ ] Lock auto-released on WebSocket disconnect (process dies or detaches)
+- [x] Daemon tracks which PID holds the attach lock for each service
+- [x] CLI sends its PID in the initial WebSocket handshake
+- [x] Second attach attempt returns error: `"process 82648 is currently attached to 'my-task'"`
+- [x] Lock auto-released on WebSocket disconnect (process dies or detaches)
 
 ### CLI
-- [ ] `don attach <name>` subcommand
-- [ ] Put terminal in raw mode (crossterm) for direct input passthrough
-- [ ] Bridge stdin/stdout to WebSocket
-- [ ] Detect and forward terminal resize events
-- [ ] Escape sequence `~.` to detach without killing the process
-- [ ] Restore terminal from raw mode on detach/exit
+- [x] `don attach <name>` subcommand
+- [x] Put terminal in raw mode (crossterm) for direct input passthrough
+- [x] Bridge stdin/stdout to WebSocket
+- [x] Detect and forward terminal resize events
+- [x] Ctrl+C / Ctrl+D to detach without killing the process
+- [x] Restore terminal from raw mode on detach/exit
 
 ### Output Integration
-- [ ] Pause prefixed output for the attached service in the don terminal
-- [ ] Ring buffer continues to be fed during attach
-- [ ] Resume prefixed output on detach
+- [x] Pause prefixed output for the attached service in the don terminal
+- [x] Ring buffer continues to be fed during attach
+- [x] Resume prefixed output on detach
 
 ### Test Coverage Checkpoint
-- [ ] Integration test: attach to a running service, send input, verify it reaches the subprocess
-- [ ] Integration test: attempt second attach while first is active — verify rejection with PID
-- [ ] Integration test: first attacher disconnects, second attach succeeds
-- [ ] Integration test: detach with escape sequence, verify service keeps running
-- [ ] Integration test: terminal resize propagates to subprocess PTY
+- [x] Integration test: attach to a running service, send input, verify it reaches the subprocess
+- [x] Integration test: attempt second attach while first is active — verify rejection with PID
+- [x] Integration test: first attacher disconnects, second attach succeeds
+- [x] Integration test: detach with escape sequence, verify service keeps running
+- [x] Integration test: terminal resize propagates to subprocess PTY

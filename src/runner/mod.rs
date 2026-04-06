@@ -176,8 +176,29 @@ pub enum RunnerCommand {
     /// Sent by `handle_config_reload` after a delay so newly-spawned deps
     /// have time to pass their ready checks.
     StartPending,
+    /// Request an interactive attach session for a service.
+    /// Returns the PTY write handle and a live output receiver, or an error.
+    Attach {
+        name: String,
+        pid: u32,
+        reply: oneshot::Sender<Result<AttachSession, CommandError>>,
+    },
+    /// Release an attach session — return the PTY write handle, clear the lock,
+    /// and resume prefixed output.
+    Detach {
+        name: String,
+        pty_write: Option<pty_process::OwnedWritePty>,
+    },
     /// Initiate graceful shutdown.
     Shutdown,
+}
+
+/// An active attach session returned to the WebSocket handler.
+pub struct AttachSession {
+    /// The PTY write half for forwarding stdin.
+    pub pty_write: pty_process::OwnedWritePty,
+    /// Live output receiver (preloaded with ring buffer snapshot).
+    pub output_rx: mpsc::Receiver<crate::output::SinkLine>,
 }
 
 /// Status of a single item (service or task) for status queries.
@@ -412,6 +433,9 @@ pub struct Runner {
     task_states: HashMap<String, TaskItemState>,
     service_handles: HashMap<String, ServiceHandle>,
 
+    /// Tracks which PID holds the interactive attach lock for each service.
+    attach_locks: HashMap<String, u32>,
+
     /// Bound TCP sockets for services with `listen` addresses.
     /// Outlive service restarts — don holds the sockets so ports are never released.
     bound_sockets: HashMap<String, crate::process::socket::BoundSockets>,
@@ -459,6 +483,10 @@ impl Runner {
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (event_tx, _) = broadcast::channel(256);
+
+        // Canonicalize base_dir so all downstream path joins produce clean
+        // absolute paths (avoids `././app` when base_dir is `.`).
+        let base_dir = std::fs::canonicalize(&base_dir).map_err(RunnerError::Io)?;
 
         let don_dir = base_dir.join(".don");
         std::fs::create_dir_all(&don_dir).map_err(RunnerError::Io)?;
@@ -576,6 +604,7 @@ impl Runner {
             service_states,
             task_states: task_item_states,
             service_handles: HashMap::new(),
+            attach_locks: HashMap::new(),
             bound_sockets: HashMap::new(),
             running_task_pgids: HashMap::new(),
             server_shutdown_tx: None,
@@ -814,6 +843,13 @@ impl Runner {
                         RunnerCommand::Restart { name, reply } => {
                             let result = self.handle_restart_cmd(&name).await;
                             let _ = reply.send(result);
+                        }
+                        RunnerCommand::Attach { name, pid, reply } => {
+                            let result = self.handle_attach_cmd(&name, pid).await;
+                            let _ = reply.send(result);
+                        }
+                        RunnerCommand::Detach { name, pty_write } => {
+                            self.handle_detach(&name, pty_write).await;
                         }
                         RunnerCommand::Rebuild { name } => {
                             self.handle_rebuild(&name).await;
@@ -1497,7 +1533,11 @@ impl Runner {
         self.output_manager
             .lifecycle_event(&format!("{name}: running {cmd} build..."));
 
-        let work_dir = resolved.dir.as_deref().unwrap_or(&self.base_dir);
+        let work_dir = match resolved.dir.as_deref() {
+            Some(d) => self.base_dir.join(d),
+            None => self.base_dir.clone(),
+        };
+        let work_dir = work_dir.as_path();
         let mut env: HashMap<String, String> = std::env::vars().collect();
         env.extend(resolved.env.clone());
 
@@ -1513,12 +1553,30 @@ impl Runner {
         .await
         {
             Ok((mut handle, child_output)) => {
-                if let Some(svc_writer) = self.output_manager.service_writer(name) {
-                    let output = child_output;
-                    tokio::spawn(async move {
-                        let _ = svc_writer.process_stream(output).await;
-                    });
-                }
+                // Pipe build output through [don] lifecycle events so it's
+                // visually distinct from the service's own output.
+                let om = self.output_manager.clone_lifecycle_emitter();
+                let build_name = name.to_string();
+                tokio::spawn(async move {
+                    let mut reader = tokio::io::BufReader::new(child_output);
+                    let mut line_buf = Vec::new();
+                    loop {
+                        line_buf.clear();
+                        match tokio::io::AsyncBufReadExt::read_until(
+                            &mut reader, b'\n', &mut line_buf,
+                        ).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                if line_buf.last() == Some(&b'\n') { line_buf.pop(); }
+                                if line_buf.last() == Some(&b'\r') { line_buf.pop(); }
+                                let text = String::from_utf8_lossy(&line_buf);
+                                om.lifecycle_event(&format!("{build_name}: {text}"));
+                            }
+                            Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                            Err(_) => break,
+                        }
+                    }
+                });
 
                 match handle.wait().await {
                     Ok(status) if status.success() => {
@@ -1590,12 +1648,18 @@ impl Runner {
         // 1. Stop removed services.
         for name in &diff.removed_services {
             if let Some(handle) = self.service_handles.remove(name) {
+                if self.attach_locks.remove(name).is_some() {
+                    self.output_manager.resume_stdout_sink(name).await;
+                }
                 let svc = self.config.services.get(name);
                 let resolved = svc.map(|s| s.resolve(self.platform));
                 let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
                 self.service_states
                     .insert(name.clone(), ServiceState::Stopping);
                 let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
+                if let Some(writer) = self.output_manager.service_writer(name) {
+                    writer.close_follow_sinks().await;
+                }
                 self.output_manager
                     .lifecycle_event(&format!("{name}: stopped (removed from config)"));
             }
@@ -1608,12 +1672,18 @@ impl Runner {
         //    listen addresses (if changed).
         for name in &diff.changed_services {
             if let Some(handle) = self.service_handles.remove(name) {
+                if self.attach_locks.remove(name).is_some() {
+                    self.output_manager.resume_stdout_sink(name).await;
+                }
                 let svc = self.config.services.get(name);
                 let resolved = svc.map(|s| s.resolve(self.platform));
                 let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
                 self.service_states
                     .insert(name.clone(), ServiceState::Stopping);
                 let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
+                if let Some(writer) = self.output_manager.service_writer(name) {
+                    writer.close_follow_sinks().await;
+                }
             }
             self.bound_sockets.remove(name);
         }
@@ -1836,12 +1906,22 @@ impl Runner {
 
         // Stop the old service (if running).
         if let Some(handle) = self.service_handles.remove(name) {
+            // Release attach lock — the old PTY is gone after restart.
+            // This causes the attach session to exit (follow sink closes below).
+            if self.attach_locks.remove(name).is_some() {
+                self.output_manager.resume_stdout_sink(name).await;
+            }
             self.service_states
                 .insert(name.to_string(), ServiceState::Stopping);
             let shutdown_config = resolved.shutdown.as_ref();
             if let Err(e) = stop_service(handle, shutdown_config, false).await {
                 self.output_manager
                     .error_event(&format!("{name}: stop failed during rebuild: {e}"));
+            }
+            // Close follow/attach sinks so attached clients and log
+            // followers detect the restart and exit cleanly.
+            if let Some(writer) = self.output_manager.service_writer(name) {
+                writer.close_follow_sinks().await;
             }
         }
 
@@ -1896,6 +1976,11 @@ impl Runner {
                 message: "not running".to_string(),
             }
         })?;
+        // Release attach lock if held — the PTY write in the attach session
+        // becomes invalid once the service stops (process gone).
+        if self.attach_locks.remove(name).is_some() {
+            self.output_manager.resume_stdout_sink(name).await;
+        }
         self.service_states
             .insert(name.to_string(), ServiceState::Stopping);
         self.output_manager
@@ -1909,6 +1994,11 @@ impl Runner {
         }
         self.service_states
             .insert(name.to_string(), ServiceState::Stopped);
+        // Close follow/attach sinks so log followers and attach sessions
+        // detect the service stopped instead of blocking forever.
+        if let Some(writer) = self.output_manager.service_writer(name) {
+            writer.close_follow_sinks().await;
+        }
         let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
             name: name.to_string(),
             state: ServiceState::Stopped,
@@ -1927,6 +2017,80 @@ impl Runner {
         self.handle_start_cmd(name).await
     }
 
+    /// Handle an interactive attach request.
+    async fn handle_attach_cmd(&mut self, name: &str, pid: u32) -> Result<AttachSession, CommandError> {
+        // Validate: must be a known, running service (not a task).
+        let _ = self.lookup_service(name)?;
+        if !self.service_handles.contains_key(name) {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "not running".to_string(),
+            });
+        }
+
+        // Check attach lock.
+        if let Some(&existing_pid) = self.attach_locks.get(name) {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: format!("process {existing_pid} is currently attached to '{name}'"),
+            });
+        }
+
+        // Take the PTY write half from the service handle.
+        let pty_write = match self.service_handles.get_mut(name) {
+            Some(ServiceHandle::Process(process)) => process.take_pty_write(),
+            _ => None,
+        };
+        let pty_write = pty_write.ok_or_else(|| CommandError::InvalidState {
+            name: name.to_string(),
+            message: "service has no PTY (spawned in pipe mode)".to_string(),
+        })?;
+
+        // Set up follow sink for live output (256 lines of headroom).
+        let output_rx = self
+            .output_manager
+            .add_follow_sink(name, 50, 256)
+            .await
+            .ok_or_else(|| CommandError::Failed {
+                name: name.to_string(),
+                message: "failed to create output sink".to_string(),
+            })?;
+
+        // Pause prefixed stdout for this service.
+        self.output_manager.pause_stdout_sink(name).await;
+
+        // Acquire the lock.
+        self.attach_locks.insert(name.to_string(), pid);
+
+        self.output_manager
+            .lifecycle_event(&format!("{name}: attached (pid {pid})"));
+
+        Ok(AttachSession { pty_write, output_rx })
+    }
+
+    /// Release an attach session.
+    async fn handle_detach(&mut self, name: &str, pty_write: Option<pty_process::OwnedWritePty>) {
+        // Only return the PTY write handle if the attach lock is still held
+        // for this service. If the service was stopped/restarted while we
+        // were attached, the lock was already cleared and the current process
+        // has a fresh PTY — setting the stale one would corrupt it.
+        if self.attach_locks.contains_key(name)
+            && let Some(pty) = pty_write
+            && let Some(ServiceHandle::Process(process)) = self.service_handles.get_mut(name)
+        {
+            process.set_pty_write(pty);
+        }
+
+        // Release lock.
+        self.attach_locks.remove(name);
+
+        // Resume prefixed output.
+        self.output_manager.resume_stdout_sink(name).await;
+
+        self.output_manager
+            .lifecycle_event(&format!("{name}: detached"));
+    }
+
     /// Handle a file-watch-triggered task re-run.
     async fn handle_task_rerun(&mut self, name: &str) {
         let task_cfg = match self.config.tasks.get(name) {
@@ -1942,22 +2106,9 @@ impl Runner {
             }
         };
 
-        let base_dir = task_cfg.dir.as_deref().unwrap_or(&self.base_dir);
-        let needs_run = self
-            .task_state
-            .needs_run(name, &task_cfg.watch, Some(base_dir))
-            .await
-            .unwrap_or(true);
-
-        if !needs_run {
-            self.output_manager
-                .lifecycle_event(&format!("{name}: rerun skipped (no changes)"));
-            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
-                name: name.to_string(),
-                success: true,
-            });
-            return;
-        }
+        // Skip the needs_run hash check — the file watcher already confirmed
+        // a matching file changed. The hash check is only needed at startup
+        // (to skip tasks whose inputs haven't changed since the last run).
 
         // If the task has opted out of auto-reruns, mark it pending and don't spawn.
         // The user will need to trigger a manual rerun when they're ready.
@@ -1983,8 +2134,12 @@ impl Runner {
         self.task_states
             .insert(name.to_string(), TaskItemState::Running);
 
+        self.output_manager
+            .debug_event(&format!("{name}: spawning process..."));
         match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
             Ok(spawn) => {
+                self.output_manager
+                    .debug_event(&format!("{name}: process spawned (pid {}))", spawn.handle.pgid()));
                 self.wire_task_output_and_wait(name, spawn, &task_cfg, None);
             }
             Err(e) => {
@@ -2201,6 +2356,8 @@ impl Runner {
         // All handles should already be stopped by initiate_shutdown.
         // Drop remaining handles to release PID files.
         self.service_handles.clear();
+        // Release attach locks (WebSocket handlers will see PTY write fail).
+        self.attach_locks.clear();
         // Release bound sockets (closes listening ports).
         self.bound_sockets.clear();
     }
