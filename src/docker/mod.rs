@@ -221,10 +221,13 @@ pub(crate) async fn start_docker_service(
 }
 
 /// Clean up a stale container by name (from a previous don run that crashed).
+///
+/// Returns `Ok(true)` if a container was found and removed, `Ok(false)` if
+/// no container by that name existed.
 pub(crate) async fn cleanup_stale_container(
     client: &Docker,
     name: &str,
-) -> Result<(), DockerError> {
+) -> Result<bool, DockerError> {
     match client.inspect_container(name, None).await {
         Ok(_) => {
             // Container exists — stop and remove it.
@@ -232,11 +235,11 @@ pub(crate) async fn cleanup_stale_container(
             let _ = client.stop_container(name, Some(stop_options)).await;
             let remove_options = RemoveContainerOptionsBuilder::new().force(true).build();
             client.remove_container(name, Some(remove_options)).await?;
-            Ok(())
+            Ok(true)
         }
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
-        }) => Ok(()),
+        }) => Ok(false),
         Err(e) => Err(DockerError::Api(e)),
     }
 }

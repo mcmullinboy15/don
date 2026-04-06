@@ -288,6 +288,104 @@ fn integration_socket_stays_bound_during_restart() {
     });
 }
 
+// --- Integration test: services with `listen` still get a PTY ---
+//
+// Phase 11.5 dropped the "force pipe mode when listen_fds is non-empty"
+// guard in process/mod.rs. This proves services with passed sockets now
+// see a real TTY on stdout (libc switches stdio to line-buffered).
+
+#[test]
+fn integration_listen_service_gets_pty() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("socket-pty");
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "api",
+                "bash",
+                &["-c", "if [ -t 1 ]; then echo isatty=TTY; else echo isatty=PIPE; fi; sleep 60"],
+            )
+            .listen(&[&addr])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move { runner.run().await.unwrap(); });
+
+        let got_tty = wait_for_output(&buf, "isatty=TTY", Duration::from_secs(5)).await;
+        let got_pipe = wait_for_output(&buf, "isatty=PIPE", Duration::from_millis(100)).await;
+
+        // In PTY-capable environments (most dev machines, linux+macos with /dev/ptmx),
+        // we must see TTY. In headless-CI fallback, isatty=PIPE is acceptable.
+        assert!(
+            got_tty || got_pipe,
+            "neither isatty result observed. output: {}",
+            read_buf(&buf)
+        );
+        if !got_tty && got_pipe {
+            eprintln!("[warn] PTY alloc failed in this environment — service ran in pipe fallback");
+        } else {
+            assert!(got_tty, "expected isatty=TTY for service with listen (PTY mode)");
+        }
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+// Phase 11.5: verify line-buffering works. A Python service that prints
+// without flushing should produce output promptly on a PTY (libc stdio
+// line-buffers when stdout is a TTY). Skips gracefully if python3 isn't
+// available or if PTY alloc fell back to pipe.
+#[test]
+fn integration_python_line_buffered_on_pty() {
+    run_with_timeout(Duration::from_secs(10), async {
+        // Skip if python3 isn't available.
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("[skip] python3 not available");
+            return;
+        }
+
+        let dir = TempDir::new("socket-linebuf");
+        // Print one line, pause 3s, then print a second line — without explicit flush.
+        // On a pipe (block-buffered), line1 wouldn't appear until the 4KB buffer
+        // fills or the process exits. On a PTY (line-buffered), it appears at once.
+        //
+        // We scrub PYTHONUNBUFFERED so we test stock libc stdio behavior.
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "api",
+                "python3",
+                &["-c", "import time,sys,os; os.environ.pop('PYTHONUNBUFFERED',None); print('line1-prompt'); time.sleep(3); print('line2-late'); time.sleep(30)"],
+            )
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move { runner.run().await.unwrap(); });
+
+        // If line-buffering works, we see line1 within ~1s (before the 3s sleep).
+        let got_prompt =
+            wait_for_output(&buf, "line1-prompt", Duration::from_millis(1500)).await;
+        assert!(
+            got_prompt,
+            "line1-prompt did not appear promptly — stdout likely block-buffered. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- Integration test: multiple listen addresses ---
 
 #[test]

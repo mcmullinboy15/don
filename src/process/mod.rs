@@ -1,12 +1,16 @@
 //! Process management — spawning, signaling, and lifecycle management
 //! for child processes in their own process groups.
 
+pub mod cleanup;
 pub mod env;
+pub mod identity;
 pub mod pid_file;
 pub(crate) mod socket;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(crate) mod test_util;
+
+pub use identity::ProcessIdentity;
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -75,8 +79,8 @@ pub struct SpawnConfig<'a> {
     /// Force pipe-based spawning instead of PTY (for testing fallback).
     pub force_pipe: bool,
     /// Raw fds to pass to the child at fd 3, 4, 5... (LISTEN_FDS protocol).
-    /// Empty means no socket passing. When non-empty, pipe mode is forced
-    /// (pty-process doesn't expose pre_exec for fd placement).
+    /// Empty means no socket passing. Works in both PTY and pipe modes —
+    /// fd placement happens in a pre_exec hook either way.
     pub listen_fds: Vec<std::os::unix::io::RawFd>,
 }
 
@@ -208,9 +212,12 @@ impl Drop for ProcessHandle {
 pub async fn spawn_process(
     config: SpawnConfig<'_>,
 ) -> Result<(ProcessHandle, ChildOutput), ProcessError> {
-    // Force pipe mode when passing listen fds — pty-process doesn't expose
-    // pre_exec for fd placement. Network services don't need a PTY anyway.
-    if !config.force_pipe && config.listen_fds.is_empty() {
+    // Default to PTY for all services — this gives children a real TTY, which
+    // flips libc stdio from block-buffered back to line-buffered, so logs from
+    // Python/C/C++/Java network services appear as they're written rather than
+    // stalling in a 4KB pipe buffer. PTY allocation can fail in headless/CI
+    // environments, in which case we fall back to pipe mode.
+    if !config.force_pipe {
         match spawn_pty(&config) {
             Ok((child, read_pty, write_pty)) => {
                 let pgid = child_pgid(&child, config.cmd)?;
@@ -280,6 +287,23 @@ fn spawn_pty(
     // Note: pty-process calls setsid() in its session_leader pre_exec hook,
     // which creates a new session AND process group (PGID = PID).
     // No additional setpgid needed — setsid handles it.
+    //
+    // If we're passing listener fds, register a pre_exec hook that runs after
+    // session_leader (pty-process chains them in order). It places the fds at
+    // 3, 4, 5... and sets LISTEN_PID to the child's own PID.
+    if !config.listen_fds.is_empty() {
+        let listen_fds = config.listen_fds.clone();
+        // Safety: place_fds_for_exec calls dup/dup2/fcntl/close and setenv
+        // is async-signal-safe on Linux/macOS. All operations happen between
+        // fork and exec in the child process only.
+        cmd = unsafe {
+            cmd.pre_exec(move || {
+                socket::place_fds_for_exec(&listen_fds)?;
+                set_listen_pid_env();
+                Ok(())
+            })
+        };
+    }
 
     let child = cmd.spawn(pts).map_err(|e| ProcessError::Spawn {
         cmd: config.cmd.to_string(),
@@ -314,16 +338,9 @@ fn spawn_pipe(config: &SpawnConfig<'_>) -> Result<tokio::process::Child, Process
             // Place listen fds at fd 3, 4, 5... and clear CLOEXEC.
             socket::place_fds_for_exec(&listen_fds)?;
 
-            // Set LISTEN_PID to our (child's) PID. getpid() returns the
-            // child's PID after fork, before exec.
+            // Set LISTEN_PID to the child's (our) PID after fork, before exec.
             if !listen_fds.is_empty() {
-                let pid = libc::getpid();
-                let pid_str = format!("{pid}\0");
-                libc::setenv(
-                    c"LISTEN_PID".as_ptr(),
-                    pid_str.as_ptr().cast(),
-                    1,
-                );
+                set_listen_pid_env();
             }
 
             nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
@@ -349,7 +366,9 @@ fn child_pgid(child: &tokio::process::Child, cmd: &str) -> Result<i32, ProcessEr
         })
 }
 
-/// Write the PGID to a file. Creates parent directories if needed.
+/// Write the PGID (and start_time if available) to a file. Creates parent
+/// directories if needed. Format: `<pgid>\n<start_time>` or just `<pgid>`
+/// if the child exited before we could capture its start_time.
 async fn write_pgid_file(path: Option<&Path>, pgid: i32) -> Result<(), ProcessError> {
     let Some(path) = path else { return Ok(()) };
     if let Some(parent) = path.parent() {
@@ -357,11 +376,16 @@ async fn write_pgid_file(path: Option<&Path>, pgid: i32) -> Result<(), ProcessEr
             .await
             .map_err(ProcessError::Io)?;
     }
-    tokio::fs::write(path, pgid.to_string())
-        .await
-        .map_err(|e| {
-            ProcessError::PgidFile(format!("failed to write pgid to '{}': {e}", path.display()))
-        })?;
+    // Capture start_time synchronously — this reads /proc/<pgid>/stat (Linux)
+    // or calls sysctl (macOS). If the child already exited (unlikely race),
+    // we fall back to writing just the PGID.
+    let content = match identity::capture(pgid) {
+        Ok(Some(ident)) => format!("{}\n{}", ident.pgid, ident.start_time),
+        _ => pgid.to_string(),
+    };
+    tokio::fs::write(path, content).await.map_err(|e| {
+        ProcessError::PgidFile(format!("failed to write pgid to '{}': {e}", path.display()))
+    })?;
     Ok(())
 }
 
@@ -369,18 +393,54 @@ async fn write_pgid_file(path: Option<&Path>, pgid: i32) -> Result<(), ProcessEr
 pub async fn read_pgid_file(path: &Path) -> Result<Option<i32>, ProcessError> {
     match tokio::fs::read_to_string(path).await {
         Ok(content) => {
-            let content = content.trim().to_string();
+            let content = content.trim();
             if content.is_empty() {
                 return Ok(None);
             }
-            let pgid: i32 = content.parse().map_err(|_| {
-                ProcessError::PgidFile(format!("invalid pgid in '{}': '{content}'", path.display()))
+            // First line is the PGID (second line, if present, is start_time).
+            let first_line = content.lines().next().unwrap_or("").trim();
+            let pgid: i32 = first_line.parse().map_err(|_| {
+                ProcessError::PgidFile(format!("invalid pgid in '{}': '{first_line}'", path.display()))
             })?;
             Ok(Some(pgid))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(ProcessError::PgidFile(format!(
             "failed to read pgid from '{}': {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Read a pid file as a full `ProcessIdentity`. Returns `None` if the file
+/// does not exist. If the file has the old single-line format, returns
+/// `ProcessIdentity { pgid, start_time: 0 }`.
+pub async fn read_pid_file_identity(
+    path: &Path,
+) -> Result<Option<ProcessIdentity>, ProcessError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => {
+            let content = content.trim();
+            if content.is_empty() {
+                return Ok(None);
+            }
+            let mut lines = content.lines();
+            let pgid_str = lines.next().unwrap_or("");
+            let pgid: i32 = pgid_str.trim().parse().map_err(|_| {
+                ProcessError::PgidFile(format!(
+                    "invalid pgid in '{}': '{pgid_str}'",
+                    path.display()
+                ))
+            })?;
+            let start_time: u64 = lines
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            Ok(Some(ProcessIdentity { pgid, start_time }))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ProcessError::PgidFile(format!(
+            "failed to read identity from '{}': {e}",
             path.display()
         ))),
     }
@@ -393,6 +453,73 @@ pub async fn cleanup_pgid_file(path: &Path) -> Result<(), std::io::Error> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Set the `LISTEN_PID` environment variable to the current process's PID.
+///
+/// Called from pre_exec hooks in the child after fork, before exec. The
+/// value must be the reader's own PID — systemd's socket-activation protocol
+/// requires it as a guard against fd inheritance leaking to nested children.
+///
+/// Uses a fixed-size stack buffer so there are no heap allocations after
+/// fork (allocator locks from other tokio threads in the parent are frozen
+/// post-fork and can deadlock the child).
+///
+/// # Safety
+///
+/// Must only be called between `fork` and `exec`. `libc::getpid` and
+/// `libc::setenv` are async-signal-safe on Linux and macOS.
+fn set_listen_pid_env() {
+    // PID_MAX_LIMIT on Linux is 2^22 = 4194304 (7 digits); macOS caps at
+    // 99999. 20 bytes holds any plausible PID plus sign plus NUL.
+    let mut buf = [0u8; 20];
+    let pid = unsafe { libc::getpid() };
+    let len = write_i32_nul(&mut buf, pid);
+    unsafe {
+        libc::setenv(c"LISTEN_PID".as_ptr(), buf.as_ptr().cast(), 1);
+    }
+    // Silence unused warning — len is useful for tests/debugging, not for setenv.
+    let _ = len;
+}
+
+/// Write a signed integer as a null-terminated ASCII string into `buf`.
+/// Returns the number of bytes written (not counting the NUL). Panics (in
+/// debug) if `buf` is too small.
+fn write_i32_nul(buf: &mut [u8], value: i32) -> usize {
+    debug_assert!(buf.len() >= 12, "buffer too small for i32");
+    // Handle sign.
+    let (mut n, negative) = if value < 0 {
+        // -i32::MIN overflows; use wrapping_neg + cast to u32 for the magnitude.
+        ((value as i64).unsigned_abs() as u32, true)
+    } else {
+        (value as u32, false)
+    };
+    // Write digits in reverse into a scratch area.
+    let mut digits = [0u8; 10];
+    let mut i = 0;
+    if n == 0 {
+        digits[0] = b'0';
+        i = 1;
+    } else {
+        while n > 0 {
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            i += 1;
+        }
+    }
+    // Emit into buf, prepending '-' if negative, reversed.
+    let mut j = 0;
+    if negative {
+        buf[j] = b'-';
+        j += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        buf[j] = digits[i];
+        j += 1;
+    }
+    buf[j] = 0;
+    j
 }
 
 fn signal_name(sig: Signal) -> &'static str {

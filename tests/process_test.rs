@@ -131,6 +131,13 @@ async fn pgid_file_written_on_spawn() {
     let stored_pgid = read_pgid_file(&pgid_path).await.unwrap();
     assert_eq!(stored_pgid, Some(handle.pgid()));
 
+    // Verify the file now contains two lines (PGID + start_time).
+    let contents = std::fs::read_to_string(&pgid_path).unwrap();
+    let lines: Vec<&str> = contents.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 lines (pgid + start_time), got: {contents:?}");
+    let start_time: u64 = lines[1].parse().unwrap();
+    assert!(start_time > 0, "start_time should be positive");
+
     handle.signal(Signal::SIGKILL).unwrap();
     handle.wait().await.unwrap();
 }
@@ -176,6 +183,44 @@ async fn pgid_file_read_and_cleanup() {
     // Read of nonexistent returns None
     let pgid = read_pgid_file(&pgid_path).await.unwrap();
     assert_eq!(pgid, None);
+}
+
+#[tokio::test]
+async fn pid_file_identity_old_format() {
+    use don::process::read_pid_file_identity;
+
+    let dir = TempDir::new("pid-identity-old");
+    let path = dir.path().join("test.pid");
+
+    // Old format: just a PGID number
+    std::fs::write(&path, "12345").unwrap();
+    let ident = read_pid_file_identity(&path).await.unwrap().unwrap();
+    assert_eq!(ident.pgid, 12345);
+    assert_eq!(ident.start_time, 0);
+}
+
+#[tokio::test]
+async fn pid_file_identity_new_format() {
+    use don::process::read_pid_file_identity;
+
+    let dir = TempDir::new("pid-identity-new");
+    let path = dir.path().join("test.pid");
+
+    // New format: PGID + start_time
+    std::fs::write(&path, "12345\n99999").unwrap();
+    let ident = read_pid_file_identity(&path).await.unwrap().unwrap();
+    assert_eq!(ident.pgid, 12345);
+    assert_eq!(ident.start_time, 99999);
+}
+
+#[tokio::test]
+async fn pid_file_identity_nonexistent() {
+    use don::process::read_pid_file_identity;
+
+    let dir = TempDir::new("pid-identity-missing");
+    let path = dir.path().join("nope.pid");
+    let ident = read_pid_file_identity(&path).await.unwrap();
+    assert!(ident.is_none());
 }
 
 #[tokio::test]

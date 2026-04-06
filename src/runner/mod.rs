@@ -458,6 +458,29 @@ impl Runner {
                 other => RunnerError::PidFile(other),
             })?;
 
+        // Clean up stale state from a previous don run (crashed or killed).
+        // Runs after we hold the PID file lock, guaranteeing we're the only
+        // don instance. Collects docker container names from config.
+        let docker_names: Vec<String> = config
+            .services
+            .iter()
+            .filter_map(|(name, svc)| {
+                svc.docker.as_ref().map(|d| {
+                    d.container
+                        .clone()
+                        .unwrap_or_else(|| format!("don-{name}"))
+                })
+            })
+            .collect();
+        let cleanup_report =
+            crate::process::cleanup::run_cleanup(&base_dir, &docker_names).await;
+        if cleanup_report.pid_files_removed > 0
+            || cleanup_report.sock_removed
+            || cleanup_report.containers_removed > 0
+        {
+            output_manager.lifecycle_event(&format!("cleaned stale state: {cleanup_report}"));
+        }
+
         let task_state = TaskState::new(don_dir.join("task-state"));
 
         // Connect to Docker if any service uses the docker preset.

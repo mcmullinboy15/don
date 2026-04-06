@@ -57,7 +57,11 @@ enum Commands {
         name: String,
     },
     /// Clean up stale state from a previous run
-    Cleanup,
+    Cleanup {
+        /// Kill a running daemon first, then clean up
+        #[arg(long)]
+        force: bool,
+    },
     /// Validate the config file
     Validate,
 }
@@ -108,10 +112,7 @@ async fn run(config_path: PathBuf, command: Commands) -> i32 {
             eprintln!("don attach {name}: not yet implemented (Phase 17)");
             1
         }
-        Commands::Cleanup => {
-            eprintln!("don cleanup: not yet implemented (Phase 12)");
-            1
-        }
+        Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
     }
 }
 
@@ -286,6 +287,116 @@ fn task_state_color(s: TaskItemState) -> Color {
         TaskItemState::PendingRerun => Color::Cyan,
         TaskItemState::Failed => Color::Red,
     }
+}
+
+async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 {
+    let base = base_dir(config_path);
+    let don_dir = base.join(".don");
+    let _ = std::fs::create_dir_all(&don_dir);
+
+    // Acquire the PID file lock so we don't race with a running daemon.
+    let don_pid_path = don_dir.join("don.pid");
+    let pid_lock = match don::process::pid_file::PidFile::acquire(
+        don_pid_path.clone(),
+        std::process::id() as i32,
+    )
+    .await
+    {
+        Ok(lock) => lock,
+        Err(don::process::pid_file::PidFileError::AlreadyLocked) => {
+            if !force {
+                println!("don daemon is running — nothing to clean up (use --force to kill it)");
+                return 0;
+            }
+            // --force: read the running daemon's PID and kill it.
+            eprintln!("killing running don daemon...");
+            if let Err(e) = kill_running_daemon(&don_pid_path).await {
+                eprintln!("failed to kill daemon: {e}");
+                return 1;
+            }
+            // Now re-acquire the lock.
+            match don::process::pid_file::PidFile::acquire(
+                don_pid_path,
+                std::process::id() as i32,
+            )
+            .await
+            {
+                Ok(lock) => lock,
+                Err(e) => {
+                    eprintln!("failed to acquire pid lock after kill: {e}");
+                    return 1;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("failed to acquire pid lock: {e}");
+            return 1;
+        }
+    };
+
+    // Load config to discover docker container names. If config doesn't
+    // exist or is invalid, still clean up what we can (pid files and socket).
+    let docker_names: Vec<String> = match don::config::Config::from_file(config_path) {
+        Ok(config) => config
+            .services
+            .iter()
+            .filter_map(|(name, svc)| {
+                svc.docker.as_ref().map(|d| {
+                    d.container
+                        .clone()
+                        .unwrap_or_else(|| format!("don-{name}"))
+                })
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
+
+    let report = don::process::cleanup::run_cleanup(&base, &docker_names).await;
+    println!("{report}");
+
+    // Hold lock until cleanup finishes, then release.
+    drop(pid_lock);
+    0
+}
+
+/// Read the PID from don.pid, send two SIGINTs (triggering the daemon's
+/// own two-signal shutdown protocol: first = graceful, second = force SIGKILL
+/// on all children), then wait for the process to exit.
+async fn kill_running_daemon(pid_path: &std::path::Path) -> Result<(), String> {
+    let content = std::fs::read_to_string(pid_path)
+        .map_err(|e| format!("failed to read {}: {e}", pid_path.display()))?;
+    let pid: i32 = content
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid pid in {}: '{}'", pid_path.display(), content.trim()))?;
+
+    let nix_pid = nix::unistd::Pid::from_raw(pid);
+
+    // First SIGINT — triggers graceful shutdown.
+    if nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGINT).is_err() {
+        return Ok(()); // Already dead.
+    }
+
+    // Brief pause so the daemon registers the first signal and enters shutdown.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Second SIGINT — sets the force flag, daemon SIGKILLs all children.
+    let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGINT);
+
+    // Wait for the daemon to actually exit (up to 10s — it needs time to
+    // reap children after SIGKILL).
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if nix::sys::signal::kill(nix_pid, None).is_err() {
+            return Ok(()); // Process is gone.
+        }
+    }
+
+    // Last resort — the daemon itself is stuck.
+    eprintln!("daemon did not exit after 10s, sending SIGKILL");
+    let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    Ok(())
 }
 
 fn validate(config_path: &std::path::Path) -> Result<(), String> {

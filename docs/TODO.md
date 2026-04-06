@@ -372,25 +372,118 @@ Wire all subcommands to the unix socket API.
 
 ---
 
-## Phase 12: Stale State Cleanup
+## Phase 11.5: Unified PTY Spawn (Correct Phase 6)
 
-Robust cleanup for crash recovery.
+Phase 6 forced services with `listen` addresses into pipe-mode spawning on
+the (incorrect) assumption that `pty-process` doesn't expose `pre_exec`. It
+actually does — `pty_process::Command::pre_exec` runs after the crate's
+internal `session_leader()` (setsid + TIOCSCTTY), which is the perfect slot
+for our fd-placement + LISTEN_PID setenv. Fixing this unblocks line-buffered
+stdout for network services (fixes the 4KB pipe-buffering problem that
+affects Python/C/C++/Java servers) and unifies the spawn path so every
+service runs on a real PTY. Must land before Phase 12, because Phase 12
+assumes a single uniform spawn path when it records process identity.
 
-- [ ] `process/cleanup.rs` — full cleanup implementation:
-  - Try-lock each file in `.don/pids/` — if lock succeeds, process is dead: read PGID, `killpg`, delete file
-  - Check `.don/don.sock` — try connect, remove if stale
-  - Check `.don/don.pid` — try lock, clean up if stale
-  - Docker container cleanup: for services with `docker.container`, check if container exists and is orphaned
-- [ ] Cleanup runs automatically on startup before starting services
-- [ ] `don cleanup` invokes the same logic standalone
+### Work
+- [x] Move the LISTEN_FDS fd placement + `LISTEN_PID` setenv into
+      `pty_process::Command::pre_exec` and keep the std `Command::pre_exec`
+      path for pipe-mode fallback.
+- [x] Remove the `config.listen_fds.is_empty()` guard in `process/mod.rs`
+      so services with `listen` also get PTY allocation.
+- [x] Delete the "pty-process doesn't expose pre_exec" comment and update
+      the docstring on `SpawnConfig`/`spawn()` to reflect the new uniform
+      behavior.
+- [x] Keep the `force_pipe` flag — still needed as a test/CI escape hatch
+      when PTY allocation itself fails.
+- [x] Extracted `set_listen_pid_env()` helper with allocation-free stack
+      buffer (avoids deadlock risk from malloc locks frozen post-fork).
+- [x] Verify PTY auto-fallback (PTY alloc fails → pipe) still works for
+      services with `listen`: the fd-placement code works on both paths.
 
 ### Test Coverage Checkpoint
-- [ ] Integration test: spawn a process, write its PGID to a pid file, kill the process externally (not via don), run cleanup, verify pid file is removed and process group is killed
-- [ ] Integration test: create a stale `.don/don.sock` (no listener), run startup, verify it's cleaned up
-- [ ] Integration test: create a stale pid file with a reused PID (process exists but isn't ours), verify flock correctly identifies it as not-stale (lock fails)
-- [ ] Integration test: create multiple stale pid files, run cleanup, verify all are cleaned up
-- [ ] Integration test: run `don cleanup` with no stale state — verify it exits cleanly with no errors
-- [ ] Integration test (requires docker): leave an orphaned container, run cleanup, verify it's stopped and removed
+- [x] Integration test: all existing socket tests pass in PTY mode (4/4).
+- [x] Integration test: child sees `isatty(1) == 1` when spawned with
+      `listen` (`integration_listen_service_gets_pty`).
+- [x] Integration test: line-buffering fix — Python service `print()`s
+      without `flush=True`, output appears within <1.5s rather than
+      waiting for 4KB (`integration_python_line_buffered_on_pty`).
+      Skips gracefully if `python3` not available.
+
+---
+
+## Phase 12: Stale State Cleanup
+
+Robust cleanup for crash recovery. When don crashes, the native service
+process groups it spawned are reparented to init and keep running. We need
+a breadcrumb on disk so the next don invocation can find and kill those
+orphans — and kill them *safely*, without hitting a recycled PGID.
+
+**Design: per-service pid files keyed on `(pgid, start_time)`.**
+
+The flock-on-`don.pid` approach from Phase 2 works for detecting "is don
+alive" but cannot detect PGID recycling on its own: a stale pid file
+written before don crashed may point to a PGID the kernel has since
+reassigned. The fix is to record `(pgid, start_time)` at spawn time —
+start_time comes from `/proc/<pgid>/stat` field 22 (btime) on Linux, or
+`libproc` / `KERN_PROC_PID` on macOS. At cleanup, re-read start_time and
+compare: if it matches, it's the same process we spawned and `killpg` is
+safe; if not, the entry is stale and we simply delete it.
+
+### Process Identity
+- [x] `process/identity.rs` — new module exposing:
+  - `ProcessIdentity { pgid: i32, start_time: u64 }`
+  - `capture(pgid) -> Result<Option<ProcessIdentity>>` — reads start_time,
+    returns `None` if the process no longer exists.
+  - `still_alive(ident) -> bool` — re-captures and compares.
+- [x] Linux impl: parse `/proc/<pgid>/stat` field 22. Handle the "comm"
+      field containing spaces/parens by splitting on the last `)`.
+- [x] macOS impl: `sysctl([CTL_KERN, KERN_PROC, KERN_PROC_PID, pgid])`
+      returns a `kinfo_proc` with `kp_proc.p_starttime`. Use `libc` directly.
+- [x] Table-driven unit tests for Linux stat parsing (commands with spaces,
+      parens, empty, truncated).
+
+### Per-Service Pid Files
+- [x] Write `.don/pids/<name>` at service spawn: PGID on line 1,
+      start_time on line 2. Falls back to PGID-only if capture fails.
+- [x] Unlink on normal service stop (both user-initiated and don shutdown)
+      via `ProcessHandle::Drop`.
+- [x] `read_pid_file_identity(path)` and `write_pgid_file(path, pgid)` —
+      serialization helpers, unit tested (including old-format compat).
+
+### Cleanup Routine
+- [x] `process/cleanup.rs` — `run_cleanup(base_dir, docker_containers)`:
+  - Scan `.don/pids/`: for each, read identity, `still_alive()`.
+    If alive: `killpg(pgid, SIGKILL)`. Always: delete the file.
+  - `.don/don.sock`: try `UnixStream::connect`;
+    if refused/absent, unlink.
+  - `.don/don.pid`: already handled by `PidFile::acquire` flock semantics.
+  - Docker: for each service with `docker.container`, inspect by name;
+    stop + force-remove if present (uses existing `cleanup_stale_container`).
+- [x] Runner calls `run_cleanup` at startup, after acquiring `don.pid`.
+- [x] `don cleanup` subcommand: loads config lightly (docker names),
+      calls `run_cleanup`, prints summary, exit 0.
+
+### Test Coverage Checkpoint
+- [x] Unit test: identity capture/compare — table-driven (same process,
+      reused PGID with different start_time, dead PGID, zero start_time).
+- [x] Unit test: stat parsing — normal, command with spaces, command with
+      closing paren, empty, truncated.
+- [x] Unit test: pid file read/write round-trip (old format + new format).
+- [x] Integration test: spawn a background process, write its identity to
+      a pid file, run cleanup → process killed, file gone.
+- [x] Integration test: write a pid file with a stale (pgid, start_time)
+      pointing at a reused PGID → cleanup deletes the file but does NOT
+      killpg (start_time mismatch).
+- [x] Integration test: create a stale `.don/don.sock` with no listener →
+      cleanup unlinks it.
+- [x] Integration test: live socket left alone by cleanup.
+- [x] Integration test: multiple stale pid files → all cleaned.
+- [x] Integration test: `don cleanup` standalone with no stale state →
+      exit 0, prints "no stale state".
+- [x] Integration test: normal service stop path unlinks its pid file
+      (covered by existing `pgid_file_cleaned_up_on_drop` test).
+- [x] Integration test (docker, gated): orphaned container left over from
+      previous config → cleanup stops and force-removes it.
 
 ---
 
