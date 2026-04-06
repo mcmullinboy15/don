@@ -348,7 +348,10 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
                 })
             })
             .collect(),
-        Err(_) => vec![],
+        Err(e) => {
+            eprintln!("Warning: could not load config for docker cleanup: {e}");
+            vec![]
+        }
     };
 
     let report = don::process::cleanup::run_cleanup(&base, &docker_names).await;

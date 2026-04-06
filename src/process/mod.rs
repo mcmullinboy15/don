@@ -432,10 +432,16 @@ pub async fn read_pid_file_identity(
                     path.display()
                 ))
             })?;
-            let start_time: u64 = lines
-                .next()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
+            let start_time: u64 = match lines.next() {
+                Some(s) => s.trim().parse().unwrap_or_else(|_| {
+                    eprintln!(
+                        "[don] warning: invalid start_time in '{}', treating as unknown",
+                        path.display()
+                    );
+                    0
+                }),
+                None => 0, // old format — no start_time line
+            };
             Ok(Some(ProcessIdentity { pgid, start_time }))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),

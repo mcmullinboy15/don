@@ -156,7 +156,14 @@ fn cleanup_socket(sock_path: &Path) -> bool {
 async fn cleanup_docker_containers(names: &[String], report: &mut CleanupReport) {
     let client = match bollard::Docker::connect_with_socket_defaults() {
         Ok(c) => c,
-        Err(_) => return, // Docker not available
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("permission") || msg.contains("EACCES") {
+                eprintln!("[don] warning: docker cleanup skipped — permission denied on docker socket");
+            }
+            // Otherwise Docker is just not installed/running — skip silently.
+            return;
+        }
     };
     for name in names {
         if let Ok(true) = crate::docker::cleanup_stale_container(&client, name).await {
