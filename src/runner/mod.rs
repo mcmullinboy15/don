@@ -416,6 +416,10 @@ pub struct Runner {
     /// Outlive service restarts — don holds the sockets so ports are never released.
     bound_sockets: HashMap<String, crate::process::socket::BoundSockets>,
 
+    /// PGIDs of running task processes. Tracked so we can kill them on shutdown.
+    /// Inserted when a task spawns, removed when it completes.
+    running_task_pgids: HashMap<String, i32>,
+
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 
@@ -557,6 +561,7 @@ impl Runner {
             task_states: task_item_states,
             service_handles: HashMap::new(),
             bound_sockets: HashMap::new(),
+            running_task_pgids: HashMap::new(),
             server_shutdown_tx: None,
             docker_client,
             cmd_tx,
@@ -1350,7 +1355,7 @@ impl Runner {
     /// - If `done_tx` is `Some`, sends `ItemDone` (initial startup path).
     /// - If `done_tx` is `None`, sends `TaskRerunComplete` (file-watch rerun path).
     fn wire_task_output_and_wait(
-        &self,
+        &mut self,
         name: &str,
         spawn: task::TaskSpawn,
         task_cfg: &crate::config::Task,
@@ -1360,6 +1365,10 @@ impl Runner {
             mut handle,
             child_output,
         } = spawn;
+
+        // Track the PGID so we can kill it during shutdown.
+        self.running_task_pgids
+            .insert(name.to_string(), handle.pgid());
 
         if let Some(svc_writer) = self.output_manager.service_writer(name) {
             tokio::spawn(async move {
@@ -1991,6 +2000,7 @@ impl Runner {
     }
 
     fn handle_task_done(&mut self, item: &ItemDone) {
+        self.running_task_pgids.remove(&item.name);
         let timing = item.elapsed.map(format_duration).unwrap_or_default();
 
         if item.success {
@@ -2074,6 +2084,7 @@ impl Runner {
         }
 
         let mut remaining: usize = by_depth.values().map(|v| v.len()).sum();
+        let mut force_announced = false;
 
         // Stop from highest depth to lowest (dependents first).
         for (_depth, names) in by_depth.into_iter().rev() {
@@ -2090,6 +2101,11 @@ impl Runner {
                     let resolved = svc.map(|s| s.resolve(self.platform));
                     let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
                     let force = SIGNAL_COUNT.load(Ordering::SeqCst) >= 2;
+                    if force && !force_announced {
+                        self.output_manager
+                            .lifecycle_event("forcing immediate shutdown");
+                        force_announced = true;
+                    }
                     let name_owned = name.clone();
                     join_set.spawn(async move {
                         let _ = stop_service(handle, shutdown_config.as_ref(), force).await;
@@ -2107,6 +2123,27 @@ impl Runner {
                     remaining -= 1;
                     self.output_manager
                         .lifecycle_event(&format!("{name} stopped ({remaining} remaining)"));
+                }
+            }
+        }
+
+        // Kill any still-running task process groups.
+        if !self.running_task_pgids.is_empty() {
+            self.output_manager.lifecycle_event(&format!(
+                "killing {} running task{}",
+                self.running_task_pgids.len(),
+                if self.running_task_pgids.len() == 1 { "" } else { "s" }
+            ));
+            for (name, pgid) in self.running_task_pgids.drain() {
+                if let Err(e) = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pgid),
+                    nix::sys::signal::Signal::SIGKILL,
+                ) {
+                    // ESRCH = already dead, which is fine.
+                    if e != nix::Error::ESRCH {
+                        self.output_manager
+                            .error_event(&format!("{name}: failed to kill task pgid {pgid}: {e}"));
+                    }
                 }
             }
         }
