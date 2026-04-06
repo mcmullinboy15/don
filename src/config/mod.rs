@@ -153,8 +153,9 @@ impl Config {
             }
             for dep in &resolved.depends_on {
                 if !all_names.contains(dep.as_str()) {
+                    let suggestion = suggest_typo(dep, &all_names);
                     errors.push(format!(
-                        "service '{name}': depends on unknown service or task '{dep}'"
+                        "service '{name}': depends on unknown service or task '{dep}'{suggestion}"
                     ));
                 }
             }
@@ -231,8 +232,9 @@ impl Config {
         for (name, task) in &self.tasks {
             for dep in &task.depends_on {
                 if !all_names.contains(dep.as_str()) {
+                    let suggestion = suggest_typo(dep, &all_names);
                     errors.push(format!(
-                        "task '{name}': depends on unknown service or task '{dep}'"
+                        "task '{name}': depends on unknown service or task '{dep}'{suggestion}"
                     ));
                 }
             }
@@ -423,6 +425,48 @@ pub enum ConfigError {
     /// The config is syntactically valid but contains semantic errors.
     #[error("config validation failed:\n{}", errors.join("\n"))]
     Validation { errors: Vec<String> },
+}
+
+/// Levenshtein edit distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let n = b.len();
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0; n + 1];
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j] + cost)
+                .min(prev[j + 1] + 1)
+                .min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Suggest a typo correction for `input` from `candidates`.
+/// Returns ` — did you mean '<best>'?` or empty string if no close match.
+fn suggest_typo(input: &str, candidates: &std::collections::HashSet<&str>) -> String {
+    let max_distance = match input.len() {
+        0..=2 => 1,
+        3..=5 => 2,
+        _ => 3,
+    };
+    let mut best: Option<(&str, usize)> = None;
+    for &candidate in candidates {
+        let d = levenshtein(input, candidate);
+        if d <= max_distance
+            && d > 0
+            && best.is_none_or(|(_, bd)| d < bd)
+        {
+            best = Some((candidate, d));
+        }
+    }
+    match best {
+        Some((name, _)) => format!(" — did you mean '{name}'?"),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]

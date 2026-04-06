@@ -620,6 +620,9 @@ impl Runner {
     /// 3. Processes commands from the mpsc channel.
     /// 4. Handles shutdown signals.
     pub async fn run(mut self) -> Result<(), RunnerError> {
+        // Warn if .don/ is not in .gitignore.
+        check_gitignore(&self.base_dir, &self.output_manager);
+
         self.output_manager.lifecycle_event("loading don.toml");
 
         let svc_count = self.config.services.len();
@@ -632,6 +635,23 @@ impl Runner {
             task_count,
             if task_count == 1 { "" } else { "s" },
         ));
+
+        // Pre-bind all declared listen ports before starting any services.
+        // This catches port conflicts (port already in use, duplicate ports
+        // across services) upfront rather than failing mid-startup.
+        let listen_services: Vec<(String, crate::config::ResolvedService)> = self
+            .config
+            .services
+            .iter()
+            .filter(|(name, _)| self.service_states.contains_key(*name))
+            .map(|(name, svc)| (name.clone(), svc.resolve(self.platform)))
+            .filter(|(_, resolved)| !resolved.listen.is_empty())
+            .collect();
+        for (name, resolved) in &listen_services {
+            if let Err(msg) = self.bind_sockets_if_needed(name, resolved) {
+                return Err(RunnerError::Config(msg));
+            }
+        }
 
         // Bind the unix socket API synchronously so bind errors surface
         // visibly at startup. Only spawn the accept loop if bind succeeds.
@@ -1286,7 +1306,7 @@ impl Runner {
             self.task_states
                 .insert(name.to_string(), TaskItemState::Skipped);
             self.output_manager
-                .lifecycle_event(&format!("running {name}... (skipped, no changes)"));
+                .lifecycle_event(&format!("{name}: skipped (no changes)"));
             let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
                 name: name.to_string(),
                 state: TaskItemState::Skipped,
@@ -2201,6 +2221,28 @@ impl Runner {
             });
         }
         statuses
+    }
+}
+
+/// Check if `.don/` is in `.gitignore`. Warns if not — the `.don/` directory
+/// contains PID files, sockets, and cached artifacts that shouldn't be committed.
+fn check_gitignore(base_dir: &std::path::Path, output: &OutputManager) {
+    let gitignore_path = base_dir.join(".gitignore");
+    match std::fs::read_to_string(&gitignore_path) {
+        Ok(content) => {
+            let has_don = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed == ".don" || trimmed == ".don/" || trimmed == "/.don" || trimmed == "/.don/"
+            });
+            if !has_don {
+                output.error_event(
+                    ".don/ is not in .gitignore — add it to avoid committing PID files, sockets, and cached artifacts"
+                );
+            }
+        }
+        Err(_) => {
+            // No .gitignore or not a git repo — skip silently.
+        }
     }
 }
 

@@ -403,7 +403,7 @@ fn integration_task_watch_skip() {
 
         let output = read_buf(&buf);
         assert!(
-            output.contains("skipped, no changes"),
+            output.contains("skipped (no changes)"),
             "task should be skipped when files unchanged: {output}"
         );
     });
