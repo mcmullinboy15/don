@@ -74,7 +74,8 @@ src/
   main.rs                   # CLI binary — thin wrapper around the library
   duration.rs               # human-readable duration string parsing ("200ms", "1s", "5m")
   config/
-    mod.rs                  # Config struct, parsing, validation, FromStr
+    mod.rs                  # Config struct, parsing, validation, FromStr, Levenshtein typo suggestions
+    diff.rs                 # config diffing for live reload (added/removed/changed detection)
     service.rs              # Service, ServiceOverride, ResolvedService, presets
     task.rs                 # Task config
     profile.rs              # Profile config
@@ -82,22 +83,33 @@ src/
     download.rs             # DownloadConfig, PlatformDownload, cache paths
     types.rs                # Shared types: Command, ReadyCheck, ShutdownConfig, LogConfig
   runner/
-    mod.rs                  # orchestrator — dependency graph, startup/shutdown sequencing
+    mod.rs                  # orchestrator — dependency graph, startup/shutdown, config reload, profiles
     service.rs              # service lifecycle: spawn, restart, stop
     task.rs                 # task execution, timeout, skip-if-unchanged
   process/
-    mod.rs                  # process group management, PTY spawning
-    pid_file.rs             # PID file locking (flock-based)
-    cleanup.rs              # stale state detection and cleanup
+    mod.rs                  # process group management, PTY spawning, identity tracking
+    pid_file.rs             # PID file locking (flock-based) for single-instance guard
+    identity.rs             # (pgid, start_time) capture for crash-recovery identity checks
+    cleanup.rs              # stale state detection and cleanup (pid files, sockets, docker)
+    env.rs                  # .env file parsing, env merging
+    socket.rs               # LISTEN_FDS socket binding and fd passing
   watch/
-    mod.rs                  # file watching, debounce, change-during-build state machine
+    mod.rs                  # file watching, debounce, change-during-build state machine, config reload
   output/
-    mod.rs                  # line buffering, service name prefixing, color assignment
+    mod.rs                  # line buffering, service name prefixing, color assignment, sink management
     ring_buffer.rs          # bounded per-service output buffer
-    log_router.rs           # stdout / file / ignore routing
+    sanitize.rs             # ANSI escape sequence filtering (strip cursor/screen, keep colors)
+  client/
+    mod.rs                  # HTTP-over-unix-socket client for CLI ↔ daemon communication
   server/
     mod.rs                  # unix socket HTTP API (axum over hyper-util)
-    routes.rs               # API endpoints: status, restart, stop, logs
+    routes.rs               # API endpoints: status, start, stop, restart, logs (incl. follow)
+  docker/
+    mod.rs                  # Docker service lifecycle via bollard API
+    build.rs                # Docker image building (tar context, streamed output)
+    parse.rs                # Port mapping, env merging for docker
+    stream.rs               # DockerLogReader: AsyncRead adapter over bollard log stream
+  download.rs               # artifact downloading, SHA-256 verification, archive extraction, caching
   task_state.rs             # task file hash tracking for skip detection
 ```
 
@@ -131,12 +143,17 @@ Modules communicate via **tokio channels**, not shared mutable state:
 **No `Arc<Mutex<_>>` for shared state.** The runner owns all service state in a plain `HashMap<String, ServiceState>`. Status queries go through the command channel. This avoids deadlocks and contention.
 
 ```rust
-// Example command enum (created in Phase 4, but the pattern is established now)
+// The actual command enum (see runner/mod.rs for the full definition)
 enum RunnerCommand {
-    Start { name: String },
-    Stop { name: String },
-    Restart { name: String },
-    Status { reply: oneshot::Sender<Vec<ServiceStatus>> },
+    Start { name: String, reply: oneshot::Sender<CommandResult> },
+    Stop { name: String, reply: oneshot::Sender<CommandResult> },
+    Restart { name: String, reply: oneshot::Sender<CommandResult> },
+    Rebuild { name: String },           // file watch triggered
+    TaskRerun { name: String },         // file watch triggered
+    Status { reply: oneshot::Sender<Vec<ItemStatus>> },
+    Logs { name: String, last_n: usize, reply: oneshot::Sender<Option<String>> },
+    ConfigReload,                       // don.toml changed
+    StartPending,                       // deferred retry for unsatisfied deps
     Shutdown,
 }
 ```
