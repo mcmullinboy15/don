@@ -9,6 +9,7 @@
 //! ring buffer and fans out to the service's current sinks. The ring buffer persists
 //! across restarts, and [`ServiceWriter`] is cloneable for reuse.
 
+pub(crate) mod osc;
 pub mod ring_buffer;
 pub(crate) mod sanitize;
 
@@ -18,7 +19,7 @@ use ring_buffer::RingBuffer;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
@@ -46,6 +47,34 @@ const COLORS: &[Color] = &[
     Color::DarkBlue,
     Color::DarkRed,
 ];
+
+/// Handle to an active OSC response sink. Use [`take_pty_write`] to
+/// stop the sink and reclaim the PTY handle (e.g., for attach).
+pub struct OscSinkHandle {
+    /// Our copy of the sender — dropping it + removing the service's
+    /// copy from the sinks list closes the channel, stopping the task.
+    tx: mpsc::Sender<SinkLine>,
+    join: JoinHandle<pty_process::OwnedWritePty>,
+    service_state: Arc<Mutex<ServiceOutputState>>,
+}
+
+impl OscSinkHandle {
+    /// Stop the OSC sink and reclaim the PTY write handle.
+    /// Removes the sink from the service's sinks list, closes the channel,
+    /// and waits for the task to return the handle.
+    pub async fn take_pty_write(self) -> Option<pty_process::OwnedWritePty> {
+        // Remove our sender from the service's sinks list.
+        {
+            let mut state = self.service_state.lock().await;
+            state
+                .sinks
+                .retain(|s| !s.tx.same_channel(&self.tx));
+        }
+        // Drop our sender to close the channel.
+        drop(self.tx);
+        self.join.await.ok()
+    }
+}
 
 /// A message to a sink. Sinks receive these and write them to their destination.
 pub struct SinkLine {
@@ -89,35 +118,32 @@ pub struct ServiceWriter {
 }
 
 impl ServiceWriter {
-    /// Process an async readable stream (from a child process) line by line.
+    /// Process an async readable stream (from a child process) as raw chunks.
     ///
-    /// Reads raw bytes, splits on `\n`, pushes each line to the ring buffer,
-    /// and fans out to all current sinks. No UTF-8 assumption — binary output
-    /// is handled correctly. Runs until EOF (the child closes its output).
-    pub async fn process_stream<R: AsyncRead + Unpin>(&self, reader: R) -> Result<(), OutputError> {
-        let mut buf_reader = BufReader::new(reader);
-        let mut line_buf = Vec::new();
+    /// Reads raw byte chunks and broadcasts them to all sinks. Each sink
+    /// decides its own buffering strategy (the stdout sink accumulates
+    /// per-service until `\n`, the ring buffer splits on `\n`, attach/follow
+    /// sinks forward immediately, the OSC sink detects terminal queries and
+    /// writes responses). No UTF-8 assumption — binary output is handled
+    /// correctly. Runs until EOF (the child closes its output).
+    pub async fn process_stream<R: AsyncRead + Unpin>(
+        &self,
+        mut reader: R,
+    ) -> Result<(), OutputError> {
+        let mut buf = [0u8; 8192];
 
         loop {
-            line_buf.clear();
-            match read_until_newline(&mut buf_reader, &mut line_buf).await {
+            match read_chunk(&mut reader, &mut buf).await {
                 Ok(0) => break, // EOF
-                Ok(_) => {
-                    // Strip trailing \n and \r.
-                    if line_buf.last() == Some(&b'\n') {
-                        line_buf.pop();
-                    }
-                    if line_buf.last() == Some(&b'\r') {
-                        line_buf.pop();
-                    }
-                    let line = Bytes::copy_from_slice(&line_buf);
+                Ok(n) => {
+                    let chunk = Bytes::copy_from_slice(&buf[..n]);
 
                     // Lock: push to ring buffer + snapshot sinks. Released before sends.
                     // Prune closed sinks (e.g. disconnected follow clients) inline.
                     let (prefix, sinks) = {
                         let mut state = self.state.lock().await;
                         state.sinks.retain(|s| !s.tx.is_closed());
-                        state.ring_buffer.push(line.clone());
+                        state.ring_buffer.push_chunk(&chunk);
                         (state.prefix.clone(), state.sinks.clone())
                     };
 
@@ -125,7 +151,7 @@ impl ServiceWriter {
                     for sink in &sinks {
                         let msg = SinkLine {
                             prefix: prefix.clone(),
-                            line: line.clone(),
+                            line: chunk.clone(),
                         };
                         if sink.drop_on_full {
                             // Non-blocking: if the client can't keep up, drop
@@ -148,6 +174,12 @@ impl ServiceWriter {
             }
         }
 
+        // Flush any partial line remaining in the ring buffer.
+        {
+            let mut state = self.state.lock().await;
+            state.ring_buffer.flush_pending();
+        }
+
         Ok(())
     }
 
@@ -165,20 +197,21 @@ impl ServiceWriter {
     /// Write a single line to the ring buffer and sinks.
     ///
     /// Used for structured output like Docker build progress that arrives
-    /// as individual text lines rather than a byte stream.
+    /// as individual text lines rather than a byte stream. Appends `\n` to
+    /// the data so sinks can flush immediately.
     pub async fn write_line(&self, line: &str) {
-        let line = Bytes::from(line.to_string());
+        let data = Bytes::from(format!("{line}\n"));
         let (prefix, sinks) = {
             let mut state = self.state.lock().await;
             state.sinks.retain(|s| !s.tx.is_closed());
-            state.ring_buffer.push(line.clone());
+            state.ring_buffer.push_chunk(data.as_ref());
             (state.prefix.clone(), state.sinks.clone())
         };
         let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
         for sink in &sinks {
             let msg = SinkLine {
                 prefix: prefix.clone(),
-                line: line.clone(),
+                line: data.clone(),
             };
             if sink.drop_on_full {
                 if sink.tx.try_send(msg).is_err() {
@@ -391,6 +424,35 @@ impl OutputManager {
         Some(rx)
     }
 
+    /// Add an OSC response sink to a service. The sink scans each chunk for
+    /// terminal queries (OSC 10/11, cursor position) and writes responses
+    /// directly to the PTY write handle.
+    ///
+    /// The sink uses `drop_on_full = true` so it never blocks the output
+    /// pipeline. Returns a [`OscSinkHandle`] that can be used to reclaim
+    /// the PTY write handle (e.g., for attach).
+    pub async fn add_osc_sink(
+        &self,
+        name: &str,
+        pty_write: pty_process::OwnedWritePty,
+    ) -> Option<OscSinkHandle> {
+        let state_arc = self.services.get(name)?.clone();
+        let (tx, rx) = mpsc::channel::<SinkLine>(16);
+        {
+            let mut state = state_arc.lock().await;
+            state.sinks.push(SinkHandle {
+                tx: tx.clone(),
+                drop_on_full: true,
+            });
+        }
+        let join = tokio::spawn(osc_sink_task(rx, pty_write));
+        Some(OscSinkHandle {
+            tx,
+            join,
+            service_state: state_arc,
+        })
+    }
+
     /// Read the last N lines from a service's ring buffer, joined by newlines.
     ///
     /// Returns `None` if the service is not registered.
@@ -398,7 +460,16 @@ impl OutputManager {
         let state_arc = self.services.get(name)?;
         let state = state_arc.lock().await;
         let parts: Vec<&[u8]> = state.ring_buffer.last_n(n).collect();
-        Some(Bytes::from(parts.join(b"\n" as &[u8])))
+        // Entries include `\n` delimiters — concatenate directly.
+        let mut result: Vec<u8> = Vec::new();
+        for part in &parts {
+            result.extend_from_slice(part);
+        }
+        // Strip trailing `\n` for clean output.
+        if result.last() == Some(&b'\n') {
+            result.pop();
+        }
+        Some(Bytes::from(result))
     }
 
     /// Register a new service that wasn't in the original config (added via
@@ -456,7 +527,7 @@ impl OutputManager {
     pub fn lifecycle_event(&self, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
-            line: Bytes::from(message.to_string()),
+            line: Bytes::from(format!("{message}\n")),
         });
     }
 
@@ -471,7 +542,7 @@ impl OutputManager {
     pub fn service_event(&self, service: &str, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
-            line: Bytes::from(format!("{service}: {message}")),
+            line: Bytes::from(format!("{service}: {message}\n")),
         });
     }
 
@@ -479,7 +550,7 @@ impl OutputManager {
     pub fn error_event(&self, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
-            line: Bytes::from(message.to_string()),
+            line: Bytes::from(format!("{message}\n")),
         });
     }
 
@@ -487,7 +558,7 @@ impl OutputManager {
     pub fn service_error_event(&self, service: &str, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
-            line: Bytes::from(format!("{service}: {message}")),
+            line: Bytes::from(format!("{service}: {message}\n")),
         });
     }
 
@@ -563,49 +634,118 @@ impl LifecycleEmitter {
     pub fn lifecycle_event(&self, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
-            line: Bytes::from(message.to_string()),
+            line: Bytes::from(format!("{message}\n")),
         });
     }
 }
 
-/// Stdout sink writer task. Receives lines and writes them to the provided writer.
+/// Stdout sink writer task. Receives raw byte chunks and accumulates
+/// per-service until `\n` or overflow, then writes the formatted line.
+///
+/// Each service's partial output is buffered independently so that
+/// interleaved chunks from different services don't produce garbled output.
 /// Runs until all senders are dropped.
 async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut rx: mpsc::Receiver<SinkLine>,
     mut writer: W,
     verbose: bool,
 ) {
-    use tokio::io::AsyncWriteExt;
+    use bytes::BytesMut;
+
     let start = std::time::Instant::now();
+    /// Maximum bytes to accumulate per-service before forcing a flush.
+    const MAX_LINE: usize = 16 * 1024;
+
+    // Per-service line accumulator, keyed by prefix bytes.
+    let mut accumulators: HashMap<Bytes, BytesMut> = HashMap::new();
+
     while let Some(msg) = rx.recv().await {
-        // Sanitize service output before writing to the shared terminal.
-        // Strip dangerous escape sequences (cursor movement, screen clear,
-        // alternate screen) while preserving colors/styles (SGR).
-        // Lifecycle events (from [don]) are trusted and not sanitized.
-        let safe_line = if msg.prefix.is_empty() {
-            msg.line.to_vec()
-        } else {
-            sanitize::sanitize_terminal_output(&msg.line)
-        };
-        if verbose {
-            let elapsed = start.elapsed();
-            let ts = format!("{:.3}s ", elapsed.as_secs_f64());
-            let _ = writer.write_all(ts.as_bytes()).await;
+        let acc = accumulators.entry(msg.prefix.clone()).or_default();
+
+        for &byte in msg.line.iter() {
+            acc.extend_from_slice(&[byte]);
+            if byte == b'\n' {
+                // Complete line — strip \r\n, sanitize, write prefixed output.
+                acc.truncate(acc.len() - 1); // remove \n
+                if acc.last() == Some(&b'\r') {
+                    acc.truncate(acc.len() - 1); // remove \r
+                }
+                let sanitized = if msg.prefix.is_empty() {
+                    acc.to_vec()
+                } else {
+                    sanitize::sanitize_terminal_output(acc)
+                };
+                write_prefixed_line(&mut writer, &msg.prefix, &sanitized, verbose, start).await;
+                acc.clear();
+            } else if acc.len() >= MAX_LINE {
+                // Overflow — flush without stripping.
+                let sanitized = if msg.prefix.is_empty() {
+                    acc.to_vec()
+                } else {
+                    sanitize::sanitize_terminal_output(acc)
+                };
+                write_prefixed_line(&mut writer, &msg.prefix, &sanitized, verbose, start).await;
+                acc.clear();
+            }
         }
-        let _ = writer.write_all(&msg.prefix).await;
-        let _ = writer.write_all(&safe_line).await;
-        let _ = writer.write_all(b"\n").await;
+    }
+
+    // Flush remaining accumulators on shutdown.
+    for (prefix, acc) in &accumulators {
+        if !acc.is_empty() {
+            let sanitized = if prefix.is_empty() {
+                acc.to_vec()
+            } else {
+                sanitize::sanitize_terminal_output(acc)
+            };
+            write_prefixed_line(&mut writer, prefix, &sanitized, verbose, start).await;
+        }
     }
 }
 
-/// File sink writer task. Receives lines and writes raw output (no prefix) to a file.
+/// Write a single prefixed, sanitized line to the writer.
+async fn write_prefixed_line<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    prefix: &[u8],
+    line: &[u8],
+    verbose: bool,
+    start: std::time::Instant,
+) {
+    use tokio::io::AsyncWriteExt;
+    if verbose {
+        let elapsed = start.elapsed();
+        let ts = format!("{:.3}s ", elapsed.as_secs_f64());
+        let _ = writer.write_all(ts.as_bytes()).await;
+    }
+    let _ = writer.write_all(prefix).await;
+    let _ = writer.write_all(line).await;
+    let _ = writer.write_all(b"\n").await;
+}
+
+/// File sink writer task. Receives raw byte chunks and writes them directly.
 /// Runs until all senders are dropped.
 async fn file_sink_task(mut rx: mpsc::Receiver<SinkLine>, mut file: tokio::fs::File) {
     use tokio::io::AsyncWriteExt;
     while let Some(msg) = rx.recv().await {
         let _ = file.write_all(&msg.line).await;
-        let _ = file.write_all(b"\n").await;
     }
+}
+
+/// OSC response sink task. Scans each chunk for terminal queries and
+/// writes responses directly to the PTY write handle. Returns the PTY
+/// write handle when the channel closes (process exit or sink removal)
+/// so it can be reclaimed by the caller.
+async fn osc_sink_task(
+    mut rx: mpsc::Receiver<SinkLine>,
+    mut pty_write: pty_process::OwnedWritePty,
+) -> pty_process::OwnedWritePty {
+    use tokio::io::AsyncWriteExt;
+    while let Some(msg) = rx.recv().await {
+        for response in osc::find_responses(&msg.line) {
+            let _ = pty_write.write_all(response).await;
+        }
+    }
+    pty_write
 }
 
 /// Open a log file for appending, creating parent directories as needed.
@@ -632,15 +772,15 @@ async fn open_log_file(path: &std::path::Path) -> Result<tokio::fs::File, Output
         })
 }
 
-/// Read bytes until `\n` or EOF, appending to `buf`.
+/// Read a chunk of bytes from the reader.
 ///
 /// Returns the number of bytes read (0 = EOF).
 /// For PTY reads, an `EIO` error signals the child exited — treated as EOF.
-async fn read_until_newline<R: AsyncRead + Unpin>(
-    reader: &mut BufReader<R>,
-    buf: &mut Vec<u8>,
+async fn read_chunk<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
 ) -> Result<usize, OutputError> {
-    match reader.read_until(b'\n', buf).await {
+    match reader.read(buf).await {
         Ok(n) => Ok(n),
         Err(e) if e.raw_os_error() == Some(libc::EIO) => Ok(0),
         Err(e) => Err(OutputError::Read(e)),

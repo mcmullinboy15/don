@@ -120,40 +120,56 @@ async fn bridge(
     let mut ws_tx: futures_util::stream::SplitSink<WebSocket, Message> = ws_tx;
     let mut ws_rx: futures_util::stream::SplitStream<WebSocket> = ws_rx;
 
-    // Task: PTY output → WebSocket (as binary frames with \r\n appended).
+    // Channel for OSC responses detected in the output stream. The output
+    // task sends response bytes here; the PTY task writes them to the PTY.
+    let (osc_tx, mut osc_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+
+    // Task: PTY output → WebSocket (as binary frames, raw bytes).
     let output_to_ws = async move {
         while let Some(sink_line) = output_rx.recv().await {
-            let mut data = sink_line.line.to_vec();
-            data.extend_from_slice(b"\r\n");
-            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+            // Detect OSC queries and send responses to the PTY task.
+            for response in crate::output::osc::find_responses(&sink_line.line) {
+                let _ = osc_tx.try_send(bytes::Bytes::from_static(response));
+            }
+            if ws_tx
+                .send(Message::Binary(sink_line.line.to_vec().into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     };
 
-    // Task: WebSocket → PTY stdin (binary) + control messages (text).
+    // Task: WebSocket → PTY stdin (binary) + control messages (text)
+    //       + OSC responses from the output task.
     let ws_to_pty = async move {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Binary(data) => {
-                    if pty_write.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-                Message::Text(text) => {
-                    if let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&text) {
-                        match ctrl {
-                            ControlMessage::Resize { cols, rows } => {
-                                let _ = pty_write.resize(pty_process::Size::new(rows, cols));
-                            }
-                            ControlMessage::Init { .. } => {
-                                // Ignore duplicate init messages.
+        loop {
+            tokio::select! {
+                msg = ws_rx.next() => {
+                    match msg {
+                        Some(Ok(Message::Binary(data))) => {
+                            if pty_write.write_all(&data).await.is_err() {
+                                break;
                             }
                         }
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&text) {
+                                match ctrl {
+                                    ControlMessage::Resize { cols, rows } => {
+                                        let _ = pty_write.resize(pty_process::Size::new(rows, cols));
+                                    }
+                                    ControlMessage::Init { .. } => {}
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        _ => {}
                     }
                 }
-                Message::Close(_) => break,
-                _ => {}
+                Some(data) = osc_rx.recv() => {
+                    let _ = pty_write.write_all(&data).await;
+                }
             }
         }
         // Return the pty_write so it can be given back to the runner.

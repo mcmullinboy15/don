@@ -208,10 +208,9 @@ struct AttachWaiter {
     reply: oneshot::Sender<Result<AttachSession, CommandError>>,
 }
 
-/// Tracks a running task's process group and PTY write handle.
+/// Tracks a running task's process group.
 struct RunningTask {
     pgid: i32,
-    pty_write: Option<pty_process::OwnedWritePty>,
 }
 
 /// Status of a single item (service or task) for status queries.
@@ -446,6 +445,10 @@ pub struct Runner {
     task_states: HashMap<String, TaskItemState>,
     service_handles: HashMap<String, ServiceHandle>,
 
+    /// OSC sink handles for services/tasks. Used to reclaim the PTY write
+    /// handle when attach is requested.
+    osc_sinks: HashMap<String, crate::output::OscSinkHandle>,
+
     /// Tracks which PID holds the interactive attach lock for each service/task.
     attach_locks: HashMap<String, u32>,
 
@@ -622,6 +625,7 @@ impl Runner {
             service_states,
             task_states: task_item_states,
             service_handles: HashMap::new(),
+            osc_sinks: HashMap::new(),
             attach_locks: HashMap::new(),
             attach_waiters: HashMap::new(),
             bound_sockets: HashMap::new(),
@@ -1202,7 +1206,7 @@ impl Runner {
                     start_result,
                     resolved,
                     done_tx,
-                );
+                ).await;
                 // Fulfill any pending attach waiter now that the handle is stored.
                 self.fulfill_pending_waiter(name).await;
                 Ok(())
@@ -1261,7 +1265,7 @@ impl Runner {
     /// and spawns the ready check (if configured). On ready check completion:
     /// - If `done_tx` is `Some`, sends `ItemDone` (initial startup path).
     /// - If `done_tx` is `None`, sends `RebuildComplete` (file-watch rebuild path).
-    fn wire_service_output_and_ready_check(
+    async fn wire_service_output_and_ready_check(
         &mut self,
         name: &str,
         start_result: service::StartResult,
@@ -1272,6 +1276,14 @@ impl Runner {
             .insert(name.to_string(), ServiceState::Running);
         self.service_handles
             .insert(name.to_string(), start_result.handle);
+
+        // Add OSC response sink if we have a PTY write handle.
+        if let Some(ServiceHandle::Process(process)) = self.service_handles.get_mut(name)
+            && let Some(pty) = process.take_pty_write()
+            && let Some(handle) = self.output_manager.add_osc_sink(name, pty).await
+        {
+            self.osc_sinks.insert(name.to_string(), handle);
+        }
 
         // Wire up output processing. The exit_tx fires when the
         // stream hits EOF (process died), used to cancel the ready check.
@@ -1468,10 +1480,17 @@ impl Runner {
         } = spawn;
 
         let pgid = handle.pgid();
-        let pty_write = handle.take_pty_write();
+
+        // Add OSC response sink if we have a PTY write handle.
+        if let Some(pty) = handle.take_pty_write()
+            && let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await
+        {
+            self.osc_sinks.insert(name.to_string(), osc_handle);
+        }
+
         self.running_tasks.insert(
             name.to_string(),
-            RunningTask { pgid, pty_write },
+            RunningTask { pgid },
         );
 
         // Fulfill any pending attach waiter for this task.
@@ -2109,18 +2128,10 @@ impl Runner {
     /// Fulfill an attach request for a running process. Assumes the caller
     /// has already validated the name exists and checked the attach lock.
     async fn fulfill_attach(&mut self, name: &str, pid: u32) -> Result<AttachSession, CommandError> {
-        let is_service = self.config.services.contains_key(name);
-
-        // Take the PTY write half from the service or task handle.
-        let pty_write = if is_service {
-            match self.service_handles.get_mut(name) {
-                Some(ServiceHandle::Process(process)) => process.take_pty_write(),
-                _ => None,
-            }
-        } else {
-            self.running_tasks
-                .get_mut(name)
-                .and_then(|t| t.pty_write.take())
+        // Reclaim the PTY write handle by stopping the OSC sink.
+        let pty_write = match self.osc_sinks.remove(name) {
+            Some(osc_handle) => osc_handle.take_pty_write().await,
+            None => None,
         };
         let pty_write = pty_write.ok_or_else(|| CommandError::InvalidState {
             name: name.to_string(),
@@ -2172,10 +2183,9 @@ impl Runner {
         if self.attach_locks.contains_key(name)
             && let Some(pty) = pty_write
         {
-            if let Some(ServiceHandle::Process(process)) = self.service_handles.get_mut(name) {
-                process.set_pty_write(pty);
-            } else if let Some(task) = self.running_tasks.get_mut(name) {
-                task.pty_write = Some(pty);
+            // Restart the OSC response sink with the returned handle.
+            if let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await {
+                self.osc_sinks.insert(name.to_string(), osc_handle);
             }
         }
 
