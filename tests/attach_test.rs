@@ -4,15 +4,14 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use futures_util::{SinkExt, StreamExt};
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::path::Path;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
@@ -75,73 +74,138 @@ async fn spawn_runner(
     (socket_path, shutdown_tx, handle)
 }
 
-/// Connect a WebSocket client to the daemon over the Unix socket.
-/// Sends the init message and returns the WebSocket stream.
-async fn ws_connect(
+/// Connect to the daemon using the raw HTTP upgrade protocol.
+/// Returns the stream ready for raw I/O, plus any leftover bytes from the header read.
+async fn raw_attach(
     socket_path: &Path,
     name: &str,
     pid: u32,
-) -> tokio_tungstenite::WebSocketStream<UnixStream> {
-    let stream = UnixStream::connect(socket_path).await.unwrap();
-    let url = format!("ws://localhost/attach/{name}");
-    let req = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(&url)
-        .header("Host", "localhost")
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header(
-            "Sec-WebSocket-Key",
-            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-        )
-        .header("Sec-WebSocket-Version", "13")
-        .body(())
-        .unwrap();
+) -> (UnixStream, Vec<u8>) {
+    let mut stream = UnixStream::connect(socket_path).await.unwrap();
+    let req = format!(
+        "GET /attach/{name}?pid={pid}&cols=80&rows=24 HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: don-attach\r\n\
+         \r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
 
-    let (mut ws, _resp) = tokio_tungstenite::client_async(req, stream)
-        .await
-        .unwrap();
-
-    // Send init message with PID.
-    let init = serde_json::json!({"type": "init", "pid": pid});
-    ws.send(Message::Text(init.to_string().into()))
-        .await
-        .unwrap();
-    ws
-}
-
-/// Read the next text or binary message, skipping pings/pongs. Returns None on close/timeout.
-async fn next_msg(
-    ws: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
-    timeout: Duration,
-) -> Option<Message> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    // Read response headers.
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 1024];
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg @ (Message::Text(_) | Message::Binary(_))))) => return Some(msg),
-            Ok(Some(Ok(Message::Ping(_)))) => continue,
-            Ok(Some(Ok(Message::Pong(_)))) => continue,
-            _ => return None,
+        let n = stream.read(&mut scratch).await.unwrap();
+        assert!(n > 0, "connection closed before headers");
+        buf.extend_from_slice(&scratch[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
         }
     }
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = std::str::from_utf8(&buf[..header_end]).unwrap();
+    let status_line = head.split("\r\n").next().unwrap();
+    let leftover = buf[header_end + 4..].to_vec();
+
+    // Verify 101.
+    assert!(
+        status_line.contains("101"),
+        "expected 101 Switching Protocols, got: {status_line}"
+    );
+    (stream, leftover)
 }
 
-/// Collect binary frames until timeout, returning concatenated bytes.
-async fn collect_binary(
-    ws: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
-    timeout: Duration,
-) -> Vec<u8> {
+/// Connect and expect a non-101 error response. Returns (status, body_text).
+async fn raw_attach_error(
+    socket_path: &Path,
+    name: &str,
+    pid: u32,
+) -> (u16, String) {
+    let mut stream = UnixStream::connect(socket_path).await.unwrap();
+    let req = format!(
+        "GET /attach/{name}?pid={pid}&cols=80&rows=24 HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\
+         Upgrade: don-attach\r\n\
+         \r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+
+    // Read headers.
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut scratch).await.unwrap();
+        assert!(n > 0, "connection closed before headers");
+        buf.extend_from_slice(&scratch[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = std::str::from_utf8(&buf[..header_end]).unwrap();
+    let status_line = head.split("\r\n").next().unwrap();
+    let status: u16 = status_line
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // Parse content-length from headers.
+    let content_length: usize = head
+        .split("\r\n")
+        .find(|h| h.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|h| h.split_once(':').map(|(_, v)| v.trim()))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    // Read body.
+    let mut body_bytes = buf[header_end + 4..].to_vec();
+    while body_bytes.len() < content_length {
+        let n = stream.read(&mut scratch).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        body_bytes.extend_from_slice(&scratch[..n]);
+    }
+    body_bytes.truncate(content_length);
+    let body = String::from_utf8_lossy(&body_bytes).to_string();
+    (status, body)
+}
+
+/// Collect bytes from the stream until timeout.
+async fn collect_bytes(stream: &mut UnixStream, timeout: Duration) -> Vec<u8> {
     let mut all = Vec::new();
+    let mut buf = [0u8; 4096];
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(Message::Binary(data)))) => all.extend_from_slice(&data),
-            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+        match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => all.extend_from_slice(&buf[..n]),
             _ => break,
         }
     }
     all
+}
+
+/// Send a resize via separate HTTP POST.
+async fn send_resize(socket_path: &Path, name: &str, cols: u16, rows: u16) {
+    let mut stream = UnixStream::connect(socket_path).await.unwrap();
+    let body = format!("{{\"cols\":{cols},\"rows\":{rows}}}");
+    let req = format!(
+        "POST /attach/{name}/resize HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 256];
+    let _ = stream.read(&mut buf).await;
 }
 
 // --- Integration tests ---
@@ -150,7 +214,6 @@ async fn collect_binary(
 fn integration_attach_send_input_and_receive_output() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("attach-io");
-        // Use `cat` as the service — it echoes stdin to stdout.
         let toml = ConfigBuilder::new()
             .add_custom_service("echoer", "cat", &[])
             .log("ignore")
@@ -162,26 +225,23 @@ fn integration_attach_send_input_and_receive_output() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let mut ws = ws_connect(&socket, "echoer", 12345).await;
+        let (mut stream, _leftover) = raw_attach(&socket, "echoer", 12345).await;
 
-        // Drain any ring buffer replay lines (brief pause).
+        // Drain any initial output (brief pause).
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Send some input.
-        ws.send(Message::Binary(b"hello\n".to_vec().into()))
-            .await
-            .unwrap();
+        stream.write_all(b"hello\n").await.unwrap();
 
         // Wait for the echo back.
-        let output = collect_binary(&mut ws, Duration::from_secs(2)).await;
+        let output = collect_bytes(&mut stream, Duration::from_secs(2)).await;
         let text = String::from_utf8_lossy(&output);
         assert!(
             text.contains("hello"),
             "expected echoed input in output; got: {text:?}"
         );
 
-        // Close the WebSocket.
-        let _ = ws.close(None).await;
+        drop(stream);
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let _ = shutdown_tx.send(()).await;
@@ -204,28 +264,23 @@ fn integration_second_attach_rejected_with_pid() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // First attach should succeed.
-        let _ws1 = ws_connect(&socket, "keeper", 11111).await;
+        // First attach should succeed (101).
+        let (_stream1, _) = raw_attach(&socket, "keeper", 11111).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Second attach should be rejected.
-        let mut ws2 = ws_connect(&socket, "keeper", 22222).await;
-        let msg = next_msg(&mut ws2, Duration::from_secs(2)).await;
-        let text = match msg {
-            Some(Message::Text(t)) => t.to_string(),
-            other => panic!("expected text error message, got: {other:?}"),
-        };
+        // Second attach should be rejected (409 Conflict).
+        let (status, body) = raw_attach_error(&socket, "keeper", 22222).await;
+        assert_eq!(status, 409, "expected 409 Conflict, got {status}");
         assert!(
-            text.contains("11111"),
-            "error should mention first PID; got: {text}"
+            body.contains("11111"),
+            "error should mention first PID; got: {body}"
         );
         assert!(
-            text.contains("attached"),
-            "error should mention 'attached'; got: {text}"
+            body.contains("attached"),
+            "error should mention 'attached'; got: {body}"
         );
 
-        let _ = ws2.close(None).await;
-        // ws1 is still connected — don't close it yet.
+        drop(_stream1);
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
     });
@@ -247,36 +302,18 @@ fn integration_second_attach_succeeds_after_first_disconnects() {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // First attach.
-        let mut ws1 = ws_connect(&socket, "keeper", 11111).await;
+        let (stream1, _) = raw_attach(&socket, "keeper", 11111).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Disconnect first.
-        let _ = ws1.close(None).await;
-        drop(ws1);
-        // Give the server time to process the disconnect and release the lock.
+        drop(stream1);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // Second attach should succeed (no error message).
-        let mut ws2 = ws_connect(&socket, "keeper", 22222).await;
-        // If we get a binary frame (output) or timeout, it's a success.
-        // If we get an error text frame, it's a failure.
-        let msg = next_msg(&mut ws2, Duration::from_secs(1)).await;
-        match msg {
-            Some(Message::Text(t)) => {
-                let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
-                assert_ne!(
-                    v.get("type").and_then(|t| t.as_str()),
-                    Some("error"),
-                    "second attach should not get error: {t}"
-                );
-            }
-            Some(Message::Binary(_)) | None => {
-                // Binary frame (output) or timeout = success (connected, no error).
-            }
-            other => panic!("unexpected message: {other:?}"),
-        }
+        // Second attach should succeed (101).
+        let (_stream2, _) = raw_attach(&socket, "keeper", 22222).await;
+        // If we got here, the upgrade succeeded.
 
-        let _ = ws2.close(None).await;
+        drop(_stream2);
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
     });
@@ -298,23 +335,17 @@ fn integration_service_keeps_running_after_detach() {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Attach and then disconnect.
-        let mut ws = ws_connect(&socket, "keeper", 12345).await;
+        let (stream, _) = raw_attach(&socket, "keeper", 12345).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = ws.close(None).await;
-        drop(ws);
+        drop(stream);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Check that the service is still running via the status endpoint.
-        let stream = UnixStream::connect(&socket).await.unwrap();
-        let mut stream = stream;
+        let mut status_stream = UnixStream::connect(&socket).await.unwrap();
         let req = "GET /status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes())
-            .await
-            .unwrap();
+        status_stream.write_all(req.as_bytes()).await.unwrap();
         let mut response = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
-            .await
-            .unwrap();
+        status_stream.read_to_end(&mut response).await.unwrap();
         let body = String::from_utf8_lossy(&response);
         assert!(
             body.contains("\"state\":\"running\"") || body.contains("\"state\":\"ready\""),
@@ -341,18 +372,13 @@ fn integration_attach_to_nonexistent_service_returns_error() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let mut ws = ws_connect(&socket, "ghost", 12345).await;
-        let msg = next_msg(&mut ws, Duration::from_secs(2)).await;
-        let text = match msg {
-            Some(Message::Text(t)) => t.to_string(),
-            other => panic!("expected text error, got: {other:?}"),
-        };
+        let (status, body) = raw_attach_error(&socket, "ghost", 12345).await;
+        assert_eq!(status, 404, "expected 404, got {status}");
         assert!(
-            text.contains("ghost"),
-            "error should mention service name; got: {text}"
+            body.contains("ghost"),
+            "error should mention service name; got: {body}"
         );
 
-        let _ = ws.close(None).await;
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
     });
@@ -362,8 +388,6 @@ fn integration_attach_to_nonexistent_service_returns_error() {
 fn integration_resize_propagates_to_subprocess_pty() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("attach-resize");
-        // The script traps SIGWINCH (sent by the kernel when the PTY is
-        // resized) and prints the new terminal size via `stty size`.
         let toml = ConfigBuilder::new()
             .add_custom_service(
                 "resizer",
@@ -379,28 +403,23 @@ fn integration_resize_propagates_to_subprocess_pty() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let mut ws = ws_connect(&socket, "resizer", 12345).await;
-        // Drain any initial output from the ring buffer replay.
+        let (mut stream, _) = raw_attach(&socket, "resizer", 12345).await;
+        // Drain any initial output.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let _ = collect_binary(&mut ws, Duration::from_millis(100)).await;
+        let _ = collect_bytes(&mut stream, Duration::from_millis(100)).await;
 
-        // Send a resize control message: 42 rows × 133 cols.
-        let resize = serde_json::json!({"type": "resize", "cols": 133, "rows": 42});
-        ws.send(Message::Text(resize.to_string().into()))
-            .await
-            .unwrap();
+        // Send resize via separate HTTP POST: 42 rows × 133 cols.
+        send_resize(&socket, "resizer", 133, 42).await;
 
         // Wait for the SIGWINCH handler to fire and `stty size` to output.
-        let output = collect_binary(&mut ws, Duration::from_secs(3)).await;
+        let output = collect_bytes(&mut stream, Duration::from_secs(3)).await;
         let text = String::from_utf8_lossy(&output);
-
-        // `stty size` prints "ROWS COLS\n", so we expect "42 133".
         assert!(
             text.contains("42 133"),
             "expected '42 133' in output after resize; got: {text:?}"
         );
 
-        let _ = ws.close(None).await;
+        drop(stream);
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
     });

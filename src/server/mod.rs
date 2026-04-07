@@ -35,10 +35,16 @@ pub enum ServerError {
     Accept(#[source] std::io::Error),
 }
 
+/// Map of active attach resize channels: service name → sender.
+type ResizeMap = std::collections::HashMap<String, mpsc::Sender<(u16, u16)>>;
+
 /// Shared state passed to all handlers.
 #[derive(Clone)]
 pub(crate) struct ApiState {
     pub cmd_tx: mpsc::Sender<RunnerCommand>,
+    /// Resize channels for active attach sessions. The attach bridge task
+    /// registers its receiver here; the resize HTTP handler sends through it.
+    pub attach_resize_txs: std::sync::Arc<tokio::sync::Mutex<ResizeMap>>,
 }
 
 /// Bind the unix socket at `socket_path` and chmod it to 0o600 so only the
@@ -86,7 +92,12 @@ pub async fn serve_api(
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);
-    let state = Arc::new(ApiState { cmd_tx });
+    let state = Arc::new(ApiState {
+        cmd_tx,
+        attach_resize_txs: std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+    });
     let app = routes::build_router(state);
     accept_loop(listener, app, shutdown).await
 }

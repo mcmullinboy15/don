@@ -7,7 +7,7 @@ license = "MIT"
 
 
 [dependencies]
-axum = { version = "0.8", features = ["ws"] }
+axum = "0.8"
 bollard = "0.20"
 bytes = "1"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -35,7 +35,6 @@ xz2 = "0.1"
 zip = "2"
 zstd = "0.13"
 tokio-stream = "0.1"
-tokio-tungstenite = "0.26"
 toml = "0.8"
 
 [dev-dependencies]

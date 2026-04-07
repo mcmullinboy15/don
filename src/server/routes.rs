@@ -19,7 +19,8 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/stop/{name}", post(post_stop))
         .route("/restart/{name}", post(post_restart))
         .route("/logs/{name}", get(get_logs))
-        .route("/attach/{name}", get(super::attach::ws_attach))
+        .route("/attach/{name}", get(super::attach::attach_handler))
+        .route("/attach/{name}/resize", post(super::attach::resize_handler))
         .with_state(state)
 }
 

@@ -2407,7 +2407,6 @@ impl Runner {
         }
 
         let mut remaining: usize = by_depth.values().map(|v| v.len()).sum();
-        let mut force_announced = false;
 
         // Stop from highest depth to lowest (dependents first).
         for (_depth, names) in by_depth.into_iter().rev() {
@@ -2416,19 +2415,19 @@ impl Runner {
                     .lifecycle_event(&format!("stopping {name}... ({remaining} remaining)"));
             }
 
-            // Collect handles and configs for this depth level.
+            // Track PGIDs of services being stopped so we can SIGKILL
+            // them if a second Ctrl+C arrives during graceful shutdown.
+            let mut stopping_pgids: HashMap<String, i32> = HashMap::new();
             let mut join_set: JoinSet<String> = JoinSet::new();
             for name in &names {
                 if let Some(handle) = self.service_handles.remove(name) {
+                    if let ServiceHandle::Process(ref proc) = handle {
+                        stopping_pgids.insert(name.clone(), proc.pgid());
+                    }
                     let svc = self.config.services.get(name);
                     let resolved = svc.map(|s| s.resolve(self.platform));
                     let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
                     let force = SIGNAL_COUNT.load(Ordering::SeqCst) >= 2;
-                    if force && !force_announced {
-                        self.output_manager
-                            .lifecycle_event("forcing immediate shutdown");
-                        force_announced = true;
-                    }
                     let name_owned = name.clone();
                     join_set.spawn(async move {
                         let _ = stop_service(handle, shutdown_config.as_ref(), force).await;
@@ -2437,16 +2436,53 @@ impl Runner {
                 }
             }
 
-            // Stop all services at this depth concurrently, emitting
-            // "stopped" for each one as it finishes.
-            while let Some(result) = join_set.join_next().await {
-                if let Ok(name) = result {
-                    self.service_states
-                        .insert(name.clone(), ServiceState::Stopped);
-                    remaining -= 1;
+            // Wait for graceful stops, but if a second Ctrl+C arrives,
+            // SIGKILL all processes being stopped and abort the futures.
+            loop {
+                if SIGNAL_COUNT.load(Ordering::SeqCst) >= 2 && !join_set.is_empty() {
                     self.output_manager
-                        .lifecycle_event(&format!("{name} stopped ({remaining} remaining)"));
+                        .lifecycle_event("forcing immediate shutdown");
+                    // SIGKILL all processes that are still being stopped.
+                    for (name, pgid) in &stopping_pgids {
+                        let _ = nix::sys::signal::killpg(
+                            nix::unistd::Pid::from_raw(*pgid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        self.service_states
+                            .insert(name.clone(), ServiceState::Stopped);
+                    }
+                    join_set.abort_all();
+                    while join_set.join_next().await.is_some() {}
+                    remaining = 0;
+                    break;
                 }
+
+                // Poll for the next completed stop, with a short sleep so
+                // we can re-check the force flag promptly.
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    join_set.join_next(),
+                )
+                .await
+                {
+                    Ok(Some(Ok(name))) => {
+                        stopping_pgids.remove(&name);
+                        self.service_states
+                            .insert(name.clone(), ServiceState::Stopped);
+                        remaining -= 1;
+                        self.output_manager
+                            .lifecycle_event(&format!("{name} stopped ({remaining} remaining)"));
+                    }
+                    Ok(Some(Err(_))) => {
+                        remaining = remaining.saturating_sub(1);
+                    }
+                    Ok(None) => break, // All tasks done.
+                    Err(_) => continue, // Timeout — re-check force flag.
+                }
+            }
+
+            if remaining == 0 {
+                break;
             }
         }
 

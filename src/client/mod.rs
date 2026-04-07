@@ -221,7 +221,7 @@ fn ensure_ok(status: u16, body: &[u8]) -> Result<(), ClientError> {
     }
 }
 
-fn classify_error(status: u16, body: &[u8]) -> ClientError {
+pub(crate) fn classify_error(status: u16, body: &[u8]) -> ClientError {
     let message = extract_error_message(body)
         .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
     match status {
@@ -240,7 +240,7 @@ fn extract_error_message(body: &[u8]) -> Option<String> {
     Some(parsed.error)
 }
 
-async fn write_request(
+pub(crate) async fn write_request(
     stream: &mut UnixStream,
     method: &str,
     path: &str,
@@ -259,7 +259,7 @@ async fn write_request(
 
 /// Read the status line and headers from a fresh response. Returns the
 /// status code, header pairs, and any leftover bytes that belong to the body.
-async fn read_head(
+pub(crate) async fn read_head(
     stream: &mut UnixStream,
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), ClientError> {
     let mut buf = Vec::<u8>::new();
@@ -313,7 +313,7 @@ fn parse_status(line: &str) -> Result<u16, ClientError> {
 /// Read the entire response body. Supports Content-Length, chunked, or
 /// read-until-close (our server sets `Connection: close` on non-stream
 /// responses).
-async fn drain_body(
+pub(crate) async fn drain_body(
     stream: &mut UnixStream,
     headers: &[(String, String)],
     mut leftover: Vec<u8>,

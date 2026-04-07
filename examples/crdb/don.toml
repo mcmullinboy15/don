@@ -16,11 +16,11 @@ run.cmd = "cockroach"
 run.args = [
     "start-single-node",
     "--insecure",
-    "--listen-addr=127.0.0.1:26257",
-    "--http-addr=127.0.0.1:8081",
+    "--listen-addr=127.0.0.1:26277",
+    "--http-addr=127.0.0.1:8091",
     "--store=.don/crdb-data",
 ]
-ready.tcp = "127.0.0.1:26257"
+ready.tcp = "127.0.0.1:26277"
 ready.interval = "200ms"
 ready.retries = 50
 
@@ -33,7 +33,7 @@ ready.retries = 50
 cmd = "scurry"
 args = [
     "push",
-    "--db-url=postgres://root@127.0.0.1:26257/defaultdb?sslmode=disable",
+    "--db-url=postgres://root@127.0.0.1:26277/defaultdb?sslmode=disable",
     "--definitions=./definitions",
     "-v"
 ]
@@ -51,7 +51,7 @@ depends_on = ["migrate"]
 ignore = ["target/**"]
 
 [services.app.env]
-DATABASE_URL = "postgres://root@127.0.0.1:26257/defaultdb?sslmode=disable"
+DATABASE_URL = "postgres://root@127.0.0.1:26277/defaultdb?sslmode=disable"
 
 
 
