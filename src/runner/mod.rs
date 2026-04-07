@@ -201,6 +201,19 @@ pub struct AttachSession {
     pub output_rx: mpsc::Receiver<crate::output::SinkLine>,
 }
 
+/// A pending attach waiter — registered when a client wants to attach
+/// to a service/task that isn't running yet.
+struct AttachWaiter {
+    pid: u32,
+    reply: oneshot::Sender<Result<AttachSession, CommandError>>,
+}
+
+/// Tracks a running task's process group and PTY write handle.
+struct RunningTask {
+    pgid: i32,
+    pty_write: Option<pty_process::OwnedWritePty>,
+}
+
 /// Status of a single item (service or task) for status queries.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -433,16 +446,21 @@ pub struct Runner {
     task_states: HashMap<String, TaskItemState>,
     service_handles: HashMap<String, ServiceHandle>,
 
-    /// Tracks which PID holds the interactive attach lock for each service.
+    /// Tracks which PID holds the interactive attach lock for each service/task.
     attach_locks: HashMap<String, u32>,
+
+    /// Pending attach waiters — clients waiting for a process to start.
+    /// When a service/task spawns, the runner checks this map and fulfills
+    /// the attach request immediately.
+    attach_waiters: HashMap<String, AttachWaiter>,
 
     /// Bound TCP sockets for services with `listen` addresses.
     /// Outlive service restarts — don holds the sockets so ports are never released.
     bound_sockets: HashMap<String, crate::process::socket::BoundSockets>,
 
-    /// PGIDs of running task processes. Tracked so we can kill them on shutdown.
-    /// Inserted when a task spawns, removed when it completes.
-    running_task_pgids: HashMap<String, i32>,
+    /// Running task state. Tracks the PGID (for shutdown kills) and
+    /// optionally holds the PTY write half (for interactive attach).
+    running_tasks: HashMap<String, RunningTask>,
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -605,8 +623,9 @@ impl Runner {
             task_states: task_item_states,
             service_handles: HashMap::new(),
             attach_locks: HashMap::new(),
+            attach_waiters: HashMap::new(),
             bound_sockets: HashMap::new(),
-            running_task_pgids: HashMap::new(),
+            running_tasks: HashMap::new(),
             server_shutdown_tx: None,
             docker_client,
             cmd_tx,
@@ -845,8 +864,7 @@ impl Runner {
                             let _ = reply.send(result);
                         }
                         RunnerCommand::Attach { name, pid, reply } => {
-                            let result = self.handle_attach_cmd(&name, pid).await;
-                            let _ = reply.send(result);
+                            self.handle_attach_cmd(&name, pid, reply).await;
                         }
                         RunnerCommand::Detach { name, pty_write } => {
                             self.handle_detach(&name, pty_write).await;
@@ -1185,6 +1203,8 @@ impl Runner {
                     resolved,
                     done_tx,
                 );
+                // Fulfill any pending attach waiter now that the handle is stored.
+                self.fulfill_pending_waiter(name).await;
                 Ok(())
             }
             Err(e) => {
@@ -1407,7 +1427,7 @@ impl Runner {
         // Spawn the task process.
         match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
             Ok(spawn) => {
-                self.wire_task_output_and_wait(name, spawn, &task_cfg, Some(done_tx));
+                self.wire_task_output_and_wait(name, spawn, &task_cfg, Some(done_tx)).await;
                 Ok(())
             }
             Err(e) => {
@@ -1435,7 +1455,7 @@ impl Runner {
     /// records success in task state, and sends completion events.
     /// - If `done_tx` is `Some`, sends `ItemDone` (initial startup path).
     /// - If `done_tx` is `None`, sends `TaskRerunComplete` (file-watch rerun path).
-    fn wire_task_output_and_wait(
+    async fn wire_task_output_and_wait(
         &mut self,
         name: &str,
         spawn: task::TaskSpawn,
@@ -1447,9 +1467,15 @@ impl Runner {
             child_output,
         } = spawn;
 
-        // Track the PGID so we can kill it during shutdown.
-        self.running_task_pgids
-            .insert(name.to_string(), handle.pgid());
+        let pgid = handle.pgid();
+        let pty_write = handle.take_pty_write();
+        self.running_tasks.insert(
+            name.to_string(),
+            RunningTask { pgid, pty_write },
+        );
+
+        // Fulfill any pending attach waiter for this task.
+        self.fulfill_pending_waiter(name).await;
 
         if let Some(svc_writer) = self.output_manager.service_writer(name) {
             tokio::spawn(async move {
@@ -2017,33 +2043,88 @@ impl Runner {
         self.handle_start_cmd(name).await
     }
 
-    /// Handle an interactive attach request.
-    async fn handle_attach_cmd(&mut self, name: &str, pid: u32) -> Result<AttachSession, CommandError> {
-        // Validate: must be a known, running service (not a task).
-        let _ = self.lookup_service(name)?;
-        if !self.service_handles.contains_key(name) {
-            return Err(CommandError::InvalidState {
+    /// Handle an interactive attach request (services or tasks).
+    ///
+    /// If the process is running, attaches immediately. If not running
+    /// (e.g. task between runs), registers a waiter that will be fulfilled
+    /// when the process next spawns.
+    async fn handle_attach_cmd(
+        &mut self,
+        name: &str,
+        pid: u32,
+        reply: oneshot::Sender<Result<AttachSession, CommandError>>,
+    ) {
+        // Must be a known service or task.
+        let is_service = self.config.services.contains_key(name);
+        let is_task = self.config.tasks.contains_key(name);
+        if !is_service && !is_task {
+            let _ = reply.send(Err(CommandError::UnknownService {
                 name: name.to_string(),
-                message: "not running".to_string(),
-            });
+            }));
+            return;
         }
 
         // Check attach lock.
         if let Some(&existing_pid) = self.attach_locks.get(name) {
-            return Err(CommandError::InvalidState {
+            let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: format!("process {existing_pid} is currently attached to '{name}'"),
-            });
+            }));
+            return;
         }
 
-        // Take the PTY write half from the service handle.
-        let pty_write = match self.service_handles.get_mut(name) {
-            Some(ServiceHandle::Process(process)) => process.take_pty_write(),
-            _ => None,
+        // Check for a pending waiter (another client already waiting).
+        if self.attach_waiters.contains_key(name) {
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "another client is already waiting to attach".to_string(),
+            }));
+            return;
+        }
+
+        // Check if the process is running.
+        let is_running = if is_service {
+            self.service_handles.contains_key(name)
+        } else {
+            self.running_tasks.contains_key(name)
+        };
+
+        if !is_running {
+            // Not running — register a waiter. The reply will be sent when
+            // the process next spawns.
+            self.output_manager
+                .lifecycle_event(&format!("{name}: waiting for process to start (attach pending)"));
+            self.attach_waiters.insert(
+                name.to_string(),
+                AttachWaiter { pid, reply },
+            );
+            return;
+        }
+
+        // Running — attach immediately.
+        let result = self.fulfill_attach(name, pid).await;
+        let _ = reply.send(result);
+    }
+
+    /// Fulfill an attach request for a running process. Assumes the caller
+    /// has already validated the name exists and checked the attach lock.
+    async fn fulfill_attach(&mut self, name: &str, pid: u32) -> Result<AttachSession, CommandError> {
+        let is_service = self.config.services.contains_key(name);
+
+        // Take the PTY write half from the service or task handle.
+        let pty_write = if is_service {
+            match self.service_handles.get_mut(name) {
+                Some(ServiceHandle::Process(process)) => process.take_pty_write(),
+                _ => None,
+            }
+        } else {
+            self.running_tasks
+                .get_mut(name)
+                .and_then(|t| t.pty_write.take())
         };
         let pty_write = pty_write.ok_or_else(|| CommandError::InvalidState {
             name: name.to_string(),
-            message: "service has no PTY (spawned in pipe mode)".to_string(),
+            message: "no PTY available (spawned in pipe mode)".to_string(),
         })?;
 
         // Set up follow sink for live output (256 lines of headroom).
@@ -2069,16 +2150,33 @@ impl Runner {
     }
 
     /// Release an attach session.
+    /// Check for a pending attach waiter and fulfill it if the process
+    /// is now running.
+    async fn fulfill_pending_waiter(&mut self, name: &str) {
+        if let Some(waiter) = self.attach_waiters.remove(name) {
+            // Check the waiter's reply channel is still alive (client may
+            // have disconnected while waiting).
+            if waiter.reply.is_closed() {
+                return;
+            }
+            let result = self.fulfill_attach(name, waiter.pid).await;
+            let _ = waiter.reply.send(result);
+        }
+    }
+
     async fn handle_detach(&mut self, name: &str, pty_write: Option<pty_process::OwnedWritePty>) {
-        // Only return the PTY write handle if the attach lock is still held
-        // for this service. If the service was stopped/restarted while we
-        // were attached, the lock was already cleared and the current process
-        // has a fresh PTY — setting the stale one would corrupt it.
+        // Only return the PTY write handle if the attach lock is still held.
+        // If the service/task was stopped/restarted while we were attached,
+        // the lock was already cleared and the current process has a fresh
+        // PTY — setting the stale one would corrupt it.
         if self.attach_locks.contains_key(name)
             && let Some(pty) = pty_write
-            && let Some(ServiceHandle::Process(process)) = self.service_handles.get_mut(name)
         {
-            process.set_pty_write(pty);
+            if let Some(ServiceHandle::Process(process)) = self.service_handles.get_mut(name) {
+                process.set_pty_write(pty);
+            } else if let Some(task) = self.running_tasks.get_mut(name) {
+                task.pty_write = Some(pty);
+            }
         }
 
         // Release lock.
@@ -2129,6 +2227,15 @@ impl Runner {
             return;
         }
 
+        // Release attach lock and close follow sinks so any active attach
+        // session exits cleanly before the new process starts.
+        if self.attach_locks.remove(name).is_some() {
+            self.output_manager.resume_stdout_sink(name).await;
+        }
+        if let Some(writer) = self.output_manager.service_writer(name) {
+            writer.close_follow_sinks().await;
+        }
+
         self.output_manager
             .lifecycle_event(&format!("{name}: re-running (file changed)"));
         self.task_states
@@ -2140,7 +2247,7 @@ impl Runner {
             Ok(spawn) => {
                 self.output_manager
                     .debug_event(&format!("{name}: process spawned (pid {}))", spawn.handle.pgid()));
-                self.wire_task_output_and_wait(name, spawn, &task_cfg, None);
+                self.wire_task_output_and_wait(name, spawn, &task_cfg, None).await;
             }
             Err(e) => {
                 self.task_states
@@ -2200,7 +2307,13 @@ impl Runner {
     }
 
     fn handle_task_done(&mut self, item: &ItemDone) {
-        self.running_task_pgids.remove(&item.name);
+        if self.running_tasks.remove(&item.name).is_some() {
+            // Release attach lock if held.
+            if self.attach_locks.remove(&item.name).is_some() {
+                // Can't await here (sync fn), but the stdout sink resume
+                // will happen naturally when the follow sink closes.
+            }
+        }
         let timing = item.elapsed.map(format_duration).unwrap_or_default();
 
         if item.success {
@@ -2328,21 +2441,21 @@ impl Runner {
         }
 
         // Kill any still-running task process groups.
-        if !self.running_task_pgids.is_empty() {
+        if !self.running_tasks.is_empty() {
             self.output_manager.lifecycle_event(&format!(
                 "killing {} running task{}",
-                self.running_task_pgids.len(),
-                if self.running_task_pgids.len() == 1 { "" } else { "s" }
+                self.running_tasks.len(),
+                if self.running_tasks.len() == 1 { "" } else { "s" }
             ));
-            for (name, pgid) in self.running_task_pgids.drain() {
+            for (name, task) in self.running_tasks.drain() {
                 if let Err(e) = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pgid),
+                    nix::unistd::Pid::from_raw(task.pgid),
                     nix::sys::signal::Signal::SIGKILL,
                 ) {
                     // ESRCH = already dead, which is fine.
                     if e != nix::Error::ESRCH {
                         self.output_manager
-                            .error_event(&format!("{name}: failed to kill task pgid {pgid}: {e}"));
+                            .error_event(&format!("{name}: failed to kill task pgid {}: {e}", task.pgid));
                     }
                 }
             }
@@ -2356,8 +2469,9 @@ impl Runner {
         // All handles should already be stopped by initiate_shutdown.
         // Drop remaining handles to release PID files.
         self.service_handles.clear();
-        // Release attach locks (WebSocket handlers will see PTY write fail).
+        // Release attach locks and drop pending waiters.
         self.attach_locks.clear();
+        self.attach_waiters.clear();
         // Release bound sockets (closes listening ports).
         self.bound_sockets.clear();
     }

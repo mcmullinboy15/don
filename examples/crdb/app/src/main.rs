@@ -25,13 +25,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let rows = client
-            .query("SELECT email, name FROM users ORDER BY created_at", &[])
+            .query(
+                "SELECT email, name, updated_at::TEXT FROM users ORDER BY created_at",
+                &[],
+            )
             .await?;
         println!("── {} users ──", rows.len());
         for row in &rows {
             let email: &str = row.get(0);
             let name: &str = row.get(1);
-            println!("  {name} <{email}>");
+            let updated_at: &str = row.get(2);
+            println!("   {name} <{email}> (updated at: {updated_at})");
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }

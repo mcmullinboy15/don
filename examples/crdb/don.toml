@@ -35,7 +35,6 @@ args = [
     "push",
     "--db-url=postgres://root@127.0.0.1:26257/defaultdb?sslmode=disable",
     "--definitions=./definitions",
-    "--force",
     "-v"
 ]
 depends_on = ["crdb"]

@@ -73,7 +73,7 @@ pub(crate) async fn spawn_task(
         dir: Some(work_dir),
         env,
         pgid_file_path: None,
-        force_pipe: true,
+        force_pipe: false,
         listen_fds: vec![],
     })
     .await?;

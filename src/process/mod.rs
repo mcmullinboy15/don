@@ -236,7 +236,10 @@ pub async fn spawn_process(
                 };
                 Ok((handle, output))
             }
-            Err(_pty_err) => spawn_pipe_handle(&config).await,
+            Err(_pty_err) => {
+                eprintln!("[don] warning: PTY allocation failed for '{}', falling back to pipes", config.cmd);
+                spawn_pipe_handle(&config).await
+            }
         }
     } else {
         spawn_pipe_handle(&config).await
