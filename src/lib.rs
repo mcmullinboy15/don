@@ -5,6 +5,7 @@ pub mod download;
 pub mod duration;
 pub mod output;
 pub mod process;
+pub(crate) mod proxy;
 pub mod runner;
 pub mod server;
 pub mod task_state;

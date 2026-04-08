@@ -2,6 +2,8 @@
 #
 # This example demonstrates:
 #   - Downloading CockroachDB and scurry (pjtatlow/scurry) on startup
+#   - Lazy-starting CockroachDB via a TCP proxy — it won't start until
+#     something connects to 127.0.0.1:26277 (e.g. the migrate task)
 #   - A `scurry push` task that watches schema definitions and re-applies on change
 #   - A Rust service that queries the database, dependent on the migration task
 #
@@ -10,17 +12,24 @@
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CockroachDB — single-node insecure cluster for local dev
+#
+# Don proxies 127.0.0.1:26277 to CockroachDB on a random port. The service
+# is lazy — it won't start until the first connection arrives (e.g. when
+# the migrate task tries to connect). The random port is injected via
+# ${CRDB_PORT} in the CLI args.
 # ──────────────────────────────────────────────────────────────────────────────
 [services.crdb]
 run.cmd = "cockroach"
 run.args = [
     "start-single-node",
     "--insecure",
-    "--listen-addr=127.0.0.1:26277",
+    "--listen-addr=127.0.0.1:${CRDB_PORT}",
     "--http-addr=127.0.0.1:8091",
     "--store=.don/crdb-data",
 ]
-ready.tcp = "127.0.0.1:26277"
+proxy = { listen = "127.0.0.1:26277", env = "CRDB_PORT" }
+lazy = true
+ready.tcp = "127.0.0.1:${CRDB_PORT}"
 ready.interval = "200ms"
 ready.retries = 50
 

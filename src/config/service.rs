@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use super::download::{DownloadConfig, default_cache_base};
 use super::platform::Platform;
-use super::types::{Command, LogConfig, ReadyCheck, ShutdownConfig};
+use super::types::{
+    Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig, deserialize_proxy,
+    deserialize_proxy_option,
+};
 
 /// A long-running service. Uses exactly one preset: docker, rust, or custom (run).
 #[derive(Debug, PartialEq, Deserialize)]
@@ -30,8 +33,17 @@ pub struct Service {
     pub depends_on: Vec<String>,
     /// Addresses for don to listen on and pass to the service via LISTEN_FDS.
     /// Don holds the sockets open across restarts so traffic is never dropped.
+    /// Mutually exclusive with `proxy`.
     #[serde(default)]
     pub listen: Vec<String>,
+    /// Proxy entries: Don listens on these addresses and forwards TCP connections
+    /// to the service on random ephemeral ports. Mutually exclusive with `listen`.
+    #[serde(default, deserialize_with = "deserialize_proxy")]
+    pub proxy: Vec<ProxyEntry>,
+    /// If true, don't start the service until the first connection arrives on a
+    /// proxy address. Requires `proxy` to be set.
+    #[serde(default)]
+    pub lazy: bool,
     /// Optional binary download configuration for this service.
     pub download: Option<DownloadConfig>,
     /// Ready check — used to gate dependents until this service is accepting traffic.
@@ -76,6 +88,9 @@ pub struct ServiceOverride {
     pub debounce: Option<String>,
     pub depends_on: Option<Vec<String>>,
     pub listen: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_proxy_option")]
+    pub proxy: Option<Vec<ProxyEntry>>,
+    pub lazy: Option<bool>,
     pub download: Option<DownloadConfig>,
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
@@ -99,6 +114,8 @@ pub struct ResolvedService {
     pub debounce: Option<String>,
     pub depends_on: Vec<String>,
     pub listen: Vec<String>,
+    pub proxy: Vec<ProxyEntry>,
+    pub lazy: bool,
     pub download: Option<DownloadConfig>,
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
@@ -248,6 +265,8 @@ impl Service {
                 debounce: self.debounce.clone(),
                 depends_on: self.depends_on.clone(),
                 listen: self.listen.clone(),
+                proxy: self.proxy.clone(),
+                lazy: self.lazy,
                 download: self.download.clone(),
                 ready: self.ready.clone(),
                 shutdown: self.shutdown.clone(),
@@ -297,6 +316,8 @@ impl Service {
                         .clone()
                         .unwrap_or_else(|| self.depends_on.clone()),
                     listen: ov.listen.clone().unwrap_or_else(|| self.listen.clone()),
+                    proxy: ov.proxy.clone().unwrap_or_else(|| self.proxy.clone()),
+                    lazy: ov.lazy.unwrap_or(self.lazy),
                     download: ov.download.clone().or_else(|| self.download.clone()),
                     ready: ov.ready.clone().or_else(|| self.ready.clone()),
                     shutdown: ov.shutdown.clone().or_else(|| self.shutdown.clone()),

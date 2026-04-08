@@ -18,7 +18,7 @@ pub use self::service::{
     DockerBuildConfig, DockerConfig, Preset, ResolvedService, RustConfig, Service,
 };
 pub use self::task::Task;
-pub use self::types::{Command, LogConfig, ReadyCheck, ShutdownConfig};
+pub use self::types::{Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig};
 
 pub use self::service::ServiceOverride;
 
@@ -224,6 +224,56 @@ impl Config {
                          (available: {}) — will use run.cmd from PATH",
                         available.join(", ")
                     ));
+                }
+            }
+        }
+
+        // Validate proxy and lazy across all services.
+        let mut proxy_addrs: HashMap<&str, &str> = HashMap::new(); // addr -> service name
+        for (name, svc) in &self.services {
+            let resolved = svc.resolve(platform);
+            // proxy and listen are mutually exclusive.
+            if !resolved.proxy.is_empty() && !resolved.listen.is_empty() {
+                errors.push(format!(
+                    "service '{name}': 'proxy' and 'listen' are mutually exclusive"
+                ));
+            }
+            // lazy requires proxy.
+            if resolved.lazy && resolved.proxy.is_empty() {
+                errors.push(format!(
+                    "service '{name}': 'lazy = true' requires 'proxy' to be set"
+                ));
+            }
+            // Validate proxy listen addresses and check for duplicates.
+            for entry in &resolved.proxy {
+                if entry.listen.parse::<std::net::SocketAddr>().is_err() {
+                    errors.push(format!(
+                        "service '{name}': invalid proxy listen address '{}' \
+                         — expected host:port (e.g. \"127.0.0.1:3000\")",
+                        entry.listen
+                    ));
+                }
+            }
+        }
+        // Check for duplicate proxy listen addresses across services.
+        // Uses resolved configs so platform overrides are accounted for.
+        let resolved_proxies: Vec<(String, Vec<String>)> = self
+            .services
+            .iter()
+            .map(|(name, svc)| {
+                let resolved = svc.resolve(platform);
+                let addrs: Vec<String> = resolved.proxy.iter().map(|e| e.listen.clone()).collect();
+                (name.clone(), addrs)
+            })
+            .collect();
+        for (name, addrs) in &resolved_proxies {
+            for addr in addrs {
+                if let Some(other) = proxy_addrs.get(addr.as_str()) {
+                    errors.push(format!(
+                        "service '{name}': proxy listen address '{addr}' is already used by service '{other}'"
+                    ));
+                } else {
+                    proxy_addrs.insert(addr, name);
                 }
             }
         }

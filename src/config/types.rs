@@ -1,6 +1,75 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// A proxy entry: Don listens on `listen` and forwards TCP connections to the
+/// service on a random ephemeral port.
+///
+/// If `env` is set, Don injects the ephemeral port as that environment variable
+/// (and supports `${VAR}` substitution in `run.args`). If `env` is `None`, Don
+/// passes the ephemeral socket via LISTEN_FDS (systemd socket activation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEntry {
+    /// Address Don binds and accepts connections on (e.g. "127.0.0.1:3000").
+    pub listen: String,
+    /// If set, the env var name Don sets to the ephemeral port number.
+    /// If `None`, Don passes the socket via LISTEN_FDS instead.
+    pub env: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ProxyEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            String(String),
+            Table {
+                listen: String,
+                env: Option<String>,
+            },
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::String(s) => Ok(ProxyEntry {
+                listen: s,
+                env: None,
+            }),
+            Raw::Table { listen, env } => Ok(ProxyEntry { listen, env }),
+        }
+    }
+}
+
+/// Deserialize the `proxy` field which accepts:
+/// - A single string: `proxy = "127.0.0.1:3000"`
+/// - A single table: `proxy = { listen = "127.0.0.1:3000", env = "PORT" }`
+/// - An array of strings/tables: `proxy = ["127.0.0.1:3000", { listen = "...", env = "PORT" }]`
+pub(crate) fn deserialize_proxy<'de, D>(deserializer: D) -> Result<Vec<ProxyEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawProxy {
+        Single(ProxyEntry),
+        List(Vec<ProxyEntry>),
+    }
+
+    match RawProxy::deserialize(deserializer)? {
+        RawProxy::Single(entry) => Ok(vec![entry]),
+        RawProxy::List(entries) => Ok(entries),
+    }
+}
+
+/// Deserialize an optional `proxy` field (for `ServiceOverride`).
+/// Returns `None` when the field is absent, `Some(vec)` when present.
+pub(crate) fn deserialize_proxy_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ProxyEntry>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_proxy(deserializer).map(Some)
+}
+
 /// A command to execute: a binary/program name plus arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Command {

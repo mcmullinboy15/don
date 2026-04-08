@@ -30,6 +30,9 @@ static SIGNAL_COUNT: AtomicU8 = AtomicU8::new(0);
 #[serde(rename_all = "lowercase")]
 pub enum ServiceState {
     Pending,
+    /// Proxy is bound and accepting connections, but the service process is not
+    /// started yet. Will transition to Starting on first incoming connection.
+    Lazy,
     Starting,
     Running,
     Ready,
@@ -42,7 +45,7 @@ impl ServiceState {
     /// Whether this state is considered "satisfied" for dependency resolution.
     /// A dependency is satisfied when the service is Ready (or for tasks, completed).
     pub(crate) fn is_satisfied(&self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(self, Self::Ready | Self::Lazy)
     }
 
 
@@ -52,6 +55,8 @@ impl ServiceState {
         matches!(
             (self, next),
             (Self::Pending, Self::Starting)
+                | (Self::Pending, Self::Lazy)
+                | (Self::Lazy, Self::Starting)
                 | (Self::Starting, Self::Running)
                 | (Self::Starting, Self::Failed)
                 | (Self::Running, Self::Ready)
@@ -461,6 +466,15 @@ pub struct Runner {
     /// Outlive service restarts — don holds the sockets so ports are never released.
     bound_sockets: HashMap<String, crate::process::socket::BoundSockets>,
 
+    /// TCP proxy listeners for services with `proxy` config.
+    /// Outlive service restarts — Don holds the listening sockets.
+    service_proxies: HashMap<String, crate::proxy::ServiceProxy>,
+
+    /// Receives service names when a lazy service's proxy gets its first connection.
+    lazy_start_rx: mpsc::Receiver<String>,
+    /// Sender half kept for passing to ServiceProxy::bind.
+    lazy_start_tx: mpsc::Sender<String>,
+
     /// Running task state. Tracks the PGID (for shutdown kills) and
     /// optionally holds the PTY write half (for interactive attach).
     running_tasks: HashMap<String, RunningTask>,
@@ -504,6 +518,7 @@ impl Runner {
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (event_tx, _) = broadcast::channel(256);
+        let (lazy_start_tx, lazy_start_rx) = mpsc::channel(16);
 
         // Canonicalize base_dir so all downstream path joins produce clean
         // absolute paths (avoids `././app` when base_dir is `.`).
@@ -629,6 +644,9 @@ impl Runner {
             attach_locks: HashMap::new(),
             attach_waiters: HashMap::new(),
             bound_sockets: HashMap::new(),
+            service_proxies: HashMap::new(),
+            lazy_start_rx,
+            lazy_start_tx,
             running_tasks: HashMap::new(),
             server_shutdown_tx: None,
             docker_client,
@@ -702,6 +720,44 @@ impl Runner {
         for (name, resolved) in &listen_services {
             if let Err(msg) = self.bind_sockets_if_needed(name, resolved) {
                 return Err(RunnerError::Config(msg));
+            }
+        }
+
+        // Pre-bind all proxy listeners. This catches port conflicts upfront
+        // and starts the accept loops (connections queue until the service is ready).
+        let proxy_services: Vec<(String, crate::config::ResolvedService)> = self
+            .config
+            .services
+            .iter()
+            .filter(|(name, _)| self.service_states.contains_key(*name))
+            .map(|(name, svc)| (name.clone(), svc.resolve(self.platform)))
+            .filter(|(_, resolved)| !resolved.proxy.is_empty())
+            .collect();
+        for (name, resolved) in &proxy_services {
+            let lazy_tx = if resolved.lazy {
+                Some(self.lazy_start_tx.clone())
+            } else {
+                None
+            };
+            match crate::proxy::ServiceProxy::bind(&resolved.proxy, lazy_tx, name).await {
+                Ok(proxy) => {
+                    let addrs: Vec<String> =
+                        proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
+                    self.output_manager.lifecycle_event(&format!(
+                        "{name}: proxy listening on {}",
+                        addrs.join(", ")
+                    ));
+                    self.service_proxies.insert(name.clone(), proxy);
+                    // Set lazy services to Lazy state (they won't enter the
+                    // startup flow until triggered by a connection).
+                    if resolved.lazy {
+                        self.service_states
+                            .insert(name.clone(), ServiceState::Lazy);
+                    }
+                }
+                Err(e) => {
+                    return Err(RunnerError::Config(format!("{name}: {e}")));
+                }
             }
         }
 
@@ -803,7 +859,10 @@ impl Runner {
                 let has_running_services = self.service_states.values().any(|s| {
                     matches!(
                         s,
-                        ServiceState::Running | ServiceState::Ready | ServiceState::Starting
+                        ServiceState::Running
+                            | ServiceState::Ready
+                            | ServiceState::Starting
+                            | ServiceState::Lazy
                     )
                 });
 
@@ -887,6 +946,14 @@ impl Runner {
                         }
                     }
                 }
+                Some(name) = self.lazy_start_rx.recv() => {
+                    if self.service_states.get(&name) == Some(&ServiceState::Lazy) {
+                        self.output_manager.lifecycle_event(
+                            &format!("{name}: first connection — starting service")
+                        );
+                        self.start_service(&name, done_tx.clone()).await?;
+                    }
+                }
                 _ = self.shutdown_rx.recv() => {
                     self.initiate_shutdown().await;
                     break;
@@ -952,6 +1019,12 @@ impl Runner {
             .collect();
 
         for name in ready {
+            // Skip lazy services — they start on first proxy connection.
+            if self.service_states.get(&name) == Some(&ServiceState::Lazy) {
+                pending.remove(&name);
+                continue;
+            }
+
             pending.remove(&name);
             in_flight.insert(name.clone());
 
@@ -1000,13 +1073,39 @@ impl Runner {
             Some(s) => s,
             None => return Err(RunnerError::Config(format!("unknown service: {name}"))),
         };
-        let resolved = svc.resolve(self.platform);
+        let mut resolved = svc.resolve(self.platform);
 
         self.output_manager
             .lifecycle_event(&format!("starting {name}..."));
 
         // Phase 1: Bind listen sockets (idempotent — skips if already bound).
-        if let Err(msg) = self.bind_sockets_if_needed(name, &resolved) {
+        // If the service has proxy entries, bind LISTEN_FDS sockets for the
+        // ephemeral ports (for entries without env vars).
+        if let Some(proxy) = self.service_proxies.get(name) {
+            // Inject proxy env vars (for entries with env: Some("PORT")).
+            let proxy_env = proxy.env_vars();
+            resolved.env.extend(proxy_env);
+            // For LISTEN_FDS mode entries, use the proxy's ephemeral addresses.
+            let listen_fds_addrs = proxy.listen_fds_addrs();
+            if !listen_fds_addrs.is_empty() {
+                // Replace any previously bound sockets with new ephemeral ones.
+                self.bound_sockets.remove(name);
+                match crate::process::socket::bind_sockets(&listen_fds_addrs) {
+                    Ok(sockets) => {
+                        self.bound_sockets.insert(name.to_string(), sockets);
+                    }
+                    Err(e) => {
+                        self.fail_service_start(
+                            name,
+                            &format!("failed to bind ephemeral sockets: {e}"),
+                            done_tx,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                }
+            }
+        } else if let Err(msg) = self.bind_sockets_if_needed(name, &resolved) {
             self.fail_service_start(name, &msg, done_tx).await;
             return Ok(());
         }
@@ -1297,8 +1396,22 @@ impl Runner {
         }
 
         let name_owned = name.to_string();
-        let ready_config = resolved.ready.clone();
+        // Expand ${VAR} in ready check fields (tcp, http) so proxy-injected
+        // vars like CRDB_PORT resolve to the actual ephemeral port.
+        let ready_config = resolved.ready.clone().map(|mut r| {
+            if let Some(ref tcp) = r.tcp {
+                r.tcp = Some(service::expand_env_vars(tcp, &resolved.env));
+            }
+            if let Some(ref http) = r.http {
+                r.http = Some(service::expand_env_vars(http, &resolved.env));
+            }
+            r
+        });
         let event_tx = self.event_tx.clone();
+        let proxy_handle = self
+            .service_proxies
+            .get(name)
+            .map(|p| p.backend_handle());
 
         if let Some(ready) = ready_config {
             tokio::spawn(async move {
@@ -1315,6 +1428,13 @@ impl Runner {
                 } else {
                     ServiceState::Failed
                 };
+
+                // Activate proxy backend once the service is ready.
+                if success
+                    && let Some(ref handle) = proxy_handle
+                {
+                    handle.activate();
+                }
 
                 let _ = event_tx.send(RunnerEvent::ServiceStateChanged {
                     name: name_owned.clone(),
@@ -1342,6 +1462,10 @@ impl Runner {
             // No ready check on rebuild path — mark ready immediately.
             self.service_states
                 .insert(name.to_string(), ServiceState::Ready);
+            // Activate proxy backend for the new instance.
+            if let Some(proxy) = self.service_proxies.get(name) {
+                proxy.set_backend();
+            }
             self.output_manager
                 .lifecycle_event(&format!("{name}: restarted"));
             let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
@@ -1710,6 +1834,7 @@ impl Runner {
             }
             self.service_states.remove(name);
             self.bound_sockets.remove(name);
+            self.service_proxies.remove(name);
         }
 
         // 2. Stop changed services (they'll be restarted with the new config).
@@ -1731,6 +1856,7 @@ impl Runner {
                 }
             }
             self.bound_sockets.remove(name);
+            self.service_proxies.remove(name);
         }
 
         // 3. Remove state for removed tasks.
@@ -1771,10 +1897,48 @@ impl Runner {
                 .await;
         }
 
-        // 6. Mark changed services as Pending for restart.
+        // 6. Mark changed services as Pending for restart, and bind proxies
+        //    for new/changed services that have proxy config.
         for name in &diff.changed_services {
             self.service_states
                 .insert(name.clone(), ServiceState::Pending);
+        }
+        let proxy_names: Vec<String> = diff
+            .added_services
+            .iter()
+            .chain(diff.changed_services.iter())
+            .cloned()
+            .collect();
+        for name in &proxy_names {
+            if let Some(svc) = self.config.services.get(name) {
+                let resolved = svc.resolve(self.platform);
+                if !resolved.proxy.is_empty() {
+                    let lazy_tx = if resolved.lazy {
+                        Some(self.lazy_start_tx.clone())
+                    } else {
+                        None
+                    };
+                    match crate::proxy::ServiceProxy::bind(&resolved.proxy, lazy_tx, name).await {
+                        Ok(proxy) => {
+                            let addrs: Vec<String> =
+                                proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
+                            self.output_manager.lifecycle_event(&format!(
+                                "{name}: proxy listening on {}",
+                                addrs.join(", ")
+                            ));
+                            self.service_proxies.insert(name.clone(), proxy);
+                            if resolved.lazy {
+                                self.service_states
+                                    .insert(name.clone(), ServiceState::Lazy);
+                            }
+                        }
+                        Err(e) => {
+                            self.output_manager
+                                .error_event(&format!("{name}: proxy bind failed: {e}"));
+                        }
+                    }
+                }
+            }
         }
 
         // 7. Start all changed + new services and tasks via topo-sorted
@@ -1930,6 +2094,11 @@ impl Runner {
     /// Runs the build (if any), stops the old process, starts a new one.
     /// If the build fails, the old process is kept running.
     /// Broadcasts `RebuildComplete` when done.
+    ///
+    /// For proxy services: clears the proxy backend (new connections queue),
+    /// allocates fresh ephemeral ports, starts the new instance, and sets the
+    /// backend once the ready check passes. The proxy never drops — clients
+    /// see a brief pause, not a connection refused.
     async fn handle_rebuild(&mut self, name: &str) {
         let svc = match self.config.services.get(name) {
             Some(s) => s,
@@ -1938,7 +2107,7 @@ impl Runner {
                 return;
             }
         };
-        let resolved = svc.resolve(self.platform);
+        let mut resolved = svc.resolve(self.platform);
 
         self.output_manager
             .lifecycle_event(&format!("{name}: rebuilding (file changed)"));
@@ -1947,6 +2116,15 @@ impl Runner {
         if let Err(()) = self.run_service_build(name, &resolved).await {
             self.fail_rebuild(name, &format!("{name}: build failed"));
             return;
+        }
+
+        // For proxy services: clear backend so new connections queue while we
+        // restart, and allocate fresh ephemeral ports for the new instance.
+        let has_proxy = self.service_proxies.contains_key(name);
+        if has_proxy
+            && let Some(proxy) = self.service_proxies.get(name)
+        {
+            proxy.clear_backend();
         }
 
         // Stop the old service (if running).
@@ -1970,7 +2148,49 @@ impl Runner {
             }
         }
 
+        // For proxy services: allocate new ephemeral ports and rebind
+        // LISTEN_FDS sockets before spawning the new instance.
+        if has_proxy
+            && let Some(proxy) = self.service_proxies.get_mut(name)
+        {
+            match proxy.reallocate_ephemeral_ports().await {
+                Ok(_old_ports) => {
+                    // Inject new proxy env vars.
+                    let proxy_env = proxy.env_vars();
+                    resolved.env.extend(proxy_env);
+                    // Rebind LISTEN_FDS sockets for new ephemeral ports.
+                    let listen_fds_addrs = proxy.listen_fds_addrs();
+                    if !listen_fds_addrs.is_empty() {
+                        self.bound_sockets.remove(name);
+                        match crate::process::socket::bind_sockets(&listen_fds_addrs) {
+                            Ok(sockets) => {
+                                self.bound_sockets.insert(name.to_string(), sockets);
+                            }
+                            Err(e) => {
+                                self.fail_rebuild(
+                                    name,
+                                    &format!(
+                                        "{name}: failed to bind ephemeral sockets: {e}"
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.fail_rebuild(
+                        name,
+                        &format!("{name}: failed to allocate ephemeral ports: {e}"),
+                    );
+                    return;
+                }
+            }
+        }
+
         // Start the service again. Sockets are already bound (don holds them).
+        // For proxy services, set_backend will be called when the ready check
+        // passes (in handle_service_done).
         let _ = self
             .spawn_and_wire_service(name, &resolved, None)
             .await;
@@ -2001,6 +2221,19 @@ impl Runner {
                 message: "already running".to_string(),
             });
         }
+        // For lazy services in Lazy state, force-start via the normal path.
+        if self.service_states.get(name) == Some(&ServiceState::Lazy) {
+            self.output_manager
+                .lifecycle_event(&format!("{name}: starting (requested)"));
+            if let Some(done_tx) = self.done_tx.clone() {
+                return self.start_service(name, done_tx).await.map_err(|e| {
+                    CommandError::Failed {
+                        name: name.to_string(),
+                        message: e.to_string(),
+                    }
+                });
+            }
+        }
         let resolved = svc.resolve(self.platform);
         self.output_manager
             .lifecycle_event(&format!("starting {name}... (requested)"));
@@ -2015,6 +2248,14 @@ impl Runner {
     /// Handle an API-initiated Stop command.
     async fn handle_stop_cmd(&mut self, name: &str) -> CommandResult {
         let resolved = self.lookup_service(name)?.resolve(self.platform);
+        // A lazy service in Lazy state has no process — just mark it Stopped.
+        if self.service_states.get(name) == Some(&ServiceState::Lazy) {
+            self.service_states
+                .insert(name.to_string(), ServiceState::Stopped);
+            self.output_manager
+                .lifecycle_event(&format!("{name}: stopped (was lazy)"));
+            return Ok(());
+        }
         let handle = self.service_handles.remove(name).ok_or_else(|| {
             CommandError::InvalidState {
                 name: name.to_string(),
@@ -2284,6 +2525,10 @@ impl Runner {
         if item.success {
             self.service_states
                 .insert(item.name.clone(), ServiceState::Ready);
+            // Activate proxy backend now that the service is ready.
+            if let Some(proxy) = self.service_proxies.get(&item.name) {
+                proxy.set_backend();
+            }
             if let Some(svc) = self.config.services.get(&item.name) {
                 let resolved = svc.resolve(self.platform);
                 let ready_desc = match &resolved.ready {
@@ -2307,11 +2552,27 @@ impl Runner {
                 ));
             }
         } else {
-            self.service_states
-                .insert(item.name.clone(), ServiceState::Failed);
-            if let Some(ref msg) = item.message {
-                self.output_manager
-                    .error_event(&format!("{}: {msg}", item.name));
+            // If a lazy service fails, reset to Lazy so the next connection
+            // can re-trigger it instead of leaving it permanently failed.
+            let is_lazy = self
+                .config
+                .services
+                .get(&item.name)
+                .is_some_and(|svc| svc.resolve(self.platform).lazy);
+            if is_lazy && self.service_proxies.contains_key(&item.name) {
+                self.service_states
+                    .insert(item.name.clone(), ServiceState::Lazy);
+                if let Some(ref msg) = item.message {
+                    self.output_manager
+                        .error_event(&format!("{}: {msg} (will retry on next connection)", item.name));
+                }
+            } else {
+                self.service_states
+                    .insert(item.name.clone(), ServiceState::Failed);
+                if let Some(ref msg) = item.message {
+                    self.output_manager
+                        .error_event(&format!("{}: {msg}", item.name));
+                }
             }
         }
     }
@@ -2356,6 +2617,11 @@ impl Runner {
     async fn initiate_shutdown(&mut self) {
         self.output_manager
             .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");
+
+        // Shut down all proxy listeners first (stop accepting new connections).
+        for (_, proxy) in self.service_proxies.drain() {
+            proxy.shutdown();
+        }
 
         // Tell the API server to stop accepting connections.
         if let Some(tx) = self.server_shutdown_tx.take() {

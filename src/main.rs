@@ -267,6 +267,7 @@ fn print_status_table(items: &[ItemStatus]) {
 fn service_state_label(s: ServiceState) -> &'static str {
     match s {
         ServiceState::Pending => "pending",
+        ServiceState::Lazy => "lazy",
         ServiceState::Starting => "starting",
         ServiceState::Running => "running",
         ServiceState::Ready => "ready",
@@ -280,6 +281,7 @@ fn service_state_color(s: ServiceState) -> Color {
     match s {
         ServiceState::Ready | ServiceState::Running => Color::Green,
         ServiceState::Starting | ServiceState::Pending | ServiceState::Stopping => Color::Yellow,
+        ServiceState::Lazy => Color::Cyan,
         ServiceState::Stopped => Color::DarkGrey,
         ServiceState::Failed => Color::Red,
     }
