@@ -188,6 +188,56 @@ path = "cockroach-v25.4.0.linux-amd64/cockroach"
 
 Cached in `.don/cache/`, symlinked to `.don/bin/`, and added to child PATH.
 
+### Bazel Integration
+
+Point a service at a Bazel target and Don handles everything — build, run, watch, and rebuild:
+
+```toml
+[services.api]
+bazel.target = "//services/api:api"
+proxy = { listen = "127.0.0.1:8080", env = "PORT" }
+```
+
+Don will:
+1. Query `bazel query` to discover source packages → auto-set watch patterns
+2. Run `bazel build` at startup (batched across all targets)
+3. Resolve the output binary via `bazel cquery` and run it directly
+4. Watch for source changes and rebuild/restart automatically
+5. Watch BUILD files and re-query the build graph when they change
+
+Multiple services sharing the same source files are batched into one `bazel build` invocation.
+
+### Turborepo Integration
+
+For monorepos using Turborepo, Don auto-resolves the task graph:
+
+```toml
+[services.web]
+turbo.task = "dev"
+turbo.filter = "@myorg/web"
+proxy = { listen = "127.0.0.1:3000", env = "PORT" }
+```
+
+Don queries `turbo run --dry-run=json` to discover workspace dependencies and input files, then watches them for changes. At startup, a batch `turbo run build` runs for all configured packages.
+
+### TCP Proxy
+
+Don listens on a port and forwards connections to the service on an ephemeral port. The proxy stays open across restarts — no dropped connections:
+
+```toml
+[services.api]
+run.cmd = "./api-server"
+proxy = { listen = "127.0.0.1:3000", env = "PORT" }
+```
+
+Don injects `PORT=<ephemeral>` into the service's environment. On restart, the proxy queues new connections while the service restarts. Supports multiple proxy entries and lazy start (delay service startup until first connection):
+
+```toml
+[services.api]
+proxy = { listen = "127.0.0.1:3000", env = "PORT" }
+lazy = true
+```
+
 ### Socket Passing
 
 Zero-downtime restarts via the systemd `LISTEN_FDS` protocol. Don binds the port and passes the socket fd to the child:
@@ -238,6 +288,7 @@ don start <name>             # start a stopped service
 don stop <name>              # stop a running service
 don restart <name>           # restart a service
 don status                   # show all services and their states
+don status -v                # verbose: watch paths, ports, commands, build targets
 don logs <name>              # view recent output
 don logs <name> --follow     # stream output
 don logs <name> --last 50    # last N lines
@@ -307,6 +358,13 @@ See [`examples/`](examples/) for complete working configs.
 | `docker.build` | table | Dockerfile build config |
 | `rust.binary` | string | Rust binary target name |
 | `go.package` | string | Go package path |
+| `proxy` | string or table | TCP proxy: `"addr"` or `{ listen, env }` |
+| `lazy` | bool | Delay start until first proxy connection |
+| `bazel.target` | string | Bazel target label (auto watch/build/run) |
+| `bazel.query_timeout` | u64 | Query timeout in seconds |
+| `turbo.task` | string | Turborepo task name |
+| `turbo.filter` | string | Turborepo package filter |
+| `turbo.build_task` | string | Task to run during batch build (default: "build") |
 | `download.platform.<platform>` | table | Per-platform download config |
 
 ## Platform Support
