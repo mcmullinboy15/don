@@ -237,6 +237,49 @@ impl BazelResolver {
         }
     }
 
+    /// Check if targets are already up to date without building.
+    ///
+    /// Uses `bazel build --check_up_to_date` which exits 0 if all targets
+    /// are up to date and non-zero if any need rebuilding. This avoids
+    /// unnecessary service restarts when a watched file changed but the
+    /// build output would be identical.
+    pub(crate) async fn check_up_to_date(
+        &self,
+        targets: &[String],
+        working_dir: &Path,
+    ) -> Result<bool, BuildToolError> {
+        if targets.is_empty() {
+            return Ok(true);
+        }
+
+        let mut cmd = tokio::process::Command::new("bazel");
+        cmd.arg("build");
+        cmd.arg("--check_up_to_date");
+        cmd.args(targets);
+        cmd.current_dir(working_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let child = cmd.spawn().map_err(|e| BuildToolError::Io {
+            tool: "bazel".to_string(),
+            source: e,
+        })?;
+
+        let timeout_secs = self.timeout.as_secs();
+        let status = tokio::time::timeout(self.timeout, child.wait_with_output())
+            .await
+            .map_err(|_| BuildToolError::QueryTimeout {
+                tool: "bazel".to_string(),
+                timeout_secs,
+            })?
+            .map_err(|e| BuildToolError::Io {
+                tool: "bazel".to_string(),
+                source: e,
+            })?;
+
+        Ok(status.status.success())
+    }
+
     /// Resolve the output binary path for a Bazel target.
     ///
     /// Uses `bazel cquery --output=files` to find the built artifact path.

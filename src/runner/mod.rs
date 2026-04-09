@@ -2172,39 +2172,59 @@ impl Runner {
                 m
             };
 
-            let count = targets.len();
-            self.output_manager.lifecycle_event(&format!(
-                "bazel: rebuilding {count} target{}...",
-                if count == 1 { "" } else { "s" }
-            ));
-
-            let om = self.output_manager.clone_lifecycle_emitter();
             let resolver = crate::build_tool::bazel::BazelResolver::new(bazel_timeout);
-            match resolver
-                .build_targets(&targets, &self.base_dir.clone(), move |line| {
-                    om.lifecycle_event(&format!("bazel: {line}"));
-                })
+
+            // Check if targets are already up to date before building.
+            // This avoids unnecessary service restarts when a watched file
+            // changed but the build output would be identical.
+            let up_to_date: bool = resolver
+                .check_up_to_date(&targets, &self.base_dir)
                 .await
-            {
-                Ok(result) => {
-                    for target in &result.succeeded {
-                        if let Some(svc_names) = target_to_names.get(target) {
-                            for n in svc_names {
-                                build_succeeded.insert(n.clone());
+                .unwrap_or_default();
+
+            if up_to_date {
+                let count = targets.len();
+                self.output_manager.lifecycle_event(&format!(
+                    "bazel: {count} target{} up to date, skipping rebuild",
+                    if count == 1 { "" } else { "s" }
+                ));
+            } else {
+                let count = targets.len();
+                self.output_manager.lifecycle_event(&format!(
+                    "bazel: rebuilding {count} target{}...",
+                    if count == 1 { "" } else { "s" }
+                ));
+
+                let om = self.output_manager.clone_lifecycle_emitter();
+                match resolver
+                    .build_targets(&targets, &self.base_dir.clone(), move |line| {
+                        om.lifecycle_event(&format!("bazel: {line}"));
+                    })
+                    .await
+                {
+                    Ok(result) => {
+                        for target in &result.succeeded {
+                            if let Some(svc_names) = target_to_names.get(target) {
+                                for n in svc_names {
+                                    build_succeeded.insert(n.clone());
+                                }
+                            }
+                        }
+                        for (target, msg) in &result.failed {
+                            if let Some(svc_names) = target_to_names.get(target) {
+                                for n in svc_names {
+                                    self.fail_rebuild(
+                                        n,
+                                        &format!("{n}: bazel build failed: {msg}"),
+                                    );
+                                }
                             }
                         }
                     }
-                    for (target, msg) in &result.failed {
-                        if let Some(svc_names) = target_to_names.get(target) {
-                            for n in svc_names {
-                                self.fail_rebuild(n, &format!("{n}: bazel build failed: {msg}"));
-                            }
+                    Err(e) => {
+                        for (name, _) in &bazel_items {
+                            self.fail_rebuild(name, &format!("{name}: bazel build error: {e}"));
                         }
-                    }
-                }
-                Err(e) => {
-                    for (name, _) in &bazel_items {
-                        self.fail_rebuild(name, &format!("{name}: bazel build error: {e}"));
                     }
                 }
             }
