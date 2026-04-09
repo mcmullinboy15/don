@@ -18,7 +18,9 @@ pub use self::service::{
     DockerBuildConfig, DockerConfig, Preset, ResolvedService, RustConfig, Service,
 };
 pub use self::task::Task;
-pub use self::types::{Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig};
+pub use self::types::{
+    BazelConfig, Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig, TurboConfig,
+};
 
 pub use self::service::ServiceOverride;
 
@@ -122,6 +124,12 @@ impl Config {
             let resolved = svc.resolve(platform);
             if let Err(e) = resolved.preset() {
                 errors.push(format!("service '{name}': {e}"));
+            }
+            // Bazel and turbo are mutually exclusive.
+            if resolved.bazel.is_some() && resolved.turbo.is_some() {
+                errors.push(format!(
+                    "service '{name}': 'bazel' and 'turbo' are mutually exclusive"
+                ));
             }
             if let Some(ref ready) = resolved.ready {
                 let check_count = ready.exec.is_some() as u8
@@ -280,6 +288,12 @@ impl Config {
 
         // Validate tasks
         for (name, task) in &self.tasks {
+            // Bazel and turbo are mutually exclusive.
+            if task.bazel.is_some() && task.turbo.is_some() {
+                errors.push(format!(
+                    "task '{name}': 'bazel' and 'turbo' are mutually exclusive"
+                ));
+            }
             for dep in &task.depends_on {
                 if !all_names.contains(dep.as_str()) {
                     let suggestion = suggest_typo(dep, &all_names);
@@ -1561,6 +1575,186 @@ mod tests {
             assert_eq!(
                 args, &expected_args[..],
                 "case '{}': args mismatch",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_bazel_config() {
+        let toml = r#"
+[services.api]
+run.cmd = "./bazel-bin/api"
+bazel.target = "//services/api:api"
+"#;
+        let config: Config = toml.parse().unwrap();
+        let svc = config.services.get("api").unwrap();
+        let bazel = svc.bazel.as_ref().unwrap();
+        assert_eq!(bazel.target, "//services/api:api");
+        assert!(bazel.query_timeout.is_none());
+        assert!(svc.turbo.is_none());
+    }
+
+    #[test]
+    fn test_parse_turbo_config() {
+        let toml = r#"
+[services.web]
+run.cmd = "npm run dev"
+turbo.task = "dev"
+turbo.filter = "@myorg/web"
+turbo.query_timeout = 60
+"#;
+        let config: Config = toml.parse().unwrap();
+        let svc = config.services.get("web").unwrap();
+        let turbo = svc.turbo.as_ref().unwrap();
+        assert_eq!(turbo.task, "dev");
+        assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
+        assert_eq!(turbo.query_timeout, Some(60));
+        assert!(svc.bazel.is_none());
+    }
+
+    #[test]
+    fn test_parse_task_with_bazel() {
+        let toml = r#"
+[tasks.codegen]
+cmd = "bazel"
+args = ["build", "//tools/codegen:all"]
+bazel.target = "//tools/codegen:all"
+"#;
+        let config: Config = toml.parse().unwrap();
+        let task = config.tasks.get("codegen").unwrap();
+        assert_eq!(task.bazel.as_ref().unwrap().target, "//tools/codegen:all");
+        assert!(task.turbo.is_none());
+    }
+
+    #[test]
+    fn test_validate_bazel_turbo_mutually_exclusive_service() {
+        let toml = r#"
+[services.api]
+run.cmd = "./api"
+bazel.target = "//services/api:api"
+turbo.task = "dev"
+"#;
+        let config: Config = toml.parse().unwrap();
+        let result = config.validate(TEST_PLATFORM);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_bazel_turbo_mutually_exclusive_task() {
+        let toml = r#"
+[tasks.codegen]
+cmd = "build"
+bazel.target = "//tools:codegen"
+turbo.task = "build"
+"#;
+        let config: Config = toml.parse().unwrap();
+        let result = config.validate(TEST_PLATFORM);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_bazel_config_with_query_timeout() {
+        let toml = r#"
+[services.api]
+run.cmd = "./api"
+bazel.target = "//services/api:api"
+bazel.query_timeout = 45
+"#;
+        let config: Config = toml.parse().unwrap();
+        let svc = config.services.get("api").unwrap();
+        assert_eq!(svc.bazel.as_ref().unwrap().query_timeout, Some(45));
+    }
+
+    #[test]
+    fn test_build_tool_config_platform_override() {
+        let toml = r#"
+[services.api]
+run.cmd = "./api"
+bazel.target = "//services/api:linux"
+
+[services.api.platform.macos-aarch64]
+bazel.target = "//services/api:macos_arm64"
+"#;
+        let config: Config = toml.parse().unwrap();
+        let svc = config.services.get("api").unwrap();
+
+        // Base config
+        let resolved = svc.resolve(Platform::LinuxX86_64);
+        assert_eq!(
+            resolved.bazel.as_ref().unwrap().target,
+            "//services/api:linux"
+        );
+
+        // Platform override
+        let resolved_mac = svc.resolve(Platform::MacosAarch64);
+        assert_eq!(
+            resolved_mac.bazel.as_ref().unwrap().target,
+            "//services/api:macos_arm64"
+        );
+    }
+
+    #[test]
+    fn test_turbo_build_task_config() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            expected_build_task: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "default build_task (not specified)",
+                toml: r#"
+[services.web]
+run.cmd = "node server.js"
+turbo.task = "dev"
+turbo.filter = "@myorg/web"
+"#,
+                expected_build_task: None,
+            },
+            Case {
+                name: "explicit build_task",
+                toml: r#"
+[services.web]
+run.cmd = "node server.js"
+turbo.task = "dev"
+turbo.filter = "@myorg/web"
+turbo.build_task = "compile"
+"#,
+                expected_build_task: Some("compile"),
+            },
+            Case {
+                name: "empty build_task opts out of batch build",
+                toml: r#"
+[services.web]
+run.cmd = "node server.js"
+turbo.task = "dev"
+turbo.filter = "@myorg/web"
+turbo.build_task = ""
+"#,
+                expected_build_task: Some(""),
+            },
+        ];
+
+        for case in cases {
+            let config: Config = case.toml.parse().unwrap();
+            let svc = config.services.get("web").unwrap();
+            let turbo = svc.turbo.as_ref().unwrap();
+            assert_eq!(
+                turbo.build_task.as_deref(),
+                case.expected_build_task,
+                "case: {}",
                 case.name
             );
         }

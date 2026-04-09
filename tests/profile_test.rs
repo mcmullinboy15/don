@@ -337,7 +337,7 @@ fn profile_excluded_services_absent_from_status() {
 
         // Check status via API — worker should not appear.
         let client = don::client::Client::new(dir.path());
-        let items = client.status().await.unwrap();
+        let items = client.status(false).await.unwrap();
         let names: Vec<String> = items
             .iter()
             .map(|i| match i {

@@ -1,0 +1,9 @@
+{
+  "name": "@example/utils",
+  "version": "0.0.1",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "build": "echo 'Building @example/utils'"
+  }
+}

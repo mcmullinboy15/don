@@ -54,13 +54,17 @@ enum WatchState {
 
 /// What command to send when this item's debounce timer fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WatchItemKind {
+pub(crate) enum WatchItemKind {
     /// Send `RunnerCommand::Rebuild { name }`.
     Service,
     /// Send `RunnerCommand::TaskRerun { name }`.
     Task,
     /// Send `RunnerCommand::ConfigReload` — no rebuild/complete cycle.
     Config,
+    /// Send `RunnerCommand::BuildGraphChanged { name }` — tier-1 watch for
+    /// build tool definition files (BUILD, package.json, etc.). No rebuild cycle;
+    /// the runner re-queries the build tool and updates tier-2 watch patterns.
+    BuildGraph,
 }
 
 /// Per-item watch tracking.
@@ -79,12 +83,31 @@ struct WatchedItem {
     ignore_patterns: Vec<Pattern>,
 }
 
+/// An update to the watch patterns for a specific item.
+///
+/// Sent from the runner to the watch manager after a build tool re-query
+/// completes, containing the new tier-2 watch patterns.
+pub(crate) struct WatchUpdate {
+    /// The service or task name (matches the key in `items`).
+    pub name: String,
+    /// What kind of item this is (Service or Task). Used when creating
+    /// a new watch item that didn't exist during initial setup.
+    pub kind: WatchItemKind,
+    /// New glob patterns to watch (replaces existing patterns).
+    pub patterns: Vec<String>,
+    /// New ignore patterns (replaces existing ignore patterns).
+    pub ignore_patterns: Vec<String>,
+    /// Base directory to resolve patterns against.
+    pub base_dir: PathBuf,
+}
+
 /// Manages file watchers for all services and tasks with watch patterns.
 ///
 /// Runs as a background tokio task, communicating with the runner via channels.
 pub(crate) struct WatchManager {
     /// The notify watcher handle — kept alive to maintain watches.
-    _watcher: RecommendedWatcher,
+    /// Named (not `_watcher`) so we can add new watch directories at runtime.
+    watcher: RecommendedWatcher,
     /// Channel receiving raw notify events.
     event_rx: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     /// Per-item (service or task) state.
@@ -93,6 +116,10 @@ pub(crate) struct WatchManager {
     cmd_tx: mpsc::Sender<RunnerCommand>,
     /// Receiver for runner events (rebuild/rerun completion).
     runner_events: broadcast::Receiver<RunnerEvent>,
+    /// Receiver for watch pattern updates from the runner (build tool re-queries).
+    update_rx: mpsc::Receiver<WatchUpdate>,
+    /// Directories already registered with the watcher.
+    registered_dirs: HashSet<PathBuf>,
 }
 
 impl WatchManager {
@@ -110,6 +137,7 @@ impl WatchManager {
         config_path: &Path,
         cmd_tx: mpsc::Sender<RunnerCommand>,
         runner_events: broadcast::Receiver<RunnerEvent>,
+        update_rx: mpsc::Receiver<WatchUpdate>,
     ) -> Result<(Self, Vec<String>), WatchError> {
         let mut warnings: Vec<String> = Vec::new();
         let (notify_tx, event_rx) = mpsc::unbounded_channel();
@@ -311,6 +339,102 @@ impl WatchManager {
             );
         }
 
+        // Register tier-1 build graph watches for services/tasks with bazel/turbo configs.
+        // These watch BUILD files, package.json, etc. and trigger re-queries of the build tool.
+        {
+            let mut build_graph_globs: Vec<(String, Vec<String>)> = Vec::new();
+
+            for (name, svc) in &config.services {
+                let resolved = svc.resolve(platform);
+                let globs = if resolved.bazel.is_some() {
+                    vec![
+                        "**/BUILD".to_string(),
+                        "**/BUILD.bazel".to_string(),
+                        "WORKSPACE".to_string(),
+                        "WORKSPACE.bazel".to_string(),
+                        "MODULE.bazel".to_string(),
+                    ]
+                } else if resolved.turbo.is_some() {
+                    vec![
+                        "**/package.json".to_string(),
+                        "turbo.json".to_string(),
+                        "turbo.jsonc".to_string(),
+                        "pnpm-workspace.yaml".to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                if !globs.is_empty() {
+                    build_graph_globs.push((name.clone(), globs));
+                }
+            }
+            for (name, task) in &config.tasks {
+                let globs = if task.bazel.is_some() {
+                    vec![
+                        "**/BUILD".to_string(),
+                        "**/BUILD.bazel".to_string(),
+                        "WORKSPACE".to_string(),
+                        "WORKSPACE.bazel".to_string(),
+                        "MODULE.bazel".to_string(),
+                    ]
+                } else if task.turbo.is_some() {
+                    vec![
+                        "**/package.json".to_string(),
+                        "turbo.json".to_string(),
+                        "turbo.jsonc".to_string(),
+                        "pnpm-workspace.yaml".to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                if !globs.is_empty() {
+                    build_graph_globs.push((name.clone(), globs));
+                }
+            }
+
+            for (name, globs) in build_graph_globs {
+                let mut compiled_patterns = Vec::new();
+                for pattern_str in &globs {
+                    let full_pattern = base_dir.join(pattern_str);
+                    match Pattern::new(&full_pattern.to_string_lossy()) {
+                        Ok(pat) => compiled_patterns.push(pat),
+                        Err(e) => {
+                            warnings.push(format!(
+                                "{name}__graph: invalid build graph pattern '{pattern_str}': {e}"
+                            ));
+                            continue;
+                        }
+                    }
+
+                    let watch_dir = glob_base_dir(&full_pattern);
+                    if watch_dir.exists() {
+                        let already_covered = registered_dirs
+                            .iter()
+                            .any(|existing| watch_dir.starts_with(existing));
+                        if !already_covered {
+                            let _ = watcher.watch(&watch_dir, RecursiveMode::Recursive);
+                            registered_dirs.insert(watch_dir);
+                        }
+                    }
+                }
+
+                if !compiled_patterns.is_empty() {
+                    items.insert(
+                        format!("{name}__graph"),
+                        WatchedItem {
+                            state: WatchState::Idle,
+                            debounce_duration: DEFAULT_DEBOUNCE,
+                            debounce_deadline: None,
+                            stale: false,
+                            kind: WatchItemKind::BuildGraph,
+                            patterns: compiled_patterns,
+                            ignore_patterns: vec![],
+                        },
+                    );
+                }
+            }
+        }
+
         // Watch the config file (don.toml) for auto-reload. We watch the
         // parent directory because editors like vim replace the file via
         // rename, which removes the inode the watcher was tracking.
@@ -341,11 +465,13 @@ impl WatchManager {
 
         Ok((
             Self {
-                _watcher: watcher,
+                watcher,
                 event_rx,
                 items,
                 cmd_tx,
                 runner_events,
+                update_rx,
+                registered_dirs,
             },
             warnings,
         ))
@@ -381,7 +507,65 @@ impl WatchManager {
                         }
                     }
                 }
+                Some(update) = self.update_rx.recv() => {
+                    self.apply_watch_update(update);
+                }
             }
+        }
+    }
+
+    /// Apply a watch update from the runner (build tool re-query completed).
+    ///
+    /// Replaces the watch patterns for the named item and registers any
+    /// new watch directories with the notify watcher.
+    fn apply_watch_update(&mut self, update: WatchUpdate) {
+        let mut compiled_patterns = Vec::new();
+        for pattern_str in &update.patterns {
+            let full_pattern = update.base_dir.join(pattern_str);
+            if let Ok(pat) = Pattern::new(&full_pattern.to_string_lossy()) {
+                compiled_patterns.push(pat);
+
+                // Always register the watch directory for build-tool-resolved
+                // patterns. A parent recursive watch may not reliably cover
+                // all subdirectories (e.g. when bazel symlinks cause inotify
+                // to miss directories during the initial recursive walk).
+                let watch_dir = glob_base_dir(&full_pattern);
+                if watch_dir.exists() {
+                    let _ = self
+                        .watcher
+                        .watch(&watch_dir, RecursiveMode::Recursive);
+                    self.registered_dirs.insert(watch_dir);
+                }
+            }
+        }
+
+        let mut compiled_ignore = Vec::new();
+        for pattern_str in &update.ignore_patterns {
+            let full_pattern = update.base_dir.join(pattern_str);
+            if let Ok(pat) = Pattern::new(&full_pattern.to_string_lossy()) {
+                compiled_ignore.push(pat);
+            }
+        }
+
+        if let Some(item) = self.items.get_mut(&update.name) {
+            item.patterns = compiled_patterns;
+            item.ignore_patterns = compiled_ignore;
+        } else {
+            // Item doesn't exist yet — create it (happens when build tool
+            // resolution completes after startup for a service with no
+            // explicit watch patterns).
+            self.items.insert(
+                update.name.clone(),
+                WatchedItem {
+                    state: WatchState::Idle,
+                    debounce_duration: DEFAULT_DEBOUNCE,
+                    debounce_deadline: None,
+                    stale: false,
+                    kind: update.kind,
+                    patterns: compiled_patterns,
+                    ignore_patterns: compiled_ignore,
+                },
+            );
         }
     }
 
@@ -406,6 +590,7 @@ impl WatchManager {
         ) {
             return;
         }
+
 
         // Find which items are affected by this event's paths.
         // Ignore patterns are checked first — if any ignore pattern matches,
@@ -481,6 +666,16 @@ impl WatchManager {
                         // go straight back to Idle.
                         item.state = WatchState::Idle;
                         RunnerCommand::ConfigReload
+                    }
+                    WatchItemKind::BuildGraph => {
+                        // Build graph change has no rebuild/complete cycle —
+                        // the runner re-queries the build tool asynchronously.
+                        // Extract the service/task name by stripping "__graph" suffix.
+                        item.state = WatchState::Idle;
+                        let item_name = name.strip_suffix("__graph")
+                            .unwrap_or(&name)
+                            .to_string();
+                        RunnerCommand::BuildGraphChanged { name: item_name }
                     }
                 };
                 // If the channel is full/closed, the runner is shutting down.
@@ -676,6 +871,25 @@ mod tests {
                 name: "does not match outside dir",
                 pattern: "/app/src/**/*.rs",
                 path: "/other/src/main.rs",
+                expected: false,
+            },
+            // Build tool integration patterns end with /** (no file extension filter)
+            Case {
+                name: "/** matches nested file",
+                pattern: "/app/services/api/**",
+                path: "/app/services/api/src/main.py",
+                expected: true,
+            },
+            Case {
+                name: "/** matches direct child",
+                pattern: "/app/services/api/**",
+                path: "/app/services/api/main.py",
+                expected: true,
+            },
+            Case {
+                name: "/** does not match sibling dir",
+                pattern: "/app/services/api/**",
+                path: "/app/services/web/main.py",
                 expected: false,
             },
         ];
@@ -1078,6 +1292,13 @@ mod tests {
                         item.state = WatchState::Idle;
                         RunnerCommand::ConfigReload
                     }
+                    WatchItemKind::BuildGraph => {
+                        item.state = WatchState::Idle;
+                        let item_name = name.strip_suffix("__graph")
+                            .unwrap_or(&name)
+                            .to_string();
+                        RunnerCommand::BuildGraphChanged { name: item_name }
+                    }
                 };
                 let _ = cmd_tx.send(cmd).await;
             }
@@ -1122,5 +1343,92 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[tokio::test]
+    async fn test_build_graph_kind_sends_build_graph_changed() {
+        tokio::time::pause();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+
+        let mut items = HashMap::new();
+        items.insert(
+            "api__graph".to_string(),
+            WatchedItem {
+                state: WatchState::Idle,
+                debounce_duration: Duration::from_millis(200),
+                debounce_deadline: None,
+                stale: false,
+                kind: WatchItemKind::BuildGraph,
+                patterns: vec![Pattern::new("**/BUILD.bazel").unwrap()],
+                ignore_patterns: vec![],
+            },
+        );
+
+        let event = notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![PathBuf::from("services/api/BUILD.bazel")],
+            attrs: Default::default(),
+        };
+
+        // Trigger the event.
+        handle_notify_event_standalone(&mut items, &event);
+        assert_eq!(items["api__graph"].state, WatchState::Debouncing);
+
+        // Wait for debounce.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
+
+        // BuildGraph kind goes straight to Idle (no rebuild cycle).
+        assert_eq!(items["api__graph"].state, WatchState::Idle);
+
+        // Should receive BuildGraphChanged with the service name (not the __graph suffix).
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(
+            matches!(cmd, RunnerCommand::BuildGraphChanged { ref name } if name == "api"),
+            "expected BuildGraphChanged for 'api', got different command"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_graph_kind_no_rebuild_cycle() {
+        // Build graph changes should NOT enter the Rebuilding state.
+        // They go Idle -> Debouncing -> Idle (fire) directly.
+        tokio::time::pause();
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(64);
+
+        let mut items = HashMap::new();
+        items.insert(
+            "web__graph".to_string(),
+            WatchedItem {
+                state: WatchState::Idle,
+                debounce_duration: Duration::from_millis(200),
+                debounce_deadline: None,
+                stale: false,
+                kind: WatchItemKind::BuildGraph,
+                patterns: vec![Pattern::new("**/package.json").unwrap()],
+                ignore_patterns: vec![],
+            },
+        );
+
+        let event = notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![PathBuf::from("apps/web/package.json")],
+            attrs: Default::default(),
+        };
+
+        handle_notify_event_standalone(&mut items, &event);
+        tokio::time::advance(Duration::from_millis(200)).await;
+        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
+
+        // Should be back to Idle, not Rebuilding.
+        assert_eq!(items["web__graph"].state, WatchState::Idle);
+        // And stale should still be false.
+        assert!(!items["web__graph"].stale);
     }
 }

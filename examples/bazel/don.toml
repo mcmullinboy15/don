@@ -1,0 +1,15 @@
+# Bazel integration example — demonstrates automatic watch path resolution
+# with zero-downtime proxy.
+#
+# Don queries `bazel query` at startup to determine which source packages
+# feed into the target, and watches those directories for changes.
+#
+# The proxy listens on :8080 and forwards to the service on an ephemeral port.
+# On rebuild, the proxy queues new connections while the service restarts —
+# no dropped requests.
+#
+# Run with: cargo run -- -c examples/bazel/don.toml
+
+[services.api]
+bazel.target = "//services/api:api"
+proxy = { listen = "127.0.0.1:8080", env = "PORT" }

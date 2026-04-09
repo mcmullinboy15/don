@@ -1,0 +1,12 @@
+{
+  "name": "@example/web",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "node src/server.js",
+    "build": "echo 'Building @example/web'"
+  },
+  "dependencies": {
+    "@example/utils": "*"
+  }
+}

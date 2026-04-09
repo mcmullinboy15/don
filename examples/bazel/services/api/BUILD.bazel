@@ -1,0 +1,9 @@
+load("@rules_python//python:py_binary.bzl", "py_binary")
+
+py_binary(
+    name = "api",
+    srcs = glob(["src/**/*.py"]),
+    main = "src/main.py",
+    deps = ["//libs/common"],
+    visibility = ["//visibility:public"],
+)

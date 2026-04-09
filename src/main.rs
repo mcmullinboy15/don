@@ -2,7 +2,7 @@
 #![allow(clippy::print_stdout)]
 
 use clap::{Parser, Subcommand};
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use don::client::{Client, ClientError};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
 use std::path::{Path, PathBuf};
@@ -43,7 +43,11 @@ enum Commands {
         name: String,
     },
     /// Show status of all services and tasks
-    Status,
+    Status {
+        /// Show detailed info: watch paths, ports, build tool targets, commands
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// View logs for a service or task
     Logs {
         /// Name of the service or task
@@ -110,7 +114,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Restart { name } => {
             run_client(&config_path, |c| async move { c.restart(&name).await }).await
         }
-        Commands::Status => run_status(&config_path).await,
+        Commands::Status { verbose } => run_status(&config_path, verbose).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
@@ -145,11 +149,11 @@ where
     }
 }
 
-async fn run_status(config_path: &Path) -> i32 {
+async fn run_status(config_path: &Path, verbose: bool) -> i32 {
     let client = client_for(config_path);
-    match client.status().await {
+    match client.status(verbose).await {
         Ok(items) => {
-            print_status_table(&items);
+            print_status_table(&items, verbose);
             0
         }
         Err(e) => {
@@ -217,7 +221,7 @@ async fn run_attach(config_path: &Path, name: &str) -> i32 {
     }
 }
 
-fn print_status_table(items: &[ItemStatus]) {
+fn print_status_table(items: &[ItemStatus], verbose: bool) {
     if items.is_empty() {
         println!("(no services or tasks)");
         return;
@@ -245,12 +249,12 @@ fn print_status_table(items: &[ItemStatus]) {
 
     println!("{:<kind_w$}  {:<name_w$}  STATE", "KIND", "NAME");
     for item in items {
-        let (kind, name, state_str, color) = match item {
-            ItemStatus::Service { name, state } => {
-                ("service", name.as_str(), service_state_label(*state), service_state_color(*state))
+        let (kind, name, state_str, color, verbose_info) = match item {
+            ItemStatus::Service { name, state, verbose } => {
+                ("service", name.as_str(), service_state_label(*state), service_state_color(*state), verbose.as_ref())
             }
-            ItemStatus::Task { name, state } => {
-                ("task", name.as_str(), task_state_label(*state), task_state_color(*state))
+            ItemStatus::Task { name, state, verbose } => {
+                ("task", name.as_str(), task_state_label(*state), task_state_color(*state), verbose.as_ref())
             }
         };
         println!(
@@ -261,6 +265,47 @@ fn print_status_table(items: &[ItemStatus]) {
             state_str,
             ResetColor,
         );
+
+        if verbose
+            && let Some(info) = verbose_info
+        {
+            print_verbose_info(info);
+        }
+    }
+}
+
+/// Print verbose details for a single item, indented under the status line.
+#[allow(clippy::print_stdout)]
+fn print_verbose_info(info: &don::runner::VerboseInfo) {
+    let dim = SetAttribute(Attribute::Dim);
+    let reset = SetAttribute(Attribute::Reset);
+
+    if let Some(ref cmd) = info.cmd {
+        println!("  {dim}cmd:{reset}    {cmd}");
+    }
+    if !info.depends_on.is_empty() {
+        println!("  {dim}deps:{reset}   {}", info.depends_on.join(", "));
+    }
+    if !info.listen.is_empty() {
+        println!("  {dim}listen:{reset} {}", info.listen.join(", "));
+    }
+    if !info.proxy.is_empty() {
+        println!("  {dim}proxy:{reset}  {}", info.proxy.join(", "));
+    }
+    if let Some(ref ready) = info.ready {
+        println!("  {dim}ready:{reset}  {ready}");
+    }
+    if let Some(ref target) = info.bazel_target {
+        println!("  {dim}bazel:{reset}  {target}");
+    }
+    if let Some(ref task) = info.turbo_task {
+        println!("  {dim}turbo:{reset}  {task}");
+    }
+    if !info.watch.is_empty() {
+        println!("  {dim}watch:{reset}  {}", info.watch.first().unwrap_or(&String::new()));
+        for pattern in info.watch.iter().skip(1) {
+            println!("         {pattern}");
+        }
     }
 }
 

@@ -380,6 +380,8 @@ fn integration_task_download_resolves_cmd() {
             log: don::config::LogConfig::Stdout,
             auto_rerun: true,
             download: Some(download),
+            bazel: None,
+            turbo: None,
         };
         let resolved = task
             .resolved_cmd(Platform::current().unwrap(), "test", Some(&cache_base))

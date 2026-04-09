@@ -333,7 +333,7 @@ async fn wait_for_socket(base: &std::path::Path, timeout: Duration) -> bool {
 /// Helper: get service names from status API.
 async fn get_service_names(base: &std::path::Path) -> Vec<String> {
     let client = Client::new(base);
-    match client.status().await {
+    match client.status(false).await {
         Ok(items) => items
             .iter()
             .filter_map(|item| match item {
@@ -348,7 +348,7 @@ async fn get_service_names(base: &std::path::Path) -> Vec<String> {
 /// Helper: get a service's state string.
 async fn get_service_state(base: &std::path::Path, name: &str) -> Option<String> {
     let client = Client::new(base);
-    let items = client.status().await.ok()?;
+    let items = client.status(false).await.ok()?;
     items.iter().find_map(|item| match item {
         ItemStatus::Service {
             name: n, state, ..

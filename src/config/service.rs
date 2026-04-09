@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use super::download::{DownloadConfig, default_cache_base};
 use super::platform::Platform;
 use super::types::{
-    Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig, deserialize_proxy,
-    deserialize_proxy_option,
+    BazelConfig, Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig, TurboConfig,
+    deserialize_proxy, deserialize_proxy_option,
 };
 
 /// A long-running service. Uses exactly one preset: docker, rust, or custom (run).
@@ -58,6 +58,13 @@ pub struct Service {
     #[serde(default)]
     pub platform: HashMap<Platform, ServiceOverride>,
 
+    /// Bazel build tool integration — auto-resolve watch patterns from the build graph.
+    /// Mutually exclusive with `turbo`.
+    pub bazel: Option<BazelConfig>,
+    /// Turborepo build tool integration — auto-resolve watch patterns from the task graph.
+    /// Mutually exclusive with `bazel`.
+    pub turbo: Option<TurboConfig>,
+
     // -- Preset: docker --
     pub docker: Option<DockerConfig>,
 
@@ -95,6 +102,8 @@ pub struct ServiceOverride {
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
     pub log: Option<LogConfig>,
+    pub bazel: Option<BazelConfig>,
+    pub turbo: Option<TurboConfig>,
 
     pub docker: Option<DockerConfig>,
     pub rust: Option<RustConfig>,
@@ -104,7 +113,7 @@ pub struct ServiceOverride {
 }
 
 /// A fully resolved service with platform overrides applied.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResolvedService {
     pub dir: Option<PathBuf>,
     pub env: HashMap<String, String>,
@@ -120,6 +129,8 @@ pub struct ResolvedService {
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
     pub log: LogConfig,
+    pub bazel: Option<BazelConfig>,
+    pub turbo: Option<TurboConfig>,
 
     pub docker: Option<DockerConfig>,
     pub rust: Option<RustConfig>,
@@ -254,7 +265,26 @@ impl Service {
     }
 
     /// Resolve the service for a specific platform, applying overrides if present.
+    /// If the service has a build tool config but no run command, one is synthesized
+    /// (e.g. the bazel binary path or `npx turbo run <task> --filter=<pkg>`).
     pub fn resolve(&self, platform: Platform) -> ResolvedService {
+        let mut resolved = self.resolve_inner(platform);
+        resolved.ensure_build_tool_run_cmd(None);
+        resolved
+    }
+
+    /// Resolve with a known Bazel binary path (from `bazel cquery`).
+    pub fn resolve_with_bazel_binary(
+        &self,
+        platform: Platform,
+        bazel_binary: &str,
+    ) -> ResolvedService {
+        let mut resolved = self.resolve_inner(platform);
+        resolved.ensure_build_tool_run_cmd(Some(bazel_binary));
+        resolved
+    }
+
+    fn resolve_inner(&self, platform: Platform) -> ResolvedService {
         match self.platform.get(&platform) {
             None => ResolvedService {
                 dir: self.dir.clone(),
@@ -271,6 +301,8 @@ impl Service {
                 ready: self.ready.clone(),
                 shutdown: self.shutdown.clone(),
                 log: self.log.clone(),
+                bazel: self.bazel.clone(),
+                turbo: self.turbo.clone(),
                 docker: self.docker.clone(),
                 rust: self.rust.clone(),
                 go: self.go.clone(),
@@ -322,6 +354,8 @@ impl Service {
                     ready: ov.ready.clone().or_else(|| self.ready.clone()),
                     shutdown: ov.shutdown.clone().or_else(|| self.shutdown.clone()),
                     log: ov.log.clone().unwrap_or_else(|| self.log.clone()),
+                    bazel: ov.bazel.clone().or_else(|| self.bazel.clone()),
+                    turbo: ov.turbo.clone().or_else(|| self.turbo.clone()),
                     docker,
                     rust,
                     go,
@@ -335,8 +369,52 @@ impl Service {
 
 impl ResolvedService {
     /// Resolve which preset this resolved service uses.
+    ///
+    /// If the service has a `bazel.target` but no explicit preset, this
+    /// synthesizes a `run` command of `bazel run <target>`. Similarly for
+    /// `turbo` with a filter, it synthesizes `npx turbo run <task> --filter=<filter>`.
     pub fn preset(&self) -> Result<Preset<'_>, String> {
+        // If no preset is set but a build tool target is configured,
+        // the run command was synthesized by `ensure_build_tool_run_cmd`.
         resolve_preset(&self.docker, &self.rust, &self.go, &self.run, &self.build)
+    }
+
+    /// If the service has a build tool config but no run command, synthesize one.
+    ///
+    /// For Bazel: if `bazel_binary` is provided (resolved via `bazel cquery`),
+    /// runs the binary directly. Otherwise falls back to `bazel run <target>`.
+    /// For Turbo: synthesizes `npx turbo run <task> --filter=<filter>`.
+    pub(crate) fn ensure_build_tool_run_cmd(&mut self, bazel_binary: Option<&str>) {
+        if self.run.is_some() || self.docker.is_some() || self.rust.is_some() || self.go.is_some() {
+            return;
+        }
+        if let Some(ref bazel) = self.bazel {
+            if let Some(bin_path) = bazel_binary {
+                self.run = Some(Command {
+                    cmd: bin_path.to_string(),
+                    args: Vec::new(),
+                });
+            } else {
+                // Fallback: use bazel run (slower — does a build check each time)
+                self.run = Some(Command {
+                    cmd: "bazel".to_string(),
+                    args: vec!["run".to_string(), bazel.target.clone()],
+                });
+            }
+        } else if let Some(ref turbo) = self.turbo
+            && let Some(ref filter) = turbo.filter
+        {
+            self.run = Some(Command {
+                cmd: "npx".to_string(),
+                args: vec![
+                    "turbo".to_string(),
+                    "run".to_string(),
+                    turbo.task.clone(),
+                    "--filter".to_string(),
+                    filter.clone(),
+                ],
+            });
+        }
     }
 
     /// Resolve the run command for a custom service, taking downloads into account.

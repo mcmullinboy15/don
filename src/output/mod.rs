@@ -16,7 +16,7 @@ pub(crate) mod sanitize;
 use bytes::Bytes;
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use ring_buffer::RingBuffer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -658,6 +658,10 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
 
     // Per-service line accumulator, keyed by prefix bytes.
     let mut accumulators: HashMap<Bytes, BytesMut> = HashMap::new();
+    // Track which accumulators just flushed via \r. When a \n immediately
+    // follows a \r, the resulting empty line is suppressed — the \r already
+    // flushed the content.
+    let mut cr_flushed: HashSet<Bytes> = HashSet::new();
 
     while let Some(msg) = rx.recv().await {
         let acc = accumulators.entry(msg.prefix.clone()).or_default();
@@ -670,22 +674,50 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 if acc.last() == Some(&b'\r') {
                     acc.truncate(acc.len() - 1); // remove \r
                 }
-                let sanitized = if msg.prefix.is_empty() {
-                    acc.to_vec()
-                } else {
-                    sanitize::sanitize_terminal_output(acc)
-                };
-                write_prefixed_line(&mut writer, &msg.prefix, &sanitized, verbose, start).await;
+                // Suppress empty lines that follow a \r flush — the content
+                // was already written when \r was processed.
+                let is_empty_after_cr = acc.is_empty() && cr_flushed.remove(&msg.prefix);
+                if !is_empty_after_cr {
+                    cr_flushed.remove(&msg.prefix);
+                    let sanitized = if msg.prefix.is_empty() {
+                        acc.to_vec()
+                    } else {
+                        sanitize::sanitize_terminal_output(acc)
+                    };
+                    write_prefixed_line(&mut writer, &msg.prefix, &sanitized, verbose, start).await;
+                }
                 acc.clear();
-            } else if acc.len() >= MAX_LINE {
-                // Overflow — flush without stripping.
-                let sanitized = if msg.prefix.is_empty() {
-                    acc.to_vec()
-                } else {
-                    sanitize::sanitize_terminal_output(acc)
-                };
-                write_prefixed_line(&mut writer, &msg.prefix, &sanitized, verbose, start).await;
+            } else if byte == b'\r' {
+                // Bare carriage return (no \n) — programs like Bazel use
+                // \r to overwrite progress lines in-place. Treat as a line
+                // boundary so each progress update gets prefixed correctly.
+                acc.truncate(acc.len() - 1); // remove \r
+                if !acc.is_empty() {
+                    let sanitized = if msg.prefix.is_empty() {
+                        acc.to_vec()
+                    } else {
+                        sanitize::sanitize_terminal_output(acc)
+                    };
+                    write_prefixed_line(
+                        &mut writer, &msg.prefix, &sanitized, verbose, start,
+                    )
+                    .await;
+                }
                 acc.clear();
+                cr_flushed.insert(msg.prefix.clone());
+            } else {
+                // Non-control byte — any pending \r suppression is stale.
+                cr_flushed.remove(&msg.prefix);
+                if acc.len() >= MAX_LINE {
+                    // Overflow — flush without stripping.
+                    let sanitized = if msg.prefix.is_empty() {
+                        acc.to_vec()
+                    } else {
+                        sanitize::sanitize_terminal_output(acc)
+                    };
+                    write_prefixed_line(&mut writer, &msg.prefix, &sanitized, verbose, start).await;
+                    acc.clear();
+                }
             }
         }
     }

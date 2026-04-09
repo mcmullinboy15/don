@@ -24,12 +24,25 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .with_state(state)
 }
 
+/// Query params for the status endpoint.
+#[derive(serde::Deserialize)]
+struct StatusQuery {
+    #[serde(default)]
+    verbose: bool,
+}
+
 /// `GET /status` — list all services/tasks and their current state.
-async fn get_status(State(state): State<Arc<ApiState>>) -> Response {
+async fn get_status(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<StatusQuery>,
+) -> Response {
     let (tx, rx) = oneshot::channel();
     if state
         .cmd_tx
-        .send(RunnerCommand::Status { reply: tx })
+        .send(RunnerCommand::Status {
+            verbose: query.verbose,
+            reply: tx,
+        })
         .await
         .is_err()
     {

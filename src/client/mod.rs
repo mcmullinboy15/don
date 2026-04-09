@@ -82,8 +82,13 @@ impl Client {
     }
 
     /// `GET /status`
-    pub async fn status(&self) -> Result<Vec<ItemStatus>, ClientError> {
-        let (status, body) = self.request("GET", "/status", false).await?;
+    pub async fn status(&self, verbose: bool) -> Result<Vec<ItemStatus>, ClientError> {
+        let path = if verbose {
+            "/status?verbose=true"
+        } else {
+            "/status"
+        };
+        let (status, body) = self.request("GET", path, false).await?;
         ensure_ok(status, &body)?;
         let parsed: StatusResponse = serde_json::from_slice(&body)?;
         Ok(parsed.items)

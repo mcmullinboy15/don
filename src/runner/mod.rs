@@ -159,6 +159,7 @@ pub enum RunnerCommand {
     TaskRerun { name: String },
     /// Query the status of all services and tasks.
     Status {
+        verbose: bool,
         reply: oneshot::Sender<Vec<ItemStatus>>,
     },
     /// Read the last N lines from a service or task's ring buffer.
@@ -177,6 +178,9 @@ pub enum RunnerCommand {
     },
     /// Reload the config file (triggered by file watcher on don.toml).
     ConfigReload,
+    /// Build graph definition files changed (BUILD, package.json, etc.).
+    /// Triggers a re-query of the build tool to update watch patterns.
+    BuildGraphChanged { name: String },
     /// Retry starting any Pending services/tasks whose deps are now satisfied.
     /// Sent by `handle_config_reload` after a delay so newly-spawned deps
     /// have time to pass their ready checks.
@@ -208,22 +212,56 @@ pub struct AttachSession {
 
 /// A pending attach waiter — registered when a client wants to attach
 /// to a service/task that isn't running yet.
-struct AttachWaiter {
-    pid: u32,
-    reply: oneshot::Sender<Result<AttachSession, CommandError>>,
-}
-
-/// Tracks a running task's process group.
-struct RunningTask {
-    pgid: i32,
+pub(crate) struct AttachWaiter {
+    pub(crate) pid: u32,
+    pub(crate) reply: oneshot::Sender<Result<AttachSession, CommandError>>,
 }
 
 /// Status of a single item (service or task) for status queries.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ItemStatus {
-    Service { name: String, state: ServiceState },
-    Task { name: String, state: TaskItemState },
+    Service {
+        name: String,
+        state: ServiceState,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        verbose: Option<VerboseInfo>,
+    },
+    Task {
+        name: String,
+        state: TaskItemState,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        verbose: Option<VerboseInfo>,
+    },
+}
+
+/// Extended information for verbose status display.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VerboseInfo {
+    /// Services/tasks this item depends on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// File watch patterns (explicit or resolved from build tool).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch: Vec<String>,
+    /// Listen addresses (LISTEN_FDS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen: Vec<String>,
+    /// Proxy listen addresses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy: Vec<String>,
+    /// Bazel target (if configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bazel_target: Option<String>,
+    /// Turbo task (if configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turbo_task: Option<String>,
+    /// Ready check description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
+    /// Run command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
 }
 
 /// An event broadcast from the runner for external consumers.
@@ -436,6 +474,58 @@ pub(crate) fn compute_depths(
     depths
 }
 
+/// All per-service runtime state, consolidated into a single struct.
+///
+/// Each running service gets one `RuntimeService` in `Runner::services`.
+/// This replaces the many separate `HashMap<String, _>` fields that previously
+/// tracked each aspect of service state independently.
+pub(crate) struct RuntimeService {
+    /// The fully resolved service config (platform overrides applied once).
+    pub resolved: crate::config::service::ResolvedService,
+    /// Current lifecycle state (Pending, Starting, Running, Ready, etc.).
+    pub state: ServiceState,
+    /// Handle to the running process (if spawned).
+    pub handle: Option<ServiceHandle>,
+    /// OSC query sink for reclaiming PTY write on attach.
+    pub osc_sink: Option<crate::output::OscSinkHandle>,
+    /// PID of the client holding the interactive attach lock.
+    pub attach_lock: Option<u32>,
+    /// Pending attach waiter (client waiting for process to start).
+    pub attach_waiter: Option<AttachWaiter>,
+    /// Bound TCP sockets (LISTEN_FDS) — outlive restarts.
+    pub bound_sockets: Option<crate::process::socket::BoundSockets>,
+    /// TCP proxy listener — outlives restarts.
+    pub proxy: Option<crate::proxy::ServiceProxy>,
+    /// Watch paths resolved from build tool queries (bazel/turbo).
+    pub resolved_watch_paths: Vec<String>,
+    /// Bazel binary path resolved via `bazel cquery --output=files`.
+    pub bazel_binary_path: Option<String>,
+    /// Whether this service was built during the batch build phase.
+    pub batch_built: bool,
+}
+
+/// All per-task runtime state, consolidated into a single struct.
+///
+/// Each task gets one `RuntimeTask` in `Runner::tasks`.
+/// This replaces the many separate `HashMap<String, _>` fields that previously
+/// tracked each aspect of task state independently.
+pub(crate) struct RuntimeTask {
+    /// The task config (stored once, no repeated lookups).
+    pub config: crate::config::task::Task,
+    /// Current lifecycle state (Pending, Running, Completed, etc.).
+    pub state: TaskItemState,
+    /// Process group ID of the running task (for shutdown kills).
+    pub pgid: Option<i32>,
+    /// OSC query sink for reclaiming PTY write on attach.
+    pub osc_sink: Option<crate::output::OscSinkHandle>,
+    /// PID of the client holding the interactive attach lock.
+    pub attach_lock: Option<u32>,
+    /// Pending attach waiter (client waiting for process to start).
+    pub attach_waiter: Option<AttachWaiter>,
+    /// Watch paths resolved from build tool queries (bazel/turbo).
+    pub resolved_watch_paths: Vec<String>,
+}
+
 /// The main runner that orchestrates services and tasks.
 pub struct Runner {
     config: Config,
@@ -445,39 +535,15 @@ pub struct Runner {
     base_dir: PathBuf,
     task_state: TaskState,
 
-    // State tracking — owned by the runner, no Arc<Mutex<>>.
-    service_states: HashMap<String, ServiceState>,
-    task_states: HashMap<String, TaskItemState>,
-    service_handles: HashMap<String, ServiceHandle>,
-
-    /// OSC sink handles for services/tasks. Used to reclaim the PTY write
-    /// handle when attach is requested.
-    osc_sinks: HashMap<String, crate::output::OscSinkHandle>,
-
-    /// Tracks which PID holds the interactive attach lock for each service/task.
-    attach_locks: HashMap<String, u32>,
-
-    /// Pending attach waiters — clients waiting for a process to start.
-    /// When a service/task spawns, the runner checks this map and fulfills
-    /// the attach request immediately.
-    attach_waiters: HashMap<String, AttachWaiter>,
-
-    /// Bound TCP sockets for services with `listen` addresses.
-    /// Outlive service restarts — don holds the sockets so ports are never released.
-    bound_sockets: HashMap<String, crate::process::socket::BoundSockets>,
-
-    /// TCP proxy listeners for services with `proxy` config.
-    /// Outlive service restarts — Don holds the listening sockets.
-    service_proxies: HashMap<String, crate::proxy::ServiceProxy>,
+    /// Consolidated per-service runtime state.
+    services: HashMap<String, RuntimeService>,
+    /// Consolidated per-task runtime state.
+    tasks: HashMap<String, RuntimeTask>,
 
     /// Receives service names when a lazy service's proxy gets its first connection.
     lazy_start_rx: mpsc::Receiver<String>,
     /// Sender half kept for passing to ServiceProxy::bind.
     lazy_start_tx: mpsc::Sender<String>,
-
-    /// Running task state. Tracks the PGID (for shutdown kills) and
-    /// optionally holds the PTY write half (for interactive attach).
-    running_tasks: HashMap<String, RunningTask>,
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -500,6 +566,28 @@ pub struct Runner {
 
     // Don's own PID file
     _don_pid_file: Option<PidFile>,
+
+    /// Sender for pushing watch pattern updates to the WatchManager.
+    /// Used after build tool re-queries to update tier-2 watch patterns.
+    watch_update_tx: Option<mpsc::Sender<crate::watch::WatchUpdate>>,
+
+    /// Mutex to serialize Bazel build invocations. Concurrent `bazel build`
+    /// commands contend for Bazel's server lock, so we queue them.
+    bazel_build_mutex: tokio::sync::Mutex<()>,
+
+    /// Services queued for a batched build-tool rebuild (file watch triggered).
+    /// Collected during a short batch window, then flushed as one build command.
+    pending_bt_rebuilds: Vec<String>,
+    /// Deadline for flushing the pending build-tool rebuild batch.
+    /// When this expires, all pending rebuilds are built in one invocation.
+    bt_rebuild_deadline: Option<tokio::time::Instant>,
+
+    /// Services/tasks queued for a batched build-graph re-query.
+    /// When BUILD/package.json files change, affected items are collected here
+    /// and flushed after a short window to avoid redundant concurrent queries.
+    pending_graph_requery: Vec<String>,
+    /// Deadline for flushing the pending graph re-query batch.
+    bt_requery_deadline: Option<tokio::time::Instant>,
 }
 
 impl Runner {
@@ -587,19 +675,19 @@ impl Runner {
             None // all items
         };
 
-        let mut service_states = HashMap::new();
-        for name in config.services.keys() {
-            if active_items.as_ref().is_none_or(|s| s.contains(name)) {
-                service_states.insert(name.clone(), ServiceState::Pending);
-            }
-        }
+        let active_services: HashSet<String> = config
+            .services
+            .keys()
+            .filter(|name| active_items.as_ref().is_none_or(|s| s.contains(*name)))
+            .cloned()
+            .collect();
 
-        let mut task_item_states = HashMap::new();
-        for name in config.tasks.keys() {
-            if active_items.as_ref().is_none_or(|s| s.contains(name)) {
-                task_item_states.insert(name.clone(), TaskItemState::Pending);
-            }
-        }
+        let active_tasks: HashSet<String> = config
+            .tasks
+            .keys()
+            .filter(|name| active_items.as_ref().is_none_or(|s| s.contains(*name)))
+            .cloned()
+            .collect();
 
         // Prune download cache entries that aren't referenced by the current
         // config. Collects (owner_name, composite_hash) pairs.
@@ -630,6 +718,47 @@ impl Runner {
             ));
         }
 
+        // Build consolidated runtime state maps.
+        let mut services = HashMap::new();
+        for (name, svc) in &config.services {
+            if active_services.contains(name) {
+                services.insert(
+                    name.clone(),
+                    RuntimeService {
+                        resolved: svc.resolve(platform),
+                        state: ServiceState::Pending,
+                        handle: None,
+                        osc_sink: None,
+                        attach_lock: None,
+                        attach_waiter: None,
+                        bound_sockets: None,
+                        proxy: None,
+                        resolved_watch_paths: Vec::new(),
+                        bazel_binary_path: None,
+                        batch_built: false,
+                    },
+                );
+            }
+        }
+
+        let mut tasks = HashMap::new();
+        for (name, task) in &config.tasks {
+            if active_tasks.contains(name) {
+                tasks.insert(
+                    name.clone(),
+                    RuntimeTask {
+                        config: task.clone(),
+                        state: TaskItemState::Pending,
+                        pgid: None,
+                        osc_sink: None,
+                        attach_lock: None,
+                        attach_waiter: None,
+                        resolved_watch_paths: Vec::new(),
+                    },
+                );
+            }
+        }
+
         Ok(Self {
             config,
             config_path,
@@ -637,17 +766,10 @@ impl Runner {
             output_manager,
             base_dir,
             task_state,
-            service_states,
-            task_states: task_item_states,
-            service_handles: HashMap::new(),
-            osc_sinks: HashMap::new(),
-            attach_locks: HashMap::new(),
-            attach_waiters: HashMap::new(),
-            bound_sockets: HashMap::new(),
-            service_proxies: HashMap::new(),
+            services,
+            tasks,
             lazy_start_rx,
             lazy_start_tx,
-            running_tasks: HashMap::new(),
             server_shutdown_tx: None,
             docker_client,
             cmd_tx,
@@ -656,6 +778,12 @@ impl Runner {
             done_tx: None,
             shutdown_rx,
             _don_pid_file: Some(don_pid_file),
+            watch_update_tx: None,
+            bazel_build_mutex: tokio::sync::Mutex::new(()),
+            pending_bt_rebuilds: Vec::new(),
+            bt_rebuild_deadline: None,
+            pending_graph_requery: Vec::new(),
+            bt_requery_deadline: None,
         })
     }
 
@@ -669,17 +797,87 @@ impl Runner {
         self.event_tx.subscribe()
     }
 
-    /// Build the dependency map from the config (for topological sorting).
     fn build_dep_map(&self) -> HashMap<String, Vec<String>> {
         let mut deps = HashMap::new();
-        for (name, svc) in &self.config.services {
-            let resolved = svc.resolve(self.platform);
-            deps.insert(name.clone(), resolved.depends_on);
+        for (name, rs) in &self.services {
+            deps.insert(name.clone(), rs.resolved.depends_on.clone());
         }
-        for (name, task) in &self.config.tasks {
-            deps.insert(name.clone(), task.depends_on.clone());
+        for (name, rt) in &self.tasks {
+            deps.insert(name.clone(), rt.config.depends_on.clone());
         }
         deps
+    }
+
+    /// Look up the attach lock for a service or task by name.
+    fn get_attach_lock(&self, name: &str) -> Option<u32> {
+        self.services
+            .get(name)
+            .and_then(|rs| rs.attach_lock)
+            .or_else(|| self.tasks.get(name).and_then(|rt| rt.attach_lock))
+    }
+
+    /// Get a mutable reference to the OSC sink option for a service or task.
+    fn get_osc_sink_mut(&mut self, name: &str) -> Option<&mut Option<crate::output::OscSinkHandle>> {
+        if let Some(rs) = self.services.get_mut(name) {
+            Some(&mut rs.osc_sink)
+        } else if let Some(rt) = self.tasks.get_mut(name) {
+            Some(&mut rt.osc_sink)
+        } else {
+            None
+        }
+    }
+
+    /// Remove the attach lock for a service or task, returning whether it was set.
+    fn remove_attach_lock(&mut self, name: &str) -> bool {
+        if let Some(rs) = self.services.get_mut(name) {
+            return rs.attach_lock.take().is_some();
+        }
+        if let Some(rt) = self.tasks.get_mut(name) {
+            return rt.attach_lock.take().is_some();
+        }
+        false
+    }
+
+    /// Set the attach lock for a service or task.
+    fn set_attach_lock(&mut self, name: &str, pid: u32) {
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.attach_lock = Some(pid);
+        } else if let Some(rt) = self.tasks.get_mut(name) {
+            rt.attach_lock = Some(pid);
+        }
+    }
+
+    /// Check if there is a pending attach waiter for a service or task.
+    fn has_attach_waiter(&self, name: &str) -> bool {
+        self.services
+            .get(name)
+            .is_some_and(|rs| rs.attach_waiter.is_some())
+            || self
+                .tasks
+                .get(name)
+                .is_some_and(|rt| rt.attach_waiter.is_some())
+    }
+
+    /// Take the pending attach waiter for a service or task.
+    fn take_attach_waiter(&mut self, name: &str) -> Option<AttachWaiter> {
+        if let Some(rs) = self.services.get_mut(name)
+            && rs.attach_waiter.is_some()
+        {
+            return rs.attach_waiter.take();
+        }
+        if let Some(rt) = self.tasks.get_mut(name) {
+            return rt.attach_waiter.take();
+        }
+        None
+    }
+
+    /// Set a pending attach waiter for a service or task.
+    fn set_attach_waiter(&mut self, name: &str, waiter: AttachWaiter) {
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.attach_waiter = Some(waiter);
+        } else if let Some(rt) = self.tasks.get_mut(name) {
+            rt.attach_waiter = Some(waiter);
+        }
     }
 
     /// Run the orchestrator: start all services and tasks in dependency order.
@@ -709,37 +907,37 @@ impl Runner {
         // Pre-bind all declared listen ports before starting any services.
         // This catches port conflicts (port already in use, duplicate ports
         // across services) upfront rather than failing mid-startup.
-        let listen_services: Vec<(String, crate::config::ResolvedService)> = self
-            .config
+        let listen_service_names: Vec<String> = self
             .services
             .iter()
-            .filter(|(name, _)| self.service_states.contains_key(*name))
-            .map(|(name, svc)| (name.clone(), svc.resolve(self.platform)))
-            .filter(|(_, resolved)| !resolved.listen.is_empty())
+            .filter(|(_, rs)| !rs.resolved.listen.is_empty())
+            .map(|(name, _)| name.clone())
             .collect();
-        for (name, resolved) in &listen_services {
-            if let Err(msg) = self.bind_sockets_if_needed(name, resolved) {
+        for name in &listen_service_names {
+            if let Err(msg) = self.bind_sockets_if_needed(name) {
                 return Err(RunnerError::Config(msg));
             }
         }
 
         // Pre-bind all proxy listeners. This catches port conflicts upfront
         // and starts the accept loops (connections queue until the service is ready).
-        let proxy_services: Vec<(String, crate::config::ResolvedService)> = self
-            .config
+        let proxy_service_names: Vec<(String, bool)> = self
             .services
             .iter()
-            .filter(|(name, _)| self.service_states.contains_key(*name))
-            .map(|(name, svc)| (name.clone(), svc.resolve(self.platform)))
-            .filter(|(_, resolved)| !resolved.proxy.is_empty())
+            .filter(|(_, rs)| !rs.resolved.proxy.is_empty())
+            .map(|(name, rs)| (name.clone(), rs.resolved.lazy))
             .collect();
-        for (name, resolved) in &proxy_services {
-            let lazy_tx = if resolved.lazy {
+        for (name, is_lazy) in &proxy_service_names {
+            let proxy_config = match self.services.get(name) {
+                Some(rs) => rs.resolved.proxy.clone(),
+                None => continue,
+            };
+            let lazy_tx = if *is_lazy {
                 Some(self.lazy_start_tx.clone())
             } else {
                 None
             };
-            match crate::proxy::ServiceProxy::bind(&resolved.proxy, lazy_tx, name).await {
+            match crate::proxy::ServiceProxy::bind(&proxy_config, lazy_tx, name).await {
                 Ok(proxy) => {
                     let addrs: Vec<String> =
                         proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
@@ -747,12 +945,13 @@ impl Runner {
                         "{name}: proxy listening on {}",
                         addrs.join(", ")
                     ));
-                    self.service_proxies.insert(name.clone(), proxy);
-                    // Set lazy services to Lazy state (they won't enter the
-                    // startup flow until triggered by a connection).
-                    if resolved.lazy {
-                        self.service_states
-                            .insert(name.clone(), ServiceState::Lazy);
+                    if let Some(rs) = self.services.get_mut(name) {
+                        rs.proxy = Some(proxy);
+                        // Set lazy services to Lazy state (they won't enter the
+                        // startup flow until triggered by a connection).
+                        if *is_lazy {
+                            rs.state = ServiceState::Lazy;
+                        }
                     }
                 }
                 Err(e) => {
@@ -796,6 +995,8 @@ impl Runner {
         // Start file watchers before spawning services so we don't miss
         // changes that happen during startup (slow ready checks, long builds, etc.).
         let mut _watch_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let (watch_update_tx, watch_update_rx) = mpsc::channel(64);
+        self.watch_update_tx = Some(watch_update_tx);
         match WatchManager::new(
             &self.config,
             self.platform,
@@ -803,6 +1004,7 @@ impl Runner {
             &self.config_path,
             self.cmd_tx.clone(),
             self.event_tx.subscribe(),
+            watch_update_rx,
         )
         .await
         {
@@ -822,6 +1024,47 @@ impl Runner {
             }
         }
 
+        // Resolve build tool watch patterns (bazel/turbo) at startup.
+        // This queries the build tools concurrently and sends the resolved
+        // watch paths to the WatchManager via the update channel.
+        let (build_tool_watches, bt_warnings) = self.resolve_build_tool_watches().await;
+        for warning in &bt_warnings {
+            self.output_manager.error_event(warning);
+        }
+        if let Some(ref tx) = self.watch_update_tx {
+            for (name, (paths, ignore)) in build_tool_watches {
+                // Store resolved watch paths on the runtime struct.
+                if let Some(rs) = self.services.get_mut(&name) {
+                    rs.resolved_watch_paths = paths.clone();
+                } else if let Some(rt) = self.tasks.get_mut(&name) {
+                    rt.resolved_watch_paths = paths.clone();
+                }
+                let kind = if self.services.contains_key(&name) {
+                    crate::watch::WatchItemKind::Service
+                } else {
+                    crate::watch::WatchItemKind::Task
+                };
+                let _ = tx
+                    .send(crate::watch::WatchUpdate {
+                        name,
+                        kind,
+                        patterns: paths,
+                        ignore_patterns: ignore,
+                        base_dir: self.base_dir.clone(),
+                    })
+                    .await;
+            }
+        }
+
+        // Run batch builds for build-tool-managed services/tasks.
+        // This runs ONE `bazel build` / `turbo run build` with all targets,
+        // letting the build tool parallelize internally.
+        self.run_batch_builds().await;
+
+        // Resolve Bazel binary paths for services that were successfully built.
+        // This uses `bazel cquery --output=files` to find the output binary,
+        // so we can run it directly instead of going through `bazel run`.
+        self.resolve_bazel_binary_paths().await;
 
         // Build dependency map and topological order.
         let dep_map = self.build_dep_map();
@@ -838,8 +1081,8 @@ impl Runner {
         let mut pending: HashSet<String> = order
             .iter()
             .filter(|name| {
-                self.service_states.contains_key(*name)
-                    || self.task_states.contains_key(*name)
+                self.services.contains_key(*name)
+                    || self.tasks.contains_key(*name)
             })
             .cloned()
             .collect();
@@ -856,9 +1099,9 @@ impl Runner {
             // Emit "all services running" once when startup is complete.
             if !all_started && pending.is_empty() && in_flight.is_empty() {
                 all_started = true;
-                let has_running_services = self.service_states.values().any(|s| {
+                let has_running_services = self.services.values().any(|rs| {
                     matches!(
-                        s,
+                        rs.state,
                         ServiceState::Running
                             | ServiceState::Ready
                             | ServiceState::Starting
@@ -894,8 +1137,8 @@ impl Runner {
                             self.initiate_shutdown().await;
                             break;
                         }
-                        RunnerCommand::Status { reply } => {
-                            let statuses = self.collect_status();
+                        RunnerCommand::Status { verbose, reply } => {
+                            let statuses = self.collect_status(verbose);
                             let _ = reply.send(statuses);
                         }
                         RunnerCommand::Logs { name, last_n, reply } => {
@@ -941,18 +1184,39 @@ impl Runner {
                         RunnerCommand::ConfigReload => {
                             self.handle_config_reload().await;
                         }
+                        RunnerCommand::BuildGraphChanged { name } => {
+                            self.handle_build_graph_changed(&name).await;
+                        }
                         RunnerCommand::StartPending => {
                             self.start_pending_items().await;
                         }
                     }
                 }
                 Some(name) = self.lazy_start_rx.recv() => {
-                    if self.service_states.get(&name) == Some(&ServiceState::Lazy) {
+                    if self.services.get(&name).is_some_and(|rs| rs.state == ServiceState::Lazy) {
                         self.output_manager.lifecycle_event(
                             &format!("{name}: first connection — starting service")
                         );
                         self.start_service(&name, done_tx.clone()).await?;
                     }
+                }
+                // Flush batched build-tool rebuilds when the batch window expires.
+                _ = async {
+                    match self.bt_rebuild_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.flush_pending_rebuilds().await;
+                }
+                // Flush batched build-graph re-queries when the batch window expires.
+                _ = async {
+                    match self.bt_requery_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.flush_pending_graph_requery().await;
                 }
                 _ = self.shutdown_rx.recv() => {
                     self.initiate_shutdown().await;
@@ -997,11 +1261,10 @@ impl Runner {
 
         for name in failed_items {
             pending.remove(&name);
-            if self.config.services.contains_key(&name) {
-                self.service_states
-                    .insert(name.clone(), ServiceState::Failed);
-            } else {
-                self.task_states.insert(name.clone(), TaskItemState::Failed);
+            if let Some(rs) = self.services.get_mut(&name) {
+                rs.state = ServiceState::Failed;
+            } else if let Some(rt) = self.tasks.get_mut(&name) {
+                rt.state = TaskItemState::Failed;
             }
             self.output_manager
                 .error_event(&format!("{name}: skipped (dependency failed)"));
@@ -1020,7 +1283,7 @@ impl Runner {
 
         for name in ready {
             // Skip lazy services — they start on first proxy connection.
-            if self.service_states.get(&name) == Some(&ServiceState::Lazy) {
+            if self.services.get(&name).is_some_and(|rs| rs.state == ServiceState::Lazy) {
                 pending.remove(&name);
                 continue;
             }
@@ -1028,9 +1291,9 @@ impl Runner {
             pending.remove(&name);
             in_flight.insert(name.clone());
 
-            if self.config.services.contains_key(&name) {
+            if self.services.contains_key(&name) {
                 self.start_service(&name, done_tx.clone()).await?;
-            } else if self.config.tasks.contains_key(&name) {
+            } else if self.tasks.contains_key(&name) {
                 self.start_task(&name, done_tx.clone()).await?;
             }
         }
@@ -1040,22 +1303,22 @@ impl Runner {
 
     /// Check if a dependency is satisfied (ready service or completed task).
     fn is_dep_satisfied(&self, dep: &str) -> bool {
-        if let Some(state) = self.service_states.get(dep) {
-            return state.is_satisfied();
+        if let Some(rs) = self.services.get(dep) {
+            return rs.state.is_satisfied();
         }
-        if let Some(state) = self.task_states.get(dep) {
-            return state.is_satisfied();
+        if let Some(rt) = self.tasks.get(dep) {
+            return rt.state.is_satisfied();
         }
         false
     }
 
     /// Check if a dependency has failed.
     fn is_dep_failed(&self, dep: &str) -> bool {
-        if let Some(state) = self.service_states.get(dep) {
-            return *state == ServiceState::Failed;
+        if let Some(rs) = self.services.get(dep) {
+            return rs.state == ServiceState::Failed;
         }
-        if let Some(state) = self.task_states.get(dep) {
-            return *state == TaskItemState::Failed;
+        if let Some(rt) = self.tasks.get(dep) {
+            return rt.state == TaskItemState::Failed;
         }
         false
     }
@@ -1066,14 +1329,16 @@ impl Runner {
         name: &str,
         done_tx: mpsc::Sender<ItemDone>,
     ) -> Result<(), RunnerError> {
-        self.service_states
-            .insert(name.to_string(), ServiceState::Starting);
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.state = ServiceState::Starting;
+        } else {
+            return Err(RunnerError::Config(format!("unknown service: {name}")));
+        }
 
-        let svc = match self.config.services.get(name) {
-            Some(s) => s,
+        let mut resolved = match self.services.get(name) {
+            Some(rs) => rs.resolved.clone(),
             None => return Err(RunnerError::Config(format!("unknown service: {name}"))),
         };
-        let mut resolved = svc.resolve(self.platform);
 
         self.output_manager
             .lifecycle_event(&format!("starting {name}..."));
@@ -1081,18 +1346,32 @@ impl Runner {
         // Phase 1: Bind listen sockets (idempotent — skips if already bound).
         // If the service has proxy entries, bind LISTEN_FDS sockets for the
         // ephemeral ports (for entries without env vars).
-        if let Some(proxy) = self.service_proxies.get(name) {
+        let has_proxy = self.services.get(name).is_some_and(|rs| rs.proxy.is_some());
+        if has_proxy {
+            let (proxy_env, listen_fds_addrs) = {
+                let rs = match self.services.get(name) {
+                    Some(rs) => rs,
+                    None => return Ok(()),
+                };
+                let proxy = match rs.proxy.as_ref() {
+                    Some(p) => p,
+                    None => return Ok(()),
+                };
+                (proxy.env_vars(), proxy.listen_fds_addrs())
+            };
             // Inject proxy env vars (for entries with env: Some("PORT")).
-            let proxy_env = proxy.env_vars();
             resolved.env.extend(proxy_env);
             // For LISTEN_FDS mode entries, use the proxy's ephemeral addresses.
-            let listen_fds_addrs = proxy.listen_fds_addrs();
             if !listen_fds_addrs.is_empty() {
                 // Replace any previously bound sockets with new ephemeral ones.
-                self.bound_sockets.remove(name);
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.bound_sockets = None;
+                }
                 match crate::process::socket::bind_sockets(&listen_fds_addrs) {
                     Ok(sockets) => {
-                        self.bound_sockets.insert(name.to_string(), sockets);
+                        if let Some(rs) = self.services.get_mut(name) {
+                            rs.bound_sockets = Some(sockets);
+                        }
                     }
                     Err(e) => {
                         self.fail_service_start(
@@ -1105,7 +1384,7 @@ impl Runner {
                     }
                 }
             }
-        } else if let Err(msg) = self.bind_sockets_if_needed(name, &resolved) {
+        } else if let Err(msg) = self.bind_sockets_if_needed(name) {
             self.fail_service_start(name, &msg, done_tx).await;
             return Ok(());
         }
@@ -1131,19 +1410,23 @@ impl Runner {
     fn bind_sockets_if_needed(
         &mut self,
         name: &str,
-        resolved: &crate::config::ResolvedService,
     ) -> Result<(), String> {
-        if resolved.listen.is_empty() || self.bound_sockets.contains_key(name) {
-            return Ok(());
-        }
-        match crate::process::socket::bind_sockets(&resolved.listen) {
+        let listen = match self.services.get(name) {
+            Some(rs) if !rs.resolved.listen.is_empty() && rs.bound_sockets.is_none() => {
+                rs.resolved.listen.clone()
+            }
+            _ => return Ok(()),
+        };
+        match crate::process::socket::bind_sockets(&listen) {
             Ok(sockets) => {
                 self.output_manager.lifecycle_event(&format!(
                     "{name}: bound {} listen socket{}",
                     sockets.len(),
                     if sockets.len() == 1 { "" } else { "s" }
                 ));
-                self.bound_sockets.insert(name.to_string(), sockets);
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.bound_sockets = Some(sockets);
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1163,6 +1446,11 @@ impl Runner {
         name: &str,
         resolved: &crate::config::ResolvedService,
     ) -> Result<(), ()> {
+        // Skip build for services already built in the batch phase.
+        if self.services.get(name).is_some_and(|rs| rs.batch_built) {
+            return Ok(());
+        }
+
         // Docker: build image if docker.build is configured.
         if let Some(ref docker_config) = resolved.docker
             && let Some(ref build_config) = docker_config.build
@@ -1284,7 +1572,7 @@ impl Runner {
         done_tx: Option<mpsc::Sender<ItemDone>>,
     ) -> Result<(), RunnerError> {
         let pid_dir = self.base_dir.join(".don").join("pids");
-        let sockets = self.bound_sockets.get(name);
+        let sockets = self.services.get(name).and_then(|rs| rs.bound_sockets.as_ref());
         let writer = self.output_manager.service_writer(name);
 
         match service::start_service(
@@ -1311,8 +1599,9 @@ impl Runner {
                 Ok(())
             }
             Err(e) => {
-                self.service_states
-                    .insert(name.to_string(), ServiceState::Failed);
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.state = ServiceState::Failed;
+                }
                 self.output_manager
                     .error_event(&format!("{name}: failed to start: {e}"));
 
@@ -1345,8 +1634,9 @@ impl Runner {
         message: &str,
         done_tx: mpsc::Sender<ItemDone>,
     ) {
-        self.service_states
-            .insert(name.to_string(), ServiceState::Failed);
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.state = ServiceState::Failed;
+        }
         let _ = done_tx
             .send(ItemDone {
                 name: name.to_string(),
@@ -1371,17 +1661,17 @@ impl Runner {
         resolved: &crate::config::ResolvedService,
         done_tx: Option<mpsc::Sender<ItemDone>>,
     ) {
-        self.service_states
-            .insert(name.to_string(), ServiceState::Running);
-        self.service_handles
-            .insert(name.to_string(), start_result.handle);
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.state = ServiceState::Running;
+            rs.handle = Some(start_result.handle);
 
-        // Add OSC response sink if we have a PTY write handle.
-        if let Some(ServiceHandle::Process(process)) = self.service_handles.get_mut(name)
-            && let Some(pty) = process.take_pty_write()
-            && let Some(handle) = self.output_manager.add_osc_sink(name, pty).await
-        {
-            self.osc_sinks.insert(name.to_string(), handle);
+            // Add OSC response sink if we have a PTY write handle.
+            if let Some(ServiceHandle::Process(process)) = rs.handle.as_mut()
+                && let Some(pty) = process.take_pty_write()
+                && let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await
+            {
+                rs.osc_sink = Some(osc_handle);
+            }
         }
 
         // Wire up output processing. The exit_tx fires when the
@@ -1409,9 +1699,20 @@ impl Runner {
         });
         let event_tx = self.event_tx.clone();
         let proxy_handle = self
-            .service_proxies
+            .services
             .get(name)
+            .and_then(|rs| rs.proxy.as_ref())
             .map(|p| p.backend_handle());
+
+        // For proxy services, activate the backend immediately so the proxy
+        // can start forwarding. The proxy has connection-level retry with
+        // backoff, so it handles the case where the service isn't listening yet.
+        if proxy_handle.is_some()
+            && let Some(rs) = self.services.get(name)
+            && let Some(ref proxy) = rs.proxy
+        {
+            proxy.set_backend();
+        }
 
         if let Some(ready) = ready_config {
             tokio::spawn(async move {
@@ -1458,13 +1759,26 @@ impl Runner {
                     });
                 }
             });
-        } else if done_tx.is_none() {
-            // No ready check on rebuild path — mark ready immediately.
-            self.service_states
-                .insert(name.to_string(), ServiceState::Ready);
-            // Activate proxy backend for the new instance.
-            if let Some(proxy) = self.service_proxies.get(name) {
-                proxy.set_backend();
+        } else if let Some(done_tx) = done_tx {
+            // No ready check, initial startup path — mark ready immediately.
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.state = ServiceState::Ready;
+            }
+            self.output_manager
+                .lifecycle_event(&format!("{name} started"));
+            let _ = done_tx
+                .send(ItemDone {
+                    name: name.to_string(),
+                    kind: NodeKind::Service,
+                    success: true,
+                    message: None,
+                    elapsed: None,
+                })
+                .await;
+        } else {
+            // No ready check, rebuild path — mark ready immediately.
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.state = ServiceState::Ready;
             }
             self.output_manager
                 .lifecycle_event(&format!("{name}: restarted"));
@@ -1481,8 +1795,8 @@ impl Runner {
         name: &str,
         done_tx: mpsc::Sender<ItemDone>,
     ) -> Result<(), RunnerError> {
-        let task_cfg = match self.config.tasks.get(name) {
-            Some(t) => t.clone(),
+        let task_cfg = match self.tasks.get(name) {
+            Some(rt) => rt.config.clone(),
             None => return Err(RunnerError::Config(format!("unknown task: {name}"))),
         };
 
@@ -1495,8 +1809,9 @@ impl Runner {
             .unwrap_or(true);
 
         if !needs_run {
-            self.task_states
-                .insert(name.to_string(), TaskItemState::Skipped);
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.state = TaskItemState::Skipped;
+            }
             self.output_manager
                 .lifecycle_event(&format!("{name}: skipped (no changes)"));
             let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
@@ -1541,8 +1856,9 @@ impl Runner {
 
         // Ensure any downloaded artifact is cached before running.
         if let Err(e) = self.ensure_task_download(name, &task_cfg).await {
-            self.task_states
-                .insert(name.to_string(), TaskItemState::Failed);
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.state = TaskItemState::Failed;
+            }
             self.output_manager
                 .error_event(&format!("{name}: download failed: {e}"));
             let _ = done_tx
@@ -1557,8 +1873,9 @@ impl Runner {
             return Ok(());
         }
 
-        self.task_states
-            .insert(name.to_string(), TaskItemState::Running);
+        if let Some(rt) = self.tasks.get_mut(name) {
+            rt.state = TaskItemState::Running;
+        }
 
         // Spawn the task process.
         match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
@@ -1567,8 +1884,9 @@ impl Runner {
                 Ok(())
             }
             Err(e) => {
-                self.task_states
-                    .insert(name.to_string(), TaskItemState::Failed);
+                if let Some(rt) = self.tasks.get_mut(name) {
+                    rt.state = TaskItemState::Failed;
+                }
                 self.output_manager
                     .error_event(&format!("{name}: failed to start: {e}"));
                 let _ = done_tx
@@ -1608,14 +1926,14 @@ impl Runner {
         // Add OSC response sink if we have a PTY write handle.
         if let Some(pty) = handle.take_pty_write()
             && let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await
+            && let Some(rt) = self.tasks.get_mut(name)
         {
-            self.osc_sinks.insert(name.to_string(), osc_handle);
+            rt.osc_sink = Some(osc_handle);
         }
 
-        self.running_tasks.insert(
-            name.to_string(),
-            RunningTask { pgid },
-        );
+        if let Some(rt) = self.tasks.get_mut(name) {
+            rt.pgid = Some(pgid);
+        }
 
         // Fulfill any pending attach waiter for this task.
         self.fulfill_pending_waiter(name).await;
@@ -1774,6 +2092,178 @@ impl Runner {
         }
     }
 
+    /// Flush all pending build-tool rebuilds as a single batch.
+    ///
+    /// Collects Bazel targets and Turbo filters from the queued services,
+    /// runs one build per tool, then restarts each affected service.
+    async fn flush_pending_rebuilds(&mut self) {
+        let names = std::mem::take(&mut self.pending_bt_rebuilds);
+        self.bt_rebuild_deadline = None;
+
+        if names.is_empty() {
+            return;
+        }
+
+        // Partition into Bazel and Turbo groups.
+        // Bazel: (service_name, target, query_timeout)
+        let mut bazel_items: Vec<(String, String)> = Vec::new();
+        let mut bazel_timeout: Option<u64> = None;
+        // Turbo: grouped by build_task → (service_name, filter)
+        let mut turbo_by_task: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut turbo_timeout: Option<u64> = None;
+        // Services without a build tool target (shouldn't happen, but handle gracefully)
+        let mut plain_rebuilds: Vec<String> = Vec::new();
+
+        for name in &names {
+            if let Some(rs) = self.services.get(name) {
+                if let Some(ref bazel) = rs.resolved.bazel {
+                    bazel_items.push((name.clone(), bazel.target.clone()));
+                    if let Some(t) = bazel.query_timeout {
+                        bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
+                    }
+                } else if let Some(ref turbo) = rs.resolved.turbo {
+                    let build_task = turbo
+                        .build_task
+                        .clone()
+                        .unwrap_or_else(|| "build".to_string());
+                    if !build_task.is_empty()
+                        && let Some(ref filter) = turbo.filter
+                    {
+                        turbo_by_task
+                            .entry(build_task)
+                            .or_default()
+                            .push((name.clone(), filter.clone()));
+                        if let Some(t) = turbo.query_timeout {
+                            turbo_timeout =
+                                Some(turbo_timeout.map_or(t, |cur: u64| cur.max(t)));
+                        }
+                    } else {
+                        plain_rebuilds.push(name.clone());
+                    }
+                } else {
+                    plain_rebuilds.push(name.clone());
+                }
+            }
+        }
+
+        // Track which services succeeded the build.
+        let mut build_succeeded: HashSet<String> = HashSet::new();
+
+        // Run Bazel batch build.
+        if !bazel_items.is_empty() {
+            let _guard = self.bazel_build_mutex.lock().await;
+            let targets: Vec<String> = bazel_items.iter().map(|(_, t)| t.clone()).collect();
+            let target_to_names: HashMap<String, Vec<String>> = {
+                let mut m: HashMap<String, Vec<String>> = HashMap::new();
+                for (name, target) in &bazel_items {
+                    m.entry(target.clone()).or_default().push(name.clone());
+                }
+                m
+            };
+
+            let count = targets.len();
+            self.output_manager.lifecycle_event(&format!(
+                "bazel: rebuilding {count} target{}...",
+                if count == 1 { "" } else { "s" }
+            ));
+
+            let om = self.output_manager.clone_lifecycle_emitter();
+            let resolver = crate::build_tool::bazel::BazelResolver::new(bazel_timeout);
+            match resolver
+                .build_targets(&targets, &self.base_dir.clone(), move |line| {
+                    om.lifecycle_event(&format!("bazel: {line}"));
+                })
+                .await
+            {
+                Ok(result) => {
+                    for target in &result.succeeded {
+                        if let Some(svc_names) = target_to_names.get(target) {
+                            for n in svc_names {
+                                build_succeeded.insert(n.clone());
+                            }
+                        }
+                    }
+                    for (target, msg) in &result.failed {
+                        if let Some(svc_names) = target_to_names.get(target) {
+                            for n in svc_names {
+                                self.fail_rebuild(n, &format!("{n}: bazel build failed: {msg}"));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    for (name, _) in &bazel_items {
+                        self.fail_rebuild(name, &format!("{name}: bazel build error: {e}"));
+                    }
+                }
+            }
+        }
+
+        // Run Turbo batch builds (one per build_task).
+        for (build_task, items) in &turbo_by_task {
+            let filters: Vec<String> = items.iter().map(|(_, f)| f.clone()).collect();
+            let filter_to_names: HashMap<String, Vec<String>> = {
+                let mut m: HashMap<String, Vec<String>> = HashMap::new();
+                for (name, filter) in items {
+                    m.entry(filter.clone()).or_default().push(name.clone());
+                }
+                m
+            };
+
+            let count = filters.len();
+            self.output_manager.lifecycle_event(&format!(
+                "turbo: rebuilding '{build_task}' for {count} package{}...",
+                if count == 1 { "" } else { "s" }
+            ));
+
+            let om = self.output_manager.clone_lifecycle_emitter();
+            let bt = build_task.clone();
+            let resolver = crate::build_tool::turbo::TurboResolver::new(
+                build_task,
+                None,
+                turbo_timeout,
+            );
+            match resolver
+                .build_packages(&bt, &filters, &self.base_dir.clone(), move |line| {
+                    om.lifecycle_event(&format!("turbo: {line}"));
+                })
+                .await
+            {
+                Ok(result) => {
+                    for filter in &result.succeeded {
+                        if let Some(svc_names) = filter_to_names.get(filter) {
+                            for n in svc_names {
+                                build_succeeded.insert(n.clone());
+                            }
+                        }
+                    }
+                    for (filter, msg) in &result.failed {
+                        if let Some(svc_names) = filter_to_names.get(filter) {
+                            for n in svc_names {
+                                self.fail_rebuild(n, &format!("{n}: turbo build failed: {msg}"));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    for (name, _) in items {
+                        self.fail_rebuild(name, &format!("{name}: turbo build error: {e}"));
+                    }
+                }
+            }
+        }
+
+        // Restart all services whose builds succeeded.
+        for name in &build_succeeded {
+            self.do_rebuild(name).await;
+        }
+
+        // Handle any plain (non-build-tool) services that ended up in the queue.
+        for name in &plain_rebuilds {
+            self.do_rebuild(name).await;
+        }
+    }
+
     fn fail_rebuild(&self, name: &str, message: &str) {
         self.output_manager.error_event(message);
         let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
@@ -1816,15 +2306,14 @@ impl Runner {
 
         // 1. Stop removed services.
         for name in &diff.removed_services {
-            if let Some(handle) = self.service_handles.remove(name) {
-                if self.attach_locks.remove(name).is_some() {
+            if let Some(rs) = self.services.get_mut(name)
+                && let Some(handle) = rs.handle.take()
+            {
+                if rs.attach_lock.take().is_some() {
                     self.output_manager.resume_stdout_sink(name).await;
                 }
-                let svc = self.config.services.get(name);
-                let resolved = svc.map(|s| s.resolve(self.platform));
-                let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
-                self.service_states
-                    .insert(name.clone(), ServiceState::Stopping);
+                let shutdown_config = rs.resolved.shutdown.clone();
+                rs.state = ServiceState::Stopping;
                 let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
                 if let Some(writer) = self.output_manager.service_writer(name) {
                     writer.close_follow_sinks().await;
@@ -1832,45 +2321,58 @@ impl Runner {
                 self.output_manager
                     .lifecycle_event(&format!("{name}: stopped (removed from config)"));
             }
-            self.service_states.remove(name);
-            self.bound_sockets.remove(name);
-            self.service_proxies.remove(name);
+            self.services.remove(name);
         }
 
         // 2. Stop changed services (they'll be restarted with the new config).
         //    Also release bound sockets so they get re-bound with the new
         //    listen addresses (if changed).
         for name in &diff.changed_services {
-            if let Some(handle) = self.service_handles.remove(name) {
-                if self.attach_locks.remove(name).is_some() {
-                    self.output_manager.resume_stdout_sink(name).await;
+            if let Some(rs) = self.services.get_mut(name) {
+                if let Some(handle) = rs.handle.take() {
+                    if rs.attach_lock.take().is_some() {
+                        self.output_manager.resume_stdout_sink(name).await;
+                    }
+                    let shutdown_config = rs.resolved.shutdown.clone();
+                    rs.state = ServiceState::Stopping;
+                    let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
+                    if let Some(writer) = self.output_manager.service_writer(name) {
+                        writer.close_follow_sinks().await;
+                    }
                 }
-                let svc = self.config.services.get(name);
-                let resolved = svc.map(|s| s.resolve(self.platform));
-                let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
-                self.service_states
-                    .insert(name.clone(), ServiceState::Stopping);
-                let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
-                if let Some(writer) = self.output_manager.service_writer(name) {
-                    writer.close_follow_sinks().await;
-                }
+                rs.bound_sockets = None;
+                rs.proxy = None;
             }
-            self.bound_sockets.remove(name);
-            self.service_proxies.remove(name);
         }
 
         // 3. Remove state for removed tasks.
         for name in &diff.removed_tasks {
-            self.task_states.remove(name);
+            self.tasks.remove(name);
         }
 
         // 4. Swap config.
         self.config = new_config;
 
-        // 5. Register new services/tasks in state maps and output manager.
+        // 5. Register new services/tasks in runtime maps and output manager.
         for name in &diff.added_services {
-            self.service_states
-                .insert(name.clone(), ServiceState::Pending);
+            if let Some(svc) = self.config.services.get(name) {
+                self.services.insert(
+                    name.clone(),
+                    RuntimeService {
+                        resolved: svc.resolve(self.platform),
+                        state: ServiceState::Pending,
+                        handle: None,
+                        osc_sink: None,
+                        attach_lock: None,
+                        attach_waiter: None,
+                        bound_sockets: None,
+                        proxy: None,
+                        resolved_watch_paths: Vec::new(),
+                        bazel_binary_path: None,
+                        batch_built: false,
+                    },
+                );
+            }
             let log_config = self
                 .config
                 .services
@@ -1883,8 +2385,20 @@ impl Runner {
                 .await;
         }
         for name in &diff.added_tasks {
-            self.task_states
-                .insert(name.clone(), TaskItemState::Pending);
+            if let Some(task) = self.config.tasks.get(name) {
+                self.tasks.insert(
+                    name.clone(),
+                    RuntimeTask {
+                        config: task.clone(),
+                        state: TaskItemState::Pending,
+                        pgid: None,
+                        osc_sink: None,
+                        attach_lock: None,
+                        attach_waiter: None,
+                        resolved_watch_paths: Vec::new(),
+                    },
+                );
+            }
             let log_config = self
                 .config
                 .tasks
@@ -1897,11 +2411,23 @@ impl Runner {
                 .await;
         }
 
-        // 6. Mark changed services as Pending for restart, and bind proxies
-        //    for new/changed services that have proxy config.
+        // 6. Mark changed services as Pending for restart, re-resolve config,
+        //    and bind proxies for new/changed services that have proxy config.
         for name in &diff.changed_services {
-            self.service_states
-                .insert(name.clone(), ServiceState::Pending);
+            if let Some(svc) = self.config.services.get(name)
+                && let Some(rs) = self.services.get_mut(name)
+            {
+                rs.resolved = svc.resolve(self.platform);
+                rs.state = ServiceState::Pending;
+            }
+        }
+        // Also update task configs for changed tasks.
+        for name in &diff.changed_tasks {
+            if let Some(task) = self.config.tasks.get(name)
+                && let Some(rt) = self.tasks.get_mut(name)
+            {
+                rt.config = task.clone();
+            }
         }
         let proxy_names: Vec<String> = diff
             .added_services
@@ -1910,33 +2436,35 @@ impl Runner {
             .cloned()
             .collect();
         for name in &proxy_names {
-            if let Some(svc) = self.config.services.get(name) {
-                let resolved = svc.resolve(self.platform);
-                if !resolved.proxy.is_empty() {
-                    let lazy_tx = if resolved.lazy {
-                        Some(self.lazy_start_tx.clone())
-                    } else {
-                        None
-                    };
-                    match crate::proxy::ServiceProxy::bind(&resolved.proxy, lazy_tx, name).await {
-                        Ok(proxy) => {
-                            let addrs: Vec<String> =
-                                proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
-                            self.output_manager.lifecycle_event(&format!(
-                                "{name}: proxy listening on {}",
-                                addrs.join(", ")
-                            ));
-                            self.service_proxies.insert(name.clone(), proxy);
-                            if resolved.lazy {
-                                self.service_states
-                                    .insert(name.clone(), ServiceState::Lazy);
-                            }
-                        }
-                        Err(e) => {
-                            self.output_manager
-                                .error_event(&format!("{name}: proxy bind failed: {e}"));
+            let (proxy_config, is_lazy) = match self.services.get(name) {
+                Some(rs) if !rs.resolved.proxy.is_empty() => {
+                    (rs.resolved.proxy.clone(), rs.resolved.lazy)
+                }
+                _ => continue,
+            };
+            let lazy_tx = if is_lazy {
+                Some(self.lazy_start_tx.clone())
+            } else {
+                None
+            };
+            match crate::proxy::ServiceProxy::bind(&proxy_config, lazy_tx, name).await {
+                Ok(proxy) => {
+                    let addrs: Vec<String> =
+                        proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
+                    self.output_manager.lifecycle_event(&format!(
+                        "{name}: proxy listening on {}",
+                        addrs.join(", ")
+                    ));
+                    if let Some(rs) = self.services.get_mut(name) {
+                        rs.proxy = Some(proxy);
+                        if is_lazy {
+                            rs.state = ServiceState::Lazy;
                         }
                     }
+                }
+                Err(e) => {
+                    self.output_manager
+                        .error_event(&format!("{name}: proxy bind failed: {e}"));
                 }
             }
         }
@@ -1966,15 +2494,7 @@ impl Runner {
                         continue;
                     }
                     let deps = dep_map.get(name).cloned().unwrap_or_default();
-                    let deps_ok = deps.iter().all(|dep| {
-                        self.service_states
-                            .get(dep)
-                            .is_some_and(|s| s.is_satisfied())
-                            || self
-                                .task_states
-                                .get(dep)
-                                .is_some_and(|s| s.is_satisfied())
-                    });
+                    let deps_ok = deps.iter().all(|dep| self.is_dep_satisfied(dep));
                     if !deps_ok {
                         self.output_manager.lifecycle_event(&format!(
                             "{name}: waiting for dependencies"
@@ -1982,15 +2502,16 @@ impl Runner {
                         continue;
                     }
                     // Service or task?
-                    if self.config.services.contains_key(name) {
+                    if self.services.contains_key(name) {
                         // Use the full start_service flow (bind sockets, download,
                         // build, spawn, wire output + ready check, lifecycle events).
                         if let Some(done_tx) = self.done_tx.clone() {
                             let _ = self.start_service(name, done_tx).await;
                         }
-                    } else if self.config.tasks.contains_key(name) {
-                        self.task_states
-                            .insert(name.clone(), TaskItemState::Running);
+                    } else if self.tasks.contains_key(name) {
+                        if let Some(rt) = self.tasks.get_mut(name) {
+                            rt.state = TaskItemState::Running;
+                        }
                         self.handle_task_rerun(name).await;
                     }
                 }
@@ -2001,19 +2522,514 @@ impl Runner {
         // schedule a deferred retry. Their deps were just spawned and need
         // time to pass ready checks before we can start the dependents.
         let has_pending = self
-            .service_states
+            .services
             .values()
-            .any(|s| *s == ServiceState::Pending)
+            .any(|rs| rs.state == ServiceState::Pending)
             || self
-                .task_states
+                .tasks
                 .values()
-                .any(|s| *s == TaskItemState::Pending);
+                .any(|rt| rt.state == TaskItemState::Pending);
         if has_pending {
             let cmd_tx = self.cmd_tx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 let _ = cmd_tx.send(RunnerCommand::StartPending).await;
             });
+        }
+    }
+
+    /// Handle a build graph change event (BUILD files, package.json, etc. changed).
+    ///
+    /// Queues the item for a batched re-query instead of spawning immediately.
+    /// This prevents redundant concurrent queries when a single BUILD file
+    /// change affects multiple services.
+    async fn handle_build_graph_changed(&mut self, name: &str) {
+        if !self.pending_graph_requery.contains(&name.to_string()) {
+            self.pending_graph_requery.push(name.to_string());
+        }
+        self.bt_requery_deadline =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+    }
+
+    /// Flush all pending build-graph re-queries.
+    ///
+    /// Runs build tool queries for each queued item and sends updated watch
+    /// patterns to the WatchManager. Uses stale-while-revalidate: old watch
+    /// patterns remain active during the re-query.
+    async fn flush_pending_graph_requery(&mut self) {
+        let names = std::mem::take(&mut self.pending_graph_requery);
+        self.bt_requery_deadline = None;
+
+        if names.is_empty() {
+            return;
+        }
+
+        use crate::build_tool::BuildGraphResolver;
+
+        let watch_update_tx = match self.watch_update_tx.clone() {
+            Some(tx) => tx,
+            None => return,
+        };
+
+        self.output_manager.lifecycle_event(&format!(
+            "re-querying build tool for {} item{}...",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" }
+        ));
+
+        for name in &names {
+            let (bazel_cfg, turbo_cfg, item_dir, ignore_patterns) =
+                if let Some(rs) = self.services.get(name) {
+                    (
+                        rs.resolved.bazel.clone(),
+                        rs.resolved.turbo.clone(),
+                        rs.resolved.dir.clone(),
+                        rs.resolved.ignore.clone(),
+                    )
+                } else if let Some(rt) = self.tasks.get(name) {
+                    (
+                        rt.config.bazel.clone(),
+                        rt.config.turbo.clone(),
+                        rt.config.dir.clone(),
+                        rt.config.ignore.clone(),
+                    )
+                } else {
+                    continue;
+                };
+
+            let working_dir = match item_dir {
+                Some(d) => self.base_dir.join(d),
+                None => self.base_dir.clone(),
+            };
+
+            let result = if let Some(ref bazel) = bazel_cfg {
+                let resolver =
+                    crate::build_tool::bazel::BazelResolver::new(bazel.query_timeout);
+                resolver.resolve(&bazel.target, &working_dir).await
+            } else if let Some(ref turbo) = turbo_cfg {
+                let resolver = crate::build_tool::turbo::TurboResolver::new(
+                    &turbo.task,
+                    turbo.filter.as_deref(),
+                    turbo.query_timeout,
+                );
+                resolver.resolve(&turbo.task, &working_dir).await
+            } else {
+                continue;
+            };
+
+            match result {
+                Ok(info) => {
+                    let count = info.watch_paths.len();
+                    self.output_manager.lifecycle_event(&format!(
+                        "{name}: updated watch paths ({count} path{})",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                    if let Some(rs) = self.services.get_mut(name) {
+                        rs.resolved_watch_paths = info.watch_paths.clone();
+                    } else if let Some(rt) = self.tasks.get_mut(name) {
+                        rt.resolved_watch_paths = info.watch_paths.clone();
+                    }
+                    let kind = if self.services.contains_key(name) {
+                        crate::watch::WatchItemKind::Service
+                    } else {
+                        crate::watch::WatchItemKind::Task
+                    };
+                    let _ = watch_update_tx
+                        .send(crate::watch::WatchUpdate {
+                            name: name.clone(),
+                            kind,
+                            patterns: info.watch_paths,
+                            ignore_patterns,
+                            base_dir: self.base_dir.clone(),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    self.output_manager.error_event(&format!(
+                        "{name}: build tool re-query failed: {e} — keeping existing watch patterns"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Resolve build tool watch patterns for all services and tasks at startup.
+    ///
+    /// For each service/task with a `bazel` or `turbo` config, queries the
+    /// build tool and injects the resolved watch paths. Returns warnings for
+    /// any failures (non-fatal).
+    /// Returns (name -> (watch_paths, ignore_patterns), warnings).
+    async fn resolve_build_tool_watches(&self) -> (
+        HashMap<String, (Vec<String>, Vec<String>)>,
+        Vec<String>,
+    ) {
+        use crate::build_tool::BuildGraphResolver;
+
+        let mut resolved_watches: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Collect all items that need build tool resolution.
+        struct BuildToolItem {
+            name: String,
+            bazel: Option<crate::config::BazelConfig>,
+            turbo: Option<crate::config::TurboConfig>,
+            dir: Option<PathBuf>,
+            ignore: Vec<String>,
+        }
+        let mut items: Vec<BuildToolItem> = Vec::new();
+
+        for (name, rs) in &self.services {
+            if rs.resolved.bazel.is_some() || rs.resolved.turbo.is_some() {
+                items.push(BuildToolItem {
+                    name: name.clone(),
+                    bazel: rs.resolved.bazel.clone(),
+                    turbo: rs.resolved.turbo.clone(),
+                    dir: rs.resolved.dir.clone(),
+                    ignore: rs.resolved.ignore.clone(),
+                });
+            }
+        }
+        for (name, rt) in &self.tasks {
+            if rt.config.bazel.is_some() || rt.config.turbo.is_some() {
+                items.push(BuildToolItem {
+                    name: name.clone(),
+                    bazel: rt.config.bazel.clone(),
+                    turbo: rt.config.turbo.clone(),
+                    dir: rt.config.dir.clone(),
+                    ignore: rt.config.ignore.clone(),
+                });
+            }
+        }
+
+        // Resolve each item concurrently.
+        let mut join_set = tokio::task::JoinSet::new();
+        for BuildToolItem { name, bazel: bazel_cfg, turbo: turbo_cfg, dir: item_dir, ignore } in items {
+            let base_dir = self.base_dir.clone();
+            let working_dir = match item_dir {
+                Some(d) => base_dir.join(d),
+                None => base_dir.clone(),
+            };
+
+            join_set.spawn(async move {
+                let result = if let Some(bazel) = bazel_cfg {
+                    let resolver = crate::build_tool::bazel::BazelResolver::new(
+                        bazel.query_timeout,
+                    );
+                    resolver.resolve(&bazel.target, &working_dir).await
+                } else if let Some(turbo) = turbo_cfg {
+                    let resolver = crate::build_tool::turbo::TurboResolver::new(
+                        &turbo.task,
+                        turbo.filter.as_deref(),
+                        turbo.query_timeout,
+                    );
+                    resolver.resolve(&turbo.task, &working_dir).await
+                } else {
+                    return (name, ignore, Err(crate::build_tool::BuildToolError::QueryFailed {
+                        tool: "unknown".to_string(),
+                        message: "no build tool configured".to_string(),
+                    }));
+                };
+                (name, ignore, result)
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            if let Ok((name, ignore, resolve_result)) = result {
+                match resolve_result {
+                    Ok(info) => {
+                        let count = info.watch_paths.len();
+                        self.output_manager.lifecycle_event(
+                            &format!("{name}: resolved {count} watch path{} from build tool",
+                                if count == 1 { "" } else { "s" })
+                        );
+                        resolved_watches.insert(name, (info.watch_paths, ignore));
+                    }
+                    Err(e) => {
+                        warnings.push(format!("{name}: build tool query failed: {e}"));
+                    }
+                }
+            }
+        }
+
+        (resolved_watches, warnings)
+    }
+
+    /// Run batch builds for all configured build tool targets.
+    ///
+    /// Collects Bazel targets and Turbo tasks from service/task configs,
+    /// runs one build command per tool (Bazel and Turbo can run concurrently),
+    /// and returns which services had successful builds vs failures.
+    ///
+    /// Build output is streamed through the OutputManager as lifecycle events.
+    /// Resolve Bazel binary paths for all batch-built services.
+    ///
+    /// After `bazel build`, queries `bazel cquery --output=files` for each
+    /// service's target to find the output binary. Services can then be started
+    /// by running the binary directly instead of `bazel run`.
+    async fn resolve_bazel_binary_paths(&mut self) {
+        let mut items: Vec<(String, String, PathBuf)> = Vec::new();
+        for (name, rs) in &self.services {
+            if !rs.batch_built {
+                continue;
+            }
+            if let Some(ref bazel) = rs.resolved.bazel {
+                let working_dir = match rs.resolved.dir.as_deref() {
+                    Some(d) => self.base_dir.join(d),
+                    None => self.base_dir.clone(),
+                };
+                items.push((name.clone(), bazel.target.clone(), working_dir));
+            }
+        }
+
+        for (name, target, working_dir) in items {
+            let resolver = crate::build_tool::bazel::BazelResolver::new(None);
+            match resolver.resolve_binary_path(&target, &working_dir).await {
+                Ok(rel_path) => {
+                    // The path is relative to the workspace (e.g. "bazel-out/.../bin/api").
+                    // Join with working_dir to make it absolute.
+                    let abs_path = working_dir.join(&rel_path);
+                    let path_str = abs_path.to_string_lossy().to_string();
+                    self.output_manager.lifecycle_event(
+                        &format!("{name}: resolved binary {rel_path}")
+                    );
+                    if let Some(rs) = self.services.get_mut(&name) {
+                        rs.bazel_binary_path = Some(path_str.clone());
+                        // Also update the resolved config to use the binary directly.
+                        if let Some(svc) = self.config.services.get(&name) {
+                            rs.resolved = svc.resolve_with_bazel_binary(self.platform, &path_str);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.output_manager.error_event(
+                        &format!("{name}: could not resolve binary path: {e} — falling back to bazel run")
+                    );
+                }
+            }
+        }
+    }
+
+    async fn run_batch_builds(&mut self) {
+        // Collect Bazel targets: (service_name, bazel_target)
+        let mut bazel_targets: Vec<(String, String)> = Vec::new();
+        // Collect Turbo filters grouped by build_task: (build_task, vec of (service_name, filter))
+        let mut turbo_by_task: std::collections::HashMap<
+            String,
+            Vec<(String, String)>,
+        > = std::collections::HashMap::new();
+        let mut bazel_timeout: Option<u64> = None;
+        let mut turbo_timeout: Option<u64> = None;
+
+        for (name, rs) in &self.services {
+            if let Some(ref bazel) = rs.resolved.bazel {
+                bazel_targets.push((name.clone(), bazel.target.clone()));
+                if let Some(t) = bazel.query_timeout {
+                    bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
+                }
+            } else if let Some(ref turbo) = rs.resolved.turbo {
+                let build_task = turbo
+                    .build_task
+                    .clone()
+                    .unwrap_or_else(|| "build".to_string());
+                if !build_task.is_empty() {
+                    if let Some(ref filter) = turbo.filter {
+                        turbo_by_task
+                            .entry(build_task)
+                            .or_default()
+                            .push((name.clone(), filter.clone()));
+                    } else {
+                        self.output_manager.error_event(&format!(
+                            "{name}: turbo.filter is required for batch builds — \
+                             skipping batch build for this service"
+                        ));
+                    }
+                }
+                if let Some(t) = turbo.query_timeout {
+                    turbo_timeout = Some(turbo_timeout.map_or(t, |cur: u64| cur.max(t)));
+                }
+            }
+        }
+        for (name, rt) in &self.tasks {
+            if let Some(ref bazel) = rt.config.bazel {
+                bazel_targets.push((name.clone(), bazel.target.clone()));
+                if let Some(t) = bazel.query_timeout {
+                    bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
+                }
+            } else if let Some(ref turbo) = rt.config.turbo {
+                let build_task = turbo
+                    .build_task
+                    .clone()
+                    .unwrap_or_else(|| "build".to_string());
+                if !build_task.is_empty() {
+                    if let Some(ref filter) = turbo.filter {
+                        turbo_by_task
+                            .entry(build_task)
+                            .or_default()
+                            .push((name.clone(), filter.clone()));
+                    } else {
+                        self.output_manager.error_event(&format!(
+                            "{name}: turbo.filter is required for batch builds — \
+                             skipping batch build for this task"
+                        ));
+                    }
+                }
+                if let Some(t) = turbo.query_timeout {
+                    turbo_timeout = Some(turbo_timeout.map_or(t, |cur: u64| cur.max(t)));
+                }
+            }
+        }
+
+        if bazel_targets.is_empty() && turbo_by_task.is_empty() {
+            return;
+        }
+
+        // Run Bazel and Turbo builds concurrently (different tools, no contention).
+        let mut join_set = JoinSet::new();
+
+        if !bazel_targets.is_empty() {
+            let targets: Vec<String> = bazel_targets.iter().map(|(_, t)| t.clone()).collect();
+            let target_to_name: std::collections::HashMap<String, Vec<String>> = {
+                let mut m: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for (name, target) in &bazel_targets {
+                    m.entry(target.clone()).or_default().push(name.clone());
+                }
+                m
+            };
+            let count = targets.len();
+            let base_dir = self.base_dir.clone();
+            let om = self.output_manager.clone_lifecycle_emitter();
+
+            self.output_manager.lifecycle_event(&format!(
+                "bazel: building {count} target{}...",
+                if count == 1 { "" } else { "s" }
+            ));
+
+            join_set.spawn(async move {
+                let resolver =
+                    crate::build_tool::bazel::BazelResolver::new(bazel_timeout);
+                let result = resolver
+                    .build_targets(&targets, &base_dir, move |line| {
+                        om.lifecycle_event(&format!("bazel: {line}"));
+                    })
+                    .await;
+                // Map build tool targets back to service/task names.
+                match result {
+                    Ok(batch) => {
+                        let mut succeeded = Vec::new();
+                        for target in &batch.succeeded {
+                            if let Some(names) = target_to_name.get(target) {
+                                succeeded.extend(names.clone());
+                            }
+                        }
+                        let mut failed = Vec::new();
+                        for (target, msg) in &batch.failed {
+                            if let Some(names) = target_to_name.get(target) {
+                                for n in names {
+                                    failed.push((n.clone(), msg.clone()));
+                                }
+                            }
+                        }
+                        Ok(crate::build_tool::BatchBuildResult { succeeded, failed })
+                    }
+                    Err(e) => Err(e),
+                }
+            });
+        }
+
+        for (build_task, items) in turbo_by_task {
+            let filters: Vec<String> = items.iter().map(|(_, f)| f.clone()).collect();
+            let filter_to_name: std::collections::HashMap<String, Vec<String>> = {
+                let mut m: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for (name, filter) in &items {
+                    m.entry(filter.clone()).or_default().push(name.clone());
+                }
+                m
+            };
+            let count = filters.len();
+            let base_dir = self.base_dir.clone();
+            let om = self.output_manager.clone_lifecycle_emitter();
+            let bt = build_task.clone();
+
+            self.output_manager.lifecycle_event(&format!(
+                "turbo: running '{build_task}' for {count} package{}...",
+                if count == 1 { "" } else { "s" }
+            ));
+
+            join_set.spawn(async move {
+                // TurboResolver needs a task for watch resolution, but here
+                // we only care about the build. Use the build_task.
+                let resolver = crate::build_tool::turbo::TurboResolver::new(
+                    &bt,
+                    None,
+                    turbo_timeout,
+                );
+                let result = resolver
+                    .build_packages(&bt, &filters, &base_dir, move |line| {
+                        om.lifecycle_event(&format!("turbo: {line}"));
+                    })
+                    .await;
+                match result {
+                    Ok(batch) => {
+                        let mut succeeded = Vec::new();
+                        for filter in &batch.succeeded {
+                            if let Some(names) = filter_to_name.get(filter) {
+                                succeeded.extend(names.clone());
+                            }
+                        }
+                        let mut failed = Vec::new();
+                        for (filter, msg) in &batch.failed {
+                            if let Some(names) = filter_to_name.get(filter) {
+                                for n in names {
+                                    failed.push((n.clone(), msg.clone()));
+                                }
+                            }
+                        }
+                        Ok(crate::build_tool::BatchBuildResult { succeeded, failed })
+                    }
+                    Err(e) => Err(e),
+                }
+            });
+        }
+
+        // Collect results from all build tool batches.
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(batch)) => {
+                    for name in batch.succeeded {
+                        if let Some(rs) = self.services.get_mut(&name) {
+                            rs.batch_built = true;
+                        }
+                    }
+                    for (name, msg) in batch.failed {
+                        self.output_manager
+                            .error_event(&format!("{name}: batch build failed: {msg}"));
+                        if let Some(rs) = self.services.get_mut(&name) {
+                            rs.state = ServiceState::Failed;
+                        }
+                        if let Some(rt) = self.tasks.get_mut(&name) {
+                            rt.state = TaskItemState::Failed;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.output_manager
+                        .error_event(&format!("batch build error: {e}"));
+                }
+                Err(e) => {
+                    self.output_manager
+                        .error_event(&format!("batch build task panicked: {e}"));
+                }
+            }
+        }
+
+        let batch_built_count = self.services.values().filter(|rs| rs.batch_built).count();
+        if batch_built_count > 0 {
+            self.output_manager.lifecycle_event(&format!(
+                "batch build complete: {batch_built_count} item{} built",
+                if batch_built_count == 1 { "" } else { "s" }
+            ));
         }
     }
 
@@ -2030,41 +3046,34 @@ impl Runner {
         let mut started_any = false;
         for name in &order {
             let is_pending_svc = self
-                .service_states
+                .services
                 .get(name)
-                .is_some_and(|s| *s == ServiceState::Pending);
+                .is_some_and(|rs| rs.state == ServiceState::Pending);
             let is_pending_task = self
-                .task_states
+                .tasks
                 .get(name)
-                .is_some_and(|s| *s == TaskItemState::Pending);
+                .is_some_and(|rt| rt.state == TaskItemState::Pending);
             if !is_pending_svc && !is_pending_task {
                 continue;
             }
 
             let deps = dep_map.get(name).cloned().unwrap_or_default();
-            let deps_ok = deps.iter().all(|dep| {
-                self.service_states
-                    .get(dep)
-                    .is_some_and(|s| s.is_satisfied())
-                    || self
-                        .task_states
-                        .get(dep)
-                        .is_some_and(|s| s.is_satisfied())
-            });
+            let deps_ok = deps.iter().all(|dep| self.is_dep_satisfied(dep));
             if !deps_ok {
                 continue;
             }
 
             if is_pending_svc {
-                if self.config.services.contains_key(name)
+                if self.services.contains_key(name)
                     && let Some(done_tx) = self.done_tx.clone()
                 {
                     let _ = self.start_service(name, done_tx).await;
                     started_any = true;
                 }
             } else if is_pending_task {
-                self.task_states
-                    .insert(name.clone(), TaskItemState::Running);
+                if let Some(rt) = self.tasks.get_mut(name) {
+                    rt.state = TaskItemState::Running;
+                }
                 self.handle_task_rerun(name).await;
                 started_any = true;
             }
@@ -2074,13 +3083,13 @@ impl Runner {
         // items might unblock further pending items.
         if started_any {
             let still_pending = self
-                .service_states
+                .services
                 .values()
-                .any(|s| *s == ServiceState::Pending)
+                .any(|rs| rs.state == ServiceState::Pending)
                 || self
-                    .task_states
+                    .tasks
                     .values()
-                    .any(|s| *s == TaskItemState::Pending);
+                    .any(|rt| rt.state == TaskItemState::Pending);
             if still_pending {
                 let cmd_tx = self.cmd_tx.clone();
                 tokio::spawn(async move {
@@ -2100,14 +3109,45 @@ impl Runner {
     /// backend once the ready check passes. The proxy never drops — clients
     /// see a brief pause, not a connection refused.
     async fn handle_rebuild(&mut self, name: &str) {
-        let svc = match self.config.services.get(name) {
-            Some(s) => s,
+        let rs = match self.services.get(name) {
+            Some(rs) => rs,
             None => {
                 self.fail_rebuild(name, &format!("{name}: rebuild requested for unknown service"));
                 return;
             }
         };
-        let mut resolved = svc.resolve(self.platform);
+
+        // For build-tool-managed services, queue the rebuild into a batch.
+        // Multiple services sharing the same source files will be batched into
+        // one `bazel build //a //b //c` invocation instead of separate builds.
+        if rs.resolved.bazel.is_some() || rs.resolved.turbo.is_some() {
+            if !self.pending_bt_rebuilds.contains(&name.to_string()) {
+                self.pending_bt_rebuilds.push(name.to_string());
+            }
+            // Set or extend the batch window (50ms). This allows multiple
+            // Rebuild commands from the watch module (which fire per-service
+            // after their individual debounce timers) to coalesce.
+            self.bt_rebuild_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+            return;
+        }
+
+        self.do_rebuild(name).await;
+    }
+
+    /// Execute a rebuild for a single service: build, stop old, restart.
+    ///
+    /// This is the core rebuild logic, called either directly (non-build-tool
+    /// services) or after a batch build completes (build-tool services).
+    async fn do_rebuild(&mut self, name: &str) {
+        let resolved = match self.services.get(name) {
+            Some(rs) => rs.resolved.clone(),
+            None => {
+                self.fail_rebuild(name, &format!("{name}: rebuild requested for unknown service"));
+                return;
+            }
+        };
+        let mut resolved = resolved;
 
         self.output_manager
             .lifecycle_event(&format!("{name}: rebuilding (file changed)"));
@@ -2120,22 +3160,24 @@ impl Runner {
 
         // For proxy services: clear backend so new connections queue while we
         // restart, and allocate fresh ephemeral ports for the new instance.
-        let has_proxy = self.service_proxies.contains_key(name);
+        let has_proxy = self.services.get(name).is_some_and(|rs| rs.proxy.is_some());
         if has_proxy
-            && let Some(proxy) = self.service_proxies.get(name)
+            && let Some(rs) = self.services.get(name)
+            && let Some(ref proxy) = rs.proxy
         {
             proxy.clear_backend();
         }
 
         // Stop the old service (if running).
-        if let Some(handle) = self.service_handles.remove(name) {
+        if let Some(handle) = self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
             // Release attach lock — the old PTY is gone after restart.
             // This causes the attach session to exit (follow sink closes below).
-            if self.attach_locks.remove(name).is_some() {
+            if self.remove_attach_lock(name) {
                 self.output_manager.resume_stdout_sink(name).await;
             }
-            self.service_states
-                .insert(name.to_string(), ServiceState::Stopping);
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.state = ServiceState::Stopping;
+            }
             let shutdown_config = resolved.shutdown.as_ref();
             if let Err(e) = stop_service(handle, shutdown_config, false).await {
                 self.output_manager
@@ -2150,41 +3192,59 @@ impl Runner {
 
         // For proxy services: allocate new ephemeral ports and rebind
         // LISTEN_FDS sockets before spawning the new instance.
-        if has_proxy
-            && let Some(proxy) = self.service_proxies.get_mut(name)
-        {
-            match proxy.reallocate_ephemeral_ports().await {
-                Ok(_old_ports) => {
-                    // Inject new proxy env vars.
-                    let proxy_env = proxy.env_vars();
+        if has_proxy {
+            // Step 1: Reallocate ephemeral ports.
+            let realloc_result = if let Some(rs) = self.services.get_mut(name) {
+                if let Some(ref mut proxy) = rs.proxy {
+                    Some(proxy.reallocate_ephemeral_ports().await)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match realloc_result {
+                Some(Ok(_old_ports)) => {
+                    // Step 2: Extract env vars and listen_fds addrs.
+                    let (proxy_env, listen_fds_addrs) = if let Some(rs) = self.services.get(name) {
+                        if let Some(ref proxy) = rs.proxy {
+                            (proxy.env_vars(), proxy.listen_fds_addrs())
+                        } else {
+                            (HashMap::new(), Vec::new())
+                        }
+                    } else {
+                        (HashMap::new(), Vec::new())
+                    };
                     resolved.env.extend(proxy_env);
-                    // Rebind LISTEN_FDS sockets for new ephemeral ports.
-                    let listen_fds_addrs = proxy.listen_fds_addrs();
+                    // Step 3: Rebind LISTEN_FDS sockets for new ephemeral ports.
                     if !listen_fds_addrs.is_empty() {
-                        self.bound_sockets.remove(name);
+                        if let Some(rs) = self.services.get_mut(name) {
+                            rs.bound_sockets = None;
+                        }
                         match crate::process::socket::bind_sockets(&listen_fds_addrs) {
                             Ok(sockets) => {
-                                self.bound_sockets.insert(name.to_string(), sockets);
+                                if let Some(rs) = self.services.get_mut(name) {
+                                    rs.bound_sockets = Some(sockets);
+                                }
                             }
                             Err(e) => {
                                 self.fail_rebuild(
                                     name,
-                                    &format!(
-                                        "{name}: failed to bind ephemeral sockets: {e}"
-                                    ),
+                                    &format!("{name}: failed to bind ephemeral sockets: {e}"),
                                 );
                                 return;
                             }
                         }
                     }
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     self.fail_rebuild(
                         name,
                         &format!("{name}: failed to allocate ephemeral ports: {e}"),
                     );
                     return;
                 }
+                None => {}
             }
         }
 
@@ -2213,16 +3273,16 @@ impl Runner {
 
     /// Handle an API-initiated Start command.
     async fn handle_start_cmd(&mut self, name: &str) -> CommandResult {
-        let svc = self.lookup_service(name)?;
+        self.lookup_service(name)?;
         // Block if the service is currently active.
-        if self.service_handles.contains_key(name) {
+        if self.services.get(name).is_some_and(|rs| rs.handle.is_some()) {
             return Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "already running".to_string(),
             });
         }
         // For lazy services in Lazy state, force-start via the normal path.
-        if self.service_states.get(name) == Some(&ServiceState::Lazy) {
+        if self.services.get(name).is_some_and(|rs| rs.state == ServiceState::Lazy) {
             self.output_manager
                 .lifecycle_event(&format!("{name}: starting (requested)"));
             if let Some(done_tx) = self.done_tx.clone() {
@@ -2234,7 +3294,14 @@ impl Runner {
                 });
             }
         }
-        let resolved = svc.resolve(self.platform);
+        let resolved = match self.services.get(name) {
+            Some(rs) => rs.resolved.clone(),
+            None => {
+                return Err(CommandError::UnknownService {
+                    name: name.to_string(),
+                })
+            }
+        };
         self.output_manager
             .lifecycle_event(&format!("starting {name}... (requested)"));
         self.spawn_and_wire_service(name, &resolved, None)
@@ -2247,39 +3314,47 @@ impl Runner {
 
     /// Handle an API-initiated Stop command.
     async fn handle_stop_cmd(&mut self, name: &str) -> CommandResult {
-        let resolved = self.lookup_service(name)?.resolve(self.platform);
+        self.lookup_service(name)?;
         // A lazy service in Lazy state has no process — just mark it Stopped.
-        if self.service_states.get(name) == Some(&ServiceState::Lazy) {
-            self.service_states
-                .insert(name.to_string(), ServiceState::Stopped);
+        if self.services.get(name).is_some_and(|rs| rs.state == ServiceState::Lazy) {
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.state = ServiceState::Stopped;
+            }
             self.output_manager
                 .lifecycle_event(&format!("{name}: stopped (was lazy)"));
             return Ok(());
         }
-        let handle = self.service_handles.remove(name).ok_or_else(|| {
-            CommandError::InvalidState {
+        let handle = self
+            .services
+            .get_mut(name)
+            .and_then(|rs| rs.handle.take())
+            .ok_or_else(|| CommandError::InvalidState {
                 name: name.to_string(),
                 message: "not running".to_string(),
-            }
-        })?;
+            })?;
+        let shutdown_config = self
+            .services
+            .get(name)
+            .and_then(|rs| rs.resolved.shutdown.clone());
         // Release attach lock if held — the PTY write in the attach session
         // becomes invalid once the service stops (process gone).
-        if self.attach_locks.remove(name).is_some() {
+        if self.remove_attach_lock(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
-        self.service_states
-            .insert(name.to_string(), ServiceState::Stopping);
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.state = ServiceState::Stopping;
+        }
         self.output_manager
             .lifecycle_event(&format!("stopping {name}... (requested)"));
-        let shutdown_config = resolved.shutdown.as_ref();
-        if let Err(e) = stop_service(handle, shutdown_config, false).await {
+        if let Err(e) = stop_service(handle, shutdown_config.as_ref(), false).await {
             return Err(CommandError::Failed {
                 name: name.to_string(),
                 message: e.to_string(),
             });
         }
-        self.service_states
-            .insert(name.to_string(), ServiceState::Stopped);
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.state = ServiceState::Stopped;
+        }
         // Close follow/attach sinks so log followers and attach sessions
         // detect the service stopped instead of blocking forever.
         if let Some(writer) = self.output_manager.service_writer(name) {
@@ -2315,8 +3390,8 @@ impl Runner {
         reply: oneshot::Sender<Result<AttachSession, CommandError>>,
     ) {
         // Must be a known service or task.
-        let is_service = self.config.services.contains_key(name);
-        let is_task = self.config.tasks.contains_key(name);
+        let is_service = self.services.contains_key(name);
+        let is_task = self.tasks.contains_key(name);
         if !is_service && !is_task {
             let _ = reply.send(Err(CommandError::UnknownService {
                 name: name.to_string(),
@@ -2325,7 +3400,7 @@ impl Runner {
         }
 
         // Check attach lock.
-        if let Some(&existing_pid) = self.attach_locks.get(name) {
+        if let Some(existing_pid) = self.get_attach_lock(name) {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: format!("process {existing_pid} is currently attached to '{name}'"),
@@ -2334,7 +3409,7 @@ impl Runner {
         }
 
         // Check for a pending waiter (another client already waiting).
-        if self.attach_waiters.contains_key(name) {
+        if self.has_attach_waiter(name) {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "another client is already waiting to attach".to_string(),
@@ -2344,9 +3419,9 @@ impl Runner {
 
         // Check if the process is running.
         let is_running = if is_service {
-            self.service_handles.contains_key(name)
+            self.services.get(name).is_some_and(|rs| rs.handle.is_some())
         } else {
-            self.running_tasks.contains_key(name)
+            self.tasks.get(name).is_some_and(|rt| rt.pgid.is_some())
         };
 
         if !is_running {
@@ -2354,10 +3429,7 @@ impl Runner {
             // the process next spawns.
             self.output_manager
                 .lifecycle_event(&format!("{name}: waiting for process to start (attach pending)"));
-            self.attach_waiters.insert(
-                name.to_string(),
-                AttachWaiter { pid, reply },
-            );
+            self.set_attach_waiter(name, AttachWaiter { pid, reply });
             return;
         }
 
@@ -2370,7 +3442,8 @@ impl Runner {
     /// has already validated the name exists and checked the attach lock.
     async fn fulfill_attach(&mut self, name: &str, pid: u32) -> Result<AttachSession, CommandError> {
         // Reclaim the PTY write handle by stopping the OSC sink.
-        let pty_write = match self.osc_sinks.remove(name) {
+        let osc_handle = self.get_osc_sink_mut(name).and_then(|opt| opt.take());
+        let pty_write = match osc_handle {
             Some(osc_handle) => osc_handle.take_pty_write().await,
             None => None,
         };
@@ -2393,7 +3466,7 @@ impl Runner {
         self.output_manager.pause_stdout_sink(name).await;
 
         // Acquire the lock.
-        self.attach_locks.insert(name.to_string(), pid);
+        self.set_attach_lock(name, pid);
 
         self.output_manager
             .lifecycle_event(&format!("{name}: attached (pid {pid})"));
@@ -2405,7 +3478,7 @@ impl Runner {
     /// Check for a pending attach waiter and fulfill it if the process
     /// is now running.
     async fn fulfill_pending_waiter(&mut self, name: &str) {
-        if let Some(waiter) = self.attach_waiters.remove(name) {
+        if let Some(waiter) = self.take_attach_waiter(name) {
             // Check the waiter's reply channel is still alive (client may
             // have disconnected while waiting).
             if waiter.reply.is_closed() {
@@ -2421,17 +3494,19 @@ impl Runner {
         // If the service/task was stopped/restarted while we were attached,
         // the lock was already cleared and the current process has a fresh
         // PTY — setting the stale one would corrupt it.
-        if self.attach_locks.contains_key(name)
+        if self.get_attach_lock(name).is_some()
             && let Some(pty) = pty_write
         {
             // Restart the OSC response sink with the returned handle.
-            if let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await {
-                self.osc_sinks.insert(name.to_string(), osc_handle);
+            if let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await
+                && let Some(sink_slot) = self.get_osc_sink_mut(name)
+            {
+                *sink_slot = Some(osc_handle);
             }
         }
 
         // Release lock.
-        self.attach_locks.remove(name);
+        self.remove_attach_lock(name);
 
         // Resume prefixed output.
         self.output_manager.resume_stdout_sink(name).await;
@@ -2442,8 +3517,8 @@ impl Runner {
 
     /// Handle a file-watch-triggered task re-run.
     async fn handle_task_rerun(&mut self, name: &str) {
-        let task_cfg = match self.config.tasks.get(name) {
-            Some(t) => t.clone(),
+        let task_cfg = match self.tasks.get(name) {
+            Some(rt) => rt.config.clone(),
             None => {
                 self.output_manager
                     .error_event(&format!("{name}: rerun requested for unknown task"));
@@ -2462,8 +3537,9 @@ impl Runner {
         // If the task has opted out of auto-reruns, mark it pending and don't spawn.
         // The user will need to trigger a manual rerun when they're ready.
         if !task_cfg.auto_rerun {
-            self.task_states
-                .insert(name.to_string(), TaskItemState::PendingRerun);
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.state = TaskItemState::PendingRerun;
+            }
             let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
                 name: name.to_string(),
                 state: TaskItemState::PendingRerun,
@@ -2480,7 +3556,7 @@ impl Runner {
 
         // Release attach lock and close follow sinks so any active attach
         // session exits cleanly before the new process starts.
-        if self.attach_locks.remove(name).is_some() {
+        if self.remove_attach_lock(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
         if let Some(writer) = self.output_manager.service_writer(name) {
@@ -2489,8 +3565,9 @@ impl Runner {
 
         self.output_manager
             .lifecycle_event(&format!("{name}: re-running (file changed)"));
-        self.task_states
-            .insert(name.to_string(), TaskItemState::Running);
+        if let Some(rt) = self.tasks.get_mut(name) {
+            rt.state = TaskItemState::Running;
+        }
 
         self.output_manager
             .debug_event(&format!("{name}: spawning process..."));
@@ -2501,8 +3578,9 @@ impl Runner {
                 self.wire_task_output_and_wait(name, spawn, &task_cfg, None).await;
             }
             Err(e) => {
-                self.task_states
-                    .insert(name.to_string(), TaskItemState::Failed);
+                if let Some(rt) = self.tasks.get_mut(name) {
+                    rt.state = TaskItemState::Failed;
+                }
                 self.output_manager
                     .error_event(&format!("{name}: failed to start: {e}"));
                 let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
@@ -2523,15 +3601,13 @@ impl Runner {
 
     fn handle_service_done(&mut self, item: &ItemDone) {
         if item.success {
-            self.service_states
-                .insert(item.name.clone(), ServiceState::Ready);
-            // Activate proxy backend now that the service is ready.
-            if let Some(proxy) = self.service_proxies.get(&item.name) {
-                proxy.set_backend();
-            }
-            if let Some(svc) = self.config.services.get(&item.name) {
-                let resolved = svc.resolve(self.platform);
-                let ready_desc = match &resolved.ready {
+            if let Some(rs) = self.services.get_mut(&item.name) {
+                rs.state = ServiceState::Ready;
+                // Activate proxy backend now that the service is ready.
+                if let Some(ref proxy) = rs.proxy {
+                    proxy.set_backend();
+                }
+                let ready_desc = match &rs.resolved.ready {
                     Some(r) if r.tcp.is_some() => {
                         format!(" (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
                     }
@@ -2544,7 +3620,7 @@ impl Runner {
                 self.output_manager.lifecycle_event(&format!(
                     "{}{}",
                     item.name,
-                    if resolved.ready.is_some() {
+                    if rs.resolved.ready.is_some() {
                         format!(" ready{ready_desc}")
                     } else {
                         ready_desc
@@ -2554,44 +3630,42 @@ impl Runner {
         } else {
             // If a lazy service fails, reset to Lazy so the next connection
             // can re-trigger it instead of leaving it permanently failed.
-            let is_lazy = self
-                .config
-                .services
-                .get(&item.name)
-                .is_some_and(|svc| svc.resolve(self.platform).lazy);
-            if is_lazy && self.service_proxies.contains_key(&item.name) {
-                self.service_states
-                    .insert(item.name.clone(), ServiceState::Lazy);
-                if let Some(ref msg) = item.message {
-                    self.output_manager
-                        .error_event(&format!("{}: {msg} (will retry on next connection)", item.name));
-                }
-            } else {
-                self.service_states
-                    .insert(item.name.clone(), ServiceState::Failed);
-                if let Some(ref msg) = item.message {
-                    self.output_manager
-                        .error_event(&format!("{}: {msg}", item.name));
+            if let Some(rs) = self.services.get_mut(&item.name) {
+                let is_lazy = rs.resolved.lazy && rs.proxy.is_some();
+                if is_lazy {
+                    rs.state = ServiceState::Lazy;
+                    if let Some(ref msg) = item.message {
+                        self.output_manager
+                            .error_event(&format!("{}: {msg} (will retry on next connection)", item.name));
+                    }
+                } else {
+                    rs.state = ServiceState::Failed;
+                    if let Some(ref msg) = item.message {
+                        self.output_manager
+                            .error_event(&format!("{}: {msg}", item.name));
+                    }
                 }
             }
         }
     }
 
     fn handle_task_done(&mut self, item: &ItemDone) {
-        if self.running_tasks.remove(&item.name).is_some() {
+        if let Some(rt) = self.tasks.get_mut(&item.name)
+            && rt.pgid.take().is_some()
+        {
             // Release attach lock if held.
-            if self.attach_locks.remove(&item.name).is_some() {
-                // Can't await here (sync fn), but the stdout sink resume
-                // will happen naturally when the follow sink closes.
-            }
+            rt.attach_lock = None;
+            // Can't await here (sync fn), but the stdout sink resume
+            // will happen naturally when the follow sink closes.
         }
         let timing = item.elapsed.map(format_duration).unwrap_or_default();
 
         if item.success {
-            let cur = self.task_states.get(&item.name).copied();
+            let cur = self.tasks.get(&item.name).map(|rt| rt.state);
             if cur != Some(TaskItemState::Skipped) {
-                self.task_states
-                    .insert(item.name.clone(), TaskItemState::Completed);
+                if let Some(rt) = self.tasks.get_mut(&item.name) {
+                    rt.state = TaskItemState::Completed;
+                }
                 let msg = if timing.is_empty() {
                     format!("{} complete", item.name)
                 } else {
@@ -2600,8 +3674,9 @@ impl Runner {
                 self.output_manager.lifecycle_event(&msg);
             }
         } else {
-            self.task_states
-                .insert(item.name.clone(), TaskItemState::Failed);
+            if let Some(rt) = self.tasks.get_mut(&item.name) {
+                rt.state = TaskItemState::Failed;
+            }
             if let Some(ref err_msg) = item.message {
                 let msg = if timing.is_empty() {
                     format!("{} failed ({err_msg})", item.name)
@@ -2619,8 +3694,10 @@ impl Runner {
             .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");
 
         // Shut down all proxy listeners first (stop accepting new connections).
-        for (_, proxy) in self.service_proxies.drain() {
-            proxy.shutdown();
+        for (_, rs) in self.services.iter_mut() {
+            if let Some(proxy) = rs.proxy.take() {
+                proxy.shutdown();
+            }
         }
 
         // Tell the API server to stop accepting connections.
@@ -2656,10 +3733,10 @@ impl Runner {
         let mut by_depth: std::collections::BTreeMap<usize, Vec<String>> =
             std::collections::BTreeMap::new();
         for name in &order {
-            if !self.config.services.contains_key(name) {
+            if !self.services.contains_key(name) {
                 continue;
             }
-            let state = self.service_states.get(name).copied();
+            let state = self.services.get(name).map(|rs| rs.state);
             if !matches!(
                 state,
                 Some(ServiceState::Running)
@@ -2686,13 +3763,14 @@ impl Runner {
             let mut stopping_pgids: HashMap<String, i32> = HashMap::new();
             let mut join_set: JoinSet<String> = JoinSet::new();
             for name in &names {
-                if let Some(handle) = self.service_handles.remove(name) {
+                if let Some(handle) = self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
                     if let ServiceHandle::Process(ref proc) = handle {
                         stopping_pgids.insert(name.clone(), proc.pgid());
                     }
-                    let svc = self.config.services.get(name);
-                    let resolved = svc.map(|s| s.resolve(self.platform));
-                    let shutdown_config = resolved.as_ref().and_then(|r| r.shutdown.clone());
+                    let shutdown_config = self
+                        .services
+                        .get(name)
+                        .and_then(|rs| rs.resolved.shutdown.clone());
                     let force = SIGNAL_COUNT.load(Ordering::SeqCst) >= 2;
                     let name_owned = name.clone();
                     join_set.spawn(async move {
@@ -2714,8 +3792,9 @@ impl Runner {
                             nix::unistd::Pid::from_raw(*pgid),
                             nix::sys::signal::Signal::SIGKILL,
                         );
-                        self.service_states
-                            .insert(name.clone(), ServiceState::Stopped);
+                        if let Some(rs) = self.services.get_mut(name) {
+                            rs.state = ServiceState::Stopped;
+                        }
                     }
                     join_set.abort_all();
                     while join_set.join_next().await.is_some() {}
@@ -2733,8 +3812,9 @@ impl Runner {
                 {
                     Ok(Some(Ok(name))) => {
                         stopping_pgids.remove(&name);
-                        self.service_states
-                            .insert(name.clone(), ServiceState::Stopped);
+                        if let Some(rs) = self.services.get_mut(&name) {
+                            rs.state = ServiceState::Stopped;
+                        }
                         remaining -= 1;
                         self.output_manager
                             .lifecycle_event(&format!("{name} stopped ({remaining} remaining)"));
@@ -2753,22 +3833,30 @@ impl Runner {
         }
 
         // Kill any still-running task process groups.
-        if !self.running_tasks.is_empty() {
+        let running_task_pgids: Vec<(String, i32)> = self
+            .tasks
+            .iter()
+            .filter_map(|(name, rt)| rt.pgid.map(|pgid| (name.clone(), pgid)))
+            .collect();
+        if !running_task_pgids.is_empty() {
             self.output_manager.lifecycle_event(&format!(
                 "killing {} running task{}",
-                self.running_tasks.len(),
-                if self.running_tasks.len() == 1 { "" } else { "s" }
+                running_task_pgids.len(),
+                if running_task_pgids.len() == 1 { "" } else { "s" }
             ));
-            for (name, task) in self.running_tasks.drain() {
+            for (name, pgid) in &running_task_pgids {
                 if let Err(e) = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(task.pgid),
+                    nix::unistd::Pid::from_raw(*pgid),
                     nix::sys::signal::Signal::SIGKILL,
                 ) {
                     // ESRCH = already dead, which is fine.
                     if e != nix::Error::ESRCH {
                         self.output_manager
-                            .error_event(&format!("{name}: failed to kill task pgid {}: {e}", task.pgid));
+                            .error_event(&format!("{name}: failed to kill task pgid {pgid}: {e}"));
                     }
+                }
+                if let Some(rt) = self.tasks.get_mut(name) {
+                    rt.pgid = None;
                 }
             }
         }
@@ -2779,28 +3867,98 @@ impl Runner {
     /// Wait for remaining async tasks to finish after shutdown.
     async fn wait_for_shutdown(&mut self) {
         // All handles should already be stopped by initiate_shutdown.
-        // Drop remaining handles to release PID files.
-        self.service_handles.clear();
-        // Release attach locks and drop pending waiters.
-        self.attach_locks.clear();
-        self.attach_waiters.clear();
-        // Release bound sockets (closes listening ports).
-        self.bound_sockets.clear();
+        // Drop remaining handles, release sockets, clear attach state.
+        for (_, rs) in self.services.iter_mut() {
+            rs.handle = None;
+            rs.attach_lock = None;
+            rs.attach_waiter = None;
+            rs.bound_sockets = None;
+        }
+        for (_, rt) in self.tasks.iter_mut() {
+            rt.attach_lock = None;
+            rt.attach_waiter = None;
+        }
     }
 
     /// Collect status of all items.
-    fn collect_status(&self) -> Vec<ItemStatus> {
+    fn collect_status(&self, verbose: bool) -> Vec<ItemStatus> {
         let mut statuses = Vec::new();
-        for (name, state) in &self.service_states {
+        for (name, rs) in &self.services {
+            let verbose_info = if verbose {
+                let resolved = &rs.resolved;
+                let ready = resolved.ready.as_ref().map(|r| {
+                    if let Some(ref tcp) = r.tcp {
+                        format!("tcp {tcp}")
+                    } else if let Some(ref http) = r.http {
+                        format!("http {http}")
+                    } else if let Some(ref exec) = r.exec {
+                        format!("{} {}", exec.cmd, exec.args.join(" "))
+                    } else {
+                        "none".to_string()
+                    }
+                });
+                let cmd = resolved.run.as_ref().map(|r| {
+                    if r.args.is_empty() {
+                        r.cmd.clone()
+                    } else {
+                        format!("{} {}", r.cmd, r.args.join(" "))
+                    }
+                });
+                // Use resolved build tool watch paths if explicit ones are empty.
+                let watch = if resolved.watch.is_empty() {
+                    rs.resolved_watch_paths.clone()
+                } else {
+                    resolved.watch.clone()
+                };
+                Some(VerboseInfo {
+                    depends_on: resolved.depends_on.clone(),
+                    watch,
+                    listen: resolved.listen.clone(),
+                    proxy: resolved.proxy.iter().map(|p| p.listen.clone()).collect(),
+                    bazel_target: resolved.bazel.as_ref().map(|b| b.target.clone()),
+                    turbo_task: resolved.turbo.as_ref().map(|t| t.task.clone()),
+                    ready,
+                    cmd,
+                })
+            } else {
+                None
+            };
             statuses.push(ItemStatus::Service {
                 name: name.clone(),
-                state: *state,
+                state: rs.state,
+                verbose: verbose_info,
             });
         }
-        for (name, state) in &self.task_states {
+        for (name, rt) in &self.tasks {
+            let verbose_info = if verbose {
+                let task = &rt.config;
+                let cmd_str = if task.args.is_empty() {
+                    task.cmd.clone()
+                } else {
+                    format!("{} {}", task.cmd, task.args.join(" "))
+                };
+                let watch = if task.watch.is_empty() {
+                    rt.resolved_watch_paths.clone()
+                } else {
+                    task.watch.clone()
+                };
+                Some(VerboseInfo {
+                    depends_on: task.depends_on.clone(),
+                    watch,
+                    listen: Vec::new(),
+                    proxy: Vec::new(),
+                    bazel_target: task.bazel.as_ref().map(|b| b.target.clone()),
+                    turbo_task: task.turbo.as_ref().map(|t| t.task.clone()),
+                    ready: None,
+                    cmd: Some(cmd_str),
+                })
+            } else {
+                None
+            };
             statuses.push(ItemStatus::Task {
                 name: name.clone(),
-                state: *state,
+                state: rt.state,
+                verbose: verbose_info,
             });
         }
         statuses
@@ -3176,5 +4334,98 @@ mod tests {
         assert_eq!(depths["b"], 1);
         assert_eq!(depths["c"], 1);
         assert_eq!(depths["d"], 2);
+    }
+
+    #[test]
+    fn runtime_service_default_state() {
+        use crate::config::service::ResolvedService;
+        use crate::config::types::LogConfig;
+        use std::collections::HashMap;
+
+        let rs = RuntimeService {
+            resolved: ResolvedService {
+                dir: None,
+                env: HashMap::new(),
+                env_file: Vec::new(),
+                watch: Vec::new(),
+                ignore: Vec::new(),
+                debounce: None,
+                depends_on: Vec::new(),
+                listen: Vec::new(),
+                proxy: Vec::new(),
+                lazy: false,
+                download: None,
+                ready: None,
+                shutdown: None,
+                log: LogConfig::Stdout,
+                bazel: None,
+                turbo: None,
+                docker: None,
+                rust: None,
+                go: None,
+                run: None,
+                build: None,
+            },
+            state: ServiceState::Pending,
+            handle: None,
+            osc_sink: None,
+            attach_lock: None,
+            attach_waiter: None,
+            bound_sockets: None,
+            proxy: None,
+            resolved_watch_paths: Vec::new(),
+            bazel_binary_path: None,
+            batch_built: false,
+        };
+
+        assert_eq!(rs.state, ServiceState::Pending);
+        assert!(rs.handle.is_none());
+        assert!(rs.osc_sink.is_none());
+        assert!(rs.attach_lock.is_none());
+        assert!(rs.attach_waiter.is_none());
+        assert!(rs.bound_sockets.is_none());
+        assert!(rs.proxy.is_none());
+        assert!(rs.resolved_watch_paths.is_empty());
+        assert!(rs.bazel_binary_path.is_none());
+        assert!(!rs.batch_built);
+        assert!(rs.resolved.run.is_none());
+    }
+
+    #[test]
+    fn runtime_task_default_state() {
+        use crate::config::types::LogConfig;
+        use std::collections::HashMap;
+
+        let rt = RuntimeTask {
+            config: crate::config::task::Task {
+                cmd: "echo".to_string(),
+                args: vec!["hello".to_string()],
+                dir: None,
+                env: HashMap::new(),
+                depends_on: Vec::new(),
+                watch: Vec::new(),
+                ignore: Vec::new(),
+                timeout: None,
+                log: LogConfig::Stdout,
+                auto_rerun: true,
+                download: None,
+                bazel: None,
+                turbo: None,
+            },
+            state: TaskItemState::Pending,
+            pgid: None,
+            osc_sink: None,
+            attach_lock: None,
+            attach_waiter: None,
+            resolved_watch_paths: Vec::new(),
+        };
+
+        assert_eq!(rt.state, TaskItemState::Pending);
+        assert!(rt.pgid.is_none());
+        assert!(rt.osc_sink.is_none());
+        assert!(rt.attach_lock.is_none());
+        assert!(rt.attach_waiter.is_none());
+        assert!(rt.resolved_watch_paths.is_empty());
+        assert_eq!(rt.config.cmd, "echo");
     }
 }

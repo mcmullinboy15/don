@@ -1,3 +1,4 @@
+pub(crate) mod build_tool;
 pub mod client;
 pub mod config;
 pub mod docker;
@@ -14,5 +15,5 @@ pub mod watch;
 pub use config::{Config, ConfigError, Platform};
 pub use duration::{parse_duration, DurationError};
 pub use output::{OutputError, OutputManager, ServiceWriter};
-pub use runner::{Runner, RunnerError};
+pub use runner::{Runner, RunnerError, VerboseInfo};
 pub use task_state::{TaskState, TaskStateError};

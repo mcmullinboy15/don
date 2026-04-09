@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use super::download::DownloadConfig;
 use super::platform::Platform;
-use super::types::LogConfig;
+use super::types::{BazelConfig, LogConfig, TurboConfig};
 
 /// A one-shot task that runs to completion.
 ///
@@ -46,6 +46,12 @@ pub struct Task {
     /// When a download exists for the current platform, its binary path
     /// replaces `cmd`. Without a matching platform entry, `cmd` is looked up on PATH.
     pub download: Option<DownloadConfig>,
+    /// Bazel build tool integration — auto-resolve watch patterns from the build graph.
+    /// Mutually exclusive with `turbo`.
+    pub bazel: Option<BazelConfig>,
+    /// Turborepo build tool integration — auto-resolve watch patterns from the task graph.
+    /// Mutually exclusive with `bazel`.
+    pub turbo: Option<TurboConfig>,
 }
 
 impl Task {

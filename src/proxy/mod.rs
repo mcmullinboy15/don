@@ -283,14 +283,31 @@ async fn proxy_accept_loop(
 }
 
 /// Forward traffic bidirectionally between client and backend.
+///
+/// Retries the backend connection with exponential backoff if the service
+/// isn't listening yet (common during startup before the process binds its port).
 async fn proxy_connection(mut client: TcpStream, backend_addr: SocketAddr) {
-    let mut backend = match TcpStream::connect(backend_addr).await {
-        Ok(stream) => stream,
-        Err(_) => {
-            // Backend not reachable — close client connection.
-            let _ = client.shutdown().await;
-            return;
+    let mut backend = None;
+    for attempt in 0..20u32 {
+        match TcpStream::connect(backend_addr).await {
+            Ok(stream) => {
+                backend = Some(stream);
+                break;
+            }
+            Err(_) => {
+                // Exponential backoff: 10ms, 20ms, 40ms, ... capped at 500ms.
+                let delay = std::time::Duration::from_millis(
+                    (10 * (1 << attempt.min(6))).min(500),
+                );
+                tokio::time::sleep(delay).await;
+            }
         }
+    }
+
+    let Some(mut backend) = backend else {
+        // Backend never became reachable — close client connection.
+        let _ = client.shutdown().await;
+        return;
     };
 
     // Shovel bytes in both directions until either side closes.

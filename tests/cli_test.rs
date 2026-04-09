@@ -205,7 +205,7 @@ fn cli_stop_and_restart_flow() {
         // status should show stopped
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = Client::new(dir.path());
-        let items = client.status().await.unwrap();
+        let items = client.status(false).await.unwrap();
         let joined = format!("{items:?}");
         assert!(joined.to_lowercase().contains("stopped"), "items: {joined}");
 

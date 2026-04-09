@@ -1,6 +1,36 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Bazel build tool integration for a service or task.
+///
+/// When configured, Don queries Bazel at startup to determine which source
+/// packages contribute to the target, and watches those directories for changes.
+/// This replaces the need for manually maintaining `watch` patterns.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BazelConfig {
+    /// Bazel target label (e.g. `"//services/api:api"`).
+    pub target: String,
+    /// Query timeout in seconds. Defaults to 30.
+    pub query_timeout: Option<u64>,
+}
+
+/// Turborepo build tool integration for a service or task.
+///
+/// When configured, Don queries Turborepo at startup to determine the task
+/// graph and source inputs, and watches the relevant package directories.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TurboConfig {
+    /// Turbo task name to query for watch resolution (e.g. `"dev"`, `"build"`).
+    pub task: String,
+    /// Turbo task to run during the batch build phase (e.g. `"build"`).
+    /// Defaults to `"build"`. Set to `""` to skip the batch build for this item.
+    pub build_task: Option<String>,
+    /// Filter to a specific package (e.g. `"@myorg/api"`).
+    pub filter: Option<String>,
+    /// Query timeout in seconds. Defaults to 30.
+    pub query_timeout: Option<u64>,
+}
+
 /// A proxy entry: Don listens on `listen` and forwards TCP connections to the
 /// service on a random ephemeral port.
 ///
