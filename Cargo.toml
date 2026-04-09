@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Boss of your dev environment"
 license = "MIT"
+repository = "https://github.com/pjtatlow/don"
 
 
 [dependencies]
@@ -52,3 +53,8 @@ dbg_macro = "deny"
 # Library code should never println — OutputManager owns stdout.
 # main.rs opts out for legitimate CLI output.
 print_stdout = "deny"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
