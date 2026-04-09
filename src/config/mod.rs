@@ -15,14 +15,14 @@ pub use self::download::{DownloadConfig, PlatformDownload};
 pub use self::platform::Platform;
 pub use self::profile::Profile;
 pub use self::service::{
-    DockerBuildConfig, DockerConfig, Preset, ResolvedService, RustConfig, Service,
+    DockerBuildConfig, DockerConfig, ResolvedService, RustConfig, Service, ServiceKind,
 };
 pub use self::task::Task;
 pub use self::types::{
     BazelConfig, Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig, TurboConfig,
 };
 
-pub use self::service::ServiceOverride;
+pub use self::service::{GoConfig, ServiceOverride};
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -122,13 +122,10 @@ impl Config {
         // Validate services
         for (name, svc) in &self.services {
             let resolved = svc.resolve(platform);
-            if let Err(e) = resolved.preset() {
-                errors.push(format!("service '{name}': {e}"));
-            }
-            // Bazel and turbo are mutually exclusive.
-            if resolved.bazel.is_some() && resolved.turbo.is_some() {
+            // ServiceKind must be set (either on the base or via a platform override).
+            if resolved.kind.is_none() {
                 errors.push(format!(
-                    "service '{name}': 'bazel' and 'turbo' are mutually exclusive"
+                    "service '{name}': must have one of: bazel, turbo, docker, rust, go, or run"
                 ));
             }
             if let Some(ref ready) = resolved.ready {
@@ -203,14 +200,20 @@ impl Config {
             if let Some(ref download) = resolved.download {
                 // Downloads only apply to custom services (with run.cmd).
                 // Rust/Go/Docker presets have their own binary resolution.
-                if resolved.rust.is_some() || resolved.go.is_some() || resolved.docker.is_some() {
-                    errors.push(format!(
-                        "service '{name}': download is not supported with rust/go/docker presets"
-                    ));
-                } else if resolved.run.is_none() {
-                    errors.push(format!(
-                        "service '{name}': download requires a run command"
-                    ));
+                match &resolved.kind {
+                    Some(ServiceKind::Rust(_))
+                    | Some(ServiceKind::Go(_))
+                    | Some(ServiceKind::Docker(_)) => {
+                        errors.push(format!(
+                            "service '{name}': download is not supported with rust/go/docker presets"
+                        ));
+                    }
+                    Some(ServiceKind::Custom { .. }) => {}
+                    _ => {
+                        errors.push(format!(
+                            "service '{name}': download requires a run command"
+                        ));
+                    }
                 }
                 for (platform_key, artifact) in &download.platform {
                     if let Err(msg) = validate_platform_download(artifact) {
@@ -221,7 +224,9 @@ impl Config {
                 }
                 // Warn if the current platform has no download entry — the
                 // service will silently fall back to a PATH lookup of run.cmd.
-                if download.for_platform(platform).is_none() && resolved.run.is_some() {
+                if download.for_platform(platform).is_none()
+                    && matches!(resolved.kind, Some(ServiceKind::Custom { .. }))
+                {
                     let available: Vec<String> = download
                         .platform
                         .keys()
@@ -659,7 +664,7 @@ mod tests {
                 check: |config| {
                     let resolved = config.services["postgres"].resolve(TEST_PLATFORM);
                     assert_eq!(resolved.dir.as_deref(), Some(std::path::Path::new("/data")));
-                    let Preset::Docker(docker) = resolved.preset().unwrap() else {
+                    let Some(ServiceKind::Docker(docker)) = &resolved.kind else {
                         panic!("expected docker preset");
                     };
                     assert_eq!(docker.image, "postgres:16");
@@ -699,7 +704,7 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     let resolved = config.services["api"].resolve(TEST_PLATFORM);
-                    let Preset::Docker(docker) = resolved.preset().unwrap() else {
+                    let Some(ServiceKind::Docker(docker)) = &resolved.kind else {
                         panic!("expected docker preset");
                     };
                     assert_eq!(docker.image, "myapp:dev");
@@ -737,7 +742,7 @@ mod tests {
                 check: |config| {
                     let resolved = config.services["api"].resolve(TEST_PLATFORM);
                     assert_eq!(resolved.dir.as_deref(), Some(std::path::Path::new("./api")));
-                    let Preset::Rust(rust) = resolved.preset().unwrap() else {
+                    let Some(ServiceKind::Rust(rust)) = &resolved.kind else {
                         panic!("expected rust preset");
                     };
                     assert_eq!(rust.binary, "api-server");
@@ -777,12 +782,12 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     let resolved = config.services["worker"].resolve(TEST_PLATFORM);
-                    let Preset::Custom { run, build } = resolved.preset().unwrap() else {
+                    let Some(ServiceKind::Custom { run, build }) = &resolved.kind else {
                         panic!("expected custom preset");
                     };
                     assert_eq!(run.cmd, "node");
                     assert_eq!(run.args, vec!["worker.js"]);
-                    let build = build.unwrap();
+                    let build = build.as_ref().unwrap();
                     assert_eq!(build.cmd, "npm");
                     assert_eq!(build.args, vec!["run", "build"]);
                     assert_eq!(resolved.dir.as_deref(), Some(std::path::Path::new("./worker")));
@@ -801,7 +806,7 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     let resolved = config.services["simple"].resolve(TEST_PLATFORM);
-                    let Preset::Custom { run, build } = resolved.preset().unwrap() else {
+                    let Some(ServiceKind::Custom { run, build }) = &resolved.kind else {
                         panic!("expected custom preset");
                     };
                     assert_eq!(run.cmd, "/usr/bin/myservice");
@@ -865,7 +870,7 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     let linux = config.services["crdb"].resolve(Platform::LinuxX86_64);
-                    let Preset::Custom { run, .. } = linux.preset().unwrap() else {
+                    let Some(ServiceKind::Custom { run, .. }) = &linux.kind else {
                         panic!("expected custom preset on linux");
                     };
                     assert_eq!(run.cmd, "cockroach");
@@ -873,7 +878,7 @@ mod tests {
                     assert_eq!(linux.env["COCKROACH_PORT"], "26257");
 
                     let macos = config.services["crdb"].resolve(Platform::MacosAarch64);
-                    let Preset::Docker(docker) = macos.preset().unwrap() else {
+                    let Some(ServiceKind::Docker(docker)) = &macos.kind else {
                         panic!("expected docker preset on macos");
                     };
                     assert_eq!(docker.image, "cockroachdb/cockroach:v24.1.0");
@@ -934,20 +939,20 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     let linux = config.services["crdb"].resolve(Platform::LinuxX86_64);
-                    let Preset::Custom { run, .. } = linux.preset().unwrap() else {
+                    let Some(ServiceKind::Custom { run, .. }) = &linux.kind else {
                         panic!("expected custom on linux");
                     };
                     assert_eq!(run.cmd, "cockroach");
 
                     let macos = config.services["crdb"].resolve(Platform::MacosAarch64);
-                    let Preset::Docker(docker) = macos.preset().unwrap() else {
+                    let Some(ServiceKind::Docker(docker)) = &macos.kind else {
                         panic!("expected docker on macos");
                     };
                     assert_eq!(docker.image, "cockroachdb/cockroach:v24.1.0");
 
                     // Platform without an override and no base preset should fail
                     let other = config.services["crdb"].resolve(Platform::LinuxAarch64);
-                    assert!(other.preset().is_err());
+                    assert!(other.kind.is_none());
                 },
             },
             ConfigTestCase {
@@ -1292,16 +1297,14 @@ mod tests {
                 },
             },
             ConfigTestCase {
-                name: "conflicting presets is a validation error",
+                name: "conflicting presets is a parse error",
                 input: r#"
                     [services.broken]
                     docker.image = "postgres:16"
                     run.cmd = "something"
                 "#,
-                expect_err: false,
-                check: |config| {
-                    assert!(config.validate(TEST_PLATFORM).is_err());
-                },
+                expect_err: true,
+                check: |_| {},
             },
             ConfigTestCase {
                 name: "ready check with no check type is a validation error",
@@ -1584,33 +1587,33 @@ mod tests {
     fn test_parse_bazel_config() {
         let toml = r#"
 [services.api]
-run.cmd = "./bazel-bin/api"
 bazel.target = "//services/api:api"
 "#;
         let config: Config = toml.parse().unwrap();
         let svc = config.services.get("api").unwrap();
-        let bazel = svc.bazel.as_ref().unwrap();
+        let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
+            panic!("expected bazel kind");
+        };
         assert_eq!(bazel.target, "//services/api:api");
         assert!(bazel.query_timeout.is_none());
-        assert!(svc.turbo.is_none());
     }
 
     #[test]
     fn test_parse_turbo_config() {
         let toml = r#"
 [services.web]
-run.cmd = "npm run dev"
 turbo.task = "dev"
 turbo.filter = "@myorg/web"
 turbo.query_timeout = 60
 "#;
         let config: Config = toml.parse().unwrap();
         let svc = config.services.get("web").unwrap();
-        let turbo = svc.turbo.as_ref().unwrap();
+        let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
+            panic!("expected turbo kind");
+        };
         assert_eq!(turbo.task, "dev");
         assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
         assert_eq!(turbo.query_timeout, Some(60));
-        assert!(svc.bazel.is_none());
     }
 
     #[test]
@@ -1628,19 +1631,18 @@ bazel.target = "//tools/codegen:all"
     }
 
     #[test]
-    fn test_validate_bazel_turbo_mutually_exclusive_service() {
+    fn test_parse_rejects_multiple_service_kinds() {
+        // Multiple service kinds are rejected at parse time, not validation.
         let toml = r#"
 [services.api]
 run.cmd = "./api"
 bazel.target = "//services/api:api"
-turbo.task = "dev"
 "#;
-        let config: Config = toml.parse().unwrap();
-        let result = config.validate(TEST_PLATFORM);
-        assert!(result.is_err());
+        let result: Result<Config, _> = toml.parse();
+        assert!(result.is_err(), "expected parse error for conflicting kinds");
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("mutually exclusive"),
+            err.contains("only one of"),
             "expected mutual exclusivity error, got: {err}"
         );
     }
@@ -1667,20 +1669,21 @@ turbo.task = "build"
     fn test_bazel_config_with_query_timeout() {
         let toml = r#"
 [services.api]
-run.cmd = "./api"
 bazel.target = "//services/api:api"
 bazel.query_timeout = 45
 "#;
         let config: Config = toml.parse().unwrap();
         let svc = config.services.get("api").unwrap();
-        assert_eq!(svc.bazel.as_ref().unwrap().query_timeout, Some(45));
+        let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
+            panic!("expected bazel kind");
+        };
+        assert_eq!(bazel.query_timeout, Some(45));
     }
 
     #[test]
     fn test_build_tool_config_platform_override() {
         let toml = r#"
 [services.api]
-run.cmd = "./api"
 bazel.target = "//services/api:linux"
 
 [services.api.platform.macos-aarch64]
@@ -1691,17 +1694,17 @@ bazel.target = "//services/api:macos_arm64"
 
         // Base config
         let resolved = svc.resolve(Platform::LinuxX86_64);
-        assert_eq!(
-            resolved.bazel.as_ref().unwrap().target,
-            "//services/api:linux"
-        );
+        let Some(ServiceKind::Bazel(bazel)) = &resolved.kind else {
+            panic!("expected bazel kind");
+        };
+        assert_eq!(bazel.target, "//services/api:linux");
 
         // Platform override
         let resolved_mac = svc.resolve(Platform::MacosAarch64);
-        assert_eq!(
-            resolved_mac.bazel.as_ref().unwrap().target,
-            "//services/api:macos_arm64"
-        );
+        let Some(ServiceKind::Bazel(bazel_mac)) = &resolved_mac.kind else {
+            panic!("expected bazel kind on macos");
+        };
+        assert_eq!(bazel_mac.target, "//services/api:macos_arm64");
     }
 
     #[test]
@@ -1717,7 +1720,6 @@ bazel.target = "//services/api:macos_arm64"
                 name: "default build_task (not specified)",
                 toml: r#"
 [services.web]
-run.cmd = "node server.js"
 turbo.task = "dev"
 turbo.filter = "@myorg/web"
 "#,
@@ -1727,7 +1729,6 @@ turbo.filter = "@myorg/web"
                 name: "explicit build_task",
                 toml: r#"
 [services.web]
-run.cmd = "node server.js"
 turbo.task = "dev"
 turbo.filter = "@myorg/web"
 turbo.build_task = "compile"
@@ -1738,7 +1739,6 @@ turbo.build_task = "compile"
                 name: "empty build_task opts out of batch build",
                 toml: r#"
 [services.web]
-run.cmd = "node server.js"
 turbo.task = "dev"
 turbo.filter = "@myorg/web"
 turbo.build_task = ""
@@ -1750,7 +1750,9 @@ turbo.build_task = ""
         for case in cases {
             let config: Config = case.toml.parse().unwrap();
             let svc = config.services.get("web").unwrap();
-            let turbo = svc.turbo.as_ref().unwrap();
+            let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
+                panic!("case '{}': expected turbo kind", case.name);
+            };
             assert_eq!(
                 turbo.build_task.as_deref(),
                 case.expected_build_task,

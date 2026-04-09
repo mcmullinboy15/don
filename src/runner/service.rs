@@ -3,7 +3,7 @@
 //! Services are long-running processes with PID files, output capture,
 //! and optional ready checks.
 
-use crate::config::service::{GoConfig, RustConfig};
+use crate::config::service::{GoConfig, RustConfig, ServiceKind};
 use crate::config::{Platform, ReadyCheck, ResolvedService, ShutdownConfig};
 use crate::duration::parse_duration;
 use crate::process::env::merge_env;
@@ -66,9 +66,9 @@ pub(crate) async fn start_service(
     service_writer: Option<&crate::output::ServiceWriter>,
     platform: Platform,
 ) -> Result<StartResult, ServiceError> {
-    // Dispatch based on the service preset.
-    if let Some(ref docker_config) = resolved.docker {
-        // Docker preset: start a container via the Docker API.
+    // Dispatch based on the service kind.
+    if let Some(ServiceKind::Docker(docker_config)) = &resolved.kind {
+        // Docker kind: start a container via the Docker API.
         let client = docker_client.ok_or_else(|| {
             ServiceError::Docker("docker client not available".to_string())
         })?;
@@ -97,30 +97,57 @@ pub(crate) async fn start_service(
     };
     let service_dir = service_dir_buf.as_path();
 
-    // Determine the run command and args based on preset.
-    // For rust/go presets, the binary path is relative to the service's
+    // Determine the run command and args based on kind.
+    // For rust/go kinds, the binary path is relative to the service's
     // working directory (where cargo/go build runs), not base_dir.
-    let (cmd, args) = if let Some(ref rust_config) = resolved.rust {
-        let binary_path = rust_binary_path(rust_config, service_dir);
-        (binary_path.to_string_lossy().into_owned(), vec![])
-    } else if let Some(ref go_config) = resolved.go {
-        let binary_path = go_binary_path(go_config, name, service_dir);
-        (binary_path.to_string_lossy().into_owned(), vec![])
-    } else if resolved.run.is_some() {
-        let cache_base = base_dir.join(".don").join("cache");
-        let (executable, args) = resolved
-            .resolved_run_cmd(platform, name, Some(&cache_base))
-            .map_err(ServiceError::Config)?;
-        (executable.to_string_lossy().into_owned(), args.to_vec())
-    } else {
-        return Err(crate::process::ProcessError::Spawn {
-            cmd: name.to_string(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "service has no run command or preset",
-            ),
+    let (cmd, args): (String, Vec<String>) = match &resolved.kind {
+        Some(ServiceKind::Rust(rust_config)) => {
+            let binary_path = rust_binary_path(rust_config, service_dir);
+            (binary_path.to_string_lossy().into_owned(), vec![])
         }
-        .into());
+        Some(ServiceKind::Go(go_config)) => {
+            let binary_path = go_binary_path(go_config, name, service_dir);
+            (binary_path.to_string_lossy().into_owned(), vec![])
+        }
+        Some(ServiceKind::Custom { .. }) => {
+            let cache_base = base_dir.join(".don").join("cache");
+            let (executable, run_args) = resolved
+                .resolved_run_cmd(platform, name, Some(&cache_base))
+                .map_err(ServiceError::Config)?;
+            (executable.to_string_lossy().into_owned(), run_args.to_vec())
+        }
+        Some(ServiceKind::Bazel(bazel)) => {
+            // Fallback: use bazel run (slower — does a build check each time).
+            // Normally the runner resolves the binary path and converts to Custom.
+            ("bazel".to_string(), vec!["run".to_string(), bazel.target.clone()])
+        }
+        Some(ServiceKind::Turbo(turbo)) => {
+            if let Some(ref filter) = turbo.filter {
+                ("npx".to_string(), vec![
+                    "turbo".to_string(),
+                    "run".to_string(),
+                    turbo.task.clone(),
+                    "--filter".to_string(),
+                    filter.clone(),
+                ])
+            } else {
+                ("npx".to_string(), vec![
+                    "turbo".to_string(),
+                    "run".to_string(),
+                    turbo.task.clone(),
+                ])
+            }
+        }
+        _ => {
+            return Err(crate::process::ProcessError::Spawn {
+                cmd: name.to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "service has no run command or preset",
+                ),
+            }
+            .into());
+        }
     };
     let injected = bound_sockets
         .map(|s| s.listen_env())

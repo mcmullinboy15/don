@@ -404,11 +404,15 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
             .services
             .iter()
             .filter_map(|(name, svc)| {
-                svc.docker.as_ref().map(|d| {
-                    d.container
-                        .clone()
-                        .unwrap_or_else(|| format!("don-{name}"))
-                })
+                if let Some(don::config::ServiceKind::Docker(d)) = &svc.kind {
+                    Some(
+                        d.container
+                            .clone()
+                            .unwrap_or_else(|| format!("don-{name}")),
+                    )
+                } else {
+                    None
+                }
             })
             .collect(),
         Err(e) => {

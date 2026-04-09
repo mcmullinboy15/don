@@ -635,11 +635,15 @@ impl Runner {
             .services
             .iter()
             .filter_map(|(name, svc)| {
-                svc.docker.as_ref().map(|d| {
-                    d.container
-                        .clone()
-                        .unwrap_or_else(|| format!("don-{name}"))
-                })
+                if let Some(crate::config::ServiceKind::Docker(d)) = &svc.kind {
+                    Some(
+                        d.container
+                            .clone()
+                            .unwrap_or_else(|| format!("don-{name}")),
+                    )
+                } else {
+                    None
+                }
             })
             .collect();
         let cleanup_report =
@@ -654,7 +658,10 @@ impl Runner {
         let task_state = TaskState::new(don_dir.join("task-state"));
 
         // Connect to Docker if any service uses the docker preset.
-        let has_docker = config.services.values().any(|s| s.docker.is_some());
+        let has_docker = config
+            .services
+            .values()
+            .any(|s| matches!(&s.kind, Some(crate::config::ServiceKind::Docker(_))));
         let docker_client = if has_docker {
             Some(
                 bollard::Docker::connect_with_socket_defaults()
@@ -1451,62 +1458,62 @@ impl Runner {
             return Ok(());
         }
 
-        // Docker: build image if docker.build is configured.
-        if let Some(ref docker_config) = resolved.docker
-            && let Some(ref build_config) = docker_config.build
-        {
-            self.output_manager
-                .lifecycle_event(&format!("{name}: building docker image..."));
-            if let Some(ref client) = self.docker_client
-                && let Some(writer) = self.output_manager.service_writer(name)
-            {
-                if let Err(e) = crate::docker::build::build_image(
-                    client,
-                    build_config,
-                    &docker_config.image,
-                    &self.base_dir,
-                    &writer,
-                )
-                .await
-                {
+        match &resolved.kind {
+            // Docker: build image if docker.build is configured.
+            Some(crate::config::ServiceKind::Docker(docker_config)) => {
+                if let Some(build_config) = &docker_config.build {
                     self.output_manager
-                        .error_event(&format!("{name}: docker build failed: {e}"));
-                    return Err(());
+                        .lifecycle_event(&format!("{name}: building docker image..."));
+                    if let Some(ref client) = self.docker_client
+                        && let Some(writer) = self.output_manager.service_writer(name)
+                    {
+                        if let Err(e) = crate::docker::build::build_image(
+                            client,
+                            build_config,
+                            &docker_config.image,
+                            &self.base_dir,
+                            &writer,
+                        )
+                        .await
+                        {
+                            self.output_manager
+                                .error_event(&format!("{name}: docker build failed: {e}"));
+                            return Err(());
+                        }
+                        self.output_manager
+                            .lifecycle_event(&format!("{name}: docker build succeeded"));
+                    }
                 }
-                self.output_manager
-                    .lifecycle_event(&format!("{name}: docker build succeeded"));
+                Ok(())
             }
-            return Ok(());
-        }
-
-        // Rust: cargo build.
-        if let Some(ref rust_config) = resolved.rust {
-            let build_args = service::rust_build_args(rust_config);
-            return self
-                .run_preset_build(name, "cargo", &build_args, resolved)
-                .await;
-        }
-
-        // Go: go build.
-        if let Some(ref go_config) = resolved.go {
-            let output_path = service::go_binary_path(go_config, name, &self.base_dir);
-            if let Some(parent) = output_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            // Rust: cargo build.
+            Some(crate::config::ServiceKind::Rust(rust_config)) => {
+                let build_args = service::rust_build_args(rust_config);
+                self.run_preset_build(name, "cargo", &build_args, resolved)
+                    .await
             }
-            let build_args = service::go_build_args(go_config, &output_path);
-            return self
-                .run_preset_build(name, "go", &build_args, resolved)
-                .await;
+            // Go: go build.
+            Some(crate::config::ServiceKind::Go(go_config)) => {
+                let output_path = service::go_binary_path(go_config, name, &self.base_dir);
+                if let Some(parent) = output_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let build_args = service::go_build_args(go_config, &output_path);
+                self.run_preset_build(name, "go", &build_args, resolved)
+                    .await
+            }
+            // Custom: run the build command if configured.
+            Some(crate::config::ServiceKind::Custom { build, .. }) => {
+                if let Some(build_cmd) = build {
+                    self.run_preset_build(name, &build_cmd.cmd, &build_cmd.args, resolved)
+                        .await
+                } else {
+                    Ok(())
+                }
+            }
+            // Bazel/Turbo: handled by batch builds, not here.
+            _ => Ok(()),
         }
-
-        // Custom: run the build command if configured.
-        if let Some(ref build_cmd) = resolved.build {
-            return self
-                .run_preset_build(name, &build_cmd.cmd, &build_cmd.args, resolved)
-                .await;
-        }
-
-        Ok(())
     }
 
     /// Download the artifact for a service if it has a download config for this platform.
@@ -2116,32 +2123,36 @@ impl Runner {
 
         for name in &names {
             if let Some(rs) = self.services.get(name) {
-                if let Some(ref bazel) = rs.resolved.bazel {
-                    bazel_items.push((name.clone(), bazel.target.clone()));
-                    if let Some(t) = bazel.query_timeout {
-                        bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
-                    }
-                } else if let Some(ref turbo) = rs.resolved.turbo {
-                    let build_task = turbo
-                        .build_task
-                        .clone()
-                        .unwrap_or_else(|| "build".to_string());
-                    if !build_task.is_empty()
-                        && let Some(ref filter) = turbo.filter
-                    {
-                        turbo_by_task
-                            .entry(build_task)
-                            .or_default()
-                            .push((name.clone(), filter.clone()));
-                        if let Some(t) = turbo.query_timeout {
-                            turbo_timeout =
-                                Some(turbo_timeout.map_or(t, |cur: u64| cur.max(t)));
+                match &rs.resolved.kind {
+                    Some(crate::config::ServiceKind::Bazel(bazel)) => {
+                        bazel_items.push((name.clone(), bazel.target.clone()));
+                        if let Some(t) = bazel.query_timeout {
+                            bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
                         }
-                    } else {
+                    }
+                    Some(crate::config::ServiceKind::Turbo(turbo)) => {
+                        let build_task = turbo
+                            .build_task
+                            .clone()
+                            .unwrap_or_else(|| "build".to_string());
+                        if !build_task.is_empty()
+                            && let Some(ref filter) = turbo.filter
+                        {
+                            turbo_by_task
+                                .entry(build_task)
+                                .or_default()
+                                .push((name.clone(), filter.clone()));
+                            if let Some(t) = turbo.query_timeout {
+                                turbo_timeout =
+                                    Some(turbo_timeout.map_or(t, |cur: u64| cur.max(t)));
+                            }
+                        } else {
+                            plain_rebuilds.push(name.clone());
+                        }
+                    }
+                    _ => {
                         plain_rebuilds.push(name.clone());
                     }
-                } else {
-                    plain_rebuilds.push(name.clone());
                 }
             }
         }
@@ -2581,8 +2592,8 @@ impl Runner {
             let (bazel_cfg, turbo_cfg, item_dir, ignore_patterns) =
                 if let Some(rs) = self.services.get(name) {
                     (
-                        rs.resolved.bazel.clone(),
-                        rs.resolved.turbo.clone(),
+                        rs.resolved.bazel_config().cloned(),
+                        rs.resolved.turbo_config().cloned(),
                         rs.resolved.dir.clone(),
                         rs.resolved.ignore.clone(),
                     )
@@ -2679,11 +2690,11 @@ impl Runner {
         let mut items: Vec<BuildToolItem> = Vec::new();
 
         for (name, rs) in &self.services {
-            if rs.resolved.bazel.is_some() || rs.resolved.turbo.is_some() {
+            if rs.resolved.is_build_tool_managed() {
                 items.push(BuildToolItem {
                     name: name.clone(),
-                    bazel: rs.resolved.bazel.clone(),
-                    turbo: rs.resolved.turbo.clone(),
+                    bazel: rs.resolved.bazel_config().cloned(),
+                    turbo: rs.resolved.turbo_config().cloned(),
                     dir: rs.resolved.dir.clone(),
                     ignore: rs.resolved.ignore.clone(),
                 });
@@ -2772,7 +2783,7 @@ impl Runner {
             if !rs.batch_built {
                 continue;
             }
-            if let Some(ref bazel) = rs.resolved.bazel {
+            if let Some(bazel) = rs.resolved.bazel_config() {
                 let working_dir = match rs.resolved.dir.as_deref() {
                     Some(d) => self.base_dir.join(d),
                     None => self.base_dir.clone(),
@@ -2821,12 +2832,12 @@ impl Runner {
         let mut turbo_timeout: Option<u64> = None;
 
         for (name, rs) in &self.services {
-            if let Some(ref bazel) = rs.resolved.bazel {
+            if let Some(bazel) = rs.resolved.bazel_config() {
                 bazel_targets.push((name.clone(), bazel.target.clone()));
                 if let Some(t) = bazel.query_timeout {
                     bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
                 }
-            } else if let Some(ref turbo) = rs.resolved.turbo {
+            } else if let Some(turbo) = rs.resolved.turbo_config() {
                 let build_task = turbo
                     .build_task
                     .clone()
@@ -3120,7 +3131,7 @@ impl Runner {
         // For build-tool-managed services, queue the rebuild into a batch.
         // Multiple services sharing the same source files will be batched into
         // one `bazel build //a //b //c` invocation instead of separate builds.
-        if rs.resolved.bazel.is_some() || rs.resolved.turbo.is_some() {
+        if rs.resolved.is_build_tool_managed() {
             if !self.pending_bt_rebuilds.contains(&name.to_string()) {
                 self.pending_bt_rebuilds.push(name.to_string());
             }
@@ -3897,7 +3908,7 @@ impl Runner {
                         "none".to_string()
                     }
                 });
-                let cmd = resolved.run.as_ref().map(|r| {
+                let cmd = resolved.run_cmd().map(|r| {
                     if r.args.is_empty() {
                         r.cmd.clone()
                     } else {
@@ -3915,8 +3926,8 @@ impl Runner {
                     watch,
                     listen: resolved.listen.clone(),
                     proxy: resolved.proxy.iter().map(|p| p.listen.clone()).collect(),
-                    bazel_target: resolved.bazel.as_ref().map(|b| b.target.clone()),
-                    turbo_task: resolved.turbo.as_ref().map(|t| t.task.clone()),
+                    bazel_target: resolved.bazel_config().map(|b| b.target.clone()),
+                    turbo_task: resolved.turbo_config().map(|t| t.task.clone()),
                     ready,
                     cmd,
                 })
@@ -4358,13 +4369,7 @@ mod tests {
                 ready: None,
                 shutdown: None,
                 log: LogConfig::Stdout,
-                bazel: None,
-                turbo: None,
-                docker: None,
-                rust: None,
-                go: None,
-                run: None,
-                build: None,
+                kind: None,
             },
             state: ServiceState::Pending,
             handle: None,
@@ -4388,7 +4393,7 @@ mod tests {
         assert!(rs.resolved_watch_paths.is_empty());
         assert!(rs.bazel_binary_path.is_none());
         assert!(!rs.batch_built);
-        assert!(rs.resolved.run.is_none());
+        assert!(rs.resolved.kind.is_none());
     }
 
     #[test]

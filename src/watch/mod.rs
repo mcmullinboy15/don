@@ -168,13 +168,13 @@ impl WatchManager {
             // Use configured watch patterns, or inject preset defaults.
             let watch_patterns: Vec<String> = if !resolved.watch.is_empty() {
                 resolved.watch.clone()
-            } else if resolved.rust.is_some() {
+            } else if resolved.rust_config().is_some() {
                 vec![
                     "src/**/*.rs".to_string(),
                     "Cargo.toml".to_string(),
                     "Cargo.lock".to_string(),
                 ]
-            } else if resolved.go.is_some() {
+            } else if resolved.go_config().is_some() {
                 vec![
                     "**/*.go".to_string(),
                     "go.mod".to_string(),
@@ -346,7 +346,7 @@ impl WatchManager {
 
             for (name, svc) in &config.services {
                 let resolved = svc.resolve(platform);
-                let globs = if resolved.bazel.is_some() {
+                let globs = if resolved.bazel_config().is_some() {
                     vec![
                         "**/BUILD".to_string(),
                         "**/BUILD.bazel".to_string(),
@@ -354,7 +354,7 @@ impl WatchManager {
                         "WORKSPACE.bazel".to_string(),
                         "MODULE.bazel".to_string(),
                     ]
-                } else if resolved.turbo.is_some() {
+                } else if resolved.turbo_config().is_some() {
                     vec![
                         "**/package.json".to_string(),
                         "turbo.json".to_string(),

@@ -9,40 +9,55 @@ use super::types::{
     deserialize_proxy, deserialize_proxy_option,
 };
 
-/// A long-running service. Uses exactly one preset: docker, rust, or custom (run).
-#[derive(Debug, PartialEq, Deserialize)]
+/// The kind of service — exactly one of these must be set.
+///
+/// Replaces the old set of mutually-exclusive optional fields (docker, rust, go, run, bazel, turbo).
+/// The compiler now enforces that a service has exactly one kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceKind {
+    /// Bazel build tool integration — auto-resolve watch patterns from the build graph.
+    Bazel(BazelConfig),
+    /// Turborepo build tool integration — auto-resolve watch patterns from the task graph.
+    Turbo(TurboConfig),
+    /// Docker container configuration.
+    Docker(DockerConfig),
+    /// Rust/Cargo service configuration.
+    Rust(RustConfig),
+    /// Go service configuration.
+    Go(GoConfig),
+    /// Custom service: a run command and an optional build command.
+    Custom {
+        run: Command,
+        build: Option<Command>,
+    },
+}
+
+/// A long-running service. Uses exactly one kind: bazel, turbo, docker, rust, go, or custom (run).
+#[derive(Debug, PartialEq)]
 pub struct Service {
     /// Working directory for the service. Defaults to the current directory.
     pub dir: Option<PathBuf>,
     /// Environment variables. No env vars are loaded by default.
-    #[serde(default)]
     pub env: HashMap<String, String>,
     /// Paths to env files to load. Don also auto-loads `.env.<service-name>` if it exists.
-    #[serde(default)]
     pub env_file: Vec<PathBuf>,
     /// File glob patterns to watch for rebuilding/restarting.
-    #[serde(default)]
     pub watch: Vec<String>,
     /// File glob patterns to ignore when watching (e.g. "**/*.log", "target/**").
-    #[serde(default)]
     pub ignore: Vec<String>,
     /// Debounce window for file watch events (e.g. "500ms" or "1s"). Defaults to "200ms".
     pub debounce: Option<String>,
     /// Services that must be started before this one.
-    #[serde(default)]
     pub depends_on: Vec<String>,
     /// Addresses for don to listen on and pass to the service via LISTEN_FDS.
     /// Don holds the sockets open across restarts so traffic is never dropped.
     /// Mutually exclusive with `proxy`.
-    #[serde(default)]
     pub listen: Vec<String>,
     /// Proxy entries: Don listens on these addresses and forwards TCP connections
     /// to the service on random ephemeral ports. Mutually exclusive with `listen`.
-    #[serde(default, deserialize_with = "deserialize_proxy")]
     pub proxy: Vec<ProxyEntry>,
     /// If true, don't start the service until the first connection arrives on a
     /// proxy address. Requires `proxy` to be set.
-    #[serde(default)]
     pub lazy: bool,
     /// Optional binary download configuration for this service.
     pub download: Option<DownloadConfig>,
@@ -51,43 +66,146 @@ pub struct Service {
     /// Shutdown behavior.
     pub shutdown: Option<ShutdownConfig>,
     /// Where to send stdout/stderr. Defaults to stdout.
-    #[serde(default)]
     pub log: LogConfig,
     /// Per-platform overrides. If the current platform has an entry here,
     /// its fields are merged on top of the base service config.
-    #[serde(default)]
     pub platform: HashMap<Platform, ServiceOverride>,
 
-    /// Bazel build tool integration — auto-resolve watch patterns from the build graph.
-    /// Mutually exclusive with `turbo`.
-    pub bazel: Option<BazelConfig>,
-    /// Turborepo build tool integration — auto-resolve watch patterns from the task graph.
-    /// Mutually exclusive with `bazel`.
-    pub turbo: Option<TurboConfig>,
+    /// The service kind. `None` when the base service has no preset
+    /// and relies on a platform override to supply one.
+    pub kind: Option<ServiceKind>,
+}
 
-    // -- Preset: docker --
-    pub docker: Option<DockerConfig>,
+/// Intermediate struct for TOML deserialization. Has the flat optional fields
+/// that get converted into a `ServiceKind` discriminant.
+#[derive(Deserialize)]
+struct RawService {
+    dir: Option<PathBuf>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    env_file: Vec<PathBuf>,
+    #[serde(default)]
+    watch: Vec<String>,
+    #[serde(default)]
+    ignore: Vec<String>,
+    debounce: Option<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    listen: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_proxy")]
+    proxy: Vec<ProxyEntry>,
+    #[serde(default)]
+    lazy: bool,
+    download: Option<DownloadConfig>,
+    ready: Option<ReadyCheck>,
+    shutdown: Option<ShutdownConfig>,
+    #[serde(default)]
+    log: LogConfig,
+    #[serde(default)]
+    platform: HashMap<Platform, ServiceOverride>,
 
-    // -- Preset: rust --
-    pub rust: Option<RustConfig>,
+    bazel: Option<BazelConfig>,
+    turbo: Option<TurboConfig>,
+    docker: Option<DockerConfig>,
+    rust: Option<RustConfig>,
+    go: Option<GoConfig>,
+    run: Option<Command>,
+    build: Option<Command>,
+}
 
-    // -- Preset: go --
-    pub go: Option<GoConfig>,
+fn raw_fields_to_kind(
+    bazel: Option<BazelConfig>,
+    turbo: Option<TurboConfig>,
+    docker: Option<DockerConfig>,
+    rust: Option<RustConfig>,
+    go: Option<GoConfig>,
+    run: Option<Command>,
+    build: Option<Command>,
+) -> Result<Option<ServiceKind>, String> {
+    let count = bazel.is_some() as u8
+        + turbo.is_some() as u8
+        + docker.is_some() as u8
+        + rust.is_some() as u8
+        + go.is_some() as u8
+        + run.is_some() as u8;
 
-    // -- Custom service (no preset) --
-    /// Command to run the service.
-    pub run: Option<Command>,
-    /// Command to build the service before running.
-    pub build: Option<Command>,
+    if count > 1 {
+        return Err(
+            "service must have only one of: bazel, turbo, docker, rust, go, or run".to_string(),
+        );
+    }
+
+    if count == 0 {
+        if build.is_some() {
+            return Err("'build' requires 'run' to be set".to_string());
+        }
+        return Ok(None);
+    }
+
+    if let Some(bazel) = bazel {
+        Ok(Some(ServiceKind::Bazel(bazel)))
+    } else if let Some(turbo) = turbo {
+        Ok(Some(ServiceKind::Turbo(turbo)))
+    } else if let Some(docker) = docker {
+        Ok(Some(ServiceKind::Docker(docker)))
+    } else if let Some(rust) = rust {
+        Ok(Some(ServiceKind::Rust(rust)))
+    } else if let Some(go) = go {
+        Ok(Some(ServiceKind::Go(go)))
+    } else if let Some(run) = run {
+        Ok(Some(ServiceKind::Custom { run, build }))
+    } else {
+        Ok(None)
+    }
+}
+
+impl TryFrom<RawService> for Service {
+    type Error = String;
+
+    fn try_from(raw: RawService) -> Result<Self, String> {
+        let kind = raw_fields_to_kind(
+            raw.bazel, raw.turbo, raw.docker, raw.rust, raw.go, raw.run, raw.build,
+        )?;
+
+        Ok(Service {
+            dir: raw.dir,
+            env: raw.env,
+            env_file: raw.env_file,
+            watch: raw.watch,
+            ignore: raw.ignore,
+            debounce: raw.debounce,
+            depends_on: raw.depends_on,
+            listen: raw.listen,
+            proxy: raw.proxy,
+            lazy: raw.lazy,
+            download: raw.download,
+            ready: raw.ready,
+            shutdown: raw.shutdown,
+            log: raw.log,
+            platform: raw.platform,
+            kind,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Service {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawService::deserialize(deserializer)?;
+        Service::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Platform-specific overrides for a service. Any field set here replaces the
 /// corresponding base field. For `env`, entries are merged (override wins on conflict).
-/// If any preset field (docker/rust/run) is set, it completely replaces the base preset.
-#[derive(Debug, PartialEq, Deserialize)]
+/// If a kind field (docker/rust/run/etc.) is set, it completely replaces the base kind.
+#[derive(Debug, PartialEq)]
 pub struct ServiceOverride {
     pub dir: Option<PathBuf>,
-    #[serde(default)]
     pub env: HashMap<String, String>,
     pub env_file: Option<Vec<PathBuf>>,
     pub watch: Option<Vec<String>>,
@@ -95,21 +213,82 @@ pub struct ServiceOverride {
     pub debounce: Option<String>,
     pub depends_on: Option<Vec<String>>,
     pub listen: Option<Vec<String>>,
-    #[serde(default, deserialize_with = "deserialize_proxy_option")]
     pub proxy: Option<Vec<ProxyEntry>>,
     pub lazy: Option<bool>,
     pub download: Option<DownloadConfig>,
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
     pub log: Option<LogConfig>,
-    pub bazel: Option<BazelConfig>,
-    pub turbo: Option<TurboConfig>,
 
-    pub docker: Option<DockerConfig>,
-    pub rust: Option<RustConfig>,
-    pub go: Option<GoConfig>,
-    pub run: Option<Command>,
-    pub build: Option<Command>,
+    /// If set, completely replaces the base service kind.
+    pub kind: Option<ServiceKind>,
+}
+
+/// Intermediate struct for TOML deserialization of ServiceOverride.
+#[derive(Deserialize)]
+struct RawServiceOverride {
+    dir: Option<PathBuf>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    env_file: Option<Vec<PathBuf>>,
+    watch: Option<Vec<String>>,
+    ignore: Option<Vec<String>>,
+    debounce: Option<String>,
+    depends_on: Option<Vec<String>>,
+    listen: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_proxy_option")]
+    proxy: Option<Vec<ProxyEntry>>,
+    lazy: Option<bool>,
+    download: Option<DownloadConfig>,
+    ready: Option<ReadyCheck>,
+    shutdown: Option<ShutdownConfig>,
+    log: Option<LogConfig>,
+
+    bazel: Option<BazelConfig>,
+    turbo: Option<TurboConfig>,
+    docker: Option<DockerConfig>,
+    rust: Option<RustConfig>,
+    go: Option<GoConfig>,
+    run: Option<Command>,
+    build: Option<Command>,
+}
+
+impl TryFrom<RawServiceOverride> for ServiceOverride {
+    type Error = String;
+
+    fn try_from(raw: RawServiceOverride) -> Result<Self, String> {
+        let kind = raw_fields_to_kind(
+            raw.bazel, raw.turbo, raw.docker, raw.rust, raw.go, raw.run, raw.build,
+        )?;
+
+        Ok(ServiceOverride {
+            dir: raw.dir,
+            env: raw.env,
+            env_file: raw.env_file,
+            watch: raw.watch,
+            ignore: raw.ignore,
+            debounce: raw.debounce,
+            depends_on: raw.depends_on,
+            listen: raw.listen,
+            proxy: raw.proxy,
+            lazy: raw.lazy,
+            download: raw.download,
+            ready: raw.ready,
+            shutdown: raw.shutdown,
+            log: raw.log,
+            kind,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ServiceOverride {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawServiceOverride::deserialize(deserializer)?;
+        ServiceOverride::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 /// A fully resolved service with platform overrides applied.
@@ -129,14 +308,10 @@ pub struct ResolvedService {
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
     pub log: LogConfig,
-    pub bazel: Option<BazelConfig>,
-    pub turbo: Option<TurboConfig>,
 
-    pub docker: Option<DockerConfig>,
-    pub rust: Option<RustConfig>,
-    pub go: Option<GoConfig>,
-    pub run: Option<Command>,
-    pub build: Option<Command>,
+    /// The resolved service kind. `None` only if validation hasn't caught
+    /// a missing preset (shouldn't happen after validation).
+    pub kind: Option<ServiceKind>,
 }
 
 /// Docker container configuration.
@@ -211,76 +386,32 @@ pub struct GoConfig {
     pub ldflags: Option<String>,
 }
 
-/// The resolved preset for a service, after validation.
-#[derive(Debug)]
-pub enum Preset<'a> {
-    Docker(&'a DockerConfig),
-    Rust(&'a RustConfig),
-    Go(&'a GoConfig),
-    Custom {
-        run: &'a Command,
-        build: Option<&'a Command>,
-    },
-}
-
-pub(crate) fn resolve_preset<'a>(
-    docker: &'a Option<DockerConfig>,
-    rust: &'a Option<RustConfig>,
-    go: &'a Option<GoConfig>,
-    run: &'a Option<Command>,
-    build: &'a Option<Command>,
-) -> Result<Preset<'a>, String> {
-    let preset_count = docker.is_some() as u8
-        + rust.is_some() as u8
-        + go.is_some() as u8
-        + run.is_some() as u8;
-
-    if preset_count == 0 {
-        return Err("service must have one of: docker, rust, go, or run".to_string());
-    }
-    if preset_count > 1 {
-        return Err("service must have only one of: docker, rust, go, or run".to_string());
-    }
-
-    if let Some(docker) = docker {
-        Ok(Preset::Docker(docker))
-    } else if let Some(rust) = rust {
-        Ok(Preset::Rust(rust))
-    } else if let Some(go) = go {
-        Ok(Preset::Go(go))
-    } else if let Some(run) = run {
-        Ok(Preset::Custom {
-            run,
-            build: build.as_ref(),
-        })
-    } else {
-        Err("service must have one of: docker, rust, go, or run".to_string())
-    }
-}
-
 impl Service {
-    /// Resolve which preset the base service uses (ignoring platform overrides).
-    pub fn preset(&self) -> Result<Preset<'_>, String> {
-        resolve_preset(&self.docker, &self.rust, &self.go, &self.run, &self.build)
-    }
-
     /// Resolve the service for a specific platform, applying overrides if present.
-    /// If the service has a build tool config but no run command, one is synthesized
-    /// (e.g. the bazel binary path or `npx turbo run <task> --filter=<pkg>`).
+    /// For Bazel services with a known binary path, use `resolve_with_bazel_binary` instead.
     pub fn resolve(&self, platform: Platform) -> ResolvedService {
-        let mut resolved = self.resolve_inner(platform);
-        resolved.ensure_build_tool_run_cmd(None);
-        resolved
+        self.resolve_inner(platform)
     }
 
     /// Resolve with a known Bazel binary path (from `bazel cquery`).
+    /// Sets the kind to `Custom` with the binary path as the run command.
     pub fn resolve_with_bazel_binary(
         &self,
         platform: Platform,
         bazel_binary: &str,
     ) -> ResolvedService {
         let mut resolved = self.resolve_inner(platform);
-        resolved.ensure_build_tool_run_cmd(Some(bazel_binary));
+        // Override the kind to Custom with the resolved binary path.
+        // Preserve the original Bazel config in case we need it later.
+        if matches!(resolved.kind, Some(ServiceKind::Bazel(_))) {
+            resolved.kind = Some(ServiceKind::Custom {
+                run: Command {
+                    cmd: bazel_binary.to_string(),
+                    args: Vec::new(),
+                },
+                build: None,
+            });
+        }
         resolved
     }
 
@@ -301,39 +432,17 @@ impl Service {
                 ready: self.ready.clone(),
                 shutdown: self.shutdown.clone(),
                 log: self.log.clone(),
-                bazel: self.bazel.clone(),
-                turbo: self.turbo.clone(),
-                docker: self.docker.clone(),
-                rust: self.rust.clone(),
-                go: self.go.clone(),
-                run: self.run.clone(),
-                build: self.build.clone(),
+                kind: self.kind.clone(),
             },
             Some(ov) => {
                 let mut env = self.env.clone();
                 env.extend(ov.env.clone());
 
-                let has_preset_override = ov.docker.is_some()
-                    || ov.rust.is_some()
-                    || ov.go.is_some()
-                    || ov.run.is_some();
-
-                let (docker, rust, go, run, build) = if has_preset_override {
-                    (
-                        ov.docker.clone(),
-                        ov.rust.clone(),
-                        ov.go.clone(),
-                        ov.run.clone(),
-                        ov.build.clone(),
-                    )
+                // If the override has a kind, use it; otherwise keep the base kind.
+                let kind = if ov.kind.is_some() {
+                    ov.kind.clone()
                 } else {
-                    (
-                        self.docker.clone(),
-                        self.rust.clone(),
-                        self.go.clone(),
-                        self.run.clone(),
-                        ov.build.clone().or_else(|| self.build.clone()),
-                    )
+                    self.kind.clone()
                 };
 
                 ResolvedService {
@@ -354,13 +463,7 @@ impl Service {
                     ready: ov.ready.clone().or_else(|| self.ready.clone()),
                     shutdown: ov.shutdown.clone().or_else(|| self.shutdown.clone()),
                     log: ov.log.clone().unwrap_or_else(|| self.log.clone()),
-                    bazel: ov.bazel.clone().or_else(|| self.bazel.clone()),
-                    turbo: ov.turbo.clone().or_else(|| self.turbo.clone()),
-                    docker,
-                    rust,
-                    go,
-                    run,
-                    build,
+                    kind,
                 }
             }
         }
@@ -368,53 +471,68 @@ impl Service {
 }
 
 impl ResolvedService {
-    /// Resolve which preset this resolved service uses.
-    ///
-    /// If the service has a `bazel.target` but no explicit preset, this
-    /// synthesizes a `run` command of `bazel run <target>`. Similarly for
-    /// `turbo` with a filter, it synthesizes `npx turbo run <task> --filter=<filter>`.
-    pub fn preset(&self) -> Result<Preset<'_>, String> {
-        // If no preset is set but a build tool target is configured,
-        // the run command was synthesized by `ensure_build_tool_run_cmd`.
-        resolve_preset(&self.docker, &self.rust, &self.go, &self.run, &self.build)
+    /// Returns the `DockerConfig` if this is a Docker service.
+    pub fn docker_config(&self) -> Option<&DockerConfig> {
+        match &self.kind {
+            Some(ServiceKind::Docker(d)) => Some(d),
+            _ => None,
+        }
     }
 
-    /// If the service has a build tool config but no run command, synthesize one.
-    ///
-    /// For Bazel: if `bazel_binary` is provided (resolved via `bazel cquery`),
-    /// runs the binary directly. Otherwise falls back to `bazel run <target>`.
-    /// For Turbo: synthesizes `npx turbo run <task> --filter=<filter>`.
-    pub(crate) fn ensure_build_tool_run_cmd(&mut self, bazel_binary: Option<&str>) {
-        if self.run.is_some() || self.docker.is_some() || self.rust.is_some() || self.go.is_some() {
-            return;
+    /// Returns the `RustConfig` if this is a Rust service.
+    pub fn rust_config(&self) -> Option<&RustConfig> {
+        match &self.kind {
+            Some(ServiceKind::Rust(r)) => Some(r),
+            _ => None,
         }
-        if let Some(ref bazel) = self.bazel {
-            if let Some(bin_path) = bazel_binary {
-                self.run = Some(Command {
-                    cmd: bin_path.to_string(),
-                    args: Vec::new(),
-                });
-            } else {
-                // Fallback: use bazel run (slower — does a build check each time)
-                self.run = Some(Command {
-                    cmd: "bazel".to_string(),
-                    args: vec!["run".to_string(), bazel.target.clone()],
-                });
-            }
-        } else if let Some(ref turbo) = self.turbo
-            && let Some(ref filter) = turbo.filter
-        {
-            self.run = Some(Command {
-                cmd: "npx".to_string(),
-                args: vec![
-                    "turbo".to_string(),
-                    "run".to_string(),
-                    turbo.task.clone(),
-                    "--filter".to_string(),
-                    filter.clone(),
-                ],
-            });
+    }
+
+    /// Returns the `GoConfig` if this is a Go service.
+    pub fn go_config(&self) -> Option<&GoConfig> {
+        match &self.kind {
+            Some(ServiceKind::Go(g)) => Some(g),
+            _ => None,
         }
+    }
+
+    /// Returns the `BazelConfig` if this is a Bazel service.
+    pub fn bazel_config(&self) -> Option<&BazelConfig> {
+        match &self.kind {
+            Some(ServiceKind::Bazel(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Returns the `TurboConfig` if this is a Turbo service.
+    pub fn turbo_config(&self) -> Option<&TurboConfig> {
+        match &self.kind {
+            Some(ServiceKind::Turbo(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Returns the run command if this is a Custom service.
+    pub fn run_cmd(&self) -> Option<&Command> {
+        match &self.kind {
+            Some(ServiceKind::Custom { run, .. }) => Some(run),
+            _ => None,
+        }
+    }
+
+    /// Returns the build command if this is a Custom service with a build step.
+    pub fn build_cmd(&self) -> Option<&Command> {
+        match &self.kind {
+            Some(ServiceKind::Custom { build, .. }) => build.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this is a Bazel or Turbo service (build-tool managed).
+    pub fn is_build_tool_managed(&self) -> bool {
+        matches!(
+            &self.kind,
+            Some(ServiceKind::Bazel(_)) | Some(ServiceKind::Turbo(_))
+        )
     }
 
     /// Resolve the run command for a custom service, taking downloads into account.
@@ -428,7 +546,7 @@ impl ResolvedService {
         service_name: &str,
         cache_base: Option<&std::path::Path>,
     ) -> Result<(PathBuf, &[String]), String> {
-        let run = self.run.as_ref().ok_or("service has no run command")?;
+        let run = self.run_cmd().ok_or("service has no run command")?;
 
         let cache_base = cache_base
             .map(PathBuf::from)
