@@ -77,12 +77,21 @@ fn parse_starttime_from_stat(stat: &str) -> Option<u64> {
 }
 
 /// Read the start_time of a process by PID/PGID on macOS.
+///
+/// Uses `sysctl` with `KERN_PROC_PID` to retrieve `kinfo_proc`, then reads
+/// `p_starttime` from a known byte offset within the struct. The `libc` crate
+/// does not expose `kinfo_proc` for Apple targets, so we treat the struct as
+/// a raw byte buffer and extract the `timeval` at offset 128 (the position of
+/// `extern_proc.p_starttime` on both arm64 and x86_64 macOS).
 #[cfg(target_os = "macos")]
 fn read_start_time(pid: i32) -> io::Result<Option<u64>> {
-    use std::mem;
+    // kinfo_proc is 648 bytes on macOS (arm64 and x86_64).
+    const KINFO_PROC_SIZE: usize = 648;
+    // p_starttime (a timeval) sits at byte offset 128 within kinfo_proc.
+    const P_STARTTIME_OFFSET: usize = 128;
 
-    let mut info: libc::kinfo_proc = unsafe { mem::zeroed() };
-    let mut size = mem::size_of::<libc::kinfo_proc>();
+    let mut buf = [0u8; KINFO_PROC_SIZE];
+    let mut size = KINFO_PROC_SIZE;
     let mut mib = [
         libc::CTL_KERN,
         libc::KERN_PROC,
@@ -94,7 +103,7 @@ fn read_start_time(pid: i32) -> io::Result<Option<u64>> {
         libc::sysctl(
             mib.as_mut_ptr(),
             4,
-            (&raw mut info).cast(),
+            buf.as_mut_ptr().cast(),
             &mut size,
             std::ptr::null_mut(),
             0,
@@ -112,7 +121,11 @@ fn read_start_time(pid: i32) -> io::Result<Option<u64>> {
         return Ok(None);
     }
 
-    let tv = info.kp_proc.p_starttime;
+    // Read the timeval (tv_sec: i64, tv_usec: i32) at the known offset.
+    // SAFETY: buf is large enough, and we're reading POD types at a known
+    // offset that macOS guarantees for kinfo_proc on this architecture.
+    let tv: libc::timeval =
+        unsafe { std::ptr::read_unaligned(buf.as_ptr().add(P_STARTTIME_OFFSET).cast()) };
     let micros = tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
     Ok(Some(micros))
 }
