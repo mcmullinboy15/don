@@ -21,6 +21,7 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/logs/{name}", get(get_logs))
         .route("/attach/{name}", get(super::attach::attach_handler))
         .route("/attach/{name}/resize", post(super::attach::resize_handler))
+        .route("/run-pending", post(post_run_pending))
         .with_state(state)
 }
 
@@ -190,6 +191,28 @@ async fn follow_logs(state: Arc<ApiState>, name: String, last: usize) -> Respons
         .body(axum::body::Body::from_stream(stream))
     {
         Ok(resp) => resp,
+        Err(_) => runner_unavailable(),
+    }
+}
+
+/// `POST /run-pending` — run all tasks in PendingRun state.
+async fn post_run_pending(State(state): State<Arc<ApiState>>) -> Response {
+    let (tx, rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(RunnerCommand::RunPendingTasks { reply: tx })
+        .await
+        .is_err()
+    {
+        return runner_unavailable();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(error_body(&e.to_string())),
+        )
+            .into_response(),
         Err(_) => runner_unavailable(),
     }
 }

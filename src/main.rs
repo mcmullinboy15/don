@@ -70,6 +70,12 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Run pending tasks
+    Run {
+        /// Run all tasks in pending_run state
+        #[arg(long)]
+        all_pending: bool,
+    },
     /// Validate the config file
     Validate,
 }
@@ -118,6 +124,14 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
+        Commands::Run { all_pending } => {
+            if all_pending {
+                run_client(&config_path, |c| async move { c.run_pending().await }).await
+            } else {
+                eprintln!("don run requires --all-pending");
+                1
+            }
+        }
     }
 }
 
@@ -339,7 +353,7 @@ fn task_state_label(s: TaskItemState) -> &'static str {
         TaskItemState::Completed => "completed",
         TaskItemState::Skipped => "skipped",
         TaskItemState::Failed => "failed",
-        TaskItemState::PendingRerun => "pending_rerun",
+        TaskItemState::PendingRun => "pending_run",
     }
 }
 
@@ -347,7 +361,7 @@ fn task_state_color(s: TaskItemState) -> Color {
     match s {
         TaskItemState::Completed | TaskItemState::Skipped => Color::Green,
         TaskItemState::Running | TaskItemState::Pending => Color::Yellow,
-        TaskItemState::PendingRerun => Color::Cyan,
+        TaskItemState::PendingRun => Color::Cyan,
         TaskItemState::Failed => Color::Red,
     }
 }

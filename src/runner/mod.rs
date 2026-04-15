@@ -84,14 +84,15 @@ pub enum TaskItemState {
     Completed,
     Skipped,
     Failed,
-    /// Watch files have changed but the task has `auto_rerun = false`,
-    /// so it's waiting for a manual trigger.
-    PendingRerun,
+    /// The task is waiting for a manual trigger via `don run --all-pending`.
+    /// Set at startup when `auto_run = false`, or on file-watch changes for
+    /// such tasks.
+    PendingRun,
 }
 
 impl TaskItemState {
     pub(crate) fn is_satisfied(&self) -> bool {
-        matches!(self, Self::Completed | Self::Skipped | Self::PendingRerun)
+        matches!(self, Self::Completed | Self::Skipped | Self::PendingRun)
     }
 
 }
@@ -197,6 +198,10 @@ pub enum RunnerCommand {
     Detach {
         name: String,
         pty_write: Option<pty_process::OwnedWritePty>,
+    },
+    /// Run all tasks currently in PendingRun state.
+    RunPendingTasks {
+        reply: oneshot::Sender<CommandResult>,
     },
     /// Initiate graceful shutdown.
     Shutdown,
@@ -1197,6 +1202,9 @@ impl Runner {
                         RunnerCommand::StartPending => {
                             self.start_pending_items().await;
                         }
+                        RunnerCommand::RunPendingTasks { reply } => {
+                            self.handle_run_pending_tasks(reply).await;
+                        }
                     }
                 }
                 Some(name) = self.lazy_start_rx.recv() => {
@@ -1806,6 +1814,30 @@ impl Runner {
             Some(rt) => rt.config.clone(),
             None => return Err(RunnerError::Config(format!("unknown task: {name}"))),
         };
+
+        // auto_run = false: skip execution entirely and mark as pending.
+        if !task_cfg.auto_run {
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.state = TaskItemState::PendingRun;
+            }
+            let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
+                name: name.to_string(),
+                state: TaskItemState::PendingRun,
+            });
+            self.output_manager.lifecycle_event(&format!(
+                "{name}: pending — auto_run = false"
+            ));
+            let _ = done_tx
+                .send(ItemDone {
+                    name: name.to_string(),
+                    kind: NodeKind::Task,
+                    success: true,
+                    message: None,
+                    elapsed: None,
+                })
+                .await;
+            return Ok(());
+        }
 
         // Check if the task needs to run.
         let base_dir = task_cfg.dir.as_deref().unwrap_or(&self.base_dir);
@@ -3567,16 +3599,16 @@ impl Runner {
 
         // If the task has opted out of auto-reruns, mark it pending and don't spawn.
         // The user will need to trigger a manual rerun when they're ready.
-        if !task_cfg.auto_rerun {
+        if !task_cfg.auto_run {
             if let Some(rt) = self.tasks.get_mut(name) {
-                rt.state = TaskItemState::PendingRerun;
+                rt.state = TaskItemState::PendingRun;
             }
             let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
                 name: name.to_string(),
-                state: TaskItemState::PendingRerun,
+                state: TaskItemState::PendingRun,
             });
             self.output_manager.lifecycle_event(&format!(
-                "{name}: files changed (pending rerun — auto_rerun = false)"
+                "{name}: files changed (pending — auto_run = false)"
             ));
             let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
                 name: name.to_string(),
@@ -3620,6 +3652,41 @@ impl Runner {
                 });
             }
         }
+    }
+
+    /// Run all tasks currently in PendingRun state.
+    async fn handle_run_pending_tasks(
+        &mut self,
+        reply: oneshot::Sender<CommandResult>,
+    ) {
+        let pending_names: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(_, rt)| rt.state == TaskItemState::PendingRun)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if pending_names.is_empty() {
+            self.output_manager
+                .lifecycle_event("no pending tasks to run");
+            let _ = reply.send(Ok(()));
+            return;
+        }
+
+        self.output_manager.lifecycle_event(&format!(
+            "running {} pending task{}...",
+            pending_names.len(),
+            if pending_names.len() == 1 { "" } else { "s" }
+        ));
+
+        for name in &pending_names {
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.state = TaskItemState::Running;
+            }
+            self.handle_task_rerun(name).await;
+        }
+
+        let _ = reply.send(Ok(()));
     }
 
     /// Handle an item completion notification.
@@ -3693,7 +3760,7 @@ impl Runner {
 
         if item.success {
             let cur = self.tasks.get(&item.name).map(|rt| rt.state);
-            if cur != Some(TaskItemState::Skipped) {
+            if cur != Some(TaskItemState::Skipped) && cur != Some(TaskItemState::PendingRun) {
                 if let Some(rt) = self.tasks.get_mut(&item.name) {
                     rt.state = TaskItemState::Completed;
                 }
@@ -4389,6 +4456,7 @@ mod tests {
                 ready: None,
                 shutdown: None,
                 log: LogConfig::Stdout,
+                reload: true,
                 kind: None,
             },
             state: ServiceState::Pending,
@@ -4432,7 +4500,7 @@ mod tests {
                 ignore: Vec::new(),
                 timeout: None,
                 log: LogConfig::Stdout,
-                auto_rerun: true,
+                auto_run: true,
                 download: None,
                 bazel: None,
                 turbo: None,

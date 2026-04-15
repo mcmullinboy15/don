@@ -1438,6 +1438,51 @@ mod tests {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                 },
             },
+            ConfigTestCase {
+                name: "reload defaults to true",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let resolved = config.services["api"].resolve(TEST_PLATFORM);
+                    assert!(resolved.reload);
+                },
+            },
+            ConfigTestCase {
+                name: "reload = false disables file watching",
+                input: r#"
+                    [services.frontend]
+                    turbo.task = "dev"
+                    turbo.filter = "@myorg/frontend"
+                    reload = false
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let resolved = config.services["frontend"].resolve(TEST_PLATFORM);
+                    assert!(!resolved.reload);
+                },
+            },
+            ConfigTestCase {
+                name: "reload = false with platform override",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    reload = false
+
+                    [services.api.platform.linux-x86_64]
+                    reload = true
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let resolved = config.services["api"].resolve(Platform::LinuxX86_64);
+                    assert!(resolved.reload, "platform override should set reload = true");
+
+                    let resolved_mac = config.services["api"].resolve(Platform::MacosAarch64);
+                    assert!(!resolved_mac.reload, "non-matching platform should keep reload = false");
+                },
+            },
         ];
 
         for case in &cases {

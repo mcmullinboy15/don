@@ -37,11 +37,12 @@ pub struct Task {
     /// Where to send stdout/stderr. Defaults to stdout.
     #[serde(default)]
     pub log: LogConfig,
-    /// Whether file-watch changes should auto-trigger a re-run.
-    /// When false, changes put the task in a pending state but don't spawn it.
+    /// Whether the task runs automatically.
+    /// When false, the task starts in a pending state (both at startup and on
+    /// file-watch changes) and must be triggered manually via `don run --all-pending`.
     /// Defaults to true.
-    #[serde(default = "default_auto_rerun")]
-    pub auto_rerun: bool,
+    #[serde(default = "default_auto_run")]
+    pub auto_run: bool,
     /// Optional download configuration — artifacts to fetch before running.
     /// When a download exists for the current platform, its binary path
     /// replaces `cmd`. Without a matching platform entry, `cmd` is looked up on PATH.
@@ -80,6 +81,6 @@ impl Task {
     }
 }
 
-fn default_auto_rerun() -> bool {
+fn default_auto_run() -> bool {
     true
 }

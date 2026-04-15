@@ -222,6 +222,12 @@ impl ServiceBuilder {
         self
     }
 
+    /// Set reload (whether don watches files and rebuilds/restarts this service).
+    pub fn reload(mut self, value: bool) -> Self {
+        self.lines.push(format!("reload = {value}"));
+        self
+    }
+
     /// Set debounce duration.
     pub fn debounce(mut self, duration: &str) -> Self {
         self.lines.push(format!("debounce = \"{duration}\""));
@@ -320,9 +326,9 @@ impl TaskBuilder {
         self
     }
 
-    /// Set auto_rerun.
-    pub fn auto_rerun(mut self, value: bool) -> Self {
-        self.lines.push(format!("auto_rerun = {value}"));
+    /// Set auto_run.
+    pub fn auto_run(mut self, value: bool) -> Self {
+        self.lines.push(format!("auto_run = {value}"));
         self
     }
 

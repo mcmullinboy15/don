@@ -165,6 +165,11 @@ impl WatchManager {
         for (name, svc) in &config.services {
             let resolved = svc.resolve(platform);
 
+            // Skip services that handle their own hot-reloading.
+            if !resolved.reload {
+                continue;
+            }
+
             // Use configured watch patterns, or inject preset defaults.
             let watch_patterns: Vec<String> = if !resolved.watch.is_empty() {
                 resolved.watch.clone()
@@ -346,6 +351,9 @@ impl WatchManager {
 
             for (name, svc) in &config.services {
                 let resolved = svc.resolve(platform);
+                if !resolved.reload {
+                    continue;
+                }
                 let globs = if resolved.bazel_config().is_some() {
                     vec![
                         "**/BUILD".to_string(),

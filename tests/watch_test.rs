@@ -410,28 +410,26 @@ fn integration_file_edit_during_startup_triggers_rebuild() {
     });
 }
 
-// --- Integration test: task with auto_rerun=false goes pending on change ---
+// --- Integration test: reload = false prevents file-watch restart ---
 
 #[test]
-fn integration_task_auto_rerun_false_goes_pending() {
+fn integration_reload_false_skips_file_watch() {
     run_with_timeout(Duration::from_secs(15), async {
-        let dir = TempDir::new("watch-task-manual");
+        let dir = TempDir::new("watch-reload-false");
 
-        let defs_dir = dir.path().join("definitions");
-        std::fs::create_dir_all(&defs_dir).unwrap();
-        let schema = defs_dir.join("users.sql");
-        std::fs::write(&schema, "CREATE TABLE users (id INT);").unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("main.rs"), "initial").unwrap();
 
-        // A service to keep don running after the task completes,
-        // plus a task with auto_rerun = false.
+        // Service with reload = false and explicit watch patterns.
+        // Even though watch patterns are set, reload = false should prevent
+        // don from setting up file watches entirely.
         let toml = ConfigBuilder::new()
-            .add_custom_service("keeper", "bash", &["-c", "sleep 60"])
-            .log("ignore")
+            .add_custom_service("frontend", "bash", &["-c", "echo STARTED && sleep 60"])
+            .watch(&["src/**/*.rs"])
+            .debounce("100ms")
+            .reload(false)
             .ready_exec("true", &[])
-            .done()
-            .add_task("migrate", "echo", &["migrating"])
-            .watch(&["definitions/**/*.sql"])
-            .auto_rerun(false)
             .done()
             .build();
 
@@ -441,10 +439,66 @@ fn integration_task_auto_rerun_false_goes_pending() {
             runner.run().await.unwrap();
         });
 
-        // Task should run at startup (first time — no prior state).
         assert!(
-            wait_for_output(&buf, "migrate complete", Duration::from_secs(5)).await,
-            "migrate should run at startup. output: {}",
+            wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+            "timed out waiting for services to start. output: {}",
+            read_buf(&buf)
+        );
+
+        // Modify the watched file — should NOT trigger a rebuild.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(src_dir.join("main.rs"), "modified").unwrap();
+
+        // Wait long enough for a rebuild to have been triggered (debounce + margin).
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let output = read_buf(&buf);
+        assert!(
+            !output.contains("rebuilding"),
+            "reload = false should prevent rebuilds on file change. output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+// --- Integration test: task with auto_run=false skips initial run and goes pending on change ---
+
+#[test]
+fn integration_task_auto_run_false_skips_initial_and_goes_pending() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-task-manual");
+
+        let defs_dir = dir.path().join("definitions");
+        std::fs::create_dir_all(&defs_dir).unwrap();
+        let schema = defs_dir.join("users.sql");
+        std::fs::write(&schema, "CREATE TABLE users (id INT);").unwrap();
+
+        // A service to keep don running after the task completes,
+        // plus a task with auto_run = false.
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "bash", &["-c", "sleep 60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task("migrate", "echo", &["migrating"])
+            .watch(&["definitions/**/*.sql"])
+            .auto_run(false)
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // Task should NOT run at startup — auto_run = false means it starts
+        // in PendingRun state immediately.
+        assert!(
+            wait_for_output(&buf, "pending — auto_run = false", Duration::from_secs(5)).await,
+            "migrate should be pending at startup. output: {}",
             read_buf(&buf)
         );
 
@@ -452,25 +506,21 @@ fn integration_task_auto_rerun_false_goes_pending() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         std::fs::write(&schema, "CREATE TABLE users (id INT, name TEXT);").unwrap();
 
-        // Should log pending rerun, NOT actually run the task again.
+        // Should log pending again, NOT actually run the task.
         assert!(
-            wait_for_output(&buf, "pending rerun", Duration::from_secs(5)).await,
-            "expected pending rerun event. output: {}",
+            wait_for_output(&buf, "files changed (pending", Duration::from_secs(5)).await,
+            "expected pending event on file change. output: {}",
             read_buf(&buf)
         );
 
-        // Give any rogue rerun a chance to start.
+        // Give any rogue run a chance to start.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let output = read_buf(&buf);
-        let complete_count = output.matches("migrate complete").count();
         assert_eq!(
-            complete_count, 1,
-            "migrate should have only completed once (at startup); output: {output}"
-        );
-        assert!(
-            !output.contains("migrate: re-running"),
-            "migrate should NOT have been re-run; output: {output}"
+            output.matches("migrate complete").count(),
+            0,
+            "migrate should never have run; output: {output}"
         );
 
         let _ = shutdown_tx.send(()).await;

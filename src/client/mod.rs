@@ -109,6 +109,15 @@ impl Client {
         self.control("/restart/", name).await
     }
 
+    /// `POST /run-pending` — trigger all tasks in PendingRun state.
+    pub async fn run_pending(&self) -> Result<(), ClientError> {
+        let (status, body) = self.request("POST", "/run-pending", false).await?;
+        if status == 204 {
+            return Ok(());
+        }
+        Err(classify_error(status, &body))
+    }
+
     /// `GET /logs/:name?last=N`
     pub async fn logs(&self, name: &str, last: usize) -> Result<Vec<String>, ClientError> {
         let path = format!("/logs/{}?last={last}", urlencode(name));

@@ -378,7 +378,7 @@ fn integration_task_download_resolves_cmd() {
             ignore: vec![],
             timeout: None,
             log: don::config::LogConfig::Stdout,
-            auto_rerun: true,
+            auto_run: true,
             download: Some(download),
             bazel: None,
             turbo: None,

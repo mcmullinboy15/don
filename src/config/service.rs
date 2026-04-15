@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::download::{DownloadConfig, default_cache_base};
+
+fn default_true() -> bool {
+    true
+}
 use super::platform::Platform;
 use super::types::{
     BazelConfig, Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig, TurboConfig,
@@ -67,6 +71,10 @@ pub struct Service {
     pub shutdown: Option<ShutdownConfig>,
     /// Where to send stdout/stderr. Defaults to stdout.
     pub log: LogConfig,
+    /// Whether don should watch files and rebuild/restart this service on changes.
+    /// Defaults to `true`. Set to `false` for services that handle their own
+    /// hot-reloading internally (e.g. vite, webpack dev server).
+    pub reload: bool,
     /// Per-platform overrides. If the current platform has an entry here,
     /// its fields are merged on top of the base service config.
     pub platform: HashMap<Platform, ServiceOverride>,
@@ -103,6 +111,8 @@ struct RawService {
     shutdown: Option<ShutdownConfig>,
     #[serde(default)]
     log: LogConfig,
+    #[serde(default = "default_true")]
+    reload: bool,
     #[serde(default)]
     platform: HashMap<Platform, ServiceOverride>,
 
@@ -184,6 +194,7 @@ impl TryFrom<RawService> for Service {
             ready: raw.ready,
             shutdown: raw.shutdown,
             log: raw.log,
+            reload: raw.reload,
             platform: raw.platform,
             kind,
         })
@@ -219,6 +230,7 @@ pub struct ServiceOverride {
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
     pub log: Option<LogConfig>,
+    pub reload: Option<bool>,
 
     /// If set, completely replaces the base service kind.
     pub kind: Option<ServiceKind>,
@@ -243,6 +255,7 @@ struct RawServiceOverride {
     ready: Option<ReadyCheck>,
     shutdown: Option<ShutdownConfig>,
     log: Option<LogConfig>,
+    reload: Option<bool>,
 
     bazel: Option<BazelConfig>,
     turbo: Option<TurboConfig>,
@@ -276,6 +289,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             ready: raw.ready,
             shutdown: raw.shutdown,
             log: raw.log,
+            reload: raw.reload,
             kind,
         })
     }
@@ -308,6 +322,8 @@ pub struct ResolvedService {
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
     pub log: LogConfig,
+    /// Whether don should watch files and rebuild/restart this service on changes.
+    pub reload: bool,
 
     /// The resolved service kind. `None` only if validation hasn't caught
     /// a missing preset (shouldn't happen after validation).
@@ -432,6 +448,7 @@ impl Service {
                 ready: self.ready.clone(),
                 shutdown: self.shutdown.clone(),
                 log: self.log.clone(),
+                reload: self.reload,
                 kind: self.kind.clone(),
             },
             Some(ov) => {
@@ -463,6 +480,7 @@ impl Service {
                     ready: ov.ready.clone().or_else(|| self.ready.clone()),
                     shutdown: ov.shutdown.clone().or_else(|| self.shutdown.clone()),
                     log: ov.log.clone().unwrap_or_else(|| self.log.clone()),
+                    reload: ov.reload.unwrap_or(self.reload),
                     kind,
                 }
             }
