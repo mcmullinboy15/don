@@ -5,6 +5,8 @@
 //! It owns all service/task state in a plain `HashMap` — no `Arc<Mutex<>>`.
 //! Communication uses channels: `mpsc` for commands in, `broadcast` for events out.
 
+mod state;
+
 pub mod service;
 pub mod task;
 
@@ -479,57 +481,7 @@ pub(crate) fn compute_depths(
     depths
 }
 
-/// All per-service runtime state, consolidated into a single struct.
-///
-/// Each running service gets one `RuntimeService` in `Runner::services`.
-/// This replaces the many separate `HashMap<String, _>` fields that previously
-/// tracked each aspect of service state independently.
-pub(crate) struct RuntimeService {
-    /// The fully resolved service config (platform overrides applied once).
-    pub resolved: crate::config::service::ResolvedService,
-    /// Current lifecycle state (Pending, Starting, Running, Ready, etc.).
-    pub state: ServiceState,
-    /// Handle to the running process (if spawned).
-    pub handle: Option<ServiceHandle>,
-    /// OSC query sink for reclaiming PTY write on attach.
-    pub osc_sink: Option<crate::output::OscSinkHandle>,
-    /// PID of the client holding the interactive attach lock.
-    pub attach_lock: Option<u32>,
-    /// Pending attach waiter (client waiting for process to start).
-    pub attach_waiter: Option<AttachWaiter>,
-    /// Bound TCP sockets (LISTEN_FDS) — outlive restarts.
-    pub bound_sockets: Option<crate::process::socket::BoundSockets>,
-    /// TCP proxy listener — outlives restarts.
-    pub proxy: Option<crate::proxy::ServiceProxy>,
-    /// Watch paths resolved from build tool queries (bazel/turbo).
-    pub resolved_watch_paths: Vec<String>,
-    /// Bazel binary path resolved via `bazel cquery --output=files`.
-    pub bazel_binary_path: Option<String>,
-    /// Whether this service was built during the batch build phase.
-    pub batch_built: bool,
-}
-
-/// All per-task runtime state, consolidated into a single struct.
-///
-/// Each task gets one `RuntimeTask` in `Runner::tasks`.
-/// This replaces the many separate `HashMap<String, _>` fields that previously
-/// tracked each aspect of task state independently.
-pub(crate) struct RuntimeTask {
-    /// The task config (stored once, no repeated lookups).
-    pub config: crate::config::task::Task,
-    /// Current lifecycle state (Pending, Running, Completed, etc.).
-    pub state: TaskItemState,
-    /// Process group ID of the running task (for shutdown kills).
-    pub pgid: Option<i32>,
-    /// OSC query sink for reclaiming PTY write on attach.
-    pub osc_sink: Option<crate::output::OscSinkHandle>,
-    /// PID of the client holding the interactive attach lock.
-    pub attach_lock: Option<u32>,
-    /// Pending attach waiter (client waiting for process to start).
-    pub attach_waiter: Option<AttachWaiter>,
-    /// Watch paths resolved from build tool queries (bazel/turbo).
-    pub resolved_watch_paths: Vec<String>,
-}
+pub(crate) use state::{RuntimeService, RuntimeTask};
 
 /// The main runner that orchestrates services and tasks.
 pub struct Runner {
@@ -736,19 +688,7 @@ impl Runner {
             if active_services.contains(name) {
                 services.insert(
                     name.clone(),
-                    RuntimeService {
-                        resolved: svc.resolve(platform),
-                        state: ServiceState::Pending,
-                        handle: None,
-                        osc_sink: None,
-                        attach_lock: None,
-                        attach_waiter: None,
-                        bound_sockets: None,
-                        proxy: None,
-                        resolved_watch_paths: Vec::new(),
-                        bazel_binary_path: None,
-                        batch_built: false,
-                    },
+                    RuntimeService::new(svc.resolve(platform), ServiceState::Pending),
                 );
             }
         }
@@ -758,15 +698,7 @@ impl Runner {
             if active_tasks.contains(name) {
                 tasks.insert(
                     name.clone(),
-                    RuntimeTask {
-                        config: task.clone(),
-                        state: TaskItemState::Pending,
-                        pgid: None,
-                        osc_sink: None,
-                        attach_lock: None,
-                        attach_waiter: None,
-                        resolved_watch_paths: Vec::new(),
-                    },
+                    RuntimeTask::new(task.clone(), TaskItemState::Pending),
                 );
             }
         }
@@ -800,6 +732,38 @@ impl Runner {
     }
 
     /// Get a sender for sending commands to this runner.
+    /// Transition a service to a new state and broadcast the change.
+    ///
+    /// The broadcast is the whole point — `RuntimeService::set_state` is
+    /// `#[must_use]` precisely so the event can't be forgotten. No-op if
+    /// the service is unknown or already at `new_state`.
+    pub(crate) fn set_service_state(&mut self, name: &str, new_state: ServiceState) {
+        let changed = self
+            .services
+            .get_mut(name)
+            .and_then(|rs| rs.set_state(new_state));
+        if let Some(state) = changed {
+            let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
+                name: name.to_string(),
+                state,
+            });
+        }
+    }
+
+    /// Transition a task to a new state and broadcast the change.
+    pub(crate) fn set_task_state(&mut self, name: &str, new_state: TaskItemState) {
+        let changed = self
+            .tasks
+            .get_mut(name)
+            .and_then(|rt| rt.set_state(new_state));
+        if let Some(state) = changed {
+            let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
+                name: name.to_string(),
+                state,
+            });
+        }
+    }
+
     pub fn command_sender(&self) -> mpsc::Sender<RunnerCommand> {
         self.cmd_tx.clone()
     }
@@ -959,11 +923,11 @@ impl Runner {
                     ));
                     if let Some(rs) = self.services.get_mut(name) {
                         rs.proxy = Some(proxy);
-                        // Set lazy services to Lazy state (they won't enter the
-                        // startup flow until triggered by a connection).
-                        if *is_lazy {
-                            rs.state = ServiceState::Lazy;
-                        }
+                    }
+                    // Set lazy services to Lazy state (they won't enter the
+                    // startup flow until triggered by a connection).
+                    if *is_lazy {
+                        self.set_service_state(name, ServiceState::Lazy);
                     }
                 }
                 Err(e) => {
@@ -1113,7 +1077,7 @@ impl Runner {
                 all_started = true;
                 let has_running_services = self.services.values().any(|rs| {
                     matches!(
-                        rs.state,
+                        rs.state(),
                         ServiceState::Running
                             | ServiceState::Ready
                             | ServiceState::Starting
@@ -1208,7 +1172,7 @@ impl Runner {
                     }
                 }
                 Some(name) = self.lazy_start_rx.recv() => {
-                    if self.services.get(&name).is_some_and(|rs| rs.state == ServiceState::Lazy) {
+                    if self.services.get(&name).is_some_and(|rs| rs.state() == ServiceState::Lazy) {
                         self.output_manager.lifecycle_event(
                             &format!("{name}: first connection — starting service")
                         );
@@ -1276,11 +1240,10 @@ impl Runner {
 
         for name in failed_items {
             pending.remove(&name);
-            if let Some(rs) = self.services.get_mut(&name) {
-                rs.state = ServiceState::Failed;
-            } else if let Some(rt) = self.tasks.get_mut(&name) {
-                rt.state = TaskItemState::Failed;
-            }
+            // `name` is either a service or a task — the helpers are no-ops
+            // for unknown names, so we can call both unconditionally.
+            self.set_service_state(&name, ServiceState::Failed);
+            self.set_task_state(&name, TaskItemState::Failed);
             self.output_manager
                 .error_event(&format!("{name}: skipped (dependency failed)"));
         }
@@ -1298,7 +1261,7 @@ impl Runner {
 
         for name in ready {
             // Skip lazy services — they start on first proxy connection.
-            if self.services.get(&name).is_some_and(|rs| rs.state == ServiceState::Lazy) {
+            if self.services.get(&name).is_some_and(|rs| rs.state() == ServiceState::Lazy) {
                 pending.remove(&name);
                 continue;
             }
@@ -1319,10 +1282,10 @@ impl Runner {
     /// Check if a dependency is satisfied (ready service or completed task).
     fn is_dep_satisfied(&self, dep: &str) -> bool {
         if let Some(rs) = self.services.get(dep) {
-            return rs.state.is_satisfied();
+            return rs.state().is_satisfied();
         }
         if let Some(rt) = self.tasks.get(dep) {
-            return rt.state.is_satisfied();
+            return rt.state().is_satisfied();
         }
         false
     }
@@ -1330,10 +1293,10 @@ impl Runner {
     /// Check if a dependency has failed.
     fn is_dep_failed(&self, dep: &str) -> bool {
         if let Some(rs) = self.services.get(dep) {
-            return rs.state == ServiceState::Failed;
+            return rs.state() == ServiceState::Failed;
         }
         if let Some(rt) = self.tasks.get(dep) {
-            return rt.state == TaskItemState::Failed;
+            return rt.state() == TaskItemState::Failed;
         }
         false
     }
@@ -1344,11 +1307,10 @@ impl Runner {
         name: &str,
         done_tx: mpsc::Sender<ItemDone>,
     ) -> Result<(), RunnerError> {
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.state = ServiceState::Starting;
-        } else {
+        if !self.services.contains_key(name) {
             return Err(RunnerError::Config(format!("unknown service: {name}")));
         }
+        self.set_service_state(name, ServiceState::Starting);
 
         let mut resolved = match self.services.get(name) {
             Some(rs) => rs.resolved.clone(),
@@ -1614,9 +1576,7 @@ impl Runner {
                 Ok(())
             }
             Err(e) => {
-                if let Some(rs) = self.services.get_mut(name) {
-                    rs.state = ServiceState::Failed;
-                }
+                self.set_service_state(name, ServiceState::Failed);
                 self.output_manager
                     .error_event(&format!("{name}: failed to start: {e}"));
 
@@ -1649,9 +1609,7 @@ impl Runner {
         message: &str,
         done_tx: mpsc::Sender<ItemDone>,
     ) {
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.state = ServiceState::Failed;
-        }
+        self.set_service_state(name, ServiceState::Failed);
         let _ = done_tx
             .send(ItemDone {
                 name: name.to_string(),
@@ -1677,7 +1635,6 @@ impl Runner {
         done_tx: Option<mpsc::Sender<ItemDone>>,
     ) {
         if let Some(rs) = self.services.get_mut(name) {
-            rs.state = ServiceState::Running;
             rs.handle = Some(start_result.handle);
 
             // Add OSC response sink if we have a PTY write handle.
@@ -1688,6 +1645,7 @@ impl Runner {
                 rs.osc_sink = Some(osc_handle);
             }
         }
+        self.set_service_state(name, ServiceState::Running);
 
         // Wire up output processing. The exit_tx fires when the
         // stream hits EOF (process died), used to cancel the ready check.
@@ -1776,9 +1734,7 @@ impl Runner {
             });
         } else if let Some(done_tx) = done_tx {
             // No ready check, initial startup path — mark ready immediately.
-            if let Some(rs) = self.services.get_mut(name) {
-                rs.state = ServiceState::Ready;
-            }
+            self.set_service_state(name, ServiceState::Ready);
             self.output_manager
                 .lifecycle_event(&format!("{name} started"));
             let _ = done_tx
@@ -1792,9 +1748,7 @@ impl Runner {
                 .await;
         } else {
             // No ready check, rebuild path — mark ready immediately.
-            if let Some(rs) = self.services.get_mut(name) {
-                rs.state = ServiceState::Ready;
-            }
+            self.set_service_state(name, ServiceState::Ready);
             self.output_manager
                 .lifecycle_event(&format!("{name}: restarted"));
             let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
@@ -1817,13 +1771,7 @@ impl Runner {
 
         // auto_run = false: skip execution entirely and mark as pending.
         if !task_cfg.auto_run {
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.state = TaskItemState::PendingRun;
-            }
-            let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
-                name: name.to_string(),
-                state: TaskItemState::PendingRun,
-            });
+            self.set_task_state(name, TaskItemState::PendingRun);
             self.output_manager.lifecycle_event(&format!(
                 "{name}: pending — auto_run = false"
             ));
@@ -1848,15 +1796,9 @@ impl Runner {
             .unwrap_or(true);
 
         if !needs_run {
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.state = TaskItemState::Skipped;
-            }
+            self.set_task_state(name, TaskItemState::Skipped);
             self.output_manager
                 .lifecycle_event(&format!("{name}: skipped (no changes)"));
-            let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
-                name: name.to_string(),
-                state: TaskItemState::Skipped,
-            });
             let _ = done_tx
                 .send(ItemDone {
                     name: name.to_string(),
@@ -1895,9 +1837,7 @@ impl Runner {
 
         // Ensure any downloaded artifact is cached before running.
         if let Err(e) = self.ensure_task_download(name, &task_cfg).await {
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.state = TaskItemState::Failed;
-            }
+            self.set_task_state(name, TaskItemState::Failed);
             self.output_manager
                 .error_event(&format!("{name}: download failed: {e}"));
             let _ = done_tx
@@ -1912,9 +1852,7 @@ impl Runner {
             return Ok(());
         }
 
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.state = TaskItemState::Running;
-        }
+        self.set_task_state(name, TaskItemState::Running);
 
         // Spawn the task process.
         match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
@@ -1923,9 +1861,7 @@ impl Runner {
                 Ok(())
             }
             Err(e) => {
-                if let Some(rt) = self.tasks.get_mut(name) {
-                    rt.state = TaskItemState::Failed;
-                }
+                self.set_task_state(name, TaskItemState::Failed);
                 self.output_manager
                     .error_event(&format!("{name}: failed to start: {e}"));
                 let _ = done_tx
@@ -2369,14 +2305,17 @@ impl Runner {
 
         // 1. Stop removed services.
         for name in &diff.removed_services {
-            if let Some(rs) = self.services.get_mut(name)
-                && let Some(handle) = rs.handle.take()
-            {
-                if rs.attach_lock.take().is_some() {
+            let to_stop = self.services.get_mut(name).and_then(|rs| {
+                let handle = rs.handle.take()?;
+                let had_attach = rs.attach_lock.take().is_some();
+                let shutdown_config = rs.resolved.shutdown.clone();
+                Some((handle, had_attach, shutdown_config))
+            });
+            if let Some((handle, had_attach, shutdown_config)) = to_stop {
+                if had_attach {
                     self.output_manager.resume_stdout_sink(name).await;
                 }
-                let shutdown_config = rs.resolved.shutdown.clone();
-                rs.state = ServiceState::Stopping;
+                self.set_service_state(name, ServiceState::Stopping);
                 let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
                 if let Some(writer) = self.output_manager.service_writer(name) {
                     writer.close_follow_sinks().await;
@@ -2391,18 +2330,23 @@ impl Runner {
         //    Also release bound sockets so they get re-bound with the new
         //    listen addresses (if changed).
         for name in &diff.changed_services {
-            if let Some(rs) = self.services.get_mut(name) {
-                if let Some(handle) = rs.handle.take() {
-                    if rs.attach_lock.take().is_some() {
-                        self.output_manager.resume_stdout_sink(name).await;
-                    }
-                    let shutdown_config = rs.resolved.shutdown.clone();
-                    rs.state = ServiceState::Stopping;
-                    let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
-                    if let Some(writer) = self.output_manager.service_writer(name) {
-                        writer.close_follow_sinks().await;
-                    }
+            let to_stop = self.services.get_mut(name).and_then(|rs| {
+                let handle = rs.handle.take()?;
+                let had_attach = rs.attach_lock.take().is_some();
+                let shutdown_config = rs.resolved.shutdown.clone();
+                Some((handle, had_attach, shutdown_config))
+            });
+            if let Some((handle, had_attach, shutdown_config)) = to_stop {
+                if had_attach {
+                    self.output_manager.resume_stdout_sink(name).await;
                 }
+                self.set_service_state(name, ServiceState::Stopping);
+                let _ = service::stop_service(handle, shutdown_config.as_ref(), false).await;
+                if let Some(writer) = self.output_manager.service_writer(name) {
+                    writer.close_follow_sinks().await;
+                }
+            }
+            if let Some(rs) = self.services.get_mut(name) {
                 rs.bound_sockets = None;
                 rs.proxy = None;
             }
@@ -2421,20 +2365,12 @@ impl Runner {
             if let Some(svc) = self.config.services.get(name) {
                 self.services.insert(
                     name.clone(),
-                    RuntimeService {
-                        resolved: svc.resolve(self.platform),
-                        state: ServiceState::Pending,
-                        handle: None,
-                        osc_sink: None,
-                        attach_lock: None,
-                        attach_waiter: None,
-                        bound_sockets: None,
-                        proxy: None,
-                        resolved_watch_paths: Vec::new(),
-                        bazel_binary_path: None,
-                        batch_built: false,
-                    },
+                    RuntimeService::new(svc.resolve(self.platform), ServiceState::Pending),
                 );
+                let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
+                    name: name.clone(),
+                    state: ServiceState::Pending,
+                });
             }
             let log_config = self
                 .config
@@ -2451,16 +2387,12 @@ impl Runner {
             if let Some(task) = self.config.tasks.get(name) {
                 self.tasks.insert(
                     name.clone(),
-                    RuntimeTask {
-                        config: task.clone(),
-                        state: TaskItemState::Pending,
-                        pgid: None,
-                        osc_sink: None,
-                        attach_lock: None,
-                        attach_waiter: None,
-                        resolved_watch_paths: Vec::new(),
-                    },
+                    RuntimeTask::new(task.clone(), TaskItemState::Pending),
                 );
+                let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
+                    name: name.clone(),
+                    state: TaskItemState::Pending,
+                });
             }
             let log_config = self
                 .config
@@ -2477,11 +2409,12 @@ impl Runner {
         // 6. Mark changed services as Pending for restart, re-resolve config,
         //    and bind proxies for new/changed services that have proxy config.
         for name in &diff.changed_services {
-            if let Some(svc) = self.config.services.get(name)
-                && let Some(rs) = self.services.get_mut(name)
-            {
-                rs.resolved = svc.resolve(self.platform);
-                rs.state = ServiceState::Pending;
+            let resolved = self.config.services.get(name).map(|svc| svc.resolve(self.platform));
+            if let Some(resolved) = resolved {
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.resolved = resolved;
+                }
+                self.set_service_state(name, ServiceState::Pending);
             }
         }
         // Also update task configs for changed tasks.
@@ -2520,9 +2453,9 @@ impl Runner {
                     ));
                     if let Some(rs) = self.services.get_mut(name) {
                         rs.proxy = Some(proxy);
-                        if is_lazy {
-                            rs.state = ServiceState::Lazy;
-                        }
+                    }
+                    if is_lazy {
+                        self.set_service_state(name, ServiceState::Lazy);
                     }
                 }
                 Err(e) => {
@@ -2572,9 +2505,7 @@ impl Runner {
                             let _ = self.start_service(name, done_tx).await;
                         }
                     } else if self.tasks.contains_key(name) {
-                        if let Some(rt) = self.tasks.get_mut(name) {
-                            rt.state = TaskItemState::Running;
-                        }
+                        self.set_task_state(name, TaskItemState::Running);
                         self.handle_task_rerun(name).await;
                     }
                 }
@@ -2587,11 +2518,11 @@ impl Runner {
         let has_pending = self
             .services
             .values()
-            .any(|rs| rs.state == ServiceState::Pending)
+            .any(|rs| rs.state() == ServiceState::Pending)
             || self
                 .tasks
                 .values()
-                .any(|rt| rt.state == TaskItemState::Pending);
+                .any(|rt| rt.state() == TaskItemState::Pending);
         if has_pending {
             let cmd_tx = self.cmd_tx.clone();
             tokio::spawn(async move {
@@ -3068,12 +2999,8 @@ impl Runner {
                     for (name, msg) in batch.failed {
                         self.output_manager
                             .error_event(&format!("{name}: batch build failed: {msg}"));
-                        if let Some(rs) = self.services.get_mut(&name) {
-                            rs.state = ServiceState::Failed;
-                        }
-                        if let Some(rt) = self.tasks.get_mut(&name) {
-                            rt.state = TaskItemState::Failed;
-                        }
+                        self.set_service_state(&name, ServiceState::Failed);
+                        self.set_task_state(&name, TaskItemState::Failed);
                     }
                 }
                 Ok(Err(e)) => {
@@ -3111,11 +3038,11 @@ impl Runner {
             let is_pending_svc = self
                 .services
                 .get(name)
-                .is_some_and(|rs| rs.state == ServiceState::Pending);
+                .is_some_and(|rs| rs.state() == ServiceState::Pending);
             let is_pending_task = self
                 .tasks
                 .get(name)
-                .is_some_and(|rt| rt.state == TaskItemState::Pending);
+                .is_some_and(|rt| rt.state() == TaskItemState::Pending);
             if !is_pending_svc && !is_pending_task {
                 continue;
             }
@@ -3134,9 +3061,7 @@ impl Runner {
                     started_any = true;
                 }
             } else if is_pending_task {
-                if let Some(rt) = self.tasks.get_mut(name) {
-                    rt.state = TaskItemState::Running;
-                }
+                self.set_task_state(name, TaskItemState::Running);
                 self.handle_task_rerun(name).await;
                 started_any = true;
             }
@@ -3148,11 +3073,11 @@ impl Runner {
             let still_pending = self
                 .services
                 .values()
-                .any(|rs| rs.state == ServiceState::Pending)
+                .any(|rs| rs.state() == ServiceState::Pending)
                 || self
                     .tasks
                     .values()
-                    .any(|rt| rt.state == TaskItemState::Pending);
+                    .any(|rt| rt.state() == TaskItemState::Pending);
             if still_pending {
                 let cmd_tx = self.cmd_tx.clone();
                 tokio::spawn(async move {
@@ -3238,9 +3163,7 @@ impl Runner {
             if self.remove_attach_lock(name) {
                 self.output_manager.resume_stdout_sink(name).await;
             }
-            if let Some(rs) = self.services.get_mut(name) {
-                rs.state = ServiceState::Stopping;
-            }
+            self.set_service_state(name, ServiceState::Stopping);
             let shutdown_config = resolved.shutdown.as_ref();
             if let Err(e) = stop_service(handle, shutdown_config, false).await {
                 self.output_manager
@@ -3345,7 +3268,7 @@ impl Runner {
             });
         }
         // For lazy services in Lazy state, force-start via the normal path.
-        if self.services.get(name).is_some_and(|rs| rs.state == ServiceState::Lazy) {
+        if self.services.get(name).is_some_and(|rs| rs.state() == ServiceState::Lazy) {
             self.output_manager
                 .lifecycle_event(&format!("{name}: starting (requested)"));
             if let Some(done_tx) = self.done_tx.clone() {
@@ -3357,7 +3280,7 @@ impl Runner {
                 });
             }
         }
-        let resolved = match self.services.get(name) {
+        let mut resolved = match self.services.get(name) {
             Some(rs) => rs.resolved.clone(),
             None => {
                 return Err(CommandError::UnknownService {
@@ -3365,6 +3288,15 @@ impl Runner {
                 })
             }
         };
+        // Re-inject proxy env vars so interpolations like `${CRDB_PORT}` in
+        // the command args / listen-addr resolve to the proxy's ephemeral
+        // port. Without this, restart feeds the literal `${CRDB_PORT}` string
+        // to the child — which fails with e.g. "unknown port" from cockroach.
+        if let Some(rs) = self.services.get(name)
+            && let Some(ref proxy) = rs.proxy
+        {
+            resolved.env.extend(proxy.env_vars());
+        }
         self.output_manager
             .lifecycle_event(&format!("starting {name}... (requested)"));
         self.spawn_and_wire_service(name, &resolved, None)
@@ -3379,10 +3311,8 @@ impl Runner {
     async fn handle_stop_cmd(&mut self, name: &str) -> CommandResult {
         self.lookup_service(name)?;
         // A lazy service in Lazy state has no process — just mark it Stopped.
-        if self.services.get(name).is_some_and(|rs| rs.state == ServiceState::Lazy) {
-            if let Some(rs) = self.services.get_mut(name) {
-                rs.state = ServiceState::Stopped;
-            }
+        if self.services.get(name).is_some_and(|rs| rs.state() == ServiceState::Lazy) {
+            self.set_service_state(name, ServiceState::Stopped);
             self.output_manager
                 .lifecycle_event(&format!("{name}: stopped (was lazy)"));
             return Ok(());
@@ -3404,9 +3334,7 @@ impl Runner {
         if self.remove_attach_lock(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.state = ServiceState::Stopping;
-        }
+        self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .lifecycle_event(&format!("stopping {name}... (requested)"));
         if let Err(e) = stop_service(handle, shutdown_config.as_ref(), false).await {
@@ -3415,18 +3343,12 @@ impl Runner {
                 message: e.to_string(),
             });
         }
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.state = ServiceState::Stopped;
-        }
+        self.set_service_state(name, ServiceState::Stopped);
         // Close follow/attach sinks so log followers and attach sessions
         // detect the service stopped instead of blocking forever.
         if let Some(writer) = self.output_manager.service_writer(name) {
             writer.close_follow_sinks().await;
         }
-        let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
-            name: name.to_string(),
-            state: ServiceState::Stopped,
-        });
         Ok(())
     }
 
@@ -3600,13 +3522,7 @@ impl Runner {
         // If the task has opted out of auto-reruns, mark it pending and don't spawn.
         // The user will need to trigger a manual rerun when they're ready.
         if !task_cfg.auto_run {
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.state = TaskItemState::PendingRun;
-            }
-            let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
-                name: name.to_string(),
-                state: TaskItemState::PendingRun,
-            });
+            self.set_task_state(name, TaskItemState::PendingRun);
             self.output_manager.lifecycle_event(&format!(
                 "{name}: files changed (pending — auto_run = false)"
             ));
@@ -3628,9 +3544,7 @@ impl Runner {
 
         self.output_manager
             .lifecycle_event(&format!("{name}: re-running (file changed)"));
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.state = TaskItemState::Running;
-        }
+        self.set_task_state(name, TaskItemState::Running);
 
         self.output_manager
             .debug_event(&format!("{name}: spawning process..."));
@@ -3641,9 +3555,7 @@ impl Runner {
                 self.wire_task_output_and_wait(name, spawn, &task_cfg, None).await;
             }
             Err(e) => {
-                if let Some(rt) = self.tasks.get_mut(name) {
-                    rt.state = TaskItemState::Failed;
-                }
+                self.set_task_state(name, TaskItemState::Failed);
                 self.output_manager
                     .error_event(&format!("{name}: failed to start: {e}"));
                 let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
@@ -3662,7 +3574,7 @@ impl Runner {
         let pending_names: Vec<String> = self
             .tasks
             .iter()
-            .filter(|(_, rt)| rt.state == TaskItemState::PendingRun)
+            .filter(|(_, rt)| rt.state() == TaskItemState::PendingRun)
             .map(|(name, _)| name.clone())
             .collect();
 
@@ -3680,9 +3592,7 @@ impl Runner {
         ));
 
         for name in &pending_names {
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.state = TaskItemState::Running;
-            }
+            self.set_task_state(name, TaskItemState::Running);
             self.handle_task_rerun(name).await;
         }
 
@@ -3699,12 +3609,7 @@ impl Runner {
 
     fn handle_service_done(&mut self, item: &ItemDone) {
         if item.success {
-            if let Some(rs) = self.services.get_mut(&item.name) {
-                rs.state = ServiceState::Ready;
-                // Activate proxy backend now that the service is ready.
-                if let Some(ref proxy) = rs.proxy {
-                    proxy.set_backend();
-                }
+            let details = self.services.get(&item.name).map(|rs| {
                 let ready_desc = match &rs.resolved.ready {
                     Some(r) if r.tcp.is_some() => {
                         format!(" (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
@@ -3715,10 +3620,21 @@ impl Runner {
                     Some(r) if r.exec.is_some() => " (exec)".to_string(),
                     _ => " started".to_string(),
                 };
+                (rs.resolved.ready.is_some(), ready_desc)
+            });
+            // Activate proxy backend before state flip so the proxy is ready
+            // to forward the moment observers see `Ready`.
+            if let Some(rs) = self.services.get(&item.name)
+                && let Some(ref proxy) = rs.proxy
+            {
+                proxy.set_backend();
+            }
+            self.set_service_state(&item.name, ServiceState::Ready);
+            if let Some((has_ready, ready_desc)) = details {
                 self.output_manager.lifecycle_event(&format!(
                     "{}{}",
                     item.name,
-                    if rs.resolved.ready.is_some() {
+                    if has_ready {
                         format!(" ready{ready_desc}")
                     } else {
                         ready_desc
@@ -3728,20 +3644,21 @@ impl Runner {
         } else {
             // If a lazy service fails, reset to Lazy so the next connection
             // can re-trigger it instead of leaving it permanently failed.
-            if let Some(rs) = self.services.get_mut(&item.name) {
-                let is_lazy = rs.resolved.lazy && rs.proxy.is_some();
-                if is_lazy {
-                    rs.state = ServiceState::Lazy;
-                    if let Some(ref msg) = item.message {
-                        self.output_manager
-                            .error_event(&format!("{}: {msg} (will retry on next connection)", item.name));
-                    }
-                } else {
-                    rs.state = ServiceState::Failed;
-                    if let Some(ref msg) = item.message {
-                        self.output_manager
-                            .error_event(&format!("{}: {msg}", item.name));
-                    }
+            let is_lazy = self
+                .services
+                .get(&item.name)
+                .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
+            if is_lazy {
+                self.set_service_state(&item.name, ServiceState::Lazy);
+                if let Some(ref msg) = item.message {
+                    self.output_manager
+                        .error_event(&format!("{}: {msg} (will retry on next connection)", item.name));
+                }
+            } else {
+                self.set_service_state(&item.name, ServiceState::Failed);
+                if let Some(ref msg) = item.message {
+                    self.output_manager
+                        .error_event(&format!("{}: {msg}", item.name));
                 }
             }
         }
@@ -3759,11 +3676,9 @@ impl Runner {
         let timing = item.elapsed.map(format_duration).unwrap_or_default();
 
         if item.success {
-            let cur = self.tasks.get(&item.name).map(|rt| rt.state);
+            let cur = self.tasks.get(&item.name).map(|rt| rt.state());
             if cur != Some(TaskItemState::Skipped) && cur != Some(TaskItemState::PendingRun) {
-                if let Some(rt) = self.tasks.get_mut(&item.name) {
-                    rt.state = TaskItemState::Completed;
-                }
+                self.set_task_state(&item.name, TaskItemState::Completed);
                 let msg = if timing.is_empty() {
                     format!("{} complete", item.name)
                 } else {
@@ -3772,9 +3687,7 @@ impl Runner {
                 self.output_manager.lifecycle_event(&msg);
             }
         } else {
-            if let Some(rt) = self.tasks.get_mut(&item.name) {
-                rt.state = TaskItemState::Failed;
-            }
+            self.set_task_state(&item.name, TaskItemState::Failed);
             if let Some(ref err_msg) = item.message {
                 let msg = if timing.is_empty() {
                     format!("{} failed ({err_msg})", item.name)
@@ -3834,7 +3747,7 @@ impl Runner {
             if !self.services.contains_key(name) {
                 continue;
             }
-            let state = self.services.get(name).map(|rs| rs.state);
+            let state = self.services.get(name).map(|rs| rs.state());
             if !matches!(
                 state,
                 Some(ServiceState::Running)
@@ -3885,14 +3798,18 @@ impl Runner {
                     self.output_manager
                         .lifecycle_event("forcing immediate shutdown");
                     // SIGKILL all processes that are still being stopped.
-                    for (name, pgid) in &stopping_pgids {
-                        let _ = nix::sys::signal::killpg(
-                            nix::unistd::Pid::from_raw(*pgid),
-                            nix::sys::signal::Signal::SIGKILL,
-                        );
-                        if let Some(rs) = self.services.get_mut(name) {
-                            rs.state = ServiceState::Stopped;
-                        }
+                    let names: Vec<String> = stopping_pgids
+                        .iter()
+                        .map(|(name, pgid)| {
+                            let _ = nix::sys::signal::killpg(
+                                nix::unistd::Pid::from_raw(*pgid),
+                                nix::sys::signal::Signal::SIGKILL,
+                            );
+                            name.clone()
+                        })
+                        .collect();
+                    for name in names {
+                        self.set_service_state(&name, ServiceState::Stopped);
                     }
                     join_set.abort_all();
                     while join_set.join_next().await.is_some() {}
@@ -3910,9 +3827,7 @@ impl Runner {
                 {
                     Ok(Some(Ok(name))) => {
                         stopping_pgids.remove(&name);
-                        if let Some(rs) = self.services.get_mut(&name) {
-                            rs.state = ServiceState::Stopped;
-                        }
+                        self.set_service_state(&name, ServiceState::Stopped);
                         remaining -= 1;
                         self.output_manager
                             .lifecycle_event(&format!("{name} stopped ({remaining} remaining)"));
@@ -4023,7 +3938,7 @@ impl Runner {
             };
             statuses.push(ItemStatus::Service {
                 name: name.clone(),
-                state: rs.state,
+                state: rs.state(),
                 verbose: verbose_info,
             });
         }
@@ -4055,7 +3970,7 @@ impl Runner {
             };
             statuses.push(ItemStatus::Task {
                 name: name.clone(),
-                state: rt.state,
+                state: rt.state(),
                 verbose: verbose_info,
             });
         }
@@ -4440,8 +4355,8 @@ mod tests {
         use crate::config::types::LogConfig;
         use std::collections::HashMap;
 
-        let rs = RuntimeService {
-            resolved: ResolvedService {
+        let rs = RuntimeService::new(
+            ResolvedService {
                 dir: None,
                 env: HashMap::new(),
                 env_file: Vec::new(),
@@ -4459,19 +4374,10 @@ mod tests {
                 reload: true,
                 kind: None,
             },
-            state: ServiceState::Pending,
-            handle: None,
-            osc_sink: None,
-            attach_lock: None,
-            attach_waiter: None,
-            bound_sockets: None,
-            proxy: None,
-            resolved_watch_paths: Vec::new(),
-            bazel_binary_path: None,
-            batch_built: false,
-        };
+            ServiceState::Pending,
+        );
 
-        assert_eq!(rs.state, ServiceState::Pending);
+        assert_eq!(rs.state(), ServiceState::Pending);
         assert!(rs.handle.is_none());
         assert!(rs.osc_sink.is_none());
         assert!(rs.attach_lock.is_none());
@@ -4489,8 +4395,8 @@ mod tests {
         use crate::config::types::LogConfig;
         use std::collections::HashMap;
 
-        let rt = RuntimeTask {
-            config: crate::config::task::Task {
+        let rt = RuntimeTask::new(
+            crate::config::task::Task {
                 cmd: "echo".to_string(),
                 args: vec!["hello".to_string()],
                 dir: None,
@@ -4505,15 +4411,10 @@ mod tests {
                 bazel: None,
                 turbo: None,
             },
-            state: TaskItemState::Pending,
-            pgid: None,
-            osc_sink: None,
-            attach_lock: None,
-            attach_waiter: None,
-            resolved_watch_paths: Vec::new(),
-        };
+            TaskItemState::Pending,
+        );
 
-        assert_eq!(rt.state, TaskItemState::Pending);
+        assert_eq!(rt.state(), TaskItemState::Pending);
         assert!(rt.pgid.is_none());
         assert!(rt.osc_sink.is_none());
         assert!(rt.attach_lock.is_none());

@@ -10,6 +10,7 @@ pub(crate) mod proxy;
 pub mod runner;
 pub mod server;
 pub mod task_state;
+pub mod tui;
 pub mod watch;
 
 pub use config::{Config, ConfigError, Platform};

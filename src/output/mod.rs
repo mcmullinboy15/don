@@ -83,6 +83,9 @@ pub struct SinkLine {
     pub prefix: Bytes,
     /// The raw line content (no newline).
     pub line: Bytes,
+    /// The service/task name this line belongs to. Empty for `[don]` lifecycle
+    /// events, which the TUI treats as unfilterable so users always see them.
+    pub name: String,
 }
 
 /// A handle to a sink. Clone the sender to subscribe a service to it.
@@ -95,8 +98,37 @@ pub(crate) struct SinkHandle {
     pub drop_on_full: bool,
 }
 
+/// A fully formatted, sanitized log line emitted by the stdout pipeline.
+///
+/// In TTY mode the stdout sink emits these over an mpsc instead of writing
+/// raw bytes, so the TUI can feed each line into `terminal.insert_before`
+/// (preserving native scrollback) and stamp the `name` for filter matching.
+/// The bytes already include any verbose-mode timestamp and the color-coded
+/// service prefix; the consumer just renders them as-is.
+pub struct FormattedLogLine {
+    /// Owning service/task name. Empty for `[don]` lifecycle events, which
+    /// the TUI always shows regardless of the active filter.
+    pub name: String,
+    /// Fully formatted line bytes. Does NOT include a trailing newline —
+    /// the renderer appends one (or, for ratatui, treats it as one row).
+    pub bytes: Vec<u8>,
+}
+
+/// Where the stdout sink task sends its formatted lines.
+///
+/// Pipe-mode output writes bytes directly to an `AsyncWrite` (today's stdout).
+/// TUI mode sends [`FormattedLogLine`]s over an mpsc for the TUI task to
+/// render via `Terminal::insert_before`.
+enum StdoutTarget<W: tokio::io::AsyncWrite + Unpin + Send> {
+    Writer(W),
+    Tui(mpsc::Sender<FormattedLogLine>),
+}
+
 /// Per-service output state. Owned by OutputManager, never removed.
 struct ServiceOutputState {
+    /// Service/task name — stamped onto every emitted `SinkLine` so the TUI
+    /// can filter without having to reverse-map the prefix bytes.
+    name: String,
     prefix: Bytes,
     ring_buffer: RingBuffer,
     /// Dynamic list of sinks this service writes to.
@@ -140,11 +172,11 @@ impl ServiceWriter {
 
                     // Lock: push to ring buffer + snapshot sinks. Released before sends.
                     // Prune closed sinks (e.g. disconnected follow clients) inline.
-                    let (prefix, sinks) = {
+                    let (name, prefix, sinks) = {
                         let mut state = self.state.lock().await;
                         state.sinks.retain(|s| !s.tx.is_closed());
                         state.ring_buffer.push_chunk(&chunk);
-                        (state.prefix.clone(), state.sinks.clone())
+                        (state.name.clone(), state.prefix.clone(), state.sinks.clone())
                     };
 
                     let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
@@ -152,6 +184,7 @@ impl ServiceWriter {
                         let msg = SinkLine {
                             prefix: prefix.clone(),
                             line: chunk.clone(),
+                            name: name.clone(),
                         };
                         if sink.drop_on_full {
                             // Non-blocking: if the client can't keep up, drop
@@ -201,17 +234,18 @@ impl ServiceWriter {
     /// the data so sinks can flush immediately.
     pub async fn write_line(&self, line: &str) {
         let data = Bytes::from(format!("{line}\n"));
-        let (prefix, sinks) = {
+        let (name, prefix, sinks) = {
             let mut state = self.state.lock().await;
             state.sinks.retain(|s| !s.tx.is_closed());
             state.ring_buffer.push_chunk(data.as_ref());
-            (state.prefix.clone(), state.sinks.clone())
+            (state.name.clone(), state.prefix.clone(), state.sinks.clone())
         };
         let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
         for sink in &sinks {
             let msg = SinkLine {
                 prefix: prefix.clone(),
                 line: data.clone(),
+                name: name.clone(),
             };
             if sink.drop_on_full {
                 if sink.tx.try_send(msg).is_err() {
@@ -304,13 +338,43 @@ impl OutputManager {
         writer: W,
         verbose: bool,
     ) -> Result<Self, OutputError> {
+        Self::new_inner(services, verbose, StdoutTarget::Writer(writer)).await
+    }
+
+    /// Create a new output manager that emits formatted log lines to the TUI
+    /// over an mpsc channel instead of writing raw bytes to stdout.
+    ///
+    /// Returns `(manager, log_rx)` — `log_rx` receives one [`FormattedLogLine`]
+    /// per complete log line (already prefixed, sanitized, and timestamp-stamped
+    /// if `verbose`). The caller is the TUI task, which feeds each line into
+    /// `Terminal::insert_before` for natural scrollback.
+    ///
+    /// Lifecycle events (`[don]`) arrive with `name = ""` so the TUI treats
+    /// them as unfilterable.
+    pub async fn new_with_tui(
+        services: &[(&str, &crate::config::LogConfig)],
+        verbose: bool,
+    ) -> Result<(Self, mpsc::Receiver<FormattedLogLine>), OutputError> {
+        let (log_tx, log_rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
+        // `tokio::io::Sink` only satisfies the generic bound — `StdoutTarget::Tui`
+        // never touches the writer arm, so the value is never exercised.
+        let target: StdoutTarget<tokio::io::Sink> = StdoutTarget::Tui(log_tx);
+        let mgr = Self::new_inner(services, verbose, target).await?;
+        Ok((mgr, log_rx))
+    }
+
+    async fn new_inner<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+        services: &[(&str, &crate::config::LogConfig)],
+        verbose: bool,
+        target: StdoutTarget<W>,
+    ) -> Result<Self, OutputError> {
         let names: Vec<&str> = services.iter().map(|(n, _)| *n).collect();
         let color_map = assign_colors(&names);
         let max_name_len = names.iter().map(|n| n.len()).max().unwrap_or(0).max(5);
 
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
-        let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, writer, verbose));
+        let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, target, verbose));
         let stdout_sink = SinkHandle { tx: stdout_tx, drop_on_full: false };
 
         // Spawn file sink tasks (deduplicated by path).
@@ -350,6 +414,7 @@ impl OutputManager {
             service_map.insert(
                 name.to_string(),
                 Arc::new(Mutex::new(ServiceOutputState {
+                    name: name.to_string(),
                     prefix,
                     ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
                     sinks,
@@ -408,6 +473,7 @@ impl OutputManager {
         let capacity = last_n.saturating_add(live_capacity).max(1);
         let (tx, rx) = mpsc::channel::<SinkLine>(capacity);
         let mut state = state_arc.lock().await;
+        let svc_name = state.name.clone();
         let prefix = state.prefix.clone();
         // Preload last N ring buffer lines. Channel has `capacity` slots and
         // is empty, so try_send is safe here.
@@ -415,6 +481,7 @@ impl OutputManager {
             let sink_line = SinkLine {
                 prefix: prefix.clone(),
                 line: Bytes::copy_from_slice(line),
+                name: svc_name.clone(),
             };
             if tx.try_send(sink_line).is_err() {
                 break;
@@ -506,6 +573,7 @@ impl OutputManager {
         self.services.insert(
             name.to_string(),
             Arc::new(Mutex::new(ServiceOutputState {
+                name: name.to_string(),
                 prefix,
                 ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
                 sinks,
@@ -528,6 +596,7 @@ impl OutputManager {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{message}\n")),
+            name: String::new(),
         });
     }
 
@@ -543,6 +612,7 @@ impl OutputManager {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{service}: {message}\n")),
+            name: String::new(),
         });
     }
 
@@ -551,6 +621,7 @@ impl OutputManager {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
             line: Bytes::from(format!("{message}\n")),
+            name: String::new(),
         });
     }
 
@@ -559,6 +630,7 @@ impl OutputManager {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
             line: Bytes::from(format!("{service}: {message}\n")),
+            name: String::new(),
         });
     }
 
@@ -635,19 +707,21 @@ impl LifecycleEmitter {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{message}\n")),
+            name: String::new(),
         });
     }
 }
 
 /// Stdout sink writer task. Receives raw byte chunks and accumulates
-/// per-service until `\n` or overflow, then writes the formatted line.
+/// per-service until `\n` or overflow, then emits the formatted line to
+/// the configured target (pipe writer or TUI channel).
 ///
 /// Each service's partial output is buffered independently so that
 /// interleaved chunks from different services don't produce garbled output.
 /// Runs until all senders are dropped.
 async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut rx: mpsc::Receiver<SinkLine>,
-    mut writer: W,
+    mut target: StdoutTarget<W>,
     verbose: bool,
 ) {
     use bytes::BytesMut;
@@ -669,7 +743,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
         for &byte in msg.line.iter() {
             acc.extend_from_slice(&[byte]);
             if byte == b'\n' {
-                // Complete line — strip \r\n, sanitize, write prefixed output.
+                // Complete line — strip \r\n, sanitize, emit prefixed output.
                 acc.truncate(acc.len() - 1); // remove \n
                 if acc.last() == Some(&b'\r') {
                     acc.truncate(acc.len() - 1); // remove \r
@@ -684,7 +758,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     } else {
                         sanitize::sanitize_terminal_output(acc)
                     };
-                    write_prefixed_line(&mut writer, &msg.prefix, &sanitized, verbose, start).await;
+                    emit_line(&mut target, &msg.name, &msg.prefix, &sanitized, verbose, start).await;
                 }
                 acc.clear();
             } else if byte == b'\r' {
@@ -698,10 +772,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     } else {
                         sanitize::sanitize_terminal_output(acc)
                     };
-                    write_prefixed_line(
-                        &mut writer, &msg.prefix, &sanitized, verbose, start,
-                    )
-                    .await;
+                    emit_line(&mut target, &msg.name, &msg.prefix, &sanitized, verbose, start).await;
                 }
                 acc.clear();
                 cr_flushed.insert(msg.prefix.clone());
@@ -715,14 +786,17 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     } else {
                         sanitize::sanitize_terminal_output(acc)
                     };
-                    write_prefixed_line(&mut writer, &msg.prefix, &sanitized, verbose, start).await;
+                    emit_line(&mut target, &msg.name, &msg.prefix, &sanitized, verbose, start).await;
                     acc.clear();
                 }
             }
         }
     }
 
-    // Flush remaining accumulators on shutdown.
+    // Flush remaining accumulators on shutdown. The name is lost here — the
+    // accumulator map is keyed on prefix bytes — so end-of-stream partial
+    // lines arrive at the TUI with an empty name (unfilterable). Partial
+    // lines at shutdown are rare and the user probably wants to see them.
     for (prefix, acc) in &accumulators {
         if !acc.is_empty() {
             let sanitized = if prefix.is_empty() {
@@ -730,28 +804,56 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             } else {
                 sanitize::sanitize_terminal_output(acc)
             };
-            write_prefixed_line(&mut writer, prefix, &sanitized, verbose, start).await;
+            emit_line(&mut target, "", prefix, &sanitized, verbose, start).await;
         }
     }
 }
 
-/// Write a single prefixed, sanitized line to the writer.
-async fn write_prefixed_line<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
+/// Build the formatted line bytes (optional verbose timestamp + prefix + content).
+/// No trailing newline — the consumer decides how to terminate the line.
+fn build_formatted_bytes(
+    prefix: &[u8],
+    line: &[u8],
+    verbose: bool,
+    start: std::time::Instant,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + line.len() + 16);
+    if verbose {
+        let elapsed = start.elapsed();
+        let ts = format!("{:.3}s ", elapsed.as_secs_f64());
+        out.extend_from_slice(ts.as_bytes());
+    }
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(line);
+    out
+}
+
+/// Emit a complete formatted line to the target — either write to the pipe
+/// writer with a trailing `\n`, or ship it to the TUI as a [`FormattedLogLine`].
+async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
+    target: &mut StdoutTarget<W>,
+    name: &str,
     prefix: &[u8],
     line: &[u8],
     verbose: bool,
     start: std::time::Instant,
 ) {
-    use tokio::io::AsyncWriteExt;
-    if verbose {
-        let elapsed = start.elapsed();
-        let ts = format!("{:.3}s ", elapsed.as_secs_f64());
-        let _ = writer.write_all(ts.as_bytes()).await;
+    let bytes = build_formatted_bytes(prefix, line, verbose, start);
+    match target {
+        StdoutTarget::Writer(writer) => {
+            use tokio::io::AsyncWriteExt;
+            let _ = writer.write_all(&bytes).await;
+            let _ = writer.write_all(b"\n").await;
+        }
+        StdoutTarget::Tui(tx) => {
+            let _ = tx
+                .send(FormattedLogLine {
+                    name: name.to_string(),
+                    bytes,
+                })
+                .await;
+        }
     }
-    let _ = writer.write_all(prefix).await;
-    let _ = writer.write_all(line).await;
-    let _ = writer.write_all(b"\n").await;
 }
 
 /// File sink writer task. Receives raw byte chunks and writes them directly.

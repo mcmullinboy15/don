@@ -44,7 +44,8 @@ args = [
     "push",
     "--db-url=postgres://root@127.0.0.1:26277/defaultdb?sslmode=disable",
     "--definitions=./definitions",
-    "-v"
+    "-v",
+    "--force"
 ]
 depends_on = ["crdb"]
 watch = ["definitions/**/*.sql"]

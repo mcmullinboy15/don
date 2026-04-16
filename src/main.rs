@@ -505,6 +505,8 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
 }
 
 async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose: bool) -> Result<(), String> {
+    use std::io::IsTerminal;
+
     let config =
         don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
@@ -524,6 +526,7 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
     }
 
     let base = base_dir(config_path);
+    let is_tty = std::io::stdout().is_terminal();
 
     // Collect service names and their log configs for OutputManager.
     let service_configs: Vec<(&str, &don::config::LogConfig)> = config
@@ -544,24 +547,93 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
         .chain(task_configs)
         .collect();
 
-    let output_manager = don::output::OutputManager::new_verbose(&all_configs, tokio::io::stdout(), verbose)
-        .await
-        .map_err(|e| format!("Error creating output manager: {e}"))?;
-
-    // Install signal handlers.
+    // Install signal handlers before building the runner so Ctrl+C still
+    // reaches the graceful-shutdown path even during a slow startup.
     let shutdown_rx = don::runner::install_signal_handlers()
         .await
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
 
-    // Create and run the runner.
-    let runner = don::runner::Runner::new(config, config_path.to_path_buf(), platform, output_manager, base, profile, shutdown_rx)
+    if is_tty {
+        let (output_manager, log_rx) =
+            don::output::OutputManager::new_with_tui(&all_configs, verbose)
+                .await
+                .map_err(|e| format!("Error creating output manager: {e}"))?;
+
+        let service_names: Vec<String> = config.services.keys().cloned().collect();
+        let task_names: Vec<String> = config.tasks.keys().cloned().collect();
+
+        let runner = don::runner::Runner::new(
+            config,
+            config_path.to_path_buf(),
+            platform,
+            output_manager,
+            base,
+            profile,
+            shutdown_rx,
+        )
         .await
         .map_err(|e| format!("Error: {e}"))?;
 
-    runner
-        .run()
+        let events = runner.subscribe();
+        let commands = runner.command_sender();
+
+        // Wrap the TUI so that if it exits unexpectedly (e.g. a terminal IO
+        // error or panic), we signal the runner to shut down instead of
+        // leaving the daemon alive while the user's terminal is in cooked
+        // mode. Without this, raw mode gets disabled but logs keep streaming —
+        // the user sees a free-floating cursor and can type into the shell
+        // while the runner runs unattended. The log_rx closing (runner
+        // shutdown) returns Ok(()) so the normal exit path is unaffected.
+        let tui = tokio::spawn(async move {
+            let result = don::tui::run_tui(
+                log_rx,
+                events,
+                commands,
+                service_names,
+                task_names,
+            )
+            .await;
+            if result.is_err() {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::this(),
+                    nix::sys::signal::Signal::SIGINT,
+                );
+            }
+            result
+        });
+
+        let runner_result = runner.run().await.map_err(|e| format!("Error: {e}"));
+
+        // Surface any TUI error so unexpected exits are visible instead of
+        // silently dropped. Runner errors take precedence.
+        match tui.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("TUI error: {e}"),
+            Err(join_err) if join_err.is_panic() => {
+                eprintln!("TUI task panicked: {join_err}");
+            }
+            Err(_) => {} // cancelled — expected on shutdown
+        }
+
+        runner_result
+    } else {
+        let output_manager =
+            don::output::OutputManager::new_verbose(&all_configs, tokio::io::stdout(), verbose)
+                .await
+                .map_err(|e| format!("Error creating output manager: {e}"))?;
+
+        let runner = don::runner::Runner::new(
+            config,
+            config_path.to_path_buf(),
+            platform,
+            output_manager,
+            base,
+            profile,
+            shutdown_rx,
+        )
         .await
         .map_err(|e| format!("Error: {e}"))?;
 
-    Ok(())
+        runner.run().await.map_err(|e| format!("Error: {e}"))
+    }
 }
