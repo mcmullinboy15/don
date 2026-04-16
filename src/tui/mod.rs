@@ -166,7 +166,11 @@ pub async fn run_tui(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Seed the viewport so the terminal reserves the bottom region before
-    // the first `insert_before` call.
+    // the first `insert_before` call. Use the raw `terminal.draw` here
+    // (not `draw_inline_bar`) so we don't park the cursor — the wrapper
+    // just did a real DSR and placed the viewport at the shell's cursor
+    // row; parking would move that cursor away from where ratatui expects
+    // subsequent writes to land.
     terminal.draw(|f| render::draw_bar(f, &app))?;
 
     loop {
@@ -183,7 +187,7 @@ pub async fn run_tui(
                             insert_line(&mut terminal, &line, width)?;
                             // `insert_before` resets ratatui's back buffer;
                             // redraw or the bar stays blank until next event.
-                            terminal.draw(|f| render::draw_bar(f, &app))?;
+                            draw_inline_bar(&mut terminal, &app)?;
                         }
                         store.push(line);
                     }
@@ -197,7 +201,7 @@ pub async fn run_tui(
                         if let Some(m) = modal.as_mut() {
                             m.draw(&app)?;
                         } else {
-                            terminal.draw(|f| render::draw_bar(f, &app))?;
+                            draw_inline_bar(&mut terminal, &app)?;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -235,7 +239,7 @@ pub async fn run_tui(
                 // screen. We redraw unconditionally so the spinner animates —
                 // ratatui's diff skips the cost when no cells changed.
                 if modal.is_none() {
-                    terminal.draw(|f| render::draw_bar(f, &app))?;
+                    draw_inline_bar(&mut terminal, &app)?;
                 }
             }
         }
@@ -253,12 +257,12 @@ pub async fn run_tui(
 /// one blank buffer row, plus a bordered status box (top border + content
 /// row + bottom border).
 ///
-/// Moves the real cursor to the bottom row **before** constructing the
-/// terminal so that [`FixedBottomBackend`]'s fake cursor position matches
-/// what `append_lines` actually writes — otherwise `compute_inline_size`
-/// would append newlines at the wrong row and the viewport math breaks.
+/// Note: no cursor parking here. [`FixedBottomBackend`] does a real DSR
+/// on its first `get_cursor_position` call (inside `Terminal::with_options`)
+/// so the viewport anchors right below the shell's pre-start output. That
+/// keeps scrollback gap-free — the trade-off is that the bar starts at the
+/// cursor row and drifts to the bottom as the first few log lines flow in.
 fn build_inline_terminal() -> Result<TuiTerminal, TuiError> {
-    park_cursor_at_bottom()?;
     let inner = CrosstermBackend::new(std::io::stdout());
     let backend = FixedBottomBackend::new(inner);
     let term = Terminal::with_options(
@@ -271,14 +275,25 @@ fn build_inline_terminal() -> Result<TuiTerminal, TuiError> {
 }
 
 /// Move the real cursor to `(0, screen_height - 1)`. Used before any
-/// operation that triggers ratatui's `compute_inline_size` (initial
-/// construction and resize) so that `append_lines` writes at the bottom
-/// row where scrolling happens, not wherever the previous draw happened
-/// to leave the cursor.
+/// operation that may trigger ratatui's `autoresize` (which calls
+/// `compute_inline_size` → `get_cursor_position` → [`FixedBottomBackend`])
+/// so the fake "bottom of screen" cursor the wrapper reports actually
+/// matches where `\n`s from `append_lines` will land and scroll.
 fn park_cursor_at_bottom() -> Result<(), TuiError> {
     let (_cols, rows) = crossterm::terminal::size()?;
     let bottom = rows.saturating_sub(1);
     execute!(std::io::stdout(), MoveTo(0, bottom))?;
+    Ok(())
+}
+
+/// Draw the inline bar, first parking the real cursor at the screen's
+/// bottom row. If `terminal.draw`'s internal `autoresize` fires because
+/// the terminal was resized since the last draw, the wrapper's fake
+/// cursor (bottom of screen) and the real cursor will be at the same row
+/// so `append_lines` scrolls correctly.
+fn draw_inline_bar(terminal: &mut TuiTerminal, app: &App) -> Result<(), TuiError> {
+    park_cursor_at_bottom()?;
+    terminal.draw(|f| render::draw_bar(f, app))?;
     Ok(())
 }
 
@@ -310,20 +325,31 @@ fn clear_and_replay(
     store: &LogStore,
     app: &App,
 ) -> Result<(), TuiError> {
-    // Park the cursor at the bottom row so `autoresize` (via ratatui) and
-    // any subsequent `append_lines` inside `insert_before` write at the
-    // scroll boundary rather than wherever the last frame left the cursor.
-    park_cursor_at_bottom()?;
-    // Force a resize pass now so `viewport_area` and `last_known_area`
-    // reflect the current terminal size. Without this, the `insert_before`
-    // loop below would use stale dimensions if the terminal was resized
-    // since the last draw.
-    terminal.autoresize()?;
-    // Full-screen wipe so old viewport content (box borders, bar text from
-    // a prior size) doesn't linger as ghosts above the new bar.
-    execute!(std::io::stdout(), Clear(ClearType::All))?;
-    // Reset ratatui's back buffer so the next draw paints the bar fresh.
-    terminal.clear()?;
+    // Move the real cursor to (0, 0) and tell the wrapper to report the
+    // same from its next `get_cursor_position` call. The subsequent
+    // `terminal.resize` anchors the inline viewport at the top of the
+    // screen; `insert_before` will then fill rows 0..N with replayed
+    // log lines while the bar drifts downward, rather than pinning the
+    // bar to the bottom with blank space above the replay content.
+    execute!(std::io::stdout(), MoveTo(0, 0))?;
+    terminal.backend_mut().force_next_cursor_top();
+    // Re-place the viewport using the override. `resize` unconditionally
+    // recomputes viewport placement (autoresize would skip when size is
+    // unchanged) and its internal `self.clear()` wipes the visible
+    // screen and resets ratatui's back buffer.
+    let size = terminal.size()?;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: size.width,
+        height: size.height,
+    };
+    terminal.resize(area)?;
+    // `resize` cleared the *visible* area but not the scrollback buffer.
+    // Purge it (`\x1b[3J`) so pre-clear content and blank bands from
+    // past `insert_before` scroll_ups don't linger when the user scrolls
+    // up. Supported by most modern terminals; older ones silently ignore.
+    execute!(std::io::stdout(), Clear(ClearType::Purge))?;
     let width = terminal.size()?.width.max(1);
     for entry in store.iter() {
         if app.filter.passes(&entry.name) {
@@ -399,7 +425,7 @@ fn handle_normal_key(
     match key.code {
         KeyCode::Enter => {
             terminal.insert_before(1, |_buf| {})?;
-            terminal.draw(|f| render::draw_bar(f, app))?;
+            draw_inline_bar(terminal, app)?;
             store.push(FormattedLogLine {
                 name: String::new(),
                 bytes: Vec::new(),

@@ -16,12 +16,15 @@
 //!
 //! ## The fix
 //!
-//! We never actually query the terminal for the cursor. Instead,
-//! [`FixedBottomBackend::get_cursor_position`] returns `(0, screen_height - 1)`
-//! — the bottom-left of the current screen. Combined with moving the real
-//! cursor to the bottom row before `Terminal::with_options` and on every
-//! resize, `compute_inline_size`'s math produces exactly the viewport we
-//! want (pinned to the bottom of the screen).
+//! - **First** call (during initial `Terminal::with_options`): do a real
+//!   DSR. It's safe here because the input task hasn't spawned yet, so no
+//!   contention on stdin. Using the real cursor anchors the viewport just
+//!   below the shell's pre-start output, which keeps scrollback clean.
+//! - **Every subsequent** call (autoresize on terminal resize): return
+//!   `(0, screen_height - 1)` — the bottom-left cell — so the viewport
+//!   pins to the bottom of the screen. The caller must `park_cursor_at_bottom`
+//!   before the draw that triggers autoresize, so that `append_lines` runs
+//!   at the screen's bottom row (where `\n` actually scrolls).
 //!
 //! Every other `Backend` method delegates to the inner [`CrosstermBackend`].
 
@@ -31,23 +34,61 @@ use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
 
-/// Wraps `CrosstermBackend` and returns a deterministic cursor position
-/// instead of reading from stdin. See the module doc for why.
+/// Wraps `CrosstermBackend` with safe `get_cursor_position` semantics.
 pub(super) struct FixedBottomBackend<W: Write> {
     inner: CrosstermBackend<W>,
+    /// `true` after the first `get_cursor_position` call. The first call is
+    /// always during `Terminal::with_options` (before the input task spawns)
+    /// so it's safe to do a real DSR. Later calls come from autoresize and
+    /// have to be faked to avoid the stdin race.
+    initial_dsr_done: bool,
+    /// One-shot override for the next `get_cursor_position` call. Set by
+    /// `force_next_cursor_top` so `clear_and_replay` can re-anchor the
+    /// inline viewport at the top of the screen via `Terminal::resize`,
+    /// making replayed content flow from top → down instead of pinning
+    /// the bar to the bottom.
+    next_override: Option<Position>,
 }
 
 impl<W: Write> FixedBottomBackend<W> {
     pub(super) fn new(inner: CrosstermBackend<W>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            initial_dsr_done: false,
+            next_override: None,
+        }
+    }
+
+    /// Tell the wrapper to report `(0, 0)` from the next
+    /// `get_cursor_position` call. Consumed on use — subsequent calls go
+    /// back to the normal fake-bottom behavior. The caller is responsible
+    /// for moving the real cursor to `(0, 0)` first so `append_lines`
+    /// inside `compute_inline_size` writes at the matching row.
+    pub(super) fn force_next_cursor_top(&mut self) {
+        self.next_override = Some(Position { x: 0, y: 0 });
     }
 }
 
 impl<W: Write> Backend for FixedBottomBackend<W> {
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        // The whole point of this wrapper: never do a DSR. Return the
-        // bottom-left cell so ratatui's inline viewport math pins the
-        // viewport to the bottom of the screen.
+        // One-shot override takes precedence. Used by `clear_and_replay`
+        // to place the viewport at the top before replaying matching
+        // log lines.
+        if let Some(pos) = self.next_override.take() {
+            return Ok(pos);
+        }
+        if !self.initial_dsr_done {
+            // First call — this is the initial Terminal construction, before
+            // the input task is spawned, so a real DSR is race-free. Using
+            // the shell's actual cursor position anchors the viewport right
+            // below existing output (no blank gap in scrollback).
+            self.initial_dsr_done = true;
+            return self.inner.get_cursor_position();
+        }
+        // Later calls come from autoresize. Fake "bottom of screen" so the
+        // viewport pins to the bottom after a resize. Callers must
+        // `park_cursor_at_bottom` before the triggering draw so that
+        // `append_lines` writes its newlines at the actual bottom row.
         let size = self.inner.size()?;
         Ok(Position {
             x: 0,
