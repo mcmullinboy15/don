@@ -5,10 +5,14 @@
 //! It owns all service/task state in a plain `HashMap` — no `Arc<Mutex<>>`.
 //! Communication uses channels: `mpsc` for commands in, `broadcast` for events out.
 
+mod completions;
+mod params;
 mod state;
 
 pub mod service;
 pub mod task;
+
+pub(crate) use params::resolve_task_params;
 
 use crate::config::{Config, Platform};
 use crate::output::OutputManager;
@@ -151,6 +155,9 @@ pub enum CommandError {
     InvalidState { name: String, message: String },
     /// The operation itself failed.
     Failed { name: String, message: String },
+    /// User supplied params that the task doesn't declare, or the validation
+    /// rules on a declared param rejected the value.
+    InvalidParams { name: String, message: String },
 }
 
 impl std::fmt::Display for CommandError {
@@ -166,6 +173,31 @@ impl std::fmt::Display for CommandError {
             }
             Self::InvalidState { name, message } => write!(f, "{name}: {message}"),
             Self::Failed { name, message } => write!(f, "{name}: {message}"),
+            Self::InvalidParams { name, message } => write!(f, "{name}: {message}"),
+        }
+    }
+}
+
+/// Error returned from [`RunnerCommand::ResolveCompletions`].
+///
+/// The TUI displays `message` inline and, when `log_path` is set, offers
+/// the user a way to pull up the full command invocation + stdout/stderr
+/// that was saved at that path.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompletionError {
+    /// Human-readable summary suitable for a status bar / inline banner.
+    pub message: String,
+    /// Filesystem path to the saved log file, when one was written.
+    /// Absent when the failure happened before the command was invoked
+    /// (e.g., unknown task or param).
+    pub log_path: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Display for CompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.log_path {
+            Some(p) => write!(f, "{} (see {})", self.message, p.display()),
+            None => write!(f, "{}", self.message),
         }
     }
 }
@@ -243,10 +275,28 @@ pub enum RunnerCommand {
         reply: oneshot::Sender<CommandResult>,
     },
     /// Run a specific task by name, bypassing the `auto_run` gate. Used by
-    /// `don run <name>` and the TUI action palette.
+    /// `don run <name>` and the TUI action palette. `params` carries the
+    /// user-supplied values for the task's declared params — empty for
+    /// tasks that don't declare any.
     RunTask {
         name: String,
+        params: HashMap<String, String>,
         reply: oneshot::Sender<CommandResult>,
+    },
+    /// Resolve candidate values for a single param of a task by running
+    /// its `completions` command. Used by the TUI form and by shell tab
+    /// completion.
+    ///
+    /// `partial` carries the user's already-entered param values for the
+    /// *other* params in the form — exposed to the completion command as
+    /// `DON_PARAM_<NAME>=<value>` env vars so one param's candidates can
+    /// depend on another. `force_refresh = true` bypasses the cache.
+    ResolveCompletions {
+        task: String,
+        param: String,
+        partial: HashMap<String, String>,
+        force_refresh: bool,
+        reply: oneshot::Sender<Result<Vec<String>, CompletionError>>,
     },
     /// Result of the startup-phase batch build. Sent by the detached
     /// [`run_batch_build_chain`] task. Transitions `Building` items to
@@ -649,6 +699,10 @@ pub struct Runner {
     pending_graph_requery: Vec<String>,
     /// Deadline for flushing the pending graph re-query batch.
     bt_requery_deadline: Option<tokio::time::Instant>,
+
+    /// Per-param completion results cache. Populated as the TUI / CLI
+    /// resolves completions; cleared on config reload.
+    completion_cache: std::sync::Arc<tokio::sync::RwLock<completions::CompletionCache>>,
 }
 
 impl Runner {
@@ -837,6 +891,9 @@ impl Runner {
             bt_rebuild_deadline: None,
             pending_graph_requery: Vec::new(),
             bt_requery_deadline: None,
+            completion_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                completions::CompletionCache::default(),
+            )),
         })
     }
 
@@ -1319,8 +1376,24 @@ impl Runner {
                         RunnerCommand::RunPendingTasks { reply } => {
                             self.handle_run_pending_tasks(reply).await;
                         }
-                        RunnerCommand::RunTask { name, reply } => {
-                            self.handle_run_task(&name, reply).await;
+                        RunnerCommand::RunTask { name, params, reply } => {
+                            self.handle_run_task(&name, params, reply).await;
+                        }
+                        RunnerCommand::ResolveCompletions {
+                            task,
+                            param,
+                            partial,
+                            force_refresh,
+                            reply,
+                        } => {
+                            self.handle_resolve_completions(
+                                &task,
+                                &param,
+                                partial,
+                                force_refresh,
+                                reply,
+                            )
+                            .await;
                         }
                         RunnerCommand::BatchBuildComplete(outcome) => {
                             // Drop the abort-on-drop handle: the task is done,
@@ -2158,6 +2231,24 @@ impl Runner {
             return Ok(());
         }
 
+        // Param'd tasks can't run without user-supplied values — park them
+        // at PendingRun so the user can trigger them via the palette / CLI.
+        if !task_cfg.params.is_empty() {
+            self.set_task_state(name, TaskItemState::PendingRun);
+            self.output_manager
+                .service_event(name, "pending — task has params, run manually");
+            let _ = done_tx
+                .send(ItemDone {
+                    name: name.to_string(),
+                    kind: NodeKind::Task,
+                    success: true,
+                    message: None,
+                    elapsed: None,
+                })
+                .await;
+            return Ok(());
+        }
+
         // Check if the task needs to run.
         let base_dir = task_cfg.dir.as_deref().unwrap_or(&self.base_dir);
         let needs_run = self
@@ -2225,8 +2316,10 @@ impl Runner {
 
         self.set_task_state(name, TaskItemState::Running);
 
-        // Spawn the task process.
-        match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
+        // Spawn the task process. Startup-phase runs never supply params —
+        // param'd tasks were intercepted above and parked at PendingRun.
+        let empty_params = HashMap::new();
+        match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform, &empty_params).await {
             Ok(spawn) => {
                 self.wire_task_output_and_wait(name, spawn, &task_cfg, Some(done_tx)).await;
                 Ok(())
@@ -2686,6 +2779,10 @@ impl Runner {
 
         self.output_manager
             .lifecycle_event(&format!("config changed: {diff}"));
+
+        // Completion cache is keyed on param config that may have changed —
+        // clear it so the next resolve rebuilds from scratch.
+        self.completion_cache.write().await.clear();
 
         // 1. Stop removed services.
         for name in &diff.removed_services {
@@ -3831,17 +3928,38 @@ impl Runner {
             return;
         }
 
-        self.spawn_task_rerun(name, &task_cfg, "re-running (file changed)").await;
+        // Tasks that declare params require user-supplied values. File-watch
+        // triggers park them in PendingRun so the user can run them explicitly
+        // (via the palette's form or `don run <task> --<param>=<value>`).
+        if !task_cfg.params.is_empty() {
+            self.set_task_state(name, TaskItemState::PendingRun);
+            self.output_manager.service_event(
+                name,
+                "files changed (pending — task has params, run manually)",
+            );
+            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                name: name.to_string(),
+                success: true,
+            });
+            return;
+        }
+
+        self.spawn_task_rerun(name, &task_cfg, &HashMap::new(), "re-running (file changed)").await;
     }
 
     /// Actually spawn a task re-run: release any attach lock, flip to
     /// `Running`, spawn, and wire output. Used by both the file-watch path
     /// ([`handle_task_rerun`]) and the explicit-run paths (`don run <name>`,
     /// `don run --all-pending`).
+    ///
+    /// `params` is the user-supplied value map; empty for param-less tasks.
+    /// Values are substituted into the task's `cmd`/`args`/`env`/`dir` via
+    /// `{{name}}` placeholders in [`task::spawn_task`].
     async fn spawn_task_rerun(
         &mut self,
         name: &str,
         task_cfg: &crate::config::Task,
+        params: &HashMap<String, String>,
         start_message: &str,
     ) {
         // Release attach lock and close follow sinks so any active attach
@@ -3858,7 +3976,7 @@ impl Runner {
 
         self.output_manager
             .service_debug_event(name, "spawning process...");
-        match task::spawn_task(task_cfg, name, &self.base_dir, self.platform).await {
+        match task::spawn_task(task_cfg, name, &self.base_dir, self.platform, params).await {
             Ok(spawn) => {
                 self.output_manager
                     .service_debug_event(name, &format!("process spawned (pid {}))", spawn.handle.pgid()));
@@ -3895,15 +4013,35 @@ impl Runner {
             return;
         }
 
+        // Param'd tasks can't be run here — they need user-supplied values.
+        // Skip with a note so the user knows to use the palette or `don run`.
+        let (runnable, needs_params): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(_, cfg)| cfg.params.is_empty());
+
+        for (name, _) in &needs_params {
+            self.output_manager
+                .service_event(name, "skipped — task has params, run manually");
+        }
+
+        if runnable.is_empty() {
+            self.output_manager
+                .lifecycle_event("no pending tasks to run (param'd tasks skipped)");
+            let _ = reply.send(Ok(()));
+            return;
+        }
+
         self.output_manager.lifecycle_event(&format!(
             "running {} pending task{}...",
-            pending.len(),
-            if pending.len() == 1 { "" } else { "s" }
+            runnable.len(),
+            if runnable.len() == 1 { "" } else { "s" }
         ));
 
-        for (name, cfg) in &pending {
+        let empty_params = HashMap::new();
+        for (name, cfg) in &runnable {
             // Explicit-run path — bypass the auto_run gate in handle_task_rerun.
-            self.spawn_task_rerun(name, cfg, "running (manual trigger)").await;
+            self.spawn_task_rerun(name, cfg, &empty_params, "running (manual trigger)")
+                .await;
         }
 
         let _ = reply.send(Ok(()));
@@ -3914,6 +4052,7 @@ impl Runner {
     async fn handle_run_task(
         &mut self,
         name: &str,
+        params: HashMap<String, String>,
         reply: oneshot::Sender<CommandResult>,
     ) {
         // Services and unknown names get a dedicated error. Services don't go
@@ -3945,8 +4084,77 @@ impl Runner {
             return;
         }
 
-        self.spawn_task_rerun(name, &cfg, "running (manual trigger)").await;
+        // Resolve params: apply defaults, reject unknown keys, reject
+        // missing required values, apply per-kind validation.
+        let resolved = match resolve_task_params(name, &cfg, params) {
+            Ok(p) => p,
+            Err(message) => {
+                let _ = reply.send(Err(CommandError::InvalidParams {
+                    name: name.to_string(),
+                    message,
+                }));
+                return;
+            }
+        };
+
+        self.spawn_task_rerun(name, &cfg, &resolved, "running (manual trigger)")
+            .await;
         let _ = reply.send(Ok(()));
+    }
+
+    /// Resolve candidate values for `param` on `task` by shelling out to its
+    /// `completions` command. Does not block the runner's main loop — the
+    /// actual command invocation is spawned as a detached tokio task so
+    /// slow completions can't freeze status queries or lifecycle events.
+    async fn handle_resolve_completions(
+        &mut self,
+        task: &str,
+        param: &str,
+        partial: HashMap<String, String>,
+        force_refresh: bool,
+        reply: oneshot::Sender<Result<Vec<String>, CompletionError>>,
+    ) {
+        let Some(rt) = self.tasks.get(task) else {
+            let _ = reply.send(Err(CompletionError {
+                message: format!("unknown task '{task}'"),
+                log_path: None,
+            }));
+            return;
+        };
+        let param_cfg = rt.config.params.iter().find(|p| p.name == param).cloned();
+        let task_env = rt.config.env.clone();
+        let Some(p) = param_cfg else {
+            let _ = reply.send(Err(CompletionError {
+                message: format!("task '{task}' has no param '{param}'"),
+                log_path: None,
+            }));
+            return;
+        };
+        let Some(completion_cfg) = p.completions.clone() else {
+            // Static choices fast-path: return them directly without any
+            // shell-out. The TUI form can still fuzzy-filter locally.
+            let _ = reply.send(Ok(p.choices.clone()));
+            return;
+        };
+
+        let cache = self.completion_cache.clone();
+        let base_dir = self.base_dir.clone();
+        let task_name = task.to_string();
+        let param_name = param.to_string();
+        tokio::spawn(async move {
+            let result = completions::resolve(completions::ResolveRequest {
+                cache: &cache,
+                task: &task_name,
+                param: &param_name,
+                completions: &completion_cfg,
+                base_dir: &base_dir,
+                task_env: &task_env,
+                partial: &partial,
+                force_refresh,
+            })
+            .await;
+            let _ = reply.send(result);
+        });
     }
 
     /// Handle an item completion notification.
@@ -5497,6 +5705,7 @@ mod tests {
                 download: None,
                 bazel: None,
                 turbo: None,
+                params: Vec::new(),
             },
             TaskItemState::Pending,
         );

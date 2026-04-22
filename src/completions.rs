@@ -16,7 +16,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 /// Which category of names a completion script is asking for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompleteKind {
     /// Service names only.
     Services,
@@ -26,6 +26,9 @@ pub enum CompleteKind {
     Items,
     /// Profile names only.
     Profiles,
+    /// Param flag names declared on a specific task (for
+    /// `don run <task> --<TAB>`). Returns the `--` prefix already.
+    TaskParams(String),
 }
 
 impl FromStr for CompleteKind {
@@ -36,7 +39,15 @@ impl FromStr for CompleteKind {
             "tasks" => Ok(Self::Tasks),
             "items" => Ok(Self::Items),
             "profiles" => Ok(Self::Profiles),
-            other => Err(format!("unknown completion kind '{other}'")),
+            other => {
+                if let Some(task) = other.strip_prefix("task-params:") {
+                    if task.is_empty() {
+                        return Err("task-params kind requires a task name".into());
+                    }
+                    return Ok(Self::TaskParams(task.to_string()));
+                }
+                Err(format!("unknown completion kind '{other}'"))
+            }
         }
     }
 }
@@ -64,6 +75,10 @@ fn collect_names(config: &Config, kind: CompleteKind) -> Vec<String> {
             .cloned()
             .collect(),
         CompleteKind::Profiles => config.profiles.keys().cloned().collect(),
+        CompleteKind::TaskParams(task) => match config.tasks.get(&task) {
+            Some(t) => t.params.iter().map(|p| format!("--{}", p.name)).collect(),
+            None => Vec::new(),
+        },
     };
     names.sort();
     names
@@ -130,6 +145,31 @@ _don_dynamic() {
     case "$prev" in
         -c|--config|-p|--profile|-l|--last) return 1 ;;
     esac
+
+    # For `don run <task> --<TAB>`, complete the task's declared params
+    # instead of the task list.
+    if [ "$kind" = "tasks" ] && [[ "$cur" == --* ]]; then
+        local task="" i=1
+        while [ $i -lt $COMP_CWORD ]; do
+            local w="${COMP_WORDS[$i]}"
+            case "$w" in
+                -c|--config) i=$((i+2)); continue ;;
+                -*) i=$((i+1)); continue ;;
+                run) i=$((i+1)); continue ;;
+                don) i=$((i+1)); continue ;;
+                *) task="$w"; break ;;
+            esac
+        done
+        if [ -n "$task" ]; then
+            local flags
+            flags="$(command don __complete "task-params:$task" 2>/dev/null)"
+            [ -z "$flags" ] && return 1
+            COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
+            return 0
+        fi
+        return 1
+    fi
+
     [[ "$cur" == -* ]] && return 1
     local names
     names="$(command don __complete "$kind" 2>/dev/null)"
@@ -171,15 +211,40 @@ _don_dynamic_kind() {
 }
 
 _don_with_dynamic() {
-    local subcmd kind
+    local subcmd kind cur
     subcmd="$(_don_dynamic_kind)"
+    cur="${words[CURRENT]}"
+
+    # `don run <task> --<TAB>` → complete the task's declared params.
+    if [[ "$subcmd" == "run" && "$cur" == --* ]]; then
+        local task="" i skip=0
+        for (( i=2; i<CURRENT; i++ )); do
+            local w="${words[i]}"
+            if (( skip )); then skip=0; continue; fi
+            case "$w" in
+                -c|--config) skip=1 ;;
+                -*) : ;;
+                run) : ;;
+                *) task="$w"; break ;;
+            esac
+        done
+        if [[ -n "$task" ]]; then
+            local -a flags
+            flags=("${(@f)$(command don __complete "task-params:$task" 2>/dev/null)}")
+            if (( ${#flags} > 0 )); then
+                compadd -- "${flags[@]}"
+                return
+            fi
+        fi
+    fi
+
     case "$subcmd" in
         start|stop|restart) kind=services ;;
         run) kind=tasks ;;
         logs|attach) kind=items ;;
         *) kind="" ;;
     esac
-    if [[ -n "$kind" && "${words[CURRENT]}" != -* ]]; then
+    if [[ -n "$kind" && "$cur" != -* ]]; then
         local -a names
         names=("${(@f)$(command don __complete "$kind" 2>/dev/null)}")
         if (( ${#names} > 0 )); then
@@ -204,6 +269,29 @@ complete -c don -n '__fish_seen_subcommand_from run' \
     -f -a '(command don __complete tasks 2>/dev/null)'
 complete -c don -n '__fish_seen_subcommand_from logs attach' \
     -f -a '(command don __complete items 2>/dev/null)'
+
+# `don run <task> --<TAB>` → complete that task's param flags.
+function __don_task_params_for_run
+    set -l tokens (commandline -opc)
+    # First non-flag token after `run` is the task name.
+    set -l saw_run 0
+    for tok in $tokens
+        if test $saw_run -eq 1
+            switch $tok
+                case '-*'
+                    continue
+                case '*'
+                    command don __complete "task-params:$tok" 2>/dev/null
+                    return
+            end
+        end
+        if test "$tok" = run
+            set saw_run 1
+        end
+    end
+end
+complete -c don -n '__fish_seen_subcommand_from run' -l '' \
+    -f -a '(__don_task_params_for_run)'
 "#;
 
 #[cfg(test)]
@@ -293,6 +381,37 @@ mod tests {
     fn kind_from_str_rejects_garbage() {
         assert!(CompleteKind::from_str("services").is_ok());
         assert!(CompleteKind::from_str("nope").is_err());
+    }
+
+    #[test]
+    fn task_params_kind_parses_and_lists_flags() {
+        let kind = CompleteKind::from_str("task-params:sync").unwrap();
+        assert_eq!(kind, CompleteKind::TaskParams("sync".to_string()));
+
+        let toml = r#"
+            [tasks.sync]
+            cmd = "echo"
+            [[tasks.sync.params]]
+            name = "index"
+            [[tasks.sync.params]]
+            name = "batch_size"
+            kind = "int"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let got = collect_names(&config, CompleteKind::TaskParams("sync".into()));
+        assert_eq!(got, vec!["--batch_size", "--index"]);
+    }
+
+    #[test]
+    fn task_params_kind_unknown_task_returns_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        let got = collect_names(&config, CompleteKind::TaskParams("missing".into()));
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn task_params_kind_requires_task_name() {
+        assert!(CompleteKind::from_str("task-params:").is_err());
     }
 
     #[test]

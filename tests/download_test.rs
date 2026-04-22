@@ -382,6 +382,7 @@ fn integration_task_download_resolves_cmd() {
             download: Some(download),
             bazel: None,
             turbo: None,
+            params: vec![],
         };
         let resolved = task
             .resolved_cmd(Platform::current().unwrap(), "test", Some(&cache_base))

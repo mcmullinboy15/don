@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::download::DownloadConfig;
+use super::param::TaskParam;
 use super::platform::Platform;
 use super::types::{BazelConfig, LogConfig, TurboConfig};
 
@@ -53,6 +54,14 @@ pub struct Task {
     /// Turborepo build tool integration — auto-resolve watch patterns from the task graph.
     /// Mutually exclusive with `bazel`.
     pub turbo: Option<TurboConfig>,
+    /// Optional parameter declarations. When non-empty, the task is
+    /// considered "interactive" — file-watch changes park it in
+    /// `PendingRun` instead of auto-running, and the user supplies values
+    /// via `don run <task> --<name>=<value>` or the TUI form.
+    /// Values substitute into `cmd`/`args`/`env`/`dir` via `{{name}}`
+    /// placeholders.
+    #[serde(default)]
+    pub params: Vec<TaskParam>,
 }
 
 impl Task {

@@ -5,13 +5,18 @@
 
 pub mod diff;
 mod download;
+pub(crate) mod param;
 mod platform;
 mod profile;
 pub(crate) mod service;
 pub(crate) mod task;
+pub(crate) mod template;
 pub(crate) mod types;
 
 pub use self::download::{DownloadConfig, PlatformDownload};
+pub use self::param::{
+    CompletionParse, Completions, ParamKind, ParamValidate, TaskParam,
+};
 pub use self::platform::Platform;
 pub use self::profile::Profile;
 pub use self::service::{
@@ -345,6 +350,8 @@ impl Config {
             {
                 errors.push(format!("task '{name}': invalid timeout: {e}"));
             }
+            // Validate params and any placeholders that reference them.
+            validate_task_params(name, task, &mut errors);
             // Validate download config.
             if let Some(ref download) = task.download {
                 for (platform_key, artifact) in &download.platform {
@@ -544,6 +551,211 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[n]
+}
+
+/// Param names that can't be declared because they collide with flags on
+/// `don run` (or global flags like `--config`/`--verbose`). Validated at
+/// config-parse time so the collision is caught before the user tries to
+/// invoke the task.
+const RESERVED_PARAM_NAMES: &[&str] = &[
+    "all-pending",
+    "no-prompt",
+    "help",
+    "version",
+    "config",
+    "verbose",
+];
+
+/// Validate a task's `params` declarations and the `{{name}}` placeholders
+/// in its command surface (`cmd`, `args`, `env`, `dir`). Appends to `errors`.
+fn validate_task_params(task_name: &str, task: &Task, errors: &mut Vec<String>) {
+    // Build the declared-name set for placeholder lookup. Also catch
+    // duplicate param names — serde won't flag them because `params` is a
+    // list, not a map.
+    let mut declared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for p in &task.params {
+        if p.name.is_empty() {
+            errors.push(format!("task '{task_name}': param has an empty name"));
+            continue;
+        }
+        if !is_valid_param_ident(&p.name) {
+            errors.push(format!(
+                "task '{task_name}': param '{}' has an invalid name — \
+                 must be an identifier (letters, digits, underscore, dash) \
+                 starting with a letter or underscore",
+                p.name
+            ));
+            continue;
+        }
+        if RESERVED_PARAM_NAMES.contains(&p.name.as_str()) {
+            errors.push(format!(
+                "task '{task_name}': param name '{}' collides with a built-in \
+                 `don run` flag — pick a different name",
+                p.name
+            ));
+        }
+        if !declared.insert(p.name.as_str()) {
+            errors.push(format!(
+                "task '{task_name}': param '{}' is declared more than once",
+                p.name
+            ));
+        }
+        // Either static choices OR a completions command, never both.
+        if !p.choices.is_empty() && p.completions.is_some() {
+            errors.push(format!(
+                "task '{task_name}': param '{}' has both 'choices' and \
+                 'completions' — pick one",
+                p.name
+            ));
+        }
+        // Int range sanity.
+        if matches!(p.kind, param::ParamKind::Int)
+            && let Some(v) = p.validate
+            && let (Some(min), Some(max)) = (v.min, v.max)
+            && min > max
+        {
+            errors.push(format!(
+                "task '{task_name}': param '{}' validate.min ({min}) > validate.max ({max})",
+                p.name
+            ));
+        }
+        // `validate` only applies to int kind today.
+        if p.validate.is_some() && !matches!(p.kind, param::ParamKind::Int) {
+            errors.push(format!(
+                "task '{task_name}': param '{}' has 'validate' but kind is not 'int'",
+                p.name
+            ));
+        }
+        // Choices requires string/choice kind.
+        if !p.choices.is_empty()
+            && !matches!(p.kind, param::ParamKind::String | param::ParamKind::Choice)
+        {
+            errors.push(format!(
+                "task '{task_name}': param '{}' has 'choices' but kind is not 'string' or 'choice'",
+                p.name
+            ));
+        }
+        // Completion cache / timeout durations must parse.
+        if let Some(ref comp) = p.completions {
+            if comp.cmd.is_empty() {
+                errors.push(format!(
+                    "task '{task_name}': param '{}' completions.cmd is empty",
+                    p.name
+                ));
+            }
+            if let Some(ref cache) = comp.cache
+                && let Err(e) = crate::duration::parse_duration(cache)
+            {
+                errors.push(format!(
+                    "task '{task_name}': param '{}' completions.cache: {e}",
+                    p.name
+                ));
+            }
+            if let Some(ref timeout) = comp.timeout
+                && let Err(e) = crate::duration::parse_duration(timeout)
+            {
+                errors.push(format!(
+                    "task '{task_name}': param '{}' completions.timeout: {e}",
+                    p.name
+                ));
+            }
+        }
+        // Default for bool must be parseable.
+        if matches!(p.kind, param::ParamKind::Bool)
+            && let Some(ref d) = p.default
+            && parse_bool_value(d).is_none()
+        {
+            errors.push(format!(
+                "task '{task_name}': param '{}' bool default '{d}' must be 'true' or 'false'",
+                p.name
+            ));
+        }
+        // Default for int must parse and satisfy the range.
+        if matches!(p.kind, param::ParamKind::Int)
+            && let Some(ref d) = p.default
+        {
+            match d.parse::<i64>() {
+                Ok(n) => {
+                    if let Some(v) = p.validate {
+                        if let Some(min) = v.min
+                            && n < min
+                        {
+                            errors.push(format!(
+                                "task '{task_name}': param '{}' default {n} is less than min {min}",
+                                p.name
+                            ));
+                        }
+                        if let Some(max) = v.max
+                            && n > max
+                        {
+                            errors.push(format!(
+                                "task '{task_name}': param '{}' default {n} is greater than max {max}",
+                                p.name
+                            ));
+                        }
+                    }
+                }
+                Err(_) => errors.push(format!(
+                    "task '{task_name}': param '{}' int default '{d}' is not a valid integer",
+                    p.name
+                )),
+            }
+        }
+        // Default for choice must be among the static choices if any.
+        if !p.choices.is_empty()
+            && let Some(ref d) = p.default
+            && !p.choices.contains(d)
+        {
+            errors.push(format!(
+                "task '{task_name}': param '{}' default '{d}' is not among choices [{}]",
+                p.name,
+                p.choices.join(", ")
+            ));
+        }
+    }
+
+    // Now scan every string in the task's command surface for `{{name}}`
+    // references and confirm they match a declared param. Unknown
+    // placeholders get a typo suggestion from the declared set.
+    let mut scan = |context: &str, s: &str| {
+        for r in template::collect_references(s) {
+            if !declared.contains(r.as_str()) {
+                let suggestion = suggest_typo(&r, &declared);
+                errors.push(format!(
+                    "task '{task_name}': {context} references undeclared param '{{{{{r}}}}}'{suggestion}"
+                ));
+            }
+        }
+    };
+    scan("cmd", &task.cmd);
+    for (idx, arg) in task.args.iter().enumerate() {
+        scan(&format!("args[{idx}]"), arg);
+    }
+    for (k, v) in &task.env {
+        scan(&format!("env['{k}']"), v);
+    }
+    if let Some(ref dir) = task.dir {
+        scan("dir", &dir.to_string_lossy());
+    }
+}
+
+fn is_valid_param_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else { return false };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Parse a string value as a bool, matching `ParamKind::Bool` semantics.
+/// Returns `None` on any unrecognized value.
+pub(crate) fn parse_bool_value(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// Suggest a typo correction for `input` from `candidates`.
@@ -1978,6 +2190,235 @@ turbo.build_task = ""
                 "case: {}",
                 case.name
             );
+        }
+    }
+
+    #[test]
+    fn validate_task_params_table() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            want: Option<&'static str>, // substring that must appear in some error
+        }
+
+        let cases = vec![
+            Case {
+                name: "no params is fine",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                "#,
+                want: None,
+            },
+            Case {
+                name: "placeholder referencing declared param is fine",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    args = ["{{name}}"]
+                    [[tasks.t.params]]
+                    name = "name"
+                "#,
+                want: None,
+            },
+            Case {
+                name: "placeholder referencing unknown param errors with suggestion",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    args = ["{{nme}}"]
+                    [[tasks.t.params]]
+                    name = "name"
+                "#,
+                want: Some("did you mean 'name'"),
+            },
+            Case {
+                name: "reserved name collides",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "config"
+                "#,
+                want: Some("collides with a built-in"),
+            },
+            Case {
+                name: "choices and completions are mutually exclusive",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "x"
+                    choices = ["a", "b"]
+                    [tasks.t.params.completions]
+                    cmd = "ls"
+                "#,
+                want: Some("pick one"),
+            },
+            Case {
+                name: "int validate min > max",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "n"
+                    kind = "int"
+                    validate = { min = 10, max = 1 }
+                "#,
+                want: Some("min (10)"),
+            },
+            Case {
+                name: "validate requires int kind",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "s"
+                    validate = { min = 1 }
+                "#,
+                want: Some("'validate' but kind is not 'int'"),
+            },
+            Case {
+                name: "choices on bool is rejected",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "b"
+                    kind = "bool"
+                    choices = ["a"]
+                "#,
+                want: Some("'choices' but kind is not"),
+            },
+            Case {
+                name: "bad bool default",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "b"
+                    kind = "bool"
+                    default = "maybe"
+                "#,
+                want: Some("must be 'true' or 'false'"),
+            },
+            Case {
+                name: "bad int default",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "n"
+                    kind = "int"
+                    default = "abc"
+                "#,
+                want: Some("not a valid integer"),
+            },
+            Case {
+                name: "int default outside range",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "n"
+                    kind = "int"
+                    default = "99"
+                    validate = { max = 10 }
+                "#,
+                want: Some("greater than max"),
+            },
+            Case {
+                name: "choice default must be among choices",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "c"
+                    kind = "choice"
+                    choices = ["a", "b"]
+                    default = "z"
+                "#,
+                want: Some("is not among choices"),
+            },
+            Case {
+                name: "duplicate param names",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "x"
+                    [[tasks.t.params]]
+                    name = "x"
+                "#,
+                want: Some("declared more than once"),
+            },
+            Case {
+                name: "invalid identifier",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "1bad"
+                "#,
+                want: Some("invalid name"),
+            },
+            Case {
+                name: "bad cache duration",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    [[tasks.t.params]]
+                    name = "x"
+                    [tasks.t.params.completions]
+                    cmd = "ls"
+                    cache = "forever"
+                "#,
+                want: Some("completions.cache"),
+            },
+            Case {
+                name: "placeholder in env resolves",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    env = { X = "{{val}}" }
+                    [[tasks.t.params]]
+                    name = "val"
+                "#,
+                want: None,
+            },
+            Case {
+                name: "placeholder in dir resolves",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    dir = "{{where}}"
+                    [[tasks.t.params]]
+                    name = "where"
+                "#,
+                want: None,
+            },
+        ];
+
+        for case in cases {
+            let config: Config = case.toml.parse().unwrap();
+            let res = config.validate(TEST_PLATFORM);
+            match (&res, case.want) {
+                (Ok(_), None) => {}
+                (Ok(_), Some(needle)) => {
+                    panic!("case '{}': expected error containing '{needle}' but got Ok", case.name)
+                }
+                (Err(ConfigError::Validation { errors }), Some(needle)) => {
+                    assert!(
+                        errors.iter().any(|e| e.contains(needle)),
+                        "case '{}': no error contains '{needle}' — got {errors:?}",
+                        case.name,
+                    );
+                }
+                (Err(ConfigError::Validation { errors }), None) => {
+                    panic!("case '{}': expected Ok but got validation errors {errors:?}", case.name)
+                }
+                (Err(e), _) => panic!("case '{}': unexpected error kind {e}", case.name),
+            }
         }
     }
 }

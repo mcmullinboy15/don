@@ -72,6 +72,7 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         ViewMode::Filter => draw_filter_modal(frame, app),
         ViewMode::Palette => draw_palette_modal(frame, app),
         ViewMode::Overlay => draw_overlay(frame, app),
+        ViewMode::Form => draw_form_modal(frame, app),
         ViewMode::Normal => {}
     }
 }
@@ -494,4 +495,169 @@ fn bold_green<S: Into<String>>(text: S) -> Span<'static> {
 
 fn dim<S: Into<String>>(text: S) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(Color::DarkGray))
+}
+
+/// Render the param-entry form. Each declared param occupies one row
+/// (prompt + input + inline hint); the focused field optionally renders a
+/// candidate dropdown beneath itself.
+fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
+    use super::form::{CandidateState, FormState};
+    use crate::config::ParamKind;
+
+    let area = frame.area();
+    if area.height < 3 || area.width == 0 {
+        return;
+    }
+    let Some(form): Option<&FormState> = app.form.as_ref() else {
+        return;
+    };
+
+    let title = format!(
+        " Run {}  — [tab] next/refresh  [↑↓] move  [enter] next/submit  [ctrl-enter] submit  [esc] cancel ",
+        form.task
+    );
+    let outer = Block::default().borders(Borders::ALL).title(title);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    if inner.height < 2 {
+        return;
+    }
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    // One paragraph with a Line per field, stacked vertically. The field
+    // rows render into the same area, so we split by exact row counts.
+    let rows = layout[0];
+    let mut y = rows.y;
+    let available = rows.height as usize;
+    let mut used = 0usize;
+    for (idx, field) in form.fields.iter().enumerate() {
+        let is_focused = idx == form.focus;
+        let field_rows = field_render_rows(field, is_focused);
+        if used + field_rows.len() > available {
+            break;
+        }
+        for line in field_rows {
+            if y >= rows.y + rows.height {
+                break;
+            }
+            let row_area = Rect {
+                x: rows.x,
+                y,
+                width: rows.width,
+                height: 1,
+            };
+            frame.render_widget(Paragraph::new(line), row_area);
+            y += 1;
+            used += 1;
+        }
+    }
+
+    // Footer line with submit error (if any) or a contextual hint.
+    let footer = match form.submit_error.as_deref() {
+        Some(err) => {
+            Line::from(vec![Span::styled(
+                format!("⚠ {err}"),
+                Style::default().fg(Color::Red),
+            )])
+        }
+        None => {
+            let hint = form
+                .focused()
+                .map(|f| match f.kind {
+                    ParamKind::Bool => "space flips the toggle",
+                    ParamKind::Int => "↑/↓ steps the value",
+                    _ => "↑/↓ selects candidate · → accepts",
+                })
+                .unwrap_or("");
+            Line::from(vec![dim(hint)])
+        }
+    };
+    frame.render_widget(Paragraph::new(footer), layout[1]);
+    // Borrow to satisfy the unused-import lint on variants we don't reach.
+    let _ = CandidateState::None;
+}
+
+/// Build the lines for one field — at least one row for the input itself,
+/// plus optional dropdown rows when the field is focused and has candidates.
+fn field_render_rows(field: &super::form::Field, is_focused: bool) -> Vec<Line<'static>> {
+    use super::form::CandidateState;
+    use crate::config::ParamKind;
+
+    let marker = if is_focused { "▶ " } else { "  " };
+    let required_mark = if field.required { "*" } else { "" };
+    let prompt = format!("{marker}{}{required_mark}: ", field.prompt);
+    let prompt_style = if is_focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let value_str = match field.kind {
+        ParamKind::Bool => {
+            if field.value.trim() == "true" {
+                "[x] true".to_string()
+            } else {
+                "[ ] false".to_string()
+            }
+        }
+        _ => field.value.clone(),
+    };
+    let cursor = if is_focused && !matches!(field.kind, ParamKind::Bool) {
+        "▎"
+    } else {
+        ""
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(prompt, prompt_style),
+        Span::styled(value_str, Style::default().fg(Color::White)),
+        Span::styled(cursor, Style::default().fg(Color::DarkGray)),
+    ]));
+
+    // Error / status banner.
+    match &field.candidates {
+        CandidateState::Loading if is_focused => {
+            lines.push(Line::from(dim("  loading completions…")));
+        }
+        CandidateState::Failed { message, log_path } if is_focused => {
+            let hint = match log_path {
+                Some(p) => format!("  ⚠ {message} (log: {})", p.display()),
+                None => format!("  ⚠ {message}"),
+            };
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::Red),
+            )));
+        }
+        _ => {}
+    }
+
+    if is_focused {
+        let visible = field.visible_candidates();
+        let cap = 5.min(visible.len());
+        for (i, cand) in visible.iter().take(cap).enumerate() {
+            let style = if i == field.candidate_highlight.min(cap.saturating_sub(1)) {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(Span::styled(format!("    {cand}"), style)));
+        }
+        if visible.len() > cap {
+            lines.push(Line::from(dim(format!(
+                "    … {} more",
+                visible.len() - cap
+            ))));
+        }
+    }
+
+    lines
 }

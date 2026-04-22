@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 
 use super::filter::FilterState;
+use super::form::FormState;
 use super::palette::ActionPalette;
+use crate::config::Task;
 use crate::output::LIFECYCLE_EVENT_NAME;
 use crate::runner::{ServiceState, TaskItemState};
 
@@ -30,6 +32,10 @@ pub(crate) enum ViewMode {
     /// `j/k/PgUp/PgDn/Home/End/g/G` scroll; `Esc`, `q`, `s`, or `Enter`
     /// dismiss.
     Overlay,
+    /// Param-entry form for a task. Opened from the palette when the user
+    /// selects a task with declared `params`. Collects values and, on
+    /// submit, dispatches `RunnerCommand::RunTask { name, params, reply }`.
+    Form,
 }
 
 /// Aggregate counts derived from service/task state, displayed on the bar.
@@ -114,10 +120,22 @@ pub(crate) struct App {
     /// render time against the visible area; the key handler can bump it
     /// freely. Reset to 0 each time the overlay is opened.
     pub(crate) overlay_scroll: usize,
+    /// Static task-config snapshot — populated at TUI startup so the
+    /// palette/form can inspect declared params without reaching back into
+    /// the runner. Kept immutable for the session: a config reload
+    /// wouldn't invalidate what's already on-screen, and the runner will
+    /// re-validate on submit anyway.
+    pub(crate) task_configs: HashMap<String, Task>,
+    /// Active form modal, or `None` when not in [`ViewMode::Form`].
+    pub(crate) form: Option<FormState>,
 }
 
 impl App {
-    pub(crate) fn new(service_names: Vec<String>, task_names: Vec<String>) -> Self {
+    pub(crate) fn new(
+        service_names: Vec<String>,
+        task_names: Vec<String>,
+        task_configs: HashMap<String, Task>,
+    ) -> Self {
         let services_state: HashMap<String, ServiceState> = service_names
             .iter()
             .map(|n| (n.clone(), ServiceState::Pending))
@@ -145,6 +163,8 @@ impl App {
             services_state,
             tasks_state,
             overlay_scroll: 0,
+            task_configs,
+            form: None,
         }
     }
 
@@ -307,7 +327,7 @@ mod tests {
 
     #[test]
     fn apply_state_refreshes_counts() {
-        let mut app = App::new(vec!["api".into(), "db".into()], vec![]);
+        let mut app = App::new(vec!["api".into(), "db".into()], vec![], HashMap::new());
         assert_eq!(app.counts.services_ready, 0);
         app.apply_service_state("api".into(), ServiceState::Ready);
         assert_eq!(app.counts.services_ready, 1);

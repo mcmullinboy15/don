@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use super::fuzzy::fuzzy_match;
+use crate::config::Task;
 use crate::runner::{ServiceState, TaskItemState};
 
 /// Maximum number of match rows to show in the palette dropdown.
@@ -36,7 +37,12 @@ pub(crate) enum ActionKind {
     /// Re-run the build command (if any), then restart. Distinct from
     /// `RestartService`, which skips the build step.
     RebuildService(String),
+    /// Run a param-less task — dispatches immediately on Enter.
     RunTask(String),
+    /// Run a task that has declared `params`. Enter opens a form modal
+    /// instead of dispatching; the form collects values and then sends
+    /// the final `RunTask` command.
+    RunTaskWithForm(String),
 }
 
 /// Palette state — only meaningful while view_mode == Palette, but lives on
@@ -55,12 +61,17 @@ pub(crate) struct ActionPalette {
 impl ActionPalette {
     /// Rebuild the action list from the current state snapshot and reset
     /// query/highlight. Call on every open — state changes constantly.
+    ///
+    /// `task_configs` is consulted to pick between [`ActionKind::RunTask`]
+    /// (no params, dispatch immediately) and
+    /// [`ActionKind::RunTaskWithForm`] (declared params, open form first).
     pub(crate) fn open(
         &mut self,
         services: &HashMap<String, ServiceState>,
         tasks: &HashMap<String, TaskItemState>,
+        task_configs: &HashMap<String, Task>,
     ) {
-        self.all_actions = build_actions(services, tasks);
+        self.all_actions = build_actions(services, tasks, task_configs);
         self.query.clear();
         self.highlight = 0;
         self.matches = (0..self.all_actions.len()).collect();
@@ -164,6 +175,7 @@ impl ActionPalette {
 pub(crate) fn build_actions(
     services: &HashMap<String, ServiceState>,
     tasks: &HashMap<String, TaskItemState>,
+    task_configs: &HashMap<String, Task>,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
 
@@ -226,16 +238,37 @@ pub(crate) fn build_actions(
         let Some(state) = tasks.get(name) else {
             continue;
         };
-        let suffix = match state {
+        let mut suffix = match state {
             TaskItemState::Running | TaskItemState::Building => continue,
             TaskItemState::Pending | TaskItemState::Failed | TaskItemState::PendingRun => {
                 " (needs run)"
             }
             TaskItemState::Completed | TaskItemState::Skipped => "",
         };
+        let has_params = task_configs
+            .get(name)
+            .is_some_and(|t| !t.params.is_empty());
+        // Param'd tasks get a visible hint so the user knows Enter will
+        // open a form rather than kick off the task directly.
+        if has_params && suffix.is_empty() {
+            suffix = " (needs input)";
+        } else if has_params {
+            // Already has " (needs run)" from a needs-run state — tack on
+            // the extra hint. Hand-rolled concat keeps the suffix &'static.
+            actions.push(Action {
+                label: format!("Run {name} (needs input)"),
+                kind: ActionKind::RunTaskWithForm(name.clone()),
+            });
+            continue;
+        }
+        let kind = if has_params {
+            ActionKind::RunTaskWithForm(name.clone())
+        } else {
+            ActionKind::RunTask(name.clone())
+        };
         actions.push(Action {
             label: format!("Run {name}{suffix}"),
-            kind: ActionKind::RunTask(name.clone()),
+            kind,
         });
     }
 
@@ -253,6 +286,52 @@ mod tests {
 
     fn tasks(entries: &[(&str, TaskItemState)]) -> HashMap<String, TaskItemState> {
         entries.iter().map(|(n, s)| (n.to_string(), *s)).collect()
+    }
+
+    fn no_task_configs() -> HashMap<String, Task> {
+        HashMap::new()
+    }
+
+    fn task_configs_with_params(names: &[(&str, bool)]) -> HashMap<String, Task> {
+        use crate::config::ParamKind;
+        names
+            .iter()
+            .map(|(name, has_params)| {
+                let params = if *has_params {
+                    vec![crate::config::TaskParam {
+                        name: "x".into(),
+                        prompt: None,
+                        required: false,
+                        default: None,
+                        kind: ParamKind::String,
+                        choices: vec![],
+                        completions: None,
+                        validate: None,
+                    }]
+                } else {
+                    vec![]
+                };
+                (
+                    name.to_string(),
+                    Task {
+                        cmd: "echo".into(),
+                        args: vec![],
+                        dir: None,
+                        env: HashMap::new(),
+                        depends_on: vec![],
+                        watch: vec![],
+                        ignore: vec![],
+                        timeout: None,
+                        log: crate::config::LogConfig::Stdout,
+                        auto_run: true,
+                        download: None,
+                        bazel: None,
+                        turbo: None,
+                        params,
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -357,7 +436,7 @@ mod tests {
         ];
 
         for case in cases {
-            let got = build_actions(&services(&case.services), &tasks(&case.tasks));
+            let got = build_actions(&services(&case.services), &tasks(&case.tasks), &no_task_configs());
             let got_labels: Vec<&str> = got.iter().map(|a| a.label.as_str()).collect();
             assert_eq!(got_labels, case.want_labels, "case: {}", case.name);
         }
@@ -372,6 +451,7 @@ mod tests {
                 ("worker", ServiceState::Ready),
             ]),
             &tasks(&[]),
+            &no_task_configs(),
         );
         // 6 actions per ready service: Restart, Rebuild, Stop ×2 services.
         // The `w` query narrows to the worker triplet plus visible cap.
@@ -391,7 +471,7 @@ mod tests {
     #[test]
     fn palette_highlight_wraps() {
         let mut p = ActionPalette::default();
-        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]));
+        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]), &no_task_configs());
         // 3 actions: Restart api, Rebuild api, Stop api.
         assert_eq!(p.highlight(), 0);
         p.highlight_prev();
@@ -403,7 +483,7 @@ mod tests {
     #[test]
     fn palette_close_empties_state() {
         let mut p = ActionPalette::default();
-        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]));
+        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]), &no_task_configs());
         p.push_query_char('s');
         p.close();
         assert_eq!(p.query(), "");
@@ -413,7 +493,7 @@ mod tests {
     #[test]
     fn palette_selected_is_none_when_no_matches() {
         let mut p = ActionPalette::default();
-        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]));
+        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]), &no_task_configs());
         p.push_query_char('z'); // matches nothing
         assert_eq!(p.visible_count(), 0);
         assert!(p.selected().is_none());
@@ -428,6 +508,7 @@ mod tests {
                 ("worker", ServiceState::Ready),
             ]),
             &tasks(&[]),
+            &no_task_configs(),
         );
         // 6 actions total (Restart, Rebuild, Stop ×2). Highlight the last.
         for _ in 0..5 {
@@ -438,5 +519,44 @@ mod tests {
         p.push_query_char('w');
         assert_eq!(p.visible_count(), 3);
         assert_eq!(p.highlight(), 0);
+    }
+
+    #[test]
+    fn paramd_tasks_use_run_task_with_form() {
+        let configs = task_configs_with_params(&[("plain", false), ("interactive", true)]);
+        let tasks = tasks(&[
+            ("plain", TaskItemState::Completed),
+            ("interactive", TaskItemState::Completed),
+        ]);
+        let got = build_actions(&HashMap::new(), &tasks, &configs);
+        // Find the two task actions.
+        let plain = got.iter().find(|a| a.label.starts_with("Run plain")).expect("plain missing");
+        let interactive = got
+            .iter()
+            .find(|a| a.label.starts_with("Run interactive"))
+            .expect("interactive missing");
+        assert!(matches!(plain.kind, ActionKind::RunTask(ref n) if n == "plain"));
+        assert!(
+            matches!(interactive.kind, ActionKind::RunTaskWithForm(ref n) if n == "interactive"),
+            "got {:?}",
+            interactive.kind,
+        );
+        assert!(interactive.label.contains("needs input"));
+    }
+
+    #[test]
+    fn paramd_tasks_combine_needs_input_with_needs_run() {
+        let configs = task_configs_with_params(&[("migrate", true)]);
+        let tasks = tasks(&[("migrate", TaskItemState::PendingRun)]);
+        let got = build_actions(&HashMap::new(), &tasks, &configs);
+        let migrate = got
+            .iter()
+            .find(|a| a.label.starts_with("Run migrate"))
+            .expect("missing migrate");
+        assert!(
+            matches!(migrate.kind, ActionKind::RunTaskWithForm(_)),
+            "got {:?}",
+            migrate.kind,
+        );
     }
 }

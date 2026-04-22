@@ -6,6 +6,7 @@
 use nix::sys::signal::Signal;
 use tokio::time;
 
+use crate::config::template::{self, TemplateError};
 use crate::config::{Platform, Task};
 use crate::duration::parse_duration;
 use crate::process::{ChildOutput, SpawnConfig, spawn_process};
@@ -23,6 +24,12 @@ pub enum TaskError {
     Timeout { timeout: String },
     #[error("invalid duration: {0}")]
     Duration(#[from] crate::duration::DurationError),
+    #[error("template error in {field}: {source}")]
+    Template {
+        field: String,
+        #[source]
+        source: TemplateError,
+    },
 }
 
 /// Result of spawning a task process: the handle for waiting and the
@@ -43,17 +50,43 @@ pub(crate) async fn spawn_task(
     task_name: &str,
     base_dir: &Path,
     platform: Platform,
+    params: &HashMap<String, String>,
 ) -> Result<TaskSpawn, TaskError> {
-    let work_dir = match task.dir.as_deref() {
+    let render = |field: &str, s: &str| -> Result<String, TaskError> {
+        template::render(s, params).map_err(|source| TaskError::Template {
+            field: field.to_string(),
+            source,
+        })
+    };
+
+    // Render templates before resolving paths / env so a `{{name}}` in `dir`
+    // flows through the same substitution the command sees.
+    let rendered_dir: Option<std::path::PathBuf> = match task.dir.as_deref() {
+        Some(d) => {
+            let s = d.to_string_lossy();
+            Some(render("dir", &s)?.into())
+        }
+        None => None,
+    };
+    let work_dir = match rendered_dir.as_deref() {
         Some(d) => base_dir.join(d),
         None => base_dir.to_path_buf(),
     };
     let work_dir = work_dir.as_path();
 
     let mut env: HashMap<String, String> = std::env::vars().collect();
-    env.extend(task.env.clone());
+    for (k, v) in &task.env {
+        env.insert(k.clone(), render(&format!("env['{k}']"), v)?);
+    }
     // Expose downloaded binaries on PATH.
     crate::process::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
+    // Expose each param to the child as DON_PARAM_<NAME> so tasks can read
+    // their own inputs without re-parsing placeholders. Intentionally
+    // separate from the `{{name}}` substitution so the task author can
+    // pick whichever interface fits the command better.
+    for (k, v) in params {
+        env.insert(format!("DON_PARAM_{}", k.to_ascii_uppercase()), v.clone());
+    }
 
     // Resolve the command path, using the download binary if configured.
     let cache_base = base_dir.join(".don").join("cache");
@@ -65,11 +98,25 @@ pub(crate) async fn spawn_task(
                 source: std::io::Error::new(std::io::ErrorKind::InvalidInput, msg),
             })
         })?;
-    let cmd_str = resolved_cmd.to_string_lossy().into_owned();
+    // Templates in `cmd` apply to the string literal — when a download is
+    // configured, the download binary path wins and placeholders in the
+    // config's `cmd` are irrelevant (the binary is fixed).
+    let cmd_str = if task.download.is_some() {
+        resolved_cmd.to_string_lossy().into_owned()
+    } else {
+        render("cmd", &task.cmd)?
+    };
+    // Render each arg through the template engine.
+    let args: Vec<String> = task
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| render(&format!("args[{i}]"), a))
+        .collect::<Result<_, _>>()?;
 
     let (handle, child_output) = spawn_process(SpawnConfig {
         cmd: &cmd_str,
-        args: &task.args,
+        args: &args,
         dir: Some(work_dir),
         env,
         pgid_file_path: None,

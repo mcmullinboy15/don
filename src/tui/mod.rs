@@ -41,6 +41,7 @@ mod app;
 mod backend;
 mod events;
 mod filter;
+mod form;
 mod fuzzy;
 mod input;
 mod log_store;
@@ -64,6 +65,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use backend::FixedBottomBackend;
 
+use crate::config::ParamKind;
 use crate::output::FormattedLogLine;
 use crate::runner::{RunnerCommand, RunnerEvent};
 use app::{App, ViewMode};
@@ -145,15 +147,19 @@ pub async fn run_tui(
     command_tx: mpsc::Sender<RunnerCommand>,
     service_names: Vec<String>,
     task_names: Vec<String>,
+    task_configs: std::collections::HashMap<String, crate::config::Task>,
 ) -> Result<(), TuiError> {
     let _raw_guard = RawModeGuard::enter()?;
 
-    let mut app = App::new(service_names, task_names);
+    let mut app = App::new(service_names, task_names, task_configs);
     let mut terminal = build_inline_terminal()?;
     let mut store = LogStore::with_capacity(DEFAULT_CAPACITY);
     let mut modal: Option<Modal> = None;
 
     let (input_tx, mut input_rx) = mpsc::channel::<AppEvent>(64);
+    // Publish the sender so background tasks (completion replies) can
+    // inject events back into the loop.
+    let _ = INPUT_TX.set(input_tx.clone());
     let input_handle = tokio::spawn(input::run(input_tx));
     // Tracks whether the input task's channel is still open. When the input
     // task exits (crossterm EventStream error), we gate its select arm off
@@ -381,6 +387,16 @@ fn handle_app_event(
             }
         }
         AppEvent::Key(key) => handle_key(key, app, terminal, store, command_tx, modal)?,
+        AppEvent::CompletionsReady {
+            param,
+            request_id,
+            result,
+        } => {
+            if let Some(form) = app.form.as_mut() {
+                form.apply_completions(&param, request_id, result);
+                redraw_modal(modal, app)?;
+            }
+        }
     }
     Ok(())
 }
@@ -417,6 +433,7 @@ fn handle_key(
         ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
         ViewMode::Palette => handle_palette_key(key, app, terminal, store, command_tx, modal)?,
         ViewMode::Overlay => handle_overlay_key(key, app, terminal, store, modal)?,
+        ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
     }
     Ok(())
 }
@@ -461,7 +478,8 @@ fn handle_normal_key(
             *modal = Some(m);
         }
         KeyCode::Char('a') => {
-            app.palette.open(&app.services_state, &app.tasks_state);
+            app.palette
+                .open(&app.services_state, &app.tasks_state, &app.task_configs);
             app.view_mode = ViewMode::Palette;
             let mut m = Modal::enter()?;
             m.draw(app)?;
@@ -540,10 +558,21 @@ fn handle_palette_key(
 ) -> Result<(), TuiError> {
     match key.code {
         KeyCode::Enter => {
-            if let Some(action) = app.palette.selected() {
-                dispatch_action(command_tx, action.kind.clone());
-            }
+            let selected_kind = app.palette.selected().map(|a| a.kind.clone());
             app.palette.close();
+            match selected_kind {
+                Some(ActionKind::RunTaskWithForm(task_name)) => {
+                    open_form_for_task(app, &task_name, command_tx)?;
+                    // open_form_for_task switched to ViewMode::Form and
+                    // rendered the form modal — nothing more to do here.
+                    redraw_modal(modal, app)?;
+                    return Ok(());
+                }
+                Some(kind) => {
+                    dispatch_action(command_tx, kind);
+                }
+                None => {}
+            }
             app.view_mode = ViewMode::Normal;
             *modal = None;
             clear_and_replay(terminal, store, app)?;
@@ -667,12 +696,335 @@ fn dispatch_action(command_tx: &mpsc::Sender<RunnerCommand>, action: ActionKind)
                 let (reply_tx, _reply_rx) = oneshot::channel();
                 RunnerCommand::RunTask {
                     name,
+                    params: std::collections::HashMap::new(),
                     reply: reply_tx,
                 }
+            }
+            ActionKind::RunTaskWithForm(_) => {
+                // Palette's Enter handler intercepts this variant and opens
+                // the form modal instead — it never reaches `dispatch_action`.
+                // Return early to avoid sending a placeholder command.
+                return;
             }
         };
         let _ = command_tx.send(cmd).await;
     });
+}
+
+/// Fire `RunnerCommand::RunTask` with the params map the user just submitted
+/// via the form modal. Reply is swallowed; state updates come through the
+/// event broadcast like any other runner command.
+fn dispatch_run_task_with_params(
+    command_tx: &mpsc::Sender<RunnerCommand>,
+    name: String,
+    params: std::collections::HashMap<String, String>,
+) {
+    let command_tx = command_tx.clone();
+    tokio::spawn(async move {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = command_tx
+            .send(RunnerCommand::RunTask {
+                name,
+                params,
+                reply: reply_tx,
+            })
+            .await;
+    });
+}
+
+/// Build the form state for `task_name`, transition to `ViewMode::Form`,
+/// and kick off any completion fetches for fields with dynamic sources.
+///
+/// `command_tx` is used to send [`RunnerCommand::ResolveCompletions`] and
+/// to relay completion replies back into the TUI loop via the shared
+/// input channel. We reuse that channel — rather than opening a second
+/// async source — so the main `select!` doesn't have to grow another arm.
+fn open_form_for_task(
+    app: &mut App,
+    task_name: &str,
+    command_tx: &mpsc::Sender<RunnerCommand>,
+) -> Result<(), TuiError> {
+    let Some(task) = app.task_configs.get(task_name).cloned() else {
+        // Palette built the action from task_configs, so a missing entry
+        // here is impossible. Keep the early-return rather than unwrapping.
+        return Ok(());
+    };
+    let Some(form) = form::FormState::new(task_name, &task) else {
+        return Ok(());
+    };
+
+    let dyn_fields: Vec<String> = form
+        .fields
+        .iter()
+        .filter(|f| f.has_dynamic_completions)
+        .map(|f| f.name.clone())
+        .collect();
+
+    app.form = Some(form);
+    app.view_mode = ViewMode::Form;
+
+    // Kick off an initial fetch for every field that needs it. The replies
+    // come back through `input_tx` so they land in the same event queue
+    // the main loop already reads.
+    for param in dyn_fields {
+        request_form_completion(app, task_name, &param, false, command_tx);
+    }
+    Ok(())
+}
+
+/// Spawn the background request/reply wiring for one completion fetch.
+/// The reply is converted into `AppEvent::CompletionsReady` and sent to
+/// the TUI loop through the global input channel.
+fn request_form_completion(
+    app: &mut App,
+    task: &str,
+    param: &str,
+    force_refresh: bool,
+    command_tx: &mpsc::Sender<RunnerCommand>,
+) {
+    let Some(form) = app.form.as_mut() else {
+        return;
+    };
+    let partial: std::collections::HashMap<String, String> = form
+        .fields
+        .iter()
+        .filter(|f| f.name != param && !f.value.is_empty())
+        .map(|f| (f.name.clone(), f.value.clone()))
+        .collect();
+    let request_id = form.start_request(param);
+
+    let command_tx = command_tx.clone();
+    let Some(input_tx) = app_input_tx().cloned() else {
+        return;
+    };
+    let task = task.to_string();
+    let param = param.to_string();
+    tokio::spawn(async move {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if command_tx
+            .send(RunnerCommand::ResolveCompletions {
+                task,
+                param: param.clone(),
+                partial,
+                force_refresh,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match reply_rx.await {
+            Ok(result) => {
+                let _ = input_tx
+                    .send(AppEvent::CompletionsReady {
+                        param,
+                        request_id,
+                        result,
+                    })
+                    .await;
+            }
+            Err(_) => {
+                // Runner dropped the reply channel (shutting down) — nothing
+                // useful to display; the form stays in Loading until the
+                // user moves on.
+            }
+        }
+    });
+}
+
+/// Shared, lazily-populated handle to the TUI loop's input channel. Set
+/// once at the top of `run_tui` and cloned by background tasks that want
+/// to inject events (e.g. completion replies). Using an `OnceLock` keeps
+/// the API clean without threading the sender through every key handler.
+static INPUT_TX: std::sync::OnceLock<mpsc::Sender<AppEvent>> = std::sync::OnceLock::new();
+
+/// Fetch the input-channel handle. Returns `None` before [`run_tui`] runs
+/// (e.g. in unit tests that exercise individual key handlers directly);
+/// background tasks skip injection in that case rather than panicking.
+fn app_input_tx() -> Option<&'static mpsc::Sender<AppEvent>> {
+    INPUT_TX.get()
+}
+
+/// Handle keys while the form modal is open. Navigation, per-kind input,
+/// candidate selection, and submit/cancel live here.
+fn handle_form_key(
+    key: KeyEvent,
+    app: &mut App,
+    terminal: &mut TuiTerminal,
+    store: &mut LogStore,
+    command_tx: &mpsc::Sender<RunnerCommand>,
+    modal: &mut Option<Modal>,
+) -> Result<(), TuiError> {
+    // Grab these up front so later `app.form` borrows don't conflict.
+    let task_name = match app.form.as_ref() {
+        Some(f) => f.task.clone(),
+        None => return Ok(()),
+    };
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            app.form = None;
+            app.view_mode = ViewMode::Normal;
+            *modal = None;
+            clear_and_replay(terminal, store, app)?;
+            return Ok(());
+        }
+        KeyCode::Enter if ctrl => {
+            // Submit regardless of focused field.
+            try_submit_form(app, command_tx, terminal, store, modal)?;
+            return Ok(());
+        }
+        KeyCode::Enter => {
+            // If focused field is on the last row → submit. Otherwise advance.
+            if let Some(form) = app.form.as_ref()
+                && form.focus + 1 >= form.fields.len()
+            {
+                try_submit_form(app, command_tx, terminal, store, modal)?;
+                return Ok(());
+            }
+            if let Some(form) = app.form.as_mut() {
+                form.focus_next();
+            }
+        }
+        KeyCode::Tab => {
+            // Tab on a dynamic field = refresh completions; on others = move focus.
+            let refresh = app
+                .form
+                .as_ref()
+                .and_then(|f| f.focused())
+                .is_some_and(|f| matches!(f.candidates, form::CandidateState::Loaded(_) | form::CandidateState::Failed { .. } | form::CandidateState::Loading));
+            let focused_param = app.form.as_ref().and_then(|f| f.focused()).map(|f| f.name.clone());
+            if refresh
+                && let Some(param) = focused_param
+            {
+                request_form_completion(app, &task_name, &param, true, command_tx);
+            } else if let Some(form) = app.form.as_mut() {
+                form.focus_next();
+            }
+        }
+        KeyCode::BackTab => {
+            if let Some(form) = app.form.as_mut() {
+                form.focus_prev();
+            }
+        }
+        KeyCode::Up => {
+            if let Some(form) = app.form.as_mut()
+                && let Some(field) = form.focused_mut()
+            {
+                match field.kind {
+                    ParamKind::Int => field.step_int(1),
+                    _ => {
+                        // Move candidate highlight up.
+                        if field.candidate_highlight > 0 {
+                            field.candidate_highlight -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Down => {
+            if let Some(form) = app.form.as_mut()
+                && let Some(field) = form.focused_mut()
+            {
+                match field.kind {
+                    ParamKind::Int => field.step_int(-1),
+                    _ => {
+                        let max = field.visible_candidates().len().saturating_sub(1);
+                        if field.candidate_highlight < max {
+                            field.candidate_highlight += 1;
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(form) = app.form.as_mut()
+                && let Some(field) = form.focused_mut()
+            {
+                match field.kind {
+                    ParamKind::Bool => field.toggle_bool(),
+                    _ => {
+                        field.value.push(' ');
+                        field.candidate_highlight = 0;
+                    }
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(form) = app.form.as_mut()
+                && let Some(field) = form.focused_mut()
+            {
+                match field.kind {
+                    ParamKind::Bool => {
+                        // Letters don't map to a bool value — ignore.
+                    }
+                    ParamKind::Int => {
+                        if c.is_ascii_digit() || (c == '-' && field.value.is_empty()) {
+                            field.value.push(c);
+                        }
+                    }
+                    _ => {
+                        field.value.push(c);
+                        field.candidate_highlight = 0;
+                    }
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(form) = app.form.as_mut()
+                && let Some(field) = form.focused_mut()
+            {
+                field.value.pop();
+            }
+        }
+        KeyCode::Right => {
+            // On a field with candidates, Right accepts the highlight.
+            if let Some(form) = app.form.as_mut()
+                && let Some(field) = form.focused_mut()
+            {
+                field.accept_highlighted_candidate();
+            }
+        }
+        _ => {}
+    }
+    redraw_modal(modal, app)?;
+    Ok(())
+}
+
+/// Attempt to submit the form. On success: dispatch `RunnerCommand::RunTask`,
+/// close the modal, return to Normal. On validation error: record it on the
+/// form so the renderer can show it, and stay open.
+fn try_submit_form(
+    app: &mut App,
+    command_tx: &mpsc::Sender<RunnerCommand>,
+    terminal: &mut TuiTerminal,
+    store: &mut LogStore,
+    modal: &mut Option<Modal>,
+) -> Result<(), TuiError> {
+    let (task_name, params) = {
+        let Some(form) = app.form.as_mut() else {
+            return Ok(());
+        };
+        match form.submit() {
+            Ok(p) => {
+                form.submit_error = None;
+                (form.task.clone(), p)
+            }
+            Err(msg) => {
+                form.submit_error = Some(msg);
+                redraw_modal(modal, app)?;
+                return Ok(());
+            }
+        }
+    };
+    dispatch_run_task_with_params(command_tx, task_name, params);
+    app.form = None;
+    app.view_mode = ViewMode::Normal;
+    *modal = None;
+    clear_and_replay(terminal, store, app)?;
+    Ok(())
 }
 
 /// Insert a single formatted log line into the scrollback above the inline

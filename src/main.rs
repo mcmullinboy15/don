@@ -92,6 +92,15 @@ enum Commands {
         /// Run all tasks currently in pending_run state
         #[arg(long, conflicts_with = "name")]
         all_pending: bool,
+        /// Never prompt for missing required params — error instead. Implicit
+        /// when stdin isn't a TTY. Useful in scripts / CI.
+        #[arg(long, conflicts_with = "all_pending")]
+        no_prompt: bool,
+        /// Per-param flags. Parsed dynamically against the task's declared
+        /// params: `--<param>=<value>`, `--<param> <value>`, or bare
+        /// `--<flag>` (treated as `"true"` for bool params).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        raw: Vec<String>,
     },
     /// Validate the config file
     Validate,
@@ -161,10 +170,8 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
-        Commands::Run { name, all_pending } => match (name, all_pending) {
-            (Some(n), _) => {
-                run_client(&config_path, |c| async move { c.run_task(&n).await }).await
-            }
+        Commands::Run { name, all_pending, raw, no_prompt } => match (name, all_pending) {
+            (Some(n), _) => run_run_task(&config_path, n, raw, no_prompt).await,
             (None, true) => {
                 run_client(&config_path, |c| async move { c.run_pending().await }).await
             }
@@ -219,6 +226,135 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
 
 fn client_for(config_path: &Path) -> Client {
     Client::new(base_dir(config_path).as_path())
+}
+
+/// Handle `don run <task> [flags]`. Parses `raw` against the task's declared
+/// params and dispatches via the client.
+async fn run_run_task(
+    config_path: &Path,
+    name: String,
+    raw: Vec<String>,
+    no_prompt: bool,
+) -> i32 {
+    // Load config to look up the task's params. This duplicates what the
+    // runner does server-side, but we need the param list *here* to
+    // parse the trailing args correctly.
+    let config = match don::config::Config::from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            errln(format!("failed to load config: {e}"));
+            return 1;
+        }
+    };
+    let Some(task) = config.tasks.get(&name) else {
+        errln(format!("unknown task '{name}'"));
+        return 1;
+    };
+
+    let parsed = match parse_task_args(&raw, &task.params) {
+        Ok(p) => p,
+        Err(msg) => {
+            errln(msg);
+            return 2;
+        }
+    };
+
+    // Interactive TTY mode could open a form here for missing required
+    // params. Until the TUI form is wired into `don run` itself, we keep
+    // the CLI in strict mode: error out when required params are missing
+    // and the user hasn't supplied `--no-prompt` (it's implied).
+    let _ = no_prompt;
+    for p in &task.params {
+        if p.required && !parsed.contains_key(&p.name) && p.default.is_none() {
+            errln(format!(
+                "missing required param --{} (run `don start` and use the palette form, \
+                 or pass --{}=<value>)",
+                p.name, p.name
+            ));
+            return 2;
+        }
+    }
+
+    let client = client_for(config_path);
+    match client.run_task(&name, parsed).await {
+        Ok(()) => 0,
+        Err(e) => {
+            errln(e);
+            1
+        }
+    }
+}
+
+/// Parse the trailing raw args from `don run <task> …` against the task's
+/// declared params. Accepts:
+/// - `--<name>=<value>`
+/// - `--<name> <value>`
+/// - bare `--<flag>` (kind = Bool → "true")
+///
+/// Returns a map of user-supplied values, or a user-facing error string.
+fn parse_task_args(
+    raw: &[String],
+    params: &[don::config::TaskParam],
+) -> Result<std::collections::HashMap<String, String>, String> {
+    use don::config::ParamKind;
+
+    let by_name: std::collections::HashMap<&str, &don::config::TaskParam> =
+        params.iter().map(|p| (p.name.as_str(), p)).collect();
+    let known_names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+
+    let mut out = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = &raw[i];
+        if !arg.starts_with("--") {
+            return Err(format!(
+                "unexpected positional arg '{arg}' — don run expects --<name>=<value> flags"
+            ));
+        }
+        let stripped = &arg[2..];
+        let (name, value) = match stripped.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (stripped.to_string(), None),
+        };
+        let Some(param) = by_name.get(name.as_str()) else {
+            let valid = if known_names.is_empty() {
+                "task declares no params".to_string()
+            } else {
+                format!("valid: --{}", known_names.join(", --"))
+            };
+            return Err(format!("unknown param '--{name}' ({valid})"));
+        };
+        let resolved = match value {
+            Some(v) => v,
+            None => match param.kind {
+                ParamKind::Bool => {
+                    // Bare `--flag` = true for bools.
+                    i += 1;
+                    out.insert(name, "true".to_string());
+                    continue;
+                }
+                _ => {
+                    // Expect the next token to be the value.
+                    match raw.get(i + 1) {
+                        Some(v) if !v.starts_with("--") => {
+                            let v = v.clone();
+                            i += 2;
+                            out.insert(name, v);
+                            continue;
+                        }
+                        _ => {
+                            return Err(format!(
+                                "param --{name} is missing a value (use --{name}=<value>)"
+                            ));
+                        }
+                    }
+                }
+            },
+        };
+        i += 1;
+        out.insert(name, resolved);
+    }
+    Ok(out)
 }
 
 fn base_dir(config_path: &Path) -> PathBuf {
@@ -692,6 +828,12 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
             .cloned()
             .collect();
 
+        // Snapshot the task configs before moving `config` into the runner —
+        // the TUI form needs the param schema to render prompts and to route
+        // per-param completion requests.
+        let task_configs: std::collections::HashMap<String, don::config::Task> =
+            config.tasks.clone();
+
         let runner = don::runner::Runner::new(
             config,
             config_path.to_path_buf(),
@@ -721,6 +863,7 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
                 commands,
                 service_names,
                 task_names,
+                task_configs,
             )
             .await;
             if result.is_err() {
@@ -765,5 +908,141 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
         .map_err(|e| format!("Error: {e}"))?;
 
         runner.run().await.map_err(|e| format!("Error: {e}"))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::parse_task_args;
+    use don::config::{ParamKind, TaskParam};
+
+    fn p(name: &str) -> TaskParam {
+        TaskParam {
+            name: name.to_string(),
+            prompt: None,
+            required: false,
+            default: None,
+            kind: ParamKind::String,
+            choices: vec![],
+            completions: None,
+            validate: None,
+        }
+    }
+
+    #[test]
+    fn parse_table() {
+        struct Case {
+            name: &'static str,
+            params: Vec<TaskParam>,
+            raw: Vec<&'static str>,
+            want_ok: Option<Vec<(&'static str, &'static str)>>,
+            want_err: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "empty args",
+                params: vec![],
+                raw: vec![],
+                want_ok: Some(vec![]),
+                want_err: None,
+            },
+            Case {
+                name: "key=value",
+                params: vec![p("index")],
+                raw: vec!["--index=users"],
+                want_ok: Some(vec![("index", "users")]),
+                want_err: None,
+            },
+            Case {
+                name: "separated",
+                params: vec![p("index")],
+                raw: vec!["--index", "users"],
+                want_ok: Some(vec![("index", "users")]),
+                want_err: None,
+            },
+            Case {
+                name: "mixed",
+                params: vec![p("a"), p("b")],
+                raw: vec!["--a=1", "--b", "two"],
+                want_ok: Some(vec![("a", "1"), ("b", "two")]),
+                want_err: None,
+            },
+            Case {
+                name: "bool bare flag",
+                params: vec![TaskParam { kind: ParamKind::Bool, ..p("enabled") }],
+                raw: vec!["--enabled"],
+                want_ok: Some(vec![("enabled", "true")]),
+                want_err: None,
+            },
+            Case {
+                name: "bool explicit value",
+                params: vec![TaskParam { kind: ParamKind::Bool, ..p("enabled") }],
+                raw: vec!["--enabled=false"],
+                want_ok: Some(vec![("enabled", "false")]),
+                want_err: None,
+            },
+            Case {
+                name: "unknown flag",
+                params: vec![p("a")],
+                raw: vec!["--b=1"],
+                want_ok: None,
+                want_err: Some("unknown param '--b'"),
+            },
+            Case {
+                name: "missing value",
+                params: vec![p("a")],
+                raw: vec!["--a"],
+                want_ok: None,
+                want_err: Some("missing a value"),
+            },
+            Case {
+                name: "positional rejected",
+                params: vec![p("a")],
+                raw: vec!["stray"],
+                want_ok: None,
+                want_err: Some("unexpected positional"),
+            },
+            Case {
+                name: "value that looks like a flag consumed by separated form errors",
+                params: vec![p("a")],
+                raw: vec!["--a", "--b"],
+                want_ok: None,
+                want_err: Some("missing a value"),
+            },
+            Case {
+                name: "value starting with dash via equals form is fine",
+                params: vec![p("a")],
+                raw: vec!["--a=-x"],
+                want_ok: Some(vec![("a", "-x")]),
+                want_err: None,
+            },
+        ];
+
+        for case in cases {
+            let raw: Vec<String> = case.raw.iter().map(|s| s.to_string()).collect();
+            let got = parse_task_args(&raw, &case.params);
+            match (got, case.want_ok, case.want_err) {
+                (Ok(m), Some(want), None) => {
+                    let want_map: std::collections::HashMap<String, String> = want
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    assert_eq!(m, want_map, "{}", case.name);
+                }
+                (Err(e), None, Some(needle)) => {
+                    assert!(
+                        e.contains(needle),
+                        "{}: err '{e}' missing '{needle}'",
+                        case.name
+                    );
+                }
+                (got, ok, err) => panic!(
+                    "{}: got {:?}, want ok={:?} err={:?}",
+                    case.name, got, ok, err
+                ),
+            }
+        }
     }
 }

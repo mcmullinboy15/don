@@ -7,8 +7,9 @@
 
 pub mod attach;
 
-use crate::runner::ItemStatus;
+use crate::runner::{CompletionError, ItemStatus};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +42,11 @@ pub enum ClientError {
     /// JSON (de)serialisation failure.
     #[error("invalid json: {0}")]
     Json(#[from] serde_json::Error),
+    /// Server ran a completion command for us, and it failed. Carries the
+    /// original [`CompletionError`] so the CLI can show the log path the
+    /// server wrote.
+    #[error("{0}")]
+    Completion(CompletionError),
 }
 
 /// Deserialised body of `GET /status`.
@@ -119,8 +125,71 @@ impl Client {
     }
 
     /// `POST /run/:name` — run a specific task, bypassing auto_run.
-    pub async fn run_task(&self, name: &str) -> Result<(), ClientError> {
-        self.control("/run/", name).await
+    ///
+    /// `params` is the user-supplied param map (empty for tasks without
+    /// declared params). Sent as `{"params": {...}}` JSON body.
+    pub async fn run_task(
+        &self,
+        name: &str,
+        params: HashMap<String, String>,
+    ) -> Result<(), ClientError> {
+        let path = format!("/run/{}", urlencode(name));
+        let body = serde_json::to_vec(&serde_json::json!({ "params": params }))?;
+        let (status, body) = self
+            .request_with_body("POST", &path, Some(body.as_slice()))
+            .await?;
+        if status == 204 {
+            return Ok(());
+        }
+        Err(classify_error(status, &body))
+    }
+
+    /// `POST /completions/:task/:param` — resolve candidate values for one
+    /// task param. `partial` carries already-entered values for other params
+    /// (exposed to the completion command as `DON_PARAM_<NAME>`).
+    pub async fn resolve_completions(
+        &self,
+        task: &str,
+        param: &str,
+        partial: HashMap<String, String>,
+        force_refresh: bool,
+    ) -> Result<Vec<String>, ClientError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            values: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        struct ErrResp {
+            error: String,
+            #[serde(default)]
+            log_path: Option<PathBuf>,
+        }
+
+        let path = format!(
+            "/completions/{}/{}",
+            urlencode(task),
+            urlencode(param)
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "partial": partial,
+            "force_refresh": force_refresh,
+        }))?;
+        let (status, body) = self
+            .request_with_body("POST", &path, Some(body.as_slice()))
+            .await?;
+        if (200..300).contains(&status) {
+            let parsed: Resp = serde_json::from_slice(&body)?;
+            return Ok(parsed.values);
+        }
+        // A 502 from the server carries {error, log_path} — surface it as
+        // a structured CompletionError via the Completions variant.
+        if let Ok(parsed) = serde_json::from_slice::<ErrResp>(&body) {
+            return Err(ClientError::Completion(CompletionError {
+                message: parsed.error,
+                log_path: parsed.log_path,
+            }));
+        }
+        Err(classify_error(status, &body))
     }
 
     /// `GET /logs/:name?last=N`
@@ -230,6 +299,20 @@ impl Client {
         let body = drain_body(&mut stream, &headers, leftover).await?;
         Ok((status, body))
     }
+
+    /// Like [`Self::request`] but with an optional JSON request body.
+    async fn request_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<(u16, Vec<u8>), ClientError> {
+        let mut stream = self.connect().await?;
+        write_request_with_body(&mut stream, method, path, body).await?;
+        let (status, headers, leftover) = read_head(&mut stream).await?;
+        let body = drain_body(&mut stream, &headers, leftover).await?;
+        Ok((status, body))
+    }
 }
 
 fn ensure_ok(status: u16, body: &[u8]) -> Result<(), ClientError> {
@@ -257,6 +340,30 @@ pub(crate) fn classify_error(status: u16, body: &[u8]) -> ClientError {
 fn extract_error_message(body: &[u8]) -> Option<String> {
     let parsed: ErrorBody = serde_json::from_slice(body).ok()?;
     Some(parsed.error)
+}
+
+/// Write a POST with a JSON request body. Emits `Content-Type: application/json`
+/// and `Content-Length: <len>`, then writes the body bytes before returning.
+pub(crate) async fn write_request_with_body(
+    stream: &mut UnixStream,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+) -> Result<(), ClientError> {
+    let body_bytes = body.unwrap_or(&[]);
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body_bytes.len(),
+    );
+    stream.write_all(req.as_bytes()).await?;
+    if !body_bytes.is_empty() {
+        stream.write_all(body_bytes).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn write_request(

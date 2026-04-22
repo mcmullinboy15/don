@@ -1,13 +1,14 @@
 //! HTTP endpoints for the unix socket API.
 
 use super::ApiState;
-use crate::runner::{CommandError, ItemStatus, RunnerCommand};
+use crate::runner::{CommandError, CompletionError, ItemStatus, RunnerCommand};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -23,6 +24,7 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/attach/{name}/resize", post(super::attach::resize_handler))
         .route("/run-pending", post(post_run_pending))
         .route("/run/{name}", post(post_run_task))
+        .route("/completions/{task}/{param}", post(post_resolve_completions))
         .with_state(state)
 }
 
@@ -196,16 +198,126 @@ async fn follow_logs(state: Arc<ApiState>, name: String, last: usize) -> Respons
     }
 }
 
+/// Body of `POST /run/:name` — carries the user-supplied param values.
+/// Empty / absent body is accepted and treated as `params = {}`.
+#[derive(Default, Deserialize)]
+struct RunTaskBody {
+    #[serde(default)]
+    params: HashMap<String, String>,
+}
+
 /// `POST /run/:name` — run a specific task by name, bypassing auto_run.
+/// The request body may carry `{"params": {...}}` with user-supplied values
+/// for any declared task params.
 async fn post_run_task(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    body: Option<Json<RunTaskBody>>,
 ) -> Response {
-    dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::RunTask {
-        name,
-        reply,
+    let params = body.map(|Json(b)| b.params).unwrap_or_default();
+    let (tx, rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(RunnerCommand::RunTask {
+            name: name.clone(),
+            params,
+            reply: tx,
+        })
+        .await
+        .is_err()
+    {
+        return runner_unavailable();
+    }
+    map_command_reply(&name, rx.await).await
+}
+
+/// Shared command-reply-to-response mapping, shared between `post_run_task`
+/// (which can't use `dispatch_control_cmd` because the command has a third
+/// field beyond `name` + `reply`) and the other control endpoints.
+async fn map_command_reply(
+    name: &str,
+    reply: Result<Result<(), CommandError>, oneshot::error::RecvError>,
+) -> Response {
+    match reply {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(CommandError::UnknownService { .. } | CommandError::UnknownTask { .. })) => {
+            not_found(name)
+        }
+        Ok(Err(e @ (CommandError::NotAService { .. } | CommandError::NotATask { .. }))) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(&e.to_string()))).into_response()
+        }
+        Ok(Err(e @ CommandError::InvalidState { .. })) => {
+            (StatusCode::CONFLICT, Json(error_body(&e.to_string()))).into_response()
+        }
+        Ok(Err(e @ CommandError::InvalidParams { .. })) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(&e.to_string()))).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(error_body(&e.to_string())),
+        )
+            .into_response(),
+        Err(_) => runner_unavailable(),
+    }
+}
+
+/// Body of `POST /completions/:task/:param`.
+#[derive(Default, Deserialize)]
+struct CompletionsBody {
+    /// Already-entered values for *other* params in the form, exposed to
+    /// the completion command as `DON_PARAM_<NAME>`.
+    #[serde(default)]
+    partial: HashMap<String, String>,
+    /// When true, skip the cache and rerun the command.
+    #[serde(default)]
+    force_refresh: bool,
+}
+
+#[derive(Serialize)]
+struct CompletionsResponse {
+    values: Vec<String>,
+}
+
+/// `POST /completions/:task/:param` — resolve candidate values for one
+/// param. Runs the configured `completions` command (or returns static
+/// `choices`). Errors carry a `log_path` when a failure log was written.
+async fn post_resolve_completions(
+    State(state): State<Arc<ApiState>>,
+    Path((task, param)): Path<(String, String)>,
+    body: Option<Json<CompletionsBody>>,
+) -> Response {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let (tx, rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(RunnerCommand::ResolveCompletions {
+            task,
+            param,
+            partial: body.partial,
+            force_refresh: body.force_refresh,
+            reply: tx,
+        })
+        .await
+        .is_err()
+    {
+        return runner_unavailable();
+    }
+    match rx.await {
+        Ok(Ok(values)) => Json(CompletionsResponse { values }).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(completion_error_body(&e)),
+        )
+            .into_response(),
+        Err(_) => runner_unavailable(),
+    }
+}
+
+fn completion_error_body(e: &CompletionError) -> serde_json::Value {
+    serde_json::json!({
+        "error": e.message,
+        "log_path": e.log_path,
     })
-    .await
 }
 
 /// `POST /run-pending` — run all tasks in PendingRun state.
@@ -245,24 +357,7 @@ where
     {
         return runner_unavailable();
     }
-    match rx.await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(CommandError::UnknownService { .. } | CommandError::UnknownTask { .. })) => {
-            not_found(name)
-        }
-        Ok(Err(e @ (CommandError::NotAService { .. } | CommandError::NotATask { .. }))) => {
-            (StatusCode::BAD_REQUEST, Json(error_body(&e.to_string()))).into_response()
-        }
-        Ok(Err(e @ CommandError::InvalidState { .. })) => {
-            (StatusCode::CONFLICT, Json(error_body(&e.to_string()))).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(error_body(&e.to_string())),
-        )
-            .into_response(),
-        Err(_) => runner_unavailable(),
-    }
+    map_command_reply(name, rx.await).await
 }
 
 fn runner_unavailable() -> Response {
