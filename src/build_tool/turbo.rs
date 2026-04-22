@@ -5,7 +5,7 @@
 //! resolved task graph including commands, directories, dependencies,
 //! and input file mappings.
 
-use super::{BuildGraphResolver, BuildToolError, ResolvedBuildInfo};
+use super::{AbortOnDrop, BuildGraphResolver, BuildToolError, ResolvedBuildInfo};
 use std::path::Path;
 use std::time::Duration;
 
@@ -81,6 +81,7 @@ impl TurboResolver {
         filters: &[String],
         working_dir: &Path,
         mut on_line: F,
+        emitter: Option<&crate::output::LifecycleEmitter>,
     ) -> Result<super::BatchBuildResult, BuildToolError>
     where
         F: FnMut(&str) + Send + 'static,
@@ -104,16 +105,30 @@ impl TurboResolver {
 
         cmd.current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // Drop = SIGKILL on shutdown mid-startup.
+            .kill_on_drop(true);
+
+        if let Some(em) = emitter {
+            let mut args: Vec<String> = prefix_args.to_vec();
+            args.push("run".to_string());
+            args.push(build_task.to_string());
+            for filter in filters {
+                args.push("--filter".to_string());
+                args.push(filter.clone());
+            }
+            em.debug_spawn("turbo", &program, &args);
+        }
 
         let mut child = cmd.spawn().map_err(|e| BuildToolError::Io {
             tool: "turbo".to_string(),
             source: e,
         })?;
 
-        // Stream stdout (turbo writes build output to stdout).
+        // Stream stdout. Wrap in AbortOnDrop so cancellation tears the
+        // reader down — see comment in `bazel.rs::build_targets`.
         let stdout = child.stdout.take();
-        let stream_handle = tokio::spawn(async move {
+        let stream_handle = AbortOnDrop::new(tokio::spawn(async move {
             if let Some(stdout) = stdout {
                 let mut reader = tokio::io::BufReader::new(stdout);
                 let mut line_buf = Vec::new();
@@ -133,11 +148,11 @@ impl TurboResolver {
                     }
                 }
             }
-        });
+        }));
 
-        // Drain stderr.
+        // Drain stderr. Same drop-on-cancel rationale.
         let stderr = child.stderr.take();
-        let stderr_handle = tokio::spawn(async move {
+        let stderr_handle = AbortOnDrop::new(tokio::spawn(async move {
             let mut collected = String::new();
             if let Some(stderr) = stderr {
                 let mut reader = tokio::io::BufReader::new(stderr);
@@ -146,7 +161,7 @@ impl TurboResolver {
                 ).await;
             }
             collected
-        });
+        }));
 
         let timeout_secs = self.timeout.as_secs();
         let status = tokio::time::timeout(self.timeout, child.wait())
@@ -160,8 +175,13 @@ impl TurboResolver {
                 source: e,
             })?;
 
-        let _ = stream_handle.await;
-        let stderr_output = stderr_handle.await.unwrap_or_default();
+        if let Some(h) = stream_handle.into_inner() {
+            let _ = h.await;
+        }
+        let stderr_output = match stderr_handle.into_inner() {
+            Some(h) => h.await.unwrap_or_default(),
+            None => String::new(),
+        };
 
         if status.success() {
             Ok(super::BatchBuildResult {
@@ -295,25 +315,27 @@ pub(crate) struct ParsedTurboTask {
     pub persistent: bool,
 }
 
-impl BuildGraphResolver for TurboResolver {
-    async fn resolve(
+impl TurboResolver {
+    /// Run `turbo run <task> --dry-run=json` with the given filters (may be
+    /// empty for "all packages") and collect the dry-run task graph.
+    async fn run_dry_run(
         &self,
-        _target: &str,
+        filters: &[&str],
         working_dir: &Path,
-    ) -> Result<ResolvedBuildInfo, BuildToolError> {
+    ) -> Result<Vec<ParsedTurboTask>, BuildToolError> {
         let (program, prefix_args) = self.find_turbo_cmd().await?;
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&prefix_args);
         cmd.args(["run", &self.task, "--dry-run=json"]);
-
-        if let Some(ref filter) = self.filter {
+        for filter in filters {
             cmd.args(["--filter", filter]);
         }
 
         cmd.current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
 
         let child = cmd.spawn().map_err(|e| BuildToolError::Io {
             tool: "turbo".to_string(),
@@ -350,14 +372,19 @@ impl BuildGraphResolver for TurboResolver {
             message: format!("non-UTF-8 output: {e}"),
         })?;
 
-        let tasks = parse_dry_run(&stdout)?;
+        parse_dry_run(&stdout)
+    }
 
-        // Aggregate watch paths and dependencies from all tasks in the graph.
+    /// Aggregate tier-2 source globs + tier-1 per-package `package.json`
+    /// globs from a parsed turbo dry-run task graph.
+    fn aggregate(tasks: &[ParsedTurboTask]) -> ResolvedBuildInfo {
         let mut all_watch_paths = Vec::new();
         let mut all_dependencies = Vec::new();
         let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut graph_definition_globs: Vec<String> = Vec::new();
 
-        for task in &tasks {
+        for task in tasks {
             for path in &task.watch_paths {
                 if seen_paths.insert(path.clone()) {
                     all_watch_paths.push(path.clone());
@@ -368,18 +395,51 @@ impl BuildGraphResolver for TurboResolver {
                     all_dependencies.push(dep.clone());
                 }
             }
+            if seen_dirs.insert(task.directory.clone()) {
+                graph_definition_globs.push(format!("{}/package.json", task.directory));
+            }
         }
 
-        Ok(ResolvedBuildInfo {
+        ResolvedBuildInfo {
             watch_paths: all_watch_paths,
             dependencies: all_dependencies,
-            graph_definition_globs: vec![
-                "**/package.json".to_string(),
-                "turbo.json".to_string(),
-                "turbo.jsonc".to_string(),
-                "pnpm-workspace.yaml".to_string(),
-            ],
-        })
+            graph_definition_globs,
+        }
+    }
+
+    /// Resolve the union of watch paths / build-graph globs for multiple
+    /// filters in ONE `turbo run --dry-run` invocation. Filters are passed
+    /// as repeated `--filter` flags, which turbo treats as a union.
+    pub(crate) async fn resolve_union(
+        &self,
+        filters: &[String],
+        working_dir: &Path,
+    ) -> Result<ResolvedBuildInfo, BuildToolError> {
+        if filters.is_empty() {
+            return Ok(ResolvedBuildInfo {
+                watch_paths: Vec::new(),
+                dependencies: Vec::new(),
+                graph_definition_globs: Vec::new(),
+            });
+        }
+        let filter_refs: Vec<&str> = filters.iter().map(String::as_str).collect();
+        let tasks = self.run_dry_run(&filter_refs, working_dir).await?;
+        Ok(Self::aggregate(&tasks))
+    }
+}
+
+impl BuildGraphResolver for TurboResolver {
+    async fn resolve(
+        &self,
+        _target: &str,
+        working_dir: &Path,
+    ) -> Result<ResolvedBuildInfo, BuildToolError> {
+        let mut filters: Vec<&str> = Vec::new();
+        if let Some(ref filter) = self.filter {
+            filters.push(filter.as_str());
+        }
+        let tasks = self.run_dry_run(&filters, working_dir).await?;
+        Ok(Self::aggregate(&tasks))
     }
 
     fn tool_name(&self) -> &'static str {

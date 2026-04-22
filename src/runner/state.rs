@@ -15,6 +15,7 @@
 //! [`RunnerEvent`]: super::RunnerEvent
 
 use super::{AttachWaiter, ServiceHandle, ServiceState, TaskItemState};
+use tokio::sync::oneshot;
 
 /// All per-service runtime state, consolidated into a single struct.
 ///
@@ -33,9 +34,8 @@ pub(crate) struct RuntimeService {
     pub attach_lock: Option<u32>,
     /// Pending attach waiter (client waiting for process to start).
     pub attach_waiter: Option<AttachWaiter>,
-    /// Bound TCP sockets (LISTEN_FDS) — outlive restarts.
-    pub bound_sockets: Option<crate::process::socket::BoundSockets>,
-    /// TCP proxy listener — outlives restarts.
+    /// TCP proxy listener — outlives restarts. Owns the bound public
+    /// listeners for both env and listenfd mode entries.
     pub proxy: Option<crate::proxy::ServiceProxy>,
     /// Watch paths resolved from build tool queries (bazel/turbo).
     pub resolved_watch_paths: Vec<String>,
@@ -43,6 +43,17 @@ pub(crate) struct RuntimeService {
     pub bazel_binary_path: Option<String>,
     /// Whether this service was built during the batch build phase.
     pub batch_built: bool,
+    /// Cancel channel for the per-service health monitor task. `Some` when
+    /// the monitor is running; dropping it (or sending) signals the loop
+    /// to exit. Cleared on stop, restart, or process exit.
+    pub monitor_cancel: Option<oneshot::Sender<()>>,
+    /// Number of consecutive `on_failure = "restart"` cycles we've
+    /// triggered without the service recovering to Ready. Drives backoff
+    /// for the next scheduled restart. Reset to 0 on Ready.
+    pub restart_attempts: u32,
+    /// Handle to a scheduled `RestartUnhealthy` command. Aborted on stop,
+    /// recovery, or manual restart so we don't fire a stale auto-restart.
+    pub pending_restart: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RuntimeService {
@@ -57,11 +68,26 @@ impl RuntimeService {
             osc_sink: None,
             attach_lock: None,
             attach_waiter: None,
-            bound_sockets: None,
             proxy: None,
             resolved_watch_paths: Vec::new(),
             bazel_binary_path: None,
             batch_built: false,
+            monitor_cancel: None,
+            restart_attempts: 0,
+            pending_restart: None,
+        }
+    }
+
+    /// Stop any running health monitor and abort any pending auto-restart.
+    /// Safe to call when neither is set. Used on stop/restart/process exit
+    /// to make sure stale monitor traffic and stale auto-restart timers
+    /// can't fire after the service is no longer in Ready/Unhealthy.
+    pub(crate) fn stop_health_tracking(&mut self) {
+        if let Some(tx) = self.monitor_cancel.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.pending_restart.take() {
+            handle.abort();
         }
     }
 

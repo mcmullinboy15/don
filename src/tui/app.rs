@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use super::filter::FilterState;
 use super::palette::ActionPalette;
+use crate::output::LIFECYCLE_EVENT_NAME;
 use crate::runner::{ServiceState, TaskItemState};
 
 /// Top-level view mode. Determines how keys are interpreted and how the
@@ -25,7 +26,9 @@ pub(crate) enum ViewMode {
     Filter,
     /// Action palette — typing filters actions, Enter dispatches.
     Palette,
-    /// Full-screen status overlay (alternate screen). Any key dismisses.
+    /// Full-screen status overlay (alternate screen). Arrow keys and
+    /// `j/k/PgUp/PgDn/Home/End/g/G` scroll; `Esc`, `q`, `s`, or `Enter`
+    /// dismiss.
     Overlay,
 }
 
@@ -35,6 +38,8 @@ pub(crate) struct StatusCounts {
     pub(crate) services_total: usize,
     pub(crate) services_ready: usize,
     pub(crate) services_failed: usize,
+    /// Services running but with a failing health-check monitor.
+    pub(crate) services_unhealthy: usize,
     /// Services actively transitioning (Pending, Starting, Running-not-ready,
     /// Stopping). Used to light up the spinner — `Ready`/`Stopped`/`Failed`/
     /// `Lazy` don't count as "doing work".
@@ -45,19 +50,28 @@ pub(crate) struct StatusCounts {
 
 impl StatusCounts {
     /// Derive counts from the current service/task state maps.
+    ///
+    /// Services in [`ServiceState::Lazy`] are excluded from `services_total`:
+    /// they haven't been started (and may never be, if no connection arrives),
+    /// so counting them makes `N/M services ready` look permanently behind.
+    /// Once a lazy service is triggered it leaves the `Lazy` state and
+    /// rejoins the count.
     pub(crate) fn from_state(
         services: &HashMap<String, ServiceState>,
         tasks: &HashMap<String, TaskItemState>,
     ) -> Self {
-        let mut counts = Self {
-            services_total: services.len(),
-            ..Self::default()
-        };
+        let mut counts = Self::default();
         for state in services.values() {
+            if matches!(state, ServiceState::Lazy) {
+                continue;
+            }
+            counts.services_total += 1;
             match state {
                 ServiceState::Ready => counts.services_ready += 1,
                 ServiceState::Failed => counts.services_failed += 1,
+                ServiceState::Unhealthy => counts.services_unhealthy += 1,
                 ServiceState::Pending
+                | ServiceState::Building
                 | ServiceState::Starting
                 | ServiceState::Running
                 | ServiceState::Stopping => counts.services_active += 1,
@@ -96,6 +110,10 @@ pub(crate) struct App {
     /// in `ServiceState::Pending` so the bar shows `0/N ready` from frame 1.
     pub(crate) services_state: HashMap<String, ServiceState>,
     pub(crate) tasks_state: HashMap<String, TaskItemState>,
+    /// Row offset for the status overlay. Clamped to a valid range at
+    /// render time against the visible area; the key handler can bump it
+    /// freely. Reset to 0 each time the overlay is opened.
+    pub(crate) overlay_scroll: usize,
 }
 
 impl App {
@@ -111,6 +129,10 @@ impl App {
 
         let mut all_filter_names = service_names;
         all_filter_names.extend(task_names);
+        // Expose `[don]` lifecycle events as their own filter entry so the
+        // user can opt in/out explicitly, rather than having them always
+        // bleed through an active filter.
+        all_filter_names.push(LIFECYCLE_EVENT_NAME.to_string());
 
         let counts = StatusCounts::from_state(&services_state, &tasks_state);
 
@@ -122,6 +144,7 @@ impl App {
             spinner_frame: 0,
             services_state,
             tasks_state,
+            overlay_scroll: 0,
         }
     }
 
@@ -178,13 +201,14 @@ mod tests {
                     services_total: 2,
                     services_ready: 2,
                     services_failed: 0,
+                    services_unhealthy: 0,
                     services_active: 0,
                     tasks_running: 0,
                     tasks_pending_run: 0,
                 },
             },
             Case {
-                name: "mixed states",
+                name: "mixed states — lazy excluded from total",
                 services: vec![
                     ("api", ServiceState::Ready),
                     ("db", ServiceState::Failed),
@@ -198,9 +222,10 @@ mod tests {
                     ("build", TaskItemState::Running),
                 ],
                 want: StatusCounts {
-                    services_total: 4,
+                    services_total: 3, // cache (Lazy) doesn't count
                     services_ready: 1,
                     services_failed: 1,
+                    services_unhealthy: 0,
                     services_active: 1, // queue (Starting)
                     tasks_running: 1,   // build
                     tasks_pending_run: 2,
@@ -214,6 +239,7 @@ mod tests {
                     services_total: 1,
                     services_ready: 0,
                     services_failed: 0,
+                    services_unhealthy: 0,
                     services_active: 1,
                     tasks_running: 0,
                     tasks_pending_run: 0,

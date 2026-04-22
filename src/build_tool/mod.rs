@@ -90,3 +90,46 @@ pub(crate) struct BatchBuildResult {
     /// Targets that failed, with error messages.
     pub failed: Vec<(String, String)>,
 }
+
+/// Owns a [`tokio::task::JoinHandle`] and aborts it when dropped, unless
+/// the handle was explicitly extracted via [`Self::into_inner`].
+///
+/// We use this to make the stderr/stdout streaming tasks spawned inside
+/// `build_targets` / `build_packages` cancellable: when the parent future
+/// is dropped (e.g. shutdown mid-build), the streaming tasks must stop
+/// reading and release any senders they hold (typically a
+/// [`crate::output::LifecycleEmitter`] cloned for the on-line callback).
+/// Without that, the stdout sink channel never closes, and
+/// `OutputManager::shutdown` blocks forever waiting on its writer task.
+///
+/// The orphaned bazel/turbo build *action* processes inherit the child's
+/// stdout/stderr fds and can hold them open long after we SIGKILL the
+/// build-tool client, so "EOF on the pipe" is not a reliable wakeup.
+pub(crate) struct AbortOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self { handle: Some(handle) }
+    }
+
+    /// Take the inner handle out, suppressing the abort-on-drop. Use when
+    /// the streaming task is expected to finish naturally (the success
+    /// path, after `child.wait()` returns and the pipes close on their own).
+    ///
+    /// Returns `None` if the handle has already been taken — this never
+    /// happens in practice because the type is constructed with `Some` and
+    /// `take` is only called by this method, which consumes `self`.
+    pub(crate) fn into_inner(mut self) -> Option<tokio::task::JoinHandle<T>> {
+        self.handle.take()
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}

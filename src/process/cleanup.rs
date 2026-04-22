@@ -22,6 +22,10 @@ pub struct CleanupReport {
     pub sock_removed: bool,
     /// Number of Docker containers removed.
     pub containers_removed: usize,
+    /// Non-fatal warnings encountered during cleanup (e.g. "docker socket
+    /// permission denied"). The CLI surfaces these to the user; the daemon
+    /// routes them through its `OutputManager`.
+    pub warnings: Vec<String>,
 }
 
 impl fmt::Display for CleanupReport {
@@ -71,6 +75,7 @@ pub async fn run_cleanup(base_dir: &Path, docker_names: &[String]) -> CleanupRep
         pids_killed: 0,
         sock_removed: false,
         containers_removed: 0,
+        warnings: Vec::new(),
     };
 
     // 1. Scan pid files.
@@ -159,7 +164,9 @@ async fn cleanup_docker_containers(names: &[String], report: &mut CleanupReport)
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("permission") || msg.contains("EACCES") {
-                eprintln!("[don] warning: docker cleanup skipped — permission denied on docker socket");
+                report.warnings.push(
+                    "docker cleanup skipped — permission denied on docker socket".to_string(),
+                );
             }
             // Otherwise Docker is just not installed/running — skip silently.
             return;

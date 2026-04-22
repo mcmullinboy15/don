@@ -127,7 +127,9 @@ fn draw_palette_modal(frame: &mut Frame<'_>, app: &App) {
 }
 
 /// Render the full-screen status overlay — a table of every known service
-/// and task with its current state.
+/// and task with its current state. Scrollable: only the window starting
+/// at `app.overlay_scroll` is drawn, clamped so we don't leave blank rows
+/// below the last entry.
 fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     if area.height == 0 || area.width == 0 {
@@ -164,8 +166,31 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
         }
     }
 
+    // Body height = frame height minus top/bottom borders and the header row.
+    let body_height = area.height.saturating_sub(3) as usize;
+    let total = rows.len();
+    let max_scroll = total.saturating_sub(body_height);
+    let scroll = app.overlay_scroll.min(max_scroll);
+    let showing_more_below = scroll < max_scroll;
+    let showing_more_above = scroll > 0;
+
+    let visible: Vec<Row<'static>> = rows.into_iter().skip(scroll).take(body_height).collect();
+
+    // Hint the user when the table is scrollable. Fits in the title bar so
+    // it doesn't steal a row from the body.
+    let mut title = String::from(" don status — [↑↓/jk] scroll  [esc] dismiss ");
+    if showing_more_above || showing_more_below {
+        let up = if showing_more_above { "↑" } else { " " };
+        let down = if showing_more_below { "↓" } else { " " };
+        title = format!(
+            " don status — [↑↓/jk] scroll  [esc] dismiss  {up}{down} ({}/{}) ",
+            scroll + visible.len(),
+            total,
+        );
+    }
+
     let table = Table::new(
-        rows,
+        visible,
         [
             Constraint::Length(9),
             Constraint::Percentage(40),
@@ -173,11 +198,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
         ],
     )
     .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" don status — [any key] dismiss "),
-    );
+    .block(Block::default().borders(Borders::ALL).title(title));
 
     frame.render_widget(table, area);
 }
@@ -296,7 +317,7 @@ fn normal_bar_line(
         spans.push(bold_green(filter.active_names().join(", ")));
         spans.push(dim("  [esc] clear"));
     } else {
-        spans.push(dim("[l] filter  [a] actions  [s] status  [^C] quit"));
+        spans.push(dim("[l] filter  [a] actions  [s] status  [q] quit"));
     }
     Line::from(spans)
 }
@@ -346,6 +367,8 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
 
     let ready_color = if counts.services_failed > 0 {
         Color::Red
+    } else if counts.services_unhealthy > 0 {
+        Color::LightRed
     } else if counts.services_total > 0 && counts.services_ready == counts.services_total {
         Color::Green
     } else {
@@ -365,6 +388,16 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
             format!("{} failed", counts.services_failed),
             Style::default()
                 .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if counts.services_unhealthy > 0 {
+        spans.push(separator());
+        spans.push(Span::styled(
+            format!("{} unhealthy", counts.services_unhealthy),
+            Style::default()
+                .fg(Color::LightRed)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -390,10 +423,12 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
 fn service_state_label(state: ServiceState) -> &'static str {
     match state {
         ServiceState::Pending => "pending",
+        ServiceState::Building => "building",
         ServiceState::Lazy => "lazy",
         ServiceState::Starting => "starting",
         ServiceState::Running => "running",
         ServiceState::Ready => "ready",
+        ServiceState::Unhealthy => "unhealthy",
         ServiceState::Stopping => "stopping",
         ServiceState::Stopped => "stopped",
         ServiceState::Failed => "failed",
@@ -403,9 +438,13 @@ fn service_state_label(state: ServiceState) -> &'static str {
 fn service_state_color(state: ServiceState) -> Color {
     match state {
         ServiceState::Ready | ServiceState::Running => Color::Green,
-        ServiceState::Starting | ServiceState::Pending | ServiceState::Stopping => Color::Yellow,
+        ServiceState::Starting
+        | ServiceState::Building
+        | ServiceState::Pending
+        | ServiceState::Stopping => Color::Yellow,
         ServiceState::Lazy => Color::Cyan,
         ServiceState::Stopped => Color::DarkGray,
+        ServiceState::Unhealthy => Color::LightRed,
         ServiceState::Failed => Color::Red,
     }
 }
@@ -413,6 +452,7 @@ fn service_state_color(state: ServiceState) -> Color {
 fn task_state_label(state: TaskItemState) -> &'static str {
     match state {
         TaskItemState::Pending => "pending",
+        TaskItemState::Building => "building",
         TaskItemState::Running => "running",
         TaskItemState::Completed => "completed",
         TaskItemState::Skipped => "skipped",
@@ -424,7 +464,7 @@ fn task_state_label(state: TaskItemState) -> &'static str {
 fn task_state_color(state: TaskItemState) -> Color {
     match state {
         TaskItemState::Completed | TaskItemState::Skipped => Color::Green,
-        TaskItemState::Running | TaskItemState::Pending => Color::Yellow,
+        TaskItemState::Running | TaskItemState::Pending | TaskItemState::Building => Color::Yellow,
         TaskItemState::PendingRun => Color::Cyan,
         TaskItemState::Failed => Color::Red,
     }

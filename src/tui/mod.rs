@@ -393,11 +393,17 @@ fn handle_key(
     command_tx: &mpsc::Sender<RunnerCommand>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
-    // Ctrl+C always raises SIGINT, regardless of mode. The installed signal
-    // handler drives graceful shutdown; a second Ctrl+C escalates via the
-    // runner's signal counter.
+    // Ctrl+C: belt-and-suspenders shutdown. We both send a `Shutdown` command
+    // directly down the runner channel AND raise SIGINT. The direct command
+    // works even if the signal handler task has died or isn't being polled
+    // (e.g., the runner is stuck pre-loop), and SIGINT preserves the
+    // two-press force-kill escalation via the runner's signal counter.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if matches!(key.code, KeyCode::Char('c')) {
+            let tx = command_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(RunnerCommand::Shutdown).await;
+            });
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::this(),
                 nix::sys::signal::Signal::SIGINT,
@@ -407,7 +413,7 @@ fn handle_key(
     }
 
     match app.view_mode {
-        ViewMode::Normal => handle_normal_key(key, app, terminal, store, modal)?,
+        ViewMode::Normal => handle_normal_key(key, app, terminal, store, command_tx, modal)?,
         ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
         ViewMode::Palette => handle_palette_key(key, app, terminal, store, command_tx, modal)?,
         ViewMode::Overlay => handle_overlay_key(key, app, terminal, store, modal)?,
@@ -420,6 +426,7 @@ fn handle_normal_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
+    command_tx: &mpsc::Sender<RunnerCommand>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     match key.code {
@@ -430,6 +437,21 @@ fn handle_normal_key(
                 name: String::new(),
                 bytes: Vec::new(),
             });
+        }
+        KeyCode::Char('q') => {
+            // Same belt-and-suspenders as Ctrl+C: command channel works once
+            // the main loop is running; SIGINT works during the slow startup
+            // phase (build-tool resolution / `bazel build`) before the main
+            // loop exists, because the signal handler feeds the dedicated
+            // `shutdown_rx` that the startup-phase `select!` is racing on.
+            let tx = command_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(RunnerCommand::Shutdown).await;
+            });
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::this(),
+                nix::sys::signal::Signal::SIGINT,
+            );
         }
         KeyCode::Char('l') => {
             app.filter.enter_edit();
@@ -446,6 +468,7 @@ fn handle_normal_key(
             *modal = Some(m);
         }
         KeyCode::Char('s') => {
+            app.overlay_scroll = 0;
             app.view_mode = ViewMode::Overlay;
             let mut m = Modal::enter()?;
             m.draw(app)?;
@@ -553,16 +576,47 @@ fn handle_palette_key(
 }
 
 fn handle_overlay_key(
-    _key: KeyEvent,
+    key: KeyEvent,
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
-    // Any key dismisses.
-    app.view_mode = ViewMode::Normal;
-    *modal = None;
-    clear_and_replay(terminal, store, app)?;
+    // Page size is approximate — the render path clamps excessive scrolls,
+    // so being loose here is fine. Matches a typical terminal's PgUp/PgDn.
+    const PAGE: usize = 10;
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.overlay_scroll = app.overlay_scroll.saturating_sub(1);
+            redraw_modal(modal, app)?;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.overlay_scroll = app.overlay_scroll.saturating_add(1);
+            redraw_modal(modal, app)?;
+        }
+        KeyCode::PageUp => {
+            app.overlay_scroll = app.overlay_scroll.saturating_sub(PAGE);
+            redraw_modal(modal, app)?;
+        }
+        KeyCode::PageDown => {
+            app.overlay_scroll = app.overlay_scroll.saturating_add(PAGE);
+            redraw_modal(modal, app)?;
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.overlay_scroll = 0;
+            redraw_modal(modal, app)?;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.overlay_scroll = usize::MAX;
+            redraw_modal(modal, app)?;
+        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') | KeyCode::Enter => {
+            app.view_mode = ViewMode::Normal;
+            *modal = None;
+            clear_and_replay(terminal, store, app)?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -582,21 +636,34 @@ fn redraw_modal(modal: &mut Option<Modal>, app: &App) -> Result<(), TuiError> {
 fn dispatch_action(command_tx: &mpsc::Sender<RunnerCommand>, action: ActionKind) {
     let command_tx = command_tx.clone();
     tokio::spawn(async move {
-        let (reply_tx, _reply_rx) = oneshot::channel();
         let cmd = match action {
-            ActionKind::RunPendingTasks => RunnerCommand::RunPendingTasks { reply: reply_tx },
-            ActionKind::StartService(name) => RunnerCommand::Start {
-                name,
-                reply: reply_tx,
-            },
-            ActionKind::StopService(name) => RunnerCommand::Stop {
-                name,
-                reply: reply_tx,
-            },
-            ActionKind::RestartService(name) => RunnerCommand::Restart {
-                name,
-                reply: reply_tx,
-            },
+            ActionKind::RunPendingTasks => {
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                RunnerCommand::RunPendingTasks { reply: reply_tx }
+            }
+            ActionKind::StartService(name) => {
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                RunnerCommand::Start {
+                    name,
+                    reply: reply_tx,
+                }
+            }
+            ActionKind::StopService(name) => {
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                RunnerCommand::Stop {
+                    name,
+                    reply: reply_tx,
+                }
+            }
+            ActionKind::RestartService(name) => {
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                RunnerCommand::Restart {
+                    name,
+                    reply: reply_tx,
+                }
+            }
+            ActionKind::RebuildService(name) => RunnerCommand::Rebuild { name },
+            ActionKind::RunTask(name) => RunnerCommand::TaskRerun { name },
         };
         let _ = command_tx.send(cmd).await;
     });

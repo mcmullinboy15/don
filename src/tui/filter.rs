@@ -6,12 +6,16 @@
 //! - **Active**: the filter has been committed with Enter. `active_selected`
 //!   is what log lines are checked against.
 //!
-//! Lifecycle events (`name == ""`) always pass regardless of the filter, so
-//! users never miss startup/shutdown messages because they narrowed the view.
+//! Blank spacer lines (`name == ""`, inserted when the user presses Enter
+//! in Normal mode) always pass regardless of the filter — they're UI
+//! whitespace, not log content. `[don]` lifecycle events are *not* special:
+//! they carry the `"don"` name and are gated like any other entry, so a
+//! narrow filter hides them unless the user explicitly selects `don`.
 //!
 //! `all_names` is the source of truth — the union of service and task names
-//! the runner knows about at TUI startup. It doesn't update on live reload;
-//! a config reload that renames services will require Esc'ing the filter.
+//! the runner knows about at TUI startup, plus the synthetic `"don"` entry
+//! for lifecycle events. It doesn't update on live reload; a config reload
+//! that renames services will require Esc'ing the filter.
 
 use std::collections::HashSet;
 
@@ -62,7 +66,8 @@ impl FilterState {
     }
 
     /// True if the given log line name passes the currently-active filter.
-    /// Lifecycle events (empty name) always pass.
+    /// Blank spacer lines (empty name) always pass; everything else — including
+    /// `[don]` lifecycle events — must be in the active selection.
     pub(crate) fn passes(&self, name: &str) -> bool {
         if !self.is_active() {
             return true;
@@ -214,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn active_filter_gates_non_matching_but_passes_lifecycle() {
+    fn active_filter_gates_non_matching_but_passes_spacers() {
         let mut s = state(&["api", "worker", "db"]);
         s.enter_edit();
         s.push_query_char('a');
@@ -223,7 +228,29 @@ mod tests {
         assert!(s.passes("api"));
         assert!(!s.passes("worker"));
         assert!(!s.passes("db"));
-        assert!(s.passes(""), "lifecycle events always pass");
+        assert!(s.passes(""), "blank spacer lines always pass");
+    }
+
+    #[test]
+    fn active_filter_gates_don_lifecycle_unless_selected() {
+        // `"don"` is just another filter entry now — not a special-cased
+        // always-pass. Covers the "hide don's logs unless I explicitly
+        // select them" behavior.
+        let mut s = state(&["api", "don"]);
+        s.enter_edit();
+        s.push_query_char('a'); // matches "api" but not "don"
+        s.commit();
+        assert!(s.passes("api"));
+        assert!(!s.passes("don"), "don gated when not in selection");
+
+        s.enter_edit();
+        // Walk to "don" and toggle it in.
+        while s.matches()[s.highlight()].as_str() != "don" {
+            s.highlight_next();
+        }
+        s.toggle_highlighted();
+        s.commit();
+        assert!(s.passes("don"), "don passes once explicitly selected");
     }
 
     #[test]

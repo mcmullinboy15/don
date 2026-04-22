@@ -126,9 +126,9 @@ fn integration_parallel_services_start_concurrently() {
         );
 
         let output = read_buf(&buf);
-        assert!(output.contains("starting svc-a"), "should start svc-a");
-        assert!(output.contains("starting svc-b"), "should start svc-b");
-        assert!(output.contains("starting svc-c"), "should start svc-c");
+        assert!(output.contains("svc-a: starting"), "should start svc-a");
+        assert!(output.contains("svc-b: starting"), "should start svc-b");
+        assert!(output.contains("svc-c: starting"), "should start svc-c");
     });
 }
 
@@ -173,8 +173,8 @@ fn integration_dependency_ordering_a_before_b() {
         handle.await.unwrap();
         let output = read_buf(&buf);
 
-        let a_start = output.find("starting svc-a");
-        let b_start = output.find("starting svc-b");
+        let a_start = output.find("svc-a: starting");
+        let b_start = output.find("svc-b: starting");
 
         assert!(a_start.is_some(), "svc-a should start: {output}");
         if let (Some(a), Some(b)) = (a_start, b_start) {
@@ -223,8 +223,8 @@ fn integration_task_depends_on_service() {
         handle.await.unwrap();
         let output = read_buf(&buf);
 
-        let svc_start = output.find("starting mydb");
-        let task_run = output.find("running migrate");
+        let svc_start = output.find("mydb: starting");
+        let task_run = output.find("migrate: running");
         assert!(svc_start.is_some(), "mydb should start: {output}");
         assert!(task_run.is_some(), "migrate should run: {output}");
 
@@ -335,6 +335,417 @@ fn integration_exec_ready_check_with_retries() {
     });
 }
 
+// --- Health monitor: unhealthy + auto-restart ---
+
+#[test]
+fn integration_health_monitor_marks_unhealthy_and_auto_restarts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("health-restart");
+
+        // Sentinel-driven exec ready check: passes iff the file exists.
+        // Lets the test flip the service between healthy and unhealthy by
+        // creating/deleting one file.
+        let sentinel = dir.path().join("healthy.flag");
+        std::fs::write(&sentinel, "ok").unwrap();
+
+        let check_script = dir.path().join("check.sh");
+        std::fs::write(
+            &check_script,
+            format!(
+                "#!/bin/sh\n[ -f {} ] && exit 0 || exit 1\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&check_script, PermissionsExt::from_mode(0o755)).unwrap();
+
+        // ConfigBuilder doesn't expose monitor fields — drop to raw TOML.
+        let toml = format!(
+            r#"
+[services.svc]
+run.cmd = "sleep"
+run.args = ["300"]
+log = "ignore"
+on_failure = "restart"
+
+[services.svc.ready]
+exec.cmd = "{}"
+interval = "150ms"
+retries = 20
+monitor = true
+monitor_interval = "150ms"
+unhealthy_after = 2
+"#,
+            check_script.display()
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // Wait for the initial ready event so we know the monitor is running.
+        wait_for_substr(&buf, "ready (exec)", Duration::from_secs(8)).await;
+
+        // Knock the service into Unhealthy by removing the sentinel. With
+        // monitor_interval=150ms and unhealthy_after=2, the transition
+        // should land within ~500ms.
+        std::fs::remove_file(&sentinel).unwrap();
+        wait_for_substr(&buf, "unhealthy", Duration::from_secs(3)).await;
+
+        // First-attempt backoff is 1s. Restore the sentinel during that
+        // window so the auto-restart's new instance can reach Ready and
+        // we get a clean shutdown after.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::fs::write(&sentinel, "ok").unwrap();
+
+        // Verify the auto-restart actually fired (it might not, if the
+        // recovery probe beat the backoff timer — accept either path).
+        let recovered_or_restarted = wait_for_any_substr(
+            &buf,
+            &["auto-restart firing", "recovered"],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            recovered_or_restarted,
+            "expected either auto-restart or recovery: {}",
+            read_buf(&buf)
+        );
+
+        // Let the system settle so the new instance reaches Ready (or the
+        // recovery path emits its event) before tearing down.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let output = read_buf(&buf);
+        // Sequence assertions: initial ready precedes unhealthy, which
+        // precedes either the recovery event or the auto-restart attempt.
+        let ready_pos = output.find("ready (exec)").expect("initial ready");
+        let unhealthy_pos = output[ready_pos..]
+            .find("unhealthy")
+            .map(|p| p + ready_pos)
+            .expect("unhealthy after ready");
+        let restart_pos = output[unhealthy_pos..]
+            .find("auto-restart firing")
+            .map(|p| p + unhealthy_pos);
+        let recover_pos = output[unhealthy_pos..]
+            .find("recovered")
+            .map(|p| p + unhealthy_pos);
+        assert!(
+            restart_pos.is_some() || recover_pos.is_some(),
+            "expected auto-restart or recovery after unhealthy: {output}"
+        );
+    });
+}
+
+/// Poll the test buffer for a substring, panicking on timeout. Used to
+/// synchronize between the test and the runner without sleep-and-pray.
+async fn wait_for_substr(buf: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if read_buf(buf).contains(needle) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timeout waiting for {needle:?} in output:\n{}",
+                read_buf(buf)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Variant that returns true on the first matching needle, false on timeout.
+async fn wait_for_any_substr(
+    buf: &Arc<Mutex<Vec<u8>>>,
+    needles: &[&str],
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let snapshot = read_buf(buf);
+        if needles.iter().any(|n| snapshot.contains(n)) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+// --- Crash detection + on_failure policy ---
+
+#[test]
+fn integration_clean_exit_status_zero_marks_stopped_not_failed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("clean-exit");
+        let port = free_port();
+
+        // Service that opens its ready port, sleeps long enough for the
+        // ready check to pass, then exits 0 — i.e. simulates a long-
+        // running service that decides to terminate cleanly.
+        let script = dir.path().join("script.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(1.5)\n\" \n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, PermissionsExt::from_mode(0o755)).unwrap();
+
+        // on_failure = "restart" — but exit 0 should bypass the restart
+        // policy entirely, so we should *not* see auto-restart fire.
+        let toml = format!(
+            r#"
+[services.cleanly]
+run.cmd = "{}"
+log = "ignore"
+on_failure = "restart"
+
+[services.cleanly.ready]
+tcp = "127.0.0.1:{port}"
+interval = "100ms"
+retries = 30
+"#,
+            script.display()
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(&buf, "ready (tcp", Duration::from_secs(8)).await;
+        wait_for_substr(&buf, "exited cleanly (status 0)", Duration::from_secs(5)).await;
+
+        // Give the system a beat to make sure no auto-restart sneaks in.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let output = read_buf(&buf);
+        assert!(
+            !output.contains("auto-restart"),
+            "exit 0 must not trigger auto-restart even with on_failure=restart: {output}"
+        );
+        assert!(
+            !output.contains("exited unexpectedly"),
+            "exit 0 must not be reported as unexpected: {output}"
+        );
+    });
+}
+
+#[test]
+fn integration_crash_triggers_auto_restart_when_on_failure_restart() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("crash-restart");
+        let port = free_port();
+
+        // Tracks how many times the service was launched. Each launch
+        // crashes (exit 7) after the ready check passes — proving that
+        // on_failure = restart actually re-spawns after a crash.
+        let counter = dir.path().join("launches");
+        std::fs::write(&counter, "0").unwrap();
+
+        let script = dir.path().join("crash-and-count.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 N=$(cat {ctr})\n\
+                 N=$((N + 1))\n\
+                 echo $N > {ctr}\n\
+                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(0.8)\n\" \n\
+                 exit 7\n",
+                ctr = counter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let toml = format!(
+            r#"
+[services.crashy]
+run.cmd = "{}"
+log = "ignore"
+on_failure = "restart"
+
+[services.crashy.ready]
+tcp = "127.0.0.1:{port}"
+interval = "100ms"
+retries = 30
+"#,
+            script.display()
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // First launch reaches ready, then exits 7 → handler emits the
+        // unexpected-exit event AND schedules an auto-restart at attempt 1
+        // (1s backoff). The "auto-restart firing" event then fires.
+        wait_for_substr(
+            &buf,
+            "exited unexpectedly with status 7",
+            Duration::from_secs(8),
+        )
+        .await;
+        wait_for_substr(
+            &buf,
+            "auto-restart firing (attempt 1)",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        // Give the new instance time to launch and the script time to bump
+        // the counter past 1 — proving an actual respawn happened.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let launches: i32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            launches >= 2,
+            "expected the auto-restart to launch the script at least twice, got {launches}"
+        );
+    });
+}
+
+// --- Crash detection ---
+
+#[test]
+fn integration_crash_after_ready_marks_failed_with_exit_code() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("crash-detect");
+
+        // A service that:
+        //   1. opens the ready-check port,
+        //   2. sleeps briefly so the ready check passes and we observe Ready,
+        //   3. exits with status 42.
+        // Using `sh -c` keeps the script self-contained and exit-code-honest
+        // (no signal complications).
+        let port = free_port();
+        let crash_script = dir.path().join("crash.sh");
+        std::fs::write(
+            &crash_script,
+            format!(
+                "#!/bin/sh\n\
+                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(1.5)\n\" \n\
+                 exit 42\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&crash_script, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("crashy", crash_script.to_str().unwrap(), &[])
+            .ready_tcp_with(&format!("127.0.0.1:{port}"), "100ms", 30)
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // Wait for ready, then for the unexpected-exit lifecycle event.
+        wait_for_substr(&buf, "ready (tcp", Duration::from_secs(8)).await;
+        wait_for_substr(
+            &buf,
+            "exited unexpectedly with status 42",
+            Duration::from_secs(8),
+        )
+        .await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let output = read_buf(&buf);
+        let ready_pos = output.find("ready (tcp").expect("ready event");
+        let exit_pos = output[ready_pos..]
+            .find("exited unexpectedly with status 42")
+            .expect("exit event after ready");
+        // Sanity: the exit event must come after Ready. (find returns
+        // an offset within the slice — non-zero means it followed.)
+        assert!(exit_pos > 0, "crash event should follow ready: {output}");
+    });
+}
+
+#[test]
+fn integration_graceful_stop_does_not_emit_crash_event() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("graceful-stop-no-crash");
+        let port = free_port();
+
+        let listen_script = dir.path().join("listen.sh");
+        std::fs::write(
+            &listen_script,
+            format!(
+                "#!/bin/sh\nexec python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\nwhile True: time.sleep(60)\n\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &listen_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("svc", listen_script.to_str().unwrap(), &[])
+            .ready_tcp_with(&format!("127.0.0.1:{port}"), "100ms", 30)
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(&buf, "ready (tcp", Duration::from_secs(8)).await;
+
+        // Graceful runner shutdown — service is killed by stop_service,
+        // which reaps the child itself. The crash watcher's EOF arrives
+        // after the runner already transitioned the service away from
+        // Ready/Unhealthy, so the handler must short-circuit and not log
+        // an "exited unexpectedly" event.
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let output = read_buf(&buf);
+        assert!(
+            !output.contains("exited unexpectedly"),
+            "graceful shutdown should not log a crash event: {output}"
+        );
+    });
+}
+
 // --- Ready check exhaustion ---
 
 #[test]
@@ -438,11 +849,11 @@ fn integration_task_watch_run_on_change() {
 
         let output = read_buf(&buf);
         assert!(
-            output.contains("running migrate") && !output.contains("skipped"),
+            output.contains("migrate: running") && !output.contains("skipped"),
             "task should run when files changed: {output}"
         );
         assert!(
-            output.contains("migrate complete"),
+            output.contains("migrate: complete"),
             "task should complete: {output}"
         );
     });

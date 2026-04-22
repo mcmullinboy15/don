@@ -106,12 +106,13 @@ fn integration_service_receives_listen_env_vars() {
         let port = free_port();
         let addr = format!("127.0.0.1:{port}");
 
-        // Service prints its LISTEN_FDS, LISTEN_FDNAMES, and LISTEN_PID env vars.
+        // Service prints its LISTEN_FDS, LISTEN_FDNAMES, LISTEN_PID, and its own
+        // $$ PID so the test can verify LISTEN_PID matches the child process.
         let toml = ConfigBuilder::new()
             .add_custom_service(
                 "api",
                 "bash",
-                &["-c", "echo LISTEN_FDS=$LISTEN_FDS LISTEN_FDNAMES=$LISTEN_FDNAMES LISTEN_PID=$LISTEN_PID && sleep 60"],
+                &["-c", "echo LISTEN_FDS=$LISTEN_FDS LISTEN_FDNAMES=$LISTEN_FDNAMES LISTEN_PID=$LISTEN_PID SELF_PID=$$ && sleep 60"],
             )
             .listen(&[&addr])
             .ready_exec("true", &[])
@@ -136,10 +137,26 @@ fn integration_service_receives_listen_env_vars() {
             output.contains(&format!("LISTEN_FDNAMES={addr}")),
             "expected LISTEN_FDNAMES={addr} in output. output: {output}"
         );
-        // LISTEN_PID should be present and non-empty.
+        // LISTEN_PID must equal the child's own PID per the systemd socket
+        // activation protocol. Extract both from the child's stdout and
+        // compare. A previous version of the code set LISTEN_PID via
+        // `setenv` in pre_exec, which the explicit envp in Rust's `execve`
+        // silently discarded, leaving the value empty.
+        fn extract(out: &str, key: &str) -> String {
+            out.split_whitespace()
+                .find_map(|tok| tok.strip_prefix(key))
+                .unwrap_or("")
+                .to_string()
+        }
+        let listen_pid = extract(&output, "LISTEN_PID=");
+        let self_pid = extract(&output, "SELF_PID=");
         assert!(
-            output.contains("LISTEN_PID="),
-            "expected LISTEN_PID in output. output: {output}"
+            !listen_pid.is_empty() && listen_pid.chars().all(|c| c.is_ascii_digit()),
+            "LISTEN_PID must be a non-empty numeric PID, got '{listen_pid}'. output: {output}"
+        );
+        assert_eq!(
+            listen_pid, self_pid,
+            "LISTEN_PID must match the child process's own PID. output: {output}"
         );
 
         let _ = shutdown_tx.send(()).await;
@@ -248,8 +265,8 @@ fn integration_socket_stays_bound_during_restart() {
         });
 
         assert!(
-            wait_for_output(&buf, "bound 1 listen socket", Duration::from_secs(5)).await,
-            "timed out waiting for socket bind. output: {}",
+            wait_for_output(&buf, &format!("proxy listening on {addr}"), Duration::from_secs(5)).await,
+            "timed out waiting for proxy bind. output: {}",
             read_buf(&buf)
         );
         assert!(
@@ -432,6 +449,69 @@ fn integration_multiple_listen_addresses() {
         let c2 = tokio::net::TcpStream::connect(&addr2).await;
         assert!(c1.is_ok(), "expected connect to {addr1} to succeed");
         assert!(c2.is_ok(), "expected connect to {addr2} to succeed");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+// --- Integration test: lazy + listenfd triggers on a connection ---
+//
+// Exercises the POLLIN-based lazy path: don binds the public listener,
+// doesn't accept, and only starts the service when a queued connection
+// shows up. This is what `listen = [...]` used to *not* support.
+
+#[test]
+fn integration_lazy_listenfd_triggers_on_connect() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("lazy-listenfd");
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "api",
+                "bash",
+                &["-c", "echo LISTEN_PID=$$ SELF=$$ && sleep 60"],
+            )
+            .proxy_listenfd(&[&addr])
+            .lazy(true)
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // Service is lazy — proxy binds, but the service should NOT start
+        // until we connect. Give it a moment, then assert nothing started.
+        assert!(
+            wait_for_output(&buf, &format!("proxy listening on {addr}"), Duration::from_secs(5)).await,
+            "expected proxy to bind. output: {}",
+            read_buf(&buf)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !read_buf(&buf).contains("api: starting"),
+            "lazy service started without a trigger. output: {}",
+            read_buf(&buf)
+        );
+
+        // Opening a connection must trigger start via POLLIN.
+        let _stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        assert!(
+            wait_for_output(&buf, "first connection", Duration::from_secs(5)).await,
+            "expected lazy trigger on connect. output: {}",
+            read_buf(&buf)
+        );
+        assert!(
+            wait_for_output(&buf, "api: ready", Duration::from_secs(5)).await,
+            "expected service to reach ready after lazy trigger. output: {}",
+            read_buf(&buf)
+        );
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

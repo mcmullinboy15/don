@@ -754,7 +754,7 @@ fn config_reload_add_dep_of_existing_service() {
         // api should restart with the new env after db becomes ready and
         // the deferred StartPending fires. Wait for api to become ready.
         assert!(
-            wait_for_output(&buf, "api ready", Duration::from_secs(5)).await,
+            wait_for_output(&buf, "api: ready", Duration::from_secs(5)).await,
             "expected api to restart and become ready. output: {}",
             read_buf(&buf)
         );

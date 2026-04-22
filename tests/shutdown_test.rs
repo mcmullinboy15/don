@@ -146,10 +146,10 @@ fn shutdown_reverse_dependency_order() {
 
         let output = read_buf(&buf);
 
-        // Find the positions of "stopping X..." messages to verify order.
-        let c_stop = output.find("stopping c...");
-        let b_stop = output.find("stopping b...");
-        let a_stop = output.find("stopping a...");
+        // Find the positions of "X: stopping..." messages to verify order.
+        let c_stop = output.find("c: stopping...");
+        let b_stop = output.find("b: stopping...");
+        let a_stop = output.find("a: stopping...");
 
         assert!(c_stop.is_some(), "c should be stopped. output: {output}");
         assert!(b_stop.is_some(), "b should be stopped. output: {output}");
@@ -236,7 +236,7 @@ fn shutdown_kills_running_task() {
 
         let (shutdown_tx, handle, buf) = spawn_runner(&toml, dir.path()).await;
         // Wait for the service to be ready (task may still be running).
-        assert!(wait_for_output(&buf, "keeper ready", Duration::from_secs(5)).await);
+        assert!(wait_for_output(&buf, "keeper: ready", Duration::from_secs(5)).await);
         // Give the task a moment to start.
         tokio::time::sleep(Duration::from_millis(300)).await;
 

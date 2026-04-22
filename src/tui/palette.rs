@@ -33,6 +33,10 @@ pub(crate) enum ActionKind {
     StartService(String),
     StopService(String),
     RestartService(String),
+    /// Re-run the build command (if any), then restart. Distinct from
+    /// `RestartService`, which skips the build step.
+    RebuildService(String),
+    RunTask(String),
 }
 
 /// Palette state — only meaningful while view_mode == Palette, but lives on
@@ -153,6 +157,10 @@ impl ActionPalette {
 /// 1. "Run all pending tasks" if any task is in [`PendingRun`](TaskItemState::PendingRun).
 /// 2. Per-service actions, sorted alphabetically by service name, with
 ///    action set varying by state.
+/// 3. Per-task run actions, sorted alphabetically. Running tasks are skipped
+///    to avoid double-spawning; every other state is runnable, with a
+///    `(needs run)` suffix for states that indicate the user should run it
+///    (`Pending`, `Failed`, `PendingRun`).
 pub(crate) fn build_actions(
     services: &HashMap<String, ServiceState>,
     tasks: &HashMap<String, TaskItemState>,
@@ -177,10 +185,14 @@ pub(crate) fn build_actions(
             continue;
         };
         match state {
-            ServiceState::Ready | ServiceState::Running => {
+            ServiceState::Ready | ServiceState::Running | ServiceState::Unhealthy => {
                 actions.push(Action {
                     label: format!("Restart {name}"),
                     kind: ActionKind::RestartService(name.clone()),
+                });
+                actions.push(Action {
+                    label: format!("Rebuild {name}"),
+                    kind: ActionKind::RebuildService(name.clone()),
                 });
                 actions.push(Action {
                     label: format!("Stop {name}"),
@@ -192,8 +204,13 @@ pub(crate) fn build_actions(
                     label: format!("Start {name}"),
                     kind: ActionKind::StartService(name.clone()),
                 });
+                actions.push(Action {
+                    label: format!("Rebuild {name}"),
+                    kind: ActionKind::RebuildService(name.clone()),
+                });
             }
             ServiceState::Pending
+            | ServiceState::Building
             | ServiceState::Lazy
             | ServiceState::Starting
             | ServiceState::Stopping => {
@@ -201,6 +218,25 @@ pub(crate) fn build_actions(
                 // transitions would race with the ongoing lifecycle operation.
             }
         }
+    }
+
+    let mut task_names: Vec<&String> = tasks.keys().collect();
+    task_names.sort();
+    for name in task_names {
+        let Some(state) = tasks.get(name) else {
+            continue;
+        };
+        let suffix = match state {
+            TaskItemState::Running | TaskItemState::Building => continue,
+            TaskItemState::Pending | TaskItemState::Failed | TaskItemState::PendingRun => {
+                " (needs run)"
+            }
+            TaskItemState::Completed | TaskItemState::Skipped => "",
+        };
+        actions.push(Action {
+            label: format!("Run {name}{suffix}"),
+            kind: ActionKind::RunTask(name.clone()),
+        });
     }
 
     actions
@@ -236,16 +272,16 @@ mod tests {
                 want_labels: vec![],
             },
             Case {
-                name: "one ready service → restart + stop",
+                name: "one ready service → restart + rebuild + stop",
                 services: vec![("api", ServiceState::Ready)],
                 tasks: vec![],
-                want_labels: vec!["Restart api", "Stop api"],
+                want_labels: vec!["Restart api", "Rebuild api", "Stop api"],
             },
             Case {
-                name: "stopped service → start",
+                name: "stopped service → start + rebuild",
                 services: vec![("worker", ServiceState::Stopped)],
                 tasks: vec![],
-                want_labels: vec!["Start worker"],
+                want_labels: vec!["Start worker", "Rebuild worker"],
             },
             Case {
                 name: "in-flight states offer nothing",
@@ -265,7 +301,42 @@ mod tests {
                     ("migrate", TaskItemState::PendingRun),
                     ("seed", TaskItemState::PendingRun),
                 ],
-                want_labels: vec!["Run all pending tasks (2)", "Restart api", "Stop api"],
+                want_labels: vec![
+                    "Run all pending tasks (2)",
+                    "Restart api",
+                    "Rebuild api",
+                    "Stop api",
+                    "Run migrate (needs run)",
+                    "Run seed (needs run)",
+                ],
+            },
+            Case {
+                name: "every task is runnable with per-state suffix",
+                services: vec![],
+                tasks: vec![
+                    ("a_pending", TaskItemState::Pending),
+                    ("b_completed", TaskItemState::Completed),
+                    ("c_skipped", TaskItemState::Skipped),
+                    ("d_failed", TaskItemState::Failed),
+                    ("e_pending_run", TaskItemState::PendingRun),
+                ],
+                want_labels: vec![
+                    "Run all pending tasks (1)",
+                    "Run a_pending (needs run)",
+                    "Run b_completed",
+                    "Run c_skipped",
+                    "Run d_failed (needs run)",
+                    "Run e_pending_run (needs run)",
+                ],
+            },
+            Case {
+                name: "running tasks are skipped to avoid double-spawn",
+                services: vec![],
+                tasks: vec![
+                    ("build", TaskItemState::Running),
+                    ("lint", TaskItemState::Completed),
+                ],
+                want_labels: vec!["Run lint"],
             },
             Case {
                 name: "services sorted alphabetically",
@@ -274,7 +345,14 @@ mod tests {
                     ("api", ServiceState::Ready),
                 ],
                 tasks: vec![],
-                want_labels: vec!["Restart api", "Stop api", "Restart worker", "Stop worker"],
+                want_labels: vec![
+                    "Restart api",
+                    "Rebuild api",
+                    "Stop api",
+                    "Restart worker",
+                    "Rebuild worker",
+                    "Stop worker",
+                ],
             },
         ];
 
@@ -295,27 +373,29 @@ mod tests {
             ]),
             &tasks(&[]),
         );
-        // Actions: Restart api, Stop api, Restart worker, Stop worker
-        assert_eq!(p.visible_count(), 4);
+        // 6 actions per ready service: Restart, Rebuild, Stop ×2 services.
+        // The `w` query narrows to the worker triplet plus visible cap.
+        assert_eq!(p.visible_count(), 6);
         p.push_query_char('w');
         let labels: Vec<&str> = p.visible().map(|(_, a)| a.label.as_str()).collect();
-        // Both worker labels match; fuzzy ranking is position-based, so the
-        // label with 'w' closer to the start ("Stop worker") ranks higher.
-        // The exact tie-break order is an implementation detail — we just
-        // assert we got both and nothing else.
+        // All three worker labels match; ranking order is an implementation
+        // detail of the fuzzy matcher — just assert the matched set.
         let mut sorted = labels.clone();
         sorted.sort();
-        assert_eq!(sorted, vec!["Restart worker", "Stop worker"]);
+        assert_eq!(
+            sorted,
+            vec!["Rebuild worker", "Restart worker", "Stop worker"]
+        );
     }
 
     #[test]
     fn palette_highlight_wraps() {
         let mut p = ActionPalette::default();
         p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]));
-        // 2 actions: Restart api, Stop api
+        // 3 actions: Restart api, Rebuild api, Stop api.
         assert_eq!(p.highlight(), 0);
         p.highlight_prev();
-        assert_eq!(p.highlight(), 1);
+        assert_eq!(p.highlight(), 2);
         p.highlight_next();
         assert_eq!(p.highlight(), 0);
     }
@@ -349,14 +429,14 @@ mod tests {
             ]),
             &tasks(&[]),
         );
-        // 4 actions total. Highlight the last.
-        for _ in 0..3 {
+        // 6 actions total (Restart, Rebuild, Stop ×2). Highlight the last.
+        for _ in 0..5 {
             p.highlight_next();
         }
-        assert_eq!(p.highlight(), 3);
-        // Typing 'w' narrows to 2 matches — highlight must clamp to 0.
+        assert_eq!(p.highlight(), 5);
+        // Typing 'w' narrows to the worker triplet — highlight must clamp to 0.
         p.push_query_char('w');
-        assert_eq!(p.visible_count(), 2);
+        assert_eq!(p.visible_count(), 3);
         assert_eq!(p.highlight(), 0);
     }
 }

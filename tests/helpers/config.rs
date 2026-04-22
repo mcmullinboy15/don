@@ -214,17 +214,43 @@ impl ServiceBuilder {
         self
     }
 
-    /// Set listen addresses.
-    pub fn listen(mut self, addrs: &[&str]) -> Self {
-        let a_str: Vec<String> = addrs.iter().map(|a| format!("\"{a}\"")).collect();
+    /// Add listenfd-mode proxy entries (shorthand form). Each address
+    /// becomes `proxy = { listen = "…", listenfd = true }` — don binds
+    /// and hands the fd to the child via `LISTEN_FDS`.
+    pub fn listen(self, addrs: &[&str]) -> Self {
+        self.proxy_listenfd(addrs)
+    }
+
+    /// Add listenfd-mode proxy entries. Equivalent to
+    /// `proxy = [{ listen = "...", listenfd = true }, ...]`.
+    pub fn proxy_listenfd(mut self, addrs: &[&str]) -> Self {
+        let entries: Vec<String> = addrs
+            .iter()
+            .map(|a| format!("{{ listen = \"{a}\", listenfd = true }}"))
+            .collect();
         self.lines
-            .push(format!("listen = [{}]", a_str.join(", ")));
+            .push(format!("proxy = [{}]", entries.join(", ")));
+        self
+    }
+
+    /// Add an env-mode proxy entry. Don accepts on `addr` and injects the
+    /// ephemeral backend port into the service's environment as `env_name`.
+    pub fn proxy_env(mut self, addr: &str, env_name: &str) -> Self {
+        self.lines.push(format!(
+            "proxy = {{ listen = \"{addr}\", env = \"{env_name}\" }}"
+        ));
         self
     }
 
     /// Set reload (whether don watches files and rebuilds/restarts this service).
     pub fn reload(mut self, value: bool) -> Self {
         self.lines.push(format!("reload = {value}"));
+        self
+    }
+
+    /// Mark this service as lazy.
+    pub fn lazy(mut self, value: bool) -> Self {
+        self.lines.push(format!("lazy = {value}"));
         self
     }
 

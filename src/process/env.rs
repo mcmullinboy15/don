@@ -156,6 +156,44 @@ pub fn merge_env(
     let mut merged: HashMap<String, String> = std::env::vars().collect();
     let mut all_warnings = Vec::new();
 
+    // If don itself was launched via `bazel run` (e.g. a
+    // `//tools/service-manager:local` target that wraps don), bazel
+    // populated the env with RUNFILES_DIR / RUNFILES_MANIFEST_FILE /
+    // JAVA_RUNFILES / exported `BASH_FUNC_runfiles_*` helpers describing
+    // DON'S runfiles. Passing those through to a bazel-built service's
+    // launcher is disastrous: the service's `runfiles.bash` init sees
+    // RUNFILES_MANIFEST_FILE already set and uses don's manifest, so
+    // `rlocation` returns empty strings for the service's files and the
+    // launcher fails with `. "": No such file or directory`.
+    //
+    // Strip anything bazel-runfiles-related so the spawned service's own
+    // launcher falls through to `$0.runfiles/` discovery correctly.
+    //
+    // The catches here:
+    // - `runfiles` substring: `RUNFILES_DIR`, `RUNFILES_MANIFEST_FILE`,
+    //   `JAVA_RUNFILES`, `BASH_FUNC_runfiles_*` (exported bash helpers).
+    // - `rlocation` substring: `BASH_FUNC_rlocation%%` (exported function),
+    //   `_RLOCATION_ISABS_PATTERN`, `_RLOCATION_GREP_CASE_INSENSITIVE_ARGS`
+    //   (internals used by runfiles.bash).
+    // - per-invocation bazel state: `BUILD_ID`, `BUILD_RANDOM`,
+    //   `BUILD_EXECROOT`, `BUILD_WORKING_DIRECTORY`. These describe don's
+    //   own bazel invocation and would mislead any child that consults
+    //   them. `BUILD_WORKSPACE_DIRECTORY` is intentionally kept — it's
+    //   the shared source-tree root and remains correct for children.
+    // - `TEST_SRCDIR`: bazel's runfiles pointer in test contexts.
+    merged.retain(|k, _| {
+        let lk = k.to_ascii_lowercase();
+        let bazel_state = matches!(
+            lk.as_str(),
+            "build_id"
+                | "build_random"
+                | "build_execroot"
+                | "build_working_directory"
+                | "test_srcdir"
+        );
+        !(lk.contains("runfiles") || lk.contains("rlocation") || bazel_state)
+    });
+
     // 1. Auto-load .env.<service_name> if it exists
     let dir = service_dir.unwrap_or_else(|| Path::new("."));
     let auto_path = dir.join(format!(".env.{service_name}"));

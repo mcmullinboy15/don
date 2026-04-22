@@ -9,8 +9,8 @@ fn default_true() -> bool {
 }
 use super::platform::Platform;
 use super::types::{
-    BazelConfig, Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig, TurboConfig,
-    deserialize_proxy, deserialize_proxy_option,
+    BazelConfig, Command, LogConfig, OnFailure, ProxyEntry, ReadyCheck, ShutdownConfig,
+    TurboConfig, deserialize_proxy, deserialize_proxy_option,
 };
 
 /// The kind of service — exactly one of these must be set.
@@ -37,7 +37,7 @@ pub enum ServiceKind {
 }
 
 /// A long-running service. Uses exactly one kind: bazel, turbo, docker, rust, go, or custom (run).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Service {
     /// Working directory for the service. Defaults to the current directory.
     pub dir: Option<PathBuf>,
@@ -53,15 +53,13 @@ pub struct Service {
     pub debounce: Option<String>,
     /// Services that must be started before this one.
     pub depends_on: Vec<String>,
-    /// Addresses for don to listen on and pass to the service via LISTEN_FDS.
-    /// Don holds the sockets open across restarts so traffic is never dropped.
-    /// Mutually exclusive with `proxy`.
-    pub listen: Vec<String>,
-    /// Proxy entries: Don listens on these addresses and forwards TCP connections
-    /// to the service on random ephemeral ports. Mutually exclusive with `listen`.
+    /// Proxy entries: Don binds each entry's `listen` address and either
+    /// forwards to an ephemeral backend port (env mode) or hands the bound
+    /// listener to the service via `LISTEN_FDS` (listenfd mode). Don holds
+    /// the listeners across restarts so traffic is never dropped.
     pub proxy: Vec<ProxyEntry>,
-    /// If true, don't start the service until the first connection arrives on a
-    /// proxy address. Requires `proxy` to be set.
+    /// If true, don't start the service until the first connection arrives on
+    /// a proxy address. Requires at least one proxy entry.
     pub lazy: bool,
     /// Optional binary download configuration for this service.
     pub download: Option<DownloadConfig>,
@@ -75,6 +73,10 @@ pub struct Service {
     /// Defaults to `true`. Set to `false` for services that handle their own
     /// hot-reloading internally (e.g. vite, webpack dev server).
     pub reload: bool,
+    /// What to do when this service fails — either marked `Unhealthy` by the
+    /// health monitor or exits with a non-zero status. Defaults to `Notify`.
+    /// `Restart` reuses the same backoff machinery for both kinds of failure.
+    pub on_failure: OnFailure,
     /// Per-platform overrides. If the current platform has an entry here,
     /// its fields are merged on top of the base service config.
     pub platform: HashMap<Platform, ServiceOverride>,
@@ -100,8 +102,6 @@ struct RawService {
     debounce: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
-    #[serde(default)]
-    listen: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_proxy")]
     proxy: Vec<ProxyEntry>,
     #[serde(default)]
@@ -113,6 +113,8 @@ struct RawService {
     log: LogConfig,
     #[serde(default = "default_true")]
     reload: bool,
+    #[serde(default)]
+    on_failure: OnFailure,
     #[serde(default)]
     platform: HashMap<Platform, ServiceOverride>,
 
@@ -187,7 +189,6 @@ impl TryFrom<RawService> for Service {
             ignore: raw.ignore,
             debounce: raw.debounce,
             depends_on: raw.depends_on,
-            listen: raw.listen,
             proxy: raw.proxy,
             lazy: raw.lazy,
             download: raw.download,
@@ -195,6 +196,7 @@ impl TryFrom<RawService> for Service {
             shutdown: raw.shutdown,
             log: raw.log,
             reload: raw.reload,
+            on_failure: raw.on_failure,
             platform: raw.platform,
             kind,
         })
@@ -214,7 +216,7 @@ impl<'de> Deserialize<'de> for Service {
 /// Platform-specific overrides for a service. Any field set here replaces the
 /// corresponding base field. For `env`, entries are merged (override wins on conflict).
 /// If a kind field (docker/rust/run/etc.) is set, it completely replaces the base kind.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServiceOverride {
     pub dir: Option<PathBuf>,
     pub env: HashMap<String, String>,
@@ -223,7 +225,6 @@ pub struct ServiceOverride {
     pub ignore: Option<Vec<String>>,
     pub debounce: Option<String>,
     pub depends_on: Option<Vec<String>>,
-    pub listen: Option<Vec<String>>,
     pub proxy: Option<Vec<ProxyEntry>>,
     pub lazy: Option<bool>,
     pub download: Option<DownloadConfig>,
@@ -231,6 +232,7 @@ pub struct ServiceOverride {
     pub shutdown: Option<ShutdownConfig>,
     pub log: Option<LogConfig>,
     pub reload: Option<bool>,
+    pub on_failure: Option<OnFailure>,
 
     /// If set, completely replaces the base service kind.
     pub kind: Option<ServiceKind>,
@@ -247,7 +249,6 @@ struct RawServiceOverride {
     ignore: Option<Vec<String>>,
     debounce: Option<String>,
     depends_on: Option<Vec<String>>,
-    listen: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_proxy_option")]
     proxy: Option<Vec<ProxyEntry>>,
     lazy: Option<bool>,
@@ -256,6 +257,7 @@ struct RawServiceOverride {
     shutdown: Option<ShutdownConfig>,
     log: Option<LogConfig>,
     reload: Option<bool>,
+    on_failure: Option<OnFailure>,
 
     bazel: Option<BazelConfig>,
     turbo: Option<TurboConfig>,
@@ -282,7 +284,6 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             ignore: raw.ignore,
             debounce: raw.debounce,
             depends_on: raw.depends_on,
-            listen: raw.listen,
             proxy: raw.proxy,
             lazy: raw.lazy,
             download: raw.download,
@@ -290,6 +291,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             shutdown: raw.shutdown,
             log: raw.log,
             reload: raw.reload,
+            on_failure: raw.on_failure,
             kind,
         })
     }
@@ -315,7 +317,6 @@ pub struct ResolvedService {
     pub ignore: Vec<String>,
     pub debounce: Option<String>,
     pub depends_on: Vec<String>,
-    pub listen: Vec<String>,
     pub proxy: Vec<ProxyEntry>,
     pub lazy: bool,
     pub download: Option<DownloadConfig>,
@@ -324,10 +325,26 @@ pub struct ResolvedService {
     pub log: LogConfig,
     /// Whether don should watch files and rebuild/restart this service on changes.
     pub reload: bool,
+    /// What to do when this service fails (Unhealthy or non-zero crash).
+    pub on_failure: OnFailure,
 
     /// The resolved service kind. `None` only if validation hasn't caught
     /// a missing preset (shouldn't happen after validation).
     pub kind: Option<ServiceKind>,
+
+    /// For Bazel services: the absolute path to the target's built binary,
+    /// resolved via `bazel cquery --output=files` after the startup batch
+    /// build. When `Some`, the spawn path launches this binary directly
+    /// instead of going through `bazel run`, which skips bazel's per-launch
+    /// analysis overhead. `None` means the binary path wasn't resolved yet
+    /// (e.g. lazy service pre-first-connection) and the spawn path falls
+    /// back to `bazel run <target>`.
+    ///
+    /// The kind is NOT rewritten to `Custom` when this is set — leaving it
+    /// as `Bazel` keeps `is_build_tool_managed()` truthful so file-watch
+    /// rebuilds correctly route through the batch-build path and actually
+    /// re-invoke `bazel build` on source changes.
+    pub resolved_binary_path: Option<String>,
 }
 
 /// Docker container configuration.
@@ -417,16 +434,10 @@ impl Service {
         bazel_binary: &str,
     ) -> ResolvedService {
         let mut resolved = self.resolve_inner(platform);
-        // Override the kind to Custom with the resolved binary path.
-        // Preserve the original Bazel config in case we need it later.
+        // Only attach the binary path for Bazel services — for any other
+        // kind this accessor is a no-op (shouldn't be called, but defensive).
         if matches!(resolved.kind, Some(ServiceKind::Bazel(_))) {
-            resolved.kind = Some(ServiceKind::Custom {
-                run: Command {
-                    cmd: bazel_binary.to_string(),
-                    args: Vec::new(),
-                },
-                build: None,
-            });
+            resolved.resolved_binary_path = Some(bazel_binary.to_string());
         }
         resolved
     }
@@ -441,7 +452,6 @@ impl Service {
                 ignore: self.ignore.clone(),
                 debounce: self.debounce.clone(),
                 depends_on: self.depends_on.clone(),
-                listen: self.listen.clone(),
                 proxy: self.proxy.clone(),
                 lazy: self.lazy,
                 download: self.download.clone(),
@@ -449,7 +459,9 @@ impl Service {
                 shutdown: self.shutdown.clone(),
                 log: self.log.clone(),
                 reload: self.reload,
+                on_failure: self.on_failure,
                 kind: self.kind.clone(),
+                resolved_binary_path: None,
             },
             Some(ov) => {
                 let mut env = self.env.clone();
@@ -473,7 +485,6 @@ impl Service {
                         .depends_on
                         .clone()
                         .unwrap_or_else(|| self.depends_on.clone()),
-                    listen: ov.listen.clone().unwrap_or_else(|| self.listen.clone()),
                     proxy: ov.proxy.clone().unwrap_or_else(|| self.proxy.clone()),
                     lazy: ov.lazy.unwrap_or(self.lazy),
                     download: ov.download.clone().or_else(|| self.download.clone()),
@@ -481,7 +492,9 @@ impl Service {
                     shutdown: ov.shutdown.clone().or_else(|| self.shutdown.clone()),
                     log: ov.log.clone().unwrap_or_else(|| self.log.clone()),
                     reload: ov.reload.unwrap_or(self.reload),
+                    on_failure: ov.on_failure.unwrap_or(self.on_failure),
                     kind,
+                    resolved_binary_path: None,
                 }
             }
         }

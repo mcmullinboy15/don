@@ -19,7 +19,8 @@ pub use self::service::{
 };
 pub use self::task::Task;
 pub use self::types::{
-    BazelConfig, Command, LogConfig, ProxyEntry, ReadyCheck, ShutdownConfig, TurboConfig,
+    BazelConfig, Command, LogConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck, ShutdownConfig,
+    TurboConfig,
 };
 
 pub use self::service::{GoConfig, ServiceOverride};
@@ -29,7 +30,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Top-level don configuration, typically loaded from `don.toml`.
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     /// Long-running services (databases, APIs, workers, etc.).
     #[serde(default)]
@@ -142,13 +143,16 @@ impl Config {
                     ));
                 }
             }
-            // Warn if a service with listen addresses uses a TCP ready check —
-            // the TCP connect will succeed immediately against don's socket
-            // without proving the service is actually accepting connections.
-            if !resolved.listen.is_empty()
-                && let Some(ref ready) = resolved.ready
+            // Warn if a service with a proxy entry uses a TCP ready check
+            // against the proxy's listen address — the TCP connect will
+            // succeed immediately against don's socket without proving the
+            // service is actually accepting connections.
+            if let Some(ref ready) = resolved.ready
                 && let Some(ref tcp_addr) = ready.tcp
-                && resolved.listen.iter().any(|l| l == tcp_addr)
+                && resolved
+                    .proxy
+                    .iter()
+                    .any(|p| p.listen == *tcp_addr)
             {
                 warnings.push(format!(
                     "service '{name}': TCP ready check on '{tcp_addr}' will pass \
@@ -184,6 +188,25 @@ impl Config {
                 && let Err(e) = crate::duration::parse_duration(&ready.interval)
             {
                 errors.push(format!("service '{name}': invalid ready interval: {e}"));
+            }
+            if let Some(ref ready) = resolved.ready {
+                if let Some(ref mi) = ready.monitor_interval
+                    && let Err(e) = crate::duration::parse_duration(mi)
+                {
+                    errors.push(format!(
+                        "service '{name}': invalid ready monitor_interval: {e}"
+                    ));
+                }
+                if !ready.monitor && ready.monitor_interval.is_some() {
+                    warnings.push(format!(
+                        "service '{name}': ready.monitor_interval set but monitor = false — it will be ignored"
+                    ));
+                }
+                if ready.monitor && ready.unhealthy_after == 0 {
+                    errors.push(format!(
+                        "service '{name}': ready.unhealthy_after must be >= 1"
+                    ));
+                }
             }
             if let Some(ref shutdown) = resolved.shutdown {
                 if let Err(e) = crate::duration::parse_duration(&shutdown.timeout) {
@@ -245,19 +268,15 @@ impl Config {
         let mut proxy_addrs: HashMap<&str, &str> = HashMap::new(); // addr -> service name
         for (name, svc) in &self.services {
             let resolved = svc.resolve(platform);
-            // proxy and listen are mutually exclusive.
-            if !resolved.proxy.is_empty() && !resolved.listen.is_empty() {
-                errors.push(format!(
-                    "service '{name}': 'proxy' and 'listen' are mutually exclusive"
-                ));
-            }
-            // lazy requires proxy.
+            // lazy needs at least one proxy entry to trigger on.
             if resolved.lazy && resolved.proxy.is_empty() {
                 errors.push(format!(
-                    "service '{name}': 'lazy = true' requires 'proxy' to be set"
+                    "service '{name}': 'lazy = true' requires at least one 'proxy' entry"
                 ));
             }
-            // Validate proxy listen addresses and check for duplicates.
+            // Validate each proxy listen address parses as host:port.
+            // The env/listenfd mutual-exclusion is enforced at deserialize
+            // time — by the time we get here, the mode is a single enum.
             for entry in &resolved.proxy {
                 if entry.listen.parse::<std::net::SocketAddr>().is_err() {
                     errors.push(format!(
@@ -730,7 +749,7 @@ mod tests {
                     rust.extra_args = ["--jobs", "4"]
                     rust.target_dir = "./target-api"
                     depends_on = ["postgres"]
-                    listen = ["0.0.0.0:3000"]
+                    proxy = "0.0.0.0:3000"
 
                     [services.api.ready]
                     http = "http://localhost:3000/healthz"
@@ -751,7 +770,9 @@ mod tests {
                     assert_eq!(rust.extra_args, vec!["--jobs", "4"]);
                     assert_eq!(rust.target_dir.as_deref(), Some(std::path::Path::new("./target-api")));
                     assert_eq!(resolved.depends_on, vec!["postgres"]);
-                    assert_eq!(resolved.listen, vec!["0.0.0.0:3000"]);
+                    assert_eq!(resolved.proxy.len(), 1);
+                    assert_eq!(resolved.proxy[0].listen, "0.0.0.0:3000");
+                    assert_eq!(resolved.proxy[0].mode, crate::config::ProxyMode::Listenfd);
 
                     let ready = resolved.ready.as_ref().unwrap();
                     assert_eq!(ready.http.as_deref(), Some("http://localhost:3000/healthz"));
@@ -1373,6 +1394,109 @@ mod tests {
                         panic!("expected validation error");
                     };
                     assert!(errors.iter().any(|e| e.contains("invalid ready interval")));
+                },
+            },
+            ConfigTestCase {
+                name: "monitor + on_failure default to off / Notify",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    [services.api.ready]
+                    http = "http://localhost:3000/health"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    config.validate(TEST_PLATFORM).unwrap();
+                    let resolved = config.services["api"].resolve(TEST_PLATFORM);
+                    let ready = resolved.ready.as_ref().unwrap();
+                    assert!(!ready.monitor);
+                    assert_eq!(ready.unhealthy_after, 3);
+                    assert!(ready.monitor_interval.is_none());
+                    assert_eq!(resolved.on_failure, OnFailure::Notify);
+                },
+            },
+            ConfigTestCase {
+                name: "monitor + on_failure=restart parses cleanly",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    on_failure = "restart"
+                    [services.api.ready]
+                    http = "http://localhost:3000/health"
+                    monitor = true
+                    monitor_interval = "5s"
+                    unhealthy_after = 2
+                "#,
+                expect_err: false,
+                check: |config| {
+                    config.validate(TEST_PLATFORM).unwrap();
+                    let resolved = config.services["api"].resolve(TEST_PLATFORM);
+                    let ready = resolved.ready.as_ref().unwrap();
+                    assert!(ready.monitor);
+                    assert_eq!(ready.monitor_interval.as_deref(), Some("5s"));
+                    assert_eq!(ready.unhealthy_after, 2);
+                    assert_eq!(resolved.on_failure, OnFailure::Restart);
+                },
+            },
+            ConfigTestCase {
+                name: "on_failure works without a ready check (crash-only restarts)",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    on_failure = "restart"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    config.validate(TEST_PLATFORM).unwrap();
+                    let resolved = config.services["api"].resolve(TEST_PLATFORM);
+                    assert!(resolved.ready.is_none());
+                    assert_eq!(resolved.on_failure, OnFailure::Restart);
+                },
+            },
+            ConfigTestCase {
+                name: "invalid monitor_interval is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    [services.api.ready]
+                    http = "http://localhost:3000/health"
+                    monitor = true
+                    monitor_interval = "soonish"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(
+                        errors
+                            .iter()
+                            .any(|e| e.contains("invalid ready monitor_interval")),
+                        "got: {errors:?}"
+                    );
+                },
+            },
+            ConfigTestCase {
+                name: "unhealthy_after = 0 with monitor enabled is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    [services.api.ready]
+                    http = "http://localhost:3000/health"
+                    monitor = true
+                    unhealthy_after = 0
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(
+                        errors.iter().any(|e| e.contains("unhealthy_after must be >= 1")),
+                        "got: {errors:?}"
+                    );
                 },
             },
             ConfigTestCase {

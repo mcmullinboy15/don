@@ -237,7 +237,10 @@ pub async fn spawn_process(
                 Ok((handle, output))
             }
             Err(_pty_err) => {
-                eprintln!("[don] warning: PTY allocation failed for '{}', falling back to pipes", config.cmd);
+                // PTY allocation failed (typically exhausted in CI / container
+                // envs with tight pty caps). Fall back silently — pipe mode
+                // works; services that specifically need a terminal will
+                // surface their own errors downstream.
                 spawn_pipe_handle(&config).await
             }
         }
@@ -284,13 +287,26 @@ fn spawn_pty(
     // dimensions at startup don't stall on a 0x0 PTY.
     let _ = pty.resize(pty_process::Size::new(24, 80));
 
-    let mut cmd = pty_process::Command::new(config.cmd);
-    cmd = cmd.args(config.args);
+    let (prog, prog_args) = listen_pid_shim(config);
+    let mut cmd = pty_process::Command::new(prog);
+    cmd = cmd.args(&prog_args);
 
-    // Set environment: overlay merged env onto inherited env.
-    // merge_env() starts from std::env::vars() so the full set is in config.env,
-    // but we use envs() rather than env_clear() to be safe.
-    cmd = cmd.envs(&config.env);
+    // SIGKILL the child if the handle is ever dropped without an explicit
+    // `terminate()`. The happy path calls `terminate()` which reaps cleanly;
+    // this guards mishaps where `rs.handle` gets replaced (e.g. a respawn
+    // path that bypassed the stop) or the runner itself panics — without
+    // this, the child survives as an orphan still bound to inherited listen
+    // fds. Only kills the immediate child PID, not the whole PG, but for
+    // don's services the child IS the PG leader (setsid via pty-process).
+    cmd = cmd.kill_on_drop(true);
+
+    // Clear the parent env first, then set exactly the merged set. Without
+    // `env_clear()`, `envs()` only ADDS — so anything we stripped from
+    // `config.env` (e.g. bazel's leaked `RUNFILES_*` / `BASH_FUNC_*`) still
+    // leaks through from don's own env into the child. `merge_env()` already
+    // seeds `std::env::vars()` minus the strip list, so clearing here is
+    // safe and gives us an exact child env.
+    cmd = cmd.env_clear().envs(&config.env);
 
     if let Some(dir) = config.dir {
         cmd = cmd.current_dir(dir);
@@ -300,18 +316,50 @@ fn spawn_pty(
     // which creates a new session AND process group (PGID = PID).
     // No additional setpgid needed — setsid handles it.
     //
+    // Catch-the-parent-dying: set PR_SET_PDEATHSIG so the child gets SIGKILL
+    // if don dies without cleanly stopping it (external `kill -9`, segfault,
+    // power loss mid-run). Without this, the child keeps running, reparented
+    // to init, and holds any inherited listen fds hostage until someone
+    // notices and kills it by hand. `kill_on_drop(true)` on the Command
+    // handles the graceful-drop case; this handles the parent-not-graceful
+    // case. Linux-only — macOS doesn't expose a portable equivalent. The
+    // setting survives execve(2) in the common (non-setuid) case.
+    //
+    // Safety: prctl is async-signal-safe per signal-safety(7). Runs between
+    // fork and exec in the child process only.
+    #[cfg(target_os = "linux")]
+    {
+        cmd = unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+        };
+    }
+
     // If we're passing listener fds, register a pre_exec hook that runs after
-    // session_leader (pty-process chains them in order). It places the fds at
-    // 3, 4, 5... and sets LISTEN_PID to the child's own PID.
+    // session_leader (pty-process chains them in order) to place the fds at
+    // 3, 4, 5… with CLOEXEC cleared. `LISTEN_PID` is handled by the shell
+    // shim that wraps the command (see `listen_pid_shim`) — `setenv` in
+    // `pre_exec` doesn't survive `execve` with an explicit envp, which
+    // `std::process::Command` always uses once `.env_clear()`/`.envs()` is
+    // called.
     if !config.listen_fds.is_empty() {
         let listen_fds = config.listen_fds.clone();
-        // Safety: place_fds_for_exec calls dup/dup2/fcntl/close and setenv
-        // is async-signal-safe on Linux/macOS. All operations happen between
-        // fork and exec in the child process only.
+        // Safety: place_fds_for_exec calls dup/dup2/fcntl/close. All operations
+        // happen between fork and exec in the child process only.
         cmd = unsafe {
             cmd.pre_exec(move || {
                 socket::place_fds_for_exec(&listen_fds)?;
-                set_listen_pid_env();
                 Ok(())
             })
         };
@@ -327,13 +375,17 @@ fn spawn_pty(
 }
 
 fn spawn_pipe(config: &SpawnConfig<'_>) -> Result<tokio::process::Child, ProcessError> {
-    let mut cmd = tokio::process::Command::new(config.cmd);
-    cmd.args(config.args);
+    let (prog, prog_args) = listen_pid_shim(config);
+    let mut cmd = tokio::process::Command::new(prog);
+    cmd.args(&prog_args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
+    // Matching `spawn_pty`: SIGKILL on drop as a safety net against orphans
+    // when a handle is replaced or the runner panics before `terminate()`.
+    cmd.kill_on_drop(true);
 
-    // Overlay merged env onto inherited env.
-    cmd.envs(&config.env);
+    // Clear the parent env first — see the matching comment in `spawn_pty`.
+    cmd.env_clear().envs(&config.env);
 
     if let Some(dir) = config.dir {
         cmd.current_dir(dir);
@@ -342,18 +394,36 @@ fn spawn_pipe(config: &SpawnConfig<'_>) -> Result<tokio::process::Child, Process
     // Clone listen fds for the pre_exec closure.
     let listen_fds = config.listen_fds.clone();
 
-    // Safety: setpgid, dup2, dup, fcntl, and close are async-signal-safe.
+    // Safety: setpgid, dup2, dup, fcntl, prctl, and close are async-signal-safe.
     // dup2(1, 2) merges stderr into stdout. This works because tokio has
     // already set up fd 1 as the pipe's write end before pre_exec runs.
+    //
+    // PR_SET_PDEATHSIG: see the matching block in `spawn_pty` for the why.
+    // Linux-only.
+    //
+    // LISTEN_PID is NOT set here: `setenv` in `pre_exec` is clobbered by the
+    // explicit envp that Rust's `Command` hands to `execve` once any env
+    // mutator is called. The shim command from `listen_pid_shim` sets
+    // `LISTEN_PID=$$` in a shell and `exec`s the real binary, so the PID the
+    // child reads matches its own process (exec preserves the PID).
     unsafe {
         cmd.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
             // Place listen fds at fd 3, 4, 5... and clear CLOEXEC.
             socket::place_fds_for_exec(&listen_fds)?;
-
-            // Set LISTEN_PID to the child's (our) PID after fork, before exec.
-            if !listen_fds.is_empty() {
-                set_listen_pid_env();
-            }
 
             nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
                 .map_err(std::io::Error::other)?;
@@ -445,14 +515,12 @@ pub async fn read_pid_file_identity(
                 ))
             })?;
             let start_time: u64 = match lines.next() {
-                Some(s) => s.trim().parse().unwrap_or_else(|_| {
-                    eprintln!(
-                        "[don] warning: invalid start_time in '{}', treating as unknown",
-                        path.display()
-                    );
-                    0
-                }),
-                None => 0, // old format — no start_time line
+                // `0` means "unknown" — the crash-recovery identity check
+                // treats missing/unknown start_time as "matches any", which
+                // is the correct permissive behaviour for both a malformed
+                // second line and the legacy one-line pgid file format.
+                Some(s) => s.trim().parse().unwrap_or(0),
+                None => 0,
             };
             Ok(Some(ProcessIdentity { pgid, start_time }))
         }
@@ -473,71 +541,34 @@ pub async fn cleanup_pgid_file(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
-/// Set the `LISTEN_PID` environment variable to the current process's PID.
+/// Wrap a command in a shell shim when listen fds are being passed, so the
+/// final binary sees `LISTEN_PID` set to its own PID.
 ///
-/// Called from pre_exec hooks in the child after fork, before exec. The
-/// value must be the reader's own PID — systemd's socket-activation protocol
-/// requires it as a guard against fd inheritance leaking to nested children.
+/// The systemd socket-activation protocol requires `LISTEN_PID` to equal the
+/// PID of the process that will read the fds. We can't set it from
+/// `pre_exec`: `std::process::Command` uses `execve` with an explicit envp
+/// (once any env method is called on the command), and `setenv` writes to
+/// `environ` which `execve` ignores. Rolling our own `execvpe` or calling
+/// `setenv` from `pre_exec` before a manual exec would also require `malloc`
+/// after fork, which isn't safe while tokio worker threads might have held
+/// allocator locks in the parent.
 ///
-/// Uses a fixed-size stack buffer so there are no heap allocations after
-/// fork (allocator locks from other tokio threads in the parent are frozen
-/// post-fork and can deadlock the child).
-///
-/// # Safety
-///
-/// Must only be called between `fork` and `exec`. `libc::getpid` and
-/// `libc::setenv` are async-signal-safe on Linux and macOS.
-fn set_listen_pid_env() {
-    // PID_MAX_LIMIT on Linux is 2^22 = 4194304 (7 digits); macOS caps at
-    // 99999. 20 bytes holds any plausible PID plus sign plus NUL.
-    let mut buf = [0u8; 20];
-    let pid = unsafe { libc::getpid() };
-    let len = write_i32_nul(&mut buf, pid);
-    unsafe {
-        libc::setenv(c"LISTEN_PID".as_ptr(), buf.as_ptr().cast(), 1);
+/// The shell shim sets `LISTEN_PID=$$` and `exec`s the real binary. `exec`
+/// preserves the PID, so the final process reads `LISTEN_PID = getpid()`.
+/// Fds at 3+ pass through untouched (CLOEXEC was already cleared by
+/// `place_fds_for_exec`, and `sh` doesn't touch fds >=3).
+fn listen_pid_shim<'a>(config: &'a SpawnConfig<'a>) -> (String, Vec<String>) {
+    if config.listen_fds.is_empty() {
+        return (config.cmd.to_string(), config.args.to_vec());
     }
-    // Silence unused warning — len is useful for tests/debugging, not for setenv.
-    let _ = len;
-}
-
-/// Write a signed integer as a null-terminated ASCII string into `buf`.
-/// Returns the number of bytes written (not counting the NUL). Panics (in
-/// debug) if `buf` is too small.
-fn write_i32_nul(buf: &mut [u8], value: i32) -> usize {
-    debug_assert!(buf.len() >= 12, "buffer too small for i32");
-    // Handle sign.
-    let (mut n, negative) = if value < 0 {
-        // -i32::MIN overflows; use wrapping_neg + cast to u32 for the magnitude.
-        ((value as i64).unsigned_abs() as u32, true)
-    } else {
-        (value as u32, false)
-    };
-    // Write digits in reverse into a scratch area.
-    let mut digits = [0u8; 10];
-    let mut i = 0;
-    if n == 0 {
-        digits[0] = b'0';
-        i = 1;
-    } else {
-        while n > 0 {
-            digits[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-            i += 1;
-        }
-    }
-    // Emit into buf, prepending '-' if negative, reversed.
-    let mut j = 0;
-    if negative {
-        buf[j] = b'-';
-        j += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        buf[j] = digits[i];
-        j += 1;
-    }
-    buf[j] = 0;
-    j
+    // `$$` is the shell's PID; `exec "$@"` replaces the shell with the real
+    // binary, preserving that PID. The literal `sh` becomes `$0`; the actual
+    // command and its args follow as `$@`.
+    let script = r#"LISTEN_PID=$$; export LISTEN_PID; exec "$@""#;
+    let mut shim_args: Vec<String> =
+        vec!["-c".to_string(), script.to_string(), "sh".to_string(), config.cmd.to_string()];
+    shim_args.extend(config.args.iter().cloned());
+    ("/bin/sh".to_string(), shim_args)
 }
 
 fn signal_name(sig: Signal) -> &'static str {

@@ -248,11 +248,11 @@ fn profile_starts_only_selected_services() {
 
         let output = read_buf(&buf);
         assert!(
-            output.contains("starting api"),
+            output.contains("api: starting..."),
             "api should start. output: {output}"
         );
         assert!(
-            !output.contains("starting worker"),
+            !output.contains("worker: starting..."),
             "worker should NOT start. output: {output}"
         );
 
@@ -290,15 +290,15 @@ fn profile_includes_transitive_deps() {
 
         let output = read_buf(&buf);
         assert!(
-            output.contains("starting db"),
+            output.contains("db: starting..."),
             "db (transitive dep) should start. output: {output}"
         );
         assert!(
-            output.contains("starting api"),
+            output.contains("api: starting..."),
             "api should start. output: {output}"
         );
         assert!(
-            !output.contains("starting worker"),
+            !output.contains("worker: starting..."),
             "worker should NOT start. output: {output}"
         );
 

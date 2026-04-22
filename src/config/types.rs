@@ -31,19 +31,36 @@ pub struct TurboConfig {
     pub query_timeout: Option<u64>,
 }
 
-/// A proxy entry: Don listens on `listen` and forwards TCP connections to the
-/// service on a random ephemeral port.
+/// A single proxy entry. Don binds `listen` once at startup and holds the
+/// port across service restarts.
 ///
-/// If `env` is set, Don injects the ephemeral port as that environment variable
-/// (and supports `${VAR}` substitution in `run.args`). If `env` is `None`, Don
-/// passes the ephemeral socket via LISTEN_FDS (systemd socket activation).
+/// Exactly one of two modes must be chosen:
+///
+/// - **Forwarding with env injection.** Don accepts on `listen`, allocates an
+///   ephemeral port for the backend, sets `env` to the ephemeral port number,
+///   and forwards bytes between client and backend. The service binds the
+///   ephemeral port using the value of the env var.
+/// - **Listenfd handoff.** Don binds `listen` and passes the bound listener
+///   to the service as `fd 3` via the systemd `LISTEN_FDS` protocol. The
+///   service accepts on the fd directly — no proxy involved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyEntry {
-    /// Address Don binds and accepts connections on (e.g. "127.0.0.1:3000").
+    /// Address Don binds on (e.g. "127.0.0.1:3000").
     pub listen: String,
-    /// If set, the env var name Don sets to the ephemeral port number.
-    /// If `None`, Don passes the socket via LISTEN_FDS instead.
-    pub env: Option<String>,
+    /// Mode selector. Exactly one variant applies per entry.
+    pub mode: ProxyMode,
+}
+
+/// How a given [`ProxyEntry`] exposes the public listener to the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyMode {
+    /// Accept on the public address, forward to an ephemeral backend port.
+    /// The ephemeral port number is injected into the service's environment
+    /// under the contained variable name.
+    Env(String),
+    /// Hand the bound listener to the service via `LISTEN_FDS` / `LISTEN_FDNAMES`
+    /// / `LISTEN_PID`. No forwarding — the service accepts directly.
+    Listenfd,
 }
 
 impl<'de> Deserialize<'de> for ProxyEntry {
@@ -55,23 +72,45 @@ impl<'de> Deserialize<'de> for ProxyEntry {
             Table {
                 listen: String,
                 env: Option<String>,
+                #[serde(default)]
+                listenfd: bool,
             },
         }
 
         match Raw::deserialize(deserializer)? {
+            // Shorthand `proxy = "127.0.0.1:3000"` means listenfd mode — the
+            // simpler of the two modes and the common case for services that
+            // speak the systemd socket-activation protocol.
             Raw::String(s) => Ok(ProxyEntry {
                 listen: s,
-                env: None,
+                mode: ProxyMode::Listenfd,
             }),
-            Raw::Table { listen, env } => Ok(ProxyEntry { listen, env }),
+            Raw::Table { listen, env, listenfd } => {
+                let mode = match (env, listenfd) {
+                    (Some(e), false) => ProxyMode::Env(e),
+                    (None, true) => ProxyMode::Listenfd,
+                    (Some(_), true) => {
+                        return Err(serde::de::Error::custom(
+                            "proxy entry: 'env' and 'listenfd = true' are mutually exclusive",
+                        ));
+                    }
+                    (None, false) => {
+                        return Err(serde::de::Error::custom(
+                            "proxy entry: one of 'env = \"VAR\"' or 'listenfd = true' must be set",
+                        ));
+                    }
+                };
+                Ok(ProxyEntry { listen, mode })
+            }
         }
     }
 }
 
 /// Deserialize the `proxy` field which accepts:
-/// - A single string: `proxy = "127.0.0.1:3000"`
+/// - A single string: `proxy = "127.0.0.1:3000"` (listenfd mode)
 /// - A single table: `proxy = { listen = "127.0.0.1:3000", env = "PORT" }`
-/// - An array of strings/tables: `proxy = ["127.0.0.1:3000", { listen = "...", env = "PORT" }]`
+///   or `{ listen = "127.0.0.1:3000", listenfd = true }`
+/// - An array of strings/tables.
 pub(crate) fn deserialize_proxy<'de, D>(deserializer: D) -> Result<Vec<ProxyEntry>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -113,6 +152,8 @@ pub struct Command {
 /// Ready check configuration. Exactly one of `exec`, `tcp`, or `http` must be set.
 ///
 /// Used to gate dependent services — they won't start until this check passes.
+/// When `monitor = true`, the same check keeps running after the service is
+/// ready and can mark it `Unhealthy` if it starts failing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ReadyCheck {
     /// Run a command — exit code 0 means ready.
@@ -121,12 +162,24 @@ pub struct ReadyCheck {
     pub tcp: Option<String>,
     /// Hit an HTTP endpoint — 2xx response means ready.
     pub http: Option<String>,
-    /// How often to check (e.g. "1s", "500ms"). Defaults to "1s".
+    /// How often to check during startup (e.g. "1s", "500ms"). Defaults to "1s".
     #[serde(default = "ReadyCheck::default_interval")]
     pub interval: String,
     /// How many times to retry before giving up. Defaults to 30.
     #[serde(default = "ReadyCheck::default_retries")]
     pub retries: u32,
+    /// If true, keep running the same check after the service reaches Ready.
+    /// Consecutive failures will mark the service Unhealthy. The service-level
+    /// `on_failure` field controls what happens on that transition.
+    #[serde(default)]
+    pub monitor: bool,
+    /// Interval between checks while monitoring. Defaults to `interval`.
+    #[serde(default)]
+    pub monitor_interval: Option<String>,
+    /// Consecutive monitor failures required to transition Ready → Unhealthy.
+    /// Defaults to 3.
+    #[serde(default = "ReadyCheck::default_unhealthy_after")]
+    pub unhealthy_after: u32,
 }
 
 impl ReadyCheck {
@@ -137,6 +190,29 @@ impl ReadyCheck {
     fn default_retries() -> u32 {
         30
     }
+
+    fn default_unhealthy_after() -> u32 {
+        3
+    }
+}
+
+/// Action to take when a service fails. A "failure" is either:
+///   - the health monitor marking the service `Unhealthy`, or
+///   - the process exiting with a non-zero status (or terminating signal).
+///
+/// Clean exits (status 0) are treated as intentional shutdowns and never
+/// trigger this policy — the service transitions to `Stopped`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailure {
+    /// Mark the service `Unhealthy` / `Failed` and emit a lifecycle event.
+    /// No restart.
+    #[default]
+    Notify,
+    /// Restart the service with escalating backoff (1, 2, 4, 8, 16, 32, 60s
+    /// capped at 60s). Backoff attempts reset when the service recovers
+    /// to `Ready` or a restart succeeds.
+    Restart,
 }
 
 /// Shutdown behavior for a service.

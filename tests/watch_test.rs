@@ -385,7 +385,7 @@ fn integration_file_edit_during_startup_triggers_rebuild() {
 
         // Wait for the service to start (but not be ready yet).
         assert!(
-            wait_for_output(&buf, "starting api", Duration::from_secs(5)).await,
+            wait_for_output(&buf, "api: starting", Duration::from_secs(5)).await,
             "timed out waiting for service to start. output: {}",
             read_buf(&buf)
         );

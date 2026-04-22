@@ -7,10 +7,10 @@ use crate::config::service::{GoConfig, RustConfig, ServiceKind};
 use crate::config::{Platform, ReadyCheck, ResolvedService, ShutdownConfig};
 use crate::duration::parse_duration;
 use crate::process::env::merge_env;
-use crate::process::socket::BoundSockets;
 use crate::process::{ProcessHandle, SpawnConfig, spawn_process};
 use nix::sys::signal::Signal;
 use std::collections::HashMap;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -55,16 +55,25 @@ pub enum ServiceError {
 /// Returns a `StartResult` containing the process handle and the child's
 /// output stream. The caller is responsible for wiring up output processing,
 /// the ready check, and state updates.
+/// Start a service.
+///
+/// `listen_fds` are raw fds of listenfd-mode proxy listeners to pass to the
+/// child at fd 3, 4, …. The parent keeps the owning `TcpListener`s alive;
+/// these are just borrowed fds. Empty if the service has no listenfd
+/// entries. `listen_fds_env` is the matching `LISTEN_FDS` / `LISTEN_FDNAMES`
+/// env var map (empty when `listen_fds` is empty).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_service(
     name: &str,
     resolved: &ResolvedService,
     base_dir: &Path,
     pid_dir: &Path,
-    bound_sockets: Option<&BoundSockets>,
+    listen_fds: &[RawFd],
+    listen_fds_env: &HashMap<String, String>,
     docker_client: Option<&bollard::Docker>,
     service_writer: Option<&crate::output::ServiceWriter>,
     platform: Platform,
+    emitter: Option<&crate::output::LifecycleEmitter>,
 ) -> Result<StartResult, ServiceError> {
     // Dispatch based on the service kind.
     if let Some(ServiceKind::Docker(docker_config)) = &resolved.kind {
@@ -117,9 +126,16 @@ pub(crate) async fn start_service(
             (executable.to_string_lossy().into_owned(), run_args.to_vec())
         }
         Some(ServiceKind::Bazel(bazel)) => {
-            // Fallback: use bazel run (slower — does a build check each time).
-            // Normally the runner resolves the binary path and converts to Custom.
-            ("bazel".to_string(), vec!["run".to_string(), bazel.target.clone()])
+            // Prefer the binary path resolved by the startup `bazel cquery`
+            // (stored on `resolved.resolved_binary_path`) — launching the
+            // built artifact directly skips bazel's per-launch analysis.
+            // Fall back to `bazel run <target>` when the path isn't known
+            // yet (e.g. lazy service pre-first-connection).
+            if let Some(ref bin_path) = resolved.resolved_binary_path {
+                (bin_path.clone(), vec![])
+            } else {
+                ("bazel".to_string(), vec!["run".to_string(), bazel.target.clone()])
+            }
         }
         Some(ServiceKind::Turbo(turbo)) => {
             if let Some(ref filter) = turbo.filter {
@@ -149,15 +165,12 @@ pub(crate) async fn start_service(
             .into());
         }
     };
-    let injected = bound_sockets
-        .map(|s| s.listen_env())
-        .unwrap_or_default();
     let (mut env, _warnings) = merge_env(
         name,
         Some(service_dir),
         &resolved.env_file,
         &resolved.env,
-        &injected,
+        listen_fds_env,
     )?;
     // Expose downloaded binaries on PATH so other services/tasks can call them.
     crate::process::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
@@ -171,10 +184,9 @@ pub(crate) async fn start_service(
     std::fs::create_dir_all(pid_dir).map_err(crate::process::ProcessError::Io)?;
     let pgid_file_path = pid_dir.join(name);
 
-    // Get raw fds to pass to the child (empty if no sockets).
-    let listen_fds = bound_sockets
-        .map(|s| s.raw_fds())
-        .unwrap_or_default();
+    if let Some(em) = emitter {
+        em.debug_spawn(name, &cmd, &args);
+    }
 
     // Spawn the process. Force pipe mode when passing listen fds
     // (pty-process doesn't expose pre_exec for fd placement).
@@ -185,7 +197,7 @@ pub(crate) async fn start_service(
         env,
         pgid_file_path: Some(pgid_file_path),
         force_pipe: !listen_fds.is_empty(),
-        listen_fds,
+        listen_fds: listen_fds.to_vec(),
     })
     .await?;
 
@@ -208,22 +220,28 @@ pub(crate) async fn run_ready_check(ready: &ReadyCheck) -> Result<(), ServiceErr
             tokio::time::sleep(interval).await;
         }
 
-        let check_result = if let Some(ref tcp_addr) = ready.tcp {
-            check_tcp(tcp_addr).await
-        } else if let Some(ref http_url) = ready.http {
-            check_http(http_url).await
-        } else if let Some(ref exec_cmd) = ready.exec {
-            check_exec(exec_cmd).await
-        } else {
-            return Ok(());
-        };
-
-        if check_result.is_ok() {
+        if run_one_check(ready).await.is_ok() {
             return Ok(());
         }
     }
 
     Err(ServiceError::ReadyCheckExhausted { retries })
+}
+
+/// Run a single ready-check probe (one HTTP/TCP/exec attempt). Returns
+/// `Ok(())` if the configured check passes, otherwise `Err` describing
+/// the failure. Returns `Ok(())` when no check type is set — there is
+/// nothing to check.
+pub(crate) async fn run_one_check(ready: &ReadyCheck) -> Result<(), ServiceError> {
+    if let Some(ref tcp_addr) = ready.tcp {
+        check_tcp(tcp_addr).await
+    } else if let Some(ref http_url) = ready.http {
+        check_http(http_url).await
+    } else if let Some(ref exec_cmd) = ready.exec {
+        check_exec(exec_cmd).await
+    } else {
+        Ok(())
+    }
 }
 
 /// TCP ready check: attempt to connect to the address.

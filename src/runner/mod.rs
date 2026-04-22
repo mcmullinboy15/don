@@ -32,12 +32,22 @@ static SIGNAL_COUNT: AtomicU8 = AtomicU8::new(0);
 #[serde(rename_all = "lowercase")]
 pub enum ServiceState {
     Pending,
+    /// A batch build (bazel/turbo) is in flight. Transitions to Pending on
+    /// success (then the service starts like any other) or Failed on build
+    /// error. Only set during the startup-phase batch build; file-watch
+    /// rebuilds keep the service in Running/Ready.
+    Building,
     /// Proxy is bound and accepting connections, but the service process is not
     /// started yet. Will transition to Starting on first incoming connection.
     Lazy,
     Starting,
     Running,
     Ready,
+    /// Process is alive but its health-check monitor is failing. Dependents
+    /// are still considered satisfied — we don't tear them down on flap. The
+    /// service can recover back to Ready, or it can be restarted (manually
+    /// or by `on_failure = "restart"`).
+    Unhealthy,
     Stopping,
     Stopped,
     Failed,
@@ -45,9 +55,10 @@ pub enum ServiceState {
 
 impl ServiceState {
     /// Whether this state is considered "satisfied" for dependency resolution.
-    /// A dependency is satisfied when the service is Ready (or for tasks, completed).
+    /// A dependency is satisfied when the service is Ready, lazy-bound, or
+    /// merely Unhealthy (process is still alive — leave dependents alone).
     pub(crate) fn is_satisfied(&self) -> bool {
-        matches!(self, Self::Ready | Self::Lazy)
+        matches!(self, Self::Ready | Self::Lazy | Self::Unhealthy)
     }
 
 
@@ -56,8 +67,12 @@ impl ServiceState {
     pub(crate) fn can_transition_to(&self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::Pending, Self::Starting)
+            (Self::Pending, Self::Building)
+                | (Self::Pending, Self::Starting)
                 | (Self::Pending, Self::Lazy)
+                | (Self::Building, Self::Pending)
+                | (Self::Building, Self::Failed)
+                | (Self::Lazy, Self::Building)
                 | (Self::Lazy, Self::Starting)
                 | (Self::Starting, Self::Running)
                 | (Self::Starting, Self::Failed)
@@ -68,6 +83,12 @@ impl ServiceState {
                 | (Self::Ready, Self::Stopping)
                 | (Self::Ready, Self::Stopped)
                 | (Self::Ready, Self::Failed)
+                | (Self::Ready, Self::Unhealthy)
+                | (Self::Unhealthy, Self::Ready)
+                | (Self::Unhealthy, Self::Stopping)
+                | (Self::Unhealthy, Self::Stopped)
+                | (Self::Unhealthy, Self::Failed)
+                | (Self::Unhealthy, Self::Pending)
                 | (Self::Stopping, Self::Stopped)
                 | (Self::Stopping, Self::Failed)
                 // Restart: from stopped back to pending
@@ -82,6 +103,9 @@ impl ServiceState {
 #[serde(rename_all = "snake_case")]
 pub enum TaskItemState {
     Pending,
+    /// Waiting on the startup-phase batch build. Transitions to Pending on
+    /// success or Failed on build error.
+    Building,
     Running,
     Completed,
     Skipped,
@@ -100,7 +124,7 @@ impl TaskItemState {
 }
 
 /// An item in the dependency graph — either a service or a task.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NodeKind {
     Service,
     Task,
@@ -139,6 +163,11 @@ impl std::fmt::Display for CommandError {
 }
 
 /// A command sent to the runner via its `mpsc` channel.
+///
+/// `BatchBuildComplete` carries a crate-private payload. The enum itself
+/// stays `pub` for callers that hold a [`Runner::command_sender`], but the
+/// variant is only ever constructed by the runner's own detached task.
+#[allow(private_interfaces)]
 pub enum RunnerCommand {
     /// Start a stopped service.
     Start {
@@ -205,6 +234,48 @@ pub enum RunnerCommand {
     RunPendingTasks {
         reply: oneshot::Sender<CommandResult>,
     },
+    /// Result of the startup-phase batch build. Sent by the detached
+    /// [`run_batch_build_chain`] task. Transitions `Building` items to
+    /// `Pending`/`Failed` and re-runs the ready-item sweep.
+    BatchBuildComplete(BatchBuildOutcome),
+    /// Result of a just-in-time build for a single lazy service triggered
+    /// by its first proxy connection. The handler applies the outcome and
+    /// (on success) calls `start_service` directly — the service is not in
+    /// the `pending` startup set, so the usual `start_ready_items` sweep
+    /// wouldn't pick it up.
+    LazyBuildComplete {
+        name: String,
+        outcome: BatchBuildOutcome,
+    },
+    /// Health-check monitor reported a state transition for a service.
+    /// Sent by the per-service monitor task spawned after the service
+    /// reaches Ready when `ready.monitor = true`. The runner translates
+    /// this into Ready ↔ Unhealthy transitions and (optionally) schedules
+    /// an auto-restart.
+    ServiceHealthChanged {
+        name: String,
+        /// `true` after a recovery, `false` after `unhealthy_after`
+        /// consecutive failures.
+        healthy: bool,
+    },
+    /// Backoff timer fired — restart a service that's `Unhealthy`
+    /// (monitor-driven) or `Failed` (crash-driven). Sent by the detached
+    /// task spawned in `schedule_auto_restart`. The `attempt` field is
+    /// informational (used in the lifecycle event) and matches
+    /// `restart_attempts` at scheduling time.
+    AutoRestart { name: String, attempt: u32 },
+    /// A service process exited (its output stream hit EOF). Sent by the
+    /// per-spawn crash-watcher task. The `pgid` identifies *which* spawn
+    /// — the runner ignores the event if the current handle has a
+    /// different pgid (the service was already restarted) or if the
+    /// state is not Running/Ready/Unhealthy (an explicit stop is in
+    /// flight). When it does act, the handler reaps the [`Child`] to
+    /// read the real [`std::process::ExitStatus`], transitions the
+    /// service to `Failed`, and emits a lifecycle event with the code
+    /// or terminating signal.
+    ///
+    /// [`Child`]: tokio::process::Child
+    ServiceExited { name: String, pgid: i32 },
     /// Initiate graceful shutdown.
     Shutdown,
 }
@@ -251,10 +322,8 @@ pub struct VerboseInfo {
     /// File watch patterns (explicit or resolved from build tool).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch: Vec<String>,
-    /// Listen addresses (LISTEN_FDS).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub listen: Vec<String>,
-    /// Proxy listen addresses.
+    /// Proxy entries, each formatted as `"addr (env=NAME)"` or
+    /// `"addr (listenfd)"` for display.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy: Vec<String>,
     /// Bazel target (if configured).
@@ -519,7 +588,28 @@ pub struct Runner {
     done_tx: Option<mpsc::Sender<ItemDone>>,
 
     // Shutdown signal receiver — wakes the select loop when Ctrl+C is pressed.
-    shutdown_rx: mpsc::Receiver<()>,
+    // `Option` because `run()` takes it out at the top to consume in the
+    // main `select!`. It's never `None` after construction until `run()`
+    // consumes it.
+    shutdown_rx: Option<mpsc::Receiver<()>>,
+
+    /// Detached batch-build task spawned at startup for services/tasks with
+    /// a bazel/turbo config. `Some` until [`RunnerCommand::BatchBuildComplete`]
+    /// arrives and the handle is consumed. Wrapped in [`AbortOnDrop`] so
+    /// shutting the runner down — or dropping the field before completion —
+    /// aborts the task, dropping the in-flight `Child` (with `kill_on_drop`)
+    /// and sending SIGKILL to the bazel/turbo client.
+    batch_build_handle: Option<crate::build_tool::AbortOnDrop<()>>,
+
+    /// Detached JIT build tasks spawned when a lazy service's proxy gets
+    /// its first connection. Keyed by service name. Entries are inserted
+    /// on spawn and removed when [`RunnerCommand::LazyBuildComplete`]
+    /// arrives. Wrapped in [`AbortOnDrop`] for the same reason as
+    /// [`Self::batch_build_handle`]: on shutdown we abort any in-flight
+    /// JIT builds so bazel/turbo output stops streaming before
+    /// "shutdown complete" is emitted.
+    lazy_build_handles:
+        HashMap<String, crate::build_tool::AbortOnDrop<()>>,
 
     // Don's own PID file
     _don_pid_file: Option<PidFile>,
@@ -610,6 +700,9 @@ impl Runner {
             || cleanup_report.containers_removed > 0
         {
             output_manager.lifecycle_event(&format!("cleaned stale state: {cleanup_report}"));
+        }
+        for warning in &cleanup_report.warnings {
+            output_manager.error_event(warning);
         }
 
         let task_state = TaskState::new(don_dir.join("task-state"));
@@ -720,9 +813,11 @@ impl Runner {
             cmd_rx,
             event_tx,
             done_tx: None,
-            shutdown_rx,
+            shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
             watch_update_tx: None,
+            batch_build_handle: None,
+            lazy_build_handles: HashMap::new(),
             bazel_build_mutex: tokio::sync::Mutex::new(()),
             pending_bt_rebuilds: Vec::new(),
             bt_rebuild_deadline: None,
@@ -867,10 +962,19 @@ impl Runner {
         // Warn if .don/ is not in .gitignore.
         check_gitignore(&self.base_dir, &self.output_manager);
 
+        // Take ownership of the shutdown receiver up front so the slow
+        // startup phase (build-tool resolution + batch builds) can `select!`
+        // on it without conflicting with `&mut self` borrows. Always `Some`
+        // here — the field is set by `Runner::new` and only consumed here.
+        let mut shutdown_rx = match self.shutdown_rx.take() {
+            Some(rx) => rx,
+            None => return Ok(()),
+        };
+
         self.output_manager.lifecycle_event("loading don.toml");
 
-        let svc_count = self.config.services.len();
-        let task_count = self.config.tasks.len();
+        let svc_count = self.services.len();
+        let task_count = self.tasks.len();
 
         self.output_manager.lifecycle_event(&format!(
             "validated {} service{}, {} task{}",
@@ -880,19 +984,18 @@ impl Runner {
             if task_count == 1 { "" } else { "s" },
         ));
 
-        // Pre-bind all declared listen ports before starting any services.
-        // This catches port conflicts (port already in use, duplicate ports
-        // across services) upfront rather than failing mid-startup.
-        let listen_service_names: Vec<String> = self
-            .services
-            .iter()
-            .filter(|(_, rs)| !rs.resolved.listen.is_empty())
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in &listen_service_names {
-            if let Err(msg) = self.bind_sockets_if_needed(name) {
-                return Err(RunnerError::Config(msg));
-            }
+        // Register synthetic "bazel" / "turbo" streams so build-tool output
+        // gets a color-coded prefix column like real services, instead of
+        // riding on `[don]` lifecycle events with a `bazel:` text prefix.
+        let has_bazel = self.services.values().any(|rs| rs.resolved.bazel_config().is_some())
+            || self.config.tasks.values().any(|t| t.bazel.is_some());
+        let has_turbo = self.services.values().any(|rs| rs.resolved.turbo_config().is_some())
+            || self.config.tasks.values().any(|t| t.turbo.is_some());
+        if has_bazel {
+            self.output_manager.register_build_tool("bazel").await;
+        }
+        if has_turbo {
+            self.output_manager.register_build_tool("turbo").await;
         }
 
         // Pre-bind all proxy listeners. This catches port conflicts upfront
@@ -913,14 +1016,21 @@ impl Runner {
             } else {
                 None
             };
-            match crate::proxy::ServiceProxy::bind(&proxy_config, lazy_tx, name).await {
+            match crate::proxy::ServiceProxy::bind(
+                &proxy_config,
+                lazy_tx,
+                name,
+                self.output_manager.clone_lifecycle_emitter(),
+            )
+            .await
+            {
                 Ok(proxy) => {
                     let addrs: Vec<String> =
                         proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
-                    self.output_manager.lifecycle_event(&format!(
-                        "{name}: proxy listening on {}",
-                        addrs.join(", ")
-                    ));
+                    self.output_manager.service_event(
+                        name,
+                        &format!("proxy listening on {}", addrs.join(", ")),
+                    );
                     if let Some(rs) = self.services.get_mut(name) {
                         rs.proxy = Some(proxy);
                     }
@@ -946,6 +1056,7 @@ impl Runner {
                     tokio::sync::watch::channel(false);
                 let cmd_tx_for_server = self.cmd_tx.clone();
                 let socket_path_for_server = socket_path.clone();
+                let server_emitter = self.output_manager.clone_lifecycle_emitter();
                 tokio::spawn(async move {
                     if let Err(e) = crate::server::serve_api(
                         listener,
@@ -955,7 +1066,8 @@ impl Runner {
                     )
                     .await
                     {
-                        eprintln!("[don] api server error: {e}");
+                        server_emitter
+                            .lifecycle_event(&format!("api server error: {e}"));
                     }
                 });
                 self.output_manager
@@ -967,24 +1079,45 @@ impl Runner {
                     .error_event(&format!("api server disabled: {e}"));
             }
         }
-
         // Start file watchers before spawning services so we don't miss
         // changes that happen during startup (slow ready checks, long builds, etc.).
         let mut _watch_handle: Option<tokio::task::JoinHandle<()>> = None;
         let (watch_update_tx, watch_update_rx) = mpsc::channel(64);
         self.watch_update_tx = Some(watch_update_tx);
-        match WatchManager::new(
-            &self.config,
-            self.platform,
-            &self.base_dir,
-            &self.config_path,
-            self.cmd_tx.clone(),
-            self.event_tx.subscribe(),
-            watch_update_rx,
-        )
-        .await
-        {
-            Ok((watch_mgr, warnings)) => {
+        // `WatchManager::new` calls `notify::Watcher::watch`, which is
+        // synchronous and walks directory trees under the hood — offload
+        // to a blocking thread so the runner's main task stays polled.
+        // Race it against `shutdown_rx` so Ctrl+C during watch setup
+        // shuts down cleanly even if setup ever gets slow again.
+        let config_for_watch = self.config.clone();
+        let platform_for_watch = self.platform;
+        let base_dir_for_watch = self.base_dir.clone();
+        let config_path_for_watch = self.config_path.clone();
+        let cmd_tx_for_watch = self.cmd_tx.clone();
+        let runner_events_for_watch = self.event_tx.subscribe();
+        let mut watch_setup_handle = tokio::task::spawn_blocking(move || {
+            WatchManager::new(
+                &config_for_watch,
+                platform_for_watch,
+                &base_dir_for_watch,
+                &config_path_for_watch,
+                cmd_tx_for_watch,
+                runner_events_for_watch,
+                watch_update_rx,
+            )
+        });
+        let watch_result = tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => {
+                watch_setup_handle.abort();
+                let _ = watch_setup_handle.await;
+                self.output_manager.shutdown().await;
+                return Ok(());
+            }
+            r = &mut watch_setup_handle => r,
+        };
+        match watch_result {
+            Ok(Ok((watch_mgr, warnings))) => {
                 for warning in &warnings {
                     self.output_manager.error_event(warning);
                 }
@@ -994,53 +1127,47 @@ impl Runner {
                     }));
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.output_manager
                     .error_event(&format!("file watcher setup failed: {e}"));
             }
-        }
-
-        // Resolve build tool watch patterns (bazel/turbo) at startup.
-        // This queries the build tools concurrently and sends the resolved
-        // watch paths to the WatchManager via the update channel.
-        let (build_tool_watches, bt_warnings) = self.resolve_build_tool_watches().await;
-        for warning in &bt_warnings {
-            self.output_manager.error_event(warning);
-        }
-        if let Some(ref tx) = self.watch_update_tx {
-            for (name, (paths, ignore)) in build_tool_watches {
-                // Store resolved watch paths on the runtime struct.
-                if let Some(rs) = self.services.get_mut(&name) {
-                    rs.resolved_watch_paths = paths.clone();
-                } else if let Some(rt) = self.tasks.get_mut(&name) {
-                    rt.resolved_watch_paths = paths.clone();
-                }
-                let kind = if self.services.contains_key(&name) {
-                    crate::watch::WatchItemKind::Service
-                } else {
-                    crate::watch::WatchItemKind::Task
-                };
-                let _ = tx
-                    .send(crate::watch::WatchUpdate {
-                        name,
-                        kind,
-                        patterns: paths,
-                        ignore_patterns: ignore,
-                        base_dir: self.base_dir.clone(),
-                    })
-                    .await;
+            Err(join_err) => {
+                self.output_manager
+                    .error_event(&format!("file watcher setup task failed: {join_err}"));
             }
         }
 
-        // Run batch builds for build-tool-managed services/tasks.
-        // This runs ONE `bazel build` / `turbo run build` with all targets,
-        // letting the build tool parallelize internally.
-        self.run_batch_builds().await;
-
-        // Resolve Bazel binary paths for services that were successfully built.
-        // This uses `bazel cquery --output=files` to find the output binary,
-        // so we can run it directly instead of going through `bazel run`.
-        self.resolve_bazel_binary_paths().await;
+        // Kick off batch builds (bazel/turbo) as a detached task. The runner
+        // keeps processing the main command loop — shutdown signals,
+        // connection-triggered lazy starts, and non-build-tool services all
+        // stay responsive while bazel crunches. On completion the task posts
+        // `RunnerCommand::BatchBuildComplete`, which transitions `Building`
+        // items to `Pending`/`Failed` and triggers the ready-item sweep.
+        //
+        // The handle is stored as `AbortOnDrop` on `self` so `Shutdown` drops
+        // the in-flight `Child`, whose `kill_on_drop(true)` sends SIGKILL to
+        // the bazel/turbo client.
+        let batch_items = self.collect_batch_build_items();
+        for item in &batch_items {
+            match item.kind {
+                NodeKind::Service => self.set_service_state(&item.name, ServiceState::Building),
+                NodeKind::Task => self.set_task_state(&item.name, TaskItemState::Building),
+            }
+        }
+        if !batch_items.is_empty() {
+            let cmd_tx = self.cmd_tx.clone();
+            let base_dir = self.base_dir.clone();
+            let emitter = self.output_manager.clone_lifecycle_emitter();
+            let watch_update_tx = self.watch_update_tx.clone();
+            let handle = tokio::spawn(async move {
+                let outcome =
+                    run_batch_build_chain(batch_items, base_dir, emitter, watch_update_tx).await;
+                let _ = cmd_tx
+                    .send(RunnerCommand::BatchBuildComplete(outcome))
+                    .await;
+            });
+            self.batch_build_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+        }
 
         // Build dependency map and topological order.
         let dep_map = self.build_dep_map();
@@ -1145,6 +1272,15 @@ impl Runner {
                             let result = self.handle_restart_cmd(&name).await;
                             let _ = reply.send(result);
                         }
+                        RunnerCommand::ServiceHealthChanged { name, healthy } => {
+                            self.handle_service_health_changed(&name, healthy).await;
+                        }
+                        RunnerCommand::AutoRestart { name, attempt } => {
+                            self.handle_auto_restart(&name, attempt).await;
+                        }
+                        RunnerCommand::ServiceExited { name, pgid } => {
+                            self.handle_service_exited(&name, pgid).await;
+                        }
                         RunnerCommand::Attach { name, pid, reply } => {
                             self.handle_attach_cmd(&name, pid, reply).await;
                         }
@@ -1169,13 +1305,110 @@ impl Runner {
                         RunnerCommand::RunPendingTasks { reply } => {
                             self.handle_run_pending_tasks(reply).await;
                         }
+                        RunnerCommand::BatchBuildComplete(outcome) => {
+                            // Drop the abort-on-drop handle: the task is done,
+                            // and leaving the handle live would abort after the
+                            // task has already returned (harmless but noisy).
+                            self.batch_build_handle = None;
+                            // Pull failed names out of the pending set before
+                            // applying the outcome. `apply_batch_build_outcome`
+                            // transitions them to `Failed`, but leaving them in
+                            // `pending` would let `start_ready_items` try to
+                            // spawn a failed service.
+                            for (name, _) in &outcome.failed {
+                                pending.remove(name);
+                            }
+                            self.apply_batch_build_outcome(outcome);
+                            self.start_ready_items(
+                                &order,
+                                &dep_map,
+                                &mut pending,
+                                &mut in_flight,
+                                &done_tx,
+                            ).await?;
+                        }
+                        RunnerCommand::LazyBuildComplete { name, outcome } => {
+                            // Drop the abort-on-drop handle: the task is done,
+                            // and leaving it live would abort after the task
+                            // has already returned (harmless but noisy).
+                            self.lazy_build_handles.remove(&name);
+                            // Single-service JIT build triggered by a first
+                            // proxy connection. `apply_batch_build_outcome`
+                            // flips Building → Pending on success or →
+                            // Failed on build error; on success we then
+                            // call `start_service` to take it through
+                            // Pending → Starting → Ready like any cold
+                            // start.
+                            let succeeded = outcome.succeeded.contains(&name);
+                            self.apply_batch_build_outcome(outcome);
+                            if succeeded
+                                && self
+                                    .services
+                                    .get(&name)
+                                    .is_some_and(|rs| rs.state() == ServiceState::Pending)
+                            {
+                                self.output_manager.service_event(
+                                    &name,
+                                    "lazy build complete, starting",
+                                );
+                                self.start_service(&name, done_tx.clone()).await?;
+                            }
+                        }
                     }
                 }
                 Some(name) = self.lazy_start_rx.recv() => {
-                    if self.services.get(&name).is_some_and(|rs| rs.state() == ServiceState::Lazy) {
-                        self.output_manager.lifecycle_event(
-                            &format!("{name}: first connection — starting service")
+                    // Only act on the first connection — subsequent connections
+                    // (during JIT build or start) find the service in a non-Lazy
+                    // state and are ignored. Connections still queue at the
+                    // proxy; they get forwarded once the backend is Ready.
+                    if !self
+                        .services
+                        .get(&name)
+                        .is_some_and(|rs| rs.state() == ServiceState::Lazy)
+                    {
+                        continue;
+                    }
+                    let needs_jit = self
+                        .services
+                        .get(&name)
+                        .is_some_and(|rs| rs.resolved.is_build_tool_managed() && !rs.batch_built);
+                    if needs_jit {
+                        let item = match self.services.get(&name) {
+                            Some(rs) => self.build_batch_item(&name, NodeKind::Service, rs),
+                            None => continue,
+                        };
+                        self.output_manager.service_event(
+                            &name,
+                            "first connection — building before start",
                         );
+                        self.set_service_state(&name, ServiceState::Building);
+                        let cmd_tx = self.cmd_tx.clone();
+                        let base_dir = self.base_dir.clone();
+                        let emitter = self.output_manager.clone_lifecycle_emitter();
+                        let watch_update_tx = self.watch_update_tx.clone();
+                        let svc_name = name.clone();
+                        let handle = tokio::spawn(async move {
+                            let outcome = run_batch_build_chain(
+                                vec![item],
+                                base_dir,
+                                emitter,
+                                watch_update_tx,
+                            )
+                            .await;
+                            let _ = cmd_tx
+                                .send(RunnerCommand::LazyBuildComplete {
+                                    name: svc_name,
+                                    outcome,
+                                })
+                                .await;
+                        });
+                        self.lazy_build_handles.insert(
+                            name.clone(),
+                            crate::build_tool::AbortOnDrop::new(handle),
+                        );
+                    } else {
+                        self.output_manager
+                            .service_event(&name, "first connection — starting service");
                         self.start_service(&name, done_tx.clone()).await?;
                     }
                 }
@@ -1197,7 +1430,7 @@ impl Runner {
                 } => {
                     self.flush_pending_graph_requery().await;
                 }
-                _ = self.shutdown_rx.recv() => {
+                _ = shutdown_rx.recv() => {
                     self.initiate_shutdown().await;
                     break;
                 }
@@ -1245,13 +1478,17 @@ impl Runner {
             self.set_service_state(&name, ServiceState::Failed);
             self.set_task_state(&name, TaskItemState::Failed);
             self.output_manager
-                .error_event(&format!("{name}: skipped (dependency failed)"));
+                .service_error_event(&name, "skipped (dependency failed)");
         }
 
         // Second pass: start items whose dependencies are all satisfied.
+        // Items still in `Building` (batch build in flight) stay in `pending`
+        // — they get picked up after `BatchBuildComplete` transitions them
+        // back to `Pending` and `start_ready_items` is re-run.
         let ready: Vec<String> = order
             .iter()
             .filter(|name| pending.contains(name.as_str()))
+            .filter(|name| !self.is_item_building(name))
             .filter(|name| {
                 let node_deps = dep_map.get(name.as_str()).cloned().unwrap_or_default();
                 node_deps.iter().all(|dep| self.is_dep_satisfied(dep))
@@ -1260,8 +1497,16 @@ impl Runner {
             .collect();
 
         for name in ready {
-            // Skip lazy services — they start on first proxy connection.
-            if self.services.get(&name).is_some_and(|rs| rs.state() == ServiceState::Lazy) {
+            // Skip lazy services — they're managed exclusively by the
+            // `lazy_start_rx` flow (proxy connection triggers JIT build +
+            // start). We gate on the CONFIG `resolved.lazy`, not the runtime
+            // state: once the first connection fires, state walks
+            // Lazy → Building → Pending → Starting → Running → Ready. If
+            // this function re-fires while the service is past `Lazy` (e.g.
+            // because a dep became Ready after the lazy-triggered start),
+            // a state-based check would miss it and we'd call `start_service`
+            // a second time — double-spawn.
+            if self.services.get(&name).is_some_and(|rs| rs.resolved.lazy) {
                 pending.remove(&name);
                 continue;
             }
@@ -1270,6 +1515,8 @@ impl Runner {
             in_flight.insert(name.clone());
 
             if self.services.contains_key(&name) {
+                self.output_manager
+                    .service_debug_event(&name, "start triggered (deps satisfied)");
                 self.start_service(&name, done_tx.clone()).await?;
             } else if self.tasks.contains_key(&name) {
                 self.start_task(&name, done_tx.clone()).await?;
@@ -1277,6 +1524,85 @@ impl Runner {
         }
 
         Ok(())
+    }
+
+    /// True when the service or task is currently blocked on the startup-
+    /// phase batch build. Used by [`Runner::start_ready_items`] to keep
+    /// `Building` entries parked in `pending` until the batch completes.
+    fn is_item_building(&self, name: &str) -> bool {
+        if let Some(rs) = self.services.get(name) {
+            return rs.state() == ServiceState::Building;
+        }
+        if let Some(rt) = self.tasks.get(name) {
+            return rt.state() == TaskItemState::Building;
+        }
+        false
+    }
+
+    /// Apply the outcome of the detached batch-build chain: mutate the
+    /// runtime state (watch paths, binary paths, `batch_built` flag) and
+    /// transition `Building` items to `Pending` (on success) or `Failed`
+    /// (on build failure). The caller is responsible for dropping its
+    /// cached batch-build handle and re-running [`Self::start_ready_items`]
+    /// so newly-unblocked items start.
+    fn apply_batch_build_outcome(&mut self, outcome: BatchBuildOutcome) {
+        for warning in &outcome.warnings {
+            self.output_manager.error_event(warning);
+        }
+
+        for (name, kind, paths) in outcome.resolved_watches {
+            match kind {
+                NodeKind::Service => {
+                    if let Some(rs) = self.services.get_mut(&name) {
+                        rs.resolved_watch_paths = paths;
+                    }
+                }
+                NodeKind::Task => {
+                    if let Some(rt) = self.tasks.get_mut(&name) {
+                        rt.resolved_watch_paths = paths;
+                    }
+                }
+            }
+        }
+
+        // Binary-path resolution only applies to bazel services — swap in
+        // the binary-backed resolved config so subsequent spawns go direct
+        // instead of through `bazel run`.
+        for (name, path_str) in outcome.binary_paths {
+            if let Some(rs) = self.services.get_mut(&name) {
+                rs.bazel_binary_path = Some(path_str.clone());
+                if let Some(svc) = self.config.services.get(&name) {
+                    rs.resolved = svc.resolve_with_bazel_binary(self.platform, &path_str);
+                }
+            }
+        }
+
+        for name in outcome.succeeded {
+            let was_building = if let Some(rs) = self.services.get_mut(&name) {
+                rs.batch_built = true;
+                rs.state() == ServiceState::Building
+            } else {
+                false
+            };
+            if was_building {
+                self.set_service_state(&name, ServiceState::Pending);
+                continue;
+            }
+            if self.tasks.contains_key(&name) {
+                self.set_task_state(&name, TaskItemState::Pending);
+            }
+        }
+
+        for (name, msg) in outcome.failed {
+            self.output_manager
+                .service_error_event(&name, &format!("batch build failed: {msg}"));
+            if self.services.contains_key(&name) {
+                self.set_service_state(&name, ServiceState::Failed);
+            }
+            if self.tasks.contains_key(&name) {
+                self.set_task_state(&name, TaskItemState::Failed);
+            }
+        }
     }
 
     /// Check if a dependency is satisfied (ready service or completed task).
@@ -1310,6 +1636,30 @@ impl Runner {
         if !self.services.contains_key(name) {
             return Err(RunnerError::Config(format!("unknown service: {name}")));
         }
+        // Defensive: never spawn twice for the same service. If we're called
+        // while the service is already Starting/Running/Ready, some caller
+        // slipped through a state-check — log loudly so we can find the path,
+        // but do NOT proceed. Spawning anyway leaks the existing process.
+        if let Some(rs) = self.services.get(name) {
+            let current = rs.state();
+            if matches!(
+                current,
+                ServiceState::Starting | ServiceState::Running | ServiceState::Ready
+            ) {
+                let pgid = match rs.handle.as_ref() {
+                    Some(ServiceHandle::Process(p)) => Some(p.pgid()),
+                    _ => None,
+                };
+                self.output_manager.service_error_event(
+                    name,
+                    &format!(
+                        "start_service called while state={current:?} pid={} — ignoring (double-start guard)",
+                        pgid.map(|p| p.to_string()).unwrap_or_else(|| "none".to_string()),
+                    ),
+                );
+                return Ok(());
+            }
+        }
         self.set_service_state(name, ServiceState::Starting);
 
         let mut resolved = match self.services.get(name) {
@@ -1317,53 +1667,16 @@ impl Runner {
             None => return Err(RunnerError::Config(format!("unknown service: {name}"))),
         };
 
-        self.output_manager
-            .lifecycle_event(&format!("starting {name}..."));
+        self.output_manager.service_event(name, "starting...");
 
-        // Phase 1: Bind listen sockets (idempotent — skips if already bound).
-        // If the service has proxy entries, bind LISTEN_FDS sockets for the
-        // ephemeral ports (for entries without env vars).
-        let has_proxy = self.services.get(name).is_some_and(|rs| rs.proxy.is_some());
-        if has_proxy {
-            let (proxy_env, listen_fds_addrs) = {
-                let rs = match self.services.get(name) {
-                    Some(rs) => rs,
-                    None => return Ok(()),
-                };
-                let proxy = match rs.proxy.as_ref() {
-                    Some(p) => p,
-                    None => return Ok(()),
-                };
-                (proxy.env_vars(), proxy.listen_fds_addrs())
-            };
-            // Inject proxy env vars (for entries with env: Some("PORT")).
-            resolved.env.extend(proxy_env);
-            // For LISTEN_FDS mode entries, use the proxy's ephemeral addresses.
-            if !listen_fds_addrs.is_empty() {
-                // Replace any previously bound sockets with new ephemeral ones.
-                if let Some(rs) = self.services.get_mut(name) {
-                    rs.bound_sockets = None;
-                }
-                match crate::process::socket::bind_sockets(&listen_fds_addrs) {
-                    Ok(sockets) => {
-                        if let Some(rs) = self.services.get_mut(name) {
-                            rs.bound_sockets = Some(sockets);
-                        }
-                    }
-                    Err(e) => {
-                        self.fail_service_start(
-                            name,
-                            &format!("failed to bind ephemeral sockets: {e}"),
-                            done_tx,
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                }
-            }
-        } else if let Err(msg) = self.bind_sockets_if_needed(name) {
-            self.fail_service_start(name, &msg, done_tx).await;
-            return Ok(());
+        // Phase 1: Merge proxy env vars into the service's env. Listenfd fds
+        // are gathered later in `spawn_and_wire_service` directly from the
+        // proxy — they live in the `ServiceProxy` itself now, not in a
+        // separate `bound_sockets` side-table.
+        if let Some(rs) = self.services.get(name)
+            && let Some(ref proxy) = rs.proxy
+        {
+            resolved.env.extend(proxy.env_vars());
         }
 
         // Phase 1.5: Download artifact (if configured).
@@ -1381,36 +1694,6 @@ impl Runner {
         // Phase 3: Spawn process + wire output + ready check.
         self.spawn_and_wire_service(name, &resolved, Some(done_tx))
             .await
-    }
-
-    /// Bind listen sockets for a service if configured and not already bound.
-    fn bind_sockets_if_needed(
-        &mut self,
-        name: &str,
-    ) -> Result<(), String> {
-        let listen = match self.services.get(name) {
-            Some(rs) if !rs.resolved.listen.is_empty() && rs.bound_sockets.is_none() => {
-                rs.resolved.listen.clone()
-            }
-            _ => return Ok(()),
-        };
-        match crate::process::socket::bind_sockets(&listen) {
-            Ok(sockets) => {
-                self.output_manager.lifecycle_event(&format!(
-                    "{name}: bound {} listen socket{}",
-                    sockets.len(),
-                    if sockets.len() == 1 { "" } else { "s" }
-                ));
-                if let Some(rs) = self.services.get_mut(name) {
-                    rs.bound_sockets = Some(sockets);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                self.output_manager.error_event(&format!("{name}: {e}"));
-                Err(e.to_string())
-            }
-        }
     }
 
     /// Run all build steps for a service based on its preset.
@@ -1433,7 +1716,7 @@ impl Runner {
             Some(crate::config::ServiceKind::Docker(docker_config)) => {
                 if let Some(build_config) = &docker_config.build {
                     self.output_manager
-                        .lifecycle_event(&format!("{name}: building docker image..."));
+                        .service_event(name, "building docker image...");
                     if let Some(ref client) = self.docker_client
                         && let Some(writer) = self.output_manager.service_writer(name)
                     {
@@ -1447,11 +1730,11 @@ impl Runner {
                         .await
                         {
                             self.output_manager
-                                .error_event(&format!("{name}: docker build failed: {e}"));
+                                .service_error_event(name, &format!("docker build failed: {e}"));
                             return Err(());
                         }
                         self.output_manager
-                            .lifecycle_event(&format!("{name}: docker build succeeded"));
+                            .service_event(name, "docker build succeeded");
                     }
                 }
                 Ok(())
@@ -1526,15 +1809,14 @@ impl Runner {
         let cache_base = self.base_dir.join(".don").join("cache");
         let bin_dir = self.base_dir.join(".don").join("bin");
         self.output_manager
-            .lifecycle_event(&format!("{name}: ensuring artifact..."));
+            .service_event(name, "ensuring artifact...");
         let writer = self.output_manager.service_writer(name);
         crate::download::ensure_artifact(artifact, &cache_base, name, writer.as_ref()).await?;
         // Link the binary into .don/bin so other services/tasks can find it on PATH.
         if let Some(bin_name) = download.effective_bin_name(self.platform) {
             crate::download::link_binary(artifact, &cache_base, name, &bin_name, &bin_dir)?;
         }
-        self.output_manager
-            .lifecycle_event(&format!("{name}: artifact ready"));
+        self.output_manager.service_event(name, "artifact ready");
         Ok(())
     }
 
@@ -1549,18 +1831,26 @@ impl Runner {
         done_tx: Option<mpsc::Sender<ItemDone>>,
     ) -> Result<(), RunnerError> {
         let pid_dir = self.base_dir.join(".don").join("pids");
-        let sockets = self.services.get(name).and_then(|rs| rs.bound_sockets.as_ref());
+        let (listen_fds, listen_fds_env) = self
+            .services
+            .get(name)
+            .and_then(|rs| rs.proxy.as_ref())
+            .map(|p| (p.listenfd_raw_fds(), p.listenfd_env()))
+            .unwrap_or_default();
         let writer = self.output_manager.service_writer(name);
+        let emitter = self.output_manager.clone_lifecycle_emitter();
 
         match service::start_service(
             name,
             resolved,
             &self.base_dir,
             &pid_dir,
-            sockets,
+            &listen_fds,
+            &listen_fds_env,
             self.docker_client.as_ref(),
             writer.as_ref(),
             self.platform,
+            Some(&emitter),
         )
         .await
         {
@@ -1578,7 +1868,7 @@ impl Runner {
             Err(e) => {
                 self.set_service_state(name, ServiceState::Failed);
                 self.output_manager
-                    .error_event(&format!("{name}: failed to start: {e}"));
+                    .service_error_event(name, &format!("failed to start: {e}"));
 
                 if let Some(done_tx) = done_tx {
                     let _ = done_tx
@@ -1634,7 +1924,11 @@ impl Runner {
         resolved: &crate::config::ResolvedService,
         done_tx: Option<mpsc::Sender<ItemDone>>,
     ) {
+        let mut spawned_pgid: Option<i32> = None;
         if let Some(rs) = self.services.get_mut(name) {
+            if let ServiceHandle::Process(ref proc) = start_result.handle {
+                spawned_pgid = Some(proc.pgid());
+            }
             rs.handle = Some(start_result.handle);
 
             // Add OSC response sink if we have a PTY write handle.
@@ -1645,16 +1939,43 @@ impl Runner {
                 rs.osc_sink = Some(osc_handle);
             }
         }
+        if let Some(pgid) = spawned_pgid {
+            self.output_manager
+                .service_debug_event(name, &format!("spawned pid={pgid}"));
+        }
         self.set_service_state(name, ServiceState::Running);
 
-        // Wire up output processing. The exit_tx fires when the
-        // stream hits EOF (process died), used to cancel the ready check.
+        // Wire up output processing. We need to fan the EOF (= process died)
+        // out to two independent waiters: the ready check (cancels its
+        // retry loop), and the crash watcher (reports the exit upstream so
+        // the runner can reap the child and transition state).
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        let (crash_exit_tx, crash_exit_rx) = tokio::sync::oneshot::channel();
         if let Some(svc_writer) = self.output_manager.service_writer(name) {
             let child_output = start_result.child_output;
             tokio::spawn(async move {
                 let _ = svc_writer.process_stream(child_output).await;
                 let _ = exit_tx.send(());
+                let _ = crash_exit_tx.send(());
+            });
+        }
+
+        // Crash watcher — fires `ServiceExited` to the runner when the
+        // child's output stream EOFs. Skipped for Docker because the
+        // bollard log stream's EOF semantics aren't yet wired to a status
+        // code path. The pgid lets the handler ignore stale events that
+        // arrive after the service has already been respawned.
+        if let Some(pgid) = spawned_pgid {
+            let cmd_tx = self.cmd_tx.clone();
+            let watch_name = name.to_string();
+            tokio::spawn(async move {
+                let _ = crash_exit_rx.await;
+                let _ = cmd_tx
+                    .send(RunnerCommand::ServiceExited {
+                        name: watch_name,
+                        pgid,
+                    })
+                    .await;
             });
         }
 
@@ -1688,6 +2009,23 @@ impl Runner {
         }
 
         if let Some(ready) = ready_config {
+            // If the new instance has `monitor = true`, build the cancel
+            // channel up front and stash the sender on the RuntimeService —
+            // the spawned task spawns the monitor on Ready and uses the
+            // matching receiver. Stop/restart cancels by dropping the sender.
+            let monitor_cancel_rx = if ready.monitor {
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.stop_health_tracking();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rs.monitor_cancel = Some(tx);
+                    Some(rx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let cmd_tx_for_monitor = self.cmd_tx.clone();
             tokio::spawn(async move {
                 let ready_result = tokio::select! {
                     result = service::run_ready_check(&ready) => result,
@@ -1715,6 +2053,24 @@ impl Runner {
                     state,
                 });
 
+                // Kick off the long-lived health monitor once Ready, if
+                // configured. The cancel rx exists only when ready.monitor
+                // was true at wire-up time, so this branch needs no extra check.
+                if success
+                    && let Some(cancel_rx) = monitor_cancel_rx
+                {
+                    let monitor_name = name_owned.clone();
+                    tokio::spawn(async move {
+                        run_health_monitor(
+                            monitor_name,
+                            ready,
+                            cmd_tx_for_monitor,
+                            cancel_rx,
+                        )
+                        .await;
+                    });
+                }
+
                 if let Some(done_tx) = done_tx {
                     let _ = done_tx
                         .send(ItemDone {
@@ -1733,10 +2089,10 @@ impl Runner {
                 }
             });
         } else if let Some(done_tx) = done_tx {
-            // No ready check, initial startup path — mark ready immediately.
-            self.set_service_state(name, ServiceState::Ready);
-            self.output_manager
-                .lifecycle_event(&format!("{name} started"));
+            // No ready check, initial startup path — just signal completion.
+            // `handle_service_done` flips state to Ready and emits the
+            // "{name} started" lifecycle event; doing either here as well
+            // would double-log and duplicate the state transition.
             let _ = done_tx
                 .send(ItemDone {
                     name: name.to_string(),
@@ -1749,8 +2105,7 @@ impl Runner {
         } else {
             // No ready check, rebuild path — mark ready immediately.
             self.set_service_state(name, ServiceState::Ready);
-            self.output_manager
-                .lifecycle_event(&format!("{name}: restarted"));
+            self.output_manager.service_event(name, "restarted");
             let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
                 name: name.to_string(),
                 success: true,
@@ -1772,9 +2127,8 @@ impl Runner {
         // auto_run = false: skip execution entirely and mark as pending.
         if !task_cfg.auto_run {
             self.set_task_state(name, TaskItemState::PendingRun);
-            self.output_manager.lifecycle_event(&format!(
-                "{name}: pending — auto_run = false"
-            ));
+            self.output_manager
+                .service_event(name, "pending — auto_run = false");
             let _ = done_tx
                 .send(ItemDone {
                     name: name.to_string(),
@@ -1798,7 +2152,7 @@ impl Runner {
         if !needs_run {
             self.set_task_state(name, TaskItemState::Skipped);
             self.output_manager
-                .lifecycle_event(&format!("{name}: skipped (no changes)"));
+                .service_event(name, "skipped (no changes)");
             let _ = done_tx
                 .send(ItemDone {
                     name: name.to_string(),
@@ -1828,18 +2182,18 @@ impl Runner {
 
         let msg = match watch_file_count {
             Some(n) => format!(
-                "running {name}... ({n} file{} changed)",
+                "running... ({n} file{} changed)",
                 if n == 1 { "" } else { "s" }
             ),
-            None => format!("running {name}..."),
+            None => "running...".to_string(),
         };
-        self.output_manager.lifecycle_event(&msg);
+        self.output_manager.service_event(name, &msg);
 
         // Ensure any downloaded artifact is cached before running.
         if let Err(e) = self.ensure_task_download(name, &task_cfg).await {
             self.set_task_state(name, TaskItemState::Failed);
             self.output_manager
-                .error_event(&format!("{name}: download failed: {e}"));
+                .service_error_event(name, &format!("download failed: {e}"));
             let _ = done_tx
                 .send(ItemDone {
                     name: name.to_string(),
@@ -1863,7 +2217,7 @@ impl Runner {
             Err(e) => {
                 self.set_task_state(name, TaskItemState::Failed);
                 self.output_manager
-                    .error_event(&format!("{name}: failed to start: {e}"));
+                    .service_error_event(name, &format!("failed to start: {e}"));
                 let _ = done_tx
                     .send(ItemDone {
                         name: name.to_string(),
@@ -1993,7 +2347,7 @@ impl Runner {
         resolved: &crate::config::ResolvedService,
     ) -> Result<(), ()> {
         self.output_manager
-            .lifecycle_event(&format!("{name}: running {cmd} build..."));
+            .service_event(name, &format!("running {cmd} build..."));
 
         let work_dir = match resolved.dir.as_deref() {
             Some(d) => self.base_dir.join(d),
@@ -2032,7 +2386,7 @@ impl Runner {
                                 if line_buf.last() == Some(&b'\n') { line_buf.pop(); }
                                 if line_buf.last() == Some(&b'\r') { line_buf.pop(); }
                                 let text = String::from_utf8_lossy(&line_buf);
-                                om.lifecycle_event(&format!("{build_name}: {text}"));
+                                om.service_event(&build_name, &text);
                             }
                             Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
                             Err(_) => break,
@@ -2043,25 +2397,25 @@ impl Runner {
                 match handle.wait().await {
                     Ok(status) if status.success() => {
                         self.output_manager
-                            .lifecycle_event(&format!("{name}: {cmd} build succeeded"));
+                            .service_event(name, &format!("{cmd} build succeeded"));
                         Ok(())
                     }
                     Ok(status) => {
                         let code = status.code().unwrap_or(-1);
                         self.fail_rebuild(
                             name,
-                            &format!("{name}: {cmd} build failed (exit code {code})"),
+                            &format!("{cmd} build failed (exit code {code})"),
                         );
                         Err(())
                     }
                     Err(e) => {
-                        self.fail_rebuild(name, &format!("{name}: {cmd} build error: {e}"));
+                        self.fail_rebuild(name, &format!("{cmd} build error: {e}"));
                         Err(())
                     }
                 }
             }
             Err(e) => {
-                self.fail_rebuild(name, &format!("{name}: failed to start {cmd} build: {e}"));
+                self.fail_rebuild(name, &format!("failed to start {cmd} build: {e}"));
                 Err(())
             }
         }
@@ -2152,22 +2506,28 @@ impl Runner {
 
             if up_to_date {
                 let count = targets.len();
-                self.output_manager.lifecycle_event(&format!(
-                    "bazel: {count} target{} up to date, skipping rebuild",
+                self.output_manager.bazel_event(&format!(
+                    "{count} target{} up to date, skipping rebuild",
                     if count == 1 { "" } else { "s" }
                 ));
             } else {
                 let count = targets.len();
-                self.output_manager.lifecycle_event(&format!(
-                    "bazel: rebuilding {count} target{}...",
+                self.output_manager.bazel_event(&format!(
+                    "rebuilding {count} target{}...",
                     if count == 1 { "" } else { "s" }
                 ));
 
                 let om = self.output_manager.clone_lifecycle_emitter();
+                let em = om.clone();
                 match resolver
-                    .build_targets(&targets, &self.base_dir.clone(), move |line| {
-                        om.lifecycle_event(&format!("bazel: {line}"));
-                    })
+                    .build_targets(
+                        &targets,
+                        &self.base_dir.clone(),
+                        move |line| {
+                            om.bazel_event(line);
+                        },
+                        Some(&em),
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -2183,7 +2543,7 @@ impl Runner {
                                 for n in svc_names {
                                     self.fail_rebuild(
                                         n,
-                                        &format!("{n}: bazel build failed: {msg}"),
+                                        &format!("bazel build failed: {msg}"),
                                     );
                                 }
                             }
@@ -2191,7 +2551,7 @@ impl Runner {
                     }
                     Err(e) => {
                         for (name, _) in &bazel_items {
-                            self.fail_rebuild(name, &format!("{name}: bazel build error: {e}"));
+                            self.fail_rebuild(name, &format!("bazel build error: {e}"));
                         }
                     }
                 }
@@ -2210,12 +2570,13 @@ impl Runner {
             };
 
             let count = filters.len();
-            self.output_manager.lifecycle_event(&format!(
-                "turbo: rebuilding '{build_task}' for {count} package{}...",
+            self.output_manager.turbo_event(&format!(
+                "rebuilding '{build_task}' for {count} package{}...",
                 if count == 1 { "" } else { "s" }
             ));
 
             let om = self.output_manager.clone_lifecycle_emitter();
+            let em = om.clone();
             let bt = build_task.clone();
             let resolver = crate::build_tool::turbo::TurboResolver::new(
                 build_task,
@@ -2223,9 +2584,15 @@ impl Runner {
                 turbo_timeout,
             );
             match resolver
-                .build_packages(&bt, &filters, &self.base_dir.clone(), move |line| {
-                    om.lifecycle_event(&format!("turbo: {line}"));
-                })
+                .build_packages(
+                    &bt,
+                    &filters,
+                    &self.base_dir.clone(),
+                    move |line| {
+                        om.turbo_event(line);
+                    },
+                    Some(&em),
+                )
                 .await
             {
                 Ok(result) => {
@@ -2239,14 +2606,14 @@ impl Runner {
                     for (filter, msg) in &result.failed {
                         if let Some(svc_names) = filter_to_names.get(filter) {
                             for n in svc_names {
-                                self.fail_rebuild(n, &format!("{n}: turbo build failed: {msg}"));
+                                self.fail_rebuild(n, &format!("turbo build failed: {msg}"));
                             }
                         }
                     }
                 }
                 Err(e) => {
                     for (name, _) in items {
-                        self.fail_rebuild(name, &format!("{name}: turbo build error: {e}"));
+                        self.fail_rebuild(name, &format!("turbo build error: {e}"));
                     }
                 }
             }
@@ -2264,7 +2631,7 @@ impl Runner {
     }
 
     fn fail_rebuild(&self, name: &str, message: &str) {
-        self.output_manager.error_event(message);
+        self.output_manager.service_error_event(name, message);
         let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
             name: name.to_string(),
             success: false,
@@ -2321,7 +2688,7 @@ impl Runner {
                     writer.close_follow_sinks().await;
                 }
                 self.output_manager
-                    .lifecycle_event(&format!("{name}: stopped (removed from config)"));
+                    .service_event(name, "stopped (removed from config)");
             }
             self.services.remove(name);
         }
@@ -2347,7 +2714,6 @@ impl Runner {
                 }
             }
             if let Some(rs) = self.services.get_mut(name) {
-                rs.bound_sockets = None;
                 rs.proxy = None;
             }
         }
@@ -2443,14 +2809,21 @@ impl Runner {
             } else {
                 None
             };
-            match crate::proxy::ServiceProxy::bind(&proxy_config, lazy_tx, name).await {
+            match crate::proxy::ServiceProxy::bind(
+                &proxy_config,
+                lazy_tx,
+                name,
+                self.output_manager.clone_lifecycle_emitter(),
+            )
+            .await
+            {
                 Ok(proxy) => {
                     let addrs: Vec<String> =
                         proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
-                    self.output_manager.lifecycle_event(&format!(
-                        "{name}: proxy listening on {}",
-                        addrs.join(", ")
-                    ));
+                    self.output_manager.service_event(
+                        name,
+                        &format!("proxy listening on {}", addrs.join(", ")),
+                    );
                     if let Some(rs) = self.services.get_mut(name) {
                         rs.proxy = Some(proxy);
                     }
@@ -2460,7 +2833,7 @@ impl Runner {
                 }
                 Err(e) => {
                     self.output_manager
-                        .error_event(&format!("{name}: proxy bind failed: {e}"));
+                        .service_error_event(name, &format!("proxy bind failed: {e}"));
                 }
             }
         }
@@ -2492,9 +2865,8 @@ impl Runner {
                     let deps = dep_map.get(name).cloned().unwrap_or_default();
                     let deps_ok = deps.iter().all(|dep| self.is_dep_satisfied(dep));
                     if !deps_ok {
-                        self.output_manager.lifecycle_event(&format!(
-                            "{name}: waiting for dependencies"
-                        ));
+                        self.output_manager
+                            .service_event(name, "waiting for dependencies");
                         continue;
                     }
                     // Service or task?
@@ -2614,10 +2986,13 @@ impl Runner {
             match result {
                 Ok(info) => {
                     let count = info.watch_paths.len();
-                    self.output_manager.lifecycle_event(&format!(
-                        "{name}: updated watch paths ({count} path{})",
-                        if count == 1 { "" } else { "s" }
-                    ));
+                    self.output_manager.service_event(
+                        name,
+                        &format!(
+                            "updated watch paths ({count} path{})",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                    );
                     if let Some(rs) = self.services.get_mut(name) {
                         rs.resolved_watch_paths = info.watch_paths.clone();
                     } else if let Some(rt) = self.tasks.get_mut(name) {
@@ -2639,387 +3014,78 @@ impl Runner {
                         .await;
                 }
                 Err(e) => {
-                    self.output_manager.error_event(&format!(
-                        "{name}: build tool re-query failed: {e} — keeping existing watch patterns"
-                    ));
+                    self.output_manager.service_error_event(
+                        name,
+                        &format!(
+                            "build tool re-query failed: {e} — keeping existing watch patterns"
+                        ),
+                    );
                 }
             }
         }
     }
 
-    /// Resolve build tool watch patterns for all services and tasks at startup.
-    ///
-    /// For each service/task with a `bazel` or `turbo` config, queries the
-    /// build tool and injects the resolved watch paths. Returns warnings for
-    /// any failures (non-fatal).
-    /// Returns (name -> (watch_paths, ignore_patterns), warnings).
-    async fn resolve_build_tool_watches(&self) -> (
-        HashMap<String, (Vec<String>, Vec<String>)>,
-        Vec<String>,
-    ) {
-        use crate::build_tool::BuildGraphResolver;
-
-        let mut resolved_watches: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
-        let mut warnings: Vec<String> = Vec::new();
-
-        // Collect all items that need build tool resolution.
-        struct BuildToolItem {
-            name: String,
-            bazel: Option<crate::config::BazelConfig>,
-            turbo: Option<crate::config::TurboConfig>,
-            dir: Option<PathBuf>,
-            ignore: Vec<String>,
-        }
-        let mut items: Vec<BuildToolItem> = Vec::new();
+    /// Snapshot of a batch-buildable service or task — everything the
+    /// standalone [`run_batch_build_chain`] needs. Taken at startup before
+    /// the detached task runs so the task doesn't touch `self`.
+    fn collect_batch_build_items(&self) -> Vec<BatchBuildItem> {
+        let mut items: Vec<BatchBuildItem> = Vec::new();
 
         for (name, rs) in &self.services {
-            if rs.resolved.is_build_tool_managed() {
-                items.push(BuildToolItem {
-                    name: name.clone(),
-                    bazel: rs.resolved.bazel_config().cloned(),
-                    turbo: rs.resolved.turbo_config().cloned(),
-                    dir: rs.resolved.dir.clone(),
-                    ignore: rs.resolved.ignore.clone(),
-                });
-            }
-        }
-        for (name, rt) in &self.tasks {
-            if rt.config.bazel.is_some() || rt.config.turbo.is_some() {
-                items.push(BuildToolItem {
-                    name: name.clone(),
-                    bazel: rt.config.bazel.clone(),
-                    turbo: rt.config.turbo.clone(),
-                    dir: rt.config.dir.clone(),
-                    ignore: rt.config.ignore.clone(),
-                });
-            }
-        }
-
-        // Resolve each item concurrently.
-        let mut join_set = tokio::task::JoinSet::new();
-        for BuildToolItem { name, bazel: bazel_cfg, turbo: turbo_cfg, dir: item_dir, ignore } in items {
-            let base_dir = self.base_dir.clone();
-            let working_dir = match item_dir {
-                Some(d) => base_dir.join(d),
-                None => base_dir.clone(),
-            };
-
-            join_set.spawn(async move {
-                let result = if let Some(bazel) = bazel_cfg {
-                    let resolver = crate::build_tool::bazel::BazelResolver::new(
-                        bazel.query_timeout,
-                    );
-                    resolver.resolve(&bazel.target, &working_dir).await
-                } else if let Some(turbo) = turbo_cfg {
-                    let resolver = crate::build_tool::turbo::TurboResolver::new(
-                        &turbo.task,
-                        turbo.filter.as_deref(),
-                        turbo.query_timeout,
-                    );
-                    resolver.resolve(&turbo.task, &working_dir).await
-                } else {
-                    return (name, ignore, Err(crate::build_tool::BuildToolError::QueryFailed {
-                        tool: "unknown".to_string(),
-                        message: "no build tool configured".to_string(),
-                    }));
-                };
-                (name, ignore, result)
-            });
-        }
-
-        while let Some(result) = join_set.join_next().await {
-            if let Ok((name, ignore, resolve_result)) = result {
-                match resolve_result {
-                    Ok(info) => {
-                        let count = info.watch_paths.len();
-                        self.output_manager.lifecycle_event(
-                            &format!("{name}: resolved {count} watch path{} from build tool",
-                                if count == 1 { "" } else { "s" })
-                        );
-                        resolved_watches.insert(name, (info.watch_paths, ignore));
-                    }
-                    Err(e) => {
-                        warnings.push(format!("{name}: build tool query failed: {e}"));
-                    }
-                }
-            }
-        }
-
-        (resolved_watches, warnings)
-    }
-
-    /// Run batch builds for all configured build tool targets.
-    ///
-    /// Collects Bazel targets and Turbo tasks from service/task configs,
-    /// runs one build command per tool (Bazel and Turbo can run concurrently),
-    /// and returns which services had successful builds vs failures.
-    ///
-    /// Build output is streamed through the OutputManager as lifecycle events.
-    /// Resolve Bazel binary paths for all batch-built services.
-    ///
-    /// After `bazel build`, queries `bazel cquery --output=files` for each
-    /// service's target to find the output binary. Services can then be started
-    /// by running the binary directly instead of `bazel run`.
-    async fn resolve_bazel_binary_paths(&mut self) {
-        let mut items: Vec<(String, String, PathBuf)> = Vec::new();
-        for (name, rs) in &self.services {
-            if !rs.batch_built {
+            if !rs.resolved.is_build_tool_managed() {
                 continue;
             }
-            if let Some(bazel) = rs.resolved.bazel_config() {
-                let working_dir = match rs.resolved.dir.as_deref() {
-                    Some(d) => self.base_dir.join(d),
-                    None => self.base_dir.clone(),
-                };
-                items.push((name.clone(), bazel.target.clone(), working_dir));
+            // Lazy bazel/turbo services defer their query+build+cquery to
+            // first connection (JIT in the `lazy_start_rx` handler). Pulling
+            // them into the startup batch would query and build services
+            // the user may never touch this session.
+            if rs.resolved.lazy {
+                continue;
             }
-        }
-
-        for (name, target, working_dir) in items {
-            let resolver = crate::build_tool::bazel::BazelResolver::new(None);
-            match resolver.resolve_binary_path(&target, &working_dir).await {
-                Ok(rel_path) => {
-                    // The path is relative to the workspace (e.g. "bazel-out/.../bin/api").
-                    // Join with working_dir to make it absolute.
-                    let abs_path = working_dir.join(&rel_path);
-                    let path_str = abs_path.to_string_lossy().to_string();
-                    self.output_manager.lifecycle_event(
-                        &format!("{name}: resolved binary {rel_path}")
-                    );
-                    if let Some(rs) = self.services.get_mut(&name) {
-                        rs.bazel_binary_path = Some(path_str.clone());
-                        // Also update the resolved config to use the binary directly.
-                        if let Some(svc) = self.config.services.get(&name) {
-                            rs.resolved = svc.resolve_with_bazel_binary(self.platform, &path_str);
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.output_manager.error_event(
-                        &format!("{name}: could not resolve binary path: {e} — falling back to bazel run")
-                    );
-                }
-            }
-        }
-    }
-
-    async fn run_batch_builds(&mut self) {
-        // Collect Bazel targets: (service_name, bazel_target)
-        let mut bazel_targets: Vec<(String, String)> = Vec::new();
-        // Collect Turbo filters grouped by build_task: (build_task, vec of (service_name, filter))
-        let mut turbo_by_task: std::collections::HashMap<
-            String,
-            Vec<(String, String)>,
-        > = std::collections::HashMap::new();
-        let mut bazel_timeout: Option<u64> = None;
-        let mut turbo_timeout: Option<u64> = None;
-
-        for (name, rs) in &self.services {
-            if let Some(bazel) = rs.resolved.bazel_config() {
-                bazel_targets.push((name.clone(), bazel.target.clone()));
-                if let Some(t) = bazel.query_timeout {
-                    bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
-                }
-            } else if let Some(turbo) = rs.resolved.turbo_config() {
-                let build_task = turbo
-                    .build_task
-                    .clone()
-                    .unwrap_or_else(|| "build".to_string());
-                if !build_task.is_empty() {
-                    if let Some(ref filter) = turbo.filter {
-                        turbo_by_task
-                            .entry(build_task)
-                            .or_default()
-                            .push((name.clone(), filter.clone()));
-                    } else {
-                        self.output_manager.error_event(&format!(
-                            "{name}: turbo.filter is required for batch builds — \
-                             skipping batch build for this service"
-                        ));
-                    }
-                }
-                if let Some(t) = turbo.query_timeout {
-                    turbo_timeout = Some(turbo_timeout.map_or(t, |cur: u64| cur.max(t)));
-                }
-            }
+            items.push(self.build_batch_item(name, NodeKind::Service, rs));
         }
         for (name, rt) in &self.tasks {
-            if let Some(ref bazel) = rt.config.bazel {
-                bazel_targets.push((name.clone(), bazel.target.clone()));
-                if let Some(t) = bazel.query_timeout {
-                    bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
-                }
-            } else if let Some(ref turbo) = rt.config.turbo {
-                let build_task = turbo
-                    .build_task
-                    .clone()
-                    .unwrap_or_else(|| "build".to_string());
-                if !build_task.is_empty() {
-                    if let Some(ref filter) = turbo.filter {
-                        turbo_by_task
-                            .entry(build_task)
-                            .or_default()
-                            .push((name.clone(), filter.clone()));
-                    } else {
-                        self.output_manager.error_event(&format!(
-                            "{name}: turbo.filter is required for batch builds — \
-                             skipping batch build for this task"
-                        ));
-                    }
-                }
-                if let Some(t) = turbo.query_timeout {
-                    turbo_timeout = Some(turbo_timeout.map_or(t, |cur: u64| cur.max(t)));
-                }
+            if rt.config.bazel.is_none() && rt.config.turbo.is_none() {
+                continue;
             }
-        }
-
-        if bazel_targets.is_empty() && turbo_by_task.is_empty() {
-            return;
-        }
-
-        // Run Bazel and Turbo builds concurrently (different tools, no contention).
-        let mut join_set = JoinSet::new();
-
-        if !bazel_targets.is_empty() {
-            let targets: Vec<String> = bazel_targets.iter().map(|(_, t)| t.clone()).collect();
-            let target_to_name: std::collections::HashMap<String, Vec<String>> = {
-                let mut m: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for (name, target) in &bazel_targets {
-                    m.entry(target.clone()).or_default().push(name.clone());
-                }
-                m
+            let working_dir = match rt.config.dir.as_deref() {
+                Some(d) => self.base_dir.join(d),
+                None => self.base_dir.clone(),
             };
-            let count = targets.len();
-            let base_dir = self.base_dir.clone();
-            let om = self.output_manager.clone_lifecycle_emitter();
-
-            self.output_manager.lifecycle_event(&format!(
-                "bazel: building {count} target{}...",
-                if count == 1 { "" } else { "s" }
-            ));
-
-            join_set.spawn(async move {
-                let resolver =
-                    crate::build_tool::bazel::BazelResolver::new(bazel_timeout);
-                let result = resolver
-                    .build_targets(&targets, &base_dir, move |line| {
-                        om.lifecycle_event(&format!("bazel: {line}"));
-                    })
-                    .await;
-                // Map build tool targets back to service/task names.
-                match result {
-                    Ok(batch) => {
-                        let mut succeeded = Vec::new();
-                        for target in &batch.succeeded {
-                            if let Some(names) = target_to_name.get(target) {
-                                succeeded.extend(names.clone());
-                            }
-                        }
-                        let mut failed = Vec::new();
-                        for (target, msg) in &batch.failed {
-                            if let Some(names) = target_to_name.get(target) {
-                                for n in names {
-                                    failed.push((n.clone(), msg.clone()));
-                                }
-                            }
-                        }
-                        Ok(crate::build_tool::BatchBuildResult { succeeded, failed })
-                    }
-                    Err(e) => Err(e),
-                }
+            items.push(BatchBuildItem {
+                name: name.clone(),
+                kind: NodeKind::Task,
+                bazel: rt.config.bazel.clone(),
+                turbo: rt.config.turbo.clone(),
+                working_dir,
+                ignore: rt.config.ignore.clone(),
             });
         }
 
-        for (build_task, items) in turbo_by_task {
-            let filters: Vec<String> = items.iter().map(|(_, f)| f.clone()).collect();
-            let filter_to_name: std::collections::HashMap<String, Vec<String>> = {
-                let mut m: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for (name, filter) in &items {
-                    m.entry(filter.clone()).or_default().push(name.clone());
-                }
-                m
-            };
-            let count = filters.len();
-            let base_dir = self.base_dir.clone();
-            let om = self.output_manager.clone_lifecycle_emitter();
-            let bt = build_task.clone();
+        items
+    }
 
-            self.output_manager.lifecycle_event(&format!(
-                "turbo: running '{build_task}' for {count} package{}...",
-                if count == 1 { "" } else { "s" }
-            ));
-
-            join_set.spawn(async move {
-                // TurboResolver needs a task for watch resolution, but here
-                // we only care about the build. Use the build_task.
-                let resolver = crate::build_tool::turbo::TurboResolver::new(
-                    &bt,
-                    None,
-                    turbo_timeout,
-                );
-                let result = resolver
-                    .build_packages(&bt, &filters, &base_dir, move |line| {
-                        om.lifecycle_event(&format!("turbo: {line}"));
-                    })
-                    .await;
-                match result {
-                    Ok(batch) => {
-                        let mut succeeded = Vec::new();
-                        for filter in &batch.succeeded {
-                            if let Some(names) = filter_to_name.get(filter) {
-                                succeeded.extend(names.clone());
-                            }
-                        }
-                        let mut failed = Vec::new();
-                        for (filter, msg) in &batch.failed {
-                            if let Some(names) = filter_to_name.get(filter) {
-                                for n in names {
-                                    failed.push((n.clone(), msg.clone()));
-                                }
-                            }
-                        }
-                        Ok(crate::build_tool::BatchBuildResult { succeeded, failed })
-                    }
-                    Err(e) => Err(e),
-                }
-            });
-        }
-
-        // Collect results from all build tool batches.
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(batch)) => {
-                    for name in batch.succeeded {
-                        if let Some(rs) = self.services.get_mut(&name) {
-                            rs.batch_built = true;
-                        }
-                    }
-                    for (name, msg) in batch.failed {
-                        self.output_manager
-                            .error_event(&format!("{name}: batch build failed: {msg}"));
-                        self.set_service_state(&name, ServiceState::Failed);
-                        self.set_task_state(&name, TaskItemState::Failed);
-                    }
-                }
-                Ok(Err(e)) => {
-                    self.output_manager
-                        .error_event(&format!("batch build error: {e}"));
-                }
-                Err(e) => {
-                    self.output_manager
-                        .error_event(&format!("batch build task panicked: {e}"));
-                }
-            }
-        }
-
-        let batch_built_count = self.services.values().filter(|rs| rs.batch_built).count();
-        if batch_built_count > 0 {
-            self.output_manager.lifecycle_event(&format!(
-                "batch build complete: {batch_built_count} item{} built",
-                if batch_built_count == 1 { "" } else { "s" }
-            ));
+    /// Snapshot a single service into a [`BatchBuildItem`] for the JIT
+    /// lazy-build path. Shares the field layout with
+    /// [`Self::collect_batch_build_items`] so the chain logic doesn't care
+    /// whether the build is startup-batched or JIT.
+    fn build_batch_item(
+        &self,
+        name: &str,
+        kind: NodeKind,
+        rs: &RuntimeService,
+    ) -> BatchBuildItem {
+        let working_dir = match rs.resolved.dir.as_deref() {
+            Some(d) => self.base_dir.join(d),
+            None => self.base_dir.clone(),
+        };
+        BatchBuildItem {
+            name: name.to_string(),
+            kind,
+            bazel: rs.resolved.bazel_config().cloned(),
+            turbo: rs.resolved.turbo_config().cloned(),
+            working_dir,
+            ignore: rs.resolved.ignore.clone(),
         }
     }
 
@@ -3054,9 +3120,23 @@ impl Runner {
             }
 
             if is_pending_svc {
+                // Skip lazy services for the same reason as `start_ready_items`:
+                // the `lazy_start_rx` flow owns them. A lazy service briefly
+                // in `Pending` state during `LazyBuildComplete`'s
+                // Building→Pending→Starting transition must not be double-started
+                // by a concurrently-scheduled `StartPending`.
+                if self
+                    .services
+                    .get(name)
+                    .is_some_and(|rs| rs.resolved.lazy)
+                {
+                    continue;
+                }
                 if self.services.contains_key(name)
                     && let Some(done_tx) = self.done_tx.clone()
                 {
+                    self.output_manager
+                        .service_event(name, "start triggered (pending sweep)");
                     let _ = self.start_service(name, done_tx).await;
                     started_any = true;
                 }
@@ -3100,7 +3180,7 @@ impl Runner {
         let rs = match self.services.get(name) {
             Some(rs) => rs,
             None => {
-                self.fail_rebuild(name, &format!("{name}: rebuild requested for unknown service"));
+                self.fail_rebuild(name, "rebuild requested for unknown service");
                 return;
             }
         };
@@ -3131,18 +3211,28 @@ impl Runner {
         let resolved = match self.services.get(name) {
             Some(rs) => rs.resolved.clone(),
             None => {
-                self.fail_rebuild(name, &format!("{name}: rebuild requested for unknown service"));
+                self.fail_rebuild(name, "rebuild requested for unknown service");
                 return;
             }
         };
         let mut resolved = resolved;
 
-        self.output_manager
-            .lifecycle_event(&format!("{name}: rebuilding (file changed)"));
+        // For build-tool-managed services the batch build has already run by
+        // the time we reach `do_rebuild` — emitting "rebuilding (file changed)"
+        // here would land confusingly *after* the bazel/turbo output. "Restarting"
+        // is the action left to do. For other kinds, the build happens below in
+        // `run_service_build`, so "rebuilding" precedes the build output as
+        // intended.
+        let message = if resolved.is_build_tool_managed() {
+            "restarting"
+        } else {
+            "rebuilding (file changed)"
+        };
+        self.output_manager.service_event(name, message);
 
         // Build (if any). On failure, keep old process running.
         if let Err(()) = self.run_service_build(name, &resolved).await {
-            self.fail_rebuild(name, &format!("{name}: build failed"));
+            self.fail_rebuild(name, "build failed");
             return;
         }
 
@@ -3167,7 +3257,7 @@ impl Runner {
             let shutdown_config = resolved.shutdown.as_ref();
             if let Err(e) = stop_service(handle, shutdown_config, false).await {
                 self.output_manager
-                    .error_event(&format!("{name}: stop failed during rebuild: {e}"));
+                    .service_error_event(name, &format!("stop failed during rebuild: {e}"));
             }
             // Close follow/attach sinks so attached clients and log
             // followers detect the restart and exit cleanly.
@@ -3176,10 +3266,10 @@ impl Runner {
             }
         }
 
-        // For proxy services: allocate new ephemeral ports and rebind
-        // LISTEN_FDS sockets before spawning the new instance.
+        // For proxy services with env-mode entries: reallocate ephemeral
+        // ports so the new process binds a fresh port. Listenfd entries are
+        // unaffected — don owns the public listener across restarts.
         if has_proxy {
-            // Step 1: Reallocate ephemeral ports.
             let realloc_result = if let Some(rs) = self.services.get_mut(name) {
                 if let Some(ref mut proxy) = rs.proxy {
                     Some(proxy.reallocate_ephemeral_ports().await)
@@ -3190,43 +3280,17 @@ impl Runner {
                 None
             };
             match realloc_result {
-                Some(Ok(_old_ports)) => {
-                    // Step 2: Extract env vars and listen_fds addrs.
-                    let (proxy_env, listen_fds_addrs) = if let Some(rs) = self.services.get(name) {
-                        if let Some(ref proxy) = rs.proxy {
-                            (proxy.env_vars(), proxy.listen_fds_addrs())
-                        } else {
-                            (HashMap::new(), Vec::new())
-                        }
-                    } else {
-                        (HashMap::new(), Vec::new())
-                    };
-                    resolved.env.extend(proxy_env);
-                    // Step 3: Rebind LISTEN_FDS sockets for new ephemeral ports.
-                    if !listen_fds_addrs.is_empty() {
-                        if let Some(rs) = self.services.get_mut(name) {
-                            rs.bound_sockets = None;
-                        }
-                        match crate::process::socket::bind_sockets(&listen_fds_addrs) {
-                            Ok(sockets) => {
-                                if let Some(rs) = self.services.get_mut(name) {
-                                    rs.bound_sockets = Some(sockets);
-                                }
-                            }
-                            Err(e) => {
-                                self.fail_rebuild(
-                                    name,
-                                    &format!("{name}: failed to bind ephemeral sockets: {e}"),
-                                );
-                                return;
-                            }
-                        }
+                Some(Ok(())) => {
+                    if let Some(rs) = self.services.get(name)
+                        && let Some(ref proxy) = rs.proxy
+                    {
+                        resolved.env.extend(proxy.env_vars());
                     }
                 }
                 Some(Err(e)) => {
                     self.fail_rebuild(
                         name,
-                        &format!("{name}: failed to allocate ephemeral ports: {e}"),
+                        &format!("failed to allocate ephemeral ports: {e}"),
                     );
                     return;
                 }
@@ -3270,7 +3334,7 @@ impl Runner {
         // For lazy services in Lazy state, force-start via the normal path.
         if self.services.get(name).is_some_and(|rs| rs.state() == ServiceState::Lazy) {
             self.output_manager
-                .lifecycle_event(&format!("{name}: starting (requested)"));
+                .service_event(name, "starting (requested)");
             if let Some(done_tx) = self.done_tx.clone() {
                 return self.start_service(name, done_tx).await.map_err(|e| {
                     CommandError::Failed {
@@ -3298,7 +3362,7 @@ impl Runner {
             resolved.env.extend(proxy.env_vars());
         }
         self.output_manager
-            .lifecycle_event(&format!("starting {name}... (requested)"));
+            .service_event(name, "starting... (requested)");
         self.spawn_and_wire_service(name, &resolved, None)
             .await
             .map_err(|e| CommandError::Failed {
@@ -3313,9 +3377,14 @@ impl Runner {
         // A lazy service in Lazy state has no process — just mark it Stopped.
         if self.services.get(name).is_some_and(|rs| rs.state() == ServiceState::Lazy) {
             self.set_service_state(name, ServiceState::Stopped);
-            self.output_manager
-                .lifecycle_event(&format!("{name}: stopped (was lazy)"));
+            self.output_manager.service_event(name, "stopped (was lazy)");
             return Ok(());
+        }
+        // Cancel monitor + any pending auto-restart before tearing down the
+        // process so a recovery probe doesn't race with the stop.
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.stop_health_tracking();
+            rs.restart_attempts = 0;
         }
         let handle = self
             .services
@@ -3336,7 +3405,7 @@ impl Runner {
         }
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
-            .lifecycle_event(&format!("stopping {name}... (requested)"));
+            .service_event(name, "stopping... (requested)");
         if let Err(e) = stop_service(handle, shutdown_config.as_ref(), false).await {
             return Err(CommandError::Failed {
                 name: name.to_string(),
@@ -3361,6 +3430,215 @@ impl Runner {
             Err(e) => return Err(e),
         }
         self.handle_start_cmd(name).await
+    }
+
+    /// Apply a health-monitor probe transition for a service.
+    ///
+    /// Only acts when the service is in `Ready` (failure → `Unhealthy`)
+    /// or `Unhealthy` (recovery → `Ready`). Stale messages from a monitor
+    /// task whose service has since stopped/restarted are ignored.
+    async fn handle_service_health_changed(&mut self, name: &str, healthy: bool) {
+        let current = match self.services.get(name) {
+            Some(rs) => rs.state(),
+            None => return,
+        };
+        if healthy {
+            if current != ServiceState::Unhealthy {
+                return;
+            }
+            self.set_service_state(name, ServiceState::Ready);
+            let attempts = self
+                .services
+                .get(name)
+                .map(|rs| rs.restart_attempts)
+                .unwrap_or(0);
+            if let Some(rs) = self.services.get_mut(name) {
+                if let Some(handle) = rs.pending_restart.take() {
+                    handle.abort();
+                }
+                rs.restart_attempts = 0;
+            }
+            let msg = if attempts > 0 {
+                "recovered (cancelled pending restart, attempts reset)"
+            } else {
+                "recovered (health check passing)"
+            };
+            self.output_manager.service_event(name, msg);
+        } else {
+            if current != ServiceState::Ready {
+                return;
+            }
+            self.set_service_state(name, ServiceState::Unhealthy);
+            let policy = self
+                .services
+                .get(name)
+                .map(|rs| rs.resolved.on_failure)
+                .unwrap_or_default();
+            match policy {
+                crate::config::OnFailure::Notify => {
+                    self.output_manager
+                        .service_error_event(name, "unhealthy (health check failing)");
+                }
+                crate::config::OnFailure::Restart => {
+                    self.schedule_auto_restart(name, "unhealthy");
+                }
+            }
+        }
+    }
+
+    /// Schedule an automatic restart for a failed service. Used for both
+    /// `Unhealthy` (monitor-driven) and `Failed` (crash-driven) failures.
+    /// Uses exponential backoff (1, 2, 4, 8, 16, 32, 60s) on consecutive
+    /// attempts. Replaces any already-scheduled restart for this service.
+    /// `reason` is included verbatim in the lifecycle event so a reader
+    /// can tell *why* the restart was scheduled.
+    fn schedule_auto_restart(&mut self, name: &str, reason: &str) {
+        let attempt = self
+            .services
+            .get(name)
+            .map(|rs| rs.restart_attempts.saturating_add(1))
+            .unwrap_or(1);
+        let backoff_secs = unhealthy_restart_backoff_secs(attempt);
+        self.output_manager.service_error_event(
+            name,
+            &format!("{reason} — auto-restart in {backoff_secs}s (attempt {attempt})"),
+        );
+        let cmd_tx = self.cmd_tx.clone();
+        let name_owned = name.to_string();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            let _ = cmd_tx
+                .send(RunnerCommand::AutoRestart {
+                    name: name_owned,
+                    attempt,
+                })
+                .await;
+        });
+        if let Some(rs) = self.services.get_mut(name)
+            && let Some(prev) = rs.pending_restart.replace(handle)
+        {
+            prev.abort();
+        }
+    }
+
+    /// Handle an unexpected exit reported by the per-spawn crash watcher.
+    ///
+    /// The watcher fires whenever the child's output stream EOFs — that
+    /// happens for *both* crashes and graceful stops. To distinguish them:
+    /// 1. Compare `pgid` against the live handle. A mismatch means the
+    ///    service has already been respawned; the event is a leftover
+    ///    from the previous instance.
+    /// 2. Filter on state. Stop / restart / shutdown paths take the
+    ///    handle and transition to `Stopping`/`Stopped`/`Failed` *before*
+    ///    the EOF arrives, so we only act if the runner still believes
+    ///    the service is `Running`/`Ready`/`Unhealthy`.
+    ///
+    /// On a real crash, reap the child to get the actual `ExitStatus`,
+    /// cancel the monitor + any pending auto-restart, transition to
+    /// `Failed`, and emit a lifecycle event with the code or signal.
+    async fn handle_service_exited(&mut self, name: &str, pgid: i32) {
+        let state = match self.services.get(name) {
+            Some(rs) => rs.state(),
+            None => return,
+        };
+        if !matches!(
+            state,
+            ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
+        ) {
+            return;
+        }
+        let current_pgid = self.services.get(name).and_then(|rs| match &rs.handle {
+            Some(ServiceHandle::Process(p)) => Some(p.pgid()),
+            _ => None,
+        });
+        if current_pgid != Some(pgid) {
+            // Stale event from a previous spawn. The current handle is a
+            // different instance; ignore.
+            return;
+        }
+        let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
+            Some(h) => h,
+            None => return,
+        };
+        // Reap the child to surface the real exit status. The wait()
+        // returns near-instantly because the process is already gone (we
+        // got here on EOF) — we're really just collecting the status code.
+        let status = if let ServiceHandle::Process(mut proc) = handle {
+            proc.wait().await.ok()
+        } else {
+            None
+        };
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.stop_health_tracking();
+        }
+        // Exit code 0 = clean self-shutdown; never treated as a failure.
+        // The service didn't ask to be restarted — it asked to exit. We
+        // mirror the graceful-stop transition (Stopped, no error) and
+        // reset restart_attempts in case the service had been flapping
+        // before deciding to exit cleanly.
+        let clean_exit = status.as_ref().is_some_and(|s| s.success());
+        if clean_exit {
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.restart_attempts = 0;
+            }
+            self.set_service_state(name, ServiceState::Stopped);
+            self.output_manager
+                .service_event(name, "exited cleanly (status 0)");
+            if let Some(writer) = self.output_manager.service_writer(name) {
+                writer.close_follow_sinks().await;
+            }
+            return;
+        }
+        self.set_service_state(name, ServiceState::Failed);
+        let exit_msg = format_unexpected_exit(status);
+        self.output_manager.service_error_event(name, &exit_msg);
+        // Apply the on_failure policy. Restart routes through the same
+        // backoff machinery as the monitor's Unhealthy → Restart path,
+        // so a service that crashes repeatedly backs off the same way.
+        let policy = self
+            .services
+            .get(name)
+            .map(|rs| rs.resolved.on_failure)
+            .unwrap_or_default();
+        if matches!(policy, crate::config::OnFailure::Restart) {
+            self.schedule_auto_restart(name, &exit_msg);
+        } else if let Some(rs) = self.services.get_mut(name) {
+            // Notify policy: nothing else to do, but reset attempts so a
+            // later manual restart starts at attempt 1 again.
+            rs.restart_attempts = 0;
+        }
+        // Close follow / attach sinks so anyone watching this service
+        // detects the exit instead of blocking forever on the next read.
+        if let Some(writer) = self.output_manager.service_writer(name) {
+            writer.close_follow_sinks().await;
+        }
+    }
+
+    /// Handle a backoff-timer-fired auto-restart. Used for both monitor-
+    /// driven (`Unhealthy`) and crash-driven (`Failed`) restarts. No-op if
+    /// the service has since recovered, stopped, or been restarted manually
+    /// — those paths transition state away from Unhealthy/Failed and we
+    /// must not re-spawn what the user just stopped.
+    async fn handle_auto_restart(&mut self, name: &str, attempt: u32) {
+        let state = match self.services.get(name) {
+            Some(rs) => rs.state(),
+            None => return,
+        };
+        if !matches!(state, ServiceState::Unhealthy | ServiceState::Failed) {
+            return;
+        }
+        if let Some(rs) = self.services.get_mut(name) {
+            // Drop the handle to the just-fired pending-restart task — it has
+            // already sent the command and completed.
+            rs.pending_restart = None;
+            rs.restart_attempts = attempt;
+        }
+        self.output_manager
+            .service_event(name, &format!("auto-restart firing (attempt {attempt})"));
+        // Reuse the standard restart path. handle_restart_cmd → stop +
+        // start; for a Failed service the stop is a no-op (the handle is
+        // already gone) and we proceed to start fresh.
+        let _ = self.handle_restart_cmd(name).await;
     }
 
     /// Handle an interactive attach request (services or tasks).
@@ -3413,7 +3691,7 @@ impl Runner {
             // Not running — register a waiter. The reply will be sent when
             // the process next spawns.
             self.output_manager
-                .lifecycle_event(&format!("{name}: waiting for process to start (attach pending)"));
+                .service_event(name, "waiting for process to start (attach pending)");
             self.set_attach_waiter(name, AttachWaiter { pid, reply });
             return;
         }
@@ -3454,7 +3732,7 @@ impl Runner {
         self.set_attach_lock(name, pid);
 
         self.output_manager
-            .lifecycle_event(&format!("{name}: attached (pid {pid})"));
+            .service_event(name, &format!("attached (pid {pid})"));
 
         Ok(AttachSession { pty_write, output_rx })
     }
@@ -3496,8 +3774,7 @@ impl Runner {
         // Resume prefixed output.
         self.output_manager.resume_stdout_sink(name).await;
 
-        self.output_manager
-            .lifecycle_event(&format!("{name}: detached"));
+        self.output_manager.service_event(name, "detached");
     }
 
     /// Handle a file-watch-triggered task re-run.
@@ -3506,7 +3783,7 @@ impl Runner {
             Some(rt) => rt.config.clone(),
             None => {
                 self.output_manager
-                    .error_event(&format!("{name}: rerun requested for unknown task"));
+                    .service_error_event(name, "rerun requested for unknown task");
                 let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
                     name: name.to_string(),
                     success: false,
@@ -3523,9 +3800,8 @@ impl Runner {
         // The user will need to trigger a manual rerun when they're ready.
         if !task_cfg.auto_run {
             self.set_task_state(name, TaskItemState::PendingRun);
-            self.output_manager.lifecycle_event(&format!(
-                "{name}: files changed (pending — auto_run = false)"
-            ));
+            self.output_manager
+                .service_event(name, "files changed (pending — auto_run = false)");
             let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
                 name: name.to_string(),
                 success: true,
@@ -3543,21 +3819,21 @@ impl Runner {
         }
 
         self.output_manager
-            .lifecycle_event(&format!("{name}: re-running (file changed)"));
+            .service_event(name, "re-running (file changed)");
         self.set_task_state(name, TaskItemState::Running);
 
         self.output_manager
-            .debug_event(&format!("{name}: spawning process..."));
+            .service_debug_event(name, "spawning process...");
         match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
             Ok(spawn) => {
                 self.output_manager
-                    .debug_event(&format!("{name}: process spawned (pid {}))", spawn.handle.pgid()));
+                    .service_debug_event(name, &format!("process spawned (pid {}))", spawn.handle.pgid()));
                 self.wire_task_output_and_wait(name, spawn, &task_cfg, None).await;
             }
             Err(e) => {
                 self.set_task_state(name, TaskItemState::Failed);
                 self.output_manager
-                    .error_event(&format!("{name}: failed to start: {e}"));
+                    .service_error_event(name, &format!("failed to start: {e}"));
                 let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
                     name: name.to_string(),
                     success: false,
@@ -3609,18 +3885,15 @@ impl Runner {
 
     fn handle_service_done(&mut self, item: &ItemDone) {
         if item.success {
-            let details = self.services.get(&item.name).map(|rs| {
-                let ready_desc = match &rs.resolved.ready {
-                    Some(r) if r.tcp.is_some() => {
-                        format!(" (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
-                    }
-                    Some(r) if r.http.is_some() => {
-                        format!(" (http {})", r.http.as_deref().unwrap_or("unknown"))
-                    }
-                    Some(r) if r.exec.is_some() => " (exec)".to_string(),
-                    _ => " started".to_string(),
-                };
-                (rs.resolved.ready.is_some(), ready_desc)
+            let message = self.services.get(&item.name).map(|rs| match &rs.resolved.ready {
+                Some(r) if r.tcp.is_some() => {
+                    format!("ready (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
+                }
+                Some(r) if r.http.is_some() => {
+                    format!("ready (http {})", r.http.as_deref().unwrap_or("unknown"))
+                }
+                Some(r) if r.exec.is_some() => "ready (exec)".to_string(),
+                _ => "started".to_string(),
             });
             // Activate proxy backend before state flip so the proxy is ready
             // to forward the moment observers see `Ready`.
@@ -3630,16 +3903,8 @@ impl Runner {
                 proxy.set_backend();
             }
             self.set_service_state(&item.name, ServiceState::Ready);
-            if let Some((has_ready, ready_desc)) = details {
-                self.output_manager.lifecycle_event(&format!(
-                    "{}{}",
-                    item.name,
-                    if has_ready {
-                        format!(" ready{ready_desc}")
-                    } else {
-                        ready_desc
-                    }
-                ));
+            if let Some(message) = message {
+                self.output_manager.service_event(&item.name, &message);
             }
         } else {
             // If a lazy service fails, reset to Lazy so the next connection
@@ -3650,15 +3915,23 @@ impl Runner {
                 .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
             if is_lazy {
                 self.set_service_state(&item.name, ServiceState::Lazy);
+                // Re-arm POLLIN watchers on any listenfd proxy entries so
+                // the next queued connection re-triggers lazy start.
+                if let Some(rs) = self.services.get_mut(&item.name)
+                    && let Some(ref mut proxy) = rs.proxy
+                {
+                    proxy.rearm_lazy_watchers();
+                }
                 if let Some(ref msg) = item.message {
-                    self.output_manager
-                        .error_event(&format!("{}: {msg} (will retry on next connection)", item.name));
+                    self.output_manager.service_error_event(
+                        &item.name,
+                        &format!("{msg} (will retry on next connection)"),
+                    );
                 }
             } else {
                 self.set_service_state(&item.name, ServiceState::Failed);
                 if let Some(ref msg) = item.message {
-                    self.output_manager
-                        .error_event(&format!("{}: {msg}", item.name));
+                    self.output_manager.service_error_event(&item.name, msg);
                 }
             }
         }
@@ -3680,21 +3953,21 @@ impl Runner {
             if cur != Some(TaskItemState::Skipped) && cur != Some(TaskItemState::PendingRun) {
                 self.set_task_state(&item.name, TaskItemState::Completed);
                 let msg = if timing.is_empty() {
-                    format!("{} complete", item.name)
+                    "complete".to_string()
                 } else {
-                    format!("{} complete ({timing})", item.name)
+                    format!("complete ({timing})")
                 };
-                self.output_manager.lifecycle_event(&msg);
+                self.output_manager.service_event(&item.name, &msg);
             }
         } else {
             self.set_task_state(&item.name, TaskItemState::Failed);
             if let Some(ref err_msg) = item.message {
                 let msg = if timing.is_empty() {
-                    format!("{} failed ({err_msg})", item.name)
+                    format!("failed ({err_msg})")
                 } else {
-                    format!("{} failed ({err_msg}, {timing})", item.name)
+                    format!("failed ({err_msg}, {timing})")
                 };
-                self.output_manager.error_event(&msg);
+                self.output_manager.service_error_event(&item.name, &msg);
             }
         }
     }
@@ -3703,6 +3976,39 @@ impl Runner {
     async fn initiate_shutdown(&mut self) {
         self.output_manager
             .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");
+
+        // Abort the detached batch-build task and await its termination so
+        // it can't keep any `LifecycleEmitter`/`SinkHandle` clones alive
+        // past shutdown. The `Child` inside has `kill_on_drop(true)`, so
+        // dropping the aborted future SIGKILLs the bazel/turbo client;
+        // awaiting the JoinHandle guarantees the drop has actually run
+        // before we continue. A 5s timeout guards against the pathological
+        // case where the inner reader tasks don't drop promptly — we'd
+        // rather continue shutdown than wedge on a stuck bazel pipe.
+        if let Some(guard) = self.batch_build_handle.take()
+            && let Some(handle) = guard.into_inner()
+        {
+            handle.abort();
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        }
+
+        // Same treatment for any in-flight JIT lazy builds. These are
+        // spawned when a lazy service's proxy gets its first connection
+        // and, until this was tracked, would keep streaming bazel/turbo
+        // output long past "shutdown complete".
+        let lazy_handles: Vec<tokio::task::JoinHandle<()>> = self
+            .lazy_build_handles
+            .drain()
+            .filter_map(|(_, guard)| guard.into_inner())
+            .collect();
+        for h in &lazy_handles {
+            h.abort();
+        }
+        for h in lazy_handles {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
+        }
 
         // Shut down all proxy listeners first (stop accepting new connections).
         for (_, rs) in self.services.iter_mut() {
@@ -3766,7 +4072,7 @@ impl Runner {
         for (_depth, names) in by_depth.into_iter().rev() {
             for name in &names {
                 self.output_manager
-                    .lifecycle_event(&format!("stopping {name}... ({remaining} remaining)"));
+                    .service_event(name, &format!("stopping... ({remaining} remaining)"));
             }
 
             // Track PGIDs of services being stopped so we can SIGKILL
@@ -3830,7 +4136,7 @@ impl Runner {
                         self.set_service_state(&name, ServiceState::Stopped);
                         remaining -= 1;
                         self.output_manager
-                            .lifecycle_event(&format!("{name} stopped ({remaining} remaining)"));
+                            .service_event(&name, &format!("stopped ({remaining} remaining)"));
                     }
                     Ok(Some(Err(_))) => {
                         remaining = remaining.saturating_sub(1);
@@ -3865,7 +4171,7 @@ impl Runner {
                     // ESRCH = already dead, which is fine.
                     if e != nix::Error::ESRCH {
                         self.output_manager
-                            .error_event(&format!("{name}: failed to kill task pgid {pgid}: {e}"));
+                            .service_error_event(name, &format!("failed to kill task pgid {pgid}: {e}"));
                     }
                 }
                 if let Some(rt) = self.tasks.get_mut(name) {
@@ -3885,7 +4191,6 @@ impl Runner {
             rs.handle = None;
             rs.attach_lock = None;
             rs.attach_waiter = None;
-            rs.bound_sockets = None;
         }
         for (_, rt) in self.tasks.iter_mut() {
             rt.attach_lock = None;
@@ -3926,8 +4231,18 @@ impl Runner {
                 Some(VerboseInfo {
                     depends_on: resolved.depends_on.clone(),
                     watch,
-                    listen: resolved.listen.clone(),
-                    proxy: resolved.proxy.iter().map(|p| p.listen.clone()).collect(),
+                    proxy: resolved
+                        .proxy
+                        .iter()
+                        .map(|p| match &p.mode {
+                            crate::config::ProxyMode::Env(name) => {
+                                format!("{} (env={name})", p.listen)
+                            }
+                            crate::config::ProxyMode::Listenfd => {
+                                format!("{} (listenfd)", p.listen)
+                            }
+                        })
+                        .collect(),
                     bazel_target: resolved.bazel_config().map(|b| b.target.clone()),
                     turbo_task: resolved.turbo_config().map(|t| t.task.clone()),
                     ready,
@@ -3958,7 +4273,6 @@ impl Runner {
                 Some(VerboseInfo {
                     depends_on: task.depends_on.clone(),
                     watch,
-                    listen: Vec::new(),
                     proxy: Vec::new(),
                     bazel_target: task.bazel.as_ref().map(|b| b.target.clone()),
                     turbo_task: task.turbo.as_ref().map(|t| t.task.clone()),
@@ -3976,6 +4290,522 @@ impl Runner {
         }
         statuses
     }
+}
+
+/// Render an unexpected-exit lifecycle message from the reaped status.
+/// Reports the exit code for normal exits, the signal number (and core
+/// dump flag) for signal-killed processes, and a plain "no status" line
+/// when the wait failed.
+fn format_unexpected_exit(status: Option<std::process::ExitStatus>) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match status {
+        Some(s) => {
+            if let Some(code) = s.code() {
+                format!("exited unexpectedly with status {code}")
+            } else if let Some(sig) = s.signal() {
+                let core = if s.core_dumped() { " (core dumped)" } else { "" };
+                format!("exited unexpectedly: killed by signal {sig}{core}")
+            } else {
+                "exited unexpectedly (no status available)".to_string()
+            }
+        }
+        None => "exited unexpectedly (could not reap exit status)".to_string(),
+    }
+}
+
+/// Compute the wait before the next auto-restart of an Unhealthy service.
+/// Doubles each attempt (1, 2, 4, 8, 16, 32, 60, 60, ...) up to a 60s cap.
+/// `attempt` is 1-based — the first restart waits 1s.
+fn unhealthy_restart_backoff_secs(attempt: u32) -> u64 {
+    let exp = attempt.saturating_sub(1).min(6);
+    (1u64 << exp).min(60)
+}
+
+/// Long-lived per-service health monitor. Spawned once a service reaches
+/// `Ready` when `ready.monitor = true`. Polls `run_one_check` at
+/// `monitor_interval` and reports state transitions back to the runner via
+/// `RunnerCommand::ServiceHealthChanged`. Exits when the cancel oneshot
+/// fires (sent or dropped) — typically on stop/restart/process exit.
+async fn run_health_monitor(
+    name: String,
+    ready: crate::config::ReadyCheck,
+    cmd_tx: mpsc::Sender<RunnerCommand>,
+    mut cancel: oneshot::Receiver<()>,
+) {
+    let interval_str = ready
+        .monitor_interval
+        .as_deref()
+        .unwrap_or(ready.interval.as_str());
+    // Both values were validated at config load; fall back to 1s if a
+    // bad value somehow reaches here — panicking in this detached task
+    // would silently orphan the monitor.
+    let interval = crate::duration::parse_duration(interval_str)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(1));
+    let unhealthy_after = ready.unhealthy_after.max(1);
+    let mut consecutive_failures: u32 = 0;
+    let mut currently_unhealthy = false;
+    loop {
+        tokio::select! {
+            _ = &mut cancel => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        let probe = service::run_one_check(&ready).await;
+        match probe {
+            Ok(()) => {
+                consecutive_failures = 0;
+                if currently_unhealthy {
+                    currently_unhealthy = false;
+                    let _ = cmd_tx
+                        .send(RunnerCommand::ServiceHealthChanged {
+                            name: name.clone(),
+                            healthy: true,
+                        })
+                        .await;
+                }
+            }
+            Err(_) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if !currently_unhealthy && consecutive_failures >= unhealthy_after {
+                    currently_unhealthy = true;
+                    let _ = cmd_tx
+                        .send(RunnerCommand::ServiceHealthChanged {
+                            name: name.clone(),
+                            healthy: false,
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot of a service or task that needs a batch build. Owned — the
+/// detached batch-build task runs entirely off this and never touches the
+/// live [`Runner`] state.
+#[derive(Clone)]
+pub(crate) struct BatchBuildItem {
+    pub(crate) name: String,
+    pub(crate) kind: NodeKind,
+    pub(crate) bazel: Option<crate::config::BazelConfig>,
+    pub(crate) turbo: Option<crate::config::TurboConfig>,
+    /// Absolute directory where the build tool should be invoked.
+    pub(crate) working_dir: PathBuf,
+    /// Ignore patterns to carry through to the watch manager.
+    pub(crate) ignore: Vec<String>,
+}
+
+/// Everything the detached batch-build task produces. Applied to runner
+/// state in the main loop when [`RunnerCommand::BatchBuildComplete`]
+/// arrives — keeps all `&mut self` mutations on the runner task.
+pub(crate) struct BatchBuildOutcome {
+    /// Per-item resolved watch paths — applied to `resolved_watch_paths` on
+    /// the runtime service/task entry.
+    pub(crate) resolved_watches: Vec<(String, NodeKind, Vec<String>)>,
+    /// Non-fatal warnings (query failures, binary-path cquery failures).
+    pub(crate) warnings: Vec<String>,
+    /// Names whose batch build succeeded — transition `Building` → `Pending`.
+    pub(crate) succeeded: HashSet<String>,
+    /// `(name, message)` for items whose batch build failed — transition
+    /// `Building` → `Failed` and surface the message as an error event.
+    pub(crate) failed: Vec<(String, String)>,
+    /// Absolute binary paths from `bazel cquery --output=files`, keyed by
+    /// service name. Only populated for bazel services whose build succeeded.
+    pub(crate) binary_paths: HashMap<String, String>,
+}
+
+/// Run the full startup-phase batch build: watch resolution → batch build
+/// → bazel binary-path cquery. Pure off-task function that takes owned
+/// inputs and returns an [`BatchBuildOutcome`] the main loop applies.
+///
+/// Sends [`crate::watch::WatchUpdate`]s directly to the watch manager as
+/// they resolve so file watching is live before the builds complete.
+async fn run_batch_build_chain(
+    items: Vec<BatchBuildItem>,
+    base_dir: PathBuf,
+    emitter: crate::output::LifecycleEmitter,
+    watch_update_tx: Option<mpsc::Sender<crate::watch::WatchUpdate>>,
+) -> BatchBuildOutcome {
+    let mut outcome = BatchBuildOutcome {
+        resolved_watches: Vec::new(),
+        warnings: Vec::new(),
+        succeeded: HashSet::new(),
+        failed: Vec::new(),
+        binary_paths: HashMap::new(),
+    };
+    if items.is_empty() {
+        return outcome;
+    }
+
+    // Step 1: resolve watch paths with ONE query per tool.
+    //
+    // Previously we ran N parallel `bazel query` / `turbo run --dry-run`
+    // subprocesses, one per item. Bazel's server has a workspace-wide
+    // analysis lock, so those parallel queries mostly serialised inside
+    // bazel anyway — and each process startup cost stacked. Now we issue
+    // a single `deps(T1 + ... + Tn) --output=xml` and DFS-walk per target
+    // client-side to keep accurate per-service attribution.
+    //
+    // Turbo still uses the union-attribution shape — upgrading it to
+    // per-filter attribution is a separate effort.
+
+    // Partition items by tool. Each item keeps its own ignore patterns
+    // (configured per service/task) but gets the same tier-1/tier-2 globs.
+    let bazel_items: Vec<&BatchBuildItem> =
+        items.iter().filter(|i| i.bazel.is_some()).collect();
+    let turbo_items: Vec<&BatchBuildItem> =
+        items.iter().filter(|i| i.turbo.is_some()).collect();
+
+    let mut bazel_info_by_target: HashMap<String, crate::build_tool::ResolvedBuildInfo> =
+        HashMap::new();
+    let mut turbo_info: Option<crate::build_tool::ResolvedBuildInfo> = None;
+
+    if !bazel_items.is_empty() {
+        let targets: Vec<String> = bazel_items
+            .iter()
+            .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
+            .collect();
+        // Take the maximum configured timeout across all bazel items (so no
+        // item gets a shorter deadline than it asked for).
+        let timeout = bazel_items
+            .iter()
+            .filter_map(|i| i.bazel.as_ref().and_then(|b| b.query_timeout))
+            .max();
+        // Unified query runs at the workspace root — all bazel items share a
+        // single workspace in practice, so the first item's working_dir is
+        // the workspace root.
+        let working_dir = bazel_items[0].working_dir.clone();
+        let resolver = crate::build_tool::bazel::BazelResolver::new(timeout);
+        match resolver.resolve_per_target(&targets, &working_dir).await {
+            Ok(info_by_target) => {
+                let unique: HashSet<&String> = info_by_target
+                    .values()
+                    .flat_map(|i| i.watch_paths.iter())
+                    .collect();
+                emitter.bazel_event(&format!(
+                    "resolved {} unique watch path{} across {} target{}",
+                    unique.len(),
+                    if unique.len() == 1 { "" } else { "s" },
+                    targets.len(),
+                    if targets.len() == 1 { "" } else { "s" },
+                ));
+                bazel_info_by_target = info_by_target;
+            }
+            Err(e) => {
+                outcome
+                    .warnings
+                    .push(format!("bazel query failed: {e}"));
+            }
+        }
+    }
+
+    if !turbo_items.is_empty() {
+        let filters: Vec<String> = turbo_items
+            .iter()
+            .filter_map(|i| i.turbo.as_ref().and_then(|t| t.filter.clone()))
+            .collect();
+        let timeout = turbo_items
+            .iter()
+            .filter_map(|i| i.turbo.as_ref().and_then(|t| t.query_timeout))
+            .max();
+        // Pick the first turbo item's task as the command's task name. All
+        // turbo items in a startup batch must share a task (this is what
+        // `turbo run <task>` takes) — if configs differ, we'd need per-task
+        // grouping. For now, emit a warning on mismatch and use the first.
+        let task = turbo_items[0]
+            .turbo
+            .as_ref()
+            .map(|t| t.task.clone())
+            .unwrap_or_default();
+        for i in &turbo_items[1..] {
+            if let Some(t) = &i.turbo
+                && t.task != task
+            {
+                outcome.warnings.push(format!(
+                    "{}: turbo.task '{}' differs from batch task '{}' — using batch task",
+                    i.name, t.task, task
+                ));
+            }
+        }
+        let working_dir = turbo_items[0].working_dir.clone();
+        let resolver =
+            crate::build_tool::turbo::TurboResolver::new(&task, None, timeout);
+        match resolver.resolve_union(&filters, &working_dir).await {
+            Ok(info) => {
+                emitter.turbo_event(&format!(
+                    "resolved {} watch path{} across {} filter{}",
+                    info.watch_paths.len(),
+                    if info.watch_paths.len() == 1 { "" } else { "s" },
+                    filters.len(),
+                    if filters.len() == 1 { "" } else { "s" },
+                ));
+                turbo_info = Some(info);
+            }
+            Err(e) => {
+                outcome
+                    .warnings
+                    .push(format!("turbo query failed: {e}"));
+            }
+        }
+    }
+
+    // Attribute resolved watch paths to each item. Bazel items get their
+    // own per-target result (computed by DFS from the unified XML graph);
+    // turbo items still share the union. Each item emits its own
+    // `WatchUpdate` so the watch manager keeps a per-service/task
+    // `WatchedItem` entry keyed by name. Directories in the watcher dedup
+    // via `registered_dirs`, so the actual inotify cost is paid once per
+    // directory regardless of how many items claim it.
+    for item in &items {
+        let info = if let Some(ref bazel) = item.bazel {
+            bazel_info_by_target.get(&bazel.target)
+        } else if item.turbo.is_some() {
+            turbo_info.as_ref()
+        } else {
+            None
+        };
+        let Some(info) = info else {
+            continue; // query failed for this tool — warning already pushed
+        };
+
+        if let Some(ref tx) = watch_update_tx {
+            let watch_kind = match item.kind {
+                NodeKind::Service => crate::watch::WatchItemKind::Service,
+                NodeKind::Task => crate::watch::WatchItemKind::Task,
+            };
+            let _ = tx
+                .send(crate::watch::WatchUpdate {
+                    name: item.name.clone(),
+                    kind: watch_kind,
+                    patterns: info.watch_paths.clone(),
+                    ignore_patterns: item.ignore.clone(),
+                    base_dir: base_dir.clone(),
+                })
+                .await;
+            if !info.graph_definition_globs.is_empty() {
+                let _ = tx
+                    .send(crate::watch::WatchUpdate {
+                        name: format!("{}__graph", item.name),
+                        kind: crate::watch::WatchItemKind::BuildGraph,
+                        patterns: info.graph_definition_globs.clone(),
+                        ignore_patterns: Vec::new(),
+                        base_dir: base_dir.clone(),
+                    })
+                    .await;
+            }
+        }
+        outcome.resolved_watches.push((
+            item.name.clone(),
+            item.kind,
+            info.watch_paths.clone(),
+        ));
+    }
+
+    // Step 2: batch builds, grouped by tool. Bazel and Turbo run concurrently.
+    let mut bazel_items: Vec<(BatchBuildItem, String)> = Vec::new();
+    let mut bazel_timeout: Option<u64> = None;
+    let mut turbo_by_task: HashMap<String, Vec<(BatchBuildItem, String)>> = HashMap::new();
+    let mut turbo_timeout: Option<u64> = None;
+
+    for item in &items {
+        if let Some(ref bazel) = item.bazel {
+            bazel_items.push((item.clone(), bazel.target.clone()));
+            if let Some(t) = bazel.query_timeout {
+                bazel_timeout = Some(bazel_timeout.map_or(t, |cur: u64| cur.max(t)));
+            }
+        } else if let Some(ref turbo) = item.turbo {
+            let build_task = turbo
+                .build_task
+                .clone()
+                .unwrap_or_else(|| "build".to_string());
+            if !build_task.is_empty() {
+                if let Some(ref filter) = turbo.filter {
+                    turbo_by_task
+                        .entry(build_task)
+                        .or_default()
+                        .push((item.clone(), filter.clone()));
+                } else {
+                    outcome.warnings.push(format!(
+                        "{}: turbo.filter is required for batch builds — skipping batch build",
+                        item.name
+                    ));
+                }
+            }
+            if let Some(t) = turbo.query_timeout {
+                turbo_timeout = Some(turbo_timeout.map_or(t, |cur: u64| cur.max(t)));
+            }
+        }
+    }
+
+    let mut build_set: JoinSet<
+        Result<crate::build_tool::BatchBuildResult, crate::build_tool::BuildToolError>,
+    > = JoinSet::new();
+
+    if !bazel_items.is_empty() {
+        let targets: Vec<String> = bazel_items.iter().map(|(_, t)| t.clone()).collect();
+        let target_to_names: HashMap<String, Vec<String>> = {
+            let mut m: HashMap<String, Vec<String>> = HashMap::new();
+            for (item, target) in &bazel_items {
+                m.entry(target.clone()).or_default().push(item.name.clone());
+            }
+            m
+        };
+        let count = targets.len();
+        let base = base_dir.clone();
+        let em = emitter.clone();
+        let em_spawn = emitter.clone();
+        emitter.bazel_event(&format!(
+            "building {count} target{}...",
+            if count == 1 { "" } else { "s" }
+        ));
+        build_set.spawn(async move {
+            let resolver = crate::build_tool::bazel::BazelResolver::new(bazel_timeout);
+            let result = resolver
+                .build_targets(
+                    &targets,
+                    &base,
+                    move |line| {
+                        em.bazel_event(line);
+                    },
+                    Some(&em_spawn),
+                )
+                .await;
+            match result {
+                Ok(batch) => {
+                    let mut succeeded: Vec<String> = Vec::new();
+                    for target in &batch.succeeded {
+                        if let Some(names) = target_to_names.get(target) {
+                            succeeded.extend(names.clone());
+                        }
+                    }
+                    let mut failed: Vec<(String, String)> = Vec::new();
+                    for (target, msg) in &batch.failed {
+                        if let Some(names) = target_to_names.get(target) {
+                            for n in names {
+                                failed.push((n.clone(), msg.clone()));
+                            }
+                        }
+                    }
+                    Ok(crate::build_tool::BatchBuildResult { succeeded, failed })
+                }
+                Err(e) => Err(e),
+            }
+        });
+    }
+
+    for (build_task, items_for_task) in turbo_by_task {
+        let filters: Vec<String> = items_for_task.iter().map(|(_, f)| f.clone()).collect();
+        let filter_to_names: HashMap<String, Vec<String>> = {
+            let mut m: HashMap<String, Vec<String>> = HashMap::new();
+            for (item, filter) in &items_for_task {
+                m.entry(filter.clone()).or_default().push(item.name.clone());
+            }
+            m
+        };
+        let count = filters.len();
+        let base = base_dir.clone();
+        let em = emitter.clone();
+        let em_spawn = emitter.clone();
+        let bt = build_task.clone();
+        emitter.turbo_event(&format!(
+            "running '{build_task}' for {count} package{}...",
+            if count == 1 { "" } else { "s" }
+        ));
+        build_set.spawn(async move {
+            let resolver =
+                crate::build_tool::turbo::TurboResolver::new(&bt, None, turbo_timeout);
+            let result = resolver
+                .build_packages(
+                    &bt,
+                    &filters,
+                    &base,
+                    move |line| {
+                        em.turbo_event(line);
+                    },
+                    Some(&em_spawn),
+                )
+                .await;
+            match result {
+                Ok(batch) => {
+                    let mut succeeded = Vec::new();
+                    for filter in &batch.succeeded {
+                        if let Some(names) = filter_to_names.get(filter) {
+                            succeeded.extend(names.clone());
+                        }
+                    }
+                    let mut failed = Vec::new();
+                    for (filter, msg) in &batch.failed {
+                        if let Some(names) = filter_to_names.get(filter) {
+                            for n in names {
+                                failed.push((n.clone(), msg.clone()));
+                            }
+                        }
+                    }
+                    Ok(crate::build_tool::BatchBuildResult { succeeded, failed })
+                }
+                Err(e) => Err(e),
+            }
+        });
+    }
+
+    while let Some(result) = build_set.join_next().await {
+        match result {
+            Ok(Ok(batch)) => {
+                for name in batch.succeeded {
+                    outcome.succeeded.insert(name);
+                }
+                for (name, msg) in batch.failed {
+                    outcome.failed.push((name, msg));
+                }
+            }
+            Ok(Err(e)) => outcome.warnings.push(format!("batch build error: {e}")),
+            Err(e) => outcome
+                .warnings
+                .push(format!("batch build task panicked: {e}")),
+        }
+    }
+
+    let built_count = outcome.succeeded.len();
+    if built_count > 0 {
+        emitter.lifecycle_event(&format!(
+            "batch build complete: {built_count} item{} built",
+            if built_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    // Step 3: bazel cquery per succeeded bazel service to find the built
+    // binary. Lets the runner spawn the artifact directly instead of via
+    // `bazel run`. Tasks and turbo services don't need this.
+    for item in &items {
+        if item.kind != NodeKind::Service {
+            continue;
+        }
+        if !outcome.succeeded.contains(&item.name) {
+            continue;
+        }
+        let Some(ref bazel) = item.bazel else {
+            continue;
+        };
+        let resolver = crate::build_tool::bazel::BazelResolver::new(None);
+        match resolver
+            .resolve_binary_path(&bazel.target, &item.working_dir)
+            .await
+        {
+            Ok(rel_path) => {
+                let abs_path = item.working_dir.join(&rel_path);
+                let path_str = abs_path.to_string_lossy().to_string();
+                emitter.service_event(&item.name, &format!("resolved binary {rel_path}"));
+                outcome.binary_paths.insert(item.name.clone(), path_str);
+            }
+            Err(e) => {
+                outcome.warnings.push(format!(
+                    "{}: could not resolve binary path: {e} — falling back to bazel run",
+                    item.name
+                ));
+            }
+        }
+    }
+
+    outcome
 }
 
 /// Check if `.don/` is in `.gitignore`. Warns if not — the `.don/` directory
@@ -4096,6 +4926,159 @@ struct ItemDone {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unhealthy_restart_backoff_table() {
+        struct Case {
+            attempt: u32,
+            want_secs: u64,
+        }
+        let cases = [
+            Case { attempt: 1, want_secs: 1 },
+            Case { attempt: 2, want_secs: 2 },
+            Case { attempt: 3, want_secs: 4 },
+            Case { attempt: 4, want_secs: 8 },
+            Case { attempt: 5, want_secs: 16 },
+            Case { attempt: 6, want_secs: 32 },
+            // Cap kicks in at attempt 7 (1<<6 = 64 → clamped to 60).
+            Case { attempt: 7, want_secs: 60 },
+            Case { attempt: 12, want_secs: 60 },
+            Case { attempt: u32::MAX, want_secs: 60 },
+            // Defensive: a 0 attempt shouldn't blow up — saturating_sub keeps
+            // exp at 0 and the wait at 1s.
+            Case { attempt: 0, want_secs: 1 },
+        ];
+        for c in cases {
+            assert_eq!(
+                unhealthy_restart_backoff_secs(c.attempt),
+                c.want_secs,
+                "attempt {}",
+                c.attempt
+            );
+        }
+    }
+
+    /// Drive `run_health_monitor` against a controllable TCP target and
+    /// verify it emits the right `ServiceHealthChanged` sequence.
+    ///
+    /// Strategy: bind a real `TcpListener`, point the monitor at its port
+    /// with a tiny interval, then close/rebind to flip health. We assert
+    /// only the sequence of `healthy` flags, not their timing — the loop
+    /// is naturally jittery and exact timings would make the test flaky.
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn run_health_monitor_emits_unhealthy_then_recovers() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let ready = crate::config::ReadyCheck {
+            exec: None,
+            tcp: Some(format!("127.0.0.1:{port}")),
+            http: None,
+            interval: "1s".to_string(),
+            retries: 1,
+            monitor: true,
+            monitor_interval: Some("20ms".to_string()),
+            unhealthy_after: 2,
+        };
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let monitor = tokio::spawn(run_health_monitor(
+            "svc".to_string(),
+            ready,
+            cmd_tx,
+            cancel_rx,
+        ));
+
+        // Listener is up — the monitor sees only successes and reports nothing.
+        // Drain for ~120ms to confirm silence on the happy path.
+        let no_msg = tokio::time::timeout(
+            std::time::Duration::from_millis(120),
+            cmd_rx.recv(),
+        )
+        .await;
+        assert!(
+            no_msg.is_err(),
+            "monitor should not emit while target is healthy"
+        );
+
+        // Drop the listener so connect() starts failing. After
+        // unhealthy_after=2 consecutive failures, expect healthy=false.
+        drop(listener);
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cmd_rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for unhealthy event")
+        .expect("monitor channel closed unexpectedly");
+        match msg {
+            RunnerCommand::ServiceHealthChanged { name, healthy } => {
+                assert_eq!(name, "svc");
+                assert!(!healthy, "expected unhealthy event first");
+            }
+            _ => panic!("unexpected command variant — monitor should only send ServiceHealthChanged"),
+        }
+
+        // Rebind so probes pass again — expect a recovery event.
+        let _restored = TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cmd_rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for recovery event")
+        .expect("monitor channel closed unexpectedly");
+        match msg {
+            RunnerCommand::ServiceHealthChanged { name, healthy } => {
+                assert_eq!(name, "svc");
+                assert!(healthy, "expected recovery event after rebind");
+            }
+            _ => panic!("unexpected command variant — monitor should only send ServiceHealthChanged"),
+        }
+
+        // Tear the monitor down cleanly so the test exits.
+        let _ = cancel_tx.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), monitor).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_health_monitor_exits_on_cancel() {
+        let ready = crate::config::ReadyCheck {
+            exec: None,
+            tcp: Some("127.0.0.1:1".to_string()),
+            http: None,
+            interval: "10s".to_string(),
+            retries: 1,
+            monitor: true,
+            monitor_interval: Some("10s".to_string()),
+            unhealthy_after: 5,
+        };
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let monitor = tokio::spawn(run_health_monitor(
+            "svc".to_string(),
+            ready,
+            cmd_tx,
+            cancel_rx,
+        ));
+        // Long monitor_interval — without cancel, the join would hang.
+        // Cancel and confirm the task returns within a short window.
+        let _ = cancel_tx.send(());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            monitor,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "monitor should exit promptly after cancel"
+        );
+    }
 
     #[test]
     fn test_topological_sort() {
@@ -4283,6 +5266,36 @@ mod tests {
                 to: ServiceState::Pending,
                 valid: true,
             },
+            Case {
+                name: "ready -> unhealthy (monitor failed)",
+                from: ServiceState::Ready,
+                to: ServiceState::Unhealthy,
+                valid: true,
+            },
+            Case {
+                name: "unhealthy -> ready (recovered)",
+                from: ServiceState::Unhealthy,
+                to: ServiceState::Ready,
+                valid: true,
+            },
+            Case {
+                name: "unhealthy -> stopping (manual stop)",
+                from: ServiceState::Unhealthy,
+                to: ServiceState::Stopping,
+                valid: true,
+            },
+            Case {
+                name: "unhealthy -> failed (process exit)",
+                from: ServiceState::Unhealthy,
+                to: ServiceState::Failed,
+                valid: true,
+            },
+            Case {
+                name: "unhealthy -> pending (restart)",
+                from: ServiceState::Unhealthy,
+                to: ServiceState::Pending,
+                valid: true,
+            },
             // Invalid transitions
             Case {
                 name: "stopped -> ready",
@@ -4364,7 +5377,6 @@ mod tests {
                 ignore: Vec::new(),
                 debounce: None,
                 depends_on: Vec::new(),
-                listen: Vec::new(),
                 proxy: Vec::new(),
                 lazy: false,
                 download: None,
@@ -4372,7 +5384,9 @@ mod tests {
                 shutdown: None,
                 log: LogConfig::Stdout,
                 reload: true,
+                on_failure: crate::config::OnFailure::Notify,
                 kind: None,
+                resolved_binary_path: None,
             },
             ServiceState::Pending,
         );
@@ -4382,7 +5396,6 @@ mod tests {
         assert!(rs.osc_sink.is_none());
         assert!(rs.attach_lock.is_none());
         assert!(rs.attach_waiter.is_none());
-        assert!(rs.bound_sockets.is_none());
         assert!(rs.proxy.is_none());
         assert!(rs.resolved_watch_paths.is_empty());
         assert!(rs.bazel_binary_path.is_none());

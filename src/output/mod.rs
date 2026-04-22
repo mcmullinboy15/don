@@ -26,6 +26,11 @@ use tokio::task::JoinHandle;
 /// Default ring buffer capacity per service (lines).
 const DEFAULT_RING_BUFFER_CAPACITY: usize = 10_000;
 
+/// Name stamped on `[don]` lifecycle events so the TUI filter can treat them
+/// like any other service/task: gated when a filter is active, selectable
+/// from the filter dropdown. Must not collide with a user service/task name.
+pub const LIFECYCLE_EVENT_NAME: &str = "don";
+
 /// ASCII BEL character — emitted on error events for an audible alert.
 const BELL: &str = "\x07";
 
@@ -83,8 +88,10 @@ pub struct SinkLine {
     pub prefix: Bytes,
     /// The raw line content (no newline).
     pub line: Bytes,
-    /// The service/task name this line belongs to. Empty for `[don]` lifecycle
-    /// events, which the TUI treats as unfilterable so users always see them.
+    /// The service/task name this line belongs to. `[don]` lifecycle events
+    /// use [`LIFECYCLE_EVENT_NAME`] so they participate in the TUI filter
+    /// like any other entry — selectable, but hidden when the filter is
+    /// active and doesn't include them.
     pub name: String,
 }
 
@@ -106,8 +113,9 @@ pub(crate) struct SinkHandle {
 /// The bytes already include any verbose-mode timestamp and the color-coded
 /// service prefix; the consumer just renders them as-is.
 pub struct FormattedLogLine {
-    /// Owning service/task name. Empty for `[don]` lifecycle events, which
-    /// the TUI always shows regardless of the active filter.
+    /// Owning service/task name. `[don]` lifecycle events carry
+    /// [`LIFECYCLE_EVENT_NAME`] so the filter treats them as a selectable
+    /// entry rather than always passing them.
     pub name: String,
     /// Fully formatted line bytes. Does NOT include a trailing newline —
     /// the renderer appends one (or, for ratatui, treats it as one row).
@@ -275,6 +283,48 @@ fn assign_colors(names: &[&str]) -> HashMap<String, usize> {
         .collect()
 }
 
+/// Format a command + args pair into a shell-ish one-liner for debug logs.
+///
+/// Any argument containing whitespace, quotes, or shell metacharacters gets
+/// single-quoted with embedded `'` escaped as `'\''`. Safe to copy-paste
+/// into a shell.
+fn format_cmdline<S: AsRef<str>>(cmd: &str, args: &[S]) -> String {
+    let mut out = shell_quote(cmd);
+    for arg in args {
+        out.push(' ');
+        out.push_str(&shell_quote(arg.as_ref()));
+    }
+    out
+}
+
+fn shell_quote(s: &str) -> String {
+    let needs_quoting = s.is_empty()
+        || s.bytes().any(|b| {
+            !(b.is_ascii_alphanumeric()
+                || b == b'_'
+                || b == b'-'
+                || b == b'.'
+                || b == b'/'
+                || b == b':'
+                || b == b'='
+                || b == b',')
+        });
+    if !needs_quoting {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Build a formatted prefix as bytes for a service name.
 fn format_prefix(name: &str, color_index: usize, max_name_len: usize) -> Bytes {
     let color = COLORS[color_index % COLORS.len()];
@@ -300,6 +350,13 @@ pub struct OutputManager {
     writer_handles: Vec<JoinHandle<()>>,
     /// Verbose mode — enables extra diagnostic lifecycle events.
     verbose: bool,
+    /// Cached formatted prefix for the synthetic "bazel" stream. Populated
+    /// by [`Self::register_build_tool`]; `None` means build output falls
+    /// back to a `[don]`-prefixed lifecycle event with a `bazel:` text
+    /// prefix.
+    bazel_prefix: Option<Bytes>,
+    /// Same as `bazel_prefix` for the synthetic "turbo" stream.
+    turbo_prefix: Option<Bytes>,
 }
 
 /// Errors from output handling.
@@ -437,7 +494,62 @@ impl OutputManager {
             stdout_sink,
             writer_handles,
             verbose,
+            bazel_prefix: None,
+            turbo_prefix: None,
         })
+    }
+
+    /// Register a synthetic "tool" service (`bazel` or `turbo`) so build
+    /// output gets its own color-coded prefix column instead of an inline
+    /// `bazel: …` text prefix on a `[don]` lifecycle event.
+    ///
+    /// Idempotent: if already registered, just returns — the cached prefix
+    /// stays intact. Name must be either `"bazel"` or `"turbo"` (panics
+    /// otherwise in debug builds; silently drops the prefix cache in
+    /// release).
+    pub async fn register_build_tool(&mut self, name: &str) {
+        self.register_service(name, &crate::config::LogConfig::Stdout).await;
+        let prefix = if let Some(state_arc) = self.services.get(name) {
+            let state = state_arc.lock().await;
+            Some(state.prefix.clone())
+        } else {
+            None
+        };
+        match name {
+            "bazel" => self.bazel_prefix = prefix,
+            "turbo" => self.turbo_prefix = prefix,
+            _ => debug_assert!(false, "register_build_tool: unknown tool '{name}'"),
+        }
+    }
+
+    /// Emit a line prefixed as bazel tool output. Falls back to a
+    /// `[don]`-prefixed `bazel: {message}` lifecycle event if
+    /// [`Self::register_build_tool`] wasn't called.
+    pub fn bazel_event(&self, message: &str) {
+        match self.bazel_prefix.as_ref() {
+            Some(prefix) => {
+                let _ = self.stdout_sink.tx.try_send(SinkLine {
+                    prefix: prefix.clone(),
+                    line: Bytes::from(format!("{message}\n")),
+                    name: "bazel".to_string(),
+                });
+            }
+            None => self.lifecycle_event(&format!("bazel: {message}")),
+        }
+    }
+
+    /// Emit a line prefixed as turbo tool output.
+    pub fn turbo_event(&self, message: &str) {
+        match self.turbo_prefix.as_ref() {
+            Some(prefix) => {
+                let _ = self.stdout_sink.tx.try_send(SinkLine {
+                    prefix: prefix.clone(),
+                    line: Bytes::from(format!("{message}\n")),
+                    name: "turbo".to_string(),
+                });
+            }
+            None => self.lifecycle_event(&format!("turbo: {message}")),
+        }
     }
 
     /// Get a writer handle for a service. Cloneable, reusable across restarts.
@@ -588,6 +700,9 @@ impl OutputManager {
         LifecycleEmitter {
             don_prefix: self.don_prefix.clone(),
             stdout_sink: self.stdout_sink.clone(),
+            bazel_prefix: self.bazel_prefix.clone(),
+            turbo_prefix: self.turbo_prefix.clone(),
+            verbose: self.verbose,
         }
     }
 
@@ -596,7 +711,7 @@ impl OutputManager {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{message}\n")),
-            name: String::new(),
+            name: LIFECYCLE_EVENT_NAME.to_string(),
         });
     }
 
@@ -607,13 +722,33 @@ impl OutputManager {
         }
     }
 
-    /// Emit a `[don]` lifecycle event for a specific service.
+    /// Log (in verbose mode only) the exact executable and arguments about
+    /// to be passed to `execve`. See [`LifecycleEmitter::debug_spawn`].
+    pub fn debug_spawn<S: AsRef<str>>(&self, label: &str, cmd: &str, args: &[S]) {
+        if !self.verbose {
+            return;
+        }
+        self.service_event(label, &format!("spawn {}", format_cmdline(cmd, args)));
+    }
+
+    /// Emit a `[don]` lifecycle event scoped to a service/task. The message
+    /// is prefixed with `{service}: ` and the line is tagged with `service`
+    /// so it passes the TUI filter when the service is selected — `[don] api:
+    /// restarted` shows up under the "api" filter, not under "don".
     pub fn service_event(&self, service: &str, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{service}: {message}\n")),
-            name: String::new(),
+            name: service.to_string(),
         });
+    }
+
+    /// Emit a `[don]` lifecycle event scoped to a service/task, only when
+    /// verbose mode is enabled. See [`Self::service_event`].
+    pub fn service_debug_event(&self, service: &str, message: &str) {
+        if self.verbose {
+            self.service_event(service, message);
+        }
     }
 
     /// Emit a `[don]` error event with a terminal bell.
@@ -621,16 +756,18 @@ impl OutputManager {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
             line: Bytes::from(format!("{message}\n")),
-            name: String::new(),
+            name: LIFECYCLE_EVENT_NAME.to_string(),
         });
     }
 
     /// Emit a `[don]` error event for a specific service with a terminal bell.
+    /// Tagged with the service name so the filter surfaces it alongside that
+    /// service's own output. See [`Self::service_event`] for rationale.
     pub fn service_error_event(&self, service: &str, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
             line: Bytes::from(format!("{service}: {message}\n")),
-            name: String::new(),
+            name: service.to_string(),
         });
     }
 
@@ -699,6 +836,9 @@ impl OutputManager {
 pub struct LifecycleEmitter {
     don_prefix: String,
     stdout_sink: SinkHandle,
+    bazel_prefix: Option<Bytes>,
+    turbo_prefix: Option<Bytes>,
+    verbose: bool,
 }
 
 impl LifecycleEmitter {
@@ -707,8 +847,86 @@ impl LifecycleEmitter {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{message}\n")),
-            name: String::new(),
+            name: LIFECYCLE_EVENT_NAME.to_string(),
         });
+    }
+
+    /// Emit a `[don]` lifecycle event scoped to a service/task. Tagged with
+    /// the service name so the TUI filter shows it when the service is
+    /// selected. See [`OutputManager::service_event`] for rationale.
+    pub fn service_event(&self, service: &str, message: &str) {
+        let _ = self.stdout_sink.tx.try_send(SinkLine {
+            prefix: Bytes::from(self.don_prefix.clone()),
+            line: Bytes::from(format!("{service}: {message}\n")),
+            name: service.to_string(),
+        });
+    }
+
+    /// Emit a `[don]` error event with a terminal bell, scoped to a service.
+    /// Tagged with the service name.
+    pub fn service_error_event(&self, service: &str, message: &str) {
+        let _ = self.stdout_sink.tx.try_send(SinkLine {
+            prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
+            line: Bytes::from(format!("{service}: {message}\n")),
+            name: service.to_string(),
+        });
+    }
+
+    /// Emit a `[don]` lifecycle event only when verbose mode is enabled.
+    pub fn debug_event(&self, message: &str) {
+        if self.verbose {
+            self.lifecycle_event(message);
+        }
+    }
+
+    /// Emit a service-scoped `[don]` event only when verbose mode is enabled.
+    pub fn service_debug_event(&self, service: &str, message: &str) {
+        if self.verbose {
+            self.service_event(service, message);
+        }
+    }
+
+    /// Log (in verbose mode only) the exact executable and arguments about
+    /// to be passed to `execve`. Use before every `Command::spawn()` so
+    /// `don -v` shows what don is actually asking the kernel to run.
+    ///
+    /// `label` is a short tag (e.g. service name, "bazel", "turbo") to
+    /// help the user identify the source of the spawn.
+    pub fn debug_spawn<S: AsRef<str>>(&self, label: &str, cmd: &str, args: &[S]) {
+        if !self.verbose {
+            return;
+        }
+        self.service_event(label, &format!("spawn {}", format_cmdline(cmd, args)));
+    }
+
+    /// Emit a line prefixed as bazel tool output. Falls back to a
+    /// `[don]`-prefixed `bazel: {message}` event if the synthetic tool
+    /// service wasn't registered.
+    pub fn bazel_event(&self, message: &str) {
+        match self.bazel_prefix.as_ref() {
+            Some(prefix) => {
+                let _ = self.stdout_sink.tx.try_send(SinkLine {
+                    prefix: prefix.clone(),
+                    line: Bytes::from(format!("{message}\n")),
+                    name: "bazel".to_string(),
+                });
+            }
+            None => self.lifecycle_event(&format!("bazel: {message}")),
+        }
+    }
+
+    /// Emit a line prefixed as turbo tool output.
+    pub fn turbo_event(&self, message: &str) {
+        match self.turbo_prefix.as_ref() {
+            Some(prefix) => {
+                let _ = self.stdout_sink.tx.try_send(SinkLine {
+                    prefix: prefix.clone(),
+                    line: Bytes::from(format!("{message}\n")),
+                    name: "turbo".to_string(),
+                });
+            }
+            None => self.lifecycle_event(&format!("turbo: {message}")),
+        }
     }
 }
 

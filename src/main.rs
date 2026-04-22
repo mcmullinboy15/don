@@ -1,11 +1,22 @@
 // The CLI binary legitimately uses stdout — it IS the user-facing output.
 #![allow(clippy::print_stdout)]
+#![allow(clippy::print_stderr)]
 
 use clap::{Parser, Subcommand};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use don::client::{Client, ClientError};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Write a line to stderr. Used for CLI error messages so they stay on the
+/// error stream (scripts / tests / shell redirection expect it). We avoid
+/// the `eprintln!` macro because it was frequently abused for debug-trace
+/// output elsewhere in the codebase; keeping stderr writes behind this
+/// single helper makes intentional error output easy to grep for.
+fn errln(msg: impl std::fmt::Display) {
+    let _ = writeln!(std::io::stderr(), "{msg}");
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "don", about = "Boss of your dev environment")]
@@ -100,14 +111,14 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                 0
             }
             Err(e) => {
-                eprintln!("{e}");
+                errln(e);
                 1
             }
         },
         Commands::Start { profile, name: None } => match run_start(&config_path, profile.as_deref(), verbose).await {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("{e}");
+                errln(e);
                 1
             }
         },
@@ -128,7 +139,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             if all_pending {
                 run_client(&config_path, |c| async move { c.run_pending().await }).await
             } else {
-                eprintln!("don run requires --all-pending");
+                errln("don run requires --all-pending");
                 1
             }
         }
@@ -157,7 +168,7 @@ where
     match make_call(client).await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("{e}");
+            errln(e);
             1
         }
     }
@@ -171,7 +182,7 @@ async fn run_status(config_path: &Path, verbose: bool) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("{e}");
+            errln(e);
             1
         }
     }
@@ -200,7 +211,7 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
         {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("{e}");
+                errln(e);
                 1
             }
         }
@@ -213,7 +224,7 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
                 0
             }
             Err(e) => {
-                eprintln!("{e}");
+                errln(e);
                 1
             }
         }
@@ -229,7 +240,7 @@ async fn run_attach(config_path: &Path, name: &str) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("{e}");
+            errln(e);
             1
         }
     }
@@ -300,9 +311,6 @@ fn print_verbose_info(info: &don::runner::VerboseInfo) {
     if !info.depends_on.is_empty() {
         println!("  {dim}deps:{reset}   {}", info.depends_on.join(", "));
     }
-    if !info.listen.is_empty() {
-        println!("  {dim}listen:{reset} {}", info.listen.join(", "));
-    }
     if !info.proxy.is_empty() {
         println!("  {dim}proxy:{reset}  {}", info.proxy.join(", "));
     }
@@ -326,10 +334,12 @@ fn print_verbose_info(info: &don::runner::VerboseInfo) {
 fn service_state_label(s: ServiceState) -> &'static str {
     match s {
         ServiceState::Pending => "pending",
+        ServiceState::Building => "building",
         ServiceState::Lazy => "lazy",
         ServiceState::Starting => "starting",
         ServiceState::Running => "running",
         ServiceState::Ready => "ready",
+        ServiceState::Unhealthy => "unhealthy",
         ServiceState::Stopping => "stopping",
         ServiceState::Stopped => "stopped",
         ServiceState::Failed => "failed",
@@ -339,9 +349,13 @@ fn service_state_label(s: ServiceState) -> &'static str {
 fn service_state_color(s: ServiceState) -> Color {
     match s {
         ServiceState::Ready | ServiceState::Running => Color::Green,
-        ServiceState::Starting | ServiceState::Pending | ServiceState::Stopping => Color::Yellow,
+        ServiceState::Starting
+        | ServiceState::Building
+        | ServiceState::Pending
+        | ServiceState::Stopping => Color::Yellow,
         ServiceState::Lazy => Color::Cyan,
         ServiceState::Stopped => Color::DarkGrey,
+        ServiceState::Unhealthy => Color::Red,
         ServiceState::Failed => Color::Red,
     }
 }
@@ -349,6 +363,7 @@ fn service_state_color(s: ServiceState) -> Color {
 fn task_state_label(s: TaskItemState) -> &'static str {
     match s {
         TaskItemState::Pending => "pending",
+        TaskItemState::Building => "building",
         TaskItemState::Running => "running",
         TaskItemState::Completed => "completed",
         TaskItemState::Skipped => "skipped",
@@ -360,7 +375,7 @@ fn task_state_label(s: TaskItemState) -> &'static str {
 fn task_state_color(s: TaskItemState) -> Color {
     match s {
         TaskItemState::Completed | TaskItemState::Skipped => Color::Green,
-        TaskItemState::Running | TaskItemState::Pending => Color::Yellow,
+        TaskItemState::Running | TaskItemState::Pending | TaskItemState::Building => Color::Yellow,
         TaskItemState::PendingRun => Color::Cyan,
         TaskItemState::Failed => Color::Red,
     }
@@ -386,9 +401,9 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
                 return 0;
             }
             // --force: read the running daemon's PID and kill it.
-            eprintln!("killing running don daemon...");
+            errln("killing running don daemon...");
             if let Err(e) = kill_running_daemon(&don_pid_path).await {
-                eprintln!("failed to kill daemon: {e}");
+                errln(format!("failed to kill daemon: {e}"));
                 return 1;
             }
             // Now re-acquire the lock.
@@ -400,13 +415,13 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
             {
                 Ok(lock) => lock,
                 Err(e) => {
-                    eprintln!("failed to acquire pid lock after kill: {e}");
+                    errln(format!("failed to acquire pid lock after kill: {e}"));
                     return 1;
                 }
             }
         }
         Err(e) => {
-            eprintln!("failed to acquire pid lock: {e}");
+            errln(format!("failed to acquire pid lock: {e}"));
             return 1;
         }
     };
@@ -430,13 +445,18 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
             })
             .collect(),
         Err(e) => {
-            eprintln!("Warning: could not load config for docker cleanup: {e}");
+            errln(format!(
+                "Warning: could not load config for docker cleanup: {e}"
+            ));
             vec![]
         }
     };
 
     let report = don::process::cleanup::run_cleanup(&base, &docker_names).await;
     println!("{report}");
+    for warning in &report.warnings {
+        errln(format!("Warning: {warning}"));
+    }
 
     // Hold lock until cleanup finishes, then release.
     drop(pid_lock);
@@ -477,7 +497,7 @@ async fn kill_running_daemon(pid_path: &std::path::Path) -> Result<(), String> {
     }
 
     // Last resort — the daemon itself is stuck.
-    eprintln!("daemon did not exit after 10s, sending SIGKILL");
+    errln("daemon did not exit after 10s, sending SIGKILL");
     let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(())
@@ -499,7 +519,7 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
         .validate(platform)
         .map_err(|e| format!("Error: {e}"))?;
     for warning in &warnings {
-        eprintln!("Warning: {warning}");
+        errln(format!("Warning: {warning}"));
     }
     Ok(())
 }
@@ -522,16 +542,35 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
         .validate(platform)
         .map_err(|e| format!("Error: {e}"))?;
     for warning in &warnings {
-        eprintln!("Warning: {warning}");
+        errln(format!("Warning: {warning}"));
     }
 
     let base = base_dir(config_path);
     let is_tty = std::io::stdout().is_terminal();
 
+    // Resolve the active item set up front so the output manager and TUI
+    // only see items that will actually run. Without this, prefix padding
+    // is sized for the longest name in the whole config, and the TUI
+    // service menu lists items the profile excludes. The runner re-runs
+    // this inside `Runner::new` to build its own filtered state.
+    let active_items: Option<std::collections::HashSet<String>> = if let Some(profile_name) = profile
+    {
+        let prof = config
+            .profiles
+            .get(profile_name)
+            .ok_or_else(|| format!("Error: unknown profile '{profile_name}'"))?;
+        Some(don::runner::resolve_profile_items(&config, prof))
+    } else {
+        None
+    };
+
+    let is_active = |name: &str| active_items.as_ref().is_none_or(|s| s.contains(name));
+
     // Collect service names and their log configs for OutputManager.
     let service_configs: Vec<(&str, &don::config::LogConfig)> = config
         .services
         .iter()
+        .filter(|(name, _)| is_active(name))
         .map(|(name, svc)| (name.as_str(), &svc.log))
         .collect();
 
@@ -539,6 +578,7 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
     let task_configs: Vec<(&str, &don::config::LogConfig)> = config
         .tasks
         .iter()
+        .filter(|(name, _)| is_active(name))
         .map(|(name, task)| (name.as_str(), &task.log))
         .collect();
 
@@ -559,8 +599,18 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
                 .await
                 .map_err(|e| format!("Error creating output manager: {e}"))?;
 
-        let service_names: Vec<String> = config.services.keys().cloned().collect();
-        let task_names: Vec<String> = config.tasks.keys().cloned().collect();
+        let service_names: Vec<String> = config
+            .services
+            .keys()
+            .filter(|name| is_active(name))
+            .cloned()
+            .collect();
+        let task_names: Vec<String> = config
+            .tasks
+            .keys()
+            .filter(|name| is_active(name))
+            .cloned()
+            .collect();
 
         let runner = don::runner::Runner::new(
             config,
@@ -608,9 +658,9 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
         // silently dropped. Runner errors take precedence.
         match tui.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("TUI error: {e}"),
+            Ok(Err(e)) => errln(format!("TUI error: {e}")),
             Err(join_err) if join_err.is_panic() => {
-                eprintln!("TUI task panicked: {join_err}");
+                errln(format!("TUI task panicked: {join_err}"));
             }
             Err(_) => {} // cancelled — expected on shutdown
         }
