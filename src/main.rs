@@ -19,7 +19,11 @@ fn errln(msg: impl std::fmt::Display) {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "don", about = "Boss of your dev environment")]
+#[command(
+    name = "don",
+    about = "Boss of your dev environment",
+    arg_required_else_help = true
+)]
 struct Cli {
     /// Path to the config file
     #[arg(short, long, default_value = "don.toml", global = true)]
@@ -30,7 +34,7 @@ struct Cli {
     verbose: bool,
 
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
@@ -81,25 +85,47 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Run pending tasks
+    /// Run a task (bypasses auto_run)
     Run {
-        /// Run all tasks in pending_run state
-        #[arg(long)]
+        /// Name of a specific task to run (mutually exclusive with --all-pending)
+        name: Option<String>,
+        /// Run all tasks currently in pending_run state
+        #[arg(long, conflicts_with = "name")]
         all_pending: bool,
     },
     /// Validate the config file
     Validate,
+    /// Print shell completion script to stdout
+    Completions {
+        /// Target shell (bash, zsh, fish, powershell, elvish)
+        shell: clap_complete::Shell,
+    },
+    /// Scaffold a starter don.toml in the current directory
+    Init {
+        /// Overwrite an existing don.toml
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run a command with .don/bin on PATH (for downloaded binaries)
+    Exec {
+        /// Command to run
+        cmd: String,
+        /// Arguments passed to the command
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Internal: list names for shell completion scripts. Hidden from help.
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        /// One of: services, tasks, items, profiles
+        kind: String,
+    },
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Commands::Start {
-        profile: None,
-        name: None,
-    });
-
-    let exit_code = run(cli.config, cli.verbose, command).await;
+    let exit_code = run(cli.config, cli.verbose, cli.command).await;
     std::process::exit(exit_code);
 }
 
@@ -135,12 +161,57 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
-        Commands::Run { all_pending } => {
-            if all_pending {
+        Commands::Run { name, all_pending } => match (name, all_pending) {
+            (Some(n), _) => {
+                run_client(&config_path, |c| async move { c.run_task(&n).await }).await
+            }
+            (None, true) => {
                 run_client(&config_path, |c| async move { c.run_pending().await }).await
-            } else {
-                errln("don run requires --all-pending");
+            }
+            (None, false) => {
+                errln("don run: provide a task name or --all-pending");
                 1
+            }
+        },
+        Commands::Completions { shell } => {
+            let mut out = std::io::stdout();
+            match don::completions::emit_script::<_, Cli>(shell, "don", &mut out) {
+                Ok(()) => 0,
+                Err(e) => {
+                    errln(format!("failed to write completion script: {e}"));
+                    1
+                }
+            }
+        }
+        Commands::Complete { kind } => {
+            // Silent-on-error: invoked inside tab-completion. If the kind is
+            // unknown or the config is broken, print nothing and exit 0 so
+            // the user's shell doesn't spew errors mid-tab-press.
+            if let Ok(kind) = kind.parse::<don::completions::CompleteKind>() {
+                for name in don::completions::list_names(kind, &config_path) {
+                    println!("{name}");
+                }
+            }
+            0
+        }
+        Commands::Init { force } => match don::init::write_starter_config(&config_path, force) {
+            Ok(()) => {
+                println!("created {}", config_path.display());
+                0
+            }
+            Err(e) => {
+                errln(e);
+                1
+            }
+        },
+        Commands::Exec { cmd, args } => {
+            let base = base_dir(&config_path);
+            match don::exec::exec_with_don_path(&base, &cmd, &args) {
+                Ok(()) => 0, // unreachable — execvp returns only on error
+                Err(e) => {
+                    errln(format!("don exec {cmd}: {e}"));
+                    127
+                }
             }
         }
     }
@@ -547,6 +618,15 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
 
     let base = base_dir(config_path);
     let is_tty = std::io::stdout().is_terminal();
+
+    // Fall back to the config's default_profile when `--profile` is not given.
+    // Validation above guarantees default_profile (if set) is a known profile,
+    // so the lookup below cannot miss. Own the string so later code can move
+    // `config` into `Runner::new` while we still hold the profile name.
+    let profile: Option<String> = profile
+        .map(str::to_string)
+        .or_else(|| config.default_profile.clone());
+    let profile: Option<&str> = profile.as_deref();
 
     // Resolve the active item set up front so the output manager and TUI
     // only see items that will actually run. Without this, prefix padding

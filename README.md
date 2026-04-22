@@ -14,13 +14,13 @@ Don reads a `don.toml` in your project root and orchestrates your entire dev sta
 # From source
 cargo install --path .
 
-# Or via Homebrew (once published)
+# Or via Homebrew
 brew install pjtatlow/tap/don
 ```
 
 ## Quick Start
 
-Create a `don.toml`:
+Run `don init` to drop a starter `don.toml` in the current directory, or create one by hand:
 
 ```toml
 [services.postgres]
@@ -64,6 +64,20 @@ Don will:
 
 ## Features
 
+### Interactive TUI
+
+When stdout is a TTY, `don start` runs a ratatui-driven interface: logs stream into native scrollback while a bordered status bar pinned to the bottom shows ready counts, running tasks, a spinner during transitions, and contextual key hints.
+
+| Key | Action |
+|-----|--------|
+| `l` | Filter services/tasks — space toggles, enter commits, esc clears |
+| `a` | Action palette — Start / Stop / Restart / Rebuild / run pending tasks |
+| `s` | Full-screen service/task status overlay |
+| `Enter` | Insert a blank line separator into scrollback |
+| `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
+
+Pipe mode (non-TTY) writes prefixed lines directly to stdout unchanged.
+
 ### Services
 
 Long-running processes (servers, databases, workers). Don keeps them alive and restarts them on file changes.
@@ -79,6 +93,16 @@ shutdown.signal = "SIGTERM"
 shutdown.timeout = "5s"
 ```
 
+Set `reload = false` to opt out of file-watch restarts — useful for services that handle their own hot-reloading (vite, webpack dev server, etc.):
+
+```toml
+[services.web]
+run.cmd = "npm"
+run.args = ["run", "dev"]
+watch = ["src/**/*.tsx"]
+reload = false   # don tracks changes for status, but doesn't restart
+```
+
 ### Tasks
 
 One-shot commands that run to completion (migrations, codegen, seeding). Only re-run when watched files change.
@@ -90,6 +114,17 @@ args = ["up"]
 depends_on = ["postgres"]
 watch = ["db/migrations/**/*.sql"]
 ```
+
+Set `auto_run = false` to defer execution — the task stays in `pending_run` on startup and on watched-file changes until you explicitly trigger it:
+
+```toml
+[tasks.seed]
+cmd = "./scripts/seed-db"
+auto_run = false
+depends_on = ["migrate"]
+```
+
+Run deferred tasks with `don run --all-pending` or from the TUI action palette.
 
 ### Dependency Graph
 
@@ -119,6 +154,22 @@ Don waits for services to be ready before starting dependents:
 ready.interval = "500ms"   # how often to check (default: 1s)
 ready.retries = 30         # max attempts (default: 30)
 ```
+
+### Health Monitoring & Auto-Restart
+
+Set `ready.monitor = true` to keep polling the ready check after startup. Consecutive failures mark the service `unhealthy`; `on_failure` decides what happens next:
+
+```toml
+[services.api]
+run.cmd = "./api-server"
+ready.http = "http://localhost:3000/health"
+ready.monitor = true              # keep checking after Ready
+ready.monitor_interval = "2s"     # interval while monitoring (default: ready.interval)
+ready.unhealthy_after = 3         # consecutive failures → Unhealthy (default: 3)
+on_failure = "restart"            # "notify" (default) or "restart"
+```
+
+`on_failure` also fires when the process exits with a non-zero status (or terminating signal) — clean exits still transition to `stopped`. Restarts use escalating backoff (1, 2, 4, 8, 16, 32, capped at 60s) and reset when the service recovers to Ready.
 
 ### File Watching
 
@@ -256,6 +307,8 @@ During a file-watch restart, the port stays bound (connections queue in the kern
 Run a subset of services for focused work:
 
 ```toml
+default_profile = "frontend"   # used by bare `don start` (optional)
+
 [profiles.frontend]
 services = ["api"]
 tasks = ["migrate"]
@@ -266,7 +319,8 @@ tasks = ["migrate"]
 ```
 
 ```sh
-don start --profile frontend
+don start                       # uses default_profile, or everything if unset
+don start --profile backend     # override
 ```
 
 Transitive dependencies are included automatically — if `api` depends on `postgres`, it starts too.
@@ -282,9 +336,10 @@ Edit `don.toml` while don is running. Don detects the change, diffs it, and appl
 ### CLI Commands
 
 ```sh
-don start                    # start the daemon (or don with no args)
+don init                     # scaffold a starter don.toml
+don start                    # start the daemon (bare `don` prints help)
 don start --profile <name>   # start a subset
-don start <name>             # start a stopped service
+don start <name>             # start a stopped service in the running daemon
 don stop <name>              # stop a running service
 don restart <name>           # restart a service
 don status                   # show all services and their states
@@ -292,22 +347,33 @@ don status -v                # verbose: watch paths, ports, commands, build targ
 don logs <name>              # view recent output
 don logs <name> --follow     # stream output
 don logs <name> --last 50    # last N lines
+don attach <name>            # attach stdin/stdout to a running service
+don run <name>               # run a specific task (bypasses auto_run)
+don run --all-pending        # run all tasks sitting in pending_run
+don exec <cmd> [args...]     # run a command with .don/bin on PATH
 don validate                 # check config without starting
 don cleanup                  # remove stale state from a crashed run
 don cleanup --force          # kill a running daemon and clean up
+don completions <shell>      # print a completion script for bash/zsh/fish/...
 ```
+
+Completions are dynamic: service, task, and profile names from your `don.toml` tab-complete on subcommands that take them (`stop`, `restart`, `run`, `logs`, `attach`). Install with e.g. `don completions bash > ~/.local/share/bash-completion/completions/don` or `don completions zsh > "${fpath[1]}/_don"`.
+
 
 ### Daemon API
 
 Don exposes a unix socket API at `.don/don.sock` for programmatic control:
 
 ```
-GET  /status              → service/task states
-POST /start/:name         → start a stopped service
-POST /stop/:name          → stop a service
-POST /restart/:name       → restart a service
-GET  /logs/:name?last=N   → ring buffer output
+GET  /status                 → service/task states
+POST /start/:name            → start a stopped service
+POST /stop/:name             → stop a service
+POST /restart/:name          → restart a service
+POST /run/:name              → run a specific task (bypasses auto_run)
+POST /run-pending            → run all tasks in pending_run state
+GET  /logs/:name?last=N      → ring buffer output
 GET  /logs/:name?follow=true → streaming NDJSON
+GET  /attach/:name           → raw-stream attach (stdin/stdout)
 ```
 
 ### Terminal Safety
@@ -323,7 +389,9 @@ Service output is sanitized before display — colors and text styles pass throu
 
 ### Crash Recovery
 
-If don crashes, the next `don start` automatically:
+Managed service crashes (non-zero exits or terminating signals) route through `on_failure`: `"notify"` marks the service failed and emits a lifecycle event; `"restart"` reuses the same backoff machinery as monitor failures.
+
+If don itself crashes, the next `don start` automatically:
 - Detects orphaned service processes via `(pgid, start_time)` identity
 - Kills confirmed orphans (safe against PID recycling)
 - Removes stale PID files, sockets, and docker containers
@@ -349,6 +417,12 @@ See [`examples/`](examples/) for complete working configs.
 | `ready.exec` | {cmd, args} | Exec ready check command |
 | `ready.interval` | string | Check interval (default: "1s") |
 | `ready.retries` | u32 | Max attempts (default: 30) |
+| `ready.monitor` | bool | Keep polling after Ready to detect unhealthy (default: false) |
+| `ready.monitor_interval` | string | Poll interval while monitoring (default: `ready.interval`) |
+| `ready.unhealthy_after` | u32 | Consecutive monitor failures → Unhealthy (default: 3) |
+| `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
+| `reload` | bool | Whether file-watch events restart the service (default: true) |
+| `auto_run` | bool | (tasks) Run automatically at startup and on watch events (default: true) |
 | `shutdown.signal` | string | Shutdown signal (default: "SIGTERM") |
 | `shutdown.timeout` | string | Grace period (default: "10s") |
 | `log` | string | Output routing: "stdout", "ignore", or a file path |
@@ -366,6 +440,7 @@ See [`examples/`](examples/) for complete working configs.
 | `turbo.filter` | string | Turborepo package filter |
 | `turbo.build_task` | string | Task to run during batch build (default: "build") |
 | `download.platform.<platform>` | table | Per-platform download config |
+| `default_profile` | string | Top-level: profile used by bare `don start` |
 
 ## Platform Support
 

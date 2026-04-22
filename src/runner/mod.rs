@@ -140,9 +140,13 @@ pub type CommandResult = Result<(), CommandError>;
 pub enum CommandError {
     /// No service with this name exists in the config.
     UnknownService { name: String },
+    /// No task with this name exists in the config.
+    UnknownTask { name: String },
     /// The name refers to a task, not a service — start/stop/restart only
     /// apply to services.
     NotAService { name: String },
+    /// The name refers to a service, not a task — `run` only applies to tasks.
+    NotATask { name: String },
     /// The service is already running (for Start) or already stopped (for Stop).
     InvalidState { name: String, message: String },
     /// The operation itself failed.
@@ -153,8 +157,12 @@ impl std::fmt::Display for CommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownService { name } => write!(f, "unknown service '{name}'"),
+            Self::UnknownTask { name } => write!(f, "unknown task '{name}'"),
             Self::NotAService { name } => {
                 write!(f, "'{name}' is a task — start/stop/restart only apply to services")
+            }
+            Self::NotATask { name } => {
+                write!(f, "'{name}' is a service — use `don start/stop/restart` instead of `don run`")
             }
             Self::InvalidState { name, message } => write!(f, "{name}: {message}"),
             Self::Failed { name, message } => write!(f, "{name}: {message}"),
@@ -232,6 +240,12 @@ pub enum RunnerCommand {
     },
     /// Run all tasks currently in PendingRun state.
     RunPendingTasks {
+        reply: oneshot::Sender<CommandResult>,
+    },
+    /// Run a specific task by name, bypassing the `auto_run` gate. Used by
+    /// `don run <name>` and the TUI action palette.
+    RunTask {
+        name: String,
         reply: oneshot::Sender<CommandResult>,
     },
     /// Result of the startup-phase batch build. Sent by the detached
@@ -1304,6 +1318,9 @@ impl Runner {
                         }
                         RunnerCommand::RunPendingTasks { reply } => {
                             self.handle_run_pending_tasks(reply).await;
+                        }
+                        RunnerCommand::RunTask { name, reply } => {
+                            self.handle_run_task(&name, reply).await;
                         }
                         RunnerCommand::BatchBuildComplete(outcome) => {
                             // Drop the abort-on-drop handle: the task is done,
@@ -3778,6 +3795,11 @@ impl Runner {
     }
 
     /// Handle a file-watch-triggered task re-run.
+    ///
+    /// Respects `auto_run = false` — tasks that have opted out transition to
+    /// `PendingRun` instead of spawning. Explicit-run paths (the user
+    /// triggering a task via `don run <name>` or `--all-pending`) bypass
+    /// this gate by calling [`spawn_task_rerun`] directly.
     async fn handle_task_rerun(&mut self, name: &str) {
         let task_cfg = match self.tasks.get(name) {
             Some(rt) => rt.config.clone(),
@@ -3809,6 +3831,19 @@ impl Runner {
             return;
         }
 
+        self.spawn_task_rerun(name, &task_cfg, "re-running (file changed)").await;
+    }
+
+    /// Actually spawn a task re-run: release any attach lock, flip to
+    /// `Running`, spawn, and wire output. Used by both the file-watch path
+    /// ([`handle_task_rerun`]) and the explicit-run paths (`don run <name>`,
+    /// `don run --all-pending`).
+    async fn spawn_task_rerun(
+        &mut self,
+        name: &str,
+        task_cfg: &crate::config::Task,
+        start_message: &str,
+    ) {
         // Release attach lock and close follow sinks so any active attach
         // session exits cleanly before the new process starts.
         if self.remove_attach_lock(name) {
@@ -3818,17 +3853,16 @@ impl Runner {
             writer.close_follow_sinks().await;
         }
 
-        self.output_manager
-            .service_event(name, "re-running (file changed)");
+        self.output_manager.service_event(name, start_message);
         self.set_task_state(name, TaskItemState::Running);
 
         self.output_manager
             .service_debug_event(name, "spawning process...");
-        match task::spawn_task(&task_cfg, name, &self.base_dir, self.platform).await {
+        match task::spawn_task(task_cfg, name, &self.base_dir, self.platform).await {
             Ok(spawn) => {
                 self.output_manager
                     .service_debug_event(name, &format!("process spawned (pid {}))", spawn.handle.pgid()));
-                self.wire_task_output_and_wait(name, spawn, &task_cfg, None).await;
+                self.wire_task_output_and_wait(name, spawn, task_cfg, None).await;
             }
             Err(e) => {
                 self.set_task_state(name, TaskItemState::Failed);
@@ -3847,14 +3881,14 @@ impl Runner {
         &mut self,
         reply: oneshot::Sender<CommandResult>,
     ) {
-        let pending_names: Vec<String> = self
+        let pending: Vec<(String, crate::config::Task)> = self
             .tasks
             .iter()
             .filter(|(_, rt)| rt.state() == TaskItemState::PendingRun)
-            .map(|(name, _)| name.clone())
+            .map(|(name, rt)| (name.clone(), rt.config.clone()))
             .collect();
 
-        if pending_names.is_empty() {
+        if pending.is_empty() {
             self.output_manager
                 .lifecycle_event("no pending tasks to run");
             let _ = reply.send(Ok(()));
@@ -3863,15 +3897,55 @@ impl Runner {
 
         self.output_manager.lifecycle_event(&format!(
             "running {} pending task{}...",
-            pending_names.len(),
-            if pending_names.len() == 1 { "" } else { "s" }
+            pending.len(),
+            if pending.len() == 1 { "" } else { "s" }
         ));
 
-        for name in &pending_names {
-            self.set_task_state(name, TaskItemState::Running);
-            self.handle_task_rerun(name).await;
+        for (name, cfg) in &pending {
+            // Explicit-run path — bypass the auto_run gate in handle_task_rerun.
+            self.spawn_task_rerun(name, cfg, "running (manual trigger)").await;
         }
 
+        let _ = reply.send(Ok(()));
+    }
+
+    /// Run a single task by name, bypassing the `auto_run` gate. Used by
+    /// `don run <name>`.
+    async fn handle_run_task(
+        &mut self,
+        name: &str,
+        reply: oneshot::Sender<CommandResult>,
+    ) {
+        // Services and unknown names get a dedicated error. Services don't go
+        // through "run" at all — that's what start/restart is for.
+        if self.services.contains_key(name) {
+            let _ = reply.send(Err(CommandError::NotATask {
+                name: name.to_string(),
+            }));
+            return;
+        }
+        let cfg = match self.tasks.get(name) {
+            Some(rt) => rt.config.clone(),
+            None => {
+                let _ = reply.send(Err(CommandError::UnknownTask {
+                    name: name.to_string(),
+                }));
+                return;
+            }
+        };
+
+        // Reject while already in flight — otherwise we'd race two spawns of
+        // the same task and the output would interleave unpredictably.
+        let current = self.tasks.get(name).map(|rt| rt.state());
+        if matches!(current, Some(TaskItemState::Running) | Some(TaskItemState::Building)) {
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "task is already running".to_string(),
+            }));
+            return;
+        }
+
+        self.spawn_task_rerun(name, &cfg, "running (manual trigger)").await;
         let _ = reply.send(Ok(()));
     }
 

@@ -6,21 +6,15 @@
 #
 # Run with: cargo run -- -c examples/turbo/don.toml
 
+# Turborepo service: Don runs `npx turbo run dev --filter=@example/web` and
+# watches the task graph inputs. At startup, `turbo run build --filter=@example/web`
+# (the build_task) runs once as part of the batch build phase before services start.
 [services.web]
-run.cmd = "node"
-run.args = ["apps/web/src/server.js"]
-ready.tcp = "127.0.0.1:3000"
-ready.interval = "200ms"
-
-# Turborepo integration: Don queries the task graph to auto-resolve watch patterns.
-# Instead of manually listing watch = ["apps/web/src/**", "packages/utils/src/**"],
-# Don discovers these from `turbo run dev --dry-run=json`.
-#
-# At startup, Don runs `turbo run build --filter=@example/web` (the build_task)
-# as part of a batch build phase before starting services.
 turbo.task = "dev"
 turbo.build_task = "build"
 turbo.filter = "@example/web"
+ready.tcp = "127.0.0.1:3000"
+ready.interval = "200ms"
 
 [tasks.build]
 cmd = "npx"

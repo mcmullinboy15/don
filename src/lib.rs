@@ -1,9 +1,12 @@
 pub(crate) mod build_tool;
 pub mod client;
+pub mod completions;
 pub mod config;
 pub mod docker;
 pub mod download;
 pub mod duration;
+pub mod exec;
+pub mod init;
 pub mod output;
 pub mod process;
 pub(crate) mod proxy;

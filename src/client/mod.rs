@@ -118,6 +118,11 @@ impl Client {
         Err(classify_error(status, &body))
     }
 
+    /// `POST /run/:name` — run a specific task, bypassing auto_run.
+    pub async fn run_task(&self, name: &str) -> Result<(), ClientError> {
+        self.control("/run/", name).await
+    }
+
     /// `GET /logs/:name?last=N`
     pub async fn logs(&self, name: &str, last: usize) -> Result<Vec<String>, ClientError> {
         let path = format!("/logs/{}?last={last}", urlencode(name));

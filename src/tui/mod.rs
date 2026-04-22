@@ -663,7 +663,13 @@ fn dispatch_action(command_tx: &mpsc::Sender<RunnerCommand>, action: ActionKind)
                 }
             }
             ActionKind::RebuildService(name) => RunnerCommand::Rebuild { name },
-            ActionKind::RunTask(name) => RunnerCommand::TaskRerun { name },
+            ActionKind::RunTask(name) => {
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                RunnerCommand::RunTask {
+                    name,
+                    reply: reply_tx,
+                }
+            }
         };
         let _ = command_tx.send(cmd).await;
     });

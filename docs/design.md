@@ -587,6 +587,8 @@ On startup, don checks whether `.don/` is covered by `.gitignore`. If not, it pr
 Profiles let you run a subset of your services. By default (no profile), don starts everything.
 
 ```toml
+default_profile = "frontend"
+
 [profiles.frontend]
 services = ["api", "postgres"]
 tasks = ["migrate"]
@@ -597,11 +599,13 @@ tasks = ["migrate", "seed"]
 ```
 
 ```
-don start                        # start everything
+don start                        # use default_profile (or everything if unset)
 don start --profile frontend     # start only frontend profile
 ```
 
 Services and tasks listed in a profile automatically include their transitive dependencies. If `api` depends on `migrate` which depends on `postgres`, listing just `api` is enough — don resolves the full chain.
+
+Set `default_profile = "<name>"` at the top level to pick a profile automatically when `don start` is run without `--profile`. Leave it unset to have `don start` run everything.
 
 ## CLI
 
@@ -613,17 +617,22 @@ Options:
   -p, --profile <NAME>      Run only services/tasks in the named profile
 
 Commands:
-  start                     Start all services and run tasks (default)
+  init                      Scaffold a starter don.toml in the current directory
+  start                     Start all services and run tasks
   restart <name>            Restart a specific service
   stop <name>               Stop a specific service
   status                    Show the status of all services and tasks
   logs <name>               Tail the logs for a specific service
+  run <name>                Run a specific task (bypasses auto_run)
+  run --all-pending         Run every task currently in pending_run
+  exec <cmd> [args...]      Run a command with .don/bin on PATH
+  attach <name>             Interactively attach stdin/stdout to a running service
   cleanup                   Kill orphaned processes, remove stale sockets/containers
   validate                  Check the config for errors without running anything
-  attach <name>             Interactively attach stdin/stdout to a running service
+  completions <shell>       Print a shell completion script (bash/zsh/fish/...)
 ```
 
-When no subcommand is given, `don` runs `start`.
+When no subcommand is given, `don` prints the help text. Use `don start` to bring your dev environment up.
 
 ### Interacting with a Running Instance
 

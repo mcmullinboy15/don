@@ -42,6 +42,10 @@ pub struct Config {
     /// Named profiles — subsets of services/tasks to run.
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
+    /// Profile used by `don start` when no `--profile` flag is given.
+    /// If unset, `don start` runs everything.
+    #[serde(default)]
+    pub default_profile: Option<String>,
 }
 
 impl std::str::FromStr for Config {
@@ -382,6 +386,15 @@ impl Config {
                     ));
                 }
             }
+        }
+
+        // Validate default_profile
+        if let Some(ref default) = self.default_profile
+            && !self.profiles.contains_key(default)
+        {
+            errors.push(format!(
+                "default_profile references unknown profile '{default}'"
+            ));
         }
 
         // Detect dependency cycles
@@ -1282,6 +1295,43 @@ mod tests {
                         panic!("expected validation error");
                     };
                     assert!(errors[0].contains("unknown task 'ghost'"));
+                },
+            },
+            ConfigTestCase {
+                name: "default_profile references a known profile",
+                input: r#"
+                    default_profile = "dev"
+
+                    [services.api]
+                    rust.binary = "api"
+
+                    [profiles.dev]
+                    services = ["api"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    assert_eq!(config.default_profile.as_deref(), Some("dev"));
+                },
+            },
+            ConfigTestCase {
+                name: "default_profile referencing unknown profile is a validation error",
+                input: r#"
+                    default_profile = "ghost"
+
+                    [services.api]
+                    rust.binary = "api"
+
+                    [profiles.dev]
+                    services = ["api"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("default_profile") && e.contains("ghost")));
                 },
             },
             ConfigTestCase {
