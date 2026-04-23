@@ -22,9 +22,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
 
-use super::app::{App, StatusCounts, ViewMode};
-use super::filter::{FilterState, MAX_DROPDOWN_ROWS};
-use super::palette::{ActionPalette, MAX_PALETTE_ROWS};
+use super::app::{App, OverlayItem, StatusCounts, ViewMode};
+use super::filter::{FilterRow, FilterState};
+use super::palette::ActionPalette;
 use crate::runner::{ServiceState, TaskItemState};
 
 /// Total rows the inline viewport reserves: 1 blank buffer row + 3 rows
@@ -57,10 +57,26 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
 
+    // Count only services for the filter badge — tasks and synthetic
+    // streams (don/bazel/turbo) are filterable too, but the bar should
+    // echo what the user thinks of as "my services." Lazy services are
+    // excluded so the denominator matches `counts.services_total` (which
+    // excludes Lazy for the same "not-yet-started" reason).
+    let countable = || {
+        app.services_state
+            .iter()
+            .filter(|(_, s)| !matches!(s, crate::runner::ServiceState::Lazy))
+    };
+    let visible_services = countable()
+        .filter(|(name, _)| app.filter.passes(name))
+        .count();
+    let total_services = countable().count();
     let bar = Paragraph::new(normal_bar_line(
         &app.counts,
         &app.filter,
         app.spinner_frame,
+        visible_services,
+        total_services,
     ));
     frame.render_widget(bar, inner);
 }
@@ -86,7 +102,7 @@ fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
     // Border + title wraps the whole modal. Inside: list at top, bar at bottom.
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" Filter logs — [space] toggle  [↑↓] move  [enter] apply  [esc] cancel ");
+        .title(" Filter logs — [space] toggle  [↑↓] move  [enter] apply  [esc] reset defaults ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -111,7 +127,7 @@ fn draw_palette_modal(frame: &mut Frame<'_>, app: &App) {
 
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" Actions — [↑↓] move  [enter] run  [esc] cancel ");
+        .title(" Tasks — [↑↓] move  [enter] run  [esc] cancel ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -128,67 +144,86 @@ fn draw_palette_modal(frame: &mut Frame<'_>, app: &App) {
 }
 
 /// Render the full-screen status overlay — a table of every known service
-/// and task with its current state. Scrollable: only the window starting
-/// at `app.overlay_scroll` is drawn, clamped so we don't leave blank rows
-/// below the last entry.
+/// and task with its current state, sorted errors → running → exited → lazy
+/// then alphabetical within each bucket. Arrow keys move a highlight; the
+/// render path scrolls so the highlighted row stays visible.
 fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     if area.height == 0 || area.width == 0 {
         return;
     }
 
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" don status — [↑↓] move  [enter] start/stop  [r] restart  [R] restart all failed  [/] filter  [esc] dismiss ");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let table_area = layout[0];
+    let bar_area = layout[1];
+
     let header = Row::new(vec!["KIND", "NAME", "STATE"])
         .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan));
 
-    let mut rows: Vec<Row<'static>> = Vec::new();
-    let mut svc_names: Vec<&String> = app.services_state.keys().collect();
-    svc_names.sort();
-    for name in svc_names {
-        if let Some(state) = app.services_state.get(name) {
-            rows.push(Row::new(vec![
-                Cell::from("service").style(Style::default().fg(Color::DarkGray)),
-                Cell::from(name.clone()),
-                Cell::from(service_state_label(*state))
-                    .style(Style::default().fg(service_state_color(*state))),
-            ]));
-        }
-    }
+    let items = app.overlay_items();
+    let total = items.len();
 
-    let mut task_names: Vec<&String> = app.tasks_state.keys().collect();
-    task_names.sort();
-    for name in task_names {
-        if let Some(state) = app.tasks_state.get(name) {
-            rows.push(Row::new(vec![
-                Cell::from("task").style(Style::default().fg(Color::DarkGray)),
-                Cell::from(name.clone()),
-                Cell::from(task_state_label(*state))
-                    .style(Style::default().fg(task_state_color(*state))),
-            ]));
-        }
-    }
-
-    // Body height = frame height minus top/bottom borders and the header row.
-    let body_height = area.height.saturating_sub(3) as usize;
-    let total = rows.len();
+    // Body height = table area minus header row.
+    let body_height = table_area.height.saturating_sub(1) as usize;
+    let highlight = app.overlay_highlight.min(total.saturating_sub(1));
+    // Scroll so the highlighted row is inside [scroll, scroll + body_height).
+    let scroll = if body_height == 0 {
+        0
+    } else if highlight >= body_height {
+        highlight + 1 - body_height
+    } else {
+        0
+    };
     let max_scroll = total.saturating_sub(body_height);
-    let scroll = app.overlay_scroll.min(max_scroll);
-    let showing_more_below = scroll < max_scroll;
+    let scroll = scroll.min(max_scroll);
+    let showing_more_below = scroll + body_height < total;
     let showing_more_above = scroll > 0;
 
-    let visible: Vec<Row<'static>> = rows.into_iter().skip(scroll).take(body_height).collect();
-
-    // Hint the user when the table is scrollable. Fits in the title bar so
-    // it doesn't steal a row from the body.
-    let mut title = String::from(" don status — [↑↓/jk] scroll  [esc] dismiss ");
-    if showing_more_above || showing_more_below {
-        let up = if showing_more_above { "↑" } else { " " };
-        let down = if showing_more_below { "↓" } else { " " };
-        title = format!(
-            " don status — [↑↓/jk] scroll  [esc] dismiss  {up}{down} ({}/{}) ",
-            scroll + visible.len(),
-            total,
-        );
-    }
+    let highlight_style = Style::default().add_modifier(Modifier::REVERSED);
+    let visible: Vec<Row<'static>> = items
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(body_height)
+        .map(|(i, item)| {
+            let (kind, name, state_cell) = match item {
+                OverlayItem::Service { name, state } => (
+                    "service",
+                    name.clone(),
+                    Cell::from(service_state_label(*state))
+                        .style(Style::default().fg(service_state_color(*state))),
+                ),
+                OverlayItem::Task { name, state } => (
+                    "task",
+                    name.clone(),
+                    Cell::from(task_state_label(*state))
+                        .style(Style::default().fg(task_state_color(*state))),
+                ),
+            };
+            let row = Row::new(vec![
+                Cell::from(kind).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(name),
+                state_cell,
+            ]);
+            if i == highlight {
+                row.style(highlight_style)
+            } else {
+                row
+            }
+        })
+        .collect();
 
     let table = Table::new(
         visible,
@@ -198,36 +233,92 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
             Constraint::Percentage(60),
         ],
     )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL).title(title));
+    .header(header);
+    frame.render_widget(table, table_area);
 
-    frame.render_widget(table, area);
+    // Bottom bar: filter input (when active or non-empty) and scroll indicator.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let has_query = !app.overlay_query.is_empty();
+    if app.overlay_filtering || has_query {
+        spans.push(bold_cyan("filter: "));
+        spans.push(Span::styled(
+            app.overlay_query.clone(),
+            Style::default().fg(Color::White),
+        ));
+        if app.overlay_filtering {
+            spans.push(Span::styled(
+                "▌",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+        spans.push(separator());
+    }
+    if total == 0 {
+        spans.push(dim(if has_query {
+            "no matches".to_string()
+        } else {
+            "(no services or tasks)".to_string()
+        }));
+    } else {
+        let scroll_hint = if showing_more_above || showing_more_below {
+            let up = if showing_more_above { "↑" } else { " " };
+            let down = if showing_more_below { "↓" } else { " " };
+            format!(
+                "{up}{down} {}/{}",
+                (highlight + 1).min(total),
+                total
+            )
+        } else {
+            format!("{}/{total}", highlight + 1)
+        };
+        spans.push(dim(scroll_hint));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), bar_area);
 }
 
 fn draw_filter_list(frame: &mut Frame<'_>, area: Rect, filter: &FilterState) {
     if area.height == 0 {
         return;
     }
-    let matches = filter.matches();
-    let visible = matches
-        .len()
-        .min(area.height as usize)
-        .min(MAX_DROPDOWN_ROWS);
-    let items: Vec<ListItem<'static>> = matches
+    let rows = filter.rows();
+    // Pass every row to ratatui; the list's `ListState` scrolls automatically
+    // to keep the selected index in view when rows overflow the area.
+    let items: Vec<ListItem<'static>> = rows
         .iter()
-        .take(visible)
-        .map(|name| {
-            let selected = filter.is_edit_selected(name);
-            let checkbox = if selected { "[x] " } else { "[ ] " };
-            let checkbox_style = if selected {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(checkbox, checkbox_style),
-                Span::raw(name.clone()),
-            ]))
+        .map(|row| match row {
+            FilterRow::All => {
+                let selected = filter.all_selected_in_edit();
+                let checkbox = if selected { "[x] " } else { "[ ] " };
+                let checkbox_style = if selected {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(checkbox, checkbox_style),
+                    Span::styled(
+                        "all",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+            }
+            FilterRow::Name(name) => {
+                let selected = filter.is_edit_selected(name);
+                let checkbox = if selected { "[x] " } else { "[ ] " };
+                let checkbox_style = if selected {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(checkbox, checkbox_style),
+                    Span::raw(name.clone()),
+                ]))
+            }
         })
         .collect();
 
@@ -239,7 +330,7 @@ fn draw_filter_list(frame: &mut Frame<'_>, area: Rect, filter: &FilterState) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
-    let mut state = ListState::default().with_selected(if matches.is_empty() {
+    let mut state = ListState::default().with_selected(if rows.is_empty() {
         None
     } else {
         Some(filter.highlight())
@@ -251,10 +342,10 @@ fn draw_palette_list(frame: &mut Frame<'_>, area: Rect, palette: &ActionPalette)
     if area.height == 0 {
         return;
     }
+    // Hand every matching action to ratatui — its `ListState` keeps the
+    // selected index in view by adjusting the scroll offset.
     let items: Vec<ListItem<'static>> = palette
         .visible()
-        .take(area.height as usize)
-        .take(MAX_PALETTE_ROWS)
         .map(|(_, action)| ListItem::new(Line::from(Span::raw(action.label.clone()))))
         .collect();
 
@@ -278,6 +369,8 @@ fn normal_bar_line(
     counts: &StatusCounts,
     filter: &FilterState,
     spinner_frame: usize,
+    visible_services: usize,
+    total_services: usize,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -313,13 +406,11 @@ fn normal_bar_line(
     }
 
     spans.push(separator());
+    spans.push(dim("[l] logs"));
     if filter.is_active() {
-        spans.push(bold_cyan("filter: "));
-        spans.push(bold_green(filter.active_names().join(", ")));
-        spans.push(dim("  [esc] clear"));
-    } else {
-        spans.push(dim("[l] filter  [a] actions  [s] status  [q] quit"));
+        spans.push(dim(format!(" ({visible_services}/{total_services})")));
     }
+    spans.push(dim("  [t] tasks  [s] status"));
     Line::from(spans)
 }
 
@@ -342,7 +433,7 @@ fn filter_bar_line(counts: &StatusCounts, filter: &FilterState) -> Line<'static>
 
 fn palette_bar_line(palette: &ActionPalette) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(bold_cyan("actions: "));
+    spans.push(bold_cyan("tasks: "));
     spans.push(Span::styled(
         palette.query().to_string(),
         Style::default().fg(Color::White),
@@ -433,6 +524,7 @@ fn service_state_label(state: ServiceState) -> &'static str {
         ServiceState::Stopping => "stopping",
         ServiceState::Stopped => "stopped",
         ServiceState::Failed => "failed",
+        ServiceState::DependencyFailed => "dep failed",
     }
 }
 
@@ -447,6 +539,9 @@ fn service_state_color(state: ServiceState) -> Color {
         ServiceState::Stopped => Color::DarkGray,
         ServiceState::Unhealthy => Color::LightRed,
         ServiceState::Failed => Color::Red,
+        // Dim red: same family as Failed but visually quieter, reflecting
+        // that it's a downstream casualty, not the root cause.
+        ServiceState::DependencyFailed => Color::Rgb(150, 60, 60),
     }
 }
 
@@ -458,6 +553,7 @@ fn task_state_label(state: TaskItemState) -> &'static str {
         TaskItemState::Completed => "completed",
         TaskItemState::Skipped => "skipped",
         TaskItemState::Failed => "failed",
+        TaskItemState::DependencyFailed => "dep failed",
         TaskItemState::PendingRun => "pending_run",
     }
 }
@@ -468,6 +564,7 @@ fn task_state_color(state: TaskItemState) -> Color {
         TaskItemState::Running | TaskItemState::Pending | TaskItemState::Building => Color::Yellow,
         TaskItemState::PendingRun => Color::Cyan,
         TaskItemState::Failed => Color::Red,
+        TaskItemState::DependencyFailed => Color::Rgb(150, 60, 60),
     }
 }
 
@@ -480,15 +577,6 @@ fn bold_cyan<S: Into<String>>(text: S) -> Span<'static> {
         text.into(),
         Style::default()
             .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn bold_green<S: Into<String>>(text: S) -> Span<'static> {
-    Span::styled(
-        text.into(),
-        Style::default()
-            .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
     )
 }

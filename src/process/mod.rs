@@ -149,6 +149,29 @@ impl ProcessHandle {
         })
     }
 
+    /// Poll `killpg(pgid, 0)` until it returns ESRCH — i.e. the process
+    /// group has no remaining members. Returns `true` when the group is
+    /// empty, `false` on timeout.
+    ///
+    /// `terminate` only reaps the *parent* process via `child.wait()`, so
+    /// any descendants in the same pgroup may still be alive (slow
+    /// graceful-shutdown children, daemons that hold file locks, etc.).
+    /// Callers that care about "is the old instance fully gone before I
+    /// start a new one?" — e.g. the restart path for a DB with an
+    /// exclusive data-dir lock — should await this after `terminate`.
+    pub async fn wait_pgroup_empty(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Err(nix::Error::ESRCH) = killpg(Pid::from_raw(self.pgid), None) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Send a signal to the process group, wait up to `timeout` for exit,
     /// then send SIGKILL if the process hasn't exited.
     pub async fn terminate(

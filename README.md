@@ -418,7 +418,7 @@ See [`examples/`](examples/) for complete working configs.
 | `ready.interval` | string | Check interval (default: "1s") |
 | `ready.retries` | u32 | Max attempts (default: 30) |
 | `ready.monitor` | bool | Keep polling after Ready to detect unhealthy (default: false) |
-| `ready.monitor_interval` | string | Poll interval while monitoring (default: `ready.interval`) |
+| `ready.monitor_interval` | string | Poll interval while monitoring (default: "10s") |
 | `ready.unhealthy_after` | u32 | Consecutive monitor failures → Unhealthy (default: 3) |
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
 | `reload` | bool | Whether file-watch events restart the service (default: true) |
@@ -435,7 +435,6 @@ See [`examples/`](examples/) for complete working configs.
 | `proxy` | string or table | TCP proxy: `"addr"` or `{ listen, env }` |
 | `lazy` | bool | Delay start until first proxy connection |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
-| `bazel.query_timeout` | u64 | Query timeout in seconds |
 | `turbo.task` | string | Turborepo task name |
 | `turbo.filter` | string | Turborepo package filter |
 | `turbo.build_task` | string | Task to run during batch build (default: "build") |

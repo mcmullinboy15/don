@@ -3,7 +3,6 @@
 //! The config is loaded from a `don.toml` file and defines services, tasks,
 //! and profiles for a dev environment.
 
-pub mod diff;
 mod download;
 pub(crate) mod param;
 mod platform;
@@ -14,9 +13,7 @@ pub(crate) mod template;
 pub(crate) mod types;
 
 pub use self::download::{DownloadConfig, PlatformDownload};
-pub use self::param::{
-    CompletionParse, Completions, ParamKind, ParamValidate, TaskParam,
-};
+pub use self::param::{CompletionParse, Completions, ParamKind, ParamValidate, TaskParam};
 pub use self::platform::Platform;
 pub use self::profile::Profile;
 pub use self::service::{
@@ -158,10 +155,7 @@ impl Config {
             // service is actually accepting connections.
             if let Some(ref ready) = resolved.ready
                 && let Some(ref tcp_addr) = ready.tcp
-                && resolved
-                    .proxy
-                    .iter()
-                    .any(|p| p.listen == *tcp_addr)
+                && resolved.proxy.iter().any(|p| p.listen == *tcp_addr)
             {
                 warnings.push(format!(
                     "service '{name}': TCP ready check on '{tcp_addr}' will pass \
@@ -180,12 +174,16 @@ impl Config {
             // Validate duration strings
             for pattern in &resolved.watch {
                 if let Err(e) = glob::Pattern::new(pattern) {
-                    errors.push(format!("service '{name}': invalid watch pattern '{pattern}': {e}"));
+                    errors.push(format!(
+                        "service '{name}': invalid watch pattern '{pattern}': {e}"
+                    ));
                 }
             }
             for pattern in &resolved.ignore {
                 if let Err(e) = glob::Pattern::new(pattern) {
-                    errors.push(format!("service '{name}': invalid ignore pattern '{pattern}': {e}"));
+                    errors.push(format!(
+                        "service '{name}': invalid ignore pattern '{pattern}': {e}"
+                    ));
                 }
             }
             if let Some(ref debounce) = resolved.debounce
@@ -199,14 +197,12 @@ impl Config {
                 errors.push(format!("service '{name}': invalid ready interval: {e}"));
             }
             if let Some(ref ready) = resolved.ready {
-                if let Some(ref mi) = ready.monitor_interval
-                    && let Err(e) = crate::duration::parse_duration(mi)
-                {
+                if let Err(e) = crate::duration::parse_duration(&ready.monitor_interval) {
                     errors.push(format!(
                         "service '{name}': invalid ready monitor_interval: {e}"
                     ));
                 }
-                if !ready.monitor && ready.monitor_interval.is_some() {
+                if !ready.monitor && ready.monitor_interval != "10s" {
                     warnings.push(format!(
                         "service '{name}': ready.monitor_interval set but monitor = false — it will be ignored"
                     ));
@@ -242,9 +238,7 @@ impl Config {
                     }
                     Some(ServiceKind::Custom { .. }) => {}
                     _ => {
-                        errors.push(format!(
-                            "service '{name}': download requires a run command"
-                        ));
+                        errors.push(format!("service '{name}': download requires a run command"));
                     }
                 }
                 for (platform_key, artifact) in &download.platform {
@@ -259,11 +253,8 @@ impl Config {
                 if download.for_platform(platform).is_none()
                     && matches!(resolved.kind, Some(ServiceKind::Custom { .. }))
                 {
-                    let available: Vec<String> = download
-                        .platform
-                        .keys()
-                        .map(|p| p.to_string())
-                        .collect();
+                    let available: Vec<String> =
+                        download.platform.keys().map(|p| p.to_string()).collect();
                     warnings.push(format!(
                         "service '{name}': no download entry for current platform {platform} \
                          (available: {}) — will use run.cmd from PATH",
@@ -337,12 +328,16 @@ impl Config {
             }
             for pattern in &task.watch {
                 if let Err(e) = glob::Pattern::new(pattern) {
-                    errors.push(format!("task '{name}': invalid watch pattern '{pattern}': {e}"));
+                    errors.push(format!(
+                        "task '{name}': invalid watch pattern '{pattern}': {e}"
+                    ));
                 }
             }
             for pattern in &task.ignore {
                 if let Err(e) = glob::Pattern::new(pattern) {
-                    errors.push(format!("task '{name}': invalid ignore pattern '{pattern}': {e}"));
+                    errors.push(format!(
+                        "task '{name}': invalid ignore pattern '{pattern}': {e}"
+                    ));
                 }
             }
             if let Some(ref timeout) = task.timeout
@@ -363,11 +358,8 @@ impl Config {
                 }
                 // Warn if the current platform has no download entry.
                 if download.for_platform(platform).is_none() {
-                    let available: Vec<String> = download
-                        .platform
-                        .keys()
-                        .map(|p| p.to_string())
-                        .collect();
+                    let available: Vec<String> =
+                        download.platform.keys().map(|p| p.to_string()).collect();
                     warnings.push(format!(
                         "task '{name}': no download entry for current platform {platform} \
                          (available: {}) — will use cmd from PATH",
@@ -544,9 +536,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i + 1;
         for (j, cb) in b.chars().enumerate() {
             let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j] + cost)
-                .min(prev[j + 1] + 1)
-                .min(curr[j] + 1);
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -741,7 +731,9 @@ fn validate_task_params(task_name: &str, task: &Task, errors: &mut Vec<String>) 
 
 fn is_valid_param_ident(name: &str) -> bool {
     let mut chars = name.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
@@ -769,10 +761,7 @@ fn suggest_typo(input: &str, candidates: &std::collections::HashSet<&str>) -> St
     let mut best: Option<(&str, usize)> = None;
     for &candidate in candidates {
         let d = levenshtein(input, candidate);
-        if d <= max_distance
-            && d > 0
-            && best.is_none_or(|(_, bd)| d < bd)
-        {
+        if d <= max_distance && d > 0 && best.is_none_or(|(_, bd)| d < bd) {
             best = Some((candidate, d));
         }
     }
@@ -848,7 +837,7 @@ mod tests {
                 sha256: case.sha256,
                 path: None,
                 setup: None,
-            headers: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
             };
             let result = validate_platform_download(&artifact);
             match (result, case.expect_err) {
@@ -856,10 +845,15 @@ mod tests {
                 (Err(msg), Some(needle)) => assert!(
                     msg.contains(needle),
                     "case '{}': expected error containing '{}', got '{}'",
-                    case.name, needle, msg
+                    case.name,
+                    needle,
+                    msg
                 ),
                 (Ok(()), Some(needle)) => {
-                    panic!("case '{}': expected error containing '{}' but got Ok", case.name, needle)
+                    panic!(
+                        "case '{}': expected error containing '{}' but got Ok",
+                        case.name, needle
+                    )
                 }
                 (Err(msg), None) => {
                     panic!("case '{}': expected Ok but got error: {}", case.name, msg)
@@ -916,7 +910,10 @@ mod tests {
                     assert_eq!(docker.ports, vec!["5432:5432"]);
                     assert_eq!(docker.volumes, vec!["pgdata:/var/lib/postgresql/data"]);
                     assert_eq!(docker.network.as_deref(), Some("my-net"));
-                    assert_eq!(docker.command, vec!["postgres", "-c", "max_connections=200"]);
+                    assert_eq!(
+                        docker.command,
+                        vec!["postgres", "-c", "max_connections=200"]
+                    );
                     assert_eq!(docker.env_file, vec![PathBuf::from(".env.postgres.docker")]);
                     assert_eq!(resolved.env["POSTGRES_PASSWORD"], "dev");
                     assert_eq!(resolved.env_file, vec![PathBuf::from(".env.shared")]);
@@ -957,10 +954,10 @@ mod tests {
                     assert_eq!(build.dockerfile.as_deref(), Some("Dockerfile.dev"));
                     assert_eq!(build.target.as_deref(), Some("development"));
                     assert_eq!(build.args["RUST_VERSION"], "1.80");
-                    assert_eq!(resolved.watch, vec![
-                        "services/api/src/**/*.rs",
-                        "services/api/Dockerfile.dev",
-                    ]);
+                    assert_eq!(
+                        resolved.watch,
+                        vec!["services/api/src/**/*.rs", "services/api/Dockerfile.dev",]
+                    );
                 },
             },
             ConfigTestCase {
@@ -993,7 +990,10 @@ mod tests {
                     assert_eq!(rust.features, vec!["dev"]);
                     assert!(rust.release);
                     assert_eq!(rust.extra_args, vec!["--jobs", "4"]);
-                    assert_eq!(rust.target_dir.as_deref(), Some(std::path::Path::new("./target-api")));
+                    assert_eq!(
+                        rust.target_dir.as_deref(),
+                        Some(std::path::Path::new("./target-api"))
+                    );
                     assert_eq!(resolved.depends_on, vec!["postgres"]);
                     assert_eq!(resolved.proxy.len(), 1);
                     assert_eq!(resolved.proxy[0].listen, "0.0.0.0:3000");
@@ -1036,7 +1036,10 @@ mod tests {
                     let build = build.as_ref().unwrap();
                     assert_eq!(build.cmd, "npm");
                     assert_eq!(build.args, vec!["run", "build"]);
-                    assert_eq!(resolved.dir.as_deref(), Some(std::path::Path::new("./worker")));
+                    assert_eq!(
+                        resolved.dir.as_deref(),
+                        Some(std::path::Path::new("./worker"))
+                    );
                     assert_eq!(resolved.watch, vec!["src/**/*.js"]);
 
                     let ready = resolved.ready.as_ref().unwrap();
@@ -1543,7 +1546,11 @@ mod tests {
                     let ConfigError::Validation { errors } = &err else {
                         panic!("expected validation error");
                     };
-                    assert!(errors.iter().any(|e| e.contains("default_profile") && e.contains("ghost")));
+                    assert!(
+                        errors
+                            .iter()
+                            .any(|e| e.contains("default_profile") && e.contains("ghost"))
+                    );
                 },
             },
             ConfigTestCase {
@@ -1673,7 +1680,7 @@ mod tests {
                     let ready = resolved.ready.as_ref().unwrap();
                     assert!(!ready.monitor);
                     assert_eq!(ready.unhealthy_after, 3);
-                    assert!(ready.monitor_interval.is_none());
+                    assert_eq!(ready.monitor_interval, "10s");
                     assert_eq!(resolved.on_failure, OnFailure::Notify);
                 },
             },
@@ -1695,7 +1702,7 @@ mod tests {
                     let resolved = config.services["api"].resolve(TEST_PLATFORM);
                     let ready = resolved.ready.as_ref().unwrap();
                     assert!(ready.monitor);
-                    assert_eq!(ready.monitor_interval.as_deref(), Some("5s"));
+                    assert_eq!(ready.monitor_interval.as_str(), "5s");
                     assert_eq!(ready.unhealthy_after, 2);
                     assert_eq!(resolved.on_failure, OnFailure::Restart);
                 },
@@ -1756,7 +1763,9 @@ mod tests {
                         panic!("expected validation error");
                     };
                     assert!(
-                        errors.iter().any(|e| e.contains("unhealthy_after must be >= 1")),
+                        errors
+                            .iter()
+                            .any(|e| e.contains("unhealthy_after must be >= 1")),
                         "got: {errors:?}"
                     );
                 },
@@ -1775,7 +1784,11 @@ mod tests {
                     let ConfigError::Validation { errors } = &err else {
                         panic!("expected validation error");
                     };
-                    assert!(errors.iter().any(|e| e.contains("invalid shutdown timeout")));
+                    assert!(
+                        errors
+                            .iter()
+                            .any(|e| e.contains("invalid shutdown timeout"))
+                    );
                 },
             },
             ConfigTestCase {
@@ -1863,10 +1876,16 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     let resolved = config.services["api"].resolve(Platform::LinuxX86_64);
-                    assert!(resolved.reload, "platform override should set reload = true");
+                    assert!(
+                        resolved.reload,
+                        "platform override should set reload = true"
+                    );
 
                     let resolved_mac = config.services["api"].resolve(Platform::MacosAarch64);
-                    assert!(!resolved_mac.reload, "non-matching platform should keep reload = false");
+                    assert!(
+                        !resolved_mac.reload,
+                        "non-matching platform should keep reload = false"
+                    );
                 },
             },
         ];
@@ -1881,8 +1900,8 @@ mod tests {
                 );
                 continue;
             }
-            let config = result
-                .unwrap_or_else(|e| panic!("case '{}': unexpected error: {e}", case.name));
+            let config =
+                result.unwrap_or_else(|e| panic!("case '{}': unexpected error: {e}", case.name));
             (case.check)(&config);
         }
     }
@@ -1976,11 +1995,17 @@ mod tests {
         ];
 
         for case in &cases {
-            let config = case.input.parse::<Config>()
+            let config = case
+                .input
+                .parse::<Config>()
                 .unwrap_or_else(|e| panic!("case '{}': parse error: {e}", case.name));
             let resolved = config.services["svc"].resolve(case.platform);
             let (executable, args) = resolved
-                .resolved_run_cmd(case.platform, "svc", Some(std::path::Path::new(case.cache_base)))
+                .resolved_run_cmd(
+                    case.platform,
+                    "svc",
+                    Some(std::path::Path::new(case.cache_base)),
+                )
                 .unwrap_or_else(|e| panic!("case '{}': resolve error: {e}", case.name));
 
             let expected_exec = match &case.expected {
@@ -2007,7 +2032,8 @@ mod tests {
             let expected_args: Vec<String> =
                 case.expect_args.iter().map(|s| s.to_string()).collect();
             assert_eq!(
-                args, &expected_args[..],
+                args,
+                &expected_args[..],
                 "case '{}': args mismatch",
                 case.name
             );
@@ -2026,7 +2052,6 @@ bazel.target = "//services/api:api"
             panic!("expected bazel kind");
         };
         assert_eq!(bazel.target, "//services/api:api");
-        assert!(bazel.query_timeout.is_none());
     }
 
     #[test]
@@ -2035,7 +2060,6 @@ bazel.target = "//services/api:api"
 [services.web]
 turbo.task = "dev"
 turbo.filter = "@myorg/web"
-turbo.query_timeout = 60
 "#;
         let config: Config = toml.parse().unwrap();
         let svc = config.services.get("web").unwrap();
@@ -2044,7 +2068,6 @@ turbo.query_timeout = 60
         };
         assert_eq!(turbo.task, "dev");
         assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
-        assert_eq!(turbo.query_timeout, Some(60));
     }
 
     #[test]
@@ -2070,7 +2093,10 @@ run.cmd = "./api"
 bazel.target = "//services/api:api"
 "#;
         let result: Result<Config, _> = toml.parse();
-        assert!(result.is_err(), "expected parse error for conflicting kinds");
+        assert!(
+            result.is_err(),
+            "expected parse error for conflicting kinds"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("only one of"),
@@ -2094,21 +2120,6 @@ turbo.task = "build"
             err.contains("mutually exclusive"),
             "expected mutual exclusivity error, got: {err}"
         );
-    }
-
-    #[test]
-    fn test_bazel_config_with_query_timeout() {
-        let toml = r#"
-[services.api]
-bazel.target = "//services/api:api"
-bazel.query_timeout = 45
-"#;
-        let config: Config = toml.parse().unwrap();
-        let svc = config.services.get("api").unwrap();
-        let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
-            panic!("expected bazel kind");
-        };
-        assert_eq!(bazel.query_timeout, Some(45));
     }
 
     #[test]
@@ -2405,7 +2416,10 @@ turbo.build_task = ""
             match (&res, case.want) {
                 (Ok(_), None) => {}
                 (Ok(_), Some(needle)) => {
-                    panic!("case '{}': expected error containing '{needle}' but got Ok", case.name)
+                    panic!(
+                        "case '{}': expected error containing '{needle}' but got Ok",
+                        case.name
+                    )
                 }
                 (Err(ConfigError::Validation { errors }), Some(needle)) => {
                     assert!(
@@ -2415,7 +2429,10 @@ turbo.build_task = ""
                     );
                 }
                 (Err(ConfigError::Validation { errors }), None) => {
-                    panic!("case '{}': expected Ok but got validation errors {errors:?}", case.name)
+                    panic!(
+                        "case '{}': expected Ok but got validation errors {errors:?}",
+                        case.name
+                    )
                 }
                 (Err(e), _) => panic!("case '{}': unexpected error kind {e}", case.name),
             }

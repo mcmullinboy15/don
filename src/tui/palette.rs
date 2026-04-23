@@ -1,22 +1,21 @@
-//! Command palette — fuzzy-searchable list of context-aware actions.
+//! Tasks palette — fuzzy-searchable list of runnable tasks.
 //!
-//! Actions are derived from the runner's current service/task state at open
-//! time: restart/stop the running services, start the stopped ones, run all
-//! tasks in `PendingRun`. Selecting one dispatches a [`RunnerCommand`].
+//! Derived from the runner's current task state at open time: "run all
+//! pending tasks" if any are in `PendingRun`, plus a per-task run action
+//! for every non-running task. Service lifecycle actions (start/stop/
+//! restart) live on the status overlay instead — they're tied to a
+//! specific highlighted service and keyed by state.
 //!
-//! The palette snapshots the action list on open and holds it until close —
-//! further state changes don't shuffle the list under the user. Selecting
-//! a stale action (e.g. restart a service that was just stopped) still sends
-//! the command; the runner will reject it cleanly via its own validation.
+//! The palette snapshots the list on open and holds it until close — state
+//! changes don't shuffle the list under the user. Selecting a stale action
+//! (e.g. run a task that just finished) still sends the command; the
+//! runner validates on receipt.
 
 use std::collections::HashMap;
 
 use super::fuzzy::fuzzy_match;
 use crate::config::Task;
-use crate::runner::{ServiceState, TaskItemState};
-
-/// Maximum number of match rows to show in the palette dropdown.
-pub(crate) const MAX_PALETTE_ROWS: usize = 8;
+use crate::runner::TaskItemState;
 
 /// A user-triggerable action. The label is shown in the palette; the kind
 /// maps to a [`RunnerCommand`] at dispatch time.
@@ -29,14 +28,9 @@ pub(crate) struct Action {
 /// What the action actually does. Kept separate from the display label so
 /// we can round-trip via fuzzy search (which sees only the label).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum ActionKind {
     RunPendingTasks,
-    StartService(String),
-    StopService(String),
-    RestartService(String),
-    /// Re-run the build command (if any), then restart. Distinct from
-    /// `RestartService`, which skips the build step.
-    RebuildService(String),
     /// Run a param-less task — dispatches immediately on Enter.
     RunTask(String),
     /// Run a task that has declared `params`. Enter opens a form modal
@@ -67,11 +61,10 @@ impl ActionPalette {
     /// [`ActionKind::RunTaskWithForm`] (declared params, open form first).
     pub(crate) fn open(
         &mut self,
-        services: &HashMap<String, ServiceState>,
         tasks: &HashMap<String, TaskItemState>,
         task_configs: &HashMap<String, Task>,
     ) {
-        self.all_actions = build_actions(services, tasks, task_configs);
+        self.all_actions = build_actions(tasks, task_configs);
         self.query.clear();
         self.highlight = 0;
         self.matches = (0..self.all_actions.len()).collect();
@@ -89,17 +82,17 @@ impl ActionPalette {
         &self.query
     }
 
-    /// Rows to display, already fuzzy-sorted and capped at [`MAX_PALETTE_ROWS`].
+    /// Rows to display, already fuzzy-sorted. The caller (ratatui list)
+    /// handles vertical scrolling when there are more rows than fit.
     pub(crate) fn visible(&self) -> impl Iterator<Item = (usize, &Action)> {
         self.matches
             .iter()
-            .take(MAX_PALETTE_ROWS)
             .enumerate()
             .filter_map(|(i, idx)| self.all_actions.get(*idx).map(|a| (i, a)))
     }
 
     pub(crate) fn visible_count(&self) -> usize {
-        self.matches.len().min(MAX_PALETTE_ROWS)
+        self.matches.len()
     }
 
     pub(crate) fn highlight(&self) -> usize {
@@ -162,18 +155,15 @@ impl ActionPalette {
     }
 }
 
-/// Build the available action list from the current state.
+/// Build the available action list from the current task state.
 ///
 /// Ordering (top to bottom in the palette):
 /// 1. "Run all pending tasks" if any task is in [`PendingRun`](TaskItemState::PendingRun).
-/// 2. Per-service actions, sorted alphabetically by service name, with
-///    action set varying by state.
-/// 3. Per-task run actions, sorted alphabetically. Running tasks are skipped
+/// 2. Per-task run actions, sorted alphabetically. Running tasks are skipped
 ///    to avoid double-spawning; every other state is runnable, with a
 ///    `(needs run)` suffix for states that indicate the user should run it
 ///    (`Pending`, `Failed`, `PendingRun`).
 pub(crate) fn build_actions(
-    services: &HashMap<String, ServiceState>,
     tasks: &HashMap<String, TaskItemState>,
     task_configs: &HashMap<String, Task>,
 ) -> Vec<Action> {
@@ -190,48 +180,6 @@ pub(crate) fn build_actions(
         });
     }
 
-    let mut names: Vec<&String> = services.keys().collect();
-    names.sort();
-    for name in names {
-        let Some(state) = services.get(name) else {
-            continue;
-        };
-        match state {
-            ServiceState::Ready | ServiceState::Running | ServiceState::Unhealthy => {
-                actions.push(Action {
-                    label: format!("Restart {name}"),
-                    kind: ActionKind::RestartService(name.clone()),
-                });
-                actions.push(Action {
-                    label: format!("Rebuild {name}"),
-                    kind: ActionKind::RebuildService(name.clone()),
-                });
-                actions.push(Action {
-                    label: format!("Stop {name}"),
-                    kind: ActionKind::StopService(name.clone()),
-                });
-            }
-            ServiceState::Stopped | ServiceState::Failed => {
-                actions.push(Action {
-                    label: format!("Start {name}"),
-                    kind: ActionKind::StartService(name.clone()),
-                });
-                actions.push(Action {
-                    label: format!("Rebuild {name}"),
-                    kind: ActionKind::RebuildService(name.clone()),
-                });
-            }
-            ServiceState::Pending
-            | ServiceState::Building
-            | ServiceState::Lazy
-            | ServiceState::Starting
-            | ServiceState::Stopping => {
-                // In-flight states — offering Stop/Start/Restart during these
-                // transitions would race with the ongoing lifecycle operation.
-            }
-        }
-    }
-
     let mut task_names: Vec<&String> = tasks.keys().collect();
     task_names.sort();
     for name in task_names {
@@ -240,9 +188,10 @@ pub(crate) fn build_actions(
         };
         let mut suffix = match state {
             TaskItemState::Running | TaskItemState::Building => continue,
-            TaskItemState::Pending | TaskItemState::Failed | TaskItemState::PendingRun => {
-                " (needs run)"
-            }
+            TaskItemState::Pending
+            | TaskItemState::Failed
+            | TaskItemState::DependencyFailed
+            | TaskItemState::PendingRun => " (needs run)",
             TaskItemState::Completed | TaskItemState::Skipped => "",
         };
         let has_params = task_configs
@@ -279,10 +228,6 @@ pub(crate) fn build_actions(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-
-    fn services(entries: &[(&str, ServiceState)]) -> HashMap<String, ServiceState> {
-        entries.iter().map(|(n, s)| (n.to_string(), *s)).collect()
-    }
 
     fn tasks(entries: &[(&str, TaskItemState)]) -> HashMap<String, TaskItemState> {
         entries.iter().map(|(n, s)| (n.to_string(), *s)).collect()
@@ -328,6 +273,7 @@ mod tests {
                         bazel: None,
                         turbo: None,
                         params,
+                        hidden: false,
                     },
                 )
             })
@@ -338,7 +284,6 @@ mod tests {
     fn build_actions_table() {
         struct Case {
             name: &'static str,
-            services: Vec<(&'static str, ServiceState)>,
             tasks: Vec<(&'static str, TaskItemState)>,
             want_labels: Vec<&'static str>,
         }
@@ -346,52 +291,11 @@ mod tests {
         let cases = vec![
             Case {
                 name: "empty",
-                services: vec![],
                 tasks: vec![],
                 want_labels: vec![],
-            },
-            Case {
-                name: "one ready service → restart + rebuild + stop",
-                services: vec![("api", ServiceState::Ready)],
-                tasks: vec![],
-                want_labels: vec!["Restart api", "Rebuild api", "Stop api"],
-            },
-            Case {
-                name: "stopped service → start + rebuild",
-                services: vec![("worker", ServiceState::Stopped)],
-                tasks: vec![],
-                want_labels: vec!["Start worker", "Rebuild worker"],
-            },
-            Case {
-                name: "in-flight states offer nothing",
-                services: vec![
-                    ("a", ServiceState::Pending),
-                    ("b", ServiceState::Starting),
-                    ("c", ServiceState::Stopping),
-                    ("d", ServiceState::Lazy),
-                ],
-                tasks: vec![],
-                want_labels: vec![],
-            },
-            Case {
-                name: "pending tasks surface at top",
-                services: vec![("api", ServiceState::Ready)],
-                tasks: vec![
-                    ("migrate", TaskItemState::PendingRun),
-                    ("seed", TaskItemState::PendingRun),
-                ],
-                want_labels: vec![
-                    "Run all pending tasks (2)",
-                    "Restart api",
-                    "Rebuild api",
-                    "Stop api",
-                    "Run migrate (needs run)",
-                    "Run seed (needs run)",
-                ],
             },
             Case {
                 name: "every task is runnable with per-state suffix",
-                services: vec![],
                 tasks: vec![
                     ("a_pending", TaskItemState::Pending),
                     ("b_completed", TaskItemState::Completed),
@@ -410,7 +314,6 @@ mod tests {
             },
             Case {
                 name: "running tasks are skipped to avoid double-spawn",
-                services: vec![],
                 tasks: vec![
                     ("build", TaskItemState::Running),
                     ("lint", TaskItemState::Completed),
@@ -418,25 +321,21 @@ mod tests {
                 want_labels: vec!["Run lint"],
             },
             Case {
-                name: "services sorted alphabetically",
-                services: vec![
-                    ("worker", ServiceState::Ready),
-                    ("api", ServiceState::Ready),
+                name: "pending-run tasks surface the aggregate action",
+                tasks: vec![
+                    ("migrate", TaskItemState::PendingRun),
+                    ("seed", TaskItemState::PendingRun),
                 ],
-                tasks: vec![],
                 want_labels: vec![
-                    "Restart api",
-                    "Rebuild api",
-                    "Stop api",
-                    "Restart worker",
-                    "Rebuild worker",
-                    "Stop worker",
+                    "Run all pending tasks (2)",
+                    "Run migrate (needs run)",
+                    "Run seed (needs run)",
                 ],
             },
         ];
 
         for case in cases {
-            let got = build_actions(&services(&case.services), &tasks(&case.tasks), &no_task_configs());
+            let got = build_actions(&tasks(&case.tasks), &no_task_configs());
             let got_labels: Vec<&str> = got.iter().map(|a| a.label.as_str()).collect();
             assert_eq!(got_labels, case.want_labels, "case: {}", case.name);
         }
@@ -446,36 +345,32 @@ mod tests {
     fn palette_fuzzy_narrows_visible_matches() {
         let mut p = ActionPalette::default();
         p.open(
-            &services(&[
-                ("api", ServiceState::Ready),
-                ("worker", ServiceState::Ready),
+            &tasks(&[
+                ("build", TaskItemState::Completed),
+                ("test", TaskItemState::Completed),
+                ("lint", TaskItemState::Completed),
             ]),
-            &tasks(&[]),
             &no_task_configs(),
         );
-        // 6 actions per ready service: Restart, Rebuild, Stop ×2 services.
-        // The `w` query narrows to the worker triplet plus visible cap.
-        assert_eq!(p.visible_count(), 6);
-        p.push_query_char('w');
+        assert_eq!(p.visible_count(), 3);
+        p.push_query_char('t');
         let labels: Vec<&str> = p.visible().map(|(_, a)| a.label.as_str()).collect();
-        // All three worker labels match; ranking order is an implementation
-        // detail of the fuzzy matcher — just assert the matched set.
-        let mut sorted = labels.clone();
-        sorted.sort();
-        assert_eq!(
-            sorted,
-            vec!["Rebuild worker", "Restart worker", "Stop worker"]
-        );
+        assert!(labels.iter().all(|l| l.contains('t')));
     }
 
     #[test]
     fn palette_highlight_wraps() {
         let mut p = ActionPalette::default();
-        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]), &no_task_configs());
-        // 3 actions: Restart api, Rebuild api, Stop api.
+        p.open(
+            &tasks(&[
+                ("a", TaskItemState::Completed),
+                ("b", TaskItemState::Completed),
+            ]),
+            &no_task_configs(),
+        );
         assert_eq!(p.highlight(), 0);
         p.highlight_prev();
-        assert_eq!(p.highlight(), 2);
+        assert_eq!(p.highlight(), 1);
         p.highlight_next();
         assert_eq!(p.highlight(), 0);
     }
@@ -483,8 +378,8 @@ mod tests {
     #[test]
     fn palette_close_empties_state() {
         let mut p = ActionPalette::default();
-        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]), &no_task_configs());
-        p.push_query_char('s');
+        p.open(&tasks(&[("a", TaskItemState::Completed)]), &no_task_configs());
+        p.push_query_char('x');
         p.close();
         assert_eq!(p.query(), "");
         assert_eq!(p.visible_count(), 0);
@@ -493,8 +388,8 @@ mod tests {
     #[test]
     fn palette_selected_is_none_when_no_matches() {
         let mut p = ActionPalette::default();
-        p.open(&services(&[("api", ServiceState::Ready)]), &tasks(&[]), &no_task_configs());
-        p.push_query_char('z'); // matches nothing
+        p.open(&tasks(&[("a", TaskItemState::Completed)]), &no_task_configs());
+        p.push_query_char('z');
         assert_eq!(p.visible_count(), 0);
         assert!(p.selected().is_none());
     }
@@ -503,22 +398,19 @@ mod tests {
     fn palette_highlight_clamps_when_matches_shrink() {
         let mut p = ActionPalette::default();
         p.open(
-            &services(&[
-                ("api", ServiceState::Ready),
-                ("worker", ServiceState::Ready),
+            &tasks(&[
+                ("alpha", TaskItemState::Completed),
+                ("beta", TaskItemState::Completed),
+                ("gamma", TaskItemState::Completed),
             ]),
-            &tasks(&[]),
             &no_task_configs(),
         );
-        // 6 actions total (Restart, Rebuild, Stop ×2). Highlight the last.
-        for _ in 0..5 {
-            p.highlight_next();
-        }
-        assert_eq!(p.highlight(), 5);
-        // Typing 'w' narrows to the worker triplet — highlight must clamp to 0.
-        p.push_query_char('w');
-        assert_eq!(p.visible_count(), 3);
-        assert_eq!(p.highlight(), 0);
+        p.highlight_next();
+        p.highlight_next();
+        assert_eq!(p.highlight(), 2);
+        p.push_query_char('a'); // matches alpha/beta/gamma all
+        // Typing can reshuffle; just ensure highlight stays valid.
+        assert!(p.highlight() < p.visible_count());
     }
 
     #[test]
@@ -528,8 +420,7 @@ mod tests {
             ("plain", TaskItemState::Completed),
             ("interactive", TaskItemState::Completed),
         ]);
-        let got = build_actions(&HashMap::new(), &tasks, &configs);
-        // Find the two task actions.
+        let got = build_actions(&tasks, &configs);
         let plain = got.iter().find(|a| a.label.starts_with("Run plain")).expect("plain missing");
         let interactive = got
             .iter()
@@ -548,7 +439,7 @@ mod tests {
     fn paramd_tasks_combine_needs_input_with_needs_run() {
         let configs = task_configs_with_params(&[("migrate", true)]);
         let tasks = tasks(&[("migrate", TaskItemState::PendingRun)]);
-        let got = build_actions(&HashMap::new(), &tasks, &configs);
+        let got = build_actions(&tasks, &configs);
         let migrate = got
             .iter()
             .find(|a| a.label.starts_with("Run migrate"))

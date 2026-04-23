@@ -7,10 +7,6 @@
 
 use super::{AbortOnDrop, BuildGraphResolver, BuildToolError, ResolvedBuildInfo};
 use std::path::Path;
-use std::time::Duration;
-
-/// Default query timeout in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Turborepo build graph resolver.
 ///
@@ -22,17 +18,17 @@ pub(crate) struct TurboResolver {
     task: String,
     /// Optional package filter (e.g. "@myorg/api").
     filter: Option<String>,
-    /// Query timeout duration.
-    timeout: Duration,
 }
 
 impl TurboResolver {
     /// Create a new resolver for the given turbo task.
-    pub(crate) fn new(task: &str, filter: Option<&str>, timeout_secs: Option<u64>) -> Self {
+    ///
+    /// All turbo operations rely on user cancellation (Ctrl+C → `kill_on_drop`)
+    /// rather than client-side timeouts.
+    pub(crate) fn new(task: &str, filter: Option<&str>) -> Self {
         Self {
             task: task.to_string(),
             filter: filter.map(String::from),
-            timeout: Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
         }
     }
 
@@ -163,17 +159,10 @@ impl TurboResolver {
             collected
         }));
 
-        let timeout_secs = self.timeout.as_secs();
-        let status = tokio::time::timeout(self.timeout, child.wait())
-            .await
-            .map_err(|_| BuildToolError::QueryTimeout {
-                tool: "turbo".to_string(),
-                timeout_secs,
-            })?
-            .map_err(|e| BuildToolError::Io {
-                tool: "turbo".to_string(),
-                source: e,
-            })?;
+        let status = child.wait().await.map_err(|e| BuildToolError::Io {
+            tool: "turbo".to_string(),
+            source: e,
+        })?;
 
         if let Some(h) = stream_handle.into_inner() {
             let _ = h.await;
@@ -342,17 +331,10 @@ impl TurboResolver {
             source: e,
         })?;
 
-        let timeout_secs = self.timeout.as_secs();
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| BuildToolError::QueryTimeout {
-                tool: "turbo".to_string(),
-                timeout_secs,
-            })?
-            .map_err(|e| BuildToolError::Io {
-                tool: "turbo".to_string(),
-                source: e,
-            })?;
+        let output = child.wait_with_output().await.map_err(|e| BuildToolError::Io {
+            tool: "turbo".to_string(),
+            source: e,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

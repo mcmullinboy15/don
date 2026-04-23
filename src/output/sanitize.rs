@@ -8,15 +8,21 @@
 //! raw output so `don logs` and `don attach` see everything.
 
 const ESC: u8 = 0x1B;
+const BEL: u8 = 0x07;
 
 /// Strip dangerous ANSI escape sequences from a line of output, keeping
 /// only SGR (Select Graphic Rendition) sequences — colors and text styles.
+/// Standalone BEL (`\x07`) bytes are stripped too; some tools (npm, tsc,
+/// readline) ring the bell on warnings, and with many services multiplexed
+/// the noise is useless — you can't tell who beeped. The raw pre-sanitize
+/// bytes still live in the ring buffer, so `don logs` and `don attach`
+/// preserve BEL.
 ///
 /// Returns the sanitized bytes. If nothing was stripped, returns the input
 /// unchanged (no allocation).
 pub(crate) fn sanitize_terminal_output(input: &[u8]) -> Vec<u8> {
-    // Fast path: no ESC byte → nothing to strip.
-    if !input.contains(&ESC) {
+    // Fast path: no ESC and no BEL → nothing to strip.
+    if !input.contains(&ESC) && !input.contains(&BEL) {
         return input.to_vec();
     }
 
@@ -24,6 +30,12 @@ pub(crate) fn sanitize_terminal_output(input: &[u8]) -> Vec<u8> {
     let mut i = 0;
 
     while i < input.len() {
+        if input[i] == BEL {
+            // Standalone BEL — drop it. (BEL inside OSC is consumed by
+            // skip_osc as the terminator.)
+            i += 1;
+            continue;
+        }
         if input[i] != ESC {
             out.push(input[i]);
             i += 1;
@@ -259,6 +271,26 @@ mod tests {
                 name: "multiple SGR in sequence",
                 input: b"\x1b[1;31;42mcolorful\x1b[0m",
                 expected: b"\x1b[1;31;42mcolorful\x1b[0m",
+            },
+            Case {
+                name: "standalone BEL stripped",
+                input: b"warning\x07!",
+                expected: b"warning!",
+            },
+            Case {
+                name: "multiple standalone BELs stripped",
+                input: b"\x07\x07a\x07b\x07",
+                expected: b"ab",
+            },
+            Case {
+                name: "BEL-only input becomes empty",
+                input: b"\x07",
+                expected: b"",
+            },
+            Case {
+                name: "BEL inside OSC still terminates correctly",
+                input: b"\x1b]0;title\x07after",
+                expected: b"after",
             },
         ];
 

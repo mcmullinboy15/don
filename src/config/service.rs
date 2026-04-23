@@ -80,6 +80,10 @@ pub struct Service {
     /// Per-platform overrides. If the current platform has an entry here,
     /// its fields are merged on top of the base service config.
     pub platform: HashMap<Platform, ServiceOverride>,
+    /// Whether this service's log output is hidden by default in the TUI
+    /// filter. Users can still unhide it interactively from the filter view.
+    /// Defaults to `false` (visible).
+    pub hidden: bool,
 
     /// The service kind. `None` when the base service has no preset
     /// and relies on a platform override to supply one.
@@ -117,6 +121,8 @@ struct RawService {
     on_failure: OnFailure,
     #[serde(default)]
     platform: HashMap<Platform, ServiceOverride>,
+    #[serde(default)]
+    hidden: bool,
 
     bazel: Option<BazelConfig>,
     turbo: Option<TurboConfig>,
@@ -198,6 +204,7 @@ impl TryFrom<RawService> for Service {
             reload: raw.reload,
             on_failure: raw.on_failure,
             platform: raw.platform,
+            hidden: raw.hidden,
             kind,
         })
     }

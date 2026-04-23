@@ -31,9 +31,6 @@ const DEFAULT_RING_BUFFER_CAPACITY: usize = 10_000;
 /// from the filter dropdown. Must not collide with a user service/task name.
 pub const LIFECYCLE_EVENT_NAME: &str = "don";
 
-/// ASCII BEL character — emitted on error events for an audible alert.
-const BELL: &str = "\x07";
-
 /// Default channel capacity for sinks.
 const SINK_CHANNEL_CAPACITY: usize = 1000;
 
@@ -751,21 +748,21 @@ impl OutputManager {
         }
     }
 
-    /// Emit a `[don]` error event with a terminal bell.
+    /// Emit a `[don]` error event.
     pub fn error_event(&self, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
-            prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
+            prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{message}\n")),
             name: LIFECYCLE_EVENT_NAME.to_string(),
         });
     }
 
-    /// Emit a `[don]` error event for a specific service with a terminal bell.
-    /// Tagged with the service name so the filter surfaces it alongside that
-    /// service's own output. See [`Self::service_event`] for rationale.
+    /// Emit a `[don]` error event for a specific service. Tagged with the
+    /// service name so the filter surfaces it alongside that service's own
+    /// output. See [`Self::service_event`] for rationale.
     pub fn service_error_event(&self, service: &str, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
-            prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
+            prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
         });
@@ -813,19 +810,43 @@ impl OutputManager {
 
     /// Shut down the output system. Clears all sink lists, drops senders,
     /// and waits for writer tasks to drain remaining messages.
+    ///
+    /// A writer task only exits once every clone of its sink sender has
+    /// dropped. If some detached task in the process is still holding a
+    /// [`LifecycleEmitter`] (and thus a sender clone) — the API server,
+    /// a slow-to-abort proxy accept loop, a lingering background build —
+    /// `handle.await` blocks forever. That would hang the daemon long
+    /// past the `shutdown complete` lifecycle event, preventing `don`
+    /// from returning to the shell.
+    ///
+    /// To make that failure mode self-correcting, each writer gets a
+    /// bounded drain window: we abort stragglers so shutdown completes
+    /// within a predictable time. The downside is occasional truncation
+    /// of the very last log line under load, which is preferable to the
+    /// daemon silently refusing to exit.
     pub async fn shutdown(self) {
-        // Clear each service's sink list so outstanding ServiceWriter handles
-        // don't keep channel senders alive.
         for state_arc in self.services.values() {
             let mut state = state_arc.lock().await;
             state.sinks.clear();
         }
-        // Drop all senders (stdout_sink + services map) to close channels.
         drop(self.stdout_sink);
         drop(self.services);
-        // Wait for writer tasks to finish draining.
-        for handle in self.writer_handles {
-            let _ = handle.await;
+        for mut handle in self.writer_handles {
+            let wait = std::time::Duration::from_secs(2);
+            match tokio::time::timeout(wait, &mut handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    // A straggler task is still holding a sender clone
+                    // (the API server task, a slow-to-abort proxy accept
+                    // loop, a lingering build). `abort()` cancels the
+                    // writer task so its `log_tx` inside the TUI plumbing
+                    // actually drops — without that, the TUI's
+                    // `log_rx.recv()` blocks forever and `don` never
+                    // returns to the shell after "shutdown complete".
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
         }
     }
 }
@@ -862,11 +883,11 @@ impl LifecycleEmitter {
         });
     }
 
-    /// Emit a `[don]` error event with a terminal bell, scoped to a service.
-    /// Tagged with the service name.
+    /// Emit a `[don]` error event scoped to a service. Tagged with the
+    /// service name.
     pub fn service_error_event(&self, service: &str, message: &str) {
         let _ = self.stdout_sink.tx.try_send(SinkLine {
-            prefix: Bytes::from(format!("{BELL}{}", self.don_prefix)),
+            prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
         });
@@ -1427,21 +1448,6 @@ mod tests {
         let output = read_buf(&buf);
         let stripped = strip_ansi(output.as_bytes());
         assert!(stripped.contains("[don]") && stripped.contains("loading don.toml"));
-    }
-
-    #[tokio::test]
-    async fn test_error_event_includes_bell() {
-        let (writer, buf) = TestBuffer::new();
-        let config = crate::config::LogConfig::Stdout;
-        let mgr = OutputManager::new(&[("api", &config)], writer)
-            .await
-            .unwrap();
-
-        mgr.error_event("build failed");
-        mgr.shutdown().await;
-
-        let output = read_buf(&buf);
-        assert!(output.contains(BELL), "error events should include bell");
     }
 
     #[tokio::test]

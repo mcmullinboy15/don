@@ -33,13 +33,36 @@ pub enum ProxyError {
 }
 
 /// A forwarding listener: don accepts on the public address and shuttles
-/// bytes to/from an ephemeral backend port that the service binds.
+/// bytes to/from a backend that the service itself binds. The backend
+/// address is either ephemeral (don allocates, injects as env var) or
+/// fixed (service binds a known port on its own).
 struct ForwardListener {
     listen_addr: SocketAddr,
-    env_name: String,
-    ephemeral_addr: SocketAddr,
+    backend: ForwardBackend,
     backend_tx: watch::Sender<Option<SocketAddr>>,
     accept_handle: JoinHandle<()>,
+}
+
+/// How the backend address for a [`ForwardListener`] is chosen.
+enum ForwardBackend {
+    /// Don allocated an ephemeral port and injected it into the service's
+    /// env under `env_name`. The service must read the env var to bind.
+    Ephemeral {
+        env_name: String,
+        addr: SocketAddr,
+    },
+    /// Service binds a known fixed address on its own. Don just forwards.
+    /// No env var injected.
+    Fixed(SocketAddr),
+}
+
+impl ForwardBackend {
+    fn addr(&self) -> SocketAddr {
+        match self {
+            Self::Ephemeral { addr, .. } => *addr,
+            Self::Fixed(addr) => *addr,
+        }
+    }
 }
 
 /// A listenfd listener: don holds the bound public listener and passes its
@@ -107,8 +130,41 @@ impl ServiceProxy {
                     ));
                     forward.push(ForwardListener {
                         listen_addr,
-                        env_name: env_name.clone(),
-                        ephemeral_addr,
+                        backend: ForwardBackend::Ephemeral {
+                            env_name: env_name.clone(),
+                            addr: ephemeral_addr,
+                        },
+                        backend_tx,
+                        accept_handle,
+                    });
+                }
+                ProxyMode::Forward(target) => {
+                    let backend_addr: SocketAddr =
+                        target.parse().map_err(|e| ProxyError::Bind {
+                            addr: target.clone(),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                e,
+                            ),
+                        })?;
+                    let listener =
+                        TcpListener::bind(listen_addr)
+                            .await
+                            .map_err(|e| ProxyError::Bind {
+                                addr: entry.listen.clone(),
+                                source: e,
+                            })?;
+                    let (backend_tx, backend_rx) = watch::channel(None);
+                    let accept_handle = tokio::spawn(proxy_accept_loop(
+                        listener,
+                        backend_rx,
+                        lazy_tx.clone(),
+                        service_name.to_string(),
+                        emitter.clone(),
+                    ));
+                    forward.push(ForwardListener {
+                        listen_addr,
+                        backend: ForwardBackend::Fixed(backend_addr),
                         backend_tx,
                         accept_handle,
                     });
@@ -154,15 +210,16 @@ impl ServiceProxy {
         })
     }
 
-    /// Update env-mode backend addresses so new connections route to the new
-    /// instance. Listenfd entries are unaffected — the child owns the fd.
+    /// Point every forwarding backend at its configured address — the
+    /// ephemeral one for `Env` mode, the fixed one for `Forward` mode.
+    /// Listenfd entries are unaffected (the child owns the fd directly).
     pub(crate) fn set_backend(&self) {
         for fwd in &self.forward {
-            let _ = fwd.backend_tx.send(Some(fwd.ephemeral_addr));
+            let _ = fwd.backend_tx.send(Some(fwd.backend.addr()));
         }
     }
 
-    /// Clear all env-mode backend addresses. New connections queue until a
+    /// Clear all forwarding backends. New connections queue until a
     /// backend is set again.
     pub(crate) fn clear_backend(&self) {
         for fwd in &self.forward {
@@ -171,22 +228,39 @@ impl ServiceProxy {
     }
 
     /// Allocate new ephemeral ports for env-mode entries. Used on restart so
-    /// the old port is gone before the new process tries to bind it. Returns
-    /// `()` — no caller consumes the old addresses.
+    /// the old port is gone before the new process tries to bind it. Fixed
+    /// `Forward` entries are left alone — their address is user-provided
+    /// and stable across restarts.
     pub(crate) async fn reallocate_ephemeral_ports(&mut self) -> Result<(), ProxyError> {
         for fwd in &mut self.forward {
-            fwd.ephemeral_addr = allocate_ephemeral_port().await?;
+            if let ForwardBackend::Ephemeral { addr, .. } = &mut fwd.backend {
+                *addr = allocate_ephemeral_port().await?;
+            }
         }
         Ok(())
     }
 
-    /// Env var map for env-mode entries, e.g. `{"PORT": "49152"}`.
+    /// Env var map for env-mode entries, e.g. `{"PORT": "49152"}`. Fixed
+    /// `Forward` entries contribute nothing — the service already knows its
+    /// port.
     pub(crate) fn env_vars(&self) -> HashMap<String, String> {
         let mut vars = HashMap::new();
         for fwd in &self.forward {
-            vars.insert(fwd.env_name.clone(), fwd.ephemeral_addr.port().to_string());
+            if let ForwardBackend::Ephemeral { env_name, addr } = &fwd.backend {
+                vars.insert(env_name.clone(), addr.port().to_string());
+            }
         }
         vars
+    }
+
+    /// True if any proxy entry requires serial (no-overlap) restart. Fixed
+    /// `Forward` backends can't have two processes binding the same port at
+    /// once, so the caller must fully tear down the old instance before
+    /// starting the new one.
+    pub(crate) fn requires_full_exit_on_restart(&self) -> bool {
+        self.forward
+            .iter()
+            .any(|f| matches!(f.backend, ForwardBackend::Fixed(_)))
     }
 
     /// `LISTEN_FDS` / `LISTEN_FDNAMES` env vars for listenfd entries. Empty
@@ -219,7 +293,7 @@ impl ServiceProxy {
         let pairs: Vec<_> = self
             .forward
             .iter()
-            .map(|fwd| (fwd.backend_tx.clone(), fwd.ephemeral_addr))
+            .map(|fwd| (fwd.backend_tx.clone(), fwd.backend.addr()))
             .collect();
         ProxyBackendHandle { pairs }
     }

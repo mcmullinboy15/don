@@ -67,8 +67,8 @@ use backend::FixedBottomBackend;
 
 use crate::config::ParamKind;
 use crate::output::FormattedLogLine;
-use crate::runner::{RunnerCommand, RunnerEvent};
-use app::{App, ViewMode};
+use crate::runner::{RunnerCommand, RunnerEvent, ServiceState};
+use app::{App, OverlayItem, ViewMode};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
 use palette::ActionKind;
@@ -141,17 +141,26 @@ impl Drop for Modal {
 /// Ctrl+C raises SIGINT to our own process so the installed signal handler
 /// drives graceful shutdown (identical behavior to pipe mode, including the
 /// two-Ctrl+C force-kill escalation).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
     mut log_rx: mpsc::Receiver<FormattedLogLine>,
     mut runner_events: broadcast::Receiver<RunnerEvent>,
     command_tx: mpsc::Sender<RunnerCommand>,
     service_names: Vec<String>,
     task_names: Vec<String>,
+    build_tool_names: Vec<String>,
     task_configs: std::collections::HashMap<String, crate::config::Task>,
+    hidden_names: std::collections::HashSet<String>,
 ) -> Result<(), TuiError> {
     let _raw_guard = RawModeGuard::enter()?;
 
-    let mut app = App::new(service_names, task_names, task_configs);
+    let mut app = App::new(
+        service_names,
+        task_names,
+        build_tool_names,
+        task_configs,
+        hidden_names,
+    );
     let mut terminal = build_inline_terminal()?;
     let mut store = LogStore::with_capacity(DEFAULT_CAPACITY);
     let mut modal: Option<Modal> = None;
@@ -204,6 +213,17 @@ pub async fn run_tui(
                 match runner_result {
                     Ok(event) => {
                         apply_runner_event(event, &mut app);
+                        // Lazy services clutter the filter modal with names
+                        // that have never produced a log line. Recompute the
+                        // hidden set after each state change so triggered
+                        // services (Lazy → Running) reappear automatically.
+                        let lazy: std::collections::HashSet<String> = app
+                            .services_state
+                            .iter()
+                            .filter(|(_, s)| matches!(s, crate::runner::ServiceState::Lazy))
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        app.filter.set_hidden_from_display(lazy);
                         if let Some(m) = modal.as_mut() {
                             m.draw(&app)?;
                         } else {
@@ -429,10 +449,10 @@ fn handle_key(
     }
 
     match app.view_mode {
-        ViewMode::Normal => handle_normal_key(key, app, terminal, store, command_tx, modal)?,
+        ViewMode::Normal => handle_normal_key(key, app, terminal, store, modal)?,
         ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
         ViewMode::Palette => handle_palette_key(key, app, terminal, store, command_tx, modal)?,
-        ViewMode::Overlay => handle_overlay_key(key, app, terminal, store, modal)?,
+        ViewMode::Overlay => handle_overlay_key(key, app, terminal, store, command_tx, modal)?,
         ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
     }
     Ok(())
@@ -443,7 +463,6 @@ fn handle_normal_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::Sender<RunnerCommand>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     match key.code {
@@ -455,21 +474,6 @@ fn handle_normal_key(
                 bytes: Vec::new(),
             });
         }
-        KeyCode::Char('q') => {
-            // Same belt-and-suspenders as Ctrl+C: command channel works once
-            // the main loop is running; SIGINT works during the slow startup
-            // phase (build-tool resolution / `bazel build`) before the main
-            // loop exists, because the signal handler feeds the dedicated
-            // `shutdown_rx` that the startup-phase `select!` is racing on.
-            let tx = command_tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(RunnerCommand::Shutdown).await;
-            });
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::this(),
-                nix::sys::signal::Signal::SIGINT,
-            );
-        }
         KeyCode::Char('l') => {
             app.filter.enter_edit();
             app.view_mode = ViewMode::Filter;
@@ -477,24 +481,21 @@ fn handle_normal_key(
             m.draw(app)?;
             *modal = Some(m);
         }
-        KeyCode::Char('a') => {
-            app.palette
-                .open(&app.services_state, &app.tasks_state, &app.task_configs);
+        KeyCode::Char('t') => {
+            app.palette.open(&app.tasks_state, &app.task_configs);
             app.view_mode = ViewMode::Palette;
             let mut m = Modal::enter()?;
             m.draw(app)?;
             *modal = Some(m);
         }
         KeyCode::Char('s') => {
-            app.overlay_scroll = 0;
+            app.overlay_highlight = 0;
+            app.overlay_query.clear();
+            app.overlay_filtering = false;
             app.view_mode = ViewMode::Overlay;
             let mut m = Modal::enter()?;
             m.draw(app)?;
             *modal = Some(m);
-        }
-        KeyCode::Esc if app.filter.is_active() => {
-            app.filter.clear_active();
-            clear_and_replay(terminal, store, app)?;
         }
         _ => {}
     }
@@ -516,17 +517,19 @@ fn handle_filter_key(
             clear_and_replay(terminal, store, app)?;
         }
         KeyCode::Esc => {
-            app.filter.cancel_edit();
+            app.filter.reset_to_defaults();
             app.view_mode = ViewMode::Normal;
             *modal = None;
-            // Filter didn't change — just catch up on any lines received
-            // during the modal and repaint the bar.
             clear_and_replay(terminal, store, app)?;
         }
         KeyCode::Char(' ') => {
             app.filter.toggle_highlighted();
             redraw_modal(modal, app)?;
         }
+        // `/` is the "filter" key across views — swallow it so pressing it
+        // reflexively (from the main bar's [/] convention) doesn't end up
+        // as the first character of the query.
+        KeyCode::Char('/') => {}
         KeyCode::Char(c) => {
             app.filter.push_query_char(c);
             redraw_modal(modal, app)?;
@@ -583,6 +586,9 @@ fn handle_palette_key(
             *modal = None;
             clear_and_replay(terminal, store, app)?;
         }
+        // `/` is the "filter" key across views — swallow it so pressing it
+        // reflexively doesn't end up as the first character of the query.
+        KeyCode::Char('/') => {}
         KeyCode::Char(c) => {
             app.palette.push_query_char(c);
             redraw_modal(modal, app)?;
@@ -609,44 +615,178 @@ fn handle_overlay_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
+    command_tx: &mpsc::Sender<RunnerCommand>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
-    // Page size is approximate — the render path clamps excessive scrolls,
-    // so being loose here is fine. Matches a typical terminal's PgUp/PgDn.
     const PAGE: usize = 10;
+
+    // Filter sub-mode: typing narrows, Enter exits keeping the query,
+    // Esc clears and exits.
+    if app.overlay_filtering {
+        match key.code {
+            KeyCode::Enter => {
+                app.overlay_filtering = false;
+                app.overlay_highlight = 0;
+                redraw_modal(modal, app)?;
+            }
+            KeyCode::Esc => {
+                app.overlay_filtering = false;
+                app.overlay_query.clear();
+                app.overlay_highlight = 0;
+                redraw_modal(modal, app)?;
+            }
+            KeyCode::Backspace => {
+                if app.overlay_query.pop().is_some() {
+                    app.overlay_highlight = 0;
+                    redraw_modal(modal, app)?;
+                }
+            }
+            KeyCode::Char(c) => {
+                app.overlay_query.push(c);
+                app.overlay_highlight = 0;
+                redraw_modal(modal, app)?;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    let total = app.overlay_items().len();
+    let max_idx = total.saturating_sub(1);
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.overlay_scroll = app.overlay_scroll.saturating_sub(1);
+        KeyCode::Up => {
+            app.overlay_highlight = app.overlay_highlight.saturating_sub(1);
             redraw_modal(modal, app)?;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.overlay_scroll = app.overlay_scroll.saturating_add(1);
+        KeyCode::Down => {
+            app.overlay_highlight = (app.overlay_highlight + 1).min(max_idx);
             redraw_modal(modal, app)?;
         }
         KeyCode::PageUp => {
-            app.overlay_scroll = app.overlay_scroll.saturating_sub(PAGE);
+            app.overlay_highlight = app.overlay_highlight.saturating_sub(PAGE);
             redraw_modal(modal, app)?;
         }
         KeyCode::PageDown => {
-            app.overlay_scroll = app.overlay_scroll.saturating_add(PAGE);
+            app.overlay_highlight = (app.overlay_highlight + PAGE).min(max_idx);
             redraw_modal(modal, app)?;
         }
-        KeyCode::Home | KeyCode::Char('g') => {
-            app.overlay_scroll = 0;
+        KeyCode::Home => {
+            app.overlay_highlight = 0;
             redraw_modal(modal, app)?;
         }
-        KeyCode::End | KeyCode::Char('G') => {
-            app.overlay_scroll = usize::MAX;
+        KeyCode::End => {
+            app.overlay_highlight = max_idx;
             redraw_modal(modal, app)?;
         }
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') | KeyCode::Enter => {
+        KeyCode::Char('/') => {
+            app.overlay_filtering = true;
+            redraw_modal(modal, app)?;
+        }
+        KeyCode::Enter => {
+            // Start or stop the highlighted service, depending on its state.
+            if let Some(cmd) = overlay_toggle_command(app) {
+                dispatch_runner_command(command_tx, cmd);
+            }
+        }
+        KeyCode::Char('r') => {
+            // Restart the highlighted service, if it's in a state that can
+            // be restarted.
+            if let Some(name) = highlighted_service_for_restart(app) {
+                let (reply, _rx) = oneshot::channel();
+                dispatch_runner_command(command_tx, RunnerCommand::Restart { name, reply });
+            }
+        }
+        KeyCode::Char('R') => {
+            // Restart every failed and dependency-failed service. The
+            // DependencyFailed ones were only stranded because something
+            // upstream broke; restarting them alongside the culprit gets
+            // the whole cascade moving again in one keystroke.
+            let failed: Vec<String> = app
+                .services_state
+                .iter()
+                .filter(|(_, s)| {
+                    matches!(s, ServiceState::Failed | ServiceState::DependencyFailed)
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            for name in failed {
+                let (reply, _rx) = oneshot::channel();
+                dispatch_runner_command(command_tx, RunnerCommand::Restart { name, reply });
+            }
+        }
+        KeyCode::Esc => {
             app.view_mode = ViewMode::Normal;
+            app.overlay_query.clear();
+            app.overlay_filtering = false;
             *modal = None;
             clear_and_replay(terminal, store, app)?;
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Build the Start/Stop command for the highlighted row, if it's an
+/// actionable service. Returns `None` for tasks, in-flight services, or
+/// when no row is highlighted.
+fn overlay_toggle_command(app: &App) -> Option<RunnerCommand> {
+    let items = app.overlay_items();
+    let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
+    let item = items.get(idx)?;
+    let OverlayItem::Service { name, state } = item else {
+        return None;
+    };
+    match state {
+        ServiceState::Ready | ServiceState::Running | ServiceState::Unhealthy => {
+            let (reply, _rx) = oneshot::channel();
+            Some(RunnerCommand::Stop {
+                name: name.clone(),
+                reply,
+            })
+        }
+        ServiceState::Stopped
+        | ServiceState::Failed
+        | ServiceState::DependencyFailed
+        | ServiceState::Lazy => {
+            let (reply, _rx) = oneshot::channel();
+            Some(RunnerCommand::Start {
+                name: name.clone(),
+                reply,
+            })
+        }
+        ServiceState::Pending
+        | ServiceState::Building
+        | ServiceState::Starting
+        | ServiceState::Stopping => None,
+    }
+}
+
+/// Service name for `r` (restart) — only services in a restartable state.
+fn highlighted_service_for_restart(app: &App) -> Option<String> {
+    let items = app.overlay_items();
+    let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
+    let item = items.get(idx)?;
+    let OverlayItem::Service { name, state } = item else {
+        return None;
+    };
+    match state {
+        ServiceState::Ready
+        | ServiceState::Running
+        | ServiceState::Unhealthy
+        | ServiceState::Failed
+        | ServiceState::DependencyFailed
+        | ServiceState::Stopped => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Send a `RunnerCommand` without waiting for the reply. Mirrors the
+/// fire-and-forget pattern used by `dispatch_action`.
+fn dispatch_runner_command(command_tx: &mpsc::Sender<RunnerCommand>, cmd: RunnerCommand) {
+    let command_tx = command_tx.clone();
+    tokio::spawn(async move {
+        let _ = command_tx.send(cmd).await;
+    });
 }
 
 fn redraw_modal(modal: &mut Option<Modal>, app: &App) -> Result<(), TuiError> {
@@ -670,28 +810,6 @@ fn dispatch_action(command_tx: &mpsc::Sender<RunnerCommand>, action: ActionKind)
                 let (reply_tx, _reply_rx) = oneshot::channel();
                 RunnerCommand::RunPendingTasks { reply: reply_tx }
             }
-            ActionKind::StartService(name) => {
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                RunnerCommand::Start {
-                    name,
-                    reply: reply_tx,
-                }
-            }
-            ActionKind::StopService(name) => {
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                RunnerCommand::Stop {
-                    name,
-                    reply: reply_tx,
-                }
-            }
-            ActionKind::RestartService(name) => {
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                RunnerCommand::Restart {
-                    name,
-                    reply: reply_tx,
-                }
-            }
-            ActionKind::RebuildService(name) => RunnerCommand::Rebuild { name },
             ActionKind::RunTask(name) => {
                 let (reply_tx, _reply_rx) = oneshot::channel();
                 RunnerCommand::RunTask {

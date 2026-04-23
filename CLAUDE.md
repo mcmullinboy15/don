@@ -152,7 +152,6 @@ enum RunnerCommand {
     TaskRerun { name: String },         // file watch triggered
     Status { reply: oneshot::Sender<Vec<ItemStatus>> },
     Logs { name: String, last_n: usize, reply: oneshot::Sender<Option<String>> },
-    ConfigReload,                       // don.toml changed
     StartPending,                       // deferred retry for unsatisfied deps
     Shutdown,
 }

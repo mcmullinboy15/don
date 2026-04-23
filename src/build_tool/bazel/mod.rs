@@ -9,26 +9,39 @@ mod graph;
 use super::{AbortOnDrop, BuildGraphResolver, BuildToolError, ResolvedBuildInfo};
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
-
-/// Default query timeout in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Bazel build graph resolver.
 ///
 /// Shells out to `bazel query` to determine which first-party source packages
 /// contribute to a given target. The resolved packages become watch directories.
 pub(crate) struct BazelResolver {
-    /// Query timeout duration.
-    timeout: Duration,
+    /// Optional emitter for streaming bazel client stderr live (lock-wait
+    /// notices, INFO/WARN/ERROR lines). When `None`, stderr is still
+    /// captured for error reporting but isn't surfaced until the process
+    /// exits — fine for tests, but in production the runner attaches one
+    /// so messages like "Another command (pid=X) is running. Waiting for
+    /// it to complete on the server (server_pid=Y)..." appear immediately.
+    emitter: Option<crate::output::LifecycleEmitter>,
 }
 
 impl BazelResolver {
-    /// Create a new resolver with the given timeout in seconds.
-    pub(crate) fn new(timeout_secs: Option<u64>) -> Self {
-        Self {
-            timeout: Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
-        }
+    /// Create a new resolver.
+    ///
+    /// All bazel operations rely on user cancellation (Ctrl+C → `kill_on_drop`
+    /// → server-side build cancellation) rather than client-side timeouts.
+    /// A fixed timeout produced misleading errors on slow cold-start queries
+    /// and on legitimately long builds.
+    pub(crate) fn new() -> Self {
+        Self { emitter: None }
+    }
+
+    /// Attach an emitter so query/cquery stderr is streamed live (not just
+    /// captured-then-replayed-on-error). Use this whenever you have one;
+    /// it makes the lock-wait notice visible while bazel is blocked behind
+    /// another client.
+    pub(crate) fn with_emitter(mut self, emitter: crate::output::LifecycleEmitter) -> Self {
+        self.emitter = Some(emitter);
+        self
     }
 
     /// Check that the `bazel` binary is available on PATH.
@@ -62,7 +75,7 @@ impl BazelResolver {
         output_format: &str,
         working_dir: &Path,
     ) -> Result<String, BuildToolError> {
-        let child = tokio::process::Command::new("bazel")
+        let mut child = tokio::process::Command::new("bazel")
             .args(["query", query, &format!("--output={output_format}")])
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
@@ -74,25 +87,28 @@ impl BazelResolver {
                 source: e,
             })?;
 
-        let timeout_secs = self.timeout.as_secs();
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| BuildToolError::QueryTimeout {
-                tool: "bazel".to_string(),
-                timeout_secs,
-            })?
-            .map_err(|e| BuildToolError::Io {
-                tool: "bazel".to_string(),
-                source: e,
-            })?;
+        // Stream stderr live so the lock-wait notice surfaces immediately;
+        // the helper also accumulates the full text for error reporting.
+        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone());
+
+        // `wait_with_output` reads whatever pipes are still attached; we
+        // already took stderr, so it just collects stdout and exit status.
+        let output = child.wait_with_output().await.map_err(|e| BuildToolError::Io {
+            tool: "bazel".to_string(),
+            source: e,
+        })?;
+
+        let stderr_collected = match stderr_handle.into_inner() {
+            Some(h) => h.await.unwrap_or_default(),
+            None => String::new(),
+        };
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             // Truncate long error messages
-            let truncated = if stderr.len() > 500 {
-                format!("{}...", &stderr[..500])
+            let truncated = if stderr_collected.len() > 500 {
+                format!("{}...", &stderr_collected[..500])
             } else {
-                stderr.to_string()
+                stderr_collected
             };
             return Err(BuildToolError::QueryFailed {
                 tool: "bazel".to_string(),
@@ -226,17 +242,10 @@ impl BazelResolver {
             }
         }));
 
-        let timeout_secs = self.timeout.as_secs();
-        let status = tokio::time::timeout(self.timeout, child.wait())
-            .await
-            .map_err(|_| BuildToolError::QueryTimeout {
-                tool: "bazel".to_string(),
-                timeout_secs,
-            })?
-            .map_err(|e| BuildToolError::Io {
-                tool: "bazel".to_string(),
-                source: e,
-            })?;
+        let status = child.wait().await.map_err(|e| BuildToolError::Io {
+            tool: "bazel".to_string(),
+            source: e,
+        })?;
 
         if let Some(h) = stdout_handle.into_inner() {
             let _ = h.await;
@@ -302,27 +311,29 @@ impl BazelResolver {
         cmd.args(targets);
         cmd.current_dir(working_dir)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            // Pipe (not null) so the lock-wait notice can be streamed to
+            // the user. Without this, `--check_up_to_date` blocked behind
+            // another bazel client looks like don is hung.
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let child = cmd.spawn().map_err(|e| BuildToolError::Io {
+        let mut child = cmd.spawn().map_err(|e| BuildToolError::Io {
             tool: "bazel".to_string(),
             source: e,
         })?;
 
-        let timeout_secs = self.timeout.as_secs();
-        let status = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| BuildToolError::QueryTimeout {
-                tool: "bazel".to_string(),
-                timeout_secs,
-            })?
-            .map_err(|e| BuildToolError::Io {
-                tool: "bazel".to_string(),
-                source: e,
-            })?;
+        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone());
 
-        Ok(status.status.success())
+        let status = child.wait().await.map_err(|e| BuildToolError::Io {
+            tool: "bazel".to_string(),
+            source: e,
+        })?;
+
+        if let Some(h) = stderr_handle.into_inner() {
+            let _ = h.await;
+        }
+
+        Ok(status.success())
     }
 
     /// Resolve per-target source packages in ONE `bazel query` call.
@@ -380,17 +391,42 @@ impl BazelResolver {
         Ok(out)
     }
 
-    /// Resolve the output binary path for a Bazel target.
+    /// Resolve the output binary paths for a batch of Bazel targets in ONE
+    /// `bazel cquery` invocation.
     ///
-    /// Uses `bazel cquery --output=files` to find the built artifact path.
-    /// Returns the first executable output file (typically the binary in bazel-bin).
-    pub(crate) async fn resolve_binary_path(
+    /// Bazel's `--output=starlark` lets us emit per-target attribution
+    /// (`<label>\t<first-bazel-out-path>`) so the analysis pass runs once
+    /// instead of N times. Targets that produce no `bazel-out/...` file
+    /// (e.g. aliases without own outputs) are absent from the returned map;
+    /// the caller should fall back to `bazel run` for those.
+    ///
+    /// Keys are inserted in both canonical (`@@//pkg:name`) and stripped
+    /// (`//pkg:name`) forms so callers can look up using whichever form
+    /// the user wrote in `don.toml`.
+    pub(crate) async fn resolve_binary_paths(
         &self,
-        target: &str,
+        targets: &[String],
         working_dir: &Path,
-    ) -> Result<String, BuildToolError> {
-        let child = tokio::process::Command::new("bazel")
-            .args(["cquery", "--output=files", target])
+    ) -> Result<HashMap<String, String>, BuildToolError> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        if targets.is_empty() {
+            return Ok(out);
+        }
+
+        // `set(T1 T2 ... Tn)` is bazel's space-separated set literal.
+        // `set` takes bare labels — no parenthesisation (unlike `+`,
+        // where we wrap targets to fence operator precedence).
+        let query = format!("set({})", targets.join(" "));
+
+        // Per-target line: `<label>\t<first-bazel-out-file-or-empty>`. The
+        // empty-files case is handled inline so the expression always
+        // evaluates — the parser drops lines whose path doesn't start
+        // with `bazel-out/`.
+        let starlark = r#"str(target.label) + "\t" + (target.files.to_list()[0].path if target.files.to_list() else "")"#;
+        let starlark_arg = format!("--starlark:expr={starlark}");
+
+        let mut child = tokio::process::Command::new("bazel")
+            .args(["cquery", &query, "--output=starlark", &starlark_arg])
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -401,41 +437,42 @@ impl BazelResolver {
                 source: e,
             })?;
 
-        let timeout_secs = self.timeout.as_secs();
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| BuildToolError::QueryTimeout {
-                tool: "bazel".to_string(),
-                timeout_secs,
-            })?
-            .map_err(|e| BuildToolError::Io {
-                tool: "bazel".to_string(),
-                source: e,
-            })?;
+        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone());
+
+        let output = child.wait_with_output().await.map_err(|e| BuildToolError::Io {
+            tool: "bazel".to_string(),
+            source: e,
+        })?;
+
+        let stderr_collected = match stderr_handle.into_inner() {
+            Some(h) => h.await.unwrap_or_default(),
+            None => String::new(),
+        };
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(BuildToolError::QueryFailed {
                 tool: "bazel".to_string(),
-                message: format!("cquery failed for {target}: {}", stderr.trim()),
+                message: format!("cquery failed: {}", stderr_collected.trim()),
             });
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // cquery --output=files returns one file per line. Pick the first
-        // output in bazel-out (the built artifact), not source files.
-        stdout
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty() && line.starts_with("bazel-out/"))
-            .map(String::from)
-            .ok_or_else(|| BuildToolError::ParseError {
-                tool: "bazel".to_string(),
-                message: format!(
-                    "no output binary found for {target} (cquery returned: {})",
-                    stdout.trim()
-                ),
-            })
+        for line in stdout.lines() {
+            let line = line.trim();
+            let Some((label, path)) = line.split_once('\t') else {
+                continue;
+            };
+            let path = path.trim();
+            if !path.starts_with("bazel-out/") {
+                continue;
+            }
+            let canonical = label.to_string();
+            let stripped = label.strip_prefix("@@").unwrap_or(label).to_string();
+            out.insert(canonical, path.to_string());
+            out.insert(stripped, path.to_string());
+        }
+
+        Ok(out)
     }
 
     /// Parse the package output from `bazel query --output=package`.
@@ -456,6 +493,46 @@ impl BazelResolver {
             .map(String::from)
             .collect()
     }
+}
+
+/// Stream a bazel client's stderr to the given emitter line-by-line, while
+/// accumulating it for error reporting. Spawn this BEFORE `child.wait()`
+/// so messages like the lock-wait notice surface immediately instead of
+/// being held until exit.
+///
+/// The returned [`AbortOnDrop`] yields the full collected stderr text when
+/// the child closes its stderr pipe.
+fn spawn_stderr_stream(
+    stderr: Option<tokio::process::ChildStderr>,
+    emitter: Option<crate::output::LifecycleEmitter>,
+) -> AbortOnDrop<String> {
+    AbortOnDrop::new(tokio::spawn(async move {
+        let mut collected = String::new();
+        let Some(stderr) = stderr else { return collected };
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let mut line_buf = Vec::new();
+        loop {
+            line_buf.clear();
+            match tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line_buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    collected.push_str(&String::from_utf8_lossy(&line_buf));
+                    if let Some(ref em) = emitter {
+                        let mut text = line_buf.as_slice();
+                        if text.last() == Some(&b'\n') {
+                            text = &text[..text.len() - 1];
+                        }
+                        if text.last() == Some(&b'\r') {
+                            text = &text[..text.len() - 1];
+                        }
+                        em.bazel_event(&String::from_utf8_lossy(text));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        collected
+    }))
 }
 
 impl BuildGraphResolver for BazelResolver {

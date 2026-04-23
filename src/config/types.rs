@@ -10,8 +10,6 @@ use std::path::PathBuf;
 pub struct BazelConfig {
     /// Bazel target label (e.g. `"//services/api:api"`).
     pub target: String,
-    /// Query timeout in seconds. Defaults to 30.
-    pub query_timeout: Option<u64>,
 }
 
 /// Turborepo build tool integration for a service or task.
@@ -27,8 +25,6 @@ pub struct TurboConfig {
     pub build_task: Option<String>,
     /// Filter to a specific package (e.g. `"@myorg/api"`).
     pub filter: Option<String>,
-    /// Query timeout in seconds. Defaults to 30.
-    pub query_timeout: Option<u64>,
 }
 
 /// A single proxy entry. Don binds `listen` once at startup and holds the
@@ -61,10 +57,27 @@ pub enum ProxyMode {
     /// Hand the bound listener to the service via `LISTEN_FDS` / `LISTEN_FDNAMES`
     /// / `LISTEN_PID`. No forwarding — the service accepts directly.
     Listenfd,
+    /// Accept on the public address, forward to the fixed backend address
+    /// `addr`. The service is expected to bind `addr` on its own — don
+    /// does NOT inject an env var, and does NOT allocate a port. Use this
+    /// when the service has a compile-time or config-baked backend port
+    /// that can't come from the environment.
+    ///
+    /// Restart semantics differ from env/listenfd: don waits for the old
+    /// instance's process group to fully exit before starting the new one,
+    /// because two processes trying to bind the same fixed port would race.
+    Forward(String),
 }
 
 impl<'de> Deserialize<'de> for ProxyEntry {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ForwardRaw {
+            Addr(String),
+            Port(u16),
+        }
+
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Raw {
@@ -74,6 +87,7 @@ impl<'de> Deserialize<'de> for ProxyEntry {
                 env: Option<String>,
                 #[serde(default)]
                 listenfd: bool,
+                forward: Option<ForwardRaw>,
             },
         }
 
@@ -85,18 +99,28 @@ impl<'de> Deserialize<'de> for ProxyEntry {
                 listen: s,
                 mode: ProxyMode::Listenfd,
             }),
-            Raw::Table { listen, env, listenfd } => {
-                let mode = match (env, listenfd) {
-                    (Some(e), false) => ProxyMode::Env(e),
-                    (None, true) => ProxyMode::Listenfd,
-                    (Some(_), true) => {
+            Raw::Table {
+                listen,
+                env,
+                listenfd,
+                forward,
+            } => {
+                let forward_addr = forward.map(|f| match f {
+                    ForwardRaw::Addr(a) => a,
+                    ForwardRaw::Port(p) => format!("127.0.0.1:{p}"),
+                });
+                let mode = match (env, listenfd, forward_addr) {
+                    (Some(e), false, None) => ProxyMode::Env(e),
+                    (None, true, None) => ProxyMode::Listenfd,
+                    (None, false, Some(a)) => ProxyMode::Forward(a),
+                    (None, false, None) => {
                         return Err(serde::de::Error::custom(
-                            "proxy entry: 'env' and 'listenfd = true' are mutually exclusive",
+                            "proxy entry: one of 'env = \"VAR\"', 'listenfd = true', or 'forward = \"addr\"' must be set",
                         ));
                     }
-                    (None, false) => {
+                    _ => {
                         return Err(serde::de::Error::custom(
-                            "proxy entry: one of 'env = \"VAR\"' or 'listenfd = true' must be set",
+                            "proxy entry: 'env', 'listenfd', and 'forward' are mutually exclusive",
                         ));
                     }
                 };
@@ -173,9 +197,9 @@ pub struct ReadyCheck {
     /// `on_failure` field controls what happens on that transition.
     #[serde(default)]
     pub monitor: bool,
-    /// Interval between checks while monitoring. Defaults to `interval`.
-    #[serde(default)]
-    pub monitor_interval: Option<String>,
+    /// Interval between checks while monitoring. Defaults to "10s".
+    #[serde(default = "ReadyCheck::default_monitor_interval")]
+    pub monitor_interval: String,
     /// Consecutive monitor failures required to transition Ready → Unhealthy.
     /// Defaults to 3.
     #[serde(default = "ReadyCheck::default_unhealthy_after")]
@@ -185,6 +209,10 @@ pub struct ReadyCheck {
 impl ReadyCheck {
     fn default_interval() -> String {
         "1s".to_string()
+    }
+
+    fn default_monitor_interval() -> String {
+        "10s".to_string()
     }
 
     fn default_retries() -> u32 {

@@ -306,10 +306,19 @@ fn parse_signal(s: &str) -> Signal {
 }
 
 /// Stop a service: send signal, wait with timeout, escalate to SIGKILL.
+///
+/// `wait_full_exit`: after the parent process is reaped, poll the process
+/// group until it's empty. Enable this for restarts of services that have
+/// a fixed backend port (see `ProxyMode::Forward`) or any other exclusive
+/// resource where the old and new instances can't coexist briefly.
+/// Leaving it `false` lets the restart proceed with a tiny window of
+/// overlap — fine for env / listenfd proxy modes where each instance
+/// uses a distinct backend.
 pub(crate) async fn stop_service(
     mut handle: ServiceHandle,
     shutdown_config: Option<&ShutdownConfig>,
     force: bool,
+    wait_full_exit: bool,
 ) -> Result<(), ServiceError> {
     match handle {
         ServiceHandle::Process(ref mut process) => {
@@ -326,6 +335,24 @@ pub(crate) async fn stop_service(
                 )
             };
             process.terminate(signal, timeout).await?;
+            if wait_full_exit {
+                // `terminate` only reaps the parent. For services that
+                // fork children (daemons, DBs with background workers),
+                // the children stay in the same pgroup and may still
+                // hold exclusive resources — e.g. a fixed backend port,
+                // a data-dir lock. Poll until the pgroup is empty so a
+                // restart won't collide with a half-dead old instance.
+                // If 2s isn't enough, SIGKILL the stragglers.
+                if !process
+                    .wait_pgroup_empty(Duration::from_secs(2))
+                    .await
+                {
+                    let _ = process.signal(Signal::SIGKILL);
+                    let _ = process
+                        .wait_pgroup_empty(Duration::from_millis(500))
+                        .await;
+                }
+            }
         }
         ServiceHandle::Docker(ref mut docker) => {
             let (signal_name, timeout) = if force {

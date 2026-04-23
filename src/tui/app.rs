@@ -7,7 +7,7 @@
 //!
 //! The main TUI loop is the only mutator — there's no shared `Arc<Mutex<_>>`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::filter::FilterState;
 use super::form::FormState;
@@ -26,16 +26,64 @@ pub(crate) enum ViewMode {
     /// Filter edit mode — typing builds a query, Space toggles selection,
     /// Enter commits.
     Filter,
-    /// Action palette — typing filters actions, Enter dispatches.
+    /// Tasks palette — typing filters tasks, Enter dispatches.
     Palette,
-    /// Full-screen status overlay (alternate screen). Arrow keys and
-    /// `j/k/PgUp/PgDn/Home/End/g/G` scroll; `Esc`, `q`, `s`, or `Enter`
-    /// dismiss.
+    /// Full-screen status overlay (alternate screen). Arrow keys move a
+    /// highlight; Enter toggles start/stop on the selected service, `r`
+    /// restarts it, `R` restarts all failed services, `Esc` dismisses.
     Overlay,
     /// Param-entry form for a task. Opened from the palette when the user
     /// selects a task with declared `params`. Collects values and, on
     /// submit, dispatches `RunnerCommand::RunTask { name, params, reply }`.
     Form,
+}
+
+/// A row in the status overlay — a service or task with its current state.
+/// Exposed so the render path and the key handler agree on which row is
+/// highlighted at `overlay_highlight`.
+#[derive(Debug, Clone)]
+pub(crate) enum OverlayItem {
+    Service { name: String, state: ServiceState },
+    Task { name: String, state: TaskItemState },
+}
+
+impl OverlayItem {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Service { name, .. } | Self::Task { name, .. } => name.as_str(),
+        }
+    }
+
+    /// Sort bucket: genuine failures → dependency-failed cascade → running
+    /// → exited → lazy. Putting `DependencyFailed` below `Failed` keeps the
+    /// actual culprit at the top so the user sees the thing they need to
+    /// look at, not the stranded dependents.
+    fn sort_bucket(&self) -> u8 {
+        match self {
+            Self::Service { state, .. } => match state {
+                ServiceState::Failed | ServiceState::Unhealthy => 0,
+                ServiceState::DependencyFailed => 1,
+                ServiceState::Pending
+                | ServiceState::Building
+                | ServiceState::Starting
+                | ServiceState::Running
+                | ServiceState::Ready
+                | ServiceState::Stopping => 2,
+                ServiceState::Stopped => 3,
+                ServiceState::Lazy => 4,
+            },
+            Self::Task { state, .. } => match state {
+                TaskItemState::Failed => 0,
+                TaskItemState::DependencyFailed => 1,
+                TaskItemState::Pending
+                | TaskItemState::Building
+                | TaskItemState::Running
+                | TaskItemState::Completed
+                | TaskItemState::Skipped
+                | TaskItemState::PendingRun => 2,
+            },
+        }
+    }
 }
 
 /// Aggregate counts derived from service/task state, displayed on the bar.
@@ -74,7 +122,11 @@ impl StatusCounts {
             counts.services_total += 1;
             match state {
                 ServiceState::Ready => counts.services_ready += 1,
-                ServiceState::Failed => counts.services_failed += 1,
+                // DependencyFailed rolls into failed — from the user's
+                // perspective it's still "not running because something broke".
+                ServiceState::Failed | ServiceState::DependencyFailed => {
+                    counts.services_failed += 1
+                }
                 ServiceState::Unhealthy => counts.services_unhealthy += 1,
                 ServiceState::Pending
                 | ServiceState::Building
@@ -116,10 +168,18 @@ pub(crate) struct App {
     /// in `ServiceState::Pending` so the bar shows `0/N ready` from frame 1.
     pub(crate) services_state: HashMap<String, ServiceState>,
     pub(crate) tasks_state: HashMap<String, TaskItemState>,
-    /// Row offset for the status overlay. Clamped to a valid range at
-    /// render time against the visible area; the key handler can bump it
-    /// freely. Reset to 0 each time the overlay is opened.
-    pub(crate) overlay_scroll: usize,
+    /// Highlighted row index in the status overlay. Reset to 0 each time the
+    /// overlay opens. The render path scrolls so this row stays visible.
+    pub(crate) overlay_highlight: usize,
+    /// Fuzzy-filter query applied to the status overlay rows. Empty = show
+    /// everything. Activated via `/` inside the overlay; `overlay_filtering`
+    /// tracks whether key input is currently editing the query.
+    pub(crate) overlay_query: String,
+    /// True when `/` has been pressed inside the overlay and subsequent
+    /// keystrokes feed the query. Enter commits and exits the sub-mode
+    /// (keeping the query active so r/R/Enter operate on the filtered list);
+    /// Esc clears the query and exits.
+    pub(crate) overlay_filtering: bool,
     /// Static task-config snapshot — populated at TUI startup so the
     /// palette/form can inspect declared params without reaching back into
     /// the runner. Kept immutable for the session: a config reload
@@ -134,7 +194,9 @@ impl App {
     pub(crate) fn new(
         service_names: Vec<String>,
         task_names: Vec<String>,
+        build_tool_names: Vec<String>,
         task_configs: HashMap<String, Task>,
+        hidden_names: HashSet<String>,
     ) -> Self {
         let services_state: HashMap<String, ServiceState> = service_names
             .iter()
@@ -147,6 +209,12 @@ impl App {
 
         let mut all_filter_names = service_names;
         all_filter_names.extend(task_names);
+        // Synthetic build-tool streams ("bazel", "turbo") emit under their
+        // own prefix, not under a service/task name. Without a filter entry
+        // they're silently gated out — the user sees nothing while bazel
+        // crunches. Add them only when the config actually uses them, so
+        // they don't show up as empty rows in unrelated projects.
+        all_filter_names.extend(build_tool_names);
         // Expose `[don]` lifecycle events as their own filter entry so the
         // user can opt in/out explicitly, rather than having them always
         // bleed through an active filter.
@@ -157,15 +225,53 @@ impl App {
         Self {
             counts,
             view_mode: ViewMode::Normal,
-            filter: FilterState::new(all_filter_names),
+            filter: FilterState::new(all_filter_names, &hidden_names),
             palette: ActionPalette::default(),
             spinner_frame: 0,
             services_state,
             tasks_state,
-            overlay_scroll: 0,
+            overlay_highlight: 0,
+            overlay_query: String::new(),
+            overlay_filtering: false,
             task_configs,
             form: None,
         }
+    }
+
+    /// Sorted rows for the status overlay: errors → running → exited → lazy,
+    /// alphabetical within a bucket. Services and tasks are interleaved by
+    /// the same sort; kind is preserved per row. When `overlay_query` is
+    /// non-empty, rows are narrowed by fuzzy name-match before sorting.
+    pub(crate) fn overlay_items(&self) -> Vec<OverlayItem> {
+        let mut items: Vec<OverlayItem> = self
+            .services_state
+            .iter()
+            .map(|(name, state)| OverlayItem::Service {
+                name: name.clone(),
+                state: *state,
+            })
+            .chain(
+                self.tasks_state
+                    .iter()
+                    .map(|(name, state)| OverlayItem::Task {
+                        name: name.clone(),
+                        state: *state,
+                    }),
+            )
+            .collect();
+        if !self.overlay_query.is_empty() {
+            let names: Vec<String> = items.iter().map(|i| i.name().to_string()).collect();
+            let matched = super::fuzzy::fuzzy_match(&self.overlay_query, &names);
+            let set: std::collections::HashSet<&str> =
+                matched.iter().map(String::as_str).collect();
+            items.retain(|i| set.contains(i.name()));
+        }
+        items.sort_by(|a, b| {
+            a.sort_bucket()
+                .cmp(&b.sort_bucket())
+                .then_with(|| a.name().cmp(b.name()))
+        });
+        items
     }
 
     /// Apply a runner-emitted state change. Returns `true` when counts
@@ -327,7 +433,13 @@ mod tests {
 
     #[test]
     fn apply_state_refreshes_counts() {
-        let mut app = App::new(vec!["api".into(), "db".into()], vec![], HashMap::new());
+        let mut app = App::new(
+            vec!["api".into(), "db".into()],
+            vec![],
+            vec![],
+            HashMap::new(),
+            HashSet::new(),
+        );
         assert_eq!(app.counts.services_ready, 0);
         app.apply_service_state("api".into(), ServiceState::Ready);
         assert_eq!(app.counts.services_ready, 1);

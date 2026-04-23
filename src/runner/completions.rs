@@ -13,7 +13,7 @@
 //!   one param's candidates depend on another (pick a DB, then list its
 //!   tables).
 //! - Results are cached by `(task, param, partial-hash)` with an optional
-//!   TTL from config. The cache is cleared on `ConfigReload`.
+//!   TTL from config.
 //! - Failures are written to `.don/logs/completions/<task>-<param>-<ts>.log`
 //!   with the full invocation + stdout + stderr + exit code, so the user
 //!   can diagnose without losing context.
@@ -87,10 +87,6 @@ impl CompletionCache {
                 ttl,
             },
         );
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
     }
 }
 

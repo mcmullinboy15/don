@@ -142,6 +142,7 @@ mod tests {
             bazel: None,
             turbo: None,
             params: vec![],
+            hidden: false,
         }
     }
 

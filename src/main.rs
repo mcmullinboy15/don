@@ -150,16 +150,19 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                 1
             }
         },
-        Commands::Start { profile, name: None } => match run_start(&config_path, profile.as_deref(), verbose).await {
+        Commands::Start {
+            profile,
+            name: None,
+        } => match run_start(&config_path, profile.as_deref(), verbose).await {
             Ok(()) => 0,
             Err(e) => {
                 errln(e);
                 1
             }
         },
-        Commands::Start { name: Some(name), .. } => {
-            run_client(&config_path, |c| async move { c.start(&name).await }).await
-        }
+        Commands::Start {
+            name: Some(name), ..
+        } => run_client(&config_path, |c| async move { c.start(&name).await }).await,
         Commands::Stop { name } => {
             run_client(&config_path, |c| async move { c.stop(&name).await }).await
         }
@@ -170,7 +173,12 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
-        Commands::Run { name, all_pending, raw, no_prompt } => match (name, all_pending) {
+        Commands::Run {
+            name,
+            all_pending,
+            raw,
+            no_prompt,
+        } => match (name, all_pending) {
             (Some(n), _) => run_run_task(&config_path, n, raw, no_prompt).await,
             (None, true) => {
                 run_client(&config_path, |c| async move { c.run_pending().await }).await
@@ -230,12 +238,7 @@ fn client_for(config_path: &Path) -> Client {
 
 /// Handle `don run <task> [flags]`. Parses `raw` against the task's declared
 /// params and dispatches via the client.
-async fn run_run_task(
-    config_path: &Path,
-    name: String,
-    raw: Vec<String>,
-    no_prompt: bool,
-) -> i32 {
+async fn run_run_task(config_path: &Path, name: String, raw: Vec<String>, no_prompt: bool) -> i32 {
     // Load config to look up the task's params. This duplicates what the
     // runner does server-side, but we need the param list *here* to
     // parse the trailing args correctly.
@@ -384,7 +387,12 @@ where
 async fn run_status(config_path: &Path, verbose: bool) -> i32 {
     let client = client_for(config_path);
     match client.status(verbose).await {
-        Ok(items) => {
+        Ok(mut items) => {
+            items.sort_by(|a, b| {
+                status_sort_bucket(a)
+                    .cmp(&status_sort_bucket(b))
+                    .then_with(|| item_name(a).cmp(item_name(b)))
+            });
             print_status_table(&items, verbose);
             0
         }
@@ -392,6 +400,44 @@ async fn run_status(config_path: &Path, verbose: bool) -> i32 {
             errln(e);
             1
         }
+    }
+}
+
+/// Sort bucket for the status table: genuine failures first, then the
+/// dependency-failed cascade, then running, then exited, then lazy. Putting
+/// `DependencyFailed` *below* `Failed` surfaces the actual culprit — the
+/// thing the user needs to look at — above everything that merely got
+/// stranded.
+fn status_sort_bucket(item: &ItemStatus) -> u8 {
+    match item {
+        ItemStatus::Service { state, .. } => match state {
+            ServiceState::Failed | ServiceState::Unhealthy => 0,
+            ServiceState::DependencyFailed => 1,
+            ServiceState::Pending
+            | ServiceState::Building
+            | ServiceState::Starting
+            | ServiceState::Running
+            | ServiceState::Ready
+            | ServiceState::Stopping => 2,
+            ServiceState::Stopped => 3,
+            ServiceState::Lazy => 4,
+        },
+        ItemStatus::Task { state, .. } => match state {
+            TaskItemState::Failed => 0,
+            TaskItemState::DependencyFailed => 1,
+            TaskItemState::Pending
+            | TaskItemState::Building
+            | TaskItemState::Running
+            | TaskItemState::Completed
+            | TaskItemState::Skipped
+            | TaskItemState::PendingRun => 2,
+        },
+    }
+}
+
+fn item_name(item: &ItemStatus) -> &str {
+    match item {
+        ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name.as_str(),
     }
 }
 
@@ -482,12 +528,28 @@ fn print_status_table(items: &[ItemStatus], verbose: bool) {
     println!("{:<kind_w$}  {:<name_w$}  STATE", "KIND", "NAME");
     for item in items {
         let (kind, name, state_str, color, verbose_info) = match item {
-            ItemStatus::Service { name, state, verbose } => {
-                ("service", name.as_str(), service_state_label(*state), service_state_color(*state), verbose.as_ref())
-            }
-            ItemStatus::Task { name, state, verbose } => {
-                ("task", name.as_str(), task_state_label(*state), task_state_color(*state), verbose.as_ref())
-            }
+            ItemStatus::Service {
+                name,
+                state,
+                verbose,
+            } => (
+                "service",
+                name.as_str(),
+                service_state_label(*state),
+                service_state_color(*state),
+                verbose.as_ref(),
+            ),
+            ItemStatus::Task {
+                name,
+                state,
+                verbose,
+            } => (
+                "task",
+                name.as_str(),
+                task_state_label(*state),
+                task_state_color(*state),
+                verbose.as_ref(),
+            ),
         };
         println!(
             "{:<kind_w$}  {:<name_w$}  {}{}{}",
@@ -498,9 +560,7 @@ fn print_status_table(items: &[ItemStatus], verbose: bool) {
             ResetColor,
         );
 
-        if verbose
-            && let Some(info) = verbose_info
-        {
+        if verbose && let Some(info) = verbose_info {
             print_verbose_info(info);
         }
     }
@@ -531,7 +591,10 @@ fn print_verbose_info(info: &don::runner::VerboseInfo) {
         println!("  {dim}turbo:{reset}  {task}");
     }
     if !info.watch.is_empty() {
-        println!("  {dim}watch:{reset}  {}", info.watch.first().unwrap_or(&String::new()));
+        println!(
+            "  {dim}watch:{reset}  {}",
+            info.watch.first().unwrap_or(&String::new())
+        );
         for pattern in info.watch.iter().skip(1) {
             println!("         {pattern}");
         }
@@ -550,6 +613,7 @@ fn service_state_label(s: ServiceState) -> &'static str {
         ServiceState::Stopping => "stopping",
         ServiceState::Stopped => "stopped",
         ServiceState::Failed => "failed",
+        ServiceState::DependencyFailed => "dep failed",
     }
 }
 
@@ -564,6 +628,9 @@ fn service_state_color(s: ServiceState) -> Color {
         ServiceState::Stopped => Color::DarkGrey,
         ServiceState::Unhealthy => Color::Red,
         ServiceState::Failed => Color::Red,
+        // Dim red: same hue family as Failed so the user sees it's in the
+        // error-neighbourhood, but visually quieter than the culprit above it.
+        ServiceState::DependencyFailed => Color::DarkRed,
     }
 }
 
@@ -575,6 +642,7 @@ fn task_state_label(s: TaskItemState) -> &'static str {
         TaskItemState::Completed => "completed",
         TaskItemState::Skipped => "skipped",
         TaskItemState::Failed => "failed",
+        TaskItemState::DependencyFailed => "dep failed",
         TaskItemState::PendingRun => "pending_run",
     }
 }
@@ -585,6 +653,7 @@ fn task_state_color(s: TaskItemState) -> Color {
         TaskItemState::Running | TaskItemState::Pending | TaskItemState::Building => Color::Yellow,
         TaskItemState::PendingRun => Color::Cyan,
         TaskItemState::Failed => Color::Red,
+        TaskItemState::DependencyFailed => Color::DarkRed,
     }
 }
 
@@ -614,11 +683,8 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
                 return 1;
             }
             // Now re-acquire the lock.
-            match don::process::pid_file::PidFile::acquire(
-                don_pid_path,
-                std::process::id() as i32,
-            )
-            .await
+            match don::process::pid_file::PidFile::acquire(don_pid_path, std::process::id() as i32)
+                .await
             {
                 Ok(lock) => lock,
                 Err(e) => {
@@ -641,11 +707,7 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
             .iter()
             .filter_map(|(name, svc)| {
                 if let Some(don::config::ServiceKind::Docker(d)) = &svc.kind {
-                    Some(
-                        d.container
-                            .clone()
-                            .unwrap_or_else(|| format!("don-{name}")),
-                    )
+                    Some(d.container.clone().unwrap_or_else(|| format!("don-{name}")))
                 } else {
                     None
                 }
@@ -676,10 +738,13 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
 async fn kill_running_daemon(pid_path: &std::path::Path) -> Result<(), String> {
     let content = std::fs::read_to_string(pid_path)
         .map_err(|e| format!("failed to read {}: {e}", pid_path.display()))?;
-    let pid: i32 = content
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid pid in {}: '{}'", pid_path.display(), content.trim()))?;
+    let pid: i32 = content.trim().parse().map_err(|_| {
+        format!(
+            "invalid pid in {}: '{}'",
+            pid_path.display(),
+            content.trim()
+        )
+    })?;
 
     let nix_pid = nix::unistd::Pid::from_raw(pid);
 
@@ -694,9 +759,9 @@ async fn kill_running_daemon(pid_path: &std::path::Path) -> Result<(), String> {
     // Second SIGINT — sets the force flag, daemon SIGKILLs all children.
     let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGINT);
 
-    // Wait for the daemon to actually exit (up to 10s — it needs time to
+    // Wait for the daemon to actually exit (up to 1s — it needs time to
     // reap children after SIGKILL).
-    for _ in 0..100 {
+    for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if nix::sys::signal::kill(nix_pid, None).is_err() {
             return Ok(()); // Process is gone.
@@ -704,15 +769,14 @@ async fn kill_running_daemon(pid_path: &std::path::Path) -> Result<(), String> {
     }
 
     // Last resort — the daemon itself is stuck.
-    errln("daemon did not exit after 10s, sending SIGKILL");
+    errln("daemon did not exit after 1s, sending SIGKILL");
     let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(())
 }
 
 fn validate(config_path: &std::path::Path) -> Result<(), String> {
-    let config =
-        don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
     let platform = don::config::Platform::current().ok_or_else(|| {
         format!(
@@ -731,11 +795,14 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose: bool) -> Result<(), String> {
+async fn run_start(
+    config_path: &std::path::Path,
+    profile: Option<&str>,
+    verbose: bool,
+) -> Result<(), String> {
     use std::io::IsTerminal;
 
-    let config =
-        don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
     let platform = don::config::Platform::current().ok_or_else(|| {
         format!(
@@ -769,16 +836,16 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
     // is sized for the longest name in the whole config, and the TUI
     // service menu lists items the profile excludes. The runner re-runs
     // this inside `Runner::new` to build its own filtered state.
-    let active_items: Option<std::collections::HashSet<String>> = if let Some(profile_name) = profile
-    {
-        let prof = config
-            .profiles
-            .get(profile_name)
-            .ok_or_else(|| format!("Error: unknown profile '{profile_name}'"))?;
-        Some(don::runner::resolve_profile_items(&config, prof))
-    } else {
-        None
-    };
+    let active_items: Option<std::collections::HashSet<String>> =
+        if let Some(profile_name) = profile {
+            let prof = config
+                .profiles
+                .get(profile_name)
+                .ok_or_else(|| format!("Error: unknown profile '{profile_name}'"))?;
+            Some(don::runner::resolve_profile_items(&config, prof))
+        } else {
+            None
+        };
 
     let is_active = |name: &str| active_items.as_ref().is_none_or(|s| s.contains(name));
 
@@ -798,10 +865,8 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
         .map(|(name, task)| (name.as_str(), &task.log))
         .collect();
 
-    let all_configs: Vec<(&str, &don::config::LogConfig)> = service_configs
-        .into_iter()
-        .chain(task_configs)
-        .collect();
+    let all_configs: Vec<(&str, &don::config::LogConfig)> =
+        service_configs.into_iter().chain(task_configs).collect();
 
     // Install signal handlers before building the runner so Ctrl+C still
     // reaches the graceful-shutdown path even during a slow startup.
@@ -834,9 +899,52 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
         let task_configs: std::collections::HashMap<String, don::config::Task> =
             config.tasks.clone();
 
+        // Synthetic build-tool stream names that should appear in the TUI
+        // filter. Without these entries, lines emitted by the bazel/turbo
+        // clients (which carry `name = "bazel"` / `"turbo"`) are silently
+        // dropped by the filter's allowlist — the user sees nothing during
+        // the build phase.
+        let mut build_tool_names: Vec<String> = Vec::new();
+        // Scan both the base `kind` and every platform override — a service
+        // might only declare `kind = "bazel"` under `[services.api.platform.linux]`,
+        // and we still want the filter entry present.
+        let service_kinds = || {
+            config.services.values().flat_map(|svc| {
+                std::iter::once(svc.kind.as_ref())
+                    .chain(svc.platform.values().map(|ov| ov.kind.as_ref()))
+                    .flatten()
+            })
+        };
+        let uses_bazel = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Bazel(_)))
+            || config.tasks.values().any(|t| t.bazel.is_some());
+        let uses_turbo = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Turbo(_)))
+            || config.tasks.values().any(|t| t.turbo.is_some());
+        if uses_bazel {
+            build_tool_names.push("bazel".to_string());
+        }
+        if uses_turbo {
+            build_tool_names.push("turbo".to_string());
+        }
+
+        // Collect names whose `hidden = true` flag should start them outside
+        // the TUI filter's default selection. Both services and tasks can
+        // opt in — the filter treats them identically.
+        let hidden_names: std::collections::HashSet<String> = config
+            .services
+            .iter()
+            .filter(|(name, svc)| is_active(name) && svc.hidden)
+            .map(|(name, _)| name.clone())
+            .chain(
+                config
+                    .tasks
+                    .iter()
+                    .filter(|(name, task)| is_active(name) && task.hidden)
+                    .map(|(name, _)| name.clone()),
+            )
+            .collect();
+
         let runner = don::runner::Runner::new(
             config,
-            config_path.to_path_buf(),
             platform,
             output_manager,
             base,
@@ -863,7 +971,9 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
                 commands,
                 service_names,
                 task_names,
+                build_tool_names,
                 task_configs,
+                hidden_names,
             )
             .await;
             if result.is_err() {
@@ -897,7 +1007,6 @@ async fn run_start(config_path: &std::path::Path, profile: Option<&str>, verbose
 
         let runner = don::runner::Runner::new(
             config,
-            config_path.to_path_buf(),
             platform,
             output_manager,
             base,
@@ -971,14 +1080,20 @@ mod tests {
             },
             Case {
                 name: "bool bare flag",
-                params: vec![TaskParam { kind: ParamKind::Bool, ..p("enabled") }],
+                params: vec![TaskParam {
+                    kind: ParamKind::Bool,
+                    ..p("enabled")
+                }],
                 raw: vec!["--enabled"],
                 want_ok: Some(vec![("enabled", "true")]),
                 want_err: None,
             },
             Case {
                 name: "bool explicit value",
-                params: vec![TaskParam { kind: ParamKind::Bool, ..p("enabled") }],
+                params: vec![TaskParam {
+                    kind: ParamKind::Bool,
+                    ..p("enabled")
+                }],
                 raw: vec!["--enabled=false"],
                 want_ok: Some(vec![("enabled", "false")]),
                 want_err: None,

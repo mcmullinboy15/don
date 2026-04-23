@@ -18,6 +18,7 @@
 
 use crate::config::{Config, Platform};
 use crate::duration::parse_duration;
+use crate::output::LifecycleEmitter;
 use crate::runner::{RunnerCommand, RunnerEvent};
 use glob::Pattern;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -59,8 +60,6 @@ pub(crate) enum WatchItemKind {
     Service,
     /// Send `RunnerCommand::TaskRerun { name }`.
     Task,
-    /// Send `RunnerCommand::ConfigReload` — no rebuild/complete cycle.
-    Config,
     /// Send `RunnerCommand::BuildGraphChanged { name }` — tier-1 watch for
     /// build tool definition files (BUILD, package.json, etc.). No rebuild cycle;
     /// the runner re-queries the build tool and updates tier-2 watch patterns.
@@ -127,6 +126,8 @@ pub(crate) struct WatchManager {
     /// coverage causes the Recursive registration to be silently skipped,
     /// and nested files never trigger events.
     registered_dirs: HashMap<PathBuf, RecursiveMode>,
+    /// Emitter for `[don]` verbose-mode diagnostics.
+    emitter: LifecycleEmitter,
 }
 
 impl WatchManager {
@@ -137,14 +138,15 @@ impl WatchManager {
     ///
     /// Returns `(Self, warnings)` where warnings are non-fatal issues like
     /// invalid glob patterns (which should have been caught by validation).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
         platform: Platform,
         base_dir: &Path,
-        config_path: &Path,
         cmd_tx: mpsc::Sender<RunnerCommand>,
         runner_events: broadcast::Receiver<RunnerEvent>,
         update_rx: mpsc::Receiver<WatchUpdate>,
+        emitter: LifecycleEmitter,
     ) -> Result<(Self, Vec<String>), WatchError> {
         let mut warnings: Vec<String> = Vec::new();
         let (notify_tx, event_rx) = mpsc::unbounded_channel();
@@ -423,30 +425,36 @@ impl WatchManager {
             }
         }
 
-        // Watch the config file (don.toml) for auto-reload. We watch the
-        // parent directory because editors like vim replace the file via
-        // rename, which removes the inode the watcher was tracking.
-        if let Ok(canonical_config) = std::fs::canonicalize(config_path)
-            && let Some(config_dir) = canonical_config.parent()
-            && let Ok(pat) = Pattern::new(&canonical_config.to_string_lossy())
-        {
-            if !is_covered(config_dir, RecursiveMode::NonRecursive, &registered_dirs) {
-                let _ = watcher.watch(config_dir, RecursiveMode::NonRecursive);
-                registered_dirs.insert(config_dir.to_path_buf(), RecursiveMode::NonRecursive);
-            }
-            items.insert(
-                "__config__".to_string(),
-                WatchedItem {
-                    state: WatchState::Idle,
-                    debounce_duration: DEFAULT_DEBOUNCE,
-                    debounce_deadline: None,
-                    stale: false,
-                    kind: WatchItemKind::Config,
-                    patterns: vec![pat],
-                    ignore_patterns: vec![],
-                },
+        // Verbose setup summary: per-item patterns/ignore/debounce, plus the
+        // full list of registered directories. This is the first thing a user
+        // hitting "nothing reloaded" will want to see.
+        let mut names: Vec<&String> = items.keys().collect();
+        names.sort();
+        for name in names {
+            let Some(item) = items.get(name) else { continue };
+            let pats: Vec<&str> = item.patterns.iter().map(Pattern::as_str).collect();
+            let igs: Vec<&str> = item.ignore_patterns.iter().map(Pattern::as_str).collect();
+            emitter.service_debug_event(
+                name,
+                &format!(
+                    "watch: registered kind={:?} debounce={:?} patterns={:?} ignore={:?}",
+                    item.kind, item.debounce_duration, pats, igs
+                ),
             );
         }
+        let mut dirs: Vec<(&PathBuf, &RecursiveMode)> = registered_dirs.iter().collect();
+        dirs.sort_by(|a, b| a.0.cmp(b.0));
+        for (dir, mode) in &dirs {
+            emitter.debug_event(&format!(
+                "watch: inotify dir {:?} mode={:?}",
+                dir, mode
+            ));
+        }
+        emitter.debug_event(&format!(
+            "watch: setup complete — {} items, {} directories registered",
+            items.len(),
+            registered_dirs.len()
+        ));
 
         Ok((
             Self {
@@ -457,6 +465,7 @@ impl WatchManager {
                 runner_events,
                 update_rx,
                 registered_dirs,
+                emitter,
             },
             warnings,
         ))
@@ -487,8 +496,14 @@ impl WatchManager {
                     match result {
                         Ok(event) => self.handle_runner_event(&event).await,
                         Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Missed some events — not critical, just continue.
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            // Missed n events. If one was a RebuildComplete,
+                            // the corresponding WatchedItem is stuck in
+                            // `Rebuilding` and will swallow future edits until
+                            // the item is re-registered. Surface it loudly.
+                            self.emitter.lifecycle_event(&format!(
+                                "watch: broadcast lag — missed {n} runner events; a service may be stuck in Rebuilding"
+                            ));
                         }
                     }
                 }
@@ -510,9 +525,7 @@ impl WatchManager {
         // updates are directory-level globs (`<pkg>/**`), which need
         // recursive watching.
         let mode = match update.kind {
-            WatchItemKind::BuildGraph | WatchItemKind::Config => {
-                RecursiveMode::NonRecursive
-            }
+            WatchItemKind::BuildGraph => RecursiveMode::NonRecursive,
             WatchItemKind::Service | WatchItemKind::Task => RecursiveMode::Recursive,
         };
 
@@ -566,10 +579,28 @@ impl WatchManager {
         if let Some(item) = self.items.get_mut(&update.name) {
             item.patterns = compiled_patterns;
             item.ignore_patterns = compiled_ignore;
+            let pats: Vec<&str> = item.patterns.iter().map(Pattern::as_str).collect();
+            let igs: Vec<&str> = item.ignore_patterns.iter().map(Pattern::as_str).collect();
+            self.emitter.service_debug_event(
+                &update.name,
+                &format!(
+                    "watch: patterns updated kind={:?} patterns={:?} ignore={:?}",
+                    update.kind, pats, igs
+                ),
+            );
         } else {
             // Item doesn't exist yet — create it (happens when build tool
             // resolution completes after startup for a service with no
             // explicit watch patterns).
+            let pats: Vec<&str> = compiled_patterns.iter().map(Pattern::as_str).collect();
+            let igs: Vec<&str> = compiled_ignore.iter().map(Pattern::as_str).collect();
+            self.emitter.service_debug_event(
+                &update.name,
+                &format!(
+                    "watch: item created kind={:?} patterns={:?} ignore={:?}",
+                    update.kind, pats, igs
+                ),
+            );
             self.items.insert(
                 update.name.clone(),
                 WatchedItem {
@@ -604,9 +635,15 @@ impl WatchManager {
                 | EventKind::Modify(_)
                 | EventKind::Remove(_)
         ) {
+            // Don't log these — Access/Other events fire constantly (every
+            // open/close/stat) and drown out the signal.
             return;
         }
 
+        self.emitter.debug_event(&format!(
+            "watch: event kind={:?} paths={:?}",
+            event.kind, event.paths
+        ));
 
         // Find which items are affected by this event's paths.
         // Ignore patterns are checked first — if any ignore pattern matches,
@@ -614,15 +651,44 @@ impl WatchManager {
         let mut affected: Vec<String> = Vec::new();
         for path in &event.paths {
             let path_str = path.to_string_lossy();
+            let mut matched_any = false;
             for (name, item) in &self.items {
-                if item.ignore_patterns.iter().any(|p| p.matches(&path_str)) {
+                if let Some(ig) = item
+                    .ignore_patterns
+                    .iter()
+                    .find(|p| p.matches(&path_str))
+                {
+                    self.emitter.service_debug_event(
+                        name,
+                        &format!(
+                            "watch: ignored {:?} by ignore pattern {:?}",
+                            path,
+                            ig.as_str()
+                        ),
+                    );
+                    matched_any = true;
                     continue;
                 }
-                if item.patterns.iter().any(|p| p.matches(&path_str))
-                    && !affected.contains(name)
-                {
-                    affected.push(name.clone());
+                if let Some(pat) = item.patterns.iter().find(|p| p.matches(&path_str)) {
+                    self.emitter.service_debug_event(
+                        name,
+                        &format!(
+                            "watch: matched {:?} by pattern {:?}",
+                            path,
+                            pat.as_str()
+                        ),
+                    );
+                    matched_any = true;
+                    if !affected.contains(name) {
+                        affected.push(name.clone());
+                    }
                 }
+            }
+            if !matched_any {
+                self.emitter.debug_event(&format!(
+                    "watch: no item matched {:?}",
+                    path
+                ));
             }
         }
 
@@ -634,16 +700,34 @@ impl WatchManager {
                     WatchState::Idle => {
                         item.state = WatchState::Debouncing;
                         item.debounce_deadline = Some(now + item.debounce_duration);
+                        self.emitter.service_debug_event(
+                            &name,
+                            &format!(
+                                "watch: Idle → Debouncing (deadline in {:?})",
+                                item.debounce_duration
+                            ),
+                        );
                     }
                     // Debouncing → Debouncing: sliding window resets the deadline
                     // so rapid consecutive saves coalesce into one rebuild.
                     WatchState::Debouncing => {
                         item.debounce_deadline = Some(now + item.debounce_duration);
+                        self.emitter.service_debug_event(
+                            &name,
+                            &format!(
+                                "watch: Debouncing — deadline bumped ({:?})",
+                                item.debounce_duration
+                            ),
+                        );
                     }
                     // Rebuilding: can't start another cycle now. Set stale so we
                     // trigger a new rebuild when the current one completes.
                     WatchState::Rebuilding => {
                         item.stale = true;
+                        self.emitter.service_debug_event(
+                            &name,
+                            "watch: Rebuilding — marked stale (will re-run after completion)",
+                        );
                     }
                 }
             }
@@ -668,20 +752,14 @@ impl WatchManager {
             if let Some(item) = self.items.get_mut(&name) {
                 item.debounce_deadline = None;
 
-                let cmd = match kind {
+                let (cmd, label) = match kind {
                     WatchItemKind::Task => {
                         item.state = WatchState::Rebuilding;
-                        RunnerCommand::TaskRerun { name }
+                        (RunnerCommand::TaskRerun { name: name.clone() }, "TaskRerun")
                     }
                     WatchItemKind::Service => {
                         item.state = WatchState::Rebuilding;
-                        RunnerCommand::Rebuild { name }
-                    }
-                    WatchItemKind::Config => {
-                        // Config reload has no rebuild/complete cycle —
-                        // go straight back to Idle.
-                        item.state = WatchState::Idle;
-                        RunnerCommand::ConfigReload
+                        (RunnerCommand::Rebuild { name: name.clone() }, "Rebuild")
                     }
                     WatchItemKind::BuildGraph => {
                         // Build graph change has no rebuild/complete cycle —
@@ -691,11 +769,26 @@ impl WatchManager {
                         let item_name = name.strip_suffix("__graph")
                             .unwrap_or(&name)
                             .to_string();
-                        RunnerCommand::BuildGraphChanged { name: item_name }
+                        (
+                            RunnerCommand::BuildGraphChanged { name: item_name },
+                            "BuildGraphChanged",
+                        )
                     }
                 };
+                self.emitter.service_debug_event(
+                    &name,
+                    &format!(
+                        "watch: debounce fired → sending {} (state={:?})",
+                        label, item.state
+                    ),
+                );
                 // If the channel is full/closed, the runner is shutting down.
-                let _ = self.cmd_tx.send(cmd).await;
+                if self.cmd_tx.send(cmd).await.is_err() {
+                    self.emitter.service_debug_event(
+                        &name,
+                        "watch: command channel closed — runner is shutting down",
+                    );
+                }
             }
         }
     }
@@ -703,12 +796,18 @@ impl WatchManager {
     /// Handle a runner event — mainly looking for rebuild/rerun completion.
     async fn handle_runner_event(&mut self, event: &RunnerEvent) {
         match event {
-            RunnerEvent::RebuildComplete { name, .. } => {
+            RunnerEvent::RebuildComplete { name, success } => {
                 if let Some(item) = self.items.get_mut(name) {
                     if item.stale {
                         // More changes came in during the rebuild — trigger another cycle.
                         item.stale = false;
                         item.state = WatchState::Rebuilding;
+                        self.emitter.service_debug_event(
+                            name,
+                            &format!(
+                                "watch: RebuildComplete(success={success}) stale=true — re-running"
+                            ),
+                        );
                         let _ = self
                             .cmd_tx
                             .send(RunnerCommand::Rebuild {
@@ -717,14 +816,30 @@ impl WatchManager {
                             .await;
                     } else {
                         item.state = WatchState::Idle;
+                        self.emitter.service_debug_event(
+                            name,
+                            &format!(
+                                "watch: RebuildComplete(success={success}) → Idle"
+                            ),
+                        );
                     }
+                } else {
+                    self.emitter.debug_event(&format!(
+                        "watch: RebuildComplete for unknown item {name:?}"
+                    ));
                 }
             }
-            RunnerEvent::TaskRerunComplete { name, .. } => {
+            RunnerEvent::TaskRerunComplete { name, success } => {
                 if let Some(item) = self.items.get_mut(name) {
                     if item.stale {
                         item.stale = false;
                         item.state = WatchState::Rebuilding;
+                        self.emitter.service_debug_event(
+                            name,
+                            &format!(
+                                "watch: TaskRerunComplete(success={success}) stale=true — re-running"
+                            ),
+                        );
                         let _ = self
                             .cmd_tx
                             .send(RunnerCommand::TaskRerun {
@@ -733,7 +848,17 @@ impl WatchManager {
                             .await;
                     } else {
                         item.state = WatchState::Idle;
+                        self.emitter.service_debug_event(
+                            name,
+                            &format!(
+                                "watch: TaskRerunComplete(success={success}) → Idle"
+                            ),
+                        );
                     }
+                } else {
+                    self.emitter.debug_event(&format!(
+                        "watch: TaskRerunComplete for unknown item {name:?}"
+                    ));
                 }
             }
             RunnerEvent::ShutdownComplete => {
@@ -1409,10 +1534,6 @@ mod tests {
                     WatchItemKind::Service => {
                         item.state = WatchState::Rebuilding;
                         RunnerCommand::Rebuild { name }
-                    }
-                    WatchItemKind::Config => {
-                        item.state = WatchState::Idle;
-                        RunnerCommand::ConfigReload
                     }
                     WatchItemKind::BuildGraph => {
                         item.state = WatchState::Idle;

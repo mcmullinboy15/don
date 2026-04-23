@@ -62,6 +62,11 @@ pub struct Task {
     /// placeholders.
     #[serde(default)]
     pub params: Vec<TaskParam>,
+    /// Whether this task's log output is hidden by default in the TUI
+    /// filter. Users can still unhide it interactively from the filter view.
+    /// Defaults to `false` (visible).
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 impl Task {

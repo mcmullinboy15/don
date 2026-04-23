@@ -377,6 +377,7 @@ mod tests {
             bazel: None,
             turbo: None,
             params,
+            hidden: false,
         }
     }
 

@@ -57,6 +57,21 @@ async fn make_runner(
     toml: &str,
     base_dir: &std::path::Path,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
+    make_runner_inner(toml, base_dir, false).await
+}
+
+async fn make_runner_verbose(
+    toml: &str,
+    base_dir: &std::path::Path,
+) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
+    make_runner_inner(toml, base_dir, true).await
+}
+
+async fn make_runner_inner(
+    toml: &str,
+    base_dir: &std::path::Path,
+    verbose: bool,
+) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
     let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
@@ -74,7 +89,9 @@ async fn make_runner(
         service_configs.into_iter().chain(task_configs).collect();
 
     let (writer, buf) = TestBuffer::new();
-    let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
+    let output_manager = OutputManager::new_verbose(&all_configs, writer, verbose)
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
     let runner =
         Runner::new(config, base_dir.join("don.toml"), PLATFORM, output_manager, base_dir.to_path_buf(), None, shutdown_rx)
@@ -258,7 +275,7 @@ fn integration_socket_stays_bound_during_restart() {
             .done()
             .build();
 
-        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
 
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
@@ -480,7 +497,7 @@ fn integration_lazy_listenfd_triggers_on_connect() {
             .done()
             .build();
 
-        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
 
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();

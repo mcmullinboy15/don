@@ -25,9 +25,6 @@ pub enum BuildToolError {
     /// The build tool query command exited with a non-zero status.
     #[error("{tool} query failed: {message}")]
     QueryFailed { tool: String, message: String },
-    /// The build tool query took too long.
-    #[error("{tool} query timed out after {timeout_secs}s")]
-    QueryTimeout { tool: String, timeout_secs: u64 },
     /// The build tool returned output that could not be parsed.
     #[error("{tool} returned unparseable output: {message}")]
     ParseError { tool: String, message: String },
