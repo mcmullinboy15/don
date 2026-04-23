@@ -8,7 +8,28 @@ mod graph;
 
 use super::{AbortOnDrop, BuildGraphResolver, BuildToolError, ResolvedBuildInfo};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Walk up from `start` looking for a Bazel workspace marker file
+/// (`MODULE.bazel`, `WORKSPACE.bazel`, `WORKSPACE`, or `REPO.bazel`) and
+/// return the first directory that contains one.
+///
+/// Returns `None` if no marker is found before hitting the filesystem root.
+/// Used to populate `BUILD_WORKSPACE_DIRECTORY` when don launches a built
+/// bazel artifact directly (bypassing `bazel run`, which would set the var
+/// itself). Launcher scripts emitted by `rules_*` commonly read this var
+/// under `set -u`, so missing it fails the service immediately.
+pub(crate) fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    let mut current: &Path = start;
+    loop {
+        for marker in ["MODULE.bazel", "WORKSPACE.bazel", "WORKSPACE", "REPO.bazel"] {
+            if current.join(marker).exists() {
+                return Some(current.to_path_buf());
+            }
+        }
+        current = current.parent()?;
+    }
+}
 
 /// Bazel build graph resolver.
 ///
@@ -395,10 +416,13 @@ impl BazelResolver {
     /// `bazel cquery` invocation.
     ///
     /// Bazel's `--output=starlark` lets us emit per-target attribution
-    /// (`<label>\t<first-bazel-out-path>`) so the analysis pass runs once
-    /// instead of N times. Targets that produce no `bazel-out/...` file
-    /// (e.g. aliases without own outputs) are absent from the returned map;
-    /// the caller should fall back to `bazel run` for those.
+    /// (`<label>\t<executable-path>`) so the analysis pass runs once instead
+    /// of N times. We read `target.files_to_run.executable.path` — the exact
+    /// binary `bazel run` would launch — which is more precise than picking
+    /// the first entry out of `target.files`. Targets without an executable
+    /// (non-`*_binary` rules, aliases that don't forward `files_to_run`) are
+    /// absent from the returned map; the caller should fall back to
+    /// `bazel run` for those.
     ///
     /// Keys are inserted in both canonical (`@@//pkg:name`) and stripped
     /// (`//pkg:name`) forms so callers can look up using whichever form
@@ -418,11 +442,11 @@ impl BazelResolver {
         // where we wrap targets to fence operator precedence).
         let query = format!("set({})", targets.join(" "));
 
-        // Per-target line: `<label>\t<first-bazel-out-file-or-empty>`. The
-        // empty-files case is handled inline so the expression always
-        // evaluates — the parser drops lines whose path doesn't start
-        // with `bazel-out/`.
-        let starlark = r#"str(target.label) + "\t" + (target.files.to_list()[0].path if target.files.to_list() else "")"#;
+        // Per-target line: `<label>\t<executable-path-or-empty>`. The
+        // no-executable case (non-runnable targets) is handled inline so
+        // the expression always evaluates — the parser drops lines whose
+        // path doesn't start with `bazel-out/`.
+        let starlark = r#"str(target.label) + "\t" + (target.files_to_run.executable.path if target.files_to_run.executable else "")"#;
         let starlark_arg = format!("--starlark:expr={starlark}");
 
         let mut child = tokio::process::Command::new("bazel")

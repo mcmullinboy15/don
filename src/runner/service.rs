@@ -175,6 +175,22 @@ pub(crate) async fn start_service(
     // Expose downloaded binaries on PATH so other services/tasks can call them.
     crate::process::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
 
+    // Bazel launcher scripts (`rules_*`-generated wrappers) commonly read
+    // `BUILD_WORKSPACE_DIRECTORY` under `set -u`. When don launches the built
+    // artifact directly (via `resolve_binary_paths`) it bypasses `bazel run`,
+    // which is what would normally set the var. Fill it in ourselves based
+    // on the service's workspace root so those launchers don't bomb out.
+    // For the `bazel run` fallback path bazel overwrites whatever we set,
+    // so this is safe either way.
+    if matches!(resolved.kind, Some(ServiceKind::Bazel(_)))
+        && let Some(workspace) = crate::build_tool::bazel::find_workspace_root(service_dir)
+    {
+        env.insert(
+            "BUILD_WORKSPACE_DIRECTORY".to_string(),
+            workspace.to_string_lossy().into_owned(),
+        );
+    }
+
     // Expand ${VAR} references in the command and args against the env map.
     // This lets proxy-injected vars like PORT be used in run args.
     let cmd = expand_env_vars(&cmd, &env);
