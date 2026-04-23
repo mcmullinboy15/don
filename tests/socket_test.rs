@@ -94,7 +94,7 @@ async fn make_runner_inner(
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
     let runner =
-        Runner::new(config, base_dir.join("don.toml"), PLATFORM, output_manager, base_dir.to_path_buf(), None, shutdown_rx)
+        Runner::new(config, PLATFORM, output_manager, base_dir.to_path_buf(), None, shutdown_rx)
             .await
             .unwrap();
     (runner, shutdown_tx, buf)

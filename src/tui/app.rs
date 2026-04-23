@@ -182,9 +182,8 @@ pub(crate) struct App {
     pub(crate) overlay_filtering: bool,
     /// Static task-config snapshot — populated at TUI startup so the
     /// palette/form can inspect declared params without reaching back into
-    /// the runner. Kept immutable for the session: a config reload
-    /// wouldn't invalidate what's already on-screen, and the runner will
-    /// re-validate on submit anyway.
+    /// the runner. Immutable for the session; the runner re-validates on
+    /// submit anyway.
     pub(crate) task_configs: HashMap<String, Task>,
     /// Active form modal, or `None` when not in [`ViewMode::Form`].
     pub(crate) form: Option<FormState>,

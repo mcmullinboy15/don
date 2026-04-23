@@ -19,8 +19,7 @@
 //!
 //! `all_names` is the source of truth — the union of service and task names
 //! the runner knows about at TUI startup, plus the synthetic `"don"` entry
-//! for lifecycle events. It doesn't update on live reload; a config reload
-//! that renames services will require Esc'ing the filter.
+//! for lifecycle events. Fixed for the session.
 //!
 //! ## The "all" synthetic row
 //!

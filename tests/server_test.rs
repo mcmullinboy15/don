@@ -85,7 +85,6 @@ async fn spawn_runner(
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
     let runner = Runner::new(
         config,
-        base_dir.join("don.toml"),
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),

@@ -208,7 +208,6 @@ async fn spawn_runner_with_profile(
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
     let runner = Runner::new(
         config,
-        config_path,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),

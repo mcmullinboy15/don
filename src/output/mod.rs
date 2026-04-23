@@ -648,9 +648,11 @@ impl OutputManager {
         Some(Bytes::from(result))
     }
 
-    /// Register a new service that wasn't in the original config (added via
-    /// live config reload). Creates a ring buffer, assigns a color, and wires
-    /// up sinks based on the log config. Existing services are left unchanged.
+    /// Register a service that wasn't known at OutputManager construction
+    /// (currently used by `register_build_tool` to give `bazel` / `turbo`
+    /// their own prefix column). Creates a ring buffer, assigns a color,
+    /// and wires up sinks based on the log config. Existing services are
+    /// left unchanged.
     pub async fn register_service(&mut self, name: &str, log_config: &crate::config::LogConfig) {
         if self.services.contains_key(name) {
             return;

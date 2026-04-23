@@ -722,7 +722,7 @@ pub struct Runner {
     bt_requery_deadline: Option<tokio::time::Instant>,
 
     /// Per-param completion results cache. Populated as the TUI / CLI
-    /// resolves completions; cleared on config reload.
+    /// resolves completions.
     completion_cache: std::sync::Arc<tokio::sync::RwLock<completions::CompletionCache>>,
 }
 
@@ -1267,7 +1267,7 @@ impl Runner {
         let order = topological_sort(&dep_map).map_err(|cycle| RunnerError::Cycle { cycle })?;
 
         // Channel for item completion notifications. Store the sender on `self`
-        // so config reload can reuse it for newly-started services.
+        // so later-started services (lazy starts, pending-sweep) can reuse it.
         let (done_tx, mut done_rx) = mpsc::channel::<ItemDone>(64);
         self.done_tx = Some(done_tx.clone());
 
@@ -2964,8 +2964,7 @@ impl Runner {
     }
 
     /// Try to start any Pending services/tasks whose dependencies are now satisfied.
-    /// Called on a deferred timer after config reload, and re-schedules itself
-    /// if items remain pending.
+    /// Driven by the `StartPending` command; re-schedules itself if items remain pending.
     async fn start_pending_items(&mut self) {
         let dep_map = self.build_dep_map();
         let order = match topological_sort(&dep_map) {
