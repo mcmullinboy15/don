@@ -239,6 +239,15 @@ pub enum RunnerCommand {
         name: String,
         reply: oneshot::Sender<CommandResult>,
     },
+    /// A task process exited after an explicit run/restart.
+    TaskExited {
+        name: String,
+        pgid: i32,
+        success: bool,
+        message: Option<String>,
+        elapsed: Option<std::time::Duration>,
+        rerun: bool,
+    },
     /// Rebuild a service triggered by a file watch event.
     /// Runs the build command (if any), then restarts the service.
     Rebuild { name: String },
@@ -1362,6 +1371,16 @@ impl Runner {
                             let result = self.handle_restart_cmd(&name).await;
                             let _ = reply.send(result);
                         }
+                        RunnerCommand::TaskExited {
+                            name,
+                            pgid,
+                            success,
+                            message,
+                            elapsed,
+                            rerun,
+                        } => {
+                            self.handle_task_exit(&name, pgid, success, message, elapsed, rerun);
+                        }
                         RunnerCommand::ServiceHealthChanged { name, healthy } => {
                             self.handle_service_health_changed(&name, healthy).await;
                         }
@@ -2439,7 +2458,8 @@ impl Runner {
         let task_cfg_clone = task_cfg.clone();
         let base_dir_owned = self.base_dir.clone();
         let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
-        let event_tx = self.event_tx.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        let rerun = done_tx.is_none();
 
         tokio::spawn(async move {
             let start = std::time::Instant::now();
@@ -2462,17 +2482,6 @@ impl Runner {
                 Err(e) => (false, Some(e.to_string())),
             };
 
-            let state = if success {
-                TaskItemState::Completed
-            } else {
-                TaskItemState::Failed
-            };
-
-            let _ = event_tx.send(RunnerEvent::TaskStateChanged {
-                name: name_owned.clone(),
-                state,
-            });
-
             if let Some(done_tx) = done_tx {
                 let _ = done_tx
                     .send(ItemDone {
@@ -2484,10 +2493,16 @@ impl Runner {
                     })
                     .await;
             } else {
-                let _ = event_tx.send(RunnerEvent::TaskRerunComplete {
-                    name: name_owned,
-                    success,
-                });
+                let _ = cmd_tx
+                    .send(RunnerCommand::TaskExited {
+                        name: name_owned,
+                        pgid,
+                        success,
+                        message,
+                        elapsed: Some(elapsed),
+                        rerun,
+                    })
+                    .await;
             }
         });
     }
@@ -3341,8 +3356,88 @@ impl Runner {
         }
     }
 
+    async fn stop_task_pgid(&mut self, name: &str, pgid: i32) -> CommandResult {
+        if self.remove_attach_lock(name) {
+            self.output_manager.resume_stdout_sink(name).await;
+        }
+        if let Some(writer) = self.output_manager.service_writer(name) {
+            writer.close_follow_sinks().await;
+        }
+
+        self.output_manager
+            .service_event(name, "stopping... (requested)");
+
+        match nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            Ok(()) | Err(nix::Error::ESRCH) => {}
+            Err(e) => {
+                return Err(CommandError::Failed {
+                    name: name.to_string(),
+                    message: format!("failed to kill task pgid {pgid}: {e}"),
+                });
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None) {
+                Err(nix::Error::ESRCH) => break,
+                Ok(()) | Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Ok(()) | Err(_) => {
+                    return Err(CommandError::Failed {
+                        name: name.to_string(),
+                        message: format!("task pgid {pgid} did not exit after SIGKILL"),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_restart_task_cmd(&mut self, name: &str) -> CommandResult {
+        let (task_cfg, last_params, state, pgid) = match self.tasks.get(name) {
+            Some(rt) => (
+                rt.config.clone(),
+                rt.last_params.clone(),
+                rt.state(),
+                rt.pgid,
+            ),
+            None => {
+                return Err(CommandError::UnknownTask {
+                    name: name.to_string(),
+                });
+            }
+        };
+
+        if !task_cfg.params.is_empty() && last_params.len() < task_cfg.params.len() {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "task has params and no previous invocation to restart; use `don run`"
+                    .to_string(),
+            });
+        }
+
+        if matches!(state, TaskItemState::Running | TaskItemState::Building)
+            && let Some(pgid) = pgid
+        {
+            self.stop_task_pgid(name, pgid).await?;
+        }
+
+        self.spawn_task_rerun(name, &task_cfg, &last_params, "restarting (manual trigger)")
+            .await;
+        Ok(())
+    }
+
     /// Handle an API-initiated Restart command: stop then start.
     async fn handle_restart_cmd(&mut self, name: &str) -> CommandResult {
+        if self.tasks.contains_key(name) {
+            return self.handle_restart_task_cmd(name).await;
+        }
         // If running, stop first (ignore not-running error).
         match self.handle_stop_cmd(name).await {
             Ok(()) => {}
@@ -3783,6 +3878,9 @@ impl Runner {
         params: &HashMap<String, String>,
         start_message: &str,
     ) {
+        if let Some(rt) = self.tasks.get_mut(name) {
+            rt.last_params = params.clone();
+        }
         // Release attach lock and close follow sinks so any active attach
         // session exits cleanly before the new process starts.
         if self.remove_attach_lock(name) {
@@ -4081,6 +4179,53 @@ impl Runner {
         }
     }
 
+    fn handle_task_exit(
+        &mut self,
+        name: &str,
+        pgid: i32,
+        success: bool,
+        message: Option<String>,
+        elapsed: Option<std::time::Duration>,
+        rerun: bool,
+    ) {
+        if self.tasks.get(name).is_none_or(|rt| rt.pgid != Some(pgid)) {
+            return;
+        }
+
+        if let Some(rt) = self.tasks.get_mut(name) {
+            rt.pgid = None;
+            rt.attach_lock = None;
+        }
+
+        let timing = elapsed.map(format_duration).unwrap_or_default();
+        if success {
+            self.set_task_state(name, TaskItemState::Completed);
+            let msg = if timing.is_empty() {
+                "complete".to_string()
+            } else {
+                format!("complete ({timing})")
+            };
+            self.output_manager.service_event(name, &msg);
+        } else {
+            self.set_task_state(name, TaskItemState::Failed);
+            if let Some(ref err_msg) = message {
+                let msg = if timing.is_empty() {
+                    format!("failed ({err_msg})")
+                } else {
+                    format!("failed ({err_msg}, {timing})")
+                };
+                self.output_manager.service_error_event(name, &msg);
+            }
+        }
+
+        if rerun {
+            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                name: name.to_string(),
+                success,
+            });
+        }
+    }
+
     /// Initiate graceful shutdown of all services.
     async fn initiate_shutdown(&mut self) {
         self.output_manager
@@ -4200,8 +4345,7 @@ impl Runner {
                     join_set.spawn(async move {
                         // Global shutdown — no subsequent restart, so the
                         // pgroup-empty poll adds latency without benefit.
-                        let _ =
-                            stop_service(handle, shutdown_config.as_ref(), force, false).await;
+                        let _ = stop_service(handle, shutdown_config.as_ref(), force, false).await;
                         name_owned
                     });
                 }

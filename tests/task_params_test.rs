@@ -112,6 +112,21 @@ async fn wait_for_task_state(
     }
 }
 
+async fn wait_for_line_count(path: &std::path::Path, count: usize) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && contents.lines().count() >= count
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Common setup: a "keeper" service that idles long enough for the test to
 /// exercise commands, plus the task definition the test passes in.
 fn toml_with_keeper(task_toml: &str) -> String {
@@ -247,6 +262,132 @@ auto_run = false
         );
         let captured = std::fs::read_to_string(&out_path).unwrap();
         assert_eq!(captured.trim(), "plain");
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = runner_handle.await;
+    });
+}
+
+#[test]
+fn integration_task_can_be_run_twice_manually() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("task-rerun-manual");
+        let out_path = dir.path().join("captured.txt");
+
+        let toml = toml_with_keeper(&format!(
+            r#"
+[tasks.plain]
+cmd = "sh"
+args = ["-c", "echo plain >> {}"]
+log = "ignore"
+auto_run = false
+"#,
+            out_path.display()
+        ));
+        let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let mut events = runner.subscribe();
+
+        let runner_handle = tokio::spawn(async move { runner.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        for _ in 0..2 {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx
+                .send(RunnerCommand::RunTask {
+                    name: "plain".to_string(),
+                    params: HashMap::new(),
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            reply_rx.await.unwrap().unwrap();
+            assert!(
+                wait_for_task_state(&mut events, "plain", TaskItemState::Completed).await,
+                "task didn't reach Completed"
+            );
+        }
+
+        let captured = std::fs::read_to_string(&out_path).unwrap();
+        assert_eq!(captured.lines().count(), 2, "captured: {captured:?}");
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = runner_handle.await;
+    });
+}
+
+#[test]
+fn integration_restart_running_task_reuses_last_params() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("task-restart-running");
+        let value_path = dir.path().join("values.txt");
+        let pid_path = dir.path().join("pids.txt");
+
+        let toml = toml_with_keeper(&format!(
+            r#"
+[tasks.sync]
+cmd = "sh"
+args = ["-c", "echo $DON_PARAM_INDEX >> {}; echo $$ >> {}; sleep 300"]
+log = "ignore"
+auto_run = false
+
+[[tasks.sync.params]]
+name = "index"
+required = true
+"#,
+            value_path.display(),
+            pid_path.display()
+        ));
+        let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let mut events = runner.subscribe();
+
+        let runner_handle = tokio::spawn(async move { runner.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut params = HashMap::new();
+        params.insert("index".to_string(), "users".to_string());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::RunTask {
+                name: "sync".to_string(),
+                params,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        assert!(
+            wait_for_task_state(&mut events, "sync", TaskItemState::Running).await,
+            "task didn't reach Running"
+        );
+        assert!(
+            wait_for_line_count(&pid_path, 1).await,
+            "pid file was not written"
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Restart {
+                name: "sync".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        assert!(
+            wait_for_line_count(&pid_path, 2).await,
+            "task did not restart"
+        );
+
+        let values = std::fs::read_to_string(&value_path).unwrap();
+        assert_eq!(values.lines().collect::<Vec<_>>(), vec!["users", "users"]);
+
+        let pids = std::fs::read_to_string(&pid_path).unwrap();
+        let pid_lines: Vec<&str> = pids.lines().collect();
+        assert_eq!(pid_lines.len(), 2, "pids: {pids:?}");
+        assert_ne!(pid_lines[0], pid_lines[1], "pids: {pids:?}");
 
         let _ = shutdown_tx.send(()).await;
         let _ = runner_handle.await;
@@ -444,7 +585,10 @@ cmd = "false"
         assert!(log_path.exists(), "log file should have been written");
         let body = std::fs::read_to_string(&log_path).unwrap();
         assert!(body.contains("task: sync"), "log missing task name: {body}");
-        assert!(body.contains("param: index"), "log missing param name: {body}");
+        assert!(
+            body.contains("param: index"),
+            "log missing param name: {body}"
+        );
 
         let _ = shutdown_tx.send(()).await;
         let _ = runner_handle.await;

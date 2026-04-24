@@ -15,6 +15,7 @@
 //! [`RunnerEvent`]: super::RunnerEvent
 
 use super::{AttachWaiter, ServiceHandle, ServiceState, TaskItemState};
+use std::collections::HashMap;
 use tokio::sync::oneshot;
 
 /// All per-service runtime state, consolidated into a single struct.
@@ -118,6 +119,9 @@ pub(crate) struct RuntimeTask {
     state: TaskItemState,
     /// The task config (stored once, no repeated lookups).
     pub config: crate::config::task::Task,
+    /// Params used for the most recent spawned run. Empty for param-less
+    /// tasks and startup/watch-triggered runs.
+    pub last_params: HashMap<String, String>,
     /// Process group ID of the running task (for shutdown kills).
     pub pgid: Option<i32>,
     /// OSC query sink for reclaiming PTY write on attach.
@@ -131,13 +135,11 @@ pub(crate) struct RuntimeTask {
 }
 
 impl RuntimeTask {
-    pub(crate) fn new(
-        config: crate::config::task::Task,
-        initial_state: TaskItemState,
-    ) -> Self {
+    pub(crate) fn new(config: crate::config::task::Task, initial_state: TaskItemState) -> Self {
         Self {
             state: initial_state,
             config,
+            last_params: HashMap::new(),
             pgid: None,
             osc_sink: None,
             attach_lock: None,

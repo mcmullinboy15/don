@@ -47,10 +47,7 @@ struct ForwardListener {
 enum ForwardBackend {
     /// Don allocated an ephemeral port and injected it into the service's
     /// env under `env_name`. The service must read the env var to bind.
-    Ephemeral {
-        env_name: String,
-        addr: SocketAddr,
-    },
+    Ephemeral { env_name: String, addr: SocketAddr },
     /// Service binds a known fixed address on its own. Don just forwards.
     /// No env var injected.
     Fixed(SocketAddr),
@@ -103,22 +100,20 @@ impl ServiceProxy {
         let mut listenfd = Vec::new();
 
         for entry in entries {
-            let listen_addr: SocketAddr = entry
-                .listen
-                .parse()
-                .map_err(|e| ProxyError::Bind {
-                    addr: entry.listen.clone(),
-                    source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
-                })?;
+            let listen_addr: SocketAddr = entry.listen.parse().map_err(|e| ProxyError::Bind {
+                addr: entry.listen.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
+            })?;
 
             match &entry.mode {
                 ProxyMode::Env(env_name) => {
-                    let listener = TcpListener::bind(listen_addr)
-                        .await
-                        .map_err(|e| ProxyError::Bind {
-                            addr: entry.listen.clone(),
-                            source: e,
-                        })?;
+                    let listener =
+                        TcpListener::bind(listen_addr)
+                            .await
+                            .map_err(|e| ProxyError::Bind {
+                                addr: entry.listen.clone(),
+                                source: e,
+                            })?;
                     let ephemeral_addr = allocate_ephemeral_port().await?;
                     let (backend_tx, backend_rx) = watch::channel(None);
                     let accept_handle = tokio::spawn(proxy_accept_loop(
@@ -142,10 +137,7 @@ impl ServiceProxy {
                     let backend_addr: SocketAddr =
                         target.parse().map_err(|e| ProxyError::Bind {
                             addr: target.clone(),
-                            source: std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                e,
-                            ),
+                            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
                         })?;
                     let listener =
                         TcpListener::bind(listen_addr)
@@ -180,8 +172,8 @@ impl ServiceProxy {
                     // `AsyncFd::readable()` only needs readiness
                     // notifications, not non-blocking I/O — it never calls
                     // `accept` on this fd.
-                    let listener = std::net::TcpListener::bind(listen_addr)
-                        .map_err(|e| ProxyError::Bind {
+                    let listener =
+                        std::net::TcpListener::bind(listen_addr).map_err(|e| ProxyError::Bind {
                             addr: entry.listen.clone(),
                             source: e,
                         })?;
@@ -284,7 +276,10 @@ impl ServiceProxy {
     /// Raw fds of the listenfd listeners, in declaration order. Each fd is a
     /// bound listening socket that the child will see at fd 3, 4, ….
     pub(crate) fn listenfd_raw_fds(&self) -> Vec<RawFd> {
-        self.listenfd.iter().map(|l| l.listener.as_raw_fd()).collect()
+        self.listenfd
+            .iter()
+            .map(|l| l.listener.as_raw_fd())
+            .collect()
     }
 
     /// Create a handle that can be sent to a spawned task to set env-mode
@@ -429,9 +424,7 @@ async fn allocate_ephemeral_port() -> Result<SocketAddr, ProxyError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(ProxyError::EphemeralPort)?;
-    let addr = listener
-        .local_addr()
-        .map_err(ProxyError::EphemeralPort)?;
+    let addr = listener.local_addr().map_err(ProxyError::EphemeralPort)?;
     drop(listener);
     Ok(addr)
 }
@@ -459,9 +452,8 @@ async fn proxy_accept_loop(
                 // Back off on repeated errors to avoid busy-spinning.
                 // First few errors get a short delay; persistent errors
                 // get longer pauses.
-                let delay = std::time::Duration::from_millis(
-                    (10 * consecutive_errors.min(100)) as u64,
-                );
+                let delay =
+                    std::time::Duration::from_millis((10 * consecutive_errors.min(100)) as u64);
                 let addr = listener
                     .local_addr()
                     .map(|a| a.to_string())
@@ -505,21 +497,26 @@ async fn proxy_accept_loop(
 /// Retries the backend connection with exponential backoff if the service
 /// isn't listening yet (common during startup before the process binds its port).
 async fn proxy_connection(mut client: TcpStream, backend_addr: SocketAddr) {
+    let backend_candidates = backend_connect_candidates(backend_addr);
     let mut backend = None;
     for attempt in 0..20u32 {
-        match TcpStream::connect(backend_addr).await {
-            Ok(stream) => {
-                backend = Some(stream);
-                break;
-            }
-            Err(_) => {
-                // Exponential backoff: 10ms, 20ms, 40ms, ... capped at 500ms.
-                let delay = std::time::Duration::from_millis(
-                    (10 * (1 << attempt.min(6))).min(500),
-                );
-                tokio::time::sleep(delay).await;
+        for candidate in &backend_candidates {
+            match TcpStream::connect(candidate).await {
+                Ok(stream) => {
+                    backend = Some(stream);
+                    break;
+                }
+                Err(_) => continue,
             }
         }
+
+        if backend.is_some() {
+            break;
+        }
+
+        // Exponential backoff: 10ms, 20ms, 40ms, ... capped at 500ms.
+        let delay = std::time::Duration::from_millis((10 * (1 << attempt.min(6))).min(500));
+        tokio::time::sleep(delay).await;
     }
 
     let Some(mut backend) = backend else {
@@ -530,4 +527,67 @@ async fn proxy_connection(mut client: TcpStream, backend_addr: SocketAddr) {
 
     // Shovel bytes in both directions until either side closes.
     let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+}
+
+fn backend_connect_candidates(backend_addr: SocketAddr) -> Vec<SocketAddr> {
+    let mut candidates = vec![backend_addr];
+    match backend_addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_loopback() => {
+            candidates.push(SocketAddr::new(
+                std::net::Ipv6Addr::LOCALHOST.into(),
+                backend_addr.port(),
+            ));
+        }
+        std::net::IpAddr::V6(ip) if ip.is_loopback() => {
+            candidates.push(SocketAddr::new(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+                backend_addr.port(),
+            ));
+        }
+        _ => {}
+    }
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use super::backend_connect_candidates;
+
+    #[test]
+    fn loopback_ipv4_backends_try_ipv6_loopback_too() {
+        let candidates =
+            backend_connect_candidates(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 46165));
+
+        assert_eq!(
+            candidates,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 46165),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 46165),
+            ]
+        );
+    }
+
+    #[test]
+    fn loopback_ipv6_backends_try_ipv4_loopback_too() {
+        let candidates =
+            backend_connect_candidates(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 46165));
+
+        assert_eq!(
+            candidates,
+            vec![
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 46165),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 46165),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_loopback_backends_keep_single_target() {
+        let target = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0010));
+        let candidates = backend_connect_candidates(SocketAddr::new(target, 46165));
+
+        assert_eq!(candidates, vec![SocketAddr::new(target, 46165)]);
+    }
 }
