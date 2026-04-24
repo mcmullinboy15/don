@@ -37,7 +37,7 @@ Get the existing code into the right module structure, fix known bugs, and estab
 
 ### Architectural Decisions
 - [x] Decided on tokio channels (mpsc + broadcast + oneshot) — no Arc<Mutex>
-- [x] Documented in CLAUDE.md under "Cross-Module Communication"
+- [x] Documented in agent guidance docs (`AGENTS.md`/`CLAUDE.md`) under "Cross-Module Communication"
 
 ### Test Infrastructure
 - [x] Create `tests/` directory for integration tests
@@ -47,7 +47,7 @@ Get the existing code into the right module structure, fix known bugs, and estab
   - `port.rs` — free_port() for ephemeral port allocation
   - `timeout.rs` — run_with_timeout() for async test timeouts
 - [x] 11 integration tests proving the harness works (valid/invalid configs, CLI binary tests)
-- [x] Added CI test guidance to CLAUDE.md (PTY fallback, test timeouts)
+- [x] Added CI test guidance to agent guidance docs (`AGENTS.md`/`CLAUDE.md`) (PTY fallback, test timeouts)
 
 ### Test Coverage Checkpoint
 - [x] All existing config parsing tests pass after restructure (6 unit tests)

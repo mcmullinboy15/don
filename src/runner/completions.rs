@@ -73,12 +73,7 @@ impl CompletionCache {
         Some(entry.values.clone())
     }
 
-    pub(crate) fn put(
-        &mut self,
-        key: CacheKey,
-        values: Vec<String>,
-        ttl: Option<Duration>,
-    ) {
+    pub(crate) fn put(&mut self, key: CacheKey, values: Vec<String>, ttl: Option<Duration>) {
         self.entries.insert(
             key,
             CacheEntry {
@@ -127,9 +122,7 @@ pub(crate) struct ResolveRequest<'a> {
 
 /// Resolve candidate values for one param by running its `completions`
 /// command. See [`ResolveRequest`] for the field meanings.
-pub(crate) async fn resolve(
-    req: ResolveRequest<'_>,
-) -> Result<Vec<String>, CompletionError> {
+pub(crate) async fn resolve(req: ResolveRequest<'_>) -> Result<Vec<String>, CompletionError> {
     let ResolveRequest {
         cache,
         task,
@@ -146,9 +139,7 @@ pub(crate) async fn resolve(
         partial_hash: hash_partial(partial),
     };
 
-    if !force_refresh
-        && let Some(cached) = cache.read().await.get(&key)
-    {
+    if !force_refresh && let Some(cached) = cache.read().await.get(&key) {
         return Ok(cached);
     }
 
@@ -212,15 +203,8 @@ pub(crate) async fn resolve(
     let parsed = match parse_output(&output.stdout, completions.parse) {
         Ok(v) => v,
         Err(msg) => {
-            let log_path = write_failure_log(
-                base_dir,
-                task,
-                param,
-                completions,
-                Some(&output),
-                &msg,
-            )
-            .await;
+            let log_path =
+                write_failure_log(base_dir, task, param, completions, Some(&output), &msg).await;
             return Err(CompletionError {
                 message: format!("completion command output could not be parsed: {msg}"),
                 log_path,
@@ -262,10 +246,7 @@ async fn run_command(
 }
 
 /// Parse stdout bytes into candidate values per the configured strategy.
-pub(crate) fn parse_output(
-    bytes: &[u8],
-    parse: CompletionParse,
-) -> Result<Vec<String>, String> {
+pub(crate) fn parse_output(bytes: &[u8], parse: CompletionParse) -> Result<Vec<String>, String> {
     match parse {
         CompletionParse::Lines => {
             let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
@@ -421,7 +402,11 @@ mod tests {
             param: "p".into(),
             partial_hash: 1,
         };
-        cache.put(key2.clone(), vec!["b".into()], Some(Duration::from_millis(1)));
+        cache.put(
+            key2.clone(),
+            vec!["b".into()],
+            Some(Duration::from_millis(1)),
+        );
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(cache.get(&key2), None, "expired entry should be missed");
     }

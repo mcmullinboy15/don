@@ -78,9 +78,8 @@ pub(crate) async fn start_service(
     // Dispatch based on the service kind.
     if let Some(ServiceKind::Docker(docker_config)) = &resolved.kind {
         // Docker kind: start a container via the Docker API.
-        let client = docker_client.ok_or_else(|| {
-            ServiceError::Docker("docker client not available".to_string())
-        })?;
+        let client = docker_client
+            .ok_or_else(|| ServiceError::Docker("docker client not available".to_string()))?;
         let (handle, child_output) = crate::docker::start_docker_service(
             client,
             name,
@@ -134,24 +133,29 @@ pub(crate) async fn start_service(
             if let Some(ref bin_path) = resolved.resolved_binary_path {
                 (bin_path.clone(), vec![])
             } else {
-                ("bazel".to_string(), vec!["run".to_string(), bazel.target.clone()])
+                (
+                    "bazel".to_string(),
+                    vec!["run".to_string(), bazel.target.clone()],
+                )
             }
         }
         Some(ServiceKind::Turbo(turbo)) => {
             if let Some(ref filter) = turbo.filter {
-                ("npx".to_string(), vec![
-                    "turbo".to_string(),
-                    "run".to_string(),
-                    turbo.task.clone(),
-                    "--filter".to_string(),
-                    filter.clone(),
-                ])
+                (
+                    "npx".to_string(),
+                    vec![
+                        "turbo".to_string(),
+                        "run".to_string(),
+                        turbo.task.clone(),
+                        "--filter".to_string(),
+                        filter.clone(),
+                    ],
+                )
             } else {
-                ("npx".to_string(), vec![
-                    "turbo".to_string(),
-                    "run".to_string(),
-                    turbo.task.clone(),
-                ])
+                (
+                    "npx".to_string(),
+                    vec!["turbo".to_string(), "run".to_string(), turbo.task.clone()],
+                )
             }
         }
         _ => {
@@ -359,14 +363,9 @@ pub(crate) async fn stop_service(
                 // a data-dir lock. Poll until the pgroup is empty so a
                 // restart won't collide with a half-dead old instance.
                 // If 2s isn't enough, SIGKILL the stragglers.
-                if !process
-                    .wait_pgroup_empty(Duration::from_secs(2))
-                    .await
-                {
+                if !process.wait_pgroup_empty(Duration::from_secs(2)).await {
                     let _ = process.signal(Signal::SIGKILL);
-                    let _ = process
-                        .wait_pgroup_empty(Duration::from_millis(500))
-                        .await;
+                    let _ = process.wait_pgroup_empty(Duration::from_millis(500)).await;
                 }
             }
         }
@@ -396,7 +395,11 @@ pub(crate) async fn stop_service(
 
 /// Construct `cargo build` arguments from a RustConfig.
 pub(crate) fn rust_build_args(config: &RustConfig) -> Vec<String> {
-    let mut args = vec!["build".to_string(), "--bin".to_string(), config.binary.clone()];
+    let mut args = vec![
+        "build".to_string(),
+        "--bin".to_string(),
+        config.binary.clone(),
+    ];
     if !config.features.is_empty() {
         args.push("--features".to_string());
         args.push(config.features.join(","));
@@ -528,8 +531,16 @@ mod tests {
                     target_dir: Some(PathBuf::from("./custom-target")),
                 },
                 expected: vec![
-                    "build", "--bin", "api", "--features", "feat1,feat2",
-                    "--release", "--target-dir", "./custom-target", "--jobs", "4",
+                    "build",
+                    "--bin",
+                    "api",
+                    "--features",
+                    "feat1,feat2",
+                    "--release",
+                    "--target-dir",
+                    "./custom-target",
+                    "--jobs",
+                    "4",
                 ],
             },
             Case {
@@ -637,8 +648,13 @@ mod tests {
                 },
                 output: "/tmp/bin/server",
                 expected: vec![
-                    "build", "-o", "/tmp/bin/server", "-race",
-                    "-ldflags", "-X main.version=1.0", "./cmd/server",
+                    "build",
+                    "-o",
+                    "/tmp/bin/server",
+                    "-race",
+                    "-ldflags",
+                    "-X main.version=1.0",
+                    "./cmd/server",
                 ],
             },
         ];

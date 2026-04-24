@@ -201,16 +201,14 @@ impl ServiceBuilder {
     /// Set watch patterns.
     pub fn watch(mut self, patterns: &[&str]) -> Self {
         let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
-        self.lines
-            .push(format!("watch = [{}]", p_str.join(", ")));
+        self.lines.push(format!("watch = [{}]", p_str.join(", ")));
         self
     }
 
     /// Set ignore patterns.
     pub fn ignore(mut self, patterns: &[&str]) -> Self {
         let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
-        self.lines
-            .push(format!("ignore = [{}]", p_str.join(", ")));
+        self.lines.push(format!("ignore = [{}]", p_str.join(", ")));
         self
     }
 
@@ -228,8 +226,7 @@ impl ServiceBuilder {
             .iter()
             .map(|a| format!("{{ listen = \"{a}\", listenfd = true }}"))
             .collect();
-        self.lines
-            .push(format!("proxy = [{}]", entries.join(", ")));
+        self.lines.push(format!("proxy = [{}]", entries.join(", ")));
         self
     }
 
@@ -274,8 +271,7 @@ impl ServiceBuilder {
     /// Set shutdown config.
     pub fn shutdown(mut self, signal: &str, timeout: &str) -> Self {
         self.lines.push(format!("shutdown.signal = \"{signal}\""));
-        self.lines
-            .push(format!("shutdown.timeout = \"{timeout}\""));
+        self.lines.push(format!("shutdown.timeout = \"{timeout}\""));
         self
     }
 
@@ -333,16 +329,14 @@ impl TaskBuilder {
     /// Set watch patterns.
     pub fn watch(mut self, patterns: &[&str]) -> Self {
         let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
-        self.lines
-            .push(format!("watch = [{}]", p_str.join(", ")));
+        self.lines.push(format!("watch = [{}]", p_str.join(", ")));
         self
     }
 
     /// Set ignore patterns.
     pub fn ignore(mut self, patterns: &[&str]) -> Self {
         let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
-        self.lines
-            .push(format!("ignore = [{}]", p_str.join(", ")));
+        self.lines.push(format!("ignore = [{}]", p_str.join(", ")));
         self
     }
 

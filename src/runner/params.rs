@@ -113,9 +113,7 @@ fn coerce(
         config::ParamKind::Bool => config::parse_bool_value(value)
             .map(|b| b.to_string())
             .ok_or_else(|| {
-                format!(
-                    "param '--{name}' for task '{task_name}': '{value}' is not a valid bool"
-                )
+                format!("param '--{name}' for task '{task_name}': '{value}' is not a valid bool")
             }),
     }
 }
@@ -192,7 +190,10 @@ mod tests {
             },
             Case {
                 name: "required missing rejected",
-                params: vec![TaskParam { required: true, ..basic_param("a") }],
+                params: vec![TaskParam {
+                    required: true,
+                    ..basic_param("a")
+                }],
                 raw: &[],
                 want_ok: None,
                 want_err: Some("missing required"),
@@ -248,7 +249,10 @@ mod tests {
                 name: "int below min",
                 params: vec![TaskParam {
                     kind: ParamKind::Int,
-                    validate: Some(ParamValidate { min: Some(10), max: None }),
+                    validate: Some(ParamValidate {
+                        min: Some(10),
+                        max: None,
+                    }),
                     ..basic_param("n")
                 }],
                 raw: &[("n", "5")],
@@ -259,7 +263,10 @@ mod tests {
                 name: "int above max",
                 params: vec![TaskParam {
                     kind: ParamKind::Int,
-                    validate: Some(ParamValidate { min: None, max: Some(10) }),
+                    validate: Some(ParamValidate {
+                        min: None,
+                        max: Some(10),
+                    }),
                     ..basic_param("n")
                 }],
                 raw: &[("n", "99")],
