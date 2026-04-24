@@ -865,8 +865,35 @@ async fn run_start(
         .map(|(name, task)| (name.as_str(), &task.log))
         .collect();
 
+    // Synthetic build-tool stream names should participate in the initial
+    // output palette so color choice and prefix width depend only on the
+    // config-derived item set, not on later registration order.
+    let service_kinds = || {
+        config.services.values().flat_map(|svc| {
+            std::iter::once(svc.kind.as_ref())
+                .chain(svc.platform.values().map(|ov| ov.kind.as_ref()))
+                .flatten()
+        })
+    };
+    let uses_bazel = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Bazel(_)))
+        || config.tasks.values().any(|t| t.bazel.is_some());
+    let uses_turbo = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Turbo(_)))
+        || config.tasks.values().any(|t| t.turbo.is_some());
+    let build_tool_log = don::config::LogConfig::Stdout;
+    let build_tool_configs: Vec<(&str, &don::config::LogConfig)> = [
+        uses_bazel.then_some(("bazel", &build_tool_log)),
+        uses_turbo.then_some(("turbo", &build_tool_log)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
     let all_configs: Vec<(&str, &don::config::LogConfig)> =
-        service_configs.into_iter().chain(task_configs).collect();
+        service_configs
+            .into_iter()
+            .chain(task_configs)
+            .chain(build_tool_configs.iter().copied())
+            .collect();
 
     // Install signal handlers before building the runner so Ctrl+C still
     // reaches the graceful-shutdown path even during a slow startup.
@@ -904,27 +931,10 @@ async fn run_start(
         // clients (which carry `name = "bazel"` / `"turbo"`) are silently
         // dropped by the filter's allowlist — the user sees nothing during
         // the build phase.
-        let mut build_tool_names: Vec<String> = Vec::new();
-        // Scan both the base `kind` and every platform override — a service
-        // might only declare `kind = "bazel"` under `[services.api.platform.linux]`,
-        // and we still want the filter entry present.
-        let service_kinds = || {
-            config.services.values().flat_map(|svc| {
-                std::iter::once(svc.kind.as_ref())
-                    .chain(svc.platform.values().map(|ov| ov.kind.as_ref()))
-                    .flatten()
-            })
-        };
-        let uses_bazel = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Bazel(_)))
-            || config.tasks.values().any(|t| t.bazel.is_some());
-        let uses_turbo = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Turbo(_)))
-            || config.tasks.values().any(|t| t.turbo.is_some());
-        if uses_bazel {
-            build_tool_names.push("bazel".to_string());
-        }
-        if uses_turbo {
-            build_tool_names.push("turbo".to_string());
-        }
+        let build_tool_names: Vec<String> = build_tool_configs
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
 
         // Collect names whose `hidden = true` flag should start them outside
         // the TUI filter's default selection. Both services and tasks can

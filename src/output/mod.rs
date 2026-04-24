@@ -34,8 +34,8 @@ pub const LIFECYCLE_EVENT_NAME: &str = "don";
 /// Default channel capacity for sinks.
 const SINK_CHANNEL_CAPACITY: usize = 1000;
 
-/// Terminal colors for service name prefixes.
-const COLORS: &[Color] = &[
+/// Terminal colors for normal service/task name prefixes.
+const SERVICE_COLORS: &[Color] = &[
     Color::Cyan,
     Color::Yellow,
     Color::Magenta,
@@ -48,7 +48,20 @@ const COLORS: &[Color] = &[
     Color::DarkGreen,
     Color::DarkBlue,
     Color::DarkRed,
+    Color::AnsiValue(208),
+    Color::AnsiValue(45),
+    Color::AnsiValue(141),
+    Color::AnsiValue(118),
+    Color::AnsiValue(81),
+    Color::AnsiValue(203),
+    Color::AnsiValue(220),
+    Color::AnsiValue(39),
 ];
+
+/// Dedicated build-tool colors so these synthetic streams never collide with
+/// the rotating service palette.
+const BAZEL_COLOR: Color = Color::AnsiValue(166);
+const TURBO_COLOR: Color = Color::AnsiValue(51);
 
 /// Handle to an active OSC response sink. Use [`take_pty_write`] to
 /// stop the sink and reclaim the PTY handle (e.g., for attach).
@@ -269,15 +282,30 @@ impl ServiceWriter {
     }
 }
 
-/// Assigns a deterministic color index to a service name.
-fn assign_colors(names: &[&str]) -> HashMap<String, usize> {
+fn reserved_color(name: &str) -> Option<Color> {
+    match name {
+        "bazel" => Some(BAZEL_COLOR),
+        "turbo" => Some(TURBO_COLOR),
+        _ => None,
+    }
+}
+
+/// Assigns a deterministic color to each service name.
+fn assign_colors(names: &[&str]) -> HashMap<String, Color> {
     let mut sorted: Vec<&str> = names.to_vec();
-    sorted.sort();
-    sorted
-        .into_iter()
-        .enumerate()
-        .map(|(i, name)| (name.to_string(), i % COLORS.len()))
-        .collect()
+    sorted.sort_unstable();
+
+    let mut next_service_color = 0usize;
+    let mut assigned = HashMap::with_capacity(sorted.len());
+    for name in sorted {
+        let color = reserved_color(name).unwrap_or_else(|| {
+            let color = SERVICE_COLORS[next_service_color % SERVICE_COLORS.len()];
+            next_service_color += 1;
+            color
+        });
+        assigned.insert(name.to_string(), color);
+    }
+    assigned
 }
 
 /// Format a command + args pair into a shell-ish one-liner for debug logs.
@@ -323,8 +351,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Build a formatted prefix as bytes for a service name.
-fn format_prefix(name: &str, color_index: usize, max_name_len: usize) -> Bytes {
-    let color = COLORS[color_index % COLORS.len()];
+fn format_prefix(name: &str, color: Color, max_name_len: usize) -> Bytes {
     Bytes::from(format!(
         "{}{:width$}{} | ",
         SetForegroundColor(color),
@@ -462,8 +489,8 @@ impl OutputManager {
                 crate::config::LogConfig::Ignore => vec![],
             };
 
-            let color_idx = color_map.get(*name).copied().unwrap_or(0);
-            let prefix = format_prefix(name, color_idx, max_name_len);
+            let color = color_map.get(*name).copied().unwrap_or(Color::White);
+            let prefix = format_prefix(name, color, max_name_len);
 
             service_map.insert(
                 name.to_string(),
@@ -667,8 +694,13 @@ impl OutputManager {
             .unwrap_or(0)
             .max(5);
         let max_name_len = current_max.max(name.len());
-        let color_idx = self.services.len() % COLORS.len();
-        let prefix = format_prefix(name, color_idx, max_name_len);
+        let mut all_names: Vec<&str> = self.services.keys().map(String::as_str).collect();
+        all_names.push(name);
+        let color = assign_colors(&all_names)
+            .get(name)
+            .copied()
+            .unwrap_or(Color::White);
+        let prefix = format_prefix(name, color, max_name_len);
 
         let sinks = match log_config {
             crate::config::LogConfig::Stdout => vec![self.stdout_sink.clone()],
@@ -1246,7 +1278,7 @@ mod tests {
             },
         ];
 
-        let mut prev_result: Option<HashMap<String, usize>> = None;
+        let mut prev_result: Option<HashMap<String, Color>> = None;
         for case in &cases {
             let result = assign_colors(&case.names);
             if let Some(ref prev) = prev_result {
@@ -1264,21 +1296,31 @@ mod tests {
     fn test_color_assignment_distinct() {
         let names = vec!["a", "b", "c", "d"];
         let result = assign_colors(&names);
-        let indices: Vec<usize> = {
+        let colors: Vec<Color> = {
             let mut sorted_names: Vec<&str> = names.clone();
-            sorted_names.sort();
+            sorted_names.sort_unstable();
             sorted_names.iter().map(|n| result[*n]).collect()
         };
-        let unique: std::collections::HashSet<usize> = indices.iter().copied().collect();
-        assert_eq!(unique.len(), indices.len());
+        let unique: std::collections::HashSet<Color> = colors.iter().copied().collect();
+        assert_eq!(unique.len(), colors.len());
     }
 
     #[test]
     fn test_color_assignment_wraps() {
-        let names: Vec<String> = (0..COLORS.len() + 3).map(|i| format!("svc{i}")).collect();
+        let names: Vec<String> = (0..SERVICE_COLORS.len() + 3)
+            .map(|i| format!("svc{i}"))
+            .collect();
         let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let result = assign_colors(&name_refs);
         assert_eq!(result.len(), names.len());
+    }
+
+    #[test]
+    fn test_build_tool_colors_are_reserved() {
+        let result = assign_colors(&["api", "bazel", "turbo", "worker"]);
+        assert_eq!(result["bazel"], BAZEL_COLOR);
+        assert_eq!(result["turbo"], TURBO_COLOR);
+        assert_ne!(result["bazel"], result["turbo"]);
     }
 
     #[test]
@@ -1308,7 +1350,7 @@ mod tests {
         ];
 
         for case in cases {
-            let prefix = format_prefix(case.service_name, 0, case.max_len);
+            let prefix = format_prefix(case.service_name, Color::Cyan, case.max_len);
             let stripped = strip_ansi(&prefix);
             let expected = format!("{:width$} | ", case.service_name, width = case.max_len);
             assert_eq!(stripped, expected, "case: {}", case.name);
