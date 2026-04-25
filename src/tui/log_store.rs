@@ -19,8 +19,15 @@ pub(crate) const DEFAULT_CAPACITY: usize = 5_000;
 
 /// A bounded, time-ordered buffer of formatted log lines.
 pub(crate) struct LogStore {
-    entries: VecDeque<FormattedLogLine>,
+    entries: VecDeque<StoredLogLine>,
     capacity: usize,
+    next_id: u64,
+}
+
+/// One stored log line plus its monotonically increasing sequence id.
+pub(crate) struct StoredLogLine {
+    pub(crate) id: u64,
+    pub(crate) line: FormattedLogLine,
 }
 
 impl LogStore {
@@ -30,24 +37,34 @@ impl LogStore {
         Self {
             entries: VecDeque::with_capacity(capacity.min(DEFAULT_CAPACITY)),
             capacity,
+            next_id: 0,
         }
     }
 
-    /// Push a line, evicting the oldest if at capacity.
-    pub(crate) fn push(&mut self, line: FormattedLogLine) {
+    /// Push a line, evicting the oldest if at capacity. Returns the line's
+    /// sequence id.
+    pub(crate) fn push(&mut self, line: FormattedLogLine) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
         if self.capacity == 0 {
-            return;
+            return id;
         }
         if self.entries.len() >= self.capacity {
             self.entries.pop_front();
         }
-        self.entries.push_back(line);
+        self.entries.push_back(StoredLogLine { id, line });
+        id
     }
 
     /// Iterate oldest-first. Used by filter-change replay to rerender
     /// matching lines into the freshly-cleared terminal.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &FormattedLogLine> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &StoredLogLine> {
         self.entries.iter()
+    }
+
+    /// Id of the most recently stored line, if any.
+    pub(crate) fn latest_id(&self) -> Option<u64> {
+        self.next_id.checked_sub(1)
     }
 
     /// Number of lines currently stored.
@@ -95,5 +112,15 @@ mod tests {
         store.push(line("a", "1"));
         store.push(line("a", "2"));
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn latest_id_tracks_most_recent_push() {
+        let mut store = LogStore::with_capacity(2);
+        assert_eq!(store.latest_id(), None);
+        assert_eq!(store.push(line("a", "1")), 0);
+        assert_eq!(store.latest_id(), Some(0));
+        assert_eq!(store.push(line("a", "2")), 1);
+        assert_eq!(store.latest_id(), Some(1));
     }
 }

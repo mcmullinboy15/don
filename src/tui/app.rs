@@ -158,6 +158,12 @@ impl StatusCounts {
 pub(crate) struct App {
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
+    /// Graceful shutdown is in progress: the inline bar becomes
+    /// non-interactive and new log lines from every service are shown.
+    pub(crate) shutdown_started: bool,
+    /// Last stored log id when shutdown started. Older lines still obey the
+    /// committed filter; newer ones bypass it.
+    pub(crate) shutdown_log_cutoff: Option<u64>,
     pub(crate) filter: FilterState,
     pub(crate) palette: ActionPalette,
     /// Monotonically incrementing frame counter, driven by the TUI's timer
@@ -224,6 +230,8 @@ impl App {
         Self {
             counts,
             view_mode: ViewMode::Normal,
+            shutdown_started: false,
+            shutdown_log_cutoff: None,
             filter: FilterState::new(all_filter_names, &hidden_names),
             palette: ActionPalette::default(),
             spinner_frame: 0,
@@ -234,6 +242,26 @@ impl App {
             overlay_filtering: false,
             task_configs,
             form: None,
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&mut self, cutoff: Option<u64>) {
+        self.shutdown_started = true;
+        self.shutdown_log_cutoff = cutoff;
+        self.view_mode = ViewMode::Normal;
+        self.palette.close();
+        self.overlay_query.clear();
+        self.overlay_filtering = false;
+        self.form = None;
+    }
+
+    pub(crate) fn should_render_log(&self, name: &str, id: u64) -> bool {
+        if !self.shutdown_started {
+            return self.filter.passes(name);
+        }
+        match self.shutdown_log_cutoff {
+            Some(cutoff) => id > cutoff || self.filter.passes(name),
+            None => true,
         }
     }
 
@@ -446,5 +474,49 @@ mod tests {
         app.apply_service_state("api".into(), ServiceState::Failed);
         assert_eq!(app.counts.services_ready, 1);
         assert_eq!(app.counts.services_failed, 1);
+    }
+
+    #[test]
+    fn shutdown_mode_only_bypasses_filter_for_new_logs() {
+        let mut app = App::new(
+            vec!["api".into(), "worker".into()],
+            vec![],
+            vec![],
+            HashMap::new(),
+            HashSet::new(),
+        );
+        app.filter.enter_edit();
+        app.filter.push_query_char('a');
+        app.filter.commit();
+
+        assert!(app.should_render_log("api", 4));
+        assert!(!app.should_render_log("worker", 4));
+
+        app.begin_shutdown(Some(4));
+
+        assert!(app.should_render_log("api", 4));
+        assert!(!app.should_render_log("worker", 4));
+        assert!(app.should_render_log("worker", 5));
+    }
+
+    #[test]
+    fn begin_shutdown_returns_to_normal_view() {
+        let mut app = App::new(
+            vec!["api".into()],
+            vec![],
+            vec![],
+            HashMap::new(),
+            HashSet::new(),
+        );
+        app.view_mode = ViewMode::Overlay;
+        app.overlay_query = "api".into();
+        app.overlay_filtering = true;
+
+        app.begin_shutdown(None);
+
+        assert!(app.shutdown_started);
+        assert_eq!(app.view_mode, ViewMode::Normal);
+        assert!(app.overlay_query.is_empty());
+        assert!(!app.overlay_filtering);
     }
 }

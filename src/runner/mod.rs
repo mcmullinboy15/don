@@ -996,6 +996,8 @@ pub enum RunnerEvent {
     RebuildComplete { name: String, success: bool },
     /// A task re-run completed (file watch triggered).
     TaskRerunComplete { name: String, success: bool },
+    /// Graceful shutdown has started.
+    ShutdownStarted,
     /// Shutdown complete.
     ShutdownComplete,
 }
@@ -4916,6 +4918,7 @@ impl Runner {
 
     /// Initiate graceful shutdown of all services.
     async fn initiate_shutdown(&mut self) {
+        let _ = self.event_tx.send(RunnerEvent::ShutdownStarted);
         let _ = self.shutdown_flag_tx.send(true);
         self.output_manager
             .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");

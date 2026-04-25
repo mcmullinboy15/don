@@ -69,13 +69,17 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
         .filter(|(name, _)| app.filter.passes(name))
         .count();
     let total_services = countable().count();
-    let bar = Paragraph::new(normal_bar_line(
-        &app.counts,
-        &app.filter,
-        app.spinner_frame,
-        visible_services,
-        total_services,
-    ));
+    let bar = if app.shutdown_started {
+        Paragraph::new(shutdown_bar_line(&app.counts, app.spinner_frame))
+    } else {
+        Paragraph::new(normal_bar_line(
+            &app.counts,
+            &app.filter,
+            app.spinner_frame,
+            visible_services,
+            total_services,
+        ))
+    };
     frame.render_widget(bar, inner);
 }
 
@@ -427,6 +431,44 @@ fn filter_bar_line(counts: &StatusCounts, filter: &FilterState) -> Line<'static>
     Line::from(spans)
 }
 
+fn shutdown_bar_line(counts: &StatusCounts, spinner_frame: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let spinner_glyph = if counts.is_working() {
+        SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()]
+    } else {
+        " "
+    };
+    spans.push(Span::styled(
+        format!(" {spinner_glyph} "),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        "shutting down",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(separator());
+    spans.extend(base_count_spans(counts));
+    if counts.tasks_running > 0 {
+        spans.push(separator());
+        let label = if counts.tasks_running == 1 {
+            "1 task running".to_string()
+        } else {
+            format!("{} tasks running", counts.tasks_running)
+        };
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn palette_bar_line(palette: &ActionPalette) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(bold_cyan("tasks: "));
@@ -504,6 +546,29 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: Line<'static>) -> String {
+        line.spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    #[test]
+    fn shutdown_bar_hides_interactive_controls() {
+        let text = line_text(shutdown_bar_line(&StatusCounts::default(), 0));
+        assert!(text.contains("shutting down"));
+        assert!(!text.contains("[l] logs"));
+        assert!(!text.contains("[t] tasks"));
+        assert!(!text.contains("[s] status"));
+    }
 }
 
 fn service_state_label(state: ServiceState) -> &'static str {

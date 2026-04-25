@@ -18,8 +18,6 @@ fn errln(msg: impl std::fmt::Display) {
     let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
-const RUNNER_FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 #[derive(Parser, Debug)]
 #[command(
     name = "don",
@@ -1065,11 +1063,10 @@ where
     T: Send + 'static,
 {
     // Process-level shutdown supervision lives outside the runner. The runner
-    // gets the first chance to unwind cleanly, but if startup or shutdown
-    // wedges after a signal, `main` still forces progress toward process exit.
+    // gets the first chance to unwind cleanly. `main` only force-aborts the
+    // runner task if a second Ctrl+C arrives, mirroring the daemon's own
+    // two-signal shutdown semantics.
     let poll_interval = std::time::Duration::from_millis(100);
-    let mut graceful_deadline = (don::runner::signal_count() >= 1)
-        .then_some(tokio::time::Instant::now() + RUNNER_FORCE_EXIT_TIMEOUT);
 
     loop {
         if don::runner::signal_count() >= 2 {
@@ -1079,30 +1076,9 @@ where
             return Err(format!("forced exit while {phase}"));
         }
 
-        if let Some(deadline) = graceful_deadline {
-            tokio::select! {
-                result = &mut handle => return map_join_result(result, phase),
-                _ = tokio::time::sleep_until(deadline) => {
-                    errln(format!(
-                        "runner did not stop within {:.1}s while {phase}; forcing exit",
-                        RUNNER_FORCE_EXIT_TIMEOUT.as_secs_f32(),
-                    ));
-                    handle.abort();
-                    let _ = handle.await;
-                    return Err(format!("forced exit while {phase}"));
-                }
-                _ = tokio::time::sleep(poll_interval) => {}
-            }
-        } else {
-            tokio::select! {
-                result = &mut handle => return map_join_result(result, phase),
-                _ = tokio::time::sleep(poll_interval) => {
-                    if don::runner::signal_count() >= 1 {
-                        graceful_deadline =
-                            Some(tokio::time::Instant::now() + RUNNER_FORCE_EXIT_TIMEOUT);
-                    }
-                }
-            }
+        tokio::select! {
+            result = &mut handle => return map_join_result(result, phase),
+            _ = tokio::time::sleep(poll_interval) => {}
         }
     }
 }

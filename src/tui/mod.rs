@@ -191,24 +191,31 @@ pub async fn run_tui(
             maybe_line = log_rx.recv() => {
                 match maybe_line {
                     Some(line) => {
+                        if is_shutdown_start_line(&line) {
+                            enter_shutdown_mode(&mut app, &mut terminal, &store, &mut modal)?;
+                        }
+                        let line_id = store.latest_id().map_or(0, |id| id.saturating_add(1));
                         // Skip inline writes while a modal owns stdout —
                         // they'd go to the alt screen. `LogStore` still
                         // captures the line, and `clear_and_replay` on
                         // modal exit brings the inline view up to date.
-                        if modal.is_none() && app.filter.passes(&line.name) {
+                        if modal.is_none() && app.should_render_log(&line.name, line_id) {
                             let width = terminal.size()?.width.max(1);
                             insert_line(&mut terminal, &line, width)?;
                             // `insert_before` resets ratatui's back buffer;
                             // redraw or the bar stays blank until next event.
                             draw_inline_bar(&mut terminal, &app)?;
                         }
-                        store.push(line);
+                        let _ = store.push(line);
                     }
                     None => break, // runner closed the log channel — shut down
                 }
             }
             runner_result = runner_events.recv() => {
                 match runner_result {
+                    Ok(RunnerEvent::ShutdownStarted) => {
+                        enter_shutdown_mode(&mut app, &mut terminal, &store, &mut modal)?;
+                    }
                     Ok(event) => {
                         apply_runner_event(event, &mut app);
                         // Lazy services clutter the filter modal with names
@@ -321,6 +328,26 @@ fn draw_inline_bar(terminal: &mut TuiTerminal, app: &App) -> Result<(), TuiError
     Ok(())
 }
 
+fn is_shutdown_start_line(line: &FormattedLogLine) -> bool {
+    line.name == crate::output::LIFECYCLE_EVENT_NAME
+        && String::from_utf8_lossy(&line.bytes).contains("shutting down gracefully")
+}
+
+fn enter_shutdown_mode(
+    app: &mut App,
+    terminal: &mut TuiTerminal,
+    store: &LogStore,
+    modal: &mut Option<Modal>,
+) -> Result<(), TuiError> {
+    if app.shutdown_started {
+        return Ok(());
+    }
+    app.begin_shutdown(store.latest_id());
+    *modal = None;
+    draw_inline_bar(terminal, app)?;
+    Ok(())
+}
+
 /// Apply one [`RunnerEvent`] to the cached state on [`App`].
 fn apply_runner_event(event: RunnerEvent, app: &mut App) {
     match event {
@@ -332,6 +359,7 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) {
         }
         RunnerEvent::RebuildComplete { .. }
         | RunnerEvent::TaskRerunComplete { .. }
+        | RunnerEvent::ShutdownStarted
         | RunnerEvent::ShutdownComplete => {}
     }
 }
@@ -376,8 +404,8 @@ fn clear_and_replay(
     execute!(std::io::stdout(), Clear(ClearType::Purge))?;
     let width = terminal.size()?.width.max(1);
     for entry in store.iter() {
-        if app.filter.passes(&entry.name) {
-            insert_line(terminal, entry, width)?;
+        if app.should_render_log(&entry.line.name, entry.id) {
+            insert_line(terminal, &entry.line, width)?;
         }
     }
     terminal.draw(|f| render::draw_bar(f, app))?;
@@ -444,6 +472,10 @@ fn handle_key(
         return Ok(());
     }
 
+    if app.shutdown_started {
+        return Ok(());
+    }
+
     match app.view_mode {
         ViewMode::Normal => handle_normal_key(key, app, terminal, store, modal)?,
         ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
@@ -465,7 +497,7 @@ fn handle_normal_key(
         KeyCode::Enter => {
             terminal.insert_before(1, |_buf| {})?;
             draw_inline_bar(terminal, app)?;
-            store.push(FormattedLogLine {
+            let _ = store.push(FormattedLogLine {
                 name: String::new(),
                 bytes: Vec::new(),
             });
