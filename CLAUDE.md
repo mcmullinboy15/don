@@ -56,6 +56,16 @@ Don manages external resources (child processes, PID files, sockets, docker cont
 - When spawning a child process, the PGID file lock must be acquired *before* the spawn — never after
 - Signal handlers must be async-signal-safe — set a flag, let the main loop handle cleanup
 
+### Shutdown Responsiveness
+
+**The runner must stay interruptible at all times.** A user pressing `Ctrl+C` should never be trapped behind a slow build, download, query, or lock wait.
+
+- Do not await long-running external work inline on the runner task unless it is explicitly raced against shutdown.
+- Any subprocess awaited from the runner task must be cancellation-safe: dropping the future must stop the underlying work (`kill_on_drop`, abort handle, or equivalent).
+- Any network/download future awaited from the runner task must be raced against shutdown so the runner can abandon it immediately.
+- If a piece of work cannot be made cancellation-safe, it does not belong on the runner task. Move it to a detached task and communicate back via channels.
+- New startup/rebuild/watch paths must answer this question in code review: "what happens if the user hits Ctrl+C right here?"
+
 ### Testing
 
 - **Use table-driven tests.** Define a struct for test cases, put them in a `Vec`, iterate. This is the standard pattern in this codebase.

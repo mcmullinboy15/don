@@ -52,7 +52,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, DurationError> {
             return Err(DurationError::UnknownUnit {
                 input: s.to_string(),
                 unit: unit.to_string(),
-            })
+            });
         }
     };
 
@@ -192,9 +192,8 @@ mod tests {
         for case in &cases {
             let result = parse_duration(case.input);
             if case.expect_ok {
-                let duration = result.unwrap_or_else(|e| {
-                    panic!("'{}': expected Ok, got Err({e})", case.input)
-                });
+                let duration = result
+                    .unwrap_or_else(|e| panic!("'{}': expected Ok, got Err({e})", case.input));
                 assert_eq!(
                     duration,
                     case.expect_duration.unwrap(),

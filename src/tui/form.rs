@@ -220,24 +220,18 @@ impl FormState {
             }
             match field.kind {
                 ParamKind::Int => {
-                    let n: i64 = v.parse().map_err(|_| {
-                        format!("'{}' must be an integer (got '{v}')", field.name)
-                    })?;
+                    let n: i64 = v
+                        .parse()
+                        .map_err(|_| format!("'{}' must be an integer (got '{v}')", field.name))?;
                     if let Some(min) = field.int_min
                         && n < min
                     {
-                        return Err(format!(
-                            "'{}' must be >= {min} (got {n})",
-                            field.name
-                        ));
+                        return Err(format!("'{}' must be >= {min} (got {n})", field.name));
                     }
                     if let Some(max) = field.int_max
                         && n > max
                     {
-                        return Err(format!(
-                            "'{}' must be <= {max} (got {n})",
-                            field.name
-                        ));
+                        return Err(format!("'{}' must be <= {max} (got {n})", field.name));
                     }
                     out.insert(field.name.clone(), n.to_string());
                 }
@@ -458,7 +452,10 @@ mod tests {
     fn submit_validates_int_bounds() {
         let task = task_with(vec![TaskParam {
             kind: ParamKind::Int,
-            validate: Some(ParamValidate { min: Some(1), max: Some(10) }),
+            validate: Some(ParamValidate {
+                min: Some(1),
+                max: Some(10),
+            }),
             ..string_param("n")
         }]);
         let mut form = FormState::new("t", &task).unwrap();
@@ -495,7 +492,10 @@ mod tests {
     fn int_stepper_clamps_to_bounds() {
         let task = task_with(vec![TaskParam {
             kind: ParamKind::Int,
-            validate: Some(ParamValidate { min: Some(0), max: Some(3) }),
+            validate: Some(ParamValidate {
+                min: Some(0),
+                max: Some(3),
+            }),
             default: Some("2".into()),
             ..string_param("n")
         }]);

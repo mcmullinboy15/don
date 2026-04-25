@@ -261,8 +261,7 @@ impl App {
         if !self.overlay_query.is_empty() {
             let names: Vec<String> = items.iter().map(|i| i.name().to_string()).collect();
             let matched = super::fuzzy::fuzzy_match(&self.overlay_query, &names);
-            let set: std::collections::HashSet<&str> =
-                matched.iter().map(String::as_str).collect();
+            let set: std::collections::HashSet<&str> = matched.iter().map(String::as_str).collect();
             items.retain(|i| set.contains(i.name()));
         }
         items.sort_by(|a, b| {

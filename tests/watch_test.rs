@@ -76,10 +76,16 @@ async fn make_runner(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner =
-        Runner::new(config, PLATFORM, output_manager, base_dir.to_path_buf(), None, shutdown_rx)
-            .await
-            .unwrap();
+    let runner = Runner::new(
+        config,
+        PLATFORM,
+        output_manager,
+        base_dir.to_path_buf(),
+        None,
+        shutdown_rx,
+    )
+    .await
+    .unwrap();
     (runner, shutdown_tx, buf)
 }
 
@@ -167,10 +173,7 @@ fn integration_build_then_restart_on_file_change() {
                 "bash",
                 &["-c", "cat built.txt 2>/dev/null; sleep 60"],
             )
-            .build_cmd(
-                "bash",
-                &["-c", "echo build-ran > built.txt"],
-            )
+            .build_cmd("bash", &["-c", "echo build-ran > built.txt"])
             .watch(&["src/**/*.rs"])
             .debounce("100ms")
             .ready_exec("true", &[])
@@ -355,11 +358,7 @@ fn integration_file_edit_during_startup_triggers_rebuild() {
         // This lets us control exactly when startup finishes.
         let ready_script = dir.path().join("ready.sh");
         std::fs::write(&ready_script, "#!/bin/bash\n[ -f \"$1\" ]").unwrap();
-        std::fs::set_permissions(
-            &ready_script,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&ready_script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let marker = dir.path().join("ready-marker");
 

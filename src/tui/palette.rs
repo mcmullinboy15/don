@@ -194,9 +194,7 @@ pub(crate) fn build_actions(
             | TaskItemState::PendingRun => " (needs run)",
             TaskItemState::Completed | TaskItemState::Skipped => "",
         };
-        let has_params = task_configs
-            .get(name)
-            .is_some_and(|t| !t.params.is_empty());
+        let has_params = task_configs.get(name).is_some_and(|t| !t.params.is_empty());
         // Param'd tasks get a visible hint so the user knows Enter will
         // open a form rather than kick off the task directly.
         if has_params && suffix.is_empty() {
@@ -378,7 +376,10 @@ mod tests {
     #[test]
     fn palette_close_empties_state() {
         let mut p = ActionPalette::default();
-        p.open(&tasks(&[("a", TaskItemState::Completed)]), &no_task_configs());
+        p.open(
+            &tasks(&[("a", TaskItemState::Completed)]),
+            &no_task_configs(),
+        );
         p.push_query_char('x');
         p.close();
         assert_eq!(p.query(), "");
@@ -388,7 +389,10 @@ mod tests {
     #[test]
     fn palette_selected_is_none_when_no_matches() {
         let mut p = ActionPalette::default();
-        p.open(&tasks(&[("a", TaskItemState::Completed)]), &no_task_configs());
+        p.open(
+            &tasks(&[("a", TaskItemState::Completed)]),
+            &no_task_configs(),
+        );
         p.push_query_char('z');
         assert_eq!(p.visible_count(), 0);
         assert!(p.selected().is_none());
@@ -421,7 +425,10 @@ mod tests {
             ("interactive", TaskItemState::Completed),
         ]);
         let got = build_actions(&tasks, &configs);
-        let plain = got.iter().find(|a| a.label.starts_with("Run plain")).expect("plain missing");
+        let plain = got
+            .iter()
+            .find(|a| a.label.starts_with("Run plain"))
+            .expect("plain missing");
         let interactive = got
             .iter()
             .find(|a| a.label.starts_with("Run interactive"))

@@ -59,9 +59,7 @@ impl AsyncRead for DockerLogReader {
                 }
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Err(std::io::Error::other(e)))
-            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(std::io::Error::other(e))),
             Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
             Poll::Pending => Poll::Pending,
         }

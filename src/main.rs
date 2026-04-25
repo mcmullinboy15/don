@@ -18,6 +18,8 @@ fn errln(msg: impl std::fmt::Display) {
     let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
+const RUNNER_FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "don",
@@ -829,7 +831,7 @@ async fn run_start(
     let profile: Option<String> = profile
         .map(str::to_string)
         .or_else(|| config.default_profile.clone());
-    let profile: Option<&str> = profile.as_deref();
+    let profile_ref: Option<&str> = profile.as_deref();
 
     // Resolve the active item set up front so the output manager and TUI
     // only see items that will actually run. Without this, prefix padding
@@ -837,7 +839,7 @@ async fn run_start(
     // service menu lists items the profile excludes. The runner re-runs
     // this inside `Runner::new` to build its own filtered state.
     let active_items: Option<std::collections::HashSet<String>> =
-        if let Some(profile_name) = profile {
+        if let Some(profile_name) = profile_ref {
             let prof = config
                 .profiles
                 .get(profile_name)
@@ -888,12 +890,11 @@ async fn run_start(
     .flatten()
     .collect();
 
-    let all_configs: Vec<(&str, &don::config::LogConfig)> =
-        service_configs
-            .into_iter()
-            .chain(task_configs)
-            .chain(build_tool_configs.iter().copied())
-            .collect();
+    let all_configs: Vec<(&str, &don::config::LogConfig)> = service_configs
+        .into_iter()
+        .chain(task_configs)
+        .chain(build_tool_configs.iter().copied())
+        .collect();
 
     // Install signal handlers before building the runner so Ctrl+C still
     // reaches the graceful-shutdown path even during a slow startup.
@@ -953,16 +954,25 @@ async fn run_start(
             )
             .collect();
 
-        let runner = don::runner::Runner::new(
-            config,
-            platform,
-            output_manager,
-            base,
-            profile,
-            shutdown_rx,
+        let runner = await_with_shutdown_supervision(
+            tokio::spawn({
+                let profile = profile.clone();
+                async move {
+                    don::runner::Runner::new(
+                        config,
+                        platform,
+                        output_manager,
+                        base,
+                        profile.as_deref(),
+                        shutdown_rx,
+                    )
+                    .await
+                    .map_err(|e| format!("Error: {e}"))
+                }
+            }),
+            "starting runner",
         )
-        .await
-        .map_err(|e| format!("Error: {e}"))?;
+        .await?;
 
         let events = runner.subscribe();
         let commands = runner.command_sender();
@@ -995,7 +1005,13 @@ async fn run_start(
             result
         });
 
-        let runner_result = runner.run().await.map_err(|e| format!("Error: {e}"));
+        let runner_task =
+            tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
+        let runner_result =
+            await_with_shutdown_supervision(runner_task, "waiting for runner shutdown").await;
+        if runner_result.is_err() {
+            tui.abort();
+        }
 
         // Surface any TUI error so unexpected exits are visible instead of
         // silently dropped. Runner errors take precedence.
@@ -1015,18 +1031,90 @@ async fn run_start(
                 .await
                 .map_err(|e| format!("Error creating output manager: {e}"))?;
 
-        let runner = don::runner::Runner::new(
-            config,
-            platform,
-            output_manager,
-            base,
-            profile,
-            shutdown_rx,
+        let runner = await_with_shutdown_supervision(
+            tokio::spawn({
+                let profile = profile.clone();
+                async move {
+                    don::runner::Runner::new(
+                        config,
+                        platform,
+                        output_manager,
+                        base,
+                        profile.as_deref(),
+                        shutdown_rx,
+                    )
+                    .await
+                    .map_err(|e| format!("Error: {e}"))
+                }
+            }),
+            "starting runner",
         )
-        .await
-        .map_err(|e| format!("Error: {e}"))?;
+        .await?;
 
-        runner.run().await.map_err(|e| format!("Error: {e}"))
+        let runner_task =
+            tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
+        await_with_shutdown_supervision(runner_task, "waiting for runner shutdown").await
+    }
+}
+
+async fn await_with_shutdown_supervision<T>(
+    mut handle: tokio::task::JoinHandle<Result<T, String>>,
+    phase: &str,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    // Process-level shutdown supervision lives outside the runner. The runner
+    // gets the first chance to unwind cleanly, but if startup or shutdown
+    // wedges after a signal, `main` still forces progress toward process exit.
+    let poll_interval = std::time::Duration::from_millis(100);
+    let mut graceful_deadline = (don::runner::signal_count() >= 1)
+        .then_some(tokio::time::Instant::now() + RUNNER_FORCE_EXIT_TIMEOUT);
+
+    loop {
+        if don::runner::signal_count() >= 2 {
+            errln(format!("forcing exit while {phase}"));
+            handle.abort();
+            let _ = handle.await;
+            return Err(format!("forced exit while {phase}"));
+        }
+
+        if let Some(deadline) = graceful_deadline {
+            tokio::select! {
+                result = &mut handle => return map_join_result(result, phase),
+                _ = tokio::time::sleep_until(deadline) => {
+                    errln(format!(
+                        "runner did not stop within {:.1}s while {phase}; forcing exit",
+                        RUNNER_FORCE_EXIT_TIMEOUT.as_secs_f32(),
+                    ));
+                    handle.abort();
+                    let _ = handle.await;
+                    return Err(format!("forced exit while {phase}"));
+                }
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        } else {
+            tokio::select! {
+                result = &mut handle => return map_join_result(result, phase),
+                _ = tokio::time::sleep(poll_interval) => {
+                    if don::runner::signal_count() >= 1 {
+                        graceful_deadline =
+                            Some(tokio::time::Instant::now() + RUNNER_FORCE_EXIT_TIMEOUT);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn map_join_result<T>(
+    result: Result<Result<T, String>, tokio::task::JoinError>,
+    phase: &str,
+) -> Result<T, String> {
+    match result {
+        Ok(inner) => inner,
+        Err(join_err) if join_err.is_cancelled() => Err(format!("cancelled while {phase}")),
+        Err(join_err) => Err(format!("task failed while {phase}: {join_err}")),
     }
 }
 

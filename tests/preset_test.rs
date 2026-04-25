@@ -75,10 +75,16 @@ async fn make_runner(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner =
-        Runner::new(config, PLATFORM, output_manager, base_dir.to_path_buf(), None, shutdown_rx)
-            .await
-            .unwrap();
+    let runner = Runner::new(
+        config,
+        PLATFORM,
+        output_manager,
+        base_dir.to_path_buf(),
+        None,
+        shutdown_rx,
+    )
+    .await
+    .unwrap();
     (runner, shutdown_tx, buf)
 }
 

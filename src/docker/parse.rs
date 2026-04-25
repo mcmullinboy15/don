@@ -177,8 +177,7 @@ mod tests {
             let input: Vec<String> = case.input.iter().map(|s| s.to_string()).collect();
             let result = parse_port_mappings(&input);
             if case.expect_ok {
-                let (bindings, exposed) =
-                    result.unwrap_or_else(|e| panic!("{}: {e}", case.name));
+                let (bindings, exposed) = result.unwrap_or_else(|e| panic!("{}: {e}", case.name));
 
                 for (container_key, host_port, host_ip) in &case.expected_bindings {
                     assert!(
@@ -189,7 +188,9 @@ mod tests {
                     let binding_list = bindings
                         .get(*container_key)
                         .and_then(|v| v.as_ref())
-                        .unwrap_or_else(|| panic!("{}: missing binding for {container_key}", case.name));
+                        .unwrap_or_else(|| {
+                            panic!("{}: missing binding for {container_key}", case.name)
+                        });
                     assert!(
                         binding_list.iter().any(|b| {
                             b.host_port.as_deref() == Some(*host_port)
@@ -250,7 +251,11 @@ mod tests {
     fn test_build_env_vars_with_file() {
         let dir = tempfile::tempdir().unwrap();
         let env_file = dir.path().join(".env");
-        std::fs::write(&env_file, "FILE_VAR=from_file\n# comment\nOVERRIDE=file_val\n").unwrap();
+        std::fs::write(
+            &env_file,
+            "FILE_VAR=from_file\n# comment\nOVERRIDE=file_val\n",
+        )
+        .unwrap();
 
         let mut env = HashMap::new();
         env.insert("OVERRIDE".to_string(), "inline_val".to_string());

@@ -93,11 +93,7 @@ impl PlatformDownload {
     ///
     /// Returns `None` if the URL has no path component (shouldn't happen with valid URLs,
     /// but we don't panic on bad input).
-    pub fn binary_path(
-        &self,
-        cache_base: &std::path::Path,
-        owner_name: &str,
-    ) -> Option<PathBuf> {
+    pub fn binary_path(&self, cache_base: &std::path::Path, owner_name: &str) -> Option<PathBuf> {
         let dir = self.cache_dir(cache_base, owner_name);
         match &self.path {
             Some(p) => Some(dir.join(p)),

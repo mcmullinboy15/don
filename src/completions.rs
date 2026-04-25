@@ -444,13 +444,19 @@ mod tests {
         let mut out = Vec::new();
         emit_script::<_, MiniCli>(Shell::Fish, "don", &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("__fish_seen_subcommand_from"), "fish postlude missing");
+        assert!(
+            text.contains("__fish_seen_subcommand_from"),
+            "fish postlude missing"
+        );
 
         let mut out = Vec::new();
         emit_script::<_, MiniCli>(Shell::PowerShell, "don", &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         // PowerShell has no postlude; just sanity-check we emitted something.
         assert!(!text.is_empty());
-        assert!(!text.contains("_don_dynamic"), "postlude leaked into powershell");
+        assert!(
+            !text.contains("_don_dynamic"),
+            "postlude leaked into powershell"
+        );
     }
 }

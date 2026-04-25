@@ -32,9 +32,7 @@ use crate::runner::{ServiceState, TaskItemState};
 pub(crate) const BAR_VIEWPORT_HEIGHT: u16 = 4;
 
 /// Spinner frames — the standard "dots" set. Rotate with `app.spinner_frame`.
-const SPINNER_FRAMES: &[&str] = &[
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-];
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Draw the status bar (blank buffer row + bordered box) into the inline
 /// viewport.
@@ -114,8 +112,7 @@ fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
     draw_filter_list(frame, layout[0], &app.filter);
-    let bar =
-        Paragraph::new(filter_bar_line(&app.counts, &app.filter));
+    let bar = Paragraph::new(filter_bar_line(&app.counts, &app.filter));
     frame.render_widget(bar, layout[1]);
 }
 
@@ -169,8 +166,11 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let table_area = layout[0];
     let bar_area = layout[1];
 
-    let header = Row::new(vec!["KIND", "NAME", "STATE"])
-        .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan));
+    let header = Row::new(vec!["KIND", "NAME", "STATE"]).style(
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
+    );
 
     let items = app.overlay_items();
     let total = items.len();
@@ -265,11 +265,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
         let scroll_hint = if showing_more_above || showing_more_below {
             let up = if showing_more_above { "↑" } else { " " };
             let down = if showing_more_below { "↓" } else { " " };
-            format!(
-                "{up}{down} {}/{}",
-                (highlight + 1).min(total),
-                total
-            )
+            format!("{up}{down} {}/{}", (highlight + 1).min(total), total)
         } else {
             format!("{}/{total}", highlight + 1)
         };
@@ -478,9 +474,7 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
         spans.push(separator());
         spans.push(Span::styled(
             format!("{} failed", counts.services_failed),
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -646,12 +640,10 @@ fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
 
     // Footer line with submit error (if any) or a contextual hint.
     let footer = match form.submit_error.as_deref() {
-        Some(err) => {
-            Line::from(vec![Span::styled(
-                format!("⚠ {err}"),
-                Style::default().fg(Color::Red),
-            )])
-        }
+        Some(err) => Line::from(vec![Span::styled(
+            format!("⚠ {err}"),
+            Style::default().fg(Color::Red),
+        )]),
         None => {
             let hint = form
                 .focused()
@@ -679,7 +671,9 @@ fn field_render_rows(field: &super::form::Field, is_focused: bool) -> Vec<Line<'
     let required_mark = if field.required { "*" } else { "" };
     let prompt = format!("{marker}{}{required_mark}: ", field.prompt);
     let prompt_style = if is_focused {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };

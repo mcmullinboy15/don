@@ -58,9 +58,7 @@ impl TurboResolver {
             .await;
 
         match npx {
-            Ok(status) if status.success() => {
-                Ok(("npx".to_string(), vec!["turbo".to_string()]))
-            }
+            Ok(status) if status.success() => Ok(("npx".to_string(), vec!["turbo".to_string()])),
             _ => Err(BuildToolError::NotInstalled {
                 tool: "turbo".to_string(),
             }),
@@ -130,13 +128,17 @@ impl TurboResolver {
                 let mut line_buf = Vec::new();
                 loop {
                     line_buf.clear();
-                    match tokio::io::AsyncBufReadExt::read_until(
-                        &mut reader, b'\n', &mut line_buf,
-                    ).await {
+                    match tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line_buf)
+                        .await
+                    {
                         Ok(0) => break,
                         Ok(_) => {
-                            if line_buf.last() == Some(&b'\n') { line_buf.pop(); }
-                            if line_buf.last() == Some(&b'\r') { line_buf.pop(); }
+                            if line_buf.last() == Some(&b'\n') {
+                                line_buf.pop();
+                            }
+                            if line_buf.last() == Some(&b'\r') {
+                                line_buf.pop();
+                            }
                             let text = String::from_utf8_lossy(&line_buf);
                             on_line(&text);
                         }
@@ -152,9 +154,7 @@ impl TurboResolver {
             let mut collected = String::new();
             if let Some(stderr) = stderr {
                 let mut reader = tokio::io::BufReader::new(stderr);
-                let _ = tokio::io::AsyncReadExt::read_to_string(
-                    &mut reader, &mut collected,
-                ).await;
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut collected).await;
             }
             collected
         }));
@@ -247,45 +247,50 @@ pub(crate) fn parse_dry_run(json: &str) -> Result<Vec<ParsedTurboTask>, BuildToo
             message: format!("failed to parse dry-run JSON: {e}"),
         })?;
 
-    Ok(dry_run.tasks.into_iter().map(|task| {
-        let persistent = task
-            .resolved_task_definition
-            .as_ref()
-            .is_some_and(|d| d.persistent);
+    Ok(dry_run
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let persistent = task
+                .resolved_task_definition
+                .as_ref()
+                .is_some_and(|d| d.persistent);
 
-        // Collect unique subdirectories from input file paths.
-        // This gives us directory-level watch patterns rather than
-        // watching every individual file.
-        let mut input_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for file_path in task.inputs.keys() {
-            // Get the parent directory of each input file
-            if let Some(parent) = std::path::Path::new(file_path).parent() {
-                let dir_str = parent.to_string_lossy();
-                if !dir_str.is_empty() && dir_str != "." {
-                    input_dirs.insert(format!("{dir_str}/**"));
+            // Collect unique subdirectories from input file paths.
+            // This gives us directory-level watch patterns rather than
+            // watching every individual file.
+            let mut input_dirs: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for file_path in task.inputs.keys() {
+                // Get the parent directory of each input file
+                if let Some(parent) = std::path::Path::new(file_path).parent() {
+                    let dir_str = parent.to_string_lossy();
+                    if !dir_str.is_empty() && dir_str != "." {
+                        input_dirs.insert(format!("{dir_str}/**"));
+                    }
                 }
             }
-        }
 
-        // If no specific input dirs were found, watch the whole package directory
-        let watch_paths = if input_dirs.is_empty() {
-            vec![format!("{}/**", task.directory)]
-        } else {
-            // Prefix input dirs with the task directory since inputs are
-            // relative to the workspace root, not the package
-            let mut paths: Vec<String> = input_dirs.into_iter().collect();
-            paths.sort();
-            paths
-        };
+            // If no specific input dirs were found, watch the whole package directory
+            let watch_paths = if input_dirs.is_empty() {
+                vec![format!("{}/**", task.directory)]
+            } else {
+                // Prefix input dirs with the task directory since inputs are
+                // relative to the workspace root, not the package
+                let mut paths: Vec<String> = input_dirs.into_iter().collect();
+                paths.sort();
+                paths
+            };
 
-        ParsedTurboTask {
-            task_id: task.task_id,
-            directory: task.directory,
-            dependencies: task.dependencies,
-            watch_paths,
-            persistent,
-        }
-    }).collect())
+            ParsedTurboTask {
+                task_id: task.task_id,
+                directory: task.directory,
+                dependencies: task.dependencies,
+                watch_paths,
+                persistent,
+            }
+        })
+        .collect())
 }
 
 /// A parsed turbo task with resolved watch information.
@@ -331,10 +336,13 @@ impl TurboResolver {
             source: e,
         })?;
 
-        let output = child.wait_with_output().await.map_err(|e| BuildToolError::Io {
-            tool: "turbo".to_string(),
-            source: e,
-        })?;
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| BuildToolError::Io {
+                tool: "turbo".to_string(),
+                source: e,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -485,7 +493,12 @@ mod tests {
         assert!(utils.dependencies.is_empty());
         assert!(!utils.persistent);
         // Should have directory-level patterns from input files
-        assert!(utils.watch_paths.iter().any(|p| p.contains("packages/utils/src")));
+        assert!(
+            utils
+                .watch_paths
+                .iter()
+                .any(|p| p.contains("packages/utils/src"))
+        );
 
         let web = &tasks[1];
         assert_eq!(web.task_id, "@myorg/web#dev");

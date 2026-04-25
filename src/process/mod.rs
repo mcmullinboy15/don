@@ -505,7 +505,10 @@ pub async fn read_pgid_file(path: &Path) -> Result<Option<i32>, ProcessError> {
             // First line is the PGID (second line, if present, is start_time).
             let first_line = content.lines().next().unwrap_or("").trim();
             let pgid: i32 = first_line.parse().map_err(|_| {
-                ProcessError::PgidFile(format!("invalid pgid in '{}': '{first_line}'", path.display()))
+                ProcessError::PgidFile(format!(
+                    "invalid pgid in '{}': '{first_line}'",
+                    path.display()
+                ))
             })?;
             Ok(Some(pgid))
         }
@@ -520,9 +523,7 @@ pub async fn read_pgid_file(path: &Path) -> Result<Option<i32>, ProcessError> {
 /// Read a pid file as a full `ProcessIdentity`. Returns `None` if the file
 /// does not exist. If the file has the old single-line format, returns
 /// `ProcessIdentity { pgid, start_time: 0 }`.
-pub async fn read_pid_file_identity(
-    path: &Path,
-) -> Result<Option<ProcessIdentity>, ProcessError> {
+pub async fn read_pid_file_identity(path: &Path) -> Result<Option<ProcessIdentity>, ProcessError> {
     match tokio::fs::read_to_string(path).await {
         Ok(content) => {
             let content = content.trim();
@@ -588,8 +589,12 @@ fn listen_pid_shim<'a>(config: &'a SpawnConfig<'a>) -> (String, Vec<String>) {
     // binary, preserving that PID. The literal `sh` becomes `$0`; the actual
     // command and its args follow as `$@`.
     let script = r#"LISTEN_PID=$$; export LISTEN_PID; exec "$@""#;
-    let mut shim_args: Vec<String> =
-        vec!["-c".to_string(), script.to_string(), "sh".to_string(), config.cmd.to_string()];
+    let mut shim_args: Vec<String> = vec![
+        "-c".to_string(),
+        script.to_string(),
+        "sh".to_string(),
+        config.cmd.to_string(),
+    ];
     shim_args.extend(config.args.iter().cloned());
     ("/bin/sh".to_string(), shim_args)
 }

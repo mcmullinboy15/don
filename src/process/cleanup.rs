@@ -52,7 +52,11 @@ impl fmt::Display for CleanupReport {
             parts.push(format!(
                 "removed {} stale container{}",
                 self.containers_removed,
-                if self.containers_removed == 1 { "" } else { "s" }
+                if self.containers_removed == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
         }
         if parts.is_empty() {

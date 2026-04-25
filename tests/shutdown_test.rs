@@ -5,13 +5,14 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::Runner;
+use don::runner::{Runner, RunnerCommand};
 use helpers::config::ConfigBuilder;
+use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
@@ -70,7 +71,11 @@ async fn wait_for_output(buf: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Durat
 async fn spawn_runner(
     toml: &str,
     base_dir: &std::path::Path,
-) -> (mpsc::Sender<()>, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<u8>>>) {
+) -> (
+    mpsc::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    Arc<Mutex<Vec<u8>>>,
+) {
     let config_path = base_dir.join("don.toml");
     std::fs::write(&config_path, toml).unwrap();
 
@@ -109,6 +114,45 @@ async fn spawn_runner(
     });
 
     (shutdown_tx, handle, buf)
+}
+
+async fn make_runner(
+    toml: &str,
+    base_dir: &std::path::Path,
+) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
+    let config_path = base_dir.join("don.toml");
+    std::fs::write(&config_path, toml).unwrap();
+
+    let config: Config = toml.parse().unwrap();
+    config.validate(PLATFORM).unwrap();
+
+    let service_configs: Vec<(&str, &LogConfig)> = config
+        .services
+        .iter()
+        .map(|(n, s)| (n.as_str(), &s.log))
+        .collect();
+    let task_configs: Vec<(&str, &LogConfig)> = config
+        .tasks
+        .iter()
+        .map(|(n, t)| (n.as_str(), &t.log))
+        .collect();
+    let all_configs: Vec<(&str, &LogConfig)> =
+        service_configs.into_iter().chain(task_configs).collect();
+
+    let (writer, buf) = TestBuffer::new();
+    let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
+    let runner = Runner::new(
+        config,
+        PLATFORM,
+        output_manager,
+        base_dir.to_path_buf(),
+        None,
+        shutdown_rx,
+    )
+    .await
+    .unwrap();
+    (runner, shutdown_tx, buf)
 }
 
 // --- Tests ---
@@ -278,6 +322,279 @@ fn shutdown_graceful_message() {
         assert!(
             output.contains("Ctrl+C again to force"),
             "expected force hint. output: {output}"
+        );
+    });
+}
+
+/// Verify shutdown interrupts a long startup-time service build instead of
+/// waiting for the build command to finish.
+#[test]
+fn shutdown_interrupts_startup_build() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-startup-build");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("builder", "sleep", &["60"])
+            .build_cmd("sleep", &["300"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (shutdown_tx, handle, buf) = spawn_runner(&toml, dir.path()).await;
+        assert!(
+            wait_for_output(
+                &buf,
+                "builder: running sleep build...",
+                Duration::from_secs(5)
+            )
+            .await,
+            "startup build never started. output: {}",
+            read_buf(&buf)
+        );
+
+        let start = std::time::Instant::now();
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+        let elapsed = start.elapsed();
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("cancelled by shutdown"),
+            "expected cancellation message. output: {output}"
+        );
+        assert!(output.contains("shutdown complete"), "output: {output}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown during startup build took too long ({elapsed:?})"
+        );
+    });
+}
+
+#[test]
+fn shutdown_interrupts_manual_stop_worker() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-manual-stop");
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "stubborn",
+                "bash",
+                &["-c", "trap '' TERM; echo started; sleep 60"],
+            )
+            .log("ignore")
+            .ready_exec("true", &[])
+            .shutdown("SIGTERM", "10s")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            let _ = runner.run().await;
+        });
+
+        assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Stop {
+                name: "stubborn".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        assert!(wait_for_output(&buf, "stopping... (requested)", Duration::from_secs(2)).await);
+
+        let start = std::time::Instant::now();
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+        let elapsed = start.elapsed();
+        let _ = reply_rx.await;
+
+        let output = read_buf(&buf);
+        assert!(output.contains("shutdown complete"), "output: {output}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "shutdown during manual stop took too long ({elapsed:?})"
+        );
+    });
+}
+
+#[test]
+fn shutdown_interrupts_manual_restart_worker() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-manual-restart");
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "stubborn",
+                "bash",
+                &["-c", "trap '' TERM; echo started; sleep 60"],
+            )
+            .log("ignore")
+            .ready_exec("true", &[])
+            .shutdown("SIGTERM", "10s")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            let _ = runner.run().await;
+        });
+
+        assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Restart {
+                name: "stubborn".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            wait_for_output(
+                &buf,
+                "stopping... (requested restart)",
+                Duration::from_secs(2),
+            )
+            .await
+        );
+
+        let start = std::time::Instant::now();
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+        let elapsed = start.elapsed();
+        let _ = reply_rx.await;
+
+        let output = read_buf(&buf);
+        assert!(output.contains("shutdown complete"), "output: {output}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "shutdown during manual restart took too long ({elapsed:?})"
+        );
+    });
+}
+
+#[test]
+fn shutdown_interrupts_manual_start_worker() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-manual-start");
+        let listen_addr = format!("127.0.0.1:{}", free_port());
+        let toml = ConfigBuilder::new()
+            .add_custom_service("lazy-builder", "sleep", &["60"])
+            .build_cmd("sleep", &["300"])
+            .proxy_listenfd(&[&listen_addr])
+            .lazy(true)
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            let _ = runner.run().await;
+        });
+
+        assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Start {
+                name: "lazy-builder".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            wait_for_output(
+                &buf,
+                "lazy-builder: running sleep build...",
+                Duration::from_secs(5),
+            )
+            .await,
+            "manual start build never started. output: {}",
+            read_buf(&buf)
+        );
+
+        let start = std::time::Instant::now();
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+        let elapsed = start.elapsed();
+
+        let output = read_buf(&buf);
+        assert!(output.contains("cancelled by shutdown"), "output: {output}");
+        assert!(output.contains("shutdown complete"), "output: {output}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown during manual start took too long ({elapsed:?})"
+        );
+    });
+}
+
+#[test]
+fn shutdown_interrupts_rebuild_worker() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-rebuild-worker");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("builder", "sleep", &["60"])
+            .build_cmd(
+                "bash",
+                &[
+                    "-c",
+                    "if [ -f slow-build ]; then sleep 300; else exit 0; fi",
+                ],
+            )
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            let _ = runner.run().await;
+        });
+
+        assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+
+        std::fs::write(dir.path().join("slow-build"), "1").unwrap();
+
+        cmd_tx
+            .send(RunnerCommand::Rebuild {
+                name: "builder".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            wait_for_output(
+                &buf,
+                "builder: rebuilding (file changed)",
+                Duration::from_secs(5),
+            )
+            .await,
+            "rebuild worker never started. output: {}",
+            read_buf(&buf)
+        );
+
+        let start = std::time::Instant::now();
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+        let elapsed = start.elapsed();
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("rebuild cancelled by shutdown"),
+            "output: {output}"
+        );
+        assert!(output.contains("shutdown complete"), "output: {output}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown during rebuild took too long ({elapsed:?})"
         );
     });
 }

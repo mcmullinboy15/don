@@ -394,7 +394,12 @@ mod tests {
                 env.insert("PATH".to_string(), v.to_string());
             }
             prepend_to_path(&mut env, Path::new(case.bin_dir));
-            assert_eq!(env.get("PATH").map(String::as_str), Some(case.expected), "case: {}", case.name);
+            assert_eq!(
+                env.get("PATH").map(String::as_str),
+                Some(case.expected),
+                "case: {}",
+                case.name
+            );
         }
     }
 

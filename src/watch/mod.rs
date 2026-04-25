@@ -218,8 +218,7 @@ impl WatchManager {
             let svc_dir = match resolved.dir.as_deref() {
                 Some(d) => {
                     let joined = base_dir.join(d);
-                    std::fs::canonicalize(&joined)
-                        .unwrap_or(joined)
+                    std::fs::canonicalize(&joined).unwrap_or(joined)
                 }
                 None => base_dir.to_path_buf(),
             };
@@ -246,9 +245,8 @@ impl WatchManager {
                 // doesn't exist so we get precise inotify coverage
                 // instead of watching a broad ancestor.
                 let watch_dir = glob_base_dir(&full_pattern);
-                std::fs::create_dir_all(&watch_dir).map_err(|e| {
-                    WatchError::Io(watch_dir.clone(), e)
-                })?;
+                std::fs::create_dir_all(&watch_dir)
+                    .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
 
                 if !is_covered(&watch_dir, RecursiveMode::Recursive, &registered_dirs) {
                     watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
@@ -292,8 +290,7 @@ impl WatchManager {
             let task_dir = match task.dir.as_deref() {
                 Some(d) => {
                     let joined = base_dir.join(d);
-                    std::fs::canonicalize(&joined)
-                        .unwrap_or(joined)
+                    std::fs::canonicalize(&joined).unwrap_or(joined)
                 }
                 None => base_dir.to_path_buf(),
             };
@@ -312,9 +309,8 @@ impl WatchManager {
                 }
 
                 let watch_dir = glob_base_dir(&full_pattern);
-                std::fs::create_dir_all(&watch_dir).map_err(|e| {
-                    WatchError::Io(watch_dir.clone(), e)
-                })?;
+                std::fs::create_dir_all(&watch_dir)
+                    .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
 
                 if !is_covered(&watch_dir, RecursiveMode::Recursive, &registered_dirs) {
                     watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
@@ -379,18 +375,10 @@ impl WatchManager {
             if has_bazel || has_turbo {
                 let mut root_file_names: Vec<&str> = Vec::new();
                 if has_bazel {
-                    root_file_names.extend([
-                        "WORKSPACE",
-                        "WORKSPACE.bazel",
-                        "MODULE.bazel",
-                    ]);
+                    root_file_names.extend(["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"]);
                 }
                 if has_turbo {
-                    root_file_names.extend([
-                        "turbo.json",
-                        "turbo.jsonc",
-                        "pnpm-workspace.yaml",
-                    ]);
+                    root_file_names.extend(["turbo.json", "turbo.jsonc", "pnpm-workspace.yaml"]);
                 }
 
                 let mut compiled_patterns = Vec::new();
@@ -431,7 +419,9 @@ impl WatchManager {
         let mut names: Vec<&String> = items.keys().collect();
         names.sort();
         for name in names {
-            let Some(item) = items.get(name) else { continue };
+            let Some(item) = items.get(name) else {
+                continue;
+            };
             let pats: Vec<&str> = item.patterns.iter().map(Pattern::as_str).collect();
             let igs: Vec<&str> = item.ignore_patterns.iter().map(Pattern::as_str).collect();
             emitter.service_debug_event(
@@ -445,10 +435,7 @@ impl WatchManager {
         let mut dirs: Vec<(&PathBuf, &RecursiveMode)> = registered_dirs.iter().collect();
         dirs.sort_by(|a, b| a.0.cmp(b.0));
         for (dir, mode) in &dirs {
-            emitter.debug_event(&format!(
-                "watch: inotify dir {:?} mode={:?}",
-                dir, mode
-            ));
+            emitter.debug_event(&format!("watch: inotify dir {:?} mode={:?}", dir, mode));
         }
         emitter.debug_event(&format!(
             "watch: setup complete — {} items, {} directories registered",
@@ -535,8 +522,8 @@ impl WatchManager {
         // `./auth/jwt/**` that will never match `/abs/cwd/./auth/jwt/foo.ts`.
         // The initial-setup path in `WatchManager::new` already canonicalizes;
         // this keeps the build-tool-resolved update path in sync.
-        let base_dir = std::fs::canonicalize(&update.base_dir)
-            .unwrap_or_else(|_| update.base_dir.clone());
+        let base_dir =
+            std::fs::canonicalize(&update.base_dir).unwrap_or_else(|_| update.base_dir.clone());
 
         let mut compiled_patterns = Vec::new();
         for pattern_str in &update.patterns {
@@ -631,9 +618,7 @@ impl WatchManager {
         // (vim, sed -i) are reported as Modify(Name(_)) by notify.
         if !matches!(
             event.kind,
-            EventKind::Create(_)
-                | EventKind::Modify(_)
-                | EventKind::Remove(_)
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
         ) {
             // Don't log these — Access/Other events fire constantly (every
             // open/close/stat) and drown out the signal.
@@ -653,11 +638,7 @@ impl WatchManager {
             let path_str = path.to_string_lossy();
             let mut matched_any = false;
             for (name, item) in &self.items {
-                if let Some(ig) = item
-                    .ignore_patterns
-                    .iter()
-                    .find(|p| p.matches(&path_str))
-                {
+                if let Some(ig) = item.ignore_patterns.iter().find(|p| p.matches(&path_str)) {
                     self.emitter.service_debug_event(
                         name,
                         &format!(
@@ -672,11 +653,7 @@ impl WatchManager {
                 if let Some(pat) = item.patterns.iter().find(|p| p.matches(&path_str)) {
                     self.emitter.service_debug_event(
                         name,
-                        &format!(
-                            "watch: matched {:?} by pattern {:?}",
-                            path,
-                            pat.as_str()
-                        ),
+                        &format!("watch: matched {:?} by pattern {:?}", path, pat.as_str()),
                     );
                     matched_any = true;
                     if !affected.contains(name) {
@@ -685,10 +662,8 @@ impl WatchManager {
                 }
             }
             if !matched_any {
-                self.emitter.debug_event(&format!(
-                    "watch: no item matched {:?}",
-                    path
-                ));
+                self.emitter
+                    .debug_event(&format!("watch: no item matched {:?}", path));
             }
         }
 
@@ -766,9 +741,7 @@ impl WatchManager {
                         // the runner re-queries the build tool asynchronously.
                         // Extract the service/task name by stripping "__graph" suffix.
                         item.state = WatchState::Idle;
-                        let item_name = name.strip_suffix("__graph")
-                            .unwrap_or(&name)
-                            .to_string();
+                        let item_name = name.strip_suffix("__graph").unwrap_or(&name).to_string();
                         (
                             RunnerCommand::BuildGraphChanged { name: item_name },
                             "BuildGraphChanged",
@@ -810,23 +783,18 @@ impl WatchManager {
                         );
                         let _ = self
                             .cmd_tx
-                            .send(RunnerCommand::Rebuild {
-                                name: name.clone(),
-                            })
+                            .send(RunnerCommand::Rebuild { name: name.clone() })
                             .await;
                     } else {
                         item.state = WatchState::Idle;
                         self.emitter.service_debug_event(
                             name,
-                            &format!(
-                                "watch: RebuildComplete(success={success}) → Idle"
-                            ),
+                            &format!("watch: RebuildComplete(success={success}) → Idle"),
                         );
                     }
                 } else {
-                    self.emitter.debug_event(&format!(
-                        "watch: RebuildComplete for unknown item {name:?}"
-                    ));
+                    self.emitter
+                        .debug_event(&format!("watch: RebuildComplete for unknown item {name:?}"));
                 }
             }
             RunnerEvent::TaskRerunComplete { name, success } => {
@@ -842,17 +810,13 @@ impl WatchManager {
                         );
                         let _ = self
                             .cmd_tx
-                            .send(RunnerCommand::TaskRerun {
-                                name: name.clone(),
-                            })
+                            .send(RunnerCommand::TaskRerun { name: name.clone() })
                             .await;
                     } else {
                         item.state = WatchState::Idle;
                         self.emitter.service_debug_event(
                             name,
-                            &format!(
-                                "watch: TaskRerunComplete(success={success}) → Idle"
-                            ),
+                            &format!("watch: TaskRerunComplete(success={success}) → Idle"),
                         );
                     }
                 } else {
@@ -1480,9 +1444,7 @@ mod tests {
                 if item.ignore_patterns.iter().any(|p| p.matches(&path_str)) {
                     continue;
                 }
-                if item.patterns.iter().any(|p| p.matches(&path_str))
-                    && !affected.contains(name)
-                {
+                if item.patterns.iter().any(|p| p.matches(&path_str)) && !affected.contains(name) {
                     affected.push(name.clone());
                 }
             }
@@ -1537,9 +1499,7 @@ mod tests {
                     }
                     WatchItemKind::BuildGraph => {
                         item.state = WatchState::Idle;
-                        let item_name = name.strip_suffix("__graph")
-                            .unwrap_or(&name)
-                            .to_string();
+                        let item_name = name.strip_suffix("__graph").unwrap_or(&name).to_string();
                         RunnerCommand::BuildGraphChanged { name: item_name }
                     }
                 };
@@ -1560,9 +1520,7 @@ mod tests {
                         item.stale = false;
                         item.state = WatchState::Rebuilding;
                         let _ = cmd_tx
-                            .send(RunnerCommand::Rebuild {
-                                name: name.clone(),
-                            })
+                            .send(RunnerCommand::Rebuild { name: name.clone() })
                             .await;
                     } else {
                         item.state = WatchState::Idle;
@@ -1575,9 +1533,7 @@ mod tests {
                         item.stale = false;
                         item.state = WatchState::Rebuilding;
                         let _ = cmd_tx
-                            .send(RunnerCommand::TaskRerun {
-                                name: name.clone(),
-                            })
+                            .send(RunnerCommand::TaskRerun { name: name.clone() })
                             .await;
                     } else {
                         item.state = WatchState::Idle;

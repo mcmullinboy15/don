@@ -110,11 +110,13 @@ fn validate_cycle_detected() {
 fn validate_invalid_duration_strings() {
     let dir = TempDir::new("validate-duration");
     let config_path = ConfigBuilder::new()
-        .raw(r#"
+        .raw(
+            r#"
             [services.api]
             run.cmd = "api"
             debounce = "not-a-duration"
-        "#)
+        "#,
+        )
         .write_to(dir.path());
 
     let config = Config::from_file(&config_path).unwrap();
@@ -129,7 +131,8 @@ fn validate_invalid_duration_strings() {
 fn validate_invalid_watch_pattern() {
     let dir = TempDir::new("validate-watch-pattern");
     let config_path = ConfigBuilder::new()
-        .raw(r#"
+        .raw(
+            r#"
             [services.api]
             run.cmd = "api"
             watch = ["src/[*.rs"]
@@ -137,7 +140,8 @@ fn validate_invalid_watch_pattern() {
             [tasks.build]
             cmd = "make"
             watch = ["lib/[bad"]
-        "#)
+        "#,
+        )
         .write_to(dir.path());
 
     let config = Config::from_file(&config_path).unwrap();
@@ -146,11 +150,15 @@ fn validate_invalid_watch_pattern() {
         panic!("expected validation error");
     };
     assert!(
-        errors.iter().any(|e| e.contains("service 'api'") && e.contains("invalid watch pattern")),
+        errors
+            .iter()
+            .any(|e| e.contains("service 'api'") && e.contains("invalid watch pattern")),
         "expected service watch pattern error, got: {errors:?}"
     );
     assert!(
-        errors.iter().any(|e| e.contains("task 'build'") && e.contains("invalid watch pattern")),
+        errors
+            .iter()
+            .any(|e| e.contains("task 'build'") && e.contains("invalid watch pattern")),
         "expected task watch pattern error, got: {errors:?}"
     );
 }
@@ -167,7 +175,9 @@ fn validate_tcp_ready_check_on_listen_address_warns() {
     let config: Config = toml.parse().unwrap();
     let warnings = config.validate(TEST_PLATFORM).unwrap();
     assert!(
-        warnings.iter().any(|w| w.contains("TCP ready check") && w.contains("don holds that socket")),
+        warnings
+            .iter()
+            .any(|w| w.contains("TCP ready check") && w.contains("don holds that socket")),
         "expected warning about TCP ready check on listen address, got: {warnings:?}"
     );
 }

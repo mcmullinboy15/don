@@ -31,12 +31,7 @@ pub(crate) async fn build_image(
 
     let mut options_builder = BuildImageOptionsBuilder::new()
         .t(image_tag)
-        .dockerfile(
-            config
-                .dockerfile
-                .as_deref()
-                .unwrap_or("Dockerfile"),
-        )
+        .dockerfile(config.dockerfile.as_deref().unwrap_or("Dockerfile"))
         .rm(true);
 
     if let Some(ref target) = config.target {
@@ -48,9 +43,9 @@ pub(crate) async fn build_image(
     }
 
     let options = options_builder.build();
-    let body = bollard::body_stream(futures_util::stream::once(async move {
-        Bytes::from(tar_body)
-    }));
+    let body = bollard::body_stream(futures_util::stream::once(
+        async move { Bytes::from(tar_body) },
+    ));
 
     let mut stream = client.build_image(options, None, Some(body));
     while let Some(result) = stream.next().await {

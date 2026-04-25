@@ -82,7 +82,11 @@ pub(crate) async fn attach_handler(
                 crate::runner::CommandError::InvalidState { .. } => StatusCode::CONFLICT,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            return (status, axum::Json(serde_json::json!({"error": e.to_string()}))).into_response();
+            return (
+                status,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
         Err(_) => {
             return (
@@ -169,7 +173,9 @@ pub(crate) async fn resize_handler(
         }
         None => (
             StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({"error": format!("no active attach session for '{name}'")})),
+            axum::Json(
+                serde_json::json!({"error": format!("no active attach session for '{name}'")}),
+            ),
         )
             .into_response(),
     }

@@ -71,11 +71,12 @@ pub fn bind_api(socket_path: &Path) -> Result<UnixListener, ServerError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|source| ServerError::Chmod {
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |source| ServerError::Chmod {
                 path: socket_path.to_path_buf(),
                 source,
-            })?;
+            },
+        )?;
     }
 
     Ok(listener)

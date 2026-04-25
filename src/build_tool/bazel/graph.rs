@@ -48,26 +48,24 @@ impl BazelDepGraph {
 
         loop {
             match xml.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) => {
-                    match e.name().as_ref() {
-                        b"rule" => {
-                            let name = read_name(e)?;
-                            if let Some(name) = name
-                                && !is_external(&name)
-                            {
-                                current = Some((name, Vec::new(), HashSet::new()));
-                            }
+                Ok(Event::Start(ref e)) => match e.name().as_ref() {
+                    b"rule" => {
+                        let name = read_name(e)?;
+                        if let Some(name) = name
+                            && !is_external(&name)
+                        {
+                            current = Some((name, Vec::new(), HashSet::new()));
                         }
-                        b"source-file" => {
-                            if let Some(name) = read_name(e)?
-                                && !is_external(&name)
-                            {
-                                sources.insert(name);
-                            }
-                        }
-                        _ => {}
                     }
-                }
+                    b"source-file" => {
+                        if let Some(name) = read_name(e)?
+                            && !is_external(&name)
+                        {
+                            sources.insert(name);
+                        }
+                    }
+                    _ => {}
+                },
                 Ok(Event::Empty(ref e)) => {
                     match e.name().as_ref() {
                         b"rule-input" => {
@@ -188,12 +186,12 @@ fn read_name(elem: &BytesStart<'_>) -> Result<Option<String>, BuildToolError> {
             message: format!("xml attribute parse error: {e}"),
         })?;
         if attr.key.as_ref() == b"name" {
-            let unescaped =
-                attr.unescape_value()
-                    .map_err(|e| BuildToolError::ParseError {
-                        tool: TOOL.to_string(),
-                        message: format!("xml attribute decode error: {e}"),
-                    })?;
+            let unescaped = attr
+                .unescape_value()
+                .map_err(|e| BuildToolError::ParseError {
+                    tool: TOOL.to_string(),
+                    message: format!("xml attribute decode error: {e}"),
+                })?;
             return Ok(Some(unescaped.into_owned()));
         }
     }
@@ -218,12 +216,36 @@ mod tests {
         }
 
         let cases = vec![
-            Case { name: "label with target", input: "//a/b/c:target", expected: Some("a/b/c") },
-            Case { name: "label without target", input: "//a/b/c", expected: Some("a/b/c") },
-            Case { name: "root package with target", input: "//:root", expected: Some("") },
-            Case { name: "nested source path", input: "//a/b:sub/dir/file.sh", expected: Some("a/b") },
-            Case { name: "external label", input: "@repo//a:b", expected: None },
-            Case { name: "relative label", input: ":target", expected: None },
+            Case {
+                name: "label with target",
+                input: "//a/b/c:target",
+                expected: Some("a/b/c"),
+            },
+            Case {
+                name: "label without target",
+                input: "//a/b/c",
+                expected: Some("a/b/c"),
+            },
+            Case {
+                name: "root package with target",
+                input: "//:root",
+                expected: Some(""),
+            },
+            Case {
+                name: "nested source path",
+                input: "//a/b:sub/dir/file.sh",
+                expected: Some("a/b"),
+            },
+            Case {
+                name: "external label",
+                input: "@repo//a:b",
+                expected: None,
+            },
+            Case {
+                name: "relative label",
+                input: ":target",
+                expected: None,
+            },
         ];
 
         for c in cases {
@@ -417,7 +439,10 @@ mod tests {
         eprintln!("api packages:    {}", api.len());
         for p in &valkey.iter().chain(api.iter()).collect::<Vec<_>>() {
             assert!(!p.is_empty(), "empty package leaked through");
-            assert!(!p.starts_with("bazel-out"), "bazel-out package leaked through");
+            assert!(
+                !p.starts_with("bazel-out"),
+                "bazel-out package leaked through"
+            );
         }
         // valkey should have far fewer packages than api.
         assert!(
@@ -426,7 +451,10 @@ mod tests {
             valkey.len(),
             api.len(),
         );
-        assert!(!valkey.is_empty(), "valkey should have at least one package");
+        assert!(
+            !valkey.is_empty(),
+            "valkey should have at least one package"
+        );
     }
 
     #[test]

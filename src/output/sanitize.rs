@@ -297,7 +297,8 @@ mod tests {
         for case in cases {
             let result = sanitize_terminal_output(case.input);
             assert_eq!(
-                result, case.expected,
+                result,
+                case.expected,
                 "case '{}': input={:?}, expected={:?}, got={:?}",
                 case.name,
                 String::from_utf8_lossy(case.input),

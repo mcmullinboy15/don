@@ -79,7 +79,10 @@ mod tests {
     fn compose_path_prepends_bin_dir() {
         let base = PathBuf::from("/project");
         let composed = compose_path(&base, Some("/usr/bin:/bin"));
-        assert_eq!(composed, std::ffi::OsString::from("/project/.don/bin:/usr/bin:/bin"));
+        assert_eq!(
+            composed,
+            std::ffi::OsString::from("/project/.don/bin:/usr/bin:/bin")
+        );
     }
 
     #[test]

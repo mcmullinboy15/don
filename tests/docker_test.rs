@@ -91,10 +91,16 @@ async fn make_runner(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner =
-        Runner::new(config, PLATFORM, output_manager, base_dir.to_path_buf(), None, shutdown_rx)
-            .await
-            .unwrap();
+    let runner = Runner::new(
+        config,
+        PLATFORM,
+        output_manager,
+        base_dir.to_path_buf(),
+        None,
+        shutdown_rx,
+    )
+    .await
+    .unwrap();
     (runner, shutdown_tx, buf)
 }
 
@@ -115,7 +121,9 @@ async fn wait_for_output(buf: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Durat
 /// Clean up a test container if it exists (best-effort).
 async fn cleanup_container(name: &str) {
     if let Ok(docker) = bollard::Docker::connect_with_socket_defaults() {
-        use bollard::query_parameters::{RemoveContainerOptionsBuilder, StopContainerOptionsBuilder};
+        use bollard::query_parameters::{
+            RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+        };
         let stop_opts = StopContainerOptionsBuilder::new().t(1).build();
         let _ = docker.stop_container(name, Some(stop_opts)).await;
         let rm_opts = RemoveContainerOptionsBuilder::new().force(true).build();
@@ -245,18 +253,15 @@ fn docker_stale_container_cleaned_up() {
             .create_container(Some(create_options), config)
             .await
             .unwrap();
-        docker
-            .start_container(container_name, None)
-            .await
-            .unwrap();
+        docker.start_container(container_name, None).await.unwrap();
 
         // Verify the stale container is running.
-        let info = docker.inspect_container(container_name, None).await.unwrap();
+        let info = docker
+            .inspect_container(container_name, None)
+            .await
+            .unwrap();
         assert!(
-            info.state
-                .as_ref()
-                .and_then(|s| s.running)
-                .unwrap_or(false),
+            info.state.as_ref().and_then(|s| s.running).unwrap_or(false),
             "stale container should be running"
         );
 

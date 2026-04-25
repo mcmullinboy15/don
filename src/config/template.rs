@@ -65,11 +65,9 @@ pub fn render(s: &str, values: &HashMap<String, String>) -> Result<String, Templ
             if name.is_empty() {
                 return Err(TemplateError::Empty { start });
             }
-            let value = values
-                .get(name)
-                .ok_or_else(|| TemplateError::UnknownName {
-                    name: name.to_string(),
-                })?;
+            let value = values.get(name).ok_or_else(|| TemplateError::UnknownName {
+                name: name.to_string(),
+            })?;
             out.push_str(value);
             i = j + 2;
             continue;
@@ -150,8 +148,16 @@ mod tests {
             want: Vec<&'static str>,
         }
         let cases = [
-            Case { name: "none", input: "plain", want: vec![] },
-            Case { name: "single", input: "a {{x}} b", want: vec!["x"] },
+            Case {
+                name: "none",
+                input: "plain",
+                want: vec![],
+            },
+            Case {
+                name: "single",
+                input: "a {{x}} b",
+                want: vec!["x"],
+            },
             Case {
                 name: "multiple distinct",
                 input: "{{a}} and {{b}}",

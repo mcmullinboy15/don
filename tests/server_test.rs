@@ -306,9 +306,7 @@ async fn follow_lines(
         };
         buffer.extend_from_slice(&chunk);
 
-        if !headers_consumed
-            && let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n")
-        {
+        if !headers_consumed && let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
             // Drain the header portion.
             buffer.drain(..pos + 4);
             headers_consumed = true;
@@ -382,14 +380,26 @@ fn integration_logs_follow_streams_lines() {
 
         // Should include preloaded tail (last=2) + live lines as they're emitted.
         let joined: String = lines.join(" | ");
-        assert!(joined.contains("pre1"), "expected pre1 in snapshot; got: {joined}");
-        assert!(joined.contains("pre2"), "expected pre2 in snapshot; got: {joined}");
-        assert!(joined.contains("live1"), "expected live1 from stream; got: {joined}");
-        assert!(joined.contains("live3"), "expected live3 from stream; got: {joined}");
+        assert!(
+            joined.contains("pre1"),
+            "expected pre1 in snapshot; got: {joined}"
+        );
+        assert!(
+            joined.contains("pre2"),
+            "expected pre2 in snapshot; got: {joined}"
+        );
+        assert!(
+            joined.contains("live1"),
+            "expected live1 from stream; got: {joined}"
+        );
+        assert!(
+            joined.contains("live3"),
+            "expected live3 from stream; got: {joined}"
+        );
         // Each line should be valid NDJSON.
         for line in &lines {
-            let v: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("not NDJSON: {line:?} ({e})"));
+            let v: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("not NDJSON: {line:?} ({e})"));
             assert!(v.get("line").is_some(), "missing 'line' field: {line}");
         }
 
@@ -426,13 +436,19 @@ fn integration_logs_endpoint_returns_ring_buffer() {
         assert!(body.contains("line5"), "body: {body}");
         assert!(body.contains("line3"), "body: {body}");
         // last=3 → should NOT include line1 (oldest, evicted).
-        assert!(!body.contains("line1"), "body should not include line1: {body}");
+        assert!(
+            !body.contains("line1"),
+            "body should not include line1: {body}"
+        );
 
         // Logs for a service with log=ignore should still be accessible
         // (ring buffer is fed regardless of log routing).
         let (status, body) = request(&socket, "GET", "/logs/chatty?last=10").await;
         assert_eq!(status, 200);
-        assert!(body.contains("line1"), "ring buffer should have all lines: {body}");
+        assert!(
+            body.contains("line1"),
+            "ring buffer should have all lines: {body}"
+        );
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

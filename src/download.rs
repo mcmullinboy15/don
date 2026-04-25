@@ -155,7 +155,6 @@ pub enum DownloadError {
     Io(#[from] std::io::Error),
 }
 
-
 /// Archive type detected from the URL file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveType {
@@ -205,7 +204,9 @@ pub async fn ensure_artifact(
     // Cache hit: directory exists, skip download.
     if cache_dir.is_dir() {
         if let Some(writer) = service_writer {
-            writer.write_line("artifact cached, skipping download").await;
+            writer
+                .write_line("artifact cached, skipping download")
+                .await;
         }
         // Still run setup if marker is missing (e.g., previous setup failed).
         run_setup_if_needed(artifact, &cache_dir, service_writer).await?;
@@ -230,7 +231,9 @@ pub async fn ensure_artifact(
         drop(lock);
         let _ = std::fs::remove_file(&lock_path);
         if let Some(writer) = service_writer {
-            writer.write_line("artifact cached, skipping download").await;
+            writer
+                .write_line("artifact cached, skipping download")
+                .await;
         }
         run_setup_if_needed(artifact, &cache_dir, service_writer).await?;
         return Ok(());
@@ -351,7 +354,9 @@ async fn acquire_download_lock(
             })
             .await
             .map_err(|e| DownloadError::Io(std::io::Error::other(e)))??;
-            return Ok(DownloadLock { _file: blocking_file });
+            return Ok(DownloadLock {
+                _file: blocking_file,
+            });
         }
         return Err(DownloadError::Io(errno));
     }
@@ -386,10 +391,12 @@ async fn download_and_verify(
         source: e,
     })?;
 
-    let response = response.error_for_status().map_err(|e| DownloadError::Http {
-        url: url.to_string(),
-        source: e,
-    })?;
+    let response = response
+        .error_for_status()
+        .map_err(|e| DownloadError::Http {
+            url: url.to_string(),
+            source: e,
+        })?;
 
     let total_size = response.content_length();
     let mut file = std::fs::File::create(dest)?;
@@ -454,9 +461,7 @@ fn expand_env_vars(input: &str, context: &str) -> Result<String, String> {
             if let Some(end) = rest.find('}') {
                 let var_name = &rest[..end];
                 let value = std::env::var(var_name).map_err(|_| {
-                    format!(
-                        "header '{context}' references env var '{var_name}' which is not set"
-                    )
+                    format!("header '{context}' references env var '{var_name}' which is not set")
                 })?;
                 out.push_str(&value);
                 // Advance the iterator past the `${VAR}`.
@@ -485,11 +490,7 @@ fn format_progress(bytes: u64, total: Option<u64>) -> String {
 }
 
 /// Verify that a file's SHA-256 hash matches the expected value.
-pub async fn verify_sha256(
-    path: &Path,
-    expected: &str,
-    url: &str,
-) -> Result<(), DownloadError> {
+pub async fn verify_sha256(path: &Path, expected: &str, url: &str) -> Result<(), DownloadError> {
     let path = path.to_path_buf();
     let expected = expected.to_string();
     let url = url.to_string();
@@ -627,16 +628,14 @@ fn is_safe_entry_path(path: &Path) -> bool {
 
 /// Extract a .zip archive into the cache directory.
 fn extract_zip(archive_path: &Path, cache_dir: &Path, url: &str) -> Result<(), DownloadError> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| DownloadError::Extract {
-            url: url.to_string(),
-            source: e,
-        })?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| DownloadError::Extract {
-            url: url.to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-        })?;
+    let file = std::fs::File::open(archive_path).map_err(|e| DownloadError::Extract {
+        url: url.to_string(),
+        source: e,
+    })?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| DownloadError::Extract {
+        url: url.to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+    })?;
 
     std::fs::create_dir_all(cache_dir)?;
 
@@ -674,11 +673,7 @@ fn extract_zip(archive_path: &Path, cache_dir: &Path, url: &str) -> Result<(), D
 }
 
 /// Place a bare binary (non-archive) into the cache directory.
-fn place_bare_binary(
-    temp_path: &Path,
-    cache_dir: &Path,
-    url: &str,
-) -> Result<(), DownloadError> {
+fn place_bare_binary(temp_path: &Path, cache_dir: &Path, url: &str) -> Result<(), DownloadError> {
     std::fs::create_dir_all(cache_dir)?;
 
     let filename = url
@@ -688,14 +683,12 @@ fn place_bare_binary(
         .rsplit('/')
         .next()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            DownloadError::Extract {
-                url: url.to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "URL has no filename component",
-                ),
-            }
+        .ok_or_else(|| DownloadError::Extract {
+            url: url.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "URL has no filename component",
+            ),
         })?;
 
     let dest = cache_dir.join(filename);
@@ -729,7 +722,11 @@ async fn run_setup_if_needed(
 
     if let Some(writer) = service_writer {
         writer
-            .write_line(&format!("running setup: {} {}", setup.cmd, setup.args.join(" ")))
+            .write_line(&format!(
+                "running setup: {} {}",
+                setup.cmd,
+                setup.args.join(" ")
+            ))
             .await;
     }
 
@@ -747,11 +744,7 @@ async fn run_setup_if_needed(
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(DownloadError::Setup {
             cmd: setup.cmd.clone(),
-            message: format!(
-                "exited with {}: {}",
-                output.status,
-                stderr.trim()
-            ),
+            message: format!("exited with {}: {}", output.status, stderr.trim()),
         });
     }
 
@@ -956,14 +949,38 @@ mod tests {
             safe: bool,
         }
         let cases = vec![
-            Case { path: "foo/bar.txt", safe: true },
-            Case { path: "foo/bar/baz", safe: true },
-            Case { path: "bin/tool", safe: true },
-            Case { path: "./foo", safe: true },
-            Case { path: "../etc/passwd", safe: false },
-            Case { path: "foo/../../etc/passwd", safe: false },
-            Case { path: "/etc/passwd", safe: false },
-            Case { path: "/tmp/evil", safe: false },
+            Case {
+                path: "foo/bar.txt",
+                safe: true,
+            },
+            Case {
+                path: "foo/bar/baz",
+                safe: true,
+            },
+            Case {
+                path: "bin/tool",
+                safe: true,
+            },
+            Case {
+                path: "./foo",
+                safe: true,
+            },
+            Case {
+                path: "../etc/passwd",
+                safe: false,
+            },
+            Case {
+                path: "foo/../../etc/passwd",
+                safe: false,
+            },
+            Case {
+                path: "/etc/passwd",
+                safe: false,
+            },
+            Case {
+                path: "/tmp/evil",
+                safe: false,
+            },
         ];
         for case in cases {
             let result = is_safe_entry_path(Path::new(case.path));
@@ -992,7 +1009,9 @@ mod tests {
 
         let out = std::fs::File::create(&archive_path).unwrap();
         let encoder = xz2::write::XzEncoder::new(out, 6);
-        write_tar_with_file(encoder, "test.txt", b"hello from xz").finish().unwrap();
+        write_tar_with_file(encoder, "test.txt", b"hello from xz")
+            .finish()
+            .unwrap();
 
         extract_tar_xz(&archive_path, &cache_dir, "http://example.com/test.tar.xz").unwrap();
         assert_eq!(
@@ -1009,7 +1028,9 @@ mod tests {
 
         let out = std::fs::File::create(&archive_path).unwrap();
         let encoder = bzip2::write::BzEncoder::new(out, bzip2::Compression::default());
-        write_tar_with_file(encoder, "test.txt", b"hello from bz2").finish().unwrap();
+        write_tar_with_file(encoder, "test.txt", b"hello from bz2")
+            .finish()
+            .unwrap();
 
         extract_tar_bz2(&archive_path, &cache_dir, "http://example.com/test.tar.bz2").unwrap();
         assert_eq!(
@@ -1026,7 +1047,9 @@ mod tests {
 
         let out = std::fs::File::create(&archive_path).unwrap();
         let encoder = zstd::stream::write::Encoder::new(out, 3).unwrap();
-        write_tar_with_file(encoder, "test.txt", b"hello from zstd").finish().unwrap();
+        write_tar_with_file(encoder, "test.txt", b"hello from zstd")
+            .finish()
+            .unwrap();
 
         extract_tar_zst(&archive_path, &cache_dir, "http://example.com/test.tar.zst").unwrap();
         assert_eq!(
@@ -1159,9 +1182,17 @@ mod tests {
 
         // Owner "alpha" has a kept and a removed hash.
         std::fs::create_dir_all(cache_base.join("alpha").join(&hash_keep)).unwrap();
-        std::fs::write(cache_base.join("alpha").join(&hash_keep).join("file"), b"kept").unwrap();
+        std::fs::write(
+            cache_base.join("alpha").join(&hash_keep).join("file"),
+            b"kept",
+        )
+        .unwrap();
         std::fs::create_dir_all(cache_base.join("alpha").join(&hash_remove)).unwrap();
-        std::fs::write(cache_base.join("alpha").join(&hash_remove).join("file"), b"gone").unwrap();
+        std::fs::write(
+            cache_base.join("alpha").join(&hash_remove).join("file"),
+            b"gone",
+        )
+        .unwrap();
         // Also a dotfile inside owner dir (lock file) — should be preserved.
         std::fs::write(cache_base.join("alpha").join(".lock-xyz"), b"").unwrap();
         // And a non-hash dir inside owner — skipped.
@@ -1178,12 +1209,19 @@ mod tests {
 
         let removed = prune_cache(cache_base, &keep).unwrap();
 
-        assert_eq!(removed.len(), 2, "should remove one hash dir + one owner dir");
+        assert_eq!(
+            removed.len(),
+            2,
+            "should remove one hash dir + one owner dir"
+        );
         assert!(cache_base.join("alpha").join(&hash_keep).exists());
         assert!(!cache_base.join("alpha").join(&hash_remove).exists());
         assert!(cache_base.join("alpha").join(not_a_hash).exists());
         assert!(cache_base.join("alpha").join(".lock-xyz").exists());
-        assert!(!cache_base.join("beta").exists(), "orphaned owner dir removed");
+        assert!(
+            !cache_base.join("beta").exists(),
+            "orphaned owner dir removed"
+        );
         assert!(cache_base.join(".some-meta").exists());
     }
 
@@ -1252,7 +1290,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&binary_path).unwrap().permissions().mode();
+            let mode = std::fs::metadata(&binary_path)
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o755);
         }
     }
@@ -1288,19 +1329,13 @@ mod tests {
         run_setup_if_needed(&artifact, &cache_dir, None)
             .await
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&counter_file).unwrap().trim(),
-            "1"
-        );
+        assert_eq!(std::fs::read_to_string(&counter_file).unwrap().trim(), "1");
 
         // Second run: setup should be skipped (marker file exists).
         run_setup_if_needed(&artifact, &cache_dir, None)
             .await
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&counter_file).unwrap().trim(),
-            "1"
-        );
+        assert_eq!(std::fs::read_to_string(&counter_file).unwrap().trim(), "1");
     }
 
     #[tokio::test]

@@ -199,10 +199,22 @@ mod tests {
             want: ParamKind,
         }
         let cases = [
-            Case { kind_str: "string", want: ParamKind::String },
-            Case { kind_str: "int", want: ParamKind::Int },
-            Case { kind_str: "bool", want: ParamKind::Bool },
-            Case { kind_str: "choice", want: ParamKind::Choice },
+            Case {
+                kind_str: "string",
+                want: ParamKind::String,
+            },
+            Case {
+                kind_str: "int",
+                want: ParamKind::Int,
+            },
+            Case {
+                kind_str: "bool",
+                want: ParamKind::Bool,
+            },
+            Case {
+                kind_str: "choice",
+                want: ParamKind::Choice,
+            },
         ];
         for c in cases {
             let toml = format!(r#"name = "x"{}kind = "{}""#, "\n", c.kind_str);
@@ -210,5 +222,4 @@ mod tests {
             assert_eq!(got.kind, c.want, "{}", c.kind_str);
         }
     }
-
 }

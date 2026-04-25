@@ -3,14 +3,14 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::Runner;
+use don::runner::{Runner, RunnerCommand};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
@@ -80,10 +80,16 @@ async fn make_runner(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner =
-        Runner::new(config, PLATFORM, output_manager, base_dir.to_path_buf(), None, shutdown_rx)
-            .await
-            .unwrap();
+    let runner = Runner::new(
+        config,
+        PLATFORM,
+        output_manager,
+        base_dir.to_path_buf(),
+        None,
+        shutdown_rx,
+    )
+    .await
+    .unwrap();
     (runner, shutdown_tx, buf)
 }
 
@@ -149,7 +155,11 @@ fn integration_dependency_ordering_a_before_b() {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&listen_script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            &listen_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
 
         let toml = ConfigBuilder::new()
             .add_custom_service("svc-a", listen_script.to_str().unwrap(), &[])
@@ -199,7 +209,11 @@ fn integration_task_depends_on_service() {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&listen_script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            &listen_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
 
         let toml = ConfigBuilder::new()
             .add_custom_service("mydb", listen_script.to_str().unwrap(), &[])
@@ -250,7 +264,11 @@ fn integration_tcp_ready_check() {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&listen_script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            &listen_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
 
         let toml = ConfigBuilder::new()
             .add_custom_service("tcpsvc", listen_script.to_str().unwrap(), &[])
@@ -301,7 +319,11 @@ fn integration_exec_ready_check_with_retries() {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&check_script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            &check_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
 
         let toml = ConfigBuilder::new()
             .add_custom_service("execsvc", "sleep", &["300"])
@@ -331,7 +353,10 @@ fn integration_exec_ready_check_with_retries() {
             .trim()
             .parse()
             .unwrap();
-        assert!(count >= 3, "check should have run at least 3 times, ran {count}");
+        assert!(
+            count >= 3,
+            "check should have run at least 3 times, ran {count}"
+        );
     });
 }
 
@@ -786,6 +811,89 @@ fn integration_ready_check_exhausted() {
     });
 }
 
+#[test]
+fn integration_dependency_failed_service_recovers_downstream_start() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("dep-failed-recovery");
+        let port = free_port();
+        let gate_file = dir.path().join("allow-start");
+        let service_script = dir.path().join("serve-when-enabled.sh");
+
+        std::fs::write(
+            &service_script,
+            "#!/bin/sh\n\
+             if [ ! -f \"$1\" ]; then\n\
+               exit 1\n\
+             fi\n\
+             exec python3 -c \"\n\
+import socket, sys, time\n\
+s = socket.socket()\n\
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+s.bind(('127.0.0.1', int(sys.argv[1])))\n\
+s.listen(1)\n\
+while True: time.sleep(60)\n\
+\" \"$2\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &service_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["300"])
+            .log("ignore")
+            .done()
+            .add_custom_service(
+                "db",
+                service_script.to_str().unwrap(),
+                &[gate_file.to_str().unwrap(), &port.to_string()],
+            )
+            .ready_tcp_with(&format!("127.0.0.1:{port}"), "100ms", 10)
+            .log("ignore")
+            .done()
+            .add_custom_service("api", "sleep", &["300"])
+            .depends_on(&["db"])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(
+            &buf,
+            "api: skipped (dependency failed)",
+            Duration::from_secs(8),
+        )
+        .await;
+
+        std::fs::write(&gate_file, "ok").unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Restart {
+                name: "db".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_ok(),
+            "manual db restart should succeed"
+        );
+
+        wait_for_substr(&buf, "api: starting", Duration::from_secs(8)).await;
+        wait_for_substr(&buf, "api: started", Duration::from_secs(8)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- Task with watch files: skip on no changes ---
 
 #[test]
@@ -907,15 +1015,15 @@ fn integration_http_ready_check() {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&server_script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            &server_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
 
         let toml = ConfigBuilder::new()
             .add_custom_service("httpsvc", server_script.to_str().unwrap(), &[])
-            .ready_http_with(
-                &format!("http://127.0.0.1:{port}/"),
-                "200ms",
-                30,
-            )
+            .ready_http_with(&format!("http://127.0.0.1:{port}/"), "200ms", 30)
             .log("ignore")
             .done()
             .build();
@@ -955,7 +1063,9 @@ fn integration_don_pid_file_prevents_double_start() {
         config.validate(PLATFORM).unwrap();
 
         let (writer1, _buf1) = TestBuffer::new();
-        let output_manager = OutputManager::new(&[("svc", &LogConfig::Ignore)], writer1).await.unwrap();
+        let output_manager = OutputManager::new(&[("svc", &LogConfig::Ignore)], writer1)
+            .await
+            .unwrap();
         let (_shutdown_tx1, shutdown_rx1) = mpsc::channel(2);
 
         // First runner acquires the PID file.
@@ -974,7 +1084,9 @@ fn integration_don_pid_file_prevents_double_start() {
         let config2: Config = toml.parse().unwrap();
         config2.validate(PLATFORM).unwrap();
         let (writer2, _buf2) = TestBuffer::new();
-        let output_manager2 = OutputManager::new(&[("svc", &LogConfig::Ignore)], writer2).await.unwrap();
+        let output_manager2 = OutputManager::new(&[("svc", &LogConfig::Ignore)], writer2)
+            .await
+            .unwrap();
         let (_shutdown_tx2, shutdown_rx2) = mpsc::channel(2);
         let result = Runner::new(
             config2,

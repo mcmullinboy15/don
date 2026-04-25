@@ -16,9 +16,7 @@ pub(crate) fn fuzzy_match(query: &str, names: &[String]) -> Vec<String> {
     let query_lower = query.to_lowercase();
     let mut scored: Vec<(usize, &String)> = names
         .iter()
-        .filter_map(|name| {
-            subsequence_score(&query_lower, &name.to_lowercase()).map(|s| (s, name))
-        })
+        .filter_map(|name| subsequence_score(&query_lower, &name.to_lowercase()).map(|s| (s, name)))
         .collect();
     // Lower score = tighter match. Stable sort to preserve original order on ties.
     scored.sort_by_key(|(score, _)| *score);

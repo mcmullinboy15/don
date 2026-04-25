@@ -201,10 +201,7 @@ fn cleanup_cli_no_stale_state() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("no stale state"),
-            "stdout: {stdout}"
-        );
+        assert!(stdout.contains("no stale state"), "stdout: {stdout}");
     });
 }
 

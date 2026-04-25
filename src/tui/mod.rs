@@ -52,9 +52,7 @@ use ansi_to_tui::IntoText;
 use crossterm::cursor::MoveTo;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -440,10 +438,8 @@ fn handle_key(
             tokio::spawn(async move {
                 let _ = tx.send(RunnerCommand::Shutdown).await;
             });
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::this(),
-                nix::sys::signal::Signal::SIGINT,
-            );
+            let _ =
+                nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
         }
         return Ok(());
     }
@@ -704,9 +700,7 @@ fn handle_overlay_key(
             let failed: Vec<String> = app
                 .services_state
                 .iter()
-                .filter(|(_, s)| {
-                    matches!(s, ServiceState::Failed | ServiceState::DependencyFailed)
-                })
+                .filter(|(_, s)| matches!(s, ServiceState::Failed | ServiceState::DependencyFailed))
                 .map(|(n, _)| n.clone())
                 .collect();
             for name in failed {
@@ -1012,11 +1006,20 @@ fn handle_form_key(
                 .form
                 .as_ref()
                 .and_then(|f| f.focused())
-                .is_some_and(|f| matches!(f.candidates, form::CandidateState::Loaded(_) | form::CandidateState::Failed { .. } | form::CandidateState::Loading));
-            let focused_param = app.form.as_ref().and_then(|f| f.focused()).map(|f| f.name.clone());
-            if refresh
-                && let Some(param) = focused_param
-            {
+                .is_some_and(|f| {
+                    matches!(
+                        f.candidates,
+                        form::CandidateState::Loaded(_)
+                            | form::CandidateState::Failed { .. }
+                            | form::CandidateState::Loading
+                    )
+                });
+            let focused_param = app
+                .form
+                .as_ref()
+                .and_then(|f| f.focused())
+                .map(|f| f.name.clone());
+            if refresh && let Some(param) = focused_param {
                 request_form_completion(app, &task_name, &param, true, command_tx);
             } else if let Some(form) = app.form.as_mut() {
                 form.focus_next();

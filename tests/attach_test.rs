@@ -75,11 +75,7 @@ async fn spawn_runner(
 
 /// Connect to the daemon using the raw HTTP upgrade protocol.
 /// Returns the stream ready for raw I/O, plus any leftover bytes from the header read.
-async fn raw_attach(
-    socket_path: &Path,
-    name: &str,
-    pid: u32,
-) -> (UnixStream, Vec<u8>) {
+async fn raw_attach(socket_path: &Path, name: &str, pid: u32) -> (UnixStream, Vec<u8>) {
     let mut stream = UnixStream::connect(socket_path).await.unwrap();
     let req = format!(
         "GET /attach/{name}?pid={pid}&cols=80&rows=24 HTTP/1.1\r\n\
@@ -115,11 +111,7 @@ async fn raw_attach(
 }
 
 /// Connect and expect a non-101 error response. Returns (status, body_text).
-async fn raw_attach_error(
-    socket_path: &Path,
-    name: &str,
-    pid: u32,
-) -> (u16, String) {
+async fn raw_attach_error(socket_path: &Path, name: &str, pid: u32) -> (u16, String) {
     let mut stream = UnixStream::connect(socket_path).await.unwrap();
     let req = format!(
         "GET /attach/{name}?pid={pid}&cols=80&rows=24 HTTP/1.1\r\n\

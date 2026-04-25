@@ -356,7 +356,10 @@ mod tests {
         assert!(s.passes("api"));
         assert!(s.passes("worker"));
         assert!(!s.passes("db"), "db hidden by default");
-        assert!(s.is_active(), "filter reports active when any name is hidden");
+        assert!(
+            s.is_active(),
+            "filter reports active when any name is hidden"
+        );
     }
 
     #[test]
@@ -603,8 +606,7 @@ mod tests {
 
         for case in cases {
             let mut s = state(&["api", "worker", "db"]);
-            let hidden: HashSet<String> =
-                case.hidden.iter().map(|s| s.to_string()).collect();
+            let hidden: HashSet<String> = case.hidden.iter().map(|s| s.to_string()).collect();
             s.set_hidden_from_display(hidden);
             for ch in case.query.chars() {
                 s.push_query_char(ch);

@@ -5,7 +5,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{resolve_profile_items, Runner};
+use don::runner::{Runner, resolve_profile_items};
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -183,7 +183,11 @@ async fn spawn_runner_with_profile(
     toml: &str,
     base_dir: &std::path::Path,
     profile: Option<&str>,
-) -> (mpsc::Sender<()>, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<u8>>>) {
+) -> (
+    mpsc::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    Arc<Mutex<Vec<u8>>>,
+) {
     let config_path = base_dir.join("don.toml");
     std::fs::write(&config_path, toml).unwrap();
 
@@ -344,7 +348,10 @@ fn profile_excluded_services_absent_from_status() {
                 don::runner::ItemStatus::Task { name, .. } => name.clone(),
             })
             .collect();
-        assert!(names.contains(&"api".to_string()), "api should be in status: {names:?}");
+        assert!(
+            names.contains(&"api".to_string()),
+            "api should be in status: {names:?}"
+        );
         assert!(
             !names.contains(&"worker".to_string()),
             "worker should NOT be in status: {names:?}"

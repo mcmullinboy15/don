@@ -135,12 +135,7 @@ mod tests {
 
         for case in cases {
             let responses = find_responses(case.chunk);
-            assert_eq!(
-                responses.len(),
-                case.expected_count,
-                "case: {}",
-                case.name
-            );
+            assert_eq!(responses.len(), case.expected_count, "case: {}", case.name);
         }
     }
 

@@ -14,7 +14,9 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::{AttachWaiter, ServiceHandle, ServiceState, TaskItemState};
+use super::{
+    AttachWaiter, CommandResult, ServiceHandle, ServiceState, ServiceStopAction, TaskItemState,
+};
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 
@@ -55,6 +57,25 @@ pub(crate) struct RuntimeService {
     /// Handle to a scheduled `RestartUnhealthy` command. Aborted on stop,
     /// recovery, or manual restart so we don't fire a stale auto-restart.
     pub pending_restart: Option<tokio::task::JoinHandle<()>>,
+    /// In-flight manual stop/restart worker, if any.
+    pub control_worker: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic generation for manual control workers so stale completions
+    /// can be ignored.
+    pub control_generation: u64,
+    /// Pending reply for a manual stop/restart request.
+    pub control_reply: Option<oneshot::Sender<CommandResult>>,
+    /// Follow-up action to run after the current stop completes.
+    pub stop_action: ServiceStopAction,
+    /// In-flight start-preparation worker (download/build) for this service.
+    pub start_worker: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic generation for start-preparation workers so stale
+    /// completions can be ignored.
+    pub start_generation: u64,
+    /// In-flight rebuild-preparation worker (build only) for this service.
+    pub rebuild_worker: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic generation for rebuild workers so stale completions can
+    /// be ignored.
+    pub rebuild_generation: u64,
 }
 
 impl RuntimeService {
@@ -76,6 +97,14 @@ impl RuntimeService {
             monitor_cancel: None,
             restart_attempts: 0,
             pending_restart: None,
+            control_worker: None,
+            control_generation: 0,
+            control_reply: None,
+            stop_action: ServiceStopAction::None,
+            start_worker: None,
+            start_generation: 0,
+            rebuild_worker: None,
+            rebuild_generation: 0,
         }
     }
 
@@ -132,6 +161,11 @@ pub(crate) struct RuntimeTask {
     pub attach_waiter: Option<AttachWaiter>,
     /// Watch paths resolved from build tool queries (bazel/turbo).
     pub resolved_watch_paths: Vec<String>,
+    /// In-flight detached task run worker.
+    pub run_worker: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic generation for task run workers so stale completions can
+    /// be ignored.
+    pub run_generation: u64,
 }
 
 impl RuntimeTask {
@@ -145,6 +179,8 @@ impl RuntimeTask {
             attach_lock: None,
             attach_waiter: None,
             resolved_watch_paths: Vec::new(),
+            run_worker: None,
+            run_generation: 0,
         }
     }
 

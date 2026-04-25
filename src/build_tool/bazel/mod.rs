@@ -114,10 +114,13 @@ impl BazelResolver {
 
         // `wait_with_output` reads whatever pipes are still attached; we
         // already took stderr, so it just collects stdout and exit status.
-        let output = child.wait_with_output().await.map_err(|e| BuildToolError::Io {
-            tool: "bazel".to_string(),
-            source: e,
-        })?;
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| BuildToolError::Io {
+                tool: "bazel".to_string(),
+                source: e,
+            })?;
 
         let stderr_collected = match stderr_handle.into_inner() {
             Some(h) => h.await.unwrap_or_default(),
@@ -191,11 +194,8 @@ impl BazelResolver {
             .kill_on_drop(true);
 
         if let Some(em) = emitter {
-            let mut args: Vec<String> = vec![
-                "build".into(),
-                "--curses=no".into(),
-                "--color=yes".into(),
-            ];
+            let mut args: Vec<String> =
+                vec!["build".into(), "--curses=no".into(), "--color=yes".into()];
             args.extend(targets.iter().cloned());
             em.debug_spawn("bazel", "bazel", &args);
         }
@@ -224,13 +224,17 @@ impl BazelResolver {
                 let mut line_buf = Vec::new();
                 loop {
                     line_buf.clear();
-                    match tokio::io::AsyncBufReadExt::read_until(
-                        &mut reader, b'\n', &mut line_buf,
-                    ).await {
+                    match tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line_buf)
+                        .await
+                    {
                         Ok(0) => break,
                         Ok(_) => {
-                            if line_buf.last() == Some(&b'\n') { line_buf.pop(); }
-                            if line_buf.last() == Some(&b'\r') { line_buf.pop(); }
+                            if line_buf.last() == Some(&b'\n') {
+                                line_buf.pop();
+                            }
+                            if line_buf.last() == Some(&b'\r') {
+                                line_buf.pop();
+                            }
                             let text = String::from_utf8_lossy(&line_buf);
                             // Parse ERROR lines to identify failed targets.
                             if text.contains("ERROR:") {
@@ -394,8 +398,7 @@ impl BazelResolver {
 
         for target in targets {
             let packages = graph.packages_for(target);
-            let watch_paths: Vec<String> =
-                packages.iter().map(|p| format!("{p}/**")).collect();
+            let watch_paths: Vec<String> = packages.iter().map(|p| format!("{p}/**")).collect();
             let graph_definition_globs: Vec<String> = packages
                 .iter()
                 .flat_map(|p| [format!("{p}/BUILD"), format!("{p}/BUILD.bazel")])
@@ -463,10 +466,13 @@ impl BazelResolver {
 
         let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone());
 
-        let output = child.wait_with_output().await.map_err(|e| BuildToolError::Io {
-            tool: "bazel".to_string(),
-            source: e,
-        })?;
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| BuildToolError::Io {
+                tool: "bazel".to_string(),
+                source: e,
+            })?;
 
         let stderr_collected = match stderr_handle.into_inner() {
             Some(h) => h.await.unwrap_or_default(),
@@ -532,7 +538,9 @@ fn spawn_stderr_stream(
 ) -> AbortOnDrop<String> {
     AbortOnDrop::new(tokio::spawn(async move {
         let mut collected = String::new();
-        let Some(stderr) = stderr else { return collected };
+        let Some(stderr) = stderr else {
+            return collected;
+        };
         let mut reader = tokio::io::BufReader::new(stderr);
         let mut line_buf = Vec::new();
         loop {
@@ -572,9 +580,7 @@ impl BuildGraphResolver for BazelResolver {
         // transitive closure. External packages (prefixed with `@`) are filtered
         // out during parsing rather than using `intersect //...` which can be
         // too aggressive with some Bazel versions.
-        let query = format!(
-            "kind(\"source file\", deps({target}))"
-        );
+        let query = format!("kind(\"source file\", deps({target}))");
         let output = self.run_query(&query, "package", working_dir).await?;
         let packages = Self::parse_packages(&output);
         let watch_paths: Vec<String> = packages.iter().map(|p| format!("{p}/**")).collect();
@@ -586,9 +592,7 @@ impl BuildGraphResolver for BazelResolver {
         // point broadcasting them here.
         let graph_definition_globs: Vec<String> = packages
             .iter()
-            .flat_map(|p| {
-                [format!("{p}/BUILD"), format!("{p}/BUILD.bazel")]
-            })
+            .flat_map(|p| [format!("{p}/BUILD"), format!("{p}/BUILD.bazel")])
             .collect();
 
         // Query for direct first-party dependencies (for informational purposes).

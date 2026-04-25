@@ -24,7 +24,10 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/attach/{name}/resize", post(super::attach::resize_handler))
         .route("/run-pending", post(post_run_pending))
         .route("/run/{name}", post(post_run_task))
-        .route("/completions/{task}/{param}", post(post_resolve_completions))
+        .route(
+            "/completions/{task}/{param}",
+            post(post_resolve_completions),
+        )
         .with_state(state)
 }
 
@@ -64,10 +67,7 @@ struct StatusResponse {
 }
 
 /// `POST /start/:name` — start a stopped service.
-async fn post_start(
-    State(state): State<Arc<ApiState>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn post_start(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::Start {
         name,
         reply,
@@ -76,10 +76,7 @@ async fn post_start(
 }
 
 /// `POST /stop/:name` — stop a running service.
-async fn post_stop(
-    State(state): State<Arc<ApiState>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn post_stop(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::Stop {
         name,
         reply,
@@ -88,10 +85,7 @@ async fn post_stop(
 }
 
 /// `POST /restart/:name` — restart a service.
-async fn post_restart(
-    State(state): State<Arc<ApiState>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn post_restart(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::Restart {
         name,
         reply,
@@ -179,7 +173,7 @@ async fn follow_logs(state: Arc<ApiState>, name: String, last: usize) -> Respons
     };
 
     // Build an NDJSON stream: one `{"line":"..."}\n` per SinkLine.
-    use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+    use tokio_stream::{StreamExt, wrappers::ReceiverStream};
     let stream = ReceiverStream::new(sink_rx).map(|sink_line| {
         let line_str = String::from_utf8_lossy(&sink_line.line).into_owned();
         let json = serde_json::json!({ "line": line_str });
@@ -304,11 +298,7 @@ async fn post_resolve_completions(
     }
     match rx.await {
         Ok(Ok(values)) => Json(CompletionsResponse { values }).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(completion_error_body(&e)),
-        )
-            .into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(completion_error_body(&e))).into_response(),
         Err(_) => runner_unavailable(),
     }
 }

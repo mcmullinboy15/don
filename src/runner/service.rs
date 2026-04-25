@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::sync::watch;
 
 /// A running service handle — either a local process or a Docker container.
 pub enum ServiceHandle {
@@ -386,6 +387,117 @@ pub(crate) async fn stop_service(
                 .stop(signal_name, timeout)
                 .await
                 .map_err(|e| ServiceError::Docker(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_shutdown_flag(shutdown_rx: &mut watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+    }
+}
+
+/// Stop a service like [`stop_service`], but let an external shutdown request
+/// cut in and force an immediate SIGKILL/remove path.
+pub(crate) async fn stop_service_interruptibly(
+    mut handle: ServiceHandle,
+    shutdown_config: Option<&ShutdownConfig>,
+    wait_full_exit: bool,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), ServiceError> {
+    match handle {
+        ServiceHandle::Process(ref mut process) => {
+            let signal = shutdown_config
+                .map(|c| parse_signal(&c.signal))
+                .unwrap_or(Signal::SIGTERM);
+            let timeout = shutdown_config
+                .and_then(|c| parse_duration(&c.timeout).ok())
+                .unwrap_or(Duration::from_secs(10));
+
+            if let Err(e) = process.signal(signal)
+                && !matches!(
+                    e,
+                    crate::process::ProcessError::Signal {
+                        source: nix::Error::ESRCH,
+                        ..
+                    }
+                )
+            {
+                return Err(ServiceError::Process(e));
+            }
+
+            let shutdown_requested = {
+                let wait_fut = process.wait();
+                let shutdown_fut = wait_for_shutdown_flag(&mut shutdown_rx);
+                tokio::pin!(wait_fut);
+                tokio::pin!(shutdown_fut);
+                tokio::select! {
+                    result = &mut wait_fut => {
+                        result?;
+                        false
+                    }
+                    _ = tokio::time::sleep(timeout) => true,
+                    _ = &mut shutdown_fut => true,
+                }
+            };
+
+            if shutdown_requested {
+                if let Err(e) = process.signal(Signal::SIGKILL)
+                    && !matches!(
+                        e,
+                        crate::process::ProcessError::Signal {
+                            source: nix::Error::ESRCH,
+                            ..
+                        }
+                    )
+                {
+                    return Err(ServiceError::Process(e));
+                }
+                tokio::time::timeout(Duration::from_millis(500), process.wait())
+                    .await
+                    .map_err(|_| crate::process::ProcessError::Unkillable {
+                        pgid: process.pgid(),
+                    })??;
+            }
+
+            if wait_full_exit && !process.wait_pgroup_empty(Duration::from_secs(2)).await {
+                let _ = process.signal(Signal::SIGKILL);
+                let _ = process.wait_pgroup_empty(Duration::from_millis(500)).await;
+            }
+        }
+        ServiceHandle::Docker(ref mut docker) => {
+            let signal_name = shutdown_config
+                .map(|c| c.signal.as_str())
+                .unwrap_or("SIGTERM");
+            let timeout = shutdown_config
+                .and_then(|c| parse_duration(&c.timeout).ok())
+                .unwrap_or(Duration::from_secs(10));
+
+            let shutdown_requested = {
+                let stop_fut = docker.stop(signal_name, timeout);
+                let shutdown_fut = wait_for_shutdown_flag(&mut shutdown_rx);
+                tokio::pin!(stop_fut);
+                tokio::pin!(shutdown_fut);
+                tokio::select! {
+                    result = &mut stop_fut => {
+                        result.map_err(|e| ServiceError::Docker(e.to_string()))?;
+                        false
+                    }
+                    _ = &mut shutdown_fut => true,
+                }
+            };
+            if shutdown_requested {
+                docker
+                    .remove()
+                    .await
+                    .map_err(|e| ServiceError::Docker(e.to_string()))?;
+            }
         }
     }
     Ok(())

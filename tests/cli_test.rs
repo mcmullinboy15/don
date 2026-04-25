@@ -23,10 +23,7 @@ const PLATFORM: Platform = Platform::LinuxX86_64;
 /// Spawn an in-process runner for the given TOML. Returns socket path,
 /// shutdown sender, and the join handle. Mirrors the pattern in
 /// tests/server_test.rs.
-async fn spawn_runner(
-    toml: &str,
-    base_dir: &Path,
-) -> (PathBuf, mpsc::Sender<()>, JoinHandle<()>) {
+async fn spawn_runner(toml: &str, base_dir: &Path) -> (PathBuf, mpsc::Sender<()>, JoinHandle<()>) {
     let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
@@ -115,11 +112,10 @@ fn cli_status_against_running_daemon() {
         // Give service time to become ready.
         tokio::time::sleep(Duration::from_millis(400)).await;
 
-        let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
-            run_cli(&config_path, &["status"])
-        })
-        .await
-        .unwrap();
+        let (code, stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&config_path, &["status"]))
+                .await
+                .unwrap();
         assert_eq!(code, 0, "stderr: {stderr}");
         assert!(stdout.contains("KIND"), "stdout: {stdout}");
         assert!(stdout.contains("keeper"), "stdout: {stdout}");
@@ -139,11 +135,10 @@ fn cli_stop_daemon_not_running_gives_clear_error() {
         std::fs::write(&config_path, &toml).unwrap();
         // Don't spawn a runner — the socket won't exist.
 
-        let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
-            run_cli(&config_path, &["stop", "api"])
-        })
-        .await
-        .unwrap();
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&config_path, &["stop", "api"]))
+                .await
+                .unwrap();
         assert_eq!(code, 1, "stderr: {stderr}");
         assert!(
             stderr.contains("daemon not running"),
@@ -168,11 +163,10 @@ fn cli_stop_unknown_name_404() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
 
         let path_for_cli = config_path.clone();
-        let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
-            run_cli(&path_for_cli, &["stop", "ghost"])
-        })
-        .await
-        .unwrap();
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&path_for_cli, &["stop", "ghost"]))
+                .await
+                .unwrap();
         assert_eq!(code, 1);
         assert!(stderr.contains("ghost"), "stderr: {stderr}");
 
@@ -246,16 +240,18 @@ fn cli_logs_last_returns_recent_lines() {
         tokio::time::sleep(Duration::from_millis(600)).await;
 
         let cp = config_path.clone();
-        let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
-            run_cli(&cp, &["logs", "chatty", "--last", "3"])
-        })
-        .await
-        .unwrap();
+        let (code, stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["logs", "chatty", "--last", "3"]))
+                .await
+                .unwrap();
         assert_eq!(code, 0, "stderr: {stderr}");
         assert!(stdout.contains("line5"), "stdout: {stdout}");
         assert!(stdout.contains("line3"), "stdout: {stdout}");
         // last=3 should not include line1.
-        assert!(!stdout.contains("line1"), "stdout should not include line1: {stdout}");
+        assert!(
+            !stdout.contains("line1"),
+            "stdout should not include line1: {stdout}"
+        );
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
@@ -282,11 +278,10 @@ fn cli_stop_on_task_returns_bad_request() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
 
         let cp = config_path.clone();
-        let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
-            run_cli(&cp, &["stop", "prep"])
-        })
-        .await
-        .unwrap();
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["stop", "prep"]))
+                .await
+                .unwrap();
         assert_eq!(code, 1);
         assert!(stderr.contains("task"), "stderr: {stderr}");
 
@@ -314,11 +309,10 @@ fn cli_start_subcommand_starts_stopped_service() {
 
         // Now use `don start keeper` to restart it.
         let cp = config_path.clone();
-        let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
-            run_cli(&cp, &["start", "keeper"])
-        })
-        .await
-        .unwrap();
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["start", "keeper"]))
+                .await
+                .unwrap();
         assert_eq!(code, 0, "stderr: {stderr}");
 
         let _ = shutdown_tx.send(()).await;

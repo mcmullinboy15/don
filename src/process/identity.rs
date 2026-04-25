@@ -92,12 +92,7 @@ fn read_start_time(pid: i32) -> io::Result<Option<u64>> {
 
     let mut buf = [0u8; KINFO_PROC_SIZE];
     let mut size = KINFO_PROC_SIZE;
-    let mut mib = [
-        libc::CTL_KERN,
-        libc::KERN_PROC,
-        libc::KERN_PROC_PID,
-        pid,
-    ];
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
 
     let ret = unsafe {
         libc::sysctl(
@@ -191,7 +186,11 @@ mod tests {
 
             for case in cases {
                 let result = parse_starttime_from_stat(case.input);
-                assert_eq!(result, case.expected, "case '{}': input={:?}", case.name, case.input);
+                assert_eq!(
+                    result, case.expected,
+                    "case '{}': input={:?}",
+                    case.name, case.input
+                );
             }
         }
     }

@@ -165,11 +165,7 @@ impl Client {
             log_path: Option<PathBuf>,
         }
 
-        let path = format!(
-            "/completions/{}/{}",
-            urlencode(task),
-            urlencode(param)
-        );
+        let path = format!("/completions/{}/{}", urlencode(task), urlencode(param));
         let body = serde_json::to_vec(&serde_json::json!({
             "partial": partial,
             "force_refresh": force_refresh,
@@ -373,7 +369,11 @@ pub(crate) async fn write_request(
     has_body: bool,
 ) -> Result<(), ClientError> {
     // Content-Length: 0 makes POSTs unambiguous for servers that want it.
-    let cl = if has_body { "" } else { "Content-Length: 0\r\n" };
+    let cl = if has_body {
+        ""
+    } else {
+        "Content-Length: 0\r\n"
+    };
     let req = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: localhost\r\n\
@@ -393,7 +393,9 @@ pub(crate) async fn read_head(
     loop {
         let n = stream.read(&mut scratch).await?;
         if n == 0 {
-            return Err(ClientError::Invalid("connection closed before headers".into()));
+            return Err(ClientError::Invalid(
+                "connection closed before headers".into(),
+            ));
         }
         buf.extend_from_slice(&scratch[..n]);
         if buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -609,4 +611,3 @@ mod tests {
         assert_eq!(extract_error_message(b"not json"), None);
     }
 }
-

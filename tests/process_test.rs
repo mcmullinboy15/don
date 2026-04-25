@@ -1,17 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
 
-use don::process::{cleanup_pgid_file, read_pgid_file, spawn_process, ChildOutput, SpawnConfig};
+use don::process::{ChildOutput, SpawnConfig, cleanup_pgid_file, read_pgid_file, spawn_process};
 use helpers::tempdir::TempDir;
 use nix::sys::signal::Signal;
 use std::collections::HashMap;
 
 /// Helper to build a basic SpawnConfig with inherited env.
-fn basic_config<'a>(
-    cmd: &'a str,
-    args: &'a [String],
-    force_pipe: bool,
-) -> SpawnConfig<'a> {
+fn basic_config<'a>(cmd: &'a str, args: &'a [String], force_pipe: bool) -> SpawnConfig<'a> {
     SpawnConfig {
         cmd,
         args,
@@ -26,7 +22,9 @@ fn basic_config<'a>(
 #[tokio::test]
 async fn spawn_process_has_own_pgid() {
     let args = ["300".to_string()];
-    let (mut handle, _output) = spawn_process(basic_config("sleep", &args, false)).await.unwrap();
+    let (mut handle, _output) = spawn_process(basic_config("sleep", &args, false))
+        .await
+        .unwrap();
     let don_pgid = nix::unistd::getpgid(None).unwrap();
 
     assert_ne!(handle.pgid(), don_pgid.as_raw());
@@ -39,7 +37,9 @@ async fn spawn_process_has_own_pgid() {
 #[tokio::test]
 async fn spawn_pipe_mode_reads_output() {
     let args = ["hello from pipe".to_string()];
-    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, true)).await.unwrap();
+    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, true))
+        .await
+        .unwrap();
     assert!(matches!(output, ChildOutput::Pipe(_)));
 
     let mut buf = Vec::new();
@@ -55,7 +55,9 @@ async fn spawn_pipe_mode_reads_output() {
 #[tokio::test]
 async fn spawn_pty_mode_reads_output() {
     let args = ["hello from pty".to_string()];
-    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, false)).await.unwrap();
+    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, false))
+        .await
+        .unwrap();
 
     let mut buf = vec![0u8; 4096];
     let n = tokio::io::AsyncReadExt::read(&mut output, &mut buf)
@@ -70,7 +72,9 @@ async fn spawn_pty_mode_reads_output() {
 #[tokio::test]
 async fn terminate_sends_sigterm_then_waits() {
     let args = ["300".to_string()];
-    let (mut handle, _output) = spawn_process(basic_config("sleep", &args, true)).await.unwrap();
+    let (mut handle, _output) = spawn_process(basic_config("sleep", &args, true))
+        .await
+        .unwrap();
 
     let status = handle
         .terminate(Signal::SIGTERM, std::time::Duration::from_secs(5))
@@ -87,7 +91,9 @@ async fn terminate_escalates_to_sigkill_on_timeout() {
         "-c".to_string(),
         "trap '' TERM; while true; do sleep 1 & wait; done".to_string(),
     ];
-    let (mut handle, _output) = spawn_process(basic_config("sh", &args, true)).await.unwrap();
+    let (mut handle, _output) = spawn_process(basic_config("sh", &args, true))
+        .await
+        .unwrap();
 
     // Verify the process is actually running
     assert!(handle.pgid() > 0);
@@ -134,7 +140,11 @@ async fn pgid_file_written_on_spawn() {
     // Verify the file now contains two lines (PGID + start_time).
     let contents = std::fs::read_to_string(&pgid_path).unwrap();
     let lines: Vec<&str> = contents.trim().lines().collect();
-    assert_eq!(lines.len(), 2, "expected 2 lines (pgid + start_time), got: {contents:?}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected 2 lines (pgid + start_time), got: {contents:?}"
+    );
     let start_time: u64 = lines[1].parse().unwrap();
     assert!(start_time > 0, "start_time should be positive");
 
@@ -228,7 +238,9 @@ async fn pty_fallback_to_pipe_on_failure() {
     // We can't easily force PTY failure, but we can verify the force_pipe
     // path produces readable output — proving the fallback mechanism works.
     let args = ["fallback test".to_string()];
-    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, true)).await.unwrap();
+    let (mut handle, mut output) = spawn_process(basic_config("echo", &args, true))
+        .await
+        .unwrap();
     assert!(matches!(output, ChildOutput::Pipe(_)));
 
     let mut buf = Vec::new();

@@ -25,6 +25,18 @@ Don uses `tokio` as its async runtime. Key dependencies:
 - **sha2 + glob** — task state hashing to skip unchanged tasks
 - **pty-process** — PTY allocation with native tokio async support (`AsyncRead`/`AsyncWrite`) so child processes see a real terminal (line-buffered output, colors)
 
+#### Shutdown Responsiveness
+
+Shutdown responsiveness is a hard architectural requirement:
+
+- The runner task must never become uninterruptible while awaiting external work.
+- Any slow subprocess, build-tool query, download, or lock wait that is awaited from the runner must race against shutdown.
+- Dropping an in-flight future during shutdown must be enough to make progress toward exit. For subprocess-backed work that means `kill_on_drop`, an abort handle, or another explicit cancellation path.
+- If work cannot satisfy that rule, it must run off the runner task and report completion back over channels.
+- Graceful shutdown coordination may live in the runner, but process-exit authority must live outside it. `main` should be able to abort a wedged runner after a bounded grace period so `Ctrl+C` always still exits the program.
+
+This is not an implementation detail. "Can the user still exit right here?" is part of the design contract for every new startup, rebuild, watch, and API control path.
+
 ## Config File (`don.toml`)
 
 The config has two top-level sections: `[services]` and `[tasks]`.

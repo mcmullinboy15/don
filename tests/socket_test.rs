@@ -93,10 +93,16 @@ async fn make_runner_inner(
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner =
-        Runner::new(config, PLATFORM, output_manager, base_dir.to_path_buf(), None, shutdown_rx)
-            .await
-            .unwrap();
+    let runner = Runner::new(
+        config,
+        PLATFORM,
+        output_manager,
+        base_dir.to_path_buf(),
+        None,
+        shutdown_rx,
+    )
+    .await
+    .unwrap();
     (runner, shutdown_tx, buf)
 }
 
@@ -233,13 +239,10 @@ while True:
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0u8; 64];
             let mut stream = stream;
-            let n = tokio::time::timeout(
-                Duration::from_secs(2),
-                stream.read(&mut buf),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
             let response = String::from_utf8_lossy(&buf[..n]);
             assert_eq!(response, "hello from fd 3");
         }
@@ -282,7 +285,12 @@ fn integration_socket_stays_bound_during_restart() {
         });
 
         assert!(
-            wait_for_output(&buf, &format!("proxy listening on {addr}"), Duration::from_secs(5)).await,
+            wait_for_output(
+                &buf,
+                &format!("proxy listening on {addr}"),
+                Duration::from_secs(5)
+            )
+            .await,
             "timed out waiting for proxy bind. output: {}",
             read_buf(&buf)
         );
@@ -339,7 +347,10 @@ fn integration_listen_service_gets_pty() {
             .add_custom_service(
                 "api",
                 "bash",
-                &["-c", "if [ -t 1 ]; then echo isatty=TTY; else echo isatty=PIPE; fi; sleep 60"],
+                &[
+                    "-c",
+                    "if [ -t 1 ]; then echo isatty=TTY; else echo isatty=PIPE; fi; sleep 60",
+                ],
             )
             .listen(&[&addr])
             .ready_exec("true", &[])
@@ -347,7 +358,9 @@ fn integration_listen_service_gets_pty() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let handle = tokio::spawn(async move { runner.run().await.unwrap(); });
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
 
         let got_tty = wait_for_output(&buf, "isatty=TTY", Duration::from_secs(5)).await;
         let got_pipe = wait_for_output(&buf, "isatty=PIPE", Duration::from_millis(100)).await;
@@ -362,7 +375,10 @@ fn integration_listen_service_gets_pty() {
         if !got_tty && got_pipe {
             eprintln!("[warn] PTY alloc failed in this environment — service ran in pipe fallback");
         } else {
-            assert!(got_tty, "expected isatty=TTY for service with listen (PTY mode)");
+            assert!(
+                got_tty,
+                "expected isatty=TTY for service with listen (PTY mode)"
+            );
         }
 
         let _ = shutdown_tx.send(()).await;
@@ -404,11 +420,12 @@ fn integration_python_line_buffered_on_pty() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let handle = tokio::spawn(async move { runner.run().await.unwrap(); });
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
 
         // If line-buffering works, we see line1 within ~1s (before the 3s sleep).
-        let got_prompt =
-            wait_for_output(&buf, "line1-prompt", Duration::from_millis(1500)).await;
+        let got_prompt = wait_for_output(&buf, "line1-prompt", Duration::from_millis(1500)).await;
         assert!(
             got_prompt,
             "line1-prompt did not appear promptly — stdout likely block-buffered. output: {}",
@@ -435,7 +452,10 @@ fn integration_multiple_listen_addresses() {
             .add_custom_service(
                 "api",
                 "bash",
-                &["-c", "echo LISTEN_FDS=$LISTEN_FDS LISTEN_FDNAMES=$LISTEN_FDNAMES && sleep 60"],
+                &[
+                    "-c",
+                    "echo LISTEN_FDS=$LISTEN_FDS LISTEN_FDNAMES=$LISTEN_FDNAMES && sleep 60",
+                ],
             )
             .listen(&[&addr1, &addr2])
             .ready_exec("true", &[])
@@ -506,7 +526,12 @@ fn integration_lazy_listenfd_triggers_on_connect() {
         // Service is lazy — proxy binds, but the service should NOT start
         // until we connect. Give it a moment, then assert nothing started.
         assert!(
-            wait_for_output(&buf, &format!("proxy listening on {addr}"), Duration::from_secs(5)).await,
+            wait_for_output(
+                &buf,
+                &format!("proxy listening on {addr}"),
+                Duration::from_secs(5)
+            )
+            .await,
             "expected proxy to bind. output: {}",
             read_buf(&buf)
         );

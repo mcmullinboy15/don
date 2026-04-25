@@ -136,7 +136,11 @@ mod tests {
             );
             if !case.expect_err {
                 let contents = std::fs::read_to_string(&path).unwrap();
-                assert!(contents.contains("# don — dev environment orchestrator"), "{}: template header missing", case.name);
+                assert!(
+                    contents.contains("# don — dev environment orchestrator"),
+                    "{}: template header missing",
+                    case.name
+                );
             }
         }
     }

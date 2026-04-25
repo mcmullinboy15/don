@@ -108,7 +108,9 @@ pub(crate) struct AbortOnDrop<T> {
 
 impl<T> AbortOnDrop<T> {
     pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self { handle: Some(handle) }
+        Self {
+            handle: Some(handle),
+        }
     }
 
     /// Take the inner handle out, suppressing the abort-on-drop. Use when

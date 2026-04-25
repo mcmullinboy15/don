@@ -17,7 +17,7 @@ pub mod tui;
 pub mod watch;
 
 pub use config::{Config, ConfigError, Platform};
-pub use duration::{parse_duration, DurationError};
+pub use duration::{DurationError, parse_duration};
 pub use output::{OutputError, OutputManager, ServiceWriter};
 pub use runner::{Runner, RunnerError, VerboseInfo};
 pub use task_state::{TaskState, TaskStateError};

@@ -58,10 +58,10 @@ const SERVICE_COLORS: &[Color] = &[
     Color::AnsiValue(39),
 ];
 
-/// Dedicated build-tool colors so these synthetic streams never collide with
-/// the rotating service palette.
-const BAZEL_COLOR: Color = Color::AnsiValue(166);
-const TURBO_COLOR: Color = Color::AnsiValue(51);
+/// Dedicated build-tool colors so these synthetic streams stay neutral and
+/// never collide with the rotating service palette.
+const BAZEL_COLOR: Color = Color::Grey;
+const TURBO_COLOR: Color = Color::Grey;
 
 /// Handle to an active OSC response sink. Use [`take_pty_write`] to
 /// stop the sink and reclaim the PTY handle (e.g., for attach).
@@ -81,9 +81,7 @@ impl OscSinkHandle {
         // Remove our sender from the service's sinks list.
         {
             let mut state = self.service_state.lock().await;
-            state
-                .sinks
-                .retain(|s| !s.tx.same_channel(&self.tx));
+            state.sinks.retain(|s| !s.tx.same_channel(&self.tx));
         }
         // Drop our sender to close the channel.
         drop(self.tx);
@@ -194,7 +192,11 @@ impl ServiceWriter {
                         let mut state = self.state.lock().await;
                         state.sinks.retain(|s| !s.tx.is_closed());
                         state.ring_buffer.push_chunk(&chunk);
-                        (state.name.clone(), state.prefix.clone(), state.sinks.clone())
+                        (
+                            state.name.clone(),
+                            state.prefix.clone(),
+                            state.sinks.clone(),
+                        )
                     };
 
                     let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
@@ -256,7 +258,11 @@ impl ServiceWriter {
             let mut state = self.state.lock().await;
             state.sinks.retain(|s| !s.tx.is_closed());
             state.ring_buffer.push_chunk(data.as_ref());
-            (state.name.clone(), state.prefix.clone(), state.sinks.clone())
+            (
+                state.name.clone(),
+                state.prefix.clone(),
+                state.sinks.clone(),
+            )
         };
         let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
         for sink in &sinks {
@@ -456,7 +462,10 @@ impl OutputManager {
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
         let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, target, verbose));
-        let stdout_sink = SinkHandle { tx: stdout_tx, drop_on_full: false };
+        let stdout_sink = SinkHandle {
+            tx: stdout_tx,
+            drop_on_full: false,
+        };
 
         // Spawn file sink tasks (deduplicated by path).
         let mut file_sinks: HashMap<PathBuf, SinkHandle> = HashMap::new();
@@ -469,7 +478,13 @@ impl OutputManager {
                 let file = open_log_file(path).await?;
                 let (tx, rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
                 writer_handles.push(tokio::spawn(file_sink_task(rx, file)));
-                file_sinks.insert(path.clone(), SinkHandle { tx, drop_on_full: false });
+                file_sinks.insert(
+                    path.clone(),
+                    SinkHandle {
+                        tx,
+                        drop_on_full: false,
+                    },
+                );
             }
         }
 
@@ -532,7 +547,8 @@ impl OutputManager {
     /// otherwise in debug builds; silently drops the prefix cache in
     /// release).
     pub async fn register_build_tool(&mut self, name: &str) {
-        self.register_service(name, &crate::config::LogConfig::Stdout).await;
+        self.register_service(name, &crate::config::LogConfig::Stdout)
+            .await;
         let prefix = if let Some(state_arc) = self.services.get(name) {
             let state = state_arc.lock().await;
             Some(state.prefix.clone())
@@ -623,7 +639,10 @@ impl OutputManager {
                 break;
             }
         }
-        state.sinks.push(SinkHandle { tx, drop_on_full: true });
+        state.sinks.push(SinkHandle {
+            tx,
+            drop_on_full: true,
+        });
         Some(rx)
     }
 
@@ -1031,7 +1050,15 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     } else {
                         sanitize::sanitize_terminal_output(acc)
                     };
-                    emit_line(&mut target, &msg.name, &msg.prefix, &sanitized, verbose, start).await;
+                    emit_line(
+                        &mut target,
+                        &msg.name,
+                        &msg.prefix,
+                        &sanitized,
+                        verbose,
+                        start,
+                    )
+                    .await;
                 }
                 acc.clear();
             } else if byte == b'\r' {
@@ -1045,7 +1072,15 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     } else {
                         sanitize::sanitize_terminal_output(acc)
                     };
-                    emit_line(&mut target, &msg.name, &msg.prefix, &sanitized, verbose, start).await;
+                    emit_line(
+                        &mut target,
+                        &msg.name,
+                        &msg.prefix,
+                        &sanitized,
+                        verbose,
+                        start,
+                    )
+                    .await;
                 }
                 acc.clear();
                 cr_flushed.insert(msg.prefix.clone());
@@ -1059,7 +1094,15 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     } else {
                         sanitize::sanitize_terminal_output(acc)
                     };
-                    emit_line(&mut target, &msg.name, &msg.prefix, &sanitized, verbose, start).await;
+                    emit_line(
+                        &mut target,
+                        &msg.name,
+                        &msg.prefix,
+                        &sanitized,
+                        verbose,
+                        start,
+                    )
+                    .await;
                     acc.clear();
                 }
             }
@@ -1320,7 +1363,7 @@ mod tests {
         let result = assign_colors(&["api", "bazel", "turbo", "worker"]);
         assert_eq!(result["bazel"], BAZEL_COLOR);
         assert_eq!(result["turbo"], TURBO_COLOR);
-        assert_ne!(result["bazel"], result["turbo"]);
+        assert_eq!(result["bazel"], Color::Grey);
     }
 
     #[test]

@@ -142,8 +142,7 @@ fn integration_download_wrong_sha256_fails() {
         let cache_base = dir.child("cache");
         let artifact = PlatformDownload {
             url: format!("http://{addr}/tool"),
-            sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             path: None,
             setup: None,
             headers: std::collections::HashMap::new(),
@@ -204,14 +203,18 @@ fn integration_download_tar_gz_extraction() {
             .unwrap();
 
         // Verify files extracted correctly.
-        let binary = artifact.cache_dir(&cache_base, "test").join("tool-v1.0/bin/mytool");
+        let binary = artifact
+            .cache_dir(&cache_base, "test")
+            .join("tool-v1.0/bin/mytool");
         assert!(binary.exists(), "binary should be extracted");
         assert_eq!(
             std::fs::read_to_string(&binary).unwrap(),
             "#!/bin/sh\necho tool"
         );
 
-        let readme = artifact.cache_dir(&cache_base, "test").join("tool-v1.0/README.md");
+        let readme = artifact
+            .cache_dir(&cache_base, "test")
+            .join("tool-v1.0/README.md");
         assert!(readme.exists(), "README should be extracted");
 
         let _ = shutdown_tx.send(());
@@ -274,7 +277,10 @@ fn integration_download_setup_runs_once() {
 
         // Verify marker file exists.
         assert!(
-            artifact.cache_dir(&cache_base, "test").join(".setup-marker").exists(),
+            artifact
+                .cache_dir(&cache_base, "test")
+                .join(".setup-marker")
+                .exists(),
             "setup marker should exist"
         );
 
@@ -330,8 +336,8 @@ fn integration_download_cache_hit_skips_network() {
 fn integration_task_download_resolves_cmd() {
     // A task with download config runs the cached binary instead of searching PATH.
     run_with_timeout(Duration::from_secs(10), async {
-        use don::config::Task;
         use don::config::Platform;
+        use don::config::Task;
 
         let dir = TempDir::new("download-task-cmd");
         let serve_dir = dir.child("serve");
@@ -353,7 +359,7 @@ fn integration_task_download_resolves_cmd() {
                 sha256: sha.clone(),
                 path: None,
                 setup: None,
-            headers: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
             },
         );
         let download = don::config::DownloadConfig {
@@ -431,7 +437,9 @@ fn integration_download_concurrent_same_sha() {
             .map(|_| {
                 let cb = cache_base_clone.clone();
                 let a = artifact_clone.clone();
-                tokio::spawn(async move { don::download::ensure_artifact(&a, &cb, "test", None).await })
+                tokio::spawn(
+                    async move { don::download::ensure_artifact(&a, &cb, "test", None).await },
+                )
             })
             .collect();
 
@@ -440,7 +448,10 @@ fn integration_download_concurrent_same_sha() {
         }
 
         let cached = artifact.cache_dir(&cache_base, "test").join("tool");
-        assert!(cached.exists(), "binary should be cached after concurrent downloads");
+        assert!(
+            cached.exists(),
+            "binary should be cached after concurrent downloads"
+        );
         assert_eq!(std::fs::read(&cached).unwrap(), binary_content);
 
         let _ = shutdown_tx.send(());
