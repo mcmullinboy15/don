@@ -6,10 +6,15 @@
 //! can narrow or widen the selection interactively at any time.
 //!
 //! The filter has two lives:
-//! - **Editing**: the user is in filter mode, typing a query and toggling
-//!   selections with Space. `editing_selected` holds the work-in-progress set.
-//! - **Active**: the filter has been committed with Enter. `active_selected`
-//!   is what log lines are checked against.
+//! - **Browsing**: outside the modal, `active_selected` is the set of names
+//!   whose log lines render.
+//! - **Editing**: the modal opens with a snapshot of the current selection.
+//!   Space/`o`/`R` mutate `active_selected` immediately; `Esc` restores the
+//!   snapshot and closes, while Enter keeps the current selection and closes.
+//!
+//! Typing does nothing until the user presses `/` to enter query-input
+//! sub-mode. Pressing Enter in query focus applies the current query result
+//! to the active selection and returns focus to the list.
 //!
 //! Blank spacer lines (`name == ""`, inserted when the user presses Enter
 //! in Normal mode) always pass regardless of the filter — they're UI
@@ -25,8 +30,7 @@
 //!
 //! The edit view prepends a synthetic `[all]` row when the query is empty.
 //! Toggling it with Space flips every name between "all selected" and
-//! "none selected". Committing Enter while highlighted on this row selects
-//! all names. The row disappears once the user starts typing a query.
+//! "none selected". The row disappears once the user starts typing a query.
 
 use std::collections::HashSet;
 
@@ -43,6 +47,15 @@ pub(crate) enum FilterRow {
     /// A real service or task name. Membership in the active set controls
     /// whether its log lines render.
     Name(String),
+}
+
+/// Which part of the filter modal currently owns keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilterFocus {
+    /// The query input owns character keys.
+    Query,
+    /// The list owns navigation and selection keys.
+    List,
 }
 
 /// Filter state, persistent across mode switches.
@@ -68,18 +81,15 @@ pub(crate) struct FilterState {
     /// [`FilterRow::All`] at position 0 when the query is empty. Names in
     /// `hidden_from_display` are omitted.
     rows: Vec<FilterRow>,
-    /// Highlighted index within `rows` — what Up/Down move.
-    highlight: usize,
-    /// Work-in-progress selection, seeded from `active_selected` on entering
-    /// edit mode. Space toggles membership here.
-    editing_selected: HashSet<String>,
-    /// Whether the user toggled anything (via Space) since entering edit
-    /// mode. Used by [`FilterState::commit`] to distinguish the
-    /// "type a query, press Enter" narrowing shortcut from curating via
-    /// explicit Space toggles.
-    edit_touched: bool,
+    /// Which part of the modal currently owns keyboard focus.
+    focus: FilterFocus,
     /// Committed selection. Log lines pass iff their name is in this set.
     active_selected: HashSet<String>,
+    /// Snapshot of `active_selected` captured when the modal opens so Esc can
+    /// restore the prior selection.
+    snapshot_selected: Option<HashSet<String>>,
+    /// Highlighted index within `rows` — what Up/Down move.
+    highlight: usize,
 }
 
 impl FilterState {
@@ -103,10 +113,10 @@ impl FilterState {
             default_selected,
             query: String::new(),
             rows,
-            highlight: 0,
-            editing_selected: HashSet::new(),
-            edit_touched: false,
+            focus: FilterFocus::List,
             active_selected,
+            snapshot_selected: None,
+            highlight: 0,
         }
     }
 
@@ -139,54 +149,77 @@ impl FilterState {
         self.active_selected.contains(name)
     }
 
-    /// Start editing. Seeds the edit selection from the currently active filter
-    /// so users can refine an existing filter rather than rebuild it.
+    /// Start editing. Captures the current selection so Esc can restore it.
     pub(crate) fn enter_edit(&mut self) {
         self.query.clear();
         self.rows = build_rows(&self.all_names, "", &self.hidden_from_display);
+        self.focus = FilterFocus::List;
+        self.snapshot_selected = Some(self.active_selected.clone());
         self.highlight = 0;
-        self.editing_selected = self.active_selected.clone();
-        self.edit_touched = false;
     }
 
-    /// Commit the current edit selection as the active filter.
-    ///
-    /// Resolves the user's intent based on what they did:
-    /// - Any Space toggles → commit the curated `editing_selected` as-is.
-    /// - Otherwise with a non-empty query → narrow to the highlighted row
-    ///   (the "type to narrow" shortcut; replaces any prior selection).
-    /// - Otherwise → commit `editing_selected` unchanged (likely a no-op).
+    /// Finish editing, keeping the current active selection.
     pub(crate) fn commit(&mut self) {
-        if !self.edit_touched && !self.query.is_empty() {
-            self.editing_selected.clear();
-            match self.rows.get(self.highlight) {
-                Some(FilterRow::Name(name)) => {
-                    self.editing_selected.insert(name.clone());
-                }
-                Some(FilterRow::All) => {
-                    // All row only renders with empty query; unreachable
-                    // in practice but safe to handle.
-                    self.editing_selected.extend(self.all_names.iter().cloned());
-                }
-                None => {}
+        self.reset_edit_state();
+    }
+
+    /// Abandon the edit session and restore the selection from when the modal
+    /// opened.
+    pub(crate) fn cancel_edit(&mut self) {
+        if let Some(snapshot) = self.snapshot_selected.take() {
+            self.active_selected = snapshot;
+        }
+        self.reset_edit_state();
+    }
+
+    /// Reset the active selection to the config-derived defaults.
+    pub(crate) fn reset_edit_to_defaults(&mut self) {
+        self.active_selected = self.default_selected.clone();
+    }
+
+    /// Enter query-input sub-mode so subsequent typed characters refine the
+    /// visible row list.
+    pub(crate) fn begin_query_edit(&mut self) {
+        self.focus = FilterFocus::Query;
+    }
+
+    /// Leave query-input sub-mode, keeping the current query active.
+    pub(crate) fn end_query_edit(&mut self) {
+        self.focus = FilterFocus::List;
+    }
+
+    /// Apply the current query result to the active selection.
+    ///
+    /// An empty query restores "all names selected". Non-empty queries use
+    /// the visible rows, which are already filtered for hidden/lazy names.
+    pub(crate) fn apply_query(&mut self) {
+        if self.query.is_empty() {
+            self.active_selected = self.all_names.iter().cloned().collect();
+            return;
+        }
+
+        self.active_selected.clear();
+        for row in &self.rows {
+            if let FilterRow::Name(name) = row {
+                self.active_selected.insert(name.clone());
             }
         }
-        self.active_selected = std::mem::take(&mut self.editing_selected);
-        self.edit_touched = false;
-        self.query.clear();
-        self.highlight = 0;
-        self.rows = build_rows(&self.all_names, "", &self.hidden_from_display);
     }
 
-    /// Reset the active selection to the config-derived defaults. Also
-    /// clears any in-flight edit state.
-    pub(crate) fn reset_to_defaults(&mut self) {
-        self.active_selected = self.default_selected.clone();
-        self.editing_selected.clear();
-        self.edit_touched = false;
-        self.query.clear();
-        self.highlight = 0;
-        self.rows = build_rows(&self.all_names, "", &self.hidden_from_display);
+    /// True when the current non-empty query narrows to exactly one real
+    /// service/task row, so Enter can apply-and-close in one step.
+    pub(crate) fn query_has_single_match(&self) -> bool {
+        !self.query.is_empty() && matches!(self.rows.as_slice(), [FilterRow::Name(_)])
+    }
+
+    /// True while the modal is capturing keystrokes into the query buffer.
+    pub(crate) fn query_editing(&self) -> bool {
+        self.focus == FilterFocus::Query
+    }
+
+    /// Which part of the modal currently owns keyboard focus.
+    pub(crate) fn focus(&self) -> FilterFocus {
+        self.focus
     }
 
     /// Append a character to the query and recompute rows.
@@ -222,26 +255,38 @@ impl FilterState {
         self.highlight = (self.highlight + 1) % self.rows.len();
     }
 
-    /// Toggle the highlighted row in the edit selection. For `Name(n)`, flip
+    /// Toggle the highlighted row in the active selection. For `Name(n)`, flip
     /// membership. For `All`, select every name (if any were missing) or
     /// clear every name (if all were already present).
     pub(crate) fn toggle_highlighted(&mut self) {
         match self.rows.get(self.highlight) {
             Some(FilterRow::Name(name)) => {
-                if self.editing_selected.contains(name) {
-                    self.editing_selected.remove(name);
+                if self.active_selected.contains(name) {
+                    self.active_selected.remove(name);
                 } else {
-                    self.editing_selected.insert(name.clone());
+                    self.active_selected.insert(name.clone());
                 }
-                self.edit_touched = true;
             }
             Some(FilterRow::All) => {
                 if self.all_selected_in_edit() {
-                    self.editing_selected.clear();
+                    self.active_selected.clear();
                 } else {
-                    self.editing_selected.extend(self.all_names.iter().cloned());
+                    self.active_selected.extend(self.all_names.iter().cloned());
                 }
-                self.edit_touched = true;
+            }
+            None => {}
+        }
+    }
+
+    /// Replace the active selection with only the highlighted row.
+    pub(crate) fn select_only_highlighted(&mut self) {
+        self.active_selected.clear();
+        match self.rows.get(self.highlight) {
+            Some(FilterRow::Name(name)) => {
+                self.active_selected.insert(name.clone());
+            }
+            Some(FilterRow::All) => {
+                self.active_selected.extend(self.all_names.iter().cloned());
             }
             None => {}
         }
@@ -262,16 +307,16 @@ impl FilterState {
         self.highlight
     }
 
-    /// Whether a name is in the edit-mode selection (used to draw the
+    /// Whether a name is in the active selection (used to draw the
     /// checkbox for a [`FilterRow::Name`]).
     pub(crate) fn is_edit_selected(&self, name: &str) -> bool {
-        self.editing_selected.contains(name)
+        self.active_selected.contains(name)
     }
 
-    /// Whether every name is currently in the edit-mode selection. Used to
+    /// Whether every name is currently in the active selection. Used to
     /// draw the checkbox for the synthetic [`FilterRow::All`] row.
     pub(crate) fn all_selected_in_edit(&self) -> bool {
-        !self.all_names.is_empty() && self.editing_selected.len() == self.all_names.len()
+        !self.all_names.is_empty() && self.active_selected.len() == self.all_names.len()
     }
 
     #[cfg(test)]
@@ -286,6 +331,14 @@ impl FilterState {
         if self.highlight >= self.rows.len() {
             self.highlight = 0;
         }
+    }
+
+    fn reset_edit_state(&mut self) {
+        self.query.clear();
+        self.focus = FilterFocus::List;
+        self.snapshot_selected = None;
+        self.highlight = 0;
+        self.rows = build_rows(&self.all_names, "", &self.hidden_from_display);
     }
 }
 
@@ -371,15 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn commit_narrows_to_typed_query() {
+    fn commit_keeps_selection_when_query_only_changes_visibility() {
         let mut s = state(&["api", "worker", "db"]);
         s.enter_edit();
         s.push_query_char('a');
         s.commit();
-        assert!(s.is_active());
         assert!(s.passes("api"));
-        assert!(!s.passes("worker"));
-        assert!(!s.passes("db"));
+        assert!(s.passes("worker"));
+        assert!(s.passes("db"));
         assert!(s.passes(""), "blank spacer lines always pass");
     }
 
@@ -388,6 +440,7 @@ mod tests {
         let mut s = state(&["api", "don"]);
         s.enter_edit();
         s.push_query_char('a'); // matches "api" but not "don"
+        s.select_only_highlighted();
         s.commit();
         assert!(s.passes("api"));
         assert!(!s.passes("don"), "don gated when not in selection");
@@ -415,10 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn single_match_plus_enter_auto_selects_highlight() {
+    fn only_highlighted_explicitly_narrows_selection() {
         let mut s = state(&["api", "worker"]);
         s.enter_edit();
         s.push_query_char('a'); // fuzzy matches "api"
+        s.select_only_highlighted();
         s.commit();
         let active: Vec<&str> = s.active_names();
         assert_eq!(active, vec!["api"]);
@@ -434,11 +488,14 @@ mod tests {
 
         s.enter_edit();
         s.push_query_char('a');
+        s.select_only_highlighted();
         s.commit();
         assert!(s.passes("api"));
         assert!(!s.passes("worker"));
 
-        s.reset_to_defaults();
+        s.enter_edit();
+        s.reset_edit_to_defaults();
+        s.commit();
         assert!(!s.passes("api"));
         assert!(s.passes("worker"));
     }
@@ -498,9 +555,6 @@ mod tests {
 
     #[test]
     fn explicit_toggle_commits_even_when_result_is_empty() {
-        // Touching the edit state with Space always commits the curated
-        // result — including "nothing selected." No auto-select shortcut
-        // fires to undo the user's explicit choice.
         let mut s = state(&["api", "worker"]);
         s.enter_edit();
         s.toggle_highlighted(); // All → clear everything
@@ -508,6 +562,61 @@ mod tests {
         assert!(s.active_names().is_empty());
         assert!(!s.passes("api"));
         assert!(!s.passes("worker"));
+    }
+
+    #[test]
+    fn cancel_edit_discards_pending_selection_changes() {
+        let mut s = state(&["api", "worker"]);
+        s.enter_edit();
+        s.push_query_char('a');
+        s.select_only_highlighted();
+
+        s.cancel_edit();
+
+        assert!(s.passes("api"));
+        assert!(s.passes("worker"));
+        assert_eq!(s.query(), "");
+        assert!(!s.query_editing());
+    }
+
+    #[test]
+    fn toggle_applies_immediately_while_modal_is_open() {
+        let mut s = state(&["api", "worker"]);
+        s.enter_edit();
+        s.highlight_next(); // api
+        s.toggle_highlighted(); // remove api immediately
+
+        assert!(!s.passes("api"));
+        assert!(s.passes("worker"));
+    }
+
+    #[test]
+    fn apply_query_selects_all_visible_matches() {
+        let mut s = state(&["api", "worker", "web"]);
+        s.enter_edit();
+        s.begin_query_edit();
+        s.push_query_char('w');
+        s.apply_query();
+        s.end_query_edit();
+
+        assert!(!s.passes("api"));
+        assert!(s.passes("worker"));
+        assert!(s.passes("web"));
+    }
+
+    #[test]
+    fn query_has_single_match_only_for_one_name() {
+        let mut s = state(&["api", "worker", "web"]);
+        s.enter_edit();
+        s.begin_query_edit();
+        assert!(!s.query_has_single_match(), "empty query does not count");
+
+        s.push_query_char('a');
+        assert!(s.query_has_single_match(), "one matching row");
+
+        s.pop_query_char();
+        s.push_query_char('w');
+        assert!(!s.query_has_single_match(), "multiple matching rows");
     }
 
     #[test]

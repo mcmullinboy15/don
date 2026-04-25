@@ -23,8 +23,8 @@ pub(crate) enum ViewMode {
     /// Log flow + status bar. Keys trigger mode changes or scrollback actions.
     #[default]
     Normal,
-    /// Filter edit mode — typing builds a query, Space toggles selection,
-    /// Enter commits.
+    /// Log-filter modal. Navigation edits the pending selection; `/` enters
+    /// query input, Enter commits, Esc cancels.
     Filter,
     /// Tasks palette — typing filters tasks, Enter dispatches.
     Palette,
@@ -487,6 +487,7 @@ mod tests {
         );
         app.filter.enter_edit();
         app.filter.push_query_char('a');
+        app.filter.select_only_highlighted();
         app.filter.commit();
 
         assert!(app.should_render_log("api", 4));

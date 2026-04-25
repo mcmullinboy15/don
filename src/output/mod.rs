@@ -296,8 +296,8 @@ fn reserved_color(name: &str) -> Option<Color> {
     }
 }
 
-/// Assigns a deterministic color to each service name.
-fn assign_colors(names: &[&str]) -> HashMap<String, Color> {
+/// Assigns a deterministic color to each service/task/build-tool name.
+pub(crate) fn assign_colors(names: &[&str]) -> HashMap<String, Color> {
     let mut sorted: Vec<&str> = names.to_vec();
     sorted.sort_unstable();
 

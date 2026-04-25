@@ -16,6 +16,8 @@
 //! [`Terminal`]: ratatui::Terminal
 //! [`Terminal::insert_before`]: ratatui::Terminal::insert_before
 
+use std::collections::HashMap;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,7 +25,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
 
 use super::app::{App, OverlayItem, StatusCounts, ViewMode};
-use super::filter::{FilterRow, FilterState};
+use super::filter::{FilterFocus, FilterRow, FilterState};
 use super::palette::ActionPalette;
 use crate::runner::{ServiceState, TaskItemState};
 
@@ -102,22 +104,35 @@ fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
     }
 
     // Border + title wraps the whole modal. Inside: list at top, bar at bottom.
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(" Filter logs — [space] toggle  [↑↓] move  [enter] apply  [esc] reset defaults ");
+    let title = match app.filter.focus() {
+        FilterFocus::List => {
+            " Filter logs — [j/k ↑↓] move  [space] toggle  [o] only this  [/] search  [enter] done  [esc] revert "
+        }
+        FilterFocus::Query => {
+            " Filter logs — [type] search  [enter] apply/close if single  [tab] back to list  [esc] revert "
+        }
+    };
+    let outer = Block::default().borders(Borders::ALL).title(title);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    if inner.height < 2 {
+    if inner.height < 3 {
         return;
     }
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
-    draw_filter_list(frame, layout[0], &app.filter);
+    let name_colors = log_name_colors(app);
+    let query = Paragraph::new(filter_query_line(&app.filter));
+    frame.render_widget(query, layout[0]);
+    draw_filter_list(frame, layout[1], &app.filter, &name_colors);
     let bar = Paragraph::new(filter_bar_line(&app.counts, &app.filter));
-    frame.render_widget(bar, layout[1]);
+    frame.render_widget(bar, layout[2]);
 }
 
 fn draw_palette_modal(frame: &mut Frame<'_>, app: &App) {
@@ -156,7 +171,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
 
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" don status — [↑↓] move  [enter] start/stop  [r] restart  [R] restart all failed  [/] filter  [esc] dismiss ");
+        .title(
+            " don status — [j/k ↑↓] move  [enter] start/stop  [r] restart  [R] restart all failed  [/] filter  [esc] clear filter/dismiss ",
+        );
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     if inner.height < 2 {
@@ -177,6 +194,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     );
 
     let items = app.overlay_items();
+    let name_colors = log_name_colors(app);
     let total = items.len();
 
     // Body height = table area minus header row.
@@ -216,9 +234,14 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
                         .style(Style::default().fg(task_state_color(*state))),
                 ),
             };
+            let name_style = name_colors
+                .get(&name)
+                .copied()
+                .map(|color| Style::default().fg(color))
+                .unwrap_or_default();
             let row = Row::new(vec![
                 Cell::from(kind).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(name),
+                Cell::from(name).style(name_style),
                 state_cell,
             ]);
             if i == highlight {
@@ -278,7 +301,12 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), bar_area);
 }
 
-fn draw_filter_list(frame: &mut Frame<'_>, area: Rect, filter: &FilterState) {
+fn draw_filter_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    filter: &FilterState,
+    name_colors: &HashMap<String, Color>,
+) {
     if area.height == 0 {
         return;
     }
@@ -314,9 +342,14 @@ fn draw_filter_list(frame: &mut Frame<'_>, area: Rect, filter: &FilterState) {
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
+                let name_style = name_colors
+                    .get(name)
+                    .copied()
+                    .map(|color| Style::default().fg(color))
+                    .unwrap_or_default();
                 ListItem::new(Line::from(vec![
                     Span::styled(checkbox, checkbox_style),
-                    Span::raw(name.clone()),
+                    Span::styled(name.clone(), name_style),
                 ]))
             }
         })
@@ -326,7 +359,6 @@ fn draw_filter_list(frame: &mut Frame<'_>, area: Rect, filter: &FilterState) {
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
-                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -417,18 +449,56 @@ fn normal_bar_line(
 fn filter_bar_line(counts: &StatusCounts, filter: &FilterState) -> Line<'static> {
     let mut spans = base_count_spans(counts);
     spans.push(separator());
-    spans.push(bold_cyan("filter: "));
-    spans.push(Span::styled(
-        filter.query().to_string(),
-        Style::default().fg(Color::White),
-    ));
-    spans.push(Span::styled(
-        "▌",
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::SLOW_BLINK),
-    ));
+    let hint = match filter.focus() {
+        FilterFocus::List => {
+            "[j/k] move  [space] toggle  [o] only this  [/] search  [R] defaults".to_string()
+        }
+        FilterFocus::Query => {
+            "[type] search  [enter] apply/close if single  [tab] back to list".to_string()
+        }
+    };
+    spans.push(dim(hint));
     Line::from(spans)
+}
+
+fn filter_query_line(filter: &FilterState) -> Line<'static> {
+    let mut spans = vec![bold_cyan("search: ")];
+    let query_style = match filter.focus() {
+        FilterFocus::Query => Style::default().fg(Color::White).bg(Color::DarkGray),
+        FilterFocus::List => Style::default().fg(Color::White),
+    };
+    let query_text = if filter.query().is_empty() && filter.focus() == FilterFocus::List {
+        Span::styled(
+            "[/] to search".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::styled(filter.query().to_string(), query_style)
+    };
+    spans.push(query_text);
+    if filter.focus() == FilterFocus::Query {
+        spans.push(Span::styled(
+            "▌",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn log_name_colors(app: &App) -> HashMap<String, Color> {
+    let names: Vec<&str> = app
+        .services_state
+        .keys()
+        .map(String::as_str)
+        .chain(app.tasks_state.keys().map(String::as_str))
+        .collect();
+    crate::output::assign_colors(&names)
+        .into_iter()
+        .map(|(name, color)| (name, color.into()))
+        .collect()
 }
 
 fn shutdown_bar_line(counts: &StatusCounts, spinner_frame: usize) -> Line<'static> {
@@ -565,7 +635,7 @@ mod tests {
     fn shutdown_bar_hides_interactive_controls() {
         let text = line_text(shutdown_bar_line(&StatusCounts::default(), 0));
         assert!(text.contains("shutting down"));
-        assert!(!text.contains("[l] logs"));
+        assert!(!text.contains("[/] logs"));
         assert!(!text.contains("[t] tasks"));
         assert!(!text.contains("[s] status"));
     }

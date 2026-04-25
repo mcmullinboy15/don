@@ -537,6 +537,44 @@ fn handle_filter_key(
     store: &mut LogStore,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
+    if app.filter.query_editing() {
+        match key.code {
+            KeyCode::Enter => {
+                let close_after_apply = app.filter.query_has_single_match();
+                app.filter.apply_query();
+                app.filter.end_query_edit();
+                if close_after_apply {
+                    app.filter.commit();
+                    app.view_mode = ViewMode::Normal;
+                    *modal = None;
+                    clear_and_replay(terminal, store, app)?;
+                } else {
+                    redraw_modal(modal, app)?;
+                }
+            }
+            KeyCode::Tab => {
+                app.filter.end_query_edit();
+                redraw_modal(modal, app)?;
+            }
+            KeyCode::Backspace => {
+                app.filter.pop_query_char();
+                redraw_modal(modal, app)?;
+            }
+            KeyCode::Char(c) => {
+                app.filter.push_query_char(c);
+                redraw_modal(modal, app)?;
+            }
+            KeyCode::Esc => {
+                app.filter.cancel_edit();
+                app.view_mode = ViewMode::Normal;
+                *modal = None;
+                clear_and_replay(terminal, store, app)?;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match key.code {
         KeyCode::Enter => {
             app.filter.commit();
@@ -545,32 +583,36 @@ fn handle_filter_key(
             clear_and_replay(terminal, store, app)?;
         }
         KeyCode::Esc => {
-            app.filter.reset_to_defaults();
+            app.filter.cancel_edit();
             app.view_mode = ViewMode::Normal;
             *modal = None;
             clear_and_replay(terminal, store, app)?;
+        }
+        KeyCode::Char('R') => {
+            app.filter.reset_edit_to_defaults();
+            redraw_modal(modal, app)?;
         }
         KeyCode::Char(' ') => {
             app.filter.toggle_highlighted();
             redraw_modal(modal, app)?;
         }
-        // `/` is the "filter" key across views — swallow it so pressing it
-        // reflexively (from the main bar's [/] convention) doesn't end up
-        // as the first character of the query.
-        KeyCode::Char('/') => {}
-        KeyCode::Char(c) => {
-            app.filter.push_query_char(c);
+        KeyCode::Char('o') => {
+            app.filter.select_only_highlighted();
             redraw_modal(modal, app)?;
         }
-        KeyCode::Backspace => {
-            app.filter.pop_query_char();
+        KeyCode::Char('/') => {
+            app.filter.begin_query_edit();
             redraw_modal(modal, app)?;
         }
-        KeyCode::Up => {
+        KeyCode::Tab => {
+            app.filter.begin_query_edit();
+            redraw_modal(modal, app)?;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
             app.filter.highlight_prev();
             redraw_modal(modal, app)?;
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Char('j') => {
             app.filter.highlight_next();
             redraw_modal(modal, app)?;
         }
@@ -682,11 +724,11 @@ fn handle_overlay_key(
     let total = app.overlay_items().len();
     let max_idx = total.saturating_sub(1);
     match key.code {
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Char('k') => {
             app.overlay_highlight = app.overlay_highlight.saturating_sub(1);
             redraw_modal(modal, app)?;
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Char('j') => {
             app.overlay_highlight = (app.overlay_highlight + 1).min(max_idx);
             redraw_modal(modal, app)?;
         }
@@ -741,6 +783,12 @@ fn handle_overlay_key(
             }
         }
         KeyCode::Esc => {
+            if !app.overlay_query.is_empty() {
+                app.overlay_query.clear();
+                app.overlay_highlight = 0;
+                redraw_modal(modal, app)?;
+                return Ok(());
+            }
             app.view_mode = ViewMode::Normal;
             app.overlay_query.clear();
             app.overlay_filtering = false;
