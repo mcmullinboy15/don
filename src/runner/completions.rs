@@ -323,6 +323,10 @@ async fn write_failure_log(
                 eprintln!("don: failed to write completions log {path:?}: {e}");
                 return None;
             }
+            if let Err(e) = f.sync_all().await {
+                eprintln!("don: failed to sync completions log {path:?}: {e}");
+                return None;
+            }
             Some(path)
         }
         Err(e) => {

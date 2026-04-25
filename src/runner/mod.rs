@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::SystemTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -98,7 +99,15 @@ struct GraphRequeryRequestItem {
 struct GraphRequeryOutcomeItem {
     name: String,
     ignore_patterns: Vec<String>,
-    result: Result<Vec<String>, String>,
+    result: Result<crate::build_tool::ResolvedBuildInfo, String>,
+}
+
+#[derive(Clone)]
+struct BatchBuildReplayItem {
+    name: String,
+    kind: NodeKind,
+    source_changed: bool,
+    graph_changed: bool,
 }
 
 enum TaskRunPrepared {
@@ -649,40 +658,222 @@ async fn run_rebuild_batch_worker(
     }
 }
 
+fn bazel_graph_requery_group_dir(working_dir: &std::path::Path) -> PathBuf {
+    crate::build_tool::bazel::find_workspace_root(working_dir)
+        .unwrap_or_else(|| working_dir.to_path_buf())
+}
+
+fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {
+    if service.resolved.lazy && !service.batch_built {
+        return false;
+    }
+
+    matches!(
+        service.state(),
+        ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
+    )
+}
+
+async fn send_watch_update(
+    tx: &mpsc::Sender<crate::watch::WatchUpdate>,
+    name: String,
+    kind: crate::watch::WatchItemKind,
+    patterns: Vec<String>,
+    ignore_patterns: Vec<String>,
+    base_dir: PathBuf,
+) {
+    let (applied_tx, applied_rx) = oneshot::channel();
+    if tx
+        .send(crate::watch::WatchUpdate {
+            name,
+            kind,
+            patterns,
+            ignore_patterns,
+            base_dir,
+            applied_tx: Some(applied_tx),
+        })
+        .await
+        .is_ok()
+    {
+        let _ = applied_rx.await;
+    }
+}
+
+fn any_glob_path_changed_since(
+    base_dir: &std::path::Path,
+    patterns: &[String],
+    ignore_patterns: &[String],
+    since: SystemTime,
+) -> bool {
+    let absolute_patterns: Vec<glob::Pattern> = patterns
+        .iter()
+        .filter_map(|pattern| {
+            let full_pattern = base_dir.join(pattern);
+            glob::Pattern::new(&full_pattern.to_string_lossy()).ok()
+        })
+        .collect();
+    let absolute_ignore: Vec<glob::Pattern> = ignore_patterns
+        .iter()
+        .filter_map(|pattern| {
+            let full_pattern = base_dir.join(pattern);
+            glob::Pattern::new(&full_pattern.to_string_lossy()).ok()
+        })
+        .collect();
+    let mut roots: Vec<PathBuf> = patterns
+        .iter()
+        .map(|pattern| glob_pattern_base_dir(&base_dir.join(pattern)))
+        .collect();
+    roots.sort();
+    roots.dedup();
+
+    roots
+        .into_iter()
+        .any(|root| scan_tree_for_changes(&root, &absolute_patterns, &absolute_ignore, since))
+}
+
+fn scan_tree_for_changes(
+    path: &std::path::Path,
+    patterns: &[glob::Pattern],
+    ignore_patterns: &[glob::Pattern],
+    since: SystemTime,
+) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let path_str = path.to_string_lossy();
+    let ignored = ignore_patterns
+        .iter()
+        .any(|ignore| ignore.matches(&path_str));
+    if !ignored && patterns.iter().any(|pattern| pattern.matches(&path_str)) {
+        let Ok(modified) = metadata.modified() else {
+            return false;
+        };
+        if modified > since {
+            return true;
+        }
+    }
+
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if scan_tree_for_changes(&entry.path(), patterns, ignore_patterns, since) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn glob_pattern_base_dir(pattern: &std::path::Path) -> PathBuf {
+    let mut base = PathBuf::new();
+    let mut hit_glob = false;
+    for component in pattern.components() {
+        let s = component.as_os_str().to_string_lossy();
+        if s.contains('*') || s.contains('?') || s.contains('[') {
+            hit_glob = true;
+            break;
+        }
+        base.push(component);
+    }
+    if !hit_glob {
+        base = base
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+    }
+    if base.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        base
+    }
+}
+
 async fn run_graph_requery_worker(
     items: Vec<GraphRequeryRequestItem>,
     emitter: crate::output::LifecycleEmitter,
 ) -> Vec<GraphRequeryOutcomeItem> {
     use crate::build_tool::BuildGraphResolver;
 
-    let mut outcomes = Vec::new();
-    for item in items {
-        let result = if let Some(ref bazel) = item.bazel {
-            let resolver =
-                crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
-            resolver
-                .resolve(&bazel.target, &item.working_dir)
-                .await
-                .map(|info| info.watch_paths)
-                .map_err(|e| e.to_string())
-        } else if let Some(ref turbo) = item.turbo {
+    let mut outcomes: Vec<Option<GraphRequeryOutcomeItem>> =
+        std::iter::repeat_with(|| None).take(items.len()).collect();
+    let mut bazel_groups: HashMap<PathBuf, Vec<(usize, GraphRequeryRequestItem)>> = HashMap::new();
+    let mut other_items: Vec<(usize, GraphRequeryRequestItem)> = Vec::new();
+
+    for (idx, item) in items.into_iter().enumerate() {
+        if item.bazel.is_some() {
+            bazel_groups
+                .entry(bazel_graph_requery_group_dir(&item.working_dir))
+                .or_default()
+                .push((idx, item));
+        } else {
+            other_items.push((idx, item));
+        }
+    }
+
+    for (working_dir, group) in bazel_groups {
+        let targets: Vec<String> = group
+            .iter()
+            .filter_map(|(_, item)| item.bazel.as_ref().map(|b| b.target.clone()))
+            .collect();
+        let resolver = crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
+        match resolver.resolve_per_target(&targets, &working_dir).await {
+            Ok(info_by_target) => {
+                for (idx, item) in group {
+                    let result = if let Some(ref bazel) = item.bazel {
+                        Ok(info_by_target.get(&bazel.target).cloned().unwrap_or(
+                            crate::build_tool::ResolvedBuildInfo {
+                                watch_paths: Vec::new(),
+                                dependencies: Vec::new(),
+                                graph_definition_globs: Vec::new(),
+                            },
+                        ))
+                    } else {
+                        Err("missing bazel config for batched graph re-query".to_string())
+                    };
+                    outcomes[idx] = Some(GraphRequeryOutcomeItem {
+                        name: item.name,
+                        ignore_patterns: item.ignore_patterns,
+                        result,
+                    });
+                }
+            }
+            Err(e) => {
+                let message = e.to_string();
+                for (idx, item) in group {
+                    outcomes[idx] = Some(GraphRequeryOutcomeItem {
+                        name: item.name,
+                        ignore_patterns: item.ignore_patterns,
+                        result: Err(message.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    for (idx, item) in other_items {
+        let result = if let Some(ref turbo) = item.turbo {
             let resolver =
                 crate::build_tool::turbo::TurboResolver::new(&turbo.task, turbo.filter.as_deref());
             resolver
                 .resolve(&turbo.task, &item.working_dir)
                 .await
-                .map(|info| info.watch_paths)
                 .map_err(|e| e.to_string())
         } else {
             continue;
         };
-        outcomes.push(GraphRequeryOutcomeItem {
+        outcomes[idx] = Some(GraphRequeryOutcomeItem {
             name: item.name,
             ignore_patterns: item.ignore_patterns,
             result,
         });
     }
-    outcomes
+
+    outcomes.into_iter().flatten().collect()
 }
 
 async fn run_task_worker(
@@ -1818,18 +2009,7 @@ impl Runner {
             }
         }
         if !batch_items.is_empty() {
-            let cmd_tx = self.cmd_tx.clone();
-            let base_dir = self.base_dir.clone();
-            let emitter = self.output_manager.clone_lifecycle_emitter();
-            let watch_update_tx = self.watch_update_tx.clone();
-            let handle = tokio::spawn(async move {
-                let outcome =
-                    run_batch_build_chain(batch_items, base_dir, emitter, watch_update_tx).await;
-                let _ = cmd_tx
-                    .send(RunnerCommand::BatchBuildComplete(outcome))
-                    .await;
-            });
-            self.batch_build_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+            self.spawn_startup_batch_build(batch_items);
         }
 
         // Build dependency map and topological order.
@@ -2064,6 +2244,7 @@ impl Runner {
                                 // and leaving the handle live would abort after the
                                 // task has already returned (harmless but noisy).
                                 self.batch_build_handle = None;
+                                let replay_items = outcome.replay_items.clone();
                                 // Pull failed names out of the pending set before
                                 // applying the outcome. `apply_batch_build_outcome`
                                 // transitions them to `Failed`, but leaving them in
@@ -2073,6 +2254,7 @@ impl Runner {
                                     pending.remove(name);
                                 }
                                 self.apply_batch_build_outcome(outcome);
+                                self.schedule_startup_batch_replays(&replay_items);
                                 if self
                                     .start_ready_items(
                                         &order,
@@ -2104,9 +2286,15 @@ impl Runner {
                                 // queue the detached service-start worker to
                                 // take it through Pending → Starting → Ready
                                 // like any cold start.
+                                let replay_items = outcome.replay_items.clone();
                                 let succeeded = outcome.succeeded.contains(&name);
                                 self.apply_batch_build_outcome(outcome);
+                                let replayed = replay_items
+                                    .iter()
+                                    .find(|item| item.name == name)
+                                    .is_some_and(|item| self.schedule_lazy_build_replay(item));
                                 if succeeded
+                                    && !replayed
                                     && self
                                         .services
                                         .get(&name)
@@ -2158,30 +2346,7 @@ impl Runner {
                                 "first connection — building before start",
                             );
                             self.set_service_state(&name, ServiceState::Building);
-                            let cmd_tx = self.cmd_tx.clone();
-                            let base_dir = self.base_dir.clone();
-                            let emitter = self.output_manager.clone_lifecycle_emitter();
-                            let watch_update_tx = self.watch_update_tx.clone();
-                            let svc_name = name.clone();
-                            let handle = tokio::spawn(async move {
-                                let outcome = run_batch_build_chain(
-                                    vec![item],
-                                    base_dir,
-                                    emitter,
-                                    watch_update_tx,
-                                )
-                                .await;
-                                let _ = cmd_tx
-                                    .send(RunnerCommand::LazyBuildComplete {
-                                        name: svc_name,
-                                        outcome,
-                                    })
-                                    .await;
-                            });
-                            self.lazy_build_handles.insert(
-                                name.clone(),
-                                crate::build_tool::AbortOnDrop::new(handle),
-                            );
+                            self.spawn_lazy_build(&name, item);
                         } else {
                             self.output_manager
                                 .service_event(&name, "first connection — starting service");
@@ -2428,6 +2593,127 @@ impl Runner {
                 self.set_task_state(&name, TaskItemState::Failed);
             }
         }
+    }
+
+    fn collect_batch_build_item_by_name(&self, name: &str) -> Option<BatchBuildItem> {
+        if let Some(rs) = self.services.get(name) {
+            if rs.resolved.is_build_tool_managed() {
+                return Some(self.build_batch_item(name, NodeKind::Service, rs));
+            }
+            return None;
+        }
+
+        let rt = self.tasks.get(name)?;
+        if rt.config.bazel.is_none() && rt.config.turbo.is_none() {
+            return None;
+        }
+        let working_dir = match rt.config.dir.as_deref() {
+            Some(d) => self.base_dir.join(d),
+            None => self.base_dir.clone(),
+        };
+        Some(BatchBuildItem {
+            name: name.to_string(),
+            kind: NodeKind::Task,
+            bazel: rt.config.bazel.clone(),
+            turbo: rt.config.turbo.clone(),
+            working_dir,
+            ignore: rt.config.ignore.clone(),
+        })
+    }
+
+    fn spawn_startup_batch_build(&mut self, items: Vec<BatchBuildItem>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let cmd_tx = self.cmd_tx.clone();
+        let base_dir = self.base_dir.clone();
+        let emitter = self.output_manager.clone_lifecycle_emitter();
+        let watch_update_tx = self.watch_update_tx.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = run_batch_build_chain(items, base_dir, emitter, watch_update_tx).await;
+            let _ = cmd_tx
+                .send(RunnerCommand::BatchBuildComplete(outcome))
+                .await;
+        });
+        self.batch_build_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+    }
+
+    fn spawn_lazy_build(&mut self, name: &str, item: BatchBuildItem) {
+        let cmd_tx = self.cmd_tx.clone();
+        let base_dir = self.base_dir.clone();
+        let emitter = self.output_manager.clone_lifecycle_emitter();
+        let watch_update_tx = self.watch_update_tx.clone();
+        let svc_name = name.to_string();
+        let handle = tokio::spawn(async move {
+            let outcome =
+                run_batch_build_chain(vec![item], base_dir, emitter, watch_update_tx).await;
+            let _ = cmd_tx
+                .send(RunnerCommand::LazyBuildComplete {
+                    name: svc_name,
+                    outcome,
+                })
+                .await;
+        });
+        self.lazy_build_handles.insert(
+            name.to_string(),
+            crate::build_tool::AbortOnDrop::new(handle),
+        );
+    }
+
+    fn schedule_startup_batch_replays(&mut self, replay_items: &[BatchBuildReplayItem]) {
+        let mut replay_batch = Vec::new();
+
+        for replay in replay_items {
+            let Some(item) = self.collect_batch_build_item_by_name(&replay.name) else {
+                continue;
+            };
+            let message = match (replay.source_changed, replay.graph_changed, replay.kind) {
+                (true, true, NodeKind::Service) => {
+                    "files changed during build — rebuilding before start"
+                }
+                (true, false, NodeKind::Service) => {
+                    "source files changed during build — rebuilding before start"
+                }
+                (false, true, NodeKind::Service) => {
+                    "build graph changed during build — rebuilding before start"
+                }
+                (true, true, NodeKind::Task) => {
+                    "files changed during build — re-running build before start"
+                }
+                (true, false, NodeKind::Task) => {
+                    "source files changed during build — re-running build before start"
+                }
+                (false, true, NodeKind::Task) => {
+                    "build graph changed during build — re-running build before start"
+                }
+                (false, false, _) => continue,
+            };
+            self.output_manager.service_event(&replay.name, message);
+            match replay.kind {
+                NodeKind::Service => self.set_service_state(&replay.name, ServiceState::Building),
+                NodeKind::Task => self.set_task_state(&replay.name, TaskItemState::Building),
+            }
+            replay_batch.push(item);
+        }
+
+        self.spawn_startup_batch_build(replay_batch);
+    }
+
+    fn schedule_lazy_build_replay(&mut self, replay: &BatchBuildReplayItem) -> bool {
+        let Some(item) = self.collect_batch_build_item_by_name(&replay.name) else {
+            return false;
+        };
+        let message = match (replay.source_changed, replay.graph_changed) {
+            (true, true) => "files changed during build — rebuilding before start",
+            (true, false) => "source files changed during build — rebuilding before start",
+            (false, true) => "build graph changed during build — rebuilding before start",
+            (false, false) => return false,
+        };
+        self.output_manager.service_event(&replay.name, message);
+        self.set_service_state(&replay.name, ServiceState::Building);
+        self.spawn_lazy_build(&replay.name, item);
+        true
     }
 
     /// Check if a dependency is satisfied (ready service or completed task).
@@ -3076,10 +3362,13 @@ impl Runner {
 
     async fn handle_graph_requery_complete(&mut self, outcomes: Vec<GraphRequeryOutcomeItem>) {
         let watch_update_tx = self.watch_update_tx.clone();
+        let mut services_to_rebuild: Vec<String> = Vec::new();
+        let mut tasks_to_rerun: Vec<String> = Vec::new();
+
         for outcome in outcomes {
             match outcome.result {
-                Ok(watch_paths) => {
-                    let count = watch_paths.len();
+                Ok(info) => {
+                    let count = info.watch_paths.len();
                     self.output_manager.service_event(
                         &outcome.name,
                         &format!(
@@ -3088,9 +3377,9 @@ impl Runner {
                         ),
                     );
                     if let Some(rs) = self.services.get_mut(&outcome.name) {
-                        rs.resolved_watch_paths = watch_paths.clone();
+                        rs.resolved_watch_paths = info.watch_paths.clone();
                     } else if let Some(rt) = self.tasks.get_mut(&outcome.name) {
-                        rt.resolved_watch_paths = watch_paths.clone();
+                        rt.resolved_watch_paths = info.watch_paths.clone();
                     }
                     if let Some(ref tx) = watch_update_tx {
                         let kind = if self.services.contains_key(&outcome.name) {
@@ -3098,15 +3387,36 @@ impl Runner {
                         } else {
                             crate::watch::WatchItemKind::Task
                         };
-                        let _ = tx
-                            .send(crate::watch::WatchUpdate {
-                                name: outcome.name.clone(),
-                                kind,
-                                patterns: watch_paths,
-                                ignore_patterns: outcome.ignore_patterns,
-                                base_dir: self.base_dir.clone(),
-                            })
-                            .await;
+                        send_watch_update(
+                            tx,
+                            outcome.name.clone(),
+                            kind,
+                            info.watch_paths.clone(),
+                            outcome.ignore_patterns,
+                            self.base_dir.clone(),
+                        )
+                        .await;
+                        send_watch_update(
+                            tx,
+                            format!("{}__graph", outcome.name),
+                            crate::watch::WatchItemKind::BuildGraph,
+                            info.graph_definition_globs,
+                            Vec::new(),
+                            self.base_dir.clone(),
+                        )
+                        .await;
+                    }
+
+                    if let Some(rs) = self.services.get(&outcome.name) {
+                        if should_rebuild_after_graph_requery(rs)
+                            && !services_to_rebuild.contains(&outcome.name)
+                        {
+                            services_to_rebuild.push(outcome.name.clone());
+                        }
+                    } else if self.tasks.contains_key(&outcome.name)
+                        && !tasks_to_rerun.contains(&outcome.name)
+                    {
+                        tasks_to_rerun.push(outcome.name.clone());
                     }
                 }
                 Err(e) => {
@@ -3123,6 +3433,24 @@ impl Runner {
             self.bt_requery_deadline =
                 Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
         }
+
+        if !services_to_rebuild.is_empty() {
+            for name in services_to_rebuild {
+                self.output_manager
+                    .service_event(&name, "build graph changed — rebuilding");
+                if !self.pending_bt_rebuilds.contains(&name) {
+                    self.pending_bt_rebuilds.push(name);
+                }
+            }
+            self.bt_rebuild_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+        }
+
+        for name in tasks_to_rerun {
+            self.output_manager
+                .service_event(&name, "build graph changed — re-running");
+            self.handle_task_rerun(&name).await;
+        }
     }
 
     /// Handle a build graph change event (BUILD files, package.json, etc. changed).
@@ -3131,7 +3459,25 @@ impl Runner {
     /// This prevents redundant concurrent queries when a single BUILD file
     /// change affects multiple services.
     async fn handle_build_graph_changed(&mut self, name: &str) {
-        if !self.pending_graph_requery.contains(&name.to_string()) {
+        if name == crate::watch::WORKSPACE_GRAPH_ITEM_NAME {
+            let service_names: Vec<String> = self
+                .services
+                .iter()
+                .filter(|(_, rs)| rs.resolved.is_build_tool_managed())
+                .map(|(service_name, _)| service_name.clone())
+                .collect();
+            let task_names: Vec<String> = self
+                .tasks
+                .iter()
+                .filter(|(_, rt)| rt.config.bazel.is_some() || rt.config.turbo.is_some())
+                .map(|(task_name, _)| task_name.clone())
+                .collect();
+            for item_name in service_names.into_iter().chain(task_names) {
+                if !self.pending_graph_requery.contains(&item_name) {
+                    self.pending_graph_requery.push(item_name);
+                }
+            }
+        } else if !self.pending_graph_requery.contains(&name.to_string()) {
             self.pending_graph_requery.push(name.to_string());
         }
         self.bt_requery_deadline =
@@ -3374,6 +3720,14 @@ impl Runner {
             }
         };
 
+        if rs.state() == ServiceState::Building {
+            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                name: name.to_string(),
+                success: true,
+            });
+            return;
+        }
+
         // For build-tool-managed services, queue the rebuild into a batch.
         // Multiple services sharing the same source files will be batched into
         // one `bazel build //a //b //c` invocation instead of separate builds.
@@ -3405,17 +3759,21 @@ impl Runner {
             }
         };
         // For build-tool-managed services the batch build has already run by
-        // the time we reach `do_rebuild` — emitting "rebuilding (file changed)"
-        // here would land confusingly *after* the bazel/turbo output. "Restarting"
-        // is the action left to do. For other kinds, the detached rebuild
-        // worker will kick off the build after this lifecycle event, so
-        // "rebuilding" still lands before the build output.
+        // the time we reach `do_rebuild`, and the actual restart is surfaced
+        // later by `queue_rebuild_service_start`'s "restarting..." event.
+        // Emitting another pre-stop "restarting" here just creates log noise.
+        //
+        // For other kinds, the detached rebuild worker will kick off the
+        // build after this lifecycle event, so "rebuilding" still lands
+        // before the build output.
         let message = if resolved.is_build_tool_managed() {
-            "restarting"
+            None
         } else {
-            "rebuilding (file changed)"
+            Some("rebuilding (file changed)")
         };
-        self.output_manager.service_event(name, message);
+        if let Some(message) = message {
+            self.output_manager.service_event(name, message);
+        }
         if resolved.is_build_tool_managed() {
             self.continue_rebuild_restart(name).await;
             return;
@@ -3673,8 +4031,6 @@ impl Runner {
                 .get(name)
                 .and_then(|rs| rs.proxy.as_ref())
                 .is_some_and(|p| p.requires_full_exit_on_restart());
-            self.output_manager
-                .service_event(name, "stopping... (rebuild)");
             let (reply_tx, _reply_rx) = oneshot::channel();
             self.spawn_manual_service_stop_worker(
                 name,
@@ -4510,6 +4866,18 @@ impl Runner {
                 return;
             }
         };
+
+        if self
+            .tasks
+            .get(name)
+            .is_some_and(|rt| rt.state() == TaskItemState::Building)
+        {
+            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                name: name.to_string(),
+                success: true,
+            });
+            return;
+        }
 
         // Skip the needs_run hash check — the file watcher already confirmed
         // a matching file changed. The hash check is only needed at startup
@@ -5427,6 +5795,9 @@ pub(crate) struct BatchBuildOutcome {
     /// Absolute binary paths from `bazel cquery --output=files`, keyed by
     /// service name. Only populated for bazel services whose build succeeded.
     pub(crate) binary_paths: HashMap<String, String>,
+    /// Items whose source and/or build-graph inputs changed while the batch
+    /// query/build/cquery pipeline was in flight and need another cycle.
+    replay_items: Vec<BatchBuildReplayItem>,
 }
 
 /// Run the full startup-phase batch build: watch resolution → batch build
@@ -5441,12 +5812,14 @@ async fn run_batch_build_chain(
     emitter: crate::output::LifecycleEmitter,
     watch_update_tx: Option<mpsc::Sender<crate::watch::WatchUpdate>>,
 ) -> BatchBuildOutcome {
+    let scan_since = SystemTime::now();
     let mut outcome = BatchBuildOutcome {
         resolved_watches: Vec::new(),
         warnings: Vec::new(),
         succeeded: HashSet::new(),
         failed: Vec::new(),
         binary_paths: HashMap::new(),
+        replay_items: Vec::new(),
     };
     if items.is_empty() {
         return outcome;
@@ -5472,6 +5845,8 @@ async fn run_batch_build_chain(
     let mut bazel_info_by_target: HashMap<String, crate::build_tool::ResolvedBuildInfo> =
         HashMap::new();
     let mut turbo_info: Option<crate::build_tool::ResolvedBuildInfo> = None;
+    let mut resolved_info_by_item: HashMap<String, crate::build_tool::ResolvedBuildInfo> =
+        HashMap::new();
 
     if !bazel_items.is_empty() {
         let targets: Vec<String> = bazel_items
@@ -5565,31 +5940,32 @@ async fn run_batch_build_chain(
         let Some(info) = info else {
             continue; // query failed for this tool — warning already pushed
         };
+        resolved_info_by_item.insert(item.name.clone(), info.clone());
 
         if let Some(ref tx) = watch_update_tx {
             let watch_kind = match item.kind {
                 NodeKind::Service => crate::watch::WatchItemKind::Service,
                 NodeKind::Task => crate::watch::WatchItemKind::Task,
             };
-            let _ = tx
-                .send(crate::watch::WatchUpdate {
-                    name: item.name.clone(),
-                    kind: watch_kind,
-                    patterns: info.watch_paths.clone(),
-                    ignore_patterns: item.ignore.clone(),
-                    base_dir: base_dir.clone(),
-                })
-                .await;
+            send_watch_update(
+                tx,
+                item.name.clone(),
+                watch_kind,
+                info.watch_paths.clone(),
+                item.ignore.clone(),
+                base_dir.clone(),
+            )
+            .await;
             if !info.graph_definition_globs.is_empty() {
-                let _ = tx
-                    .send(crate::watch::WatchUpdate {
-                        name: format!("{}__graph", item.name),
-                        kind: crate::watch::WatchItemKind::BuildGraph,
-                        patterns: info.graph_definition_globs.clone(),
-                        ignore_patterns: Vec::new(),
-                        base_dir: base_dir.clone(),
-                    })
-                    .await;
+                send_watch_update(
+                    tx,
+                    format!("{}__graph", item.name),
+                    crate::watch::WatchItemKind::BuildGraph,
+                    info.graph_definition_globs.clone(),
+                    Vec::new(),
+                    base_dir.clone(),
+                )
+                .await;
             }
         }
         outcome
@@ -5837,6 +6213,27 @@ async fn run_batch_build_chain(
         }
     }
 
+    for item in &items {
+        if !outcome.succeeded.contains(&item.name) {
+            continue;
+        }
+        let Some(info) = resolved_info_by_item.get(&item.name) else {
+            continue;
+        };
+        let source_changed =
+            any_glob_path_changed_since(&base_dir, &info.watch_paths, &item.ignore, scan_since);
+        let graph_changed =
+            any_glob_path_changed_since(&base_dir, &info.graph_definition_globs, &[], scan_since);
+        if source_changed || graph_changed {
+            outcome.replay_items.push(BatchBuildReplayItem {
+                name: item.name.clone(),
+                kind: item.kind,
+                source_changed,
+                graph_changed,
+            });
+        }
+    }
+
     outcome
 }
 
@@ -5968,6 +6365,7 @@ struct ItemDone {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn unhealthy_restart_backoff_table() {
@@ -6496,5 +6894,157 @@ mod tests {
         assert!(rt.attach_waiter.is_none());
         assert!(rt.resolved_watch_paths.is_empty());
         assert_eq!(rt.config.cmd, "echo");
+    }
+
+    #[test]
+    fn test_should_rebuild_after_graph_requery() {
+        use crate::config::service::ResolvedService;
+        use crate::config::types::LogConfig;
+        use std::collections::HashMap;
+
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+            lazy: bool,
+            batch_built: bool,
+            expected: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "ready non-lazy rebuilds",
+                state: ServiceState::Ready,
+                lazy: false,
+                batch_built: true,
+                expected: true,
+            },
+            Case {
+                name: "running non-lazy rebuilds",
+                state: ServiceState::Running,
+                lazy: false,
+                batch_built: true,
+                expected: true,
+            },
+            Case {
+                name: "untouched lazy service does not cold start",
+                state: ServiceState::Lazy,
+                lazy: true,
+                batch_built: false,
+                expected: false,
+            },
+            Case {
+                name: "pending service does not rebuild",
+                state: ServiceState::Pending,
+                lazy: false,
+                batch_built: true,
+                expected: false,
+            },
+        ];
+
+        for case in cases {
+            let mut service = RuntimeService::new(
+                ResolvedService {
+                    dir: None,
+                    env: HashMap::new(),
+                    env_file: Vec::new(),
+                    watch: Vec::new(),
+                    ignore: Vec::new(),
+                    debounce: None,
+                    depends_on: Vec::new(),
+                    proxy: Vec::new(),
+                    lazy: case.lazy,
+                    download: None,
+                    ready: None,
+                    shutdown: None,
+                    log: LogConfig::Stdout,
+                    reload: true,
+                    on_failure: crate::config::OnFailure::Notify,
+                    kind: None,
+                    resolved_binary_path: None,
+                },
+                case.state,
+            );
+            service.batch_built = case.batch_built;
+
+            assert_eq!(
+                should_rebuild_after_graph_requery(&service),
+                case.expected,
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_bazel_graph_requery_group_dir() {
+        struct Case {
+            name: &'static str,
+            working_dir: PathBuf,
+            expected: PathBuf,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("repo");
+        let nested = workspace.join("services").join("api");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(workspace.join("MODULE.bazel"), "").unwrap();
+
+        let no_workspace = temp.path().join("scratch");
+        fs::create_dir_all(&no_workspace).unwrap();
+
+        let cases = vec![
+            Case {
+                name: "walks up to bazel workspace root",
+                working_dir: nested.clone(),
+                expected: workspace.clone(),
+            },
+            Case {
+                name: "falls back to item dir without workspace marker",
+                working_dir: no_workspace.clone(),
+                expected: no_workspace.clone(),
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                bazel_graph_requery_group_dir(&case.working_dir),
+                case.expected,
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_any_glob_path_changed_since_respects_ignore_patterns() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("generated")).unwrap();
+        fs::write(repo.join("src/app.ts"), "console.log('src');").unwrap();
+        fs::write(
+            repo.join("generated/schema.ts"),
+            "console.log('generated');",
+        )
+        .unwrap();
+
+        assert!(any_glob_path_changed_since(
+            repo,
+            &["src/**".to_string()],
+            &[],
+            SystemTime::UNIX_EPOCH,
+        ));
+        assert!(!any_glob_path_changed_since(
+            repo,
+            &["generated/**".to_string()],
+            &["generated/**".to_string()],
+            SystemTime::UNIX_EPOCH,
+        ));
+        assert!(!any_glob_path_changed_since(
+            repo,
+            &["src/**".to_string()],
+            &[],
+            SystemTime::now() + std::time::Duration::from_secs(60),
+        ));
     }
 }

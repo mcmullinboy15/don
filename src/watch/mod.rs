@@ -25,11 +25,13 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 
 /// Default debounce window when none is configured.
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Synthetic watch item used for workspace-level build graph files.
+pub(crate) const WORKSPACE_GRAPH_ITEM_NAME: &str = "__workspace_graph__";
 
 /// Errors from the watch module.
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +100,9 @@ pub(crate) struct WatchUpdate {
     pub ignore_patterns: Vec<String>,
     /// Base directory to resolve patterns against.
     pub base_dir: PathBuf,
+    /// Optional completion signal sent once the watch manager has applied the
+    /// update and registered any needed directories.
+    pub applied_tx: Option<oneshot::Sender<()>>,
 }
 
 /// Manages file watchers for all services and tasks with watch patterns.
@@ -398,7 +403,7 @@ impl WatchManager {
 
                 if !compiled_patterns.is_empty() {
                     items.insert(
-                        "__workspace_graph__".to_string(),
+                        WORKSPACE_GRAPH_ITEM_NAME.to_string(),
                         WatchedItem {
                             state: WatchState::Idle,
                             debounce_duration: DEFAULT_DEBOUNCE,
@@ -505,7 +510,7 @@ impl WatchManager {
     ///
     /// Replaces the watch patterns for the named item and registers any
     /// new watch directories with the notify watcher.
-    fn apply_watch_update(&mut self, update: WatchUpdate) {
+    fn apply_watch_update(&mut self, mut update: WatchUpdate) {
         // Tier-1 BuildGraph updates land on specific filename patterns
         // (`<pkg>/BUILD`, `<pkg>/package.json`) — a non-recursive watch on
         // the package directory is exactly right. Tier-2 Service/Task
@@ -564,8 +569,7 @@ impl WatchManager {
         }
 
         if let Some(item) = self.items.get_mut(&update.name) {
-            item.patterns = compiled_patterns;
-            item.ignore_patterns = compiled_ignore;
+            refresh_item_definition(item, update.kind, compiled_patterns, compiled_ignore);
             let pats: Vec<&str> = item.patterns.iter().map(Pattern::as_str).collect();
             let igs: Vec<&str> = item.ignore_patterns.iter().map(Pattern::as_str).collect();
             self.emitter.service_debug_event(
@@ -600,6 +604,10 @@ impl WatchManager {
                     ignore_patterns: compiled_ignore,
                 },
             );
+        }
+
+        if let Some(applied_tx) = update.applied_tx.take() {
+            let _ = applied_tx.send(());
         }
     }
 
@@ -741,7 +749,7 @@ impl WatchManager {
                         // the runner re-queries the build tool asynchronously.
                         // Extract the service/task name by stripping "__graph" suffix.
                         item.state = WatchState::Idle;
-                        let item_name = name.strip_suffix("__graph").unwrap_or(&name).to_string();
+                        let item_name = build_graph_command_name(&name);
                         (
                             RunnerCommand::BuildGraphChanged { name: item_name },
                             "BuildGraphChanged",
@@ -857,6 +865,32 @@ fn is_covered(
         return true;
     }
     false
+}
+
+fn refresh_item_definition(
+    item: &mut WatchedItem,
+    kind: WatchItemKind,
+    patterns: Vec<Pattern>,
+    ignore_patterns: Vec<Pattern>,
+) {
+    // A build-tool re-query is a full re-registration of this item's watch
+    // definition. If we previously missed a RebuildComplete /
+    // TaskRerunComplete broadcast, the item may be stuck in `Rebuilding` and
+    // would otherwise swallow future edits forever.
+    item.state = WatchState::Idle;
+    item.debounce_deadline = None;
+    item.stale = false;
+    item.kind = kind;
+    item.patterns = patterns;
+    item.ignore_patterns = ignore_patterns;
+}
+
+fn build_graph_command_name(name: &str) -> String {
+    if name == WORKSPACE_GRAPH_ITEM_NAME {
+        return WORKSPACE_GRAPH_ITEM_NAME.to_string();
+    }
+
+    name.strip_suffix("__graph").unwrap_or(name).to_string()
 }
 
 /// Extract the base directory from a glob pattern.
@@ -1499,7 +1533,7 @@ mod tests {
                     }
                     WatchItemKind::BuildGraph => {
                         item.state = WatchState::Idle;
-                        let item_name = name.strip_suffix("__graph").unwrap_or(&name).to_string();
+                        let item_name = build_graph_command_name(&name);
                         RunnerCommand::BuildGraphChanged { name: item_name }
                     }
                 };
@@ -1629,5 +1663,77 @@ mod tests {
         assert_eq!(items["web__graph"].state, WatchState::Idle);
         // And stale should still be false.
         assert!(!items["web__graph"].stale);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_build_graph_kind_preserves_workspace_sentinel() {
+        tokio::time::pause();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+
+        let mut items = HashMap::new();
+        items.insert(
+            WORKSPACE_GRAPH_ITEM_NAME.to_string(),
+            WatchedItem {
+                state: WatchState::Idle,
+                debounce_duration: Duration::from_millis(200),
+                debounce_deadline: None,
+                stale: false,
+                kind: WatchItemKind::BuildGraph,
+                patterns: vec![Pattern::new("**/MODULE.bazel").unwrap()],
+                ignore_patterns: vec![],
+            },
+        );
+
+        let event = notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![PathBuf::from("MODULE.bazel")],
+            attrs: Default::default(),
+        };
+
+        handle_notify_event_standalone(&mut items, &event);
+        tokio::time::advance(Duration::from_millis(200)).await;
+        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
+
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(
+            matches!(cmd, RunnerCommand::BuildGraphChanged { ref name } if name == WORKSPACE_GRAPH_ITEM_NAME),
+            "expected BuildGraphChanged for workspace sentinel, got different command"
+        );
+    }
+
+    #[test]
+    fn test_refresh_item_definition_resets_stuck_rebuilding_state() {
+        let original_patterns = vec![Pattern::new("src/**/*.rs").unwrap()];
+        let replacement_patterns = vec![Pattern::new("pkg/**").unwrap()];
+        let replacement_ignore = vec![Pattern::new("pkg/generated/**").unwrap()];
+
+        let mut item = WatchedItem {
+            state: WatchState::Rebuilding,
+            debounce_duration: Duration::from_millis(200),
+            debounce_deadline: Some(Instant::now() + Duration::from_millis(50)),
+            stale: true,
+            kind: WatchItemKind::Service,
+            patterns: original_patterns,
+            ignore_patterns: vec![],
+        };
+
+        refresh_item_definition(
+            &mut item,
+            WatchItemKind::Task,
+            replacement_patterns,
+            replacement_ignore,
+        );
+
+        assert_eq!(item.state, WatchState::Idle);
+        assert_eq!(item.debounce_deadline, None);
+        assert!(!item.stale);
+        assert_eq!(item.kind, WatchItemKind::Task);
+        assert_eq!(item.patterns.len(), 1);
+        assert_eq!(item.patterns[0].as_str(), "pkg/**");
+        assert_eq!(item.ignore_patterns.len(), 1);
+        assert_eq!(item.ignore_patterns[0].as_str(), "pkg/generated/**");
     }
 }
