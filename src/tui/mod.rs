@@ -64,7 +64,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use backend::FixedBottomBackend;
 
 use crate::config::ParamKind;
-use crate::output::FormattedLogLine;
+use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
 use crate::runner::{RunnerCommand, RunnerEvent, ServiceState};
 use app::{App, OverlayItem, ViewMode};
 use events::AppEvent;
@@ -96,6 +96,12 @@ impl Drop for RawModeGuard {
 }
 
 type TuiTerminal = Terminal<FixedBottomBackend<std::io::Stdout>>;
+
+#[derive(Clone)]
+struct TuiControls {
+    verbosity: VerbosityControl,
+    lifecycle_emitter: LifecycleEmitter,
+}
 
 /// Alt-screen full-screen terminal used by Filter, Palette, and Overlay
 /// modes. RAII: entering/leaving alt screen is tied to construction/drop,
@@ -144,6 +150,8 @@ pub async fn run_tui(
     mut log_rx: mpsc::Receiver<FormattedLogLine>,
     mut runner_events: broadcast::Receiver<RunnerEvent>,
     command_tx: mpsc::Sender<RunnerCommand>,
+    verbosity: VerbosityControl,
+    lifecycle_emitter: LifecycleEmitter,
     service_names: Vec<String>,
     task_names: Vec<String>,
     build_tool_names: Vec<String>,
@@ -151,6 +159,10 @@ pub async fn run_tui(
     hidden_names: std::collections::HashSet<String>,
 ) -> Result<(), TuiError> {
     let _raw_guard = RawModeGuard::enter()?;
+    let controls = TuiControls {
+        verbosity,
+        lifecycle_emitter,
+    };
 
     let mut app = App::new(
         service_names,
@@ -158,6 +170,7 @@ pub async fn run_tui(
         build_tool_names,
         task_configs,
         hidden_names,
+        controls.verbosity.is_enabled(),
     );
     let mut terminal = build_inline_terminal()?;
     let mut store = LogStore::with_capacity(DEFAULT_CAPACITY);
@@ -253,6 +266,7 @@ pub async fn run_tui(
                             &mut terminal,
                             &mut store,
                             &command_tx,
+                            &controls,
                             &mut modal,
                         )?;
                     }
@@ -419,6 +433,7 @@ fn handle_app_event(
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
     command_tx: &mpsc::Sender<RunnerCommand>,
+    controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     match event {
@@ -432,7 +447,7 @@ fn handle_app_event(
                 clear_and_replay(terminal, store, app)?;
             }
         }
-        AppEvent::Key(key) => handle_key(key, app, terminal, store, command_tx, modal)?,
+        AppEvent::Key(key) => handle_key(key, app, terminal, store, command_tx, controls, modal)?,
         AppEvent::CompletionsReady {
             param,
             request_id,
@@ -453,6 +468,7 @@ fn handle_key(
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
     command_tx: &mpsc::Sender<RunnerCommand>,
+    controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     // Ctrl+C: belt-and-suspenders shutdown. We both send a `Shutdown` command
@@ -461,13 +477,28 @@ fn handle_key(
     // (e.g., the runner is stuck pre-loop), and SIGINT preserves the
     // two-press force-kill escalation via the runner's signal counter.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(key.code, KeyCode::Char('c')) {
-            let tx = command_tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(RunnerCommand::Shutdown).await;
-            });
-            let _ =
-                nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
+        match key.code {
+            KeyCode::Char('c') => {
+                let tx = command_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(RunnerCommand::Shutdown).await;
+                });
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::this(),
+                    nix::sys::signal::Signal::SIGINT,
+                );
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                let enabled = controls.verbosity.toggle();
+                app.set_verbose_enabled(enabled);
+                controls.lifecycle_emitter.lifecycle_event(if enabled {
+                    "verbose logging enabled"
+                } else {
+                    "verbose logging disabled"
+                });
+                redraw_current_view(app, terminal, modal)?;
+            }
+            _ => {}
         }
         return Ok(());
     }
@@ -482,6 +513,19 @@ fn handle_key(
         ViewMode::Palette => handle_palette_key(key, app, terminal, store, command_tx, modal)?,
         ViewMode::Overlay => handle_overlay_key(key, app, terminal, store, command_tx, modal)?,
         ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
+    }
+    Ok(())
+}
+
+fn redraw_current_view(
+    app: &App,
+    terminal: &mut TuiTerminal,
+    modal: &mut Option<Modal>,
+) -> Result<(), TuiError> {
+    if let Some(m) = modal.as_mut() {
+        m.draw(app)?;
+    } else {
+        draw_inline_bar(terminal, app)?;
     }
     Ok(())
 }

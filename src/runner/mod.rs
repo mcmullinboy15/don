@@ -1174,6 +1174,12 @@ pub struct VerboseInfo {
     /// Run command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
+    /// Live watch-manager state for this item, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch_state: Option<String>,
+    /// Extra watch diagnostics for this item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_notes: Vec<String>,
 }
 
 /// An event broadcast from the runner for external consumers.
@@ -1458,6 +1464,8 @@ pub struct Runner {
     /// Sender for pushing watch pattern updates to the WatchManager.
     /// Used after build tool re-queries to update tier-2 watch patterns.
     watch_update_tx: Option<mpsc::Sender<crate::watch::WatchUpdate>>,
+    /// Sender for querying the live watch manager state for verbose status.
+    watch_query_tx: Option<mpsc::Sender<crate::watch::WatchQuery>>,
 
     /// Mutex to serialize Bazel build invocations. Concurrent `bazel build`
     /// commands contend for Bazel's server lock, so we queue them.
@@ -1657,6 +1665,7 @@ impl Runner {
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
             watch_update_tx: None,
+            watch_query_tx: None,
             batch_build_handle: None,
             lazy_build_handles: HashMap::new(),
             rebuild_batch_handle: None,
@@ -1938,6 +1947,8 @@ impl Runner {
         let mut watch_handle: Option<tokio::task::JoinHandle<()>> = None;
         let (watch_update_tx, watch_update_rx) = mpsc::channel(64);
         self.watch_update_tx = Some(watch_update_tx);
+        let (watch_query_tx, watch_query_rx) = mpsc::channel(8);
+        self.watch_query_tx = Some(watch_query_tx);
         // `WatchManager::new` calls `notify::Watcher::watch`, which is
         // synchronous and walks directory trees under the hood — offload
         // to a blocking thread so the runner's main task stays polled.
@@ -1957,6 +1968,7 @@ impl Runner {
                 cmd_tx_for_watch,
                 runner_events_for_watch,
                 watch_update_rx,
+                watch_query_rx,
                 emitter_for_watch,
             )
         });
@@ -2107,7 +2119,7 @@ impl Runner {
                                 break;
                             }
                             RunnerCommand::Status { verbose, reply } => {
-                                let statuses = self.collect_status(verbose);
+                                let statuses = self.collect_status(verbose).await;
                                 let _ = reply.send(statuses);
                             }
                             RunnerCommand::Logs { name, last_n, reply } => {
@@ -5578,9 +5590,31 @@ impl Runner {
         }
     }
 
+    async fn fetch_watch_snapshot(&self) -> Option<crate::watch::WatchSnapshot> {
+        let tx = self.watch_query_tx.as_ref()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx
+            .send(crate::watch::WatchQuery { reply: reply_tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(250), reply_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
     /// Collect status of all items.
-    fn collect_status(&self, verbose: bool) -> Vec<ItemStatus> {
+    async fn collect_status(&self, verbose: bool) -> Vec<ItemStatus> {
         let mut statuses = Vec::new();
+        let watch_snapshot = if verbose {
+            self.fetch_watch_snapshot().await
+        } else {
+            None
+        };
+        let watch_snapshot_available = watch_snapshot.is_some();
         for (name, rs) in &self.services {
             let verbose_info = if verbose {
                 let resolved = &rs.resolved;
@@ -5608,6 +5642,35 @@ impl Runner {
                 } else {
                     resolved.watch.clone()
                 };
+                let watch_item = watch_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.items.get(name));
+                let mut watch_notes = Vec::new();
+                if let Some(snapshot) = &watch_snapshot {
+                    if snapshot.notify_error_count > 0
+                        && let Some(ref last) = snapshot.last_notify_error
+                    {
+                        watch_notes.push(format!(
+                            "notify errors={} last={last}",
+                            snapshot.notify_error_count
+                        ));
+                    }
+                    if snapshot.runner_event_lag_count > 0 {
+                        watch_notes.push(format!(
+                            "runner-event lag count={}",
+                            snapshot.runner_event_lag_count
+                        ));
+                    }
+                }
+                if let Some(item) = watch_item {
+                    if let Some(ref last_error) = item.last_error {
+                        watch_notes.push(last_error.clone());
+                    }
+                } else if !watch.is_empty() && watch_snapshot_available {
+                    watch_notes.push("watch item missing from watch manager".to_string());
+                } else if !watch.is_empty() {
+                    watch_notes.push("watch manager unavailable".to_string());
+                }
                 Some(VerboseInfo {
                     depends_on: resolved.depends_on.clone(),
                     watch,
@@ -5630,6 +5693,13 @@ impl Runner {
                     turbo_task: resolved.turbo_config().map(|t| t.task.clone()),
                     ready,
                     cmd,
+                    watch_state: watch_item.map(|item| {
+                        format!(
+                            "{} state={} stale={} debounce={}ms",
+                            item.kind, item.state, item.stale, item.debounce_ms
+                        )
+                    }),
+                    watch_notes,
                 })
             } else {
                 None
@@ -5653,6 +5723,35 @@ impl Runner {
                 } else {
                     task.watch.clone()
                 };
+                let watch_item = watch_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.items.get(name));
+                let mut watch_notes = Vec::new();
+                if let Some(snapshot) = &watch_snapshot {
+                    if snapshot.notify_error_count > 0
+                        && let Some(ref last) = snapshot.last_notify_error
+                    {
+                        watch_notes.push(format!(
+                            "notify errors={} last={last}",
+                            snapshot.notify_error_count
+                        ));
+                    }
+                    if snapshot.runner_event_lag_count > 0 {
+                        watch_notes.push(format!(
+                            "runner-event lag count={}",
+                            snapshot.runner_event_lag_count
+                        ));
+                    }
+                }
+                if let Some(item) = watch_item {
+                    if let Some(ref last_error) = item.last_error {
+                        watch_notes.push(last_error.clone());
+                    }
+                } else if !watch.is_empty() && watch_snapshot_available {
+                    watch_notes.push("watch item missing from watch manager".to_string());
+                } else if !watch.is_empty() {
+                    watch_notes.push("watch manager unavailable".to_string());
+                }
                 Some(VerboseInfo {
                     depends_on: task.depends_on.clone(),
                     watch,
@@ -5661,6 +5760,13 @@ impl Runner {
                     turbo_task: task.turbo.as_ref().map(|t| t.task.clone()),
                     ready: None,
                     cmd: Some(cmd_str),
+                    watch_state: watch_item.map(|item| {
+                        format!(
+                            "{} state={} stale={} debounce={}ms",
+                            item.kind, item.state, item.stale, item.debounce_ms
+                        )
+                    }),
+                    watch_notes,
                 })
             } else {
                 None

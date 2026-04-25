@@ -80,6 +80,7 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
             app.spinner_frame,
             visible_services,
             total_services,
+            app.verbose_enabled,
         ))
     };
     frame.render_widget(bar, inner);
@@ -403,6 +404,7 @@ fn normal_bar_line(
     spinner_frame: usize,
     visible_services: usize,
     total_services: usize,
+    verbose_enabled: bool,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -443,6 +445,10 @@ fn normal_bar_line(
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
     }
     spans.push(dim("  [t] tasks  [s] status"));
+    if verbose_enabled {
+        spans.push(separator());
+        spans.push(dim("verbose"));
+    }
     Line::from(spans)
 }
 

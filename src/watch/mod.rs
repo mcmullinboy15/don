@@ -82,6 +82,8 @@ struct WatchedItem {
     patterns: Vec<Pattern>,
     /// Glob patterns for ignoring file events (checked before watch patterns).
     ignore_patterns: Vec<Pattern>,
+    /// Last diagnostic associated with this item's watch registration or state.
+    last_error: Option<String>,
 }
 
 /// An update to the watch patterns for a specific item.
@@ -105,6 +107,27 @@ pub(crate) struct WatchUpdate {
     pub applied_tx: Option<oneshot::Sender<()>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct WatchItemSnapshot {
+    pub kind: &'static str,
+    pub state: &'static str,
+    pub stale: bool,
+    pub debounce_ms: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WatchSnapshot {
+    pub items: HashMap<String, WatchItemSnapshot>,
+    pub notify_error_count: u64,
+    pub runner_event_lag_count: u64,
+    pub last_notify_error: Option<String>,
+}
+
+pub(crate) struct WatchQuery {
+    pub reply: oneshot::Sender<WatchSnapshot>,
+}
+
 /// Manages file watchers for all services and tasks with watch patterns.
 ///
 /// Runs as a background tokio task, communicating with the runner via channels.
@@ -122,6 +145,8 @@ pub(crate) struct WatchManager {
     runner_events: broadcast::Receiver<RunnerEvent>,
     /// Receiver for watch pattern updates from the runner (build tool re-queries).
     update_rx: mpsc::Receiver<WatchUpdate>,
+    /// Receiver for debug/status queries from the runner.
+    query_rx: mpsc::Receiver<WatchQuery>,
     /// Directories already registered with the watcher, keyed by path with
     /// the mode the watch was registered under.
     ///
@@ -133,6 +158,12 @@ pub(crate) struct WatchManager {
     registered_dirs: HashMap<PathBuf, RecursiveMode>,
     /// Emitter for `[don]` verbose-mode diagnostics.
     emitter: LifecycleEmitter,
+    /// Count of notify backend errors seen since startup.
+    notify_error_count: u64,
+    /// Count of broadcast lag incidents while consuming runner events.
+    runner_event_lag_count: u64,
+    /// Most recent notify backend error.
+    last_notify_error: Option<String>,
 }
 
 impl WatchManager {
@@ -151,6 +182,7 @@ impl WatchManager {
         cmd_tx: mpsc::Sender<RunnerCommand>,
         runner_events: broadcast::Receiver<RunnerEvent>,
         update_rx: mpsc::Receiver<WatchUpdate>,
+        query_rx: mpsc::Receiver<WatchQuery>,
         emitter: LifecycleEmitter,
     ) -> Result<(Self, Vec<String>), WatchError> {
         let mut warnings: Vec<String> = Vec::new();
@@ -282,6 +314,7 @@ impl WatchManager {
                     kind: WatchItemKind::Service,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
+                    last_error: None,
                 },
             );
         }
@@ -346,6 +379,7 @@ impl WatchManager {
                     kind: WatchItemKind::Task,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
+                    last_error: None,
                 },
             );
         }
@@ -397,8 +431,16 @@ impl WatchManager {
                 // Non-recursive watch on the workspace root is enough for
                 // these specific filenames. No symlink spelunking.
                 if !is_covered(base_dir, RecursiveMode::NonRecursive, &registered_dirs) {
-                    let _ = watcher.watch(base_dir, RecursiveMode::NonRecursive);
-                    registered_dirs.insert(base_dir.to_path_buf(), RecursiveMode::NonRecursive);
+                    match watcher.watch(base_dir, RecursiveMode::NonRecursive) {
+                        Ok(()) => {
+                            registered_dirs
+                                .insert(base_dir.to_path_buf(), RecursiveMode::NonRecursive);
+                        }
+                        Err(e) => warnings.push(format!(
+                            "workspace watch registration failed for {}: {e}",
+                            base_dir.display()
+                        )),
+                    }
                 }
 
                 if !compiled_patterns.is_empty() {
@@ -412,6 +454,7 @@ impl WatchManager {
                             kind: WatchItemKind::BuildGraph,
                             patterns: compiled_patterns,
                             ignore_patterns: vec![],
+                            last_error: None,
                         },
                     );
                 }
@@ -456,8 +499,12 @@ impl WatchManager {
                 cmd_tx,
                 runner_events,
                 update_rx,
+                query_rx,
                 registered_dirs,
                 emitter,
+                notify_error_count: 0,
+                runner_event_lag_count: 0,
+                last_notify_error: None,
             },
             warnings,
         ))
@@ -477,8 +524,9 @@ impl WatchManager {
 
             tokio::select! {
                 Some(event_result) = self.event_rx.recv() => {
-                    if let Ok(event) = event_result {
-                        self.handle_notify_event(&event);
+                    match event_result {
+                        Ok(event) => self.handle_notify_event(&event),
+                        Err(err) => self.record_notify_error(&err.to_string()),
                     }
                 }
                 _ = sleep_until_or_pending(next_deadline) => {
@@ -493,6 +541,8 @@ impl WatchManager {
                             // the corresponding WatchedItem is stuck in
                             // `Rebuilding` and will swallow future edits until
                             // the item is re-registered. Surface it loudly.
+                            self.runner_event_lag_count =
+                                self.runner_event_lag_count.saturating_add(n);
                             self.emitter.lifecycle_event(&format!(
                                 "watch: broadcast lag — missed {n} runner events; a service may be stuck in Rebuilding"
                             ));
@@ -501,6 +551,9 @@ impl WatchManager {
                 }
                 Some(update) = self.update_rx.recv() => {
                     self.apply_watch_update(update);
+                }
+                Some(query) = self.query_rx.recv() => {
+                    let _ = query.reply.send(self.snapshot());
                 }
             }
         }
@@ -551,11 +604,31 @@ impl WatchManager {
                     if mode == RecursiveMode::Recursive
                         && self.registered_dirs.get(&watch_dir)
                             == Some(&RecursiveMode::NonRecursive)
+                        && let Err(e) = self.watcher.unwatch(&watch_dir)
                     {
-                        let _ = self.watcher.unwatch(&watch_dir);
+                        self.record_item_error(
+                            &update.name,
+                            format!(
+                                "watch: failed to replace non-recursive watch for {}: {e}",
+                                watch_dir.display()
+                            ),
+                        );
                     }
-                    let _ = self.watcher.watch(&watch_dir, mode);
-                    self.registered_dirs.insert(watch_dir, mode);
+                    match self.watcher.watch(&watch_dir, mode) {
+                        Ok(()) => {
+                            self.registered_dirs.insert(watch_dir, mode);
+                        }
+                        Err(e) => {
+                            self.record_item_error(
+                                &update.name,
+                                format!(
+                                    "watch: failed to register {:?} watch for {}: {e}",
+                                    mode,
+                                    watch_dir.display()
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -602,6 +675,7 @@ impl WatchManager {
                     kind: update.kind,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
+                    last_error: None,
                 },
             );
         }
@@ -645,33 +719,64 @@ impl WatchManager {
         for path in &event.paths {
             let path_str = path.to_string_lossy();
             let mut matched_any = false;
+            let mut ignored_by: Vec<String> = Vec::new();
+            let mut unmatched: Vec<String> = Vec::new();
             for (name, item) in &self.items {
+                let state = watch_state_label(item.state);
                 if let Some(ig) = item.ignore_patterns.iter().find(|p| p.matches(&path_str)) {
                     self.emitter.service_debug_event(
                         name,
                         &format!(
-                            "watch: ignored {:?} by ignore pattern {:?}",
+                            "watch: ignored path={:?} state={} ignore={:?}",
                             path,
+                            state,
                             ig.as_str()
                         ),
                     );
-                    matched_any = true;
+                    ignored_by.push(name.clone());
                     continue;
                 }
                 if let Some(pat) = item.patterns.iter().find(|p| p.matches(&path_str)) {
                     self.emitter.service_debug_event(
                         name,
-                        &format!("watch: matched {:?} by pattern {:?}", path, pat.as_str()),
+                        &format!(
+                            "watch: matched path={:?} state={} pattern={:?}",
+                            path,
+                            state,
+                            pat.as_str()
+                        ),
                     );
                     matched_any = true;
                     if !affected.contains(name) {
                         affected.push(name.clone());
                     }
+                } else {
+                    unmatched.push(name.clone());
                 }
             }
             if !matched_any {
-                self.emitter
-                    .debug_event(&format!("watch: no item matched {:?}", path));
+                if ignored_by.is_empty() {
+                    self.emitter
+                        .debug_event(&format!("watch: no item matched {:?}", path));
+                } else {
+                    self.emitter.debug_event(&format!(
+                        "watch: no rebuild match for {:?} (ignored by {})",
+                        path,
+                        ignored_by.join(", ")
+                    ));
+                }
+                for name in unmatched {
+                    if let Some(item) = self.items.get(&name) {
+                        self.emitter.service_debug_event(
+                            &name,
+                            &format!(
+                                "watch: did not match path={:?} state={} reason=no pattern matched",
+                                path,
+                                watch_state_label(item.state)
+                            ),
+                        );
+                    }
+                }
             }
         }
 
@@ -839,6 +944,47 @@ impl WatchManager {
             _ => {}
         }
     }
+
+    fn snapshot(&self) -> WatchSnapshot {
+        let items = self
+            .items
+            .iter()
+            .map(|(name, item)| {
+                (
+                    name.clone(),
+                    WatchItemSnapshot {
+                        kind: watch_item_kind_label(item.kind),
+                        state: watch_state_label(item.state),
+                        stale: item.stale,
+                        debounce_ms: item.debounce_duration.as_millis() as u64,
+                        last_error: item.last_error.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        WatchSnapshot {
+            items,
+            notify_error_count: self.notify_error_count,
+            runner_event_lag_count: self.runner_event_lag_count,
+            last_notify_error: self.last_notify_error.clone(),
+        }
+    }
+
+    fn record_notify_error(&mut self, error: &str) {
+        self.notify_error_count = self.notify_error_count.saturating_add(1);
+        self.last_notify_error = Some(error.to_string());
+        self.emitter
+            .lifecycle_event(&format!("watch: notify backend error: {error}"));
+    }
+
+    fn record_item_error(&mut self, name: &str, error: String) {
+        if let Some(item) = self.items.get_mut(name) {
+            item.last_error = Some(error.clone());
+        }
+        self.emitter.service_debug_event(name, &error);
+        self.emitter.lifecycle_event(&error);
+    }
 }
 
 /// Is a watch on `path` with `mode` already covered by something in `existing`?
@@ -883,6 +1029,7 @@ fn refresh_item_definition(
     item.kind = kind;
     item.patterns = patterns;
     item.ignore_patterns = ignore_patterns;
+    item.last_error = None;
 }
 
 fn build_graph_command_name(name: &str) -> String {
@@ -891,6 +1038,22 @@ fn build_graph_command_name(name: &str) -> String {
     }
 
     name.strip_suffix("__graph").unwrap_or(name).to_string()
+}
+
+fn watch_state_label(state: WatchState) -> &'static str {
+    match state {
+        WatchState::Idle => "idle",
+        WatchState::Debouncing => "debouncing",
+        WatchState::Rebuilding => "rebuilding",
+    }
+}
+
+fn watch_item_kind_label(kind: WatchItemKind) -> &'static str {
+    match kind {
+        WatchItemKind::Service => "service",
+        WatchItemKind::Task => "task",
+        WatchItemKind::BuildGraph => "build_graph",
+    }
 }
 
 /// Extract the base directory from a glob pattern.
@@ -1170,6 +1333,7 @@ mod tests {
                 kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1231,6 +1395,7 @@ mod tests {
                 kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1283,6 +1448,7 @@ mod tests {
                 kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1326,6 +1492,7 @@ mod tests {
                 kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1370,6 +1537,7 @@ mod tests {
                 kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1415,6 +1583,7 @@ mod tests {
                 kind: WatchItemKind::Service,
                 patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1595,6 +1764,7 @@ mod tests {
                 kind: WatchItemKind::BuildGraph,
                 patterns: vec![Pattern::new("**/BUILD.bazel").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1644,6 +1814,7 @@ mod tests {
                 kind: WatchItemKind::BuildGraph,
                 patterns: vec![Pattern::new("**/package.json").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1682,6 +1853,7 @@ mod tests {
                 kind: WatchItemKind::BuildGraph,
                 patterns: vec![Pattern::new("**/MODULE.bazel").unwrap()],
                 ignore_patterns: vec![],
+                last_error: None,
             },
         );
 
@@ -1718,6 +1890,7 @@ mod tests {
             kind: WatchItemKind::Service,
             patterns: original_patterns,
             ignore_patterns: vec![],
+            last_error: None,
         };
 
         refresh_item_definition(

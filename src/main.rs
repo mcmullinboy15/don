@@ -599,6 +599,15 @@ fn print_verbose_info(info: &don::runner::VerboseInfo) {
             println!("         {pattern}");
         }
     }
+    if let Some(ref watch_state) = info.watch_state {
+        println!("  {dim}watch state:{reset}  {watch_state}");
+    }
+    if !info.watch_notes.is_empty() {
+        println!("  {dim}watch diag:{reset}   {}", info.watch_notes[0]);
+        for note in info.watch_notes.iter().skip(1) {
+            println!("               {note}");
+        }
+    }
 }
 
 fn service_state_label(s: ServiceState) -> &'static str {
@@ -905,6 +914,8 @@ async fn run_start(
             don::output::OutputManager::new_with_tui(&all_configs, verbose)
                 .await
                 .map_err(|e| format!("Error creating output manager: {e}"))?;
+        let verbosity = output_manager.verbosity_control();
+        let lifecycle_emitter = output_manager.clone_lifecycle_emitter();
 
         let service_names: Vec<String> = config
             .services
@@ -987,6 +998,8 @@ async fn run_start(
                 log_rx,
                 events,
                 commands,
+                verbosity,
+                lifecycle_emitter,
                 service_names,
                 task_names,
                 build_tool_names,

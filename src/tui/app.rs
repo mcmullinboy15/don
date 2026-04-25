@@ -158,6 +158,7 @@ impl StatusCounts {
 pub(crate) struct App {
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
+    pub(crate) verbose_enabled: bool,
     /// Graceful shutdown is in progress: the inline bar becomes
     /// non-interactive and new log lines from every service are shown.
     pub(crate) shutdown_started: bool,
@@ -202,6 +203,7 @@ impl App {
         build_tool_names: Vec<String>,
         task_configs: HashMap<String, Task>,
         hidden_names: HashSet<String>,
+        verbose_enabled: bool,
     ) -> Self {
         let services_state: HashMap<String, ServiceState> = service_names
             .iter()
@@ -230,6 +232,7 @@ impl App {
         Self {
             counts,
             view_mode: ViewMode::Normal,
+            verbose_enabled,
             shutdown_started: false,
             shutdown_log_cutoff: None,
             filter: FilterState::new(all_filter_names, &hidden_names),
@@ -253,6 +256,10 @@ impl App {
         self.overlay_query.clear();
         self.overlay_filtering = false;
         self.form = None;
+    }
+
+    pub(crate) fn set_verbose_enabled(&mut self, verbose_enabled: bool) {
+        self.verbose_enabled = verbose_enabled;
     }
 
     pub(crate) fn should_render_log(&self, name: &str, id: u64) -> bool {
@@ -465,6 +472,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashSet::new(),
+            false,
         );
         assert_eq!(app.counts.services_ready, 0);
         app.apply_service_state("api".into(), ServiceState::Ready);
@@ -484,6 +492,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashSet::new(),
+            false,
         );
         app.filter.enter_edit();
         app.filter.push_query_char('a');
@@ -508,6 +517,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashSet::new(),
+            false,
         );
         app.view_mode = ViewMode::Overlay;
         app.overlay_query = "api".into();

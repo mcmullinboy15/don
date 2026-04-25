@@ -19,6 +19,7 @@ use ring_buffer::RingBuffer;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -128,6 +129,41 @@ pub struct FormattedLogLine {
     /// Fully formatted line bytes. Does NOT include a trailing newline —
     /// the renderer appends one (or, for ratatui, treats it as one row).
     pub bytes: Vec<u8>,
+}
+
+/// Shared runtime control for verbose lifecycle and watch logging.
+///
+/// Clones point at the same atomic flag, so the TUI can toggle verbosity
+/// live while the stdout sink and background emitters observe the change
+/// immediately.
+#[derive(Clone, Debug)]
+pub struct VerbosityControl {
+    enabled: Arc<AtomicBool>,
+}
+
+impl VerbosityControl {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(enabled)),
+        }
+    }
+
+    /// Return whether verbose logging is currently enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Set verbose logging on or off for all current emitters and sinks.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Flip verbose logging and return the new state.
+    pub fn toggle(&self) -> bool {
+        let new_value = !self.is_enabled();
+        self.set_enabled(new_value);
+        new_value
+    }
 }
 
 /// Where the stdout sink task sends its formatted lines.
@@ -378,8 +414,9 @@ pub struct OutputManager {
     stdout_sink: SinkHandle,
     /// Writer task JoinHandles for clean shutdown.
     writer_handles: Vec<JoinHandle<()>>,
-    /// Verbose mode — enables extra diagnostic lifecycle events.
-    verbose: bool,
+    /// Shared runtime verbose mode — enables extra diagnostic lifecycle events
+    /// and timestamps on stdout/TUI log lines.
+    verbosity: VerbosityControl,
     /// Cached formatted prefix for the synthetic "bazel" stream. Populated
     /// by [`Self::register_build_tool`]; `None` means build output falls
     /// back to a `[don]`-prefixed lifecycle event with a `bazel:` text
@@ -458,10 +495,11 @@ impl OutputManager {
         let names: Vec<&str> = services.iter().map(|(n, _)| *n).collect();
         let color_map = assign_colors(&names);
         let max_name_len = names.iter().map(|n| n.len()).max().unwrap_or(0).max(5);
+        let verbosity = VerbosityControl::new(verbose);
 
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
-        let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, target, verbose));
+        let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, target, verbosity.clone()));
         let stdout_sink = SinkHandle {
             tx: stdout_tx,
             drop_on_full: false,
@@ -532,7 +570,7 @@ impl OutputManager {
             don_prefix,
             stdout_sink,
             writer_handles,
-            verbose,
+            verbosity,
             bazel_prefix: None,
             turbo_prefix: None,
         })
@@ -744,6 +782,11 @@ impl OutputManager {
         );
     }
 
+    /// Get a shared runtime controller for verbose logging.
+    pub fn verbosity_control(&self) -> VerbosityControl {
+        self.verbosity.clone()
+    }
+
     /// Get a lightweight, cloneable handle for emitting `[don]` lifecycle
     /// events from spawned tasks (e.g. build output).
     pub fn clone_lifecycle_emitter(&self) -> LifecycleEmitter {
@@ -752,7 +795,7 @@ impl OutputManager {
             stdout_sink: self.stdout_sink.clone(),
             bazel_prefix: self.bazel_prefix.clone(),
             turbo_prefix: self.turbo_prefix.clone(),
-            verbose: self.verbose,
+            verbosity: self.verbosity.clone(),
         }
     }
 
@@ -767,7 +810,7 @@ impl OutputManager {
 
     /// Emit a `[don]` lifecycle event only when verbose mode is enabled.
     pub fn debug_event(&self, message: &str) {
-        if self.verbose {
+        if self.verbosity.is_enabled() {
             self.lifecycle_event(message);
         }
     }
@@ -775,7 +818,7 @@ impl OutputManager {
     /// Log (in verbose mode only) the exact executable and arguments about
     /// to be passed to `execve`. See [`LifecycleEmitter::debug_spawn`].
     pub fn debug_spawn<S: AsRef<str>>(&self, label: &str, cmd: &str, args: &[S]) {
-        if !self.verbose {
+        if !self.verbosity.is_enabled() {
             return;
         }
         self.service_event(label, &format!("spawn {}", format_cmdline(cmd, args)));
@@ -796,7 +839,7 @@ impl OutputManager {
     /// Emit a `[don]` lifecycle event scoped to a service/task, only when
     /// verbose mode is enabled. See [`Self::service_event`].
     pub fn service_debug_event(&self, service: &str, message: &str) {
-        if self.verbose {
+        if self.verbosity.is_enabled() {
             self.service_event(service, message);
         }
     }
@@ -912,7 +955,7 @@ pub struct LifecycleEmitter {
     stdout_sink: SinkHandle,
     bazel_prefix: Option<Bytes>,
     turbo_prefix: Option<Bytes>,
-    verbose: bool,
+    verbosity: VerbosityControl,
 }
 
 impl LifecycleEmitter {
@@ -948,14 +991,14 @@ impl LifecycleEmitter {
 
     /// Emit a `[don]` lifecycle event only when verbose mode is enabled.
     pub fn debug_event(&self, message: &str) {
-        if self.verbose {
+        if self.verbosity.is_enabled() {
             self.lifecycle_event(message);
         }
     }
 
     /// Emit a service-scoped `[don]` event only when verbose mode is enabled.
     pub fn service_debug_event(&self, service: &str, message: &str) {
-        if self.verbose {
+        if self.verbosity.is_enabled() {
             self.service_event(service, message);
         }
     }
@@ -967,7 +1010,7 @@ impl LifecycleEmitter {
     /// `label` is a short tag (e.g. service name, "bazel", "turbo") to
     /// help the user identify the source of the spawn.
     pub fn debug_spawn<S: AsRef<str>>(&self, label: &str, cmd: &str, args: &[S]) {
-        if !self.verbose {
+        if !self.verbosity.is_enabled() {
             return;
         }
         self.service_event(label, &format!("spawn {}", format_cmdline(cmd, args)));
@@ -1014,7 +1057,7 @@ impl LifecycleEmitter {
 async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut rx: mpsc::Receiver<SinkLine>,
     mut target: StdoutTarget<W>,
-    verbose: bool,
+    verbosity: VerbosityControl,
 ) {
     use bytes::BytesMut;
 
@@ -1055,7 +1098,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
-                        verbose,
+                        &verbosity,
                         start,
                     )
                     .await;
@@ -1077,7 +1120,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
-                        verbose,
+                        &verbosity,
                         start,
                     )
                     .await;
@@ -1099,7 +1142,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
-                        verbose,
+                        &verbosity,
                         start,
                     )
                     .await;
@@ -1120,7 +1163,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             } else {
                 sanitize::sanitize_terminal_output(acc)
             };
-            emit_line(&mut target, "", prefix, &sanitized, verbose, start).await;
+            emit_line(&mut target, "", prefix, &sanitized, &verbosity, start).await;
         }
     }
 }
@@ -1130,11 +1173,11 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
 fn build_formatted_bytes(
     prefix: &[u8],
     line: &[u8],
-    verbose: bool,
+    verbosity: &VerbosityControl,
     start: std::time::Instant,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(prefix.len() + line.len() + 16);
-    if verbose {
+    if verbosity.is_enabled() {
         let elapsed = start.elapsed();
         let ts = format!("{:.3}s ", elapsed.as_secs_f64());
         out.extend_from_slice(ts.as_bytes());
@@ -1151,10 +1194,10 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     name: &str,
     prefix: &[u8],
     line: &[u8],
-    verbose: bool,
+    verbosity: &VerbosityControl,
     start: std::time::Instant,
 ) {
-    let bytes = build_formatted_bytes(prefix, line, verbose, start);
+    let bytes = build_formatted_bytes(prefix, line, verbosity, start);
     match target {
         StdoutTarget::Writer(writer) => {
             use tokio::io::AsyncWriteExt;
@@ -1572,5 +1615,55 @@ mod tests {
         let output = read_buf(&buf);
         assert!(output.contains("alpha"), "should have alpha output");
         assert!(output.contains("beta"), "should have beta output");
+    }
+
+    #[tokio::test]
+    async fn test_runtime_verbose_toggle_updates_emitters_and_stdout_formatting() {
+        let (writer, buf) = TestBuffer::new();
+        let config = crate::config::LogConfig::Stdout;
+        let mgr = OutputManager::new_verbose(&[("svc", &config)], writer, false)
+            .await
+            .unwrap();
+        let verbosity = mgr.verbosity_control();
+        let svc = mgr.service_writer("svc").unwrap();
+
+        mgr.debug_event("hidden while verbose is off");
+        svc.write_line("before").await;
+        tokio::task::yield_now().await;
+
+        verbosity.set_enabled(true);
+        mgr.debug_event("visible after toggle");
+        svc.write_line("after").await;
+        tokio::task::yield_now().await;
+
+        mgr.shutdown().await;
+
+        let output = strip_ansi(read_buf(&buf).as_bytes());
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected one normal line, one lifecycle line, one verbose line"
+        );
+        assert!(
+            !lines[0]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit()),
+            "first line should not have a verbose timestamp: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("visible after toggle"),
+            "lifecycle debug event should become visible after toggle"
+        );
+        assert!(
+            lines[2]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit()),
+            "third line should gain a verbose timestamp after toggle: {:?}",
+            lines[2]
+        );
     }
 }
