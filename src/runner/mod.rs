@@ -84,6 +84,7 @@ struct RebuildBatchRequest {
 
 struct RebuildBatchOutcome {
     build_succeeded: Vec<String>,
+    up_to_date: Vec<String>,
     failed: Vec<(String, String)>,
     plain_rebuilds: Vec<String>,
 }
@@ -526,6 +527,7 @@ async fn run_rebuild_batch_worker(
     bazel_build_mutex: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) -> RebuildBatchOutcome {
     let mut build_succeeded: HashSet<String> = HashSet::new();
+    let mut up_to_date: HashSet<String> = HashSet::new();
     let mut failed: Vec<(String, String)> = Vec::new();
 
     if !request.bazel_items.is_empty() {
@@ -544,16 +546,19 @@ async fn run_rebuild_batch_worker(
         };
 
         let resolver = crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
-        let up_to_date = resolver
+        let all_up_to_date = resolver
             .check_up_to_date(&targets, &base_dir)
             .await
             .unwrap_or_default();
-        if up_to_date {
+        if all_up_to_date {
             let count = targets.len();
             emitter.bazel_event(&format!(
                 "{count} target{} up to date, skipping rebuild",
                 if count == 1 { "" } else { "s" }
             ));
+            for (name, _) in &request.bazel_items {
+                up_to_date.insert(name.clone());
+            }
         } else {
             let count = targets.len();
             emitter.bazel_event(&format!(
@@ -653,6 +658,7 @@ async fn run_rebuild_batch_worker(
 
     RebuildBatchOutcome {
         build_succeeded: build_succeeded.into_iter().collect(),
+        up_to_date: up_to_date.into_iter().collect(),
         failed,
         plain_rebuilds: request.plain_rebuilds,
     }
@@ -3359,6 +3365,14 @@ impl Runner {
     async fn handle_rebuild_batch_complete(&mut self, outcome: RebuildBatchOutcome) {
         for (name, message) in &outcome.failed {
             self.fail_rebuild(name, message);
+        }
+        for name in &outcome.up_to_date {
+            self.output_manager
+                .service_event(name, "skipped (no changes)");
+            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                name: name.clone(),
+                success: true,
+            });
         }
         for name in &outcome.build_succeeded {
             self.do_rebuild(name).await;
@@ -6642,6 +6656,86 @@ mod tests {
         let _ = cancel_tx.send(());
         let result = tokio::time::timeout(std::time::Duration::from_millis(200), monitor).await;
         assert!(result.is_ok(), "monitor should exit promptly after cancel");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn up_to_date_batch_rebuild_still_emits_rebuild_complete() {
+        use crate::config::service::{Service, ServiceKind};
+        use crate::config::types::{BazelConfig, LogConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            services: [(
+                "api".to_string(),
+                Service {
+                    dir: None,
+                    env: HashMap::new(),
+                    env_file: Vec::new(),
+                    watch: Vec::new(),
+                    ignore: Vec::new(),
+                    debounce: None,
+                    depends_on: Vec::new(),
+                    proxy: Vec::new(),
+                    lazy: false,
+                    download: None,
+                    ready: None,
+                    shutdown: None,
+                    log: LogConfig::Stdout,
+                    reload: true,
+                    on_failure: crate::config::OnFailure::Notify,
+                    platform: HashMap::new(),
+                    hidden: false,
+                    kind: Some(ServiceKind::Bazel(BazelConfig {
+                        target: "//api:api".to_string(),
+                    })),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            tasks: HashMap::new(),
+            profiles: HashMap::new(),
+            default_profile: None,
+        };
+        let output_manager = crate::output::OutputManager::new_verbose(
+            &[("api", &LogConfig::Stdout)],
+            tokio::io::sink(),
+            false,
+        )
+        .await
+        .unwrap();
+        let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let mut runner = Runner::new(
+            config,
+            Platform::LinuxX86_64,
+            output_manager,
+            temp.path().to_path_buf(),
+            None,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        let mut events = runner.subscribe();
+
+        runner
+            .handle_rebuild_batch_complete(RebuildBatchOutcome {
+                build_succeeded: Vec::new(),
+                up_to_date: vec!["api".to_string()],
+                failed: Vec::new(),
+                plain_rebuilds: Vec::new(),
+            })
+            .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
+            .await
+            .expect("timeout waiting for RebuildComplete")
+            .expect("runner event channel closed unexpectedly");
+        match event {
+            RunnerEvent::RebuildComplete {
+                name,
+                success: true,
+            } if name == "api" => {}
+            other => panic!("unexpected runner event: {other:?}"),
+        }
     }
 
     #[test]

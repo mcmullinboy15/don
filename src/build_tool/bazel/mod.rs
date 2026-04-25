@@ -321,6 +321,11 @@ impl BazelResolver {
     /// are up to date and non-zero if any need rebuilding. This avoids
     /// unnecessary service restarts when a watched file changed but the
     /// build output would be identical.
+    ///
+    /// Bazel reports "needs rebuilding" as a non-zero exit and may print
+    /// `ERROR:` lines on stderr even though this is an expected control-flow
+    /// outcome, not an actual failure. Suppress live stderr emission for this
+    /// probe so the logs stay quiet unless a real rebuild runs.
     pub(crate) async fn check_up_to_date(
         &self,
         targets: &[String],
@@ -347,7 +352,7 @@ impl BazelResolver {
             source: e,
         })?;
 
-        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone());
+        let stderr_handle = spawn_stderr_stream(child.stderr.take(), None);
 
         let status = child.wait().await.map_err(|e| BuildToolError::Io {
             tool: "bazel".to_string(),
