@@ -5,6 +5,7 @@
 //! commands. Cache hits skip the network entirely.
 
 use futures_util::StreamExt;
+use hex::encode;
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::Path;
@@ -426,7 +427,7 @@ async fn download_and_verify(
     file.flush()?;
     drop(file);
 
-    let actual = format!("{:x}", hasher.finalize());
+    let actual = encode(hasher.finalize());
     if actual != expected_sha256.to_lowercase() {
         return Err(DownloadError::Sha256Mismatch {
             url: url.to_string(),
@@ -519,7 +520,7 @@ fn verify_sha256_sync(path: &Path, expected: &str, url: &str) -> Result<(), Down
 pub fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    encode(hasher.finalize())
 }
 
 /// Extract a .tar.gz archive into the cache directory.

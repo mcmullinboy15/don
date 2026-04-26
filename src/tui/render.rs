@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 
+use crossterm::style::Color as CrosstermColor;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -503,8 +504,32 @@ fn log_name_colors(app: &App) -> HashMap<String, Color> {
         .collect();
     crate::output::assign_colors(&names)
         .into_iter()
-        .map(|(name, color)| (name, color.into()))
+        .map(|(name, color)| (name, crossterm_color_to_ratatui(color)))
         .collect()
+}
+
+fn crossterm_color_to_ratatui(color: CrosstermColor) -> Color {
+    match color {
+        CrosstermColor::Reset => Color::Reset,
+        CrosstermColor::Black => Color::Black,
+        CrosstermColor::DarkGrey => Color::DarkGray,
+        CrosstermColor::Red => Color::LightRed,
+        CrosstermColor::DarkRed => Color::Red,
+        CrosstermColor::Green => Color::LightGreen,
+        CrosstermColor::DarkGreen => Color::Green,
+        CrosstermColor::Yellow => Color::LightYellow,
+        CrosstermColor::DarkYellow => Color::Yellow,
+        CrosstermColor::Blue => Color::LightBlue,
+        CrosstermColor::DarkBlue => Color::Blue,
+        CrosstermColor::Magenta => Color::LightMagenta,
+        CrosstermColor::DarkMagenta => Color::Magenta,
+        CrosstermColor::Cyan => Color::LightCyan,
+        CrosstermColor::DarkCyan => Color::Cyan,
+        CrosstermColor::White => Color::White,
+        CrosstermColor::Grey => Color::Gray,
+        CrosstermColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
+        CrosstermColor::AnsiValue(value) => Color::Indexed(value),
+    }
 }
 
 fn shutdown_bar_line(counts: &StatusCounts, spinner_frame: usize) -> Line<'static> {

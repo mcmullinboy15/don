@@ -10,6 +10,7 @@
 //! [`crate::process::listen_pid_shim`] (setenv from `pre_exec` doesn't
 //! survive `execve` with an explicit envp).
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 
 /// The first fd number for passed sockets (per systemd convention).
@@ -37,15 +38,21 @@ pub(crate) fn place_fds_for_exec(source_fds: &[RawFd]) -> std::io::Result<()> {
     // (A source fd might be 3 or 4, which we need as target positions.)
     let mut temp_fds = Vec::with_capacity(source_fds.len());
     for &src in source_fds {
-        let temp = nix::unistd::dup(src).map_err(std::io::Error::other)?;
+        let temp = unsafe { libc::dup(src) };
+        if temp < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let temp = unsafe { OwnedFd::from_raw_fd(temp) };
         temp_fds.push(temp);
     }
 
     // Pass 2: dup2 temp fds to target positions (3, 4, 5...) and clear CLOEXEC.
-    for (i, &temp) in temp_fds.iter().enumerate() {
+    for (i, temp) in temp_fds.iter().enumerate() {
         let target = SD_LISTEN_FDS_START + i as i32;
-        nix::unistd::dup2(temp, target).map_err(std::io::Error::other)?;
-        let _ = nix::unistd::close(temp);
+        let result = unsafe { libc::dup2(temp.as_raw_fd(), target) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         clear_cloexec(target)?;
     }
 
@@ -54,11 +61,15 @@ pub(crate) fn place_fds_for_exec(source_fds: &[RawFd]) -> std::io::Result<()> {
 
 /// Clear the FD_CLOEXEC flag on a file descriptor.
 fn clear_cloexec(fd: RawFd) -> std::io::Result<()> {
-    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-    let flags = fcntl(fd, FcntlArg::F_GETFD).map_err(std::io::Error::other)?;
-    let mut fd_flags = FdFlag::from_bits_truncate(flags);
-    fd_flags.remove(FdFlag::FD_CLOEXEC);
-    fcntl(fd, FcntlArg::F_SETFD(fd_flags)).map_err(std::io::Error::other)?;
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 

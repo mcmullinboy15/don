@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// output elsewhere in the codebase; keeping stderr writes behind this
 /// single helper makes intentional error output easy to grep for.
 fn errln(msg: impl std::fmt::Display) {
-    let _ = writeln!(std::io::stderr(), "{msg}");
+    let _ = write!(std::io::stderr(), "{msg}\r\n");
 }
 
 #[derive(Parser, Debug)]

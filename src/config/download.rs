@@ -1,3 +1,4 @@
+use hex::encode;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -74,7 +75,7 @@ impl PlatformDownload {
         hasher.update(self.url.as_bytes());
         hasher.update(b"\n");
         hasher.update(self.sha256.as_bytes());
-        format!("{:x}", hasher.finalize())
+        encode(hasher.finalize())
     }
 
     /// The directory where this artifact is cached:

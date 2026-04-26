@@ -749,12 +749,11 @@ fn handle_overlay_key(
                 app.overlay_highlight = 0;
                 redraw_modal(modal, app)?;
             }
-            KeyCode::Backspace => {
-                if app.overlay_query.pop().is_some() {
-                    app.overlay_highlight = 0;
-                    redraw_modal(modal, app)?;
-                }
+            KeyCode::Backspace if app.overlay_query.pop().is_some() => {
+                app.overlay_highlight = 0;
+                redraw_modal(modal, app)?;
             }
+            KeyCode::Backspace => {}
             KeyCode::Char(c) => {
                 app.overlay_query.push(c);
                 app.overlay_highlight = 0;

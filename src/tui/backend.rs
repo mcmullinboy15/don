@@ -70,6 +70,8 @@ impl<W: Write> FixedBottomBackend<W> {
 }
 
 impl<W: Write> Backend for FixedBottomBackend<W> {
+    type Error = io::Error;
+
     fn get_cursor_position(&mut self) -> io::Result<Position> {
         // One-shot override takes precedence. Used by `clear_and_replay`
         // to place the viewport at the top before replaying matching

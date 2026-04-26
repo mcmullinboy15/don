@@ -67,11 +67,8 @@ fn create_tar_gz(path: &std::path::Path, files: &[(&str, &[u8])]) {
 
 /// Compute the SHA-256 hash of a file.
 fn sha256_of_file(path: &std::path::Path) -> String {
-    use sha2::{Digest, Sha256};
     let data = std::fs::read(path).unwrap();
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    format!("{:x}", hasher.finalize())
+    don::download::compute_sha256(&data)
 }
 
 // --- Integration tests ---

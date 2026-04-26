@@ -60,6 +60,19 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Install latest stable Rust
+        shell: bash
+        run: |
+          if ! command -v rustup > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+          rustc --version
+          cargo --version
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -120,13 +133,19 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
+      - name: Install latest stable Rust
+        shell: bash
         run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          if ! command -v rustup > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
+
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+          rustc --version
+          cargo --version
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -179,6 +198,19 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Install latest stable Rust
+        shell: bash
+        run: |
+          if ! command -v rustup > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+          rustc --version
+          cargo --version
       - name: Install cached dist
         uses: actions/download-artifact@v7
         with:

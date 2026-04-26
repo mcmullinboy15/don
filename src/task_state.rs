@@ -4,6 +4,7 @@
 //! State is stored in `.don/task-state/<task-name>.sha256`.
 //! A hash is only written after a task exits successfully (exit code 0).
 
+use hex::encode;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -168,7 +169,7 @@ impl TaskState {
             hasher.update(b"\0");
         }
 
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(encode(hasher.finalize()))
     }
 
     fn hash_file_path(&self, task_name: &str) -> PathBuf {

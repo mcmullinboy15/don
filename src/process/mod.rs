@@ -450,7 +450,9 @@ fn spawn_pipe(config: &SpawnConfig<'_>) -> Result<tokio::process::Child, Process
 
             nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
                 .map_err(std::io::Error::other)?;
-            nix::unistd::dup2(1, 2).map_err(std::io::Error::other)?;
+            if libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
