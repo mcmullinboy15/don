@@ -108,9 +108,10 @@ impl BazelResolver {
                 source: e,
             })?;
 
-        // Stream stderr live so the lock-wait notice surfaces immediately;
-        // the helper also accumulates the full text for error reporting.
-        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone());
+        // Keep query progress quiet. The only live signal worth surfacing
+        // here is Bazel waiting behind another command; failures still
+        // come back with captured stderr in the returned error.
+        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone(), true);
 
         // `wait_with_output` reads whatever pipes are still attached; we
         // already took stderr, so it just collects stdout and exit status.
@@ -352,7 +353,7 @@ impl BazelResolver {
             source: e,
         })?;
 
-        let stderr_handle = spawn_stderr_stream(child.stderr.take(), None);
+        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone(), true);
 
         let status = child.wait().await.map_err(|e| BuildToolError::Io {
             tool: "bazel".to_string(),
@@ -469,7 +470,9 @@ impl BazelResolver {
                 source: e,
             })?;
 
-        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone());
+        // `cquery` is a metadata lookup, not user-interesting build output.
+        // Surface only lock-wait notices live; keep the rest for errors.
+        let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone(), true);
 
         let output = child
             .wait_with_output()
@@ -540,6 +543,7 @@ impl BazelResolver {
 fn spawn_stderr_stream(
     stderr: Option<tokio::process::ChildStderr>,
     emitter: Option<crate::output::LifecycleEmitter>,
+    lock_wait_only: bool,
 ) -> AbortOnDrop<String> {
     AbortOnDrop::new(tokio::spawn(async move {
         let mut collected = String::new();
@@ -562,7 +566,10 @@ fn spawn_stderr_stream(
                         if text.last() == Some(&b'\r') {
                             text = &text[..text.len() - 1];
                         }
-                        em.bazel_event(&String::from_utf8_lossy(text));
+                        let text = String::from_utf8_lossy(text);
+                        if should_emit_stderr_line(lock_wait_only, &text) {
+                            em.bazel_event(&text);
+                        }
                     }
                 }
                 Err(_) => break,
@@ -570,6 +577,16 @@ fn spawn_stderr_stream(
         }
         collected
     }))
+}
+
+fn should_emit_stderr_line(lock_wait_only: bool, line: &str) -> bool {
+    !lock_wait_only || is_lock_wait_notice(line)
+}
+
+fn is_lock_wait_notice(line: &str) -> bool {
+    line.contains("Another command")
+        && (line.contains("Waiting for it to complete on the server")
+            || line.contains("Waiting for it to complete"))
 }
 
 impl BuildGraphResolver for BazelResolver {
@@ -681,6 +698,52 @@ mod tests {
             let result = BazelResolver::parse_packages(case.input);
             let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(result, expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_should_emit_stderr_line() {
+        struct Case {
+            name: &'static str,
+            lock_wait_only: bool,
+            line: &'static str,
+            expected: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "full mode emits progress",
+                lock_wait_only: false,
+                line: "INFO: Invocation ID: 123",
+                expected: true,
+            },
+            Case {
+                name: "lock-wait mode suppresses invocation id",
+                lock_wait_only: true,
+                line: "INFO: Invocation ID: 123",
+                expected: false,
+            },
+            Case {
+                name: "lock-wait mode keeps server wait notice",
+                lock_wait_only: true,
+                line: "Another command (pid=1) is running. Waiting for it to complete on the server (server_pid=2)...",
+                expected: true,
+            },
+            Case {
+                name: "lock-wait mode suppresses unrelated info",
+                lock_wait_only: true,
+                line: "Loading: 2328 packages loaded",
+                expected: false,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                should_emit_stderr_line(case.lock_wait_only, case.line),
+                case.expected,
+                "{}",
+                case.name
+            );
         }
     }
 }

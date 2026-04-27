@@ -5973,6 +5973,11 @@ async fn run_batch_build_chain(
             .iter()
             .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
             .collect();
+        emitter.bazel_event(&format!(
+            "querying bazel watch paths for {} target{}...",
+            targets.len(),
+            if targets.len() == 1 { "" } else { "s" },
+        ));
         // Unified query runs at the workspace root — all bazel items share a
         // single workspace in practice, so the first item's working_dir is
         // the workspace root.
@@ -6296,6 +6301,11 @@ async fn run_batch_build_chain(
             .iter()
             .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
             .collect();
+        emitter.bazel_event(&format!(
+            "resolving bazel binary paths for {} target{}...",
+            targets.len(),
+            if targets.len() == 1 { "" } else { "s" },
+        ));
         // All bazel items share a workspace in practice — same rationale as
         // the watch-resolution step above.
         let working_dir = bazel_services_to_resolve[0].working_dir.clone();
@@ -6310,8 +6320,10 @@ async fn run_batch_build_chain(
                         Some(rel_path) => {
                             let abs_path = item.working_dir.join(rel_path);
                             let path_str = abs_path.to_string_lossy().to_string();
-                            emitter
-                                .service_event(&item.name, &format!("resolved binary {rel_path}"));
+                            emitter.service_debug_event(
+                                &item.name,
+                                &format!("resolved binary {rel_path}"),
+                            );
                             outcome.binary_paths.insert(item.name.clone(), path_str);
                         }
                         None => {
