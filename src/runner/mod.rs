@@ -973,6 +973,10 @@ pub enum RunnerCommand {
     /// Rebuild a service triggered by a file watch event.
     /// Runs the build command (if any), then restarts the service.
     Rebuild { name: String },
+    /// A watched file changed during the current rebuild cycle for a service.
+    /// The active build should finish, but any pending restart should be
+    /// skipped because the build output is already stale.
+    RebuildStale { name: String },
     /// Re-run a task triggered by a file watch event.
     TaskRerun { name: String },
     /// Query the status of all services and tasks.
@@ -2226,6 +2230,9 @@ impl Runner {
                             RunnerCommand::Rebuild { name } => {
                                 self.handle_rebuild(&name, &mut shutdown_rx).await;
                             }
+                            RunnerCommand::RebuildStale { name } => {
+                                self.mark_rebuild_stale(&name);
+                            }
                             RunnerCommand::TaskRerun { name } => {
                                 self.handle_task_rerun(&name).await;
                             }
@@ -3362,6 +3369,26 @@ impl Runner {
         });
     }
 
+    fn mark_rebuild_stale(&mut self, name: &str) {
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.rebuild_stale = true;
+        }
+    }
+
+    fn clear_rebuild_stale(&mut self, name: &str) {
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.rebuild_stale = false;
+        }
+    }
+
+    fn take_rebuild_stale(&mut self, name: &str) -> bool {
+        self.services.get_mut(name).is_some_and(|rs| {
+            let stale = rs.rebuild_stale;
+            rs.rebuild_stale = false;
+            stale
+        })
+    }
+
     async fn handle_rebuild_batch_complete(&mut self, outcome: RebuildBatchOutcome) {
         for (name, message) in &outcome.failed {
             self.fail_rebuild(name, message);
@@ -3375,9 +3402,23 @@ impl Runner {
             });
         }
         for name in &outcome.build_succeeded {
+            if self.take_rebuild_stale(name) {
+                let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                    name: name.clone(),
+                    success: true,
+                });
+                continue;
+            }
             self.do_rebuild(name).await;
         }
         for name in &outcome.plain_rebuilds {
+            if self.take_rebuild_stale(name) {
+                let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                    name: name.clone(),
+                    success: true,
+                });
+                continue;
+            }
             self.do_rebuild(name).await;
         }
         if !self.pending_bt_rebuilds.is_empty() {
@@ -3738,6 +3779,7 @@ impl Runner {
     /// backend once the ready check passes. The proxy never drops — clients
     /// see a brief pause, not a connection refused.
     async fn handle_rebuild(&mut self, name: &str, _shutdown_rx: &mut mpsc::Receiver<()>) {
+        self.clear_rebuild_stale(name);
         let rs = match self.services.get(name) {
             Some(rs) => rs,
             None => {
@@ -4092,7 +4134,16 @@ impl Runner {
         }
 
         match result {
-            Ok(()) => self.continue_rebuild_restart(name).await,
+            Ok(()) => {
+                if self.take_rebuild_stale(name) {
+                    let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                        name: name.to_string(),
+                        success: true,
+                    });
+                } else {
+                    self.continue_rebuild_restart(name).await;
+                }
+            }
             Err(message) if message == "shutdown requested" => {
                 self.initiate_shutdown().await;
             }
@@ -4277,7 +4328,15 @@ impl Runner {
                         self.queue_background_service_start(name, ServiceStartMode::Full)
                     }
                     ServiceStopAction::RestartSpawnOnly => {
-                        self.queue_rebuild_service_start(name).await
+                        if self.take_rebuild_stale(name) {
+                            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                                name: name.to_string(),
+                                success: true,
+                            });
+                            Ok(())
+                        } else {
+                            self.queue_rebuild_service_start(name).await
+                        }
                     }
                 };
                 if let Some(reply) = reply {

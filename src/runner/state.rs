@@ -76,6 +76,9 @@ pub(crate) struct RuntimeService {
     /// Monotonic generation for rebuild workers so stale completions can
     /// be ignored.
     pub rebuild_generation: u64,
+    /// A watched file changed during the current rebuild cycle, so any
+    /// pending restart for that cycle should be skipped.
+    pub rebuild_stale: bool,
 }
 
 impl RuntimeService {
@@ -105,6 +108,7 @@ impl RuntimeService {
             start_generation: 0,
             rebuild_worker: None,
             rebuild_generation: 0,
+            rebuild_stale: false,
         }
     }
 

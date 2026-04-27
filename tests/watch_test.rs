@@ -208,6 +208,91 @@ fn integration_build_then_restart_on_file_change() {
     });
 }
 
+// --- Integration test: edit during build skips intermediate restart ---
+
+#[test]
+fn integration_edit_during_build_skips_intermediate_restart() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("watch-build-stale");
+
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("app.rs"), "v1").unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "bash", &["-c", "echo PID=$$ && sleep 60"])
+            .build_cmd(
+                "bash",
+                &[
+                    "-c",
+                    "if [ -f slow-build ]; then sleep 1; rm -f slow-build; fi",
+                ],
+            )
+            .watch(&["src/**/*.rs"])
+            .debounce("100ms")
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+            "timed out waiting for services to start. output: {}",
+            read_buf(&buf)
+        );
+
+        std::fs::write(dir.path().join("slow-build"), "1").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(src_dir.join("app.rs"), "v2").unwrap();
+
+        assert!(
+            wait_for_output(&buf, "rebuilding (file changed)", Duration::from_secs(5)).await,
+            "timed out waiting for first rebuild. output: {}",
+            read_buf(&buf)
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(src_dir.join("app.rs"), "v3").unwrap();
+
+        let start = tokio::time::Instant::now();
+        loop {
+            let output = read_buf(&buf);
+            let rebuilds = output.matches("rebuilding (file changed)").count();
+            let restarts = output.matches("restarting...").count();
+            let build_successes = output.matches("bash build succeeded").count();
+            if rebuilds >= 2 && build_successes >= 3 {
+                assert_eq!(
+                    restarts, 1,
+                    "expected only one restart after two rebuild cycles. output: {output}"
+                );
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out waiting for stale rebuild flow. output: {output}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let output = read_buf(&buf);
+        assert_eq!(
+            output.matches("restarting...").count(),
+            1,
+            "unexpected extra restart after stale rebuild. output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- Integration test: build failure keeps old process ---
 
 #[test]

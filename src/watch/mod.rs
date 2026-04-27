@@ -525,7 +525,7 @@ impl WatchManager {
             tokio::select! {
                 Some(event_result) = self.event_rx.recv() => {
                     match event_result {
-                        Ok(event) => self.handle_notify_event(&event),
+                        Ok(event) => self.handle_notify_event(&event).await,
                         Err(err) => self.record_notify_error(&err.to_string()),
                     }
                 }
@@ -695,7 +695,7 @@ impl WatchManager {
     }
 
     /// Route a notify event to the affected items and update their state machines.
-    fn handle_notify_event(&mut self, event: &notify::Event) {
+    async fn handle_notify_event(&mut self, event: &notify::Event) {
         // Only care about create, modify, and remove events. Renames
         // (vim, sed -i) are reported as Modify(Name(_)) by notify.
         if !matches!(
@@ -781,6 +781,7 @@ impl WatchManager {
         }
 
         let now = Instant::now();
+        let mut stale_services: Vec<String> = Vec::new();
         for name in affected {
             if let Some(item) = self.items.get_mut(&name) {
                 match item.state {
@@ -812,6 +813,9 @@ impl WatchManager {
                     // trigger a new rebuild when the current one completes.
                     WatchState::Rebuilding => {
                         item.stale = true;
+                        if item.kind == WatchItemKind::Service && !stale_services.contains(&name) {
+                            stale_services.push(name.clone());
+                        }
                         self.emitter.service_debug_event(
                             &name,
                             "watch: Rebuilding — marked stale (will re-run after completion)",
@@ -819,6 +823,10 @@ impl WatchManager {
                     }
                 }
             }
+        }
+
+        for name in stale_services {
+            let _ = self.cmd_tx.send(RunnerCommand::RebuildStale { name }).await;
         }
     }
 
@@ -1350,7 +1358,7 @@ mod tests {
         let mut mgr_items = items;
         for _ in 0..10 {
             let event = make_event();
-            handle_notify_event_standalone(&mut mgr_items, &event);
+            handle_notify_event_standalone(&mut mgr_items, &event, &cmd_tx).await;
             tokio::time::advance(Duration::from_millis(10)).await;
         }
 
@@ -1408,7 +1416,7 @@ mod tests {
         };
 
         // First event: start debouncing.
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         tokio::time::advance(Duration::from_millis(200)).await;
         fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
         let _ = cmd_rx.try_recv().unwrap(); // consume first Rebuild
@@ -1422,7 +1430,7 @@ mod tests {
         assert_eq!(items["api"].state, WatchState::Idle);
 
         // Second event: should start a new cycle.
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         assert_eq!(items["api"].state, WatchState::Debouncing);
 
         tokio::time::advance(Duration::from_millis(200)).await;
@@ -1460,7 +1468,7 @@ mod tests {
             attrs: Default::default(),
         };
 
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
 
         // At 200ms: should NOT have fired yet (debounce is 500ms).
         tokio::time::advance(Duration::from_millis(200)).await;
@@ -1504,9 +1512,11 @@ mod tests {
             paths: vec![PathBuf::from("src/main.rs")],
             attrs: Default::default(),
         };
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         assert!(items["api"].stale);
         assert_eq!(items["api"].state, WatchState::Rebuilding);
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api"));
 
         // Build completes — should trigger another Rebuild because stale.
         let complete = RunnerEvent::RebuildComplete {
@@ -1551,9 +1561,16 @@ mod tests {
 
         // 5 events during build.
         for _ in 0..5 {
-            handle_notify_event_standalone(&mut items, &event);
+            handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         }
         assert!(items["api"].stale);
+        let mut stale_count = 0;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api") {
+                stale_count += 1;
+            }
+        }
+        assert_eq!(stale_count, 5);
 
         // Build completes — only one follow-up rebuild.
         let complete = RunnerEvent::RebuildComplete {
@@ -1597,7 +1614,7 @@ mod tests {
 
         // Idle -> Debouncing
         assert_eq!(items["api"].state, WatchState::Idle);
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         assert_eq!(items["api"].state, WatchState::Debouncing);
 
         // Debouncing -> Rebuilding
@@ -1607,9 +1624,11 @@ mod tests {
         let _ = cmd_rx.try_recv().unwrap();
 
         // Events during rebuild set stale.
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         assert!(items["api"].stale);
         assert_eq!(items["api"].state, WatchState::Rebuilding);
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api"));
 
         // Rebuild completes with stale -> immediately Rebuilding again.
         let complete = RunnerEvent::RebuildComplete {
@@ -1629,9 +1648,10 @@ mod tests {
 
     // --- Test helpers: standalone versions of WatchManager methods ---
 
-    fn handle_notify_event_standalone(
+    async fn handle_notify_event_standalone(
         items: &mut HashMap<String, WatchedItem>,
         event: &notify::Event,
+        cmd_tx: &mpsc::Sender<RunnerCommand>,
     ) {
         if !matches!(
             event.kind,
@@ -1654,6 +1674,7 @@ mod tests {
         }
 
         let now = Instant::now();
+        let mut stale_services: Vec<String> = Vec::new();
         for name in affected {
             if let Some(item) = items.get_mut(&name) {
                 match item.state {
@@ -1666,9 +1687,16 @@ mod tests {
                     }
                     WatchState::Rebuilding => {
                         item.stale = true;
+                        if item.kind == WatchItemKind::Service && !stale_services.contains(&name) {
+                            stale_services.push(name.clone());
+                        }
                     }
                 }
             }
+        }
+
+        for name in stale_services {
+            let _ = cmd_tx.send(RunnerCommand::RebuildStale { name }).await;
         }
     }
 
@@ -1777,7 +1805,7 @@ mod tests {
         };
 
         // Trigger the event.
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         assert_eq!(items["api__graph"].state, WatchState::Debouncing);
 
         // Wait for debounce.
@@ -1826,7 +1854,7 @@ mod tests {
             attrs: Default::default(),
         };
 
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         tokio::time::advance(Duration::from_millis(200)).await;
         fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
 
@@ -1865,7 +1893,7 @@ mod tests {
             attrs: Default::default(),
         };
 
-        handle_notify_event_standalone(&mut items, &event);
+        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
         tokio::time::advance(Duration::from_millis(200)).await;
         fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
 
