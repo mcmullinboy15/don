@@ -7,12 +7,14 @@ use std::path::{Path, PathBuf};
 /// `depends_on` and other fields before finalizing with `.done()`.
 pub struct ConfigBuilder {
     toml: String,
+    has_service_groups_table: bool,
 }
 
 impl ConfigBuilder {
     pub fn new() -> Self {
         Self {
             toml: String::new(),
+            has_service_groups_table: false,
         }
     }
 
@@ -82,6 +84,26 @@ impl ConfigBuilder {
             let task_str: Vec<String> = tasks.iter().map(|t| format!("\"{t}\"")).collect();
             writeln!(self.toml, "tasks = [{}]", task_str.join(", ")).unwrap();
         }
+        writeln!(self.toml).unwrap();
+        self
+    }
+
+    /// Add a named service group.
+    pub fn add_service_group(mut self, name: &str, services: &[&str]) -> Self {
+        let svc_str: Vec<String> = services.iter().map(|s| format!("\"{s}\"")).collect();
+        if !self.has_service_groups_table {
+            writeln!(self.toml, "[service_groups]").unwrap();
+            self.has_service_groups_table = true;
+        }
+        writeln!(self.toml, "{name} = [{}]", svc_str.join(", ")).unwrap();
+        writeln!(self.toml).unwrap();
+        self
+    }
+
+    /// Set global watch ignore patterns.
+    pub fn watch_ignore(mut self, patterns: &[&str]) -> Self {
+        let p_str: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+        writeln!(self.toml, "watch_ignore = [{}]", p_str.join(", ")).unwrap();
         writeln!(self.toml).unwrap();
         self
     }

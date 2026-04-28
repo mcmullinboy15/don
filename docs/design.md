@@ -39,7 +39,14 @@ This is not an implementation detail. "Can the user still exit right here?" is p
 
 ## Config File (`don.toml`)
 
-The config has two top-level sections: `[services]` and `[tasks]`.
+The config has `[services]`, `[tasks]`, `[service_groups]`, and `[profiles]`
+sections, plus a few optional top-level keys such as `default_profile` and
+`watch_ignore`.
+
+```toml
+# Ignore generated and state files across every watcher in the workspace.
+watch_ignore = ["target/**", ".don/**", "src/generated/**"]
+```
 
 ### Services
 
@@ -312,6 +319,20 @@ Services and tasks share a single dependency namespace. The `depends_on` field a
 - A task depending on a **task**: waits for the dependency to complete successfully
 
 Names must be unique across services and tasks (validated).
+
+You can also define named groups of services and reference those group names
+from `depends_on`:
+
+```toml
+[service_groups]
+datastores = ["postgres", "redis"]
+
+[services.api]
+rust.binary = "api-server"
+depends_on = ["datastores"]
+```
+
+Depending on a service group is equivalent to depending on each member service.
 
 ## Project-Local State
 
@@ -601,12 +622,15 @@ Profiles let you run a subset of your services. By default (no profile), don sta
 ```toml
 default_profile = "frontend"
 
+[service_groups]
+datastores = ["postgres", "redis"]
+
 [profiles.frontend]
 services = ["api", "postgres"]
 tasks = ["migrate"]
 
 [profiles.backend]
-services = ["api", "worker", "postgres", "redis"]
+services = ["api", "worker", "datastores"]
 tasks = ["migrate", "seed"]
 ```
 
@@ -615,7 +639,10 @@ don start                        # use default_profile (or everything if unset)
 don start --profile frontend     # start only frontend profile
 ```
 
-Services and tasks listed in a profile automatically include their transitive dependencies. If `api` depends on `migrate` which depends on `postgres`, listing just `api` is enough — don resolves the full chain.
+Profiles may list individual service names or service group names in
+`services`. Services and tasks listed in a profile automatically include their
+transitive dependencies. If `api` depends on `migrate` which depends on
+`postgres`, listing just `api` is enough — don resolves the full chain.
 
 Set `default_profile = "<name>"` at the top level to pick a profile automatically when `don start` is run without `--profile`. Leave it unset to have `don start` run everything.
 

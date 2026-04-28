@@ -106,6 +106,24 @@ fn resolve_profile_transitive_deps() {
             profile_name: "dev",
             expected: vec!["api", "db", "seed"],
         },
+        Case {
+            name: "profile expands service groups and dependency groups",
+            toml: r#"
+                [services.postgres]
+                run.cmd = "pg"
+                [services.redis]
+                run.cmd = "redis"
+                [services.api]
+                run.cmd = "api"
+                depends_on = ["datastores"]
+                [service_groups]
+                datastores = ["postgres", "redis"]
+                [profiles.backend]
+                services = ["api", "datastores"]
+            "#,
+            profile_name: "backend",
+            expected: vec!["api", "postgres", "redis"],
+        },
     ];
 
     for case in cases {
@@ -355,6 +373,51 @@ fn profile_excluded_services_absent_from_status() {
         assert!(
             !names.contains(&"worker".to_string()),
             "worker should NOT be in status: {names:?}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// Profiles can include a service group directly.
+#[test]
+fn profile_service_group_starts_group_members() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("profile-service-group");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("postgres", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_custom_service("redis", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_custom_service("worker", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_service_group("datastores", &["postgres", "redis"])
+            .add_profile("backend", &["datastores"], &[])
+            .build();
+
+        let (shutdown_tx, handle, buf) =
+            spawn_runner_with_profile(&toml, dir.path(), Some("backend")).await;
+        assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("postgres: starting..."),
+            "postgres should start. output: {output}"
+        );
+        assert!(
+            output.contains("redis: starting..."),
+            "redis should start. output: {output}"
+        );
+        assert!(
+            !output.contains("worker: starting..."),
+            "worker should NOT start. output: {output}"
         );
 
         let _ = shutdown_tx.send(()).await;

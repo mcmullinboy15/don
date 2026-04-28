@@ -28,7 +28,7 @@ pub use self::types::{
 pub use self::service::{GoConfig, ServiceOverride};
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Top-level don configuration, typically loaded from `don.toml`.
@@ -37,6 +37,10 @@ pub struct Config {
     /// Long-running services (databases, APIs, workers, etc.).
     #[serde(default)]
     pub services: HashMap<String, Service>,
+    /// Named groups of services that can be referenced from `depends_on`
+    /// and `profiles.*.services`.
+    #[serde(default)]
+    pub service_groups: HashMap<String, Vec<String>>,
     /// One-shot tasks (migrations, codegen, etc.).
     /// Only re-run when watched files change since last successful run.
     #[serde(default)]
@@ -48,6 +52,10 @@ pub struct Config {
     /// If unset, `don start` runs everything.
     #[serde(default)]
     pub default_profile: Option<String>,
+    /// File glob patterns, relative to the workspace root, ignored by all
+    /// file-watch and watch-derived change detection.
+    #[serde(default)]
+    pub watch_ignore: Vec<String>,
 }
 
 impl std::str::FromStr for Config {
@@ -102,12 +110,51 @@ impl Config {
     }
 
     /// All known names (services + tasks) for dependency validation.
-    fn all_names(&self) -> std::collections::HashSet<&str> {
+    fn all_names(&self) -> HashSet<&str> {
         self.services
             .keys()
             .chain(self.tasks.keys())
             .map(|s| s.as_str())
             .collect()
+    }
+
+    fn all_service_names(&self) -> HashSet<&str> {
+        self.services.keys().map(|s| s.as_str()).collect()
+    }
+
+    fn dependency_reference_names(&self) -> HashSet<&str> {
+        let mut names = self.all_names();
+        names.extend(self.service_groups.keys().map(|s| s.as_str()));
+        names
+    }
+
+    fn profile_service_reference_names(&self) -> HashSet<&str> {
+        let mut names = self.all_service_names();
+        names.extend(self.service_groups.keys().map(|s| s.as_str()));
+        names
+    }
+
+    pub(crate) fn expand_dependency_refs(&self, refs: &[String]) -> Vec<String> {
+        let mut expanded = Vec::new();
+        let mut seen = HashSet::new();
+
+        for name in refs {
+            if let Some(group) = self.service_groups.get(name) {
+                for member in group {
+                    if seen.insert(member.clone()) {
+                        expanded.push(member.clone());
+                    }
+                }
+            } else if seen.insert(name.clone()) {
+                expanded.push(name.clone());
+            }
+        }
+
+        expanded
+    }
+
+    pub(crate) fn expand_profile_services(&self, refs: &[String]) -> Vec<String> {
+        self.expand_dependency_refs(refs)
     }
 
     /// Validate the entire config for a given platform.
@@ -117,12 +164,46 @@ impl Config {
     pub fn validate(&self, platform: Platform) -> Result<Vec<String>, ConfigError> {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
-        let all_names = self.all_names();
+        let all_service_names = self.all_service_names();
+        let dependency_reference_names = self.dependency_reference_names();
+        let profile_service_reference_names = self.profile_service_reference_names();
+
+        for pattern in &self.watch_ignore {
+            if let Err(e) = glob::Pattern::new(pattern) {
+                errors.push(format!(
+                    "invalid global watch_ignore pattern '{pattern}': {e}"
+                ));
+            }
+        }
 
         // Check for name collisions between services and tasks
         for name in self.services.keys() {
             if self.tasks.contains_key(name) {
                 errors.push(format!("'{name}' is defined as both a service and a task"));
+            }
+        }
+
+        for name in self.service_groups.keys() {
+            if self.services.contains_key(name) {
+                errors.push(format!(
+                    "service group '{name}' conflicts with service '{name}'"
+                ));
+            }
+            if self.tasks.contains_key(name) {
+                errors.push(format!(
+                    "service group '{name}' conflicts with task '{name}'"
+                ));
+            }
+        }
+
+        for (name, members) in &self.service_groups {
+            for member in members {
+                if !self.services.contains_key(member) {
+                    let suggestion = suggest_typo(member, &all_service_names);
+                    errors.push(format!(
+                        "service group '{name}': references unknown service '{member}'{suggestion}"
+                    ));
+                }
             }
         }
 
@@ -164,10 +245,10 @@ impl Config {
                 ));
             }
             for dep in &resolved.depends_on {
-                if !all_names.contains(dep.as_str()) {
-                    let suggestion = suggest_typo(dep, &all_names);
+                if !dependency_reference_names.contains(dep.as_str()) {
+                    let suggestion = suggest_typo(dep, &dependency_reference_names);
                     errors.push(format!(
-                        "service '{name}': depends on unknown service or task '{dep}'{suggestion}"
+                        "service '{name}': depends on unknown service, task, or service group '{dep}'{suggestion}"
                     ));
                 }
             }
@@ -319,10 +400,10 @@ impl Config {
                 ));
             }
             for dep in &task.depends_on {
-                if !all_names.contains(dep.as_str()) {
-                    let suggestion = suggest_typo(dep, &all_names);
+                if !dependency_reference_names.contains(dep.as_str()) {
+                    let suggestion = suggest_typo(dep, &dependency_reference_names);
                     errors.push(format!(
-                        "task '{name}': depends on unknown service or task '{dep}'{suggestion}"
+                        "task '{name}': depends on unknown service, task, or service group '{dep}'{suggestion}"
                     ));
                 }
             }
@@ -372,9 +453,10 @@ impl Config {
         // Validate profiles
         for (name, profile) in &self.profiles {
             for svc in &profile.services {
-                if !self.services.contains_key(svc) {
+                if !profile_service_reference_names.contains(svc.as_str()) {
+                    let suggestion = suggest_typo(svc, &profile_service_reference_names);
                     errors.push(format!(
-                        "profile '{name}': references unknown service '{svc}'"
+                        "profile '{name}': references unknown service or service group '{svc}'{suggestion}"
                     ));
                 }
             }
@@ -447,10 +529,13 @@ impl Config {
         let mut deps: HashMap<String, Vec<String>> = HashMap::new();
         for (name, svc) in &self.services {
             let resolved = svc.resolve(platform);
-            deps.insert(name.clone(), resolved.depends_on);
+            deps.insert(
+                name.clone(),
+                self.expand_dependency_refs(&resolved.depends_on),
+            );
         }
         for (name, task) in &self.tasks {
-            deps.insert(name.clone(), task.depends_on.clone());
+            deps.insert(name.clone(), self.expand_dependency_refs(&task.depends_on));
         }
 
         #[derive(Clone, Copy, PartialEq)]
@@ -873,6 +958,19 @@ mod tests {
     #[test]
     fn test_config_parsing() {
         let cases = vec![
+            ConfigTestCase {
+                name: "global watch ignore parses",
+                input: r#"
+                    watch_ignore = ["target/**", ".don/**"]
+
+                    [services.api]
+                    run.cmd = "api"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert_eq!(config.watch_ignore, vec!["target/**", ".don/**"]);
+                },
+            },
             ConfigTestCase {
                 name: "docker service with all fields",
                 input: r#"
@@ -1374,7 +1472,9 @@ mod tests {
                     let ConfigError::Validation { errors } = &err else {
                         panic!("expected validation error");
                     };
-                    assert!(errors[0].contains("unknown service or task 'nonexistent'"));
+                    assert!(
+                        errors[0].contains("unknown service, task, or service group 'nonexistent'")
+                    );
                 },
             },
             ConfigTestCase {
@@ -1408,7 +1508,81 @@ mod tests {
                     let ConfigError::Validation { errors } = &err else {
                         panic!("expected validation error");
                     };
-                    assert!(errors[0].contains("unknown service or task 'ghost'"));
+                    assert!(errors[0].contains("unknown service, task, or service group 'ghost'"));
+                },
+            },
+            ConfigTestCase {
+                name: "service groups are valid in dependencies and profiles",
+                input: r#"
+                    [services.postgres]
+                    run.cmd = "postgres"
+
+                    [services.redis]
+                    run.cmd = "redis"
+
+                    [services.api]
+                    run.cmd = "api"
+                    depends_on = ["datastores"]
+
+                    [tasks.seed]
+                    cmd = "seed"
+                    depends_on = ["datastores"]
+
+                    [service_groups]
+                    datastores = ["postgres", "redis"]
+
+                    [profiles.dev]
+                    services = ["api", "datastores"]
+                    tasks = ["seed"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    assert_eq!(
+                        config.service_groups.get("datastores"),
+                        Some(&vec!["postgres".to_string(), "redis".to_string()])
+                    );
+                },
+            },
+            ConfigTestCase {
+                name: "service group with unknown service is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+
+                    [service_groups]
+                    datastores = ["postgres"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| {
+                        e.contains("service group 'datastores'")
+                            && e.contains("unknown service 'postgres'")
+                    }));
+                },
+            },
+            ConfigTestCase {
+                name: "service group name colliding with service is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+
+                    [service_groups]
+                    api = ["api"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| {
+                        e.contains("service group 'api'") && e.contains("conflicts with service")
+                    }));
                 },
             },
             ConfigTestCase {
@@ -1425,6 +1599,29 @@ mod tests {
                     [tasks.c]
                     cmd = "c"
                     depends_on = ["a"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("dependency cycle")));
+                },
+            },
+            ConfigTestCase {
+                name: "dependency cycle through service group is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    depends_on = ["datastores"]
+
+                    [services.postgres]
+                    run.cmd = "postgres"
+                    depends_on = ["api"]
+
+                    [service_groups]
+                    datastores = ["postgres"]
                 "#,
                 expect_err: false,
                 check: |config| {
@@ -1491,7 +1688,7 @@ mod tests {
                     let ConfigError::Validation { errors } = &err else {
                         panic!("expected validation error");
                     };
-                    assert!(errors[0].contains("unknown service 'nonexistent'"));
+                    assert!(errors[0].contains("unknown service or service group 'nonexistent'"));
                 },
             },
             ConfigTestCase {

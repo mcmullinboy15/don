@@ -34,7 +34,7 @@ fn validate_invalid_config_unknown_dep() {
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
     };
-    assert!(errors[0].contains("unknown service or task 'ghost'"));
+    assert!(errors[0].contains("unknown service, task, or service group 'ghost'"));
 }
 
 #[test]
@@ -160,6 +160,33 @@ fn validate_invalid_watch_pattern() {
             .iter()
             .any(|e| e.contains("task 'build'") && e.contains("invalid watch pattern")),
         "expected task watch pattern error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_invalid_global_watch_ignore_pattern() {
+    let dir = TempDir::new("validate-global-watch-ignore-pattern");
+    let config_path = ConfigBuilder::new()
+        .raw(
+            r#"
+            watch_ignore = ["generated/[*.rs"]
+
+            [services.api]
+            run.cmd = "api"
+        "#,
+        )
+        .write_to(dir.path());
+
+    let config = Config::from_file(&config_path).unwrap();
+    let err = config.validate(TEST_PLATFORM).unwrap_err();
+    let ConfigError::Validation { errors } = &err else {
+        panic!("expected validation error");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("invalid global watch_ignore pattern")),
+        "expected global watch_ignore pattern error, got: {errors:?}"
     );
 }
 

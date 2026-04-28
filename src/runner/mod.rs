@@ -117,6 +117,13 @@ enum TaskRunPrepared {
     Spawned(Box<task::TaskSpawn>),
 }
 
+struct TaskWorkerContext {
+    base_dir: PathBuf,
+    platform: Platform,
+    emitter: crate::output::LifecycleEmitter,
+    global_watch_ignore: Vec<String>,
+}
+
 /// The state of a service in the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -705,6 +712,40 @@ async fn send_watch_update(
     }
 }
 
+fn working_dir_for(base_dir: &std::path::Path, dir: Option<&std::path::Path>) -> PathBuf {
+    match dir {
+        Some(dir) => base_dir.join(dir),
+        None => base_dir.to_path_buf(),
+    }
+}
+
+fn resolve_glob_pattern(base_dir: &std::path::Path, pattern: &str) -> String {
+    let path = std::path::Path::new(pattern);
+    if path.is_absolute() {
+        path.to_string_lossy().into_owned()
+    } else {
+        base_dir.join(path).to_string_lossy().into_owned()
+    }
+}
+
+fn resolve_watch_ignore_patterns(
+    item_base_dir: &std::path::Path,
+    item_ignore_patterns: &[String],
+    workspace_base_dir: &std::path::Path,
+    global_watch_ignore: &[String],
+) -> Vec<String> {
+    let mut patterns: Vec<String> = item_ignore_patterns
+        .iter()
+        .map(|pattern| resolve_glob_pattern(item_base_dir, pattern))
+        .collect();
+    patterns.extend(
+        global_watch_ignore
+            .iter()
+            .map(|pattern| resolve_glob_pattern(workspace_base_dir, pattern)),
+    );
+    patterns
+}
+
 fn any_glob_path_changed_since(
     base_dir: &std::path::Path,
     patterns: &[String],
@@ -713,21 +754,19 @@ fn any_glob_path_changed_since(
 ) -> bool {
     let absolute_patterns: Vec<glob::Pattern> = patterns
         .iter()
-        .filter_map(|pattern| {
-            let full_pattern = base_dir.join(pattern);
-            glob::Pattern::new(&full_pattern.to_string_lossy()).ok()
-        })
+        .filter_map(|pattern| glob::Pattern::new(&resolve_glob_pattern(base_dir, pattern)).ok())
         .collect();
     let absolute_ignore: Vec<glob::Pattern> = ignore_patterns
         .iter()
-        .filter_map(|pattern| {
-            let full_pattern = base_dir.join(pattern);
-            glob::Pattern::new(&full_pattern.to_string_lossy()).ok()
-        })
+        .filter_map(|pattern| glob::Pattern::new(&resolve_glob_pattern(base_dir, pattern)).ok())
         .collect();
     let mut roots: Vec<PathBuf> = patterns
         .iter()
-        .map(|pattern| glob_pattern_base_dir(&base_dir.join(pattern)))
+        .map(|pattern| {
+            glob_pattern_base_dir(std::path::Path::new(&resolve_glob_pattern(
+                base_dir, pattern,
+            )))
+        })
         .collect();
     roots.sort();
     roots.dedup();
@@ -883,14 +922,18 @@ async fn run_graph_requery_worker(
 }
 
 async fn run_task_worker(
-    base_dir: PathBuf,
-    platform: Platform,
-    emitter: crate::output::LifecycleEmitter,
+    ctx: TaskWorkerContext,
     name: &str,
     task_cfg: &crate::config::Task,
     params: &HashMap<String, String>,
     mode: TaskRunMode,
 ) -> Result<TaskRunPrepared, String> {
+    let TaskWorkerContext {
+        base_dir,
+        platform,
+        emitter,
+        global_watch_ignore,
+    } = ctx;
     if matches!(mode, TaskRunMode::Startup) {
         if !task_cfg.auto_run {
             return Ok(TaskRunPrepared::PendingRun {
@@ -904,9 +947,15 @@ async fn run_task_worker(
         }
 
         let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
-        let watch_base = task_cfg.dir.as_deref().unwrap_or(&base_dir);
+        let watch_base = working_dir_for(&base_dir, task_cfg.dir.as_deref());
+        let ignore_patterns = resolve_watch_ignore_patterns(
+            &watch_base,
+            &task_cfg.ignore,
+            &base_dir,
+            &global_watch_ignore,
+        );
         let needs_run = task_state
-            .needs_run(name, &task_cfg.watch, Some(watch_base))
+            .needs_run(name, &task_cfg.watch, &ignore_patterns, Some(&watch_base))
             .await
             .unwrap_or(true);
         if !needs_run {
@@ -1588,7 +1637,7 @@ impl Runner {
                 .profiles
                 .get(profile_name)
                 .ok_or_else(|| RunnerError::Config(format!("unknown profile '{profile_name}'")))?;
-            Some(resolve_profile_items(&config, prof))
+            Some(resolve_profile_items_for_platform(&config, prof, platform))
         } else {
             None // all items
         };
@@ -1640,9 +1689,11 @@ impl Runner {
         let mut services = HashMap::new();
         for (name, svc) in &config.services {
             if active_services.contains(name) {
+                let mut resolved = svc.resolve(platform);
+                resolved.depends_on = config.expand_dependency_refs(&resolved.depends_on);
                 services.insert(
                     name.clone(),
-                    RuntimeService::new(svc.resolve(platform), ServiceState::Pending),
+                    RuntimeService::new(resolved, ServiceState::Pending),
                 );
             }
         }
@@ -1650,10 +1701,9 @@ impl Runner {
         let mut tasks = HashMap::new();
         for (name, task) in &config.tasks {
             if active_tasks.contains(name) {
-                tasks.insert(
-                    name.clone(),
-                    RuntimeTask::new(task.clone(), TaskItemState::Pending),
-                );
+                let mut task = task.clone();
+                task.depends_on = config.expand_dependency_refs(&task.depends_on);
+                tasks.insert(name.clone(), RuntimeTask::new(task, TaskItemState::Pending));
             }
         }
 
@@ -2632,17 +2682,20 @@ impl Runner {
         if rt.config.bazel.is_none() && rt.config.turbo.is_none() {
             return None;
         }
-        let working_dir = match rt.config.dir.as_deref() {
-            Some(d) => self.base_dir.join(d),
-            None => self.base_dir.clone(),
-        };
+        let working_dir = working_dir_for(&self.base_dir, rt.config.dir.as_deref());
+        let ignore = resolve_watch_ignore_patterns(
+            &working_dir,
+            &rt.config.ignore,
+            &self.base_dir,
+            &self.config.watch_ignore,
+        );
         Some(BatchBuildItem {
             name: name.to_string(),
             kind: NodeKind::Task,
             bazel: rt.config.bazel.clone(),
             turbo: rt.config.turbo.clone(),
             working_dir,
-            ignore: rt.config.ignore.clone(),
+            ignore,
         })
     }
 
@@ -2655,8 +2708,21 @@ impl Runner {
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
         let watch_update_tx = self.watch_update_tx.clone();
+        let global_watch_ignore = resolve_watch_ignore_patterns(
+            &self.base_dir,
+            &[],
+            &self.base_dir,
+            &self.config.watch_ignore,
+        );
         let handle = tokio::spawn(async move {
-            let outcome = run_batch_build_chain(items, base_dir, emitter, watch_update_tx).await;
+            let outcome = run_batch_build_chain(
+                items,
+                base_dir,
+                emitter,
+                watch_update_tx,
+                global_watch_ignore,
+            )
+            .await;
             let _ = cmd_tx
                 .send(RunnerCommand::BatchBuildComplete(outcome))
                 .await;
@@ -2669,10 +2735,22 @@ impl Runner {
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
         let watch_update_tx = self.watch_update_tx.clone();
+        let global_watch_ignore = resolve_watch_ignore_patterns(
+            &self.base_dir,
+            &[],
+            &self.base_dir,
+            &self.config.watch_ignore,
+        );
         let svc_name = name.to_string();
         let handle = tokio::spawn(async move {
-            let outcome =
-                run_batch_build_chain(vec![item], base_dir, emitter, watch_update_tx).await;
+            let outcome = run_batch_build_chain(
+                vec![item],
+                base_dir,
+                emitter,
+                watch_update_tx,
+                global_watch_ignore,
+            )
+            .await;
             let _ = cmd_tx
                 .send(RunnerCommand::LazyBuildComplete {
                     name: svc_name,
@@ -3056,17 +3134,16 @@ impl Runner {
         let emitter = self.output_manager.clone_lifecycle_emitter();
         let name_owned = name.to_string();
         let task_cfg_for_worker = task_cfg.clone();
+        let global_watch_ignore = self.config.watch_ignore.clone();
         let worker = tokio::spawn(async move {
-            let result = run_task_worker(
+            let ctx = TaskWorkerContext {
                 base_dir,
                 platform,
                 emitter,
-                &name_owned,
-                &task_cfg_for_worker,
-                &params,
-                mode,
-            )
-            .await;
+                global_watch_ignore,
+            };
+            let result =
+                run_task_worker(ctx, &name_owned, &task_cfg_for_worker, &params, mode).await;
             let _ = cmd_tx
                 .send(RunnerCommand::TaskRunPrepared {
                     name: name_owned,
@@ -3234,6 +3311,7 @@ impl Runner {
         let name_owned = name.to_string();
         let task_cfg_clone = task_cfg.clone();
         let base_dir_owned = self.base_dir.clone();
+        let global_watch_ignore = self.config.watch_ignore.clone();
         let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
         let cmd_tx = self.cmd_tx.clone();
         let rerun = done_tx.is_none();
@@ -3246,9 +3324,21 @@ impl Runner {
             let (success, message) = match result {
                 Ok(status) => {
                     if status.success() {
-                        let task_dir = task_cfg_clone.dir.as_deref().unwrap_or(&base_dir_owned);
+                        let task_dir =
+                            working_dir_for(&base_dir_owned, task_cfg_clone.dir.as_deref());
+                        let ignore_patterns = resolve_watch_ignore_patterns(
+                            &task_dir,
+                            &task_cfg_clone.ignore,
+                            &base_dir_owned,
+                            &global_watch_ignore,
+                        );
                         let _ = task_state
-                            .record_success(&name_owned, &task_cfg_clone.watch, Some(task_dir))
+                            .record_success(
+                                &name_owned,
+                                &task_cfg_clone.watch,
+                                &ignore_patterns,
+                                Some(&task_dir),
+                            )
                             .await;
                         (true, None)
                     } else {
@@ -3431,6 +3521,12 @@ impl Runner {
         let watch_update_tx = self.watch_update_tx.clone();
         let mut services_to_rebuild: Vec<String> = Vec::new();
         let mut tasks_to_rerun: Vec<String> = Vec::new();
+        let global_watch_ignore = resolve_watch_ignore_patterns(
+            &self.base_dir,
+            &[],
+            &self.base_dir,
+            &self.config.watch_ignore,
+        );
 
         for outcome in outcomes {
             match outcome.result {
@@ -3468,7 +3564,7 @@ impl Runner {
                             format!("{}__graph", outcome.name),
                             crate::watch::WatchItemKind::BuildGraph,
                             info.graph_definition_globs,
-                            Vec::new(),
+                            global_watch_ignore.clone(),
                             self.base_dir.clone(),
                         )
                         .await;
@@ -3606,10 +3702,13 @@ impl Runner {
             if bazel.is_none() && turbo.is_none() {
                 continue;
             }
-            let working_dir = match item_dir {
-                Some(d) => self.base_dir.join(d),
-                None => self.base_dir.clone(),
-            };
+            let working_dir = working_dir_for(&self.base_dir, item_dir.as_deref());
+            let ignore_patterns = resolve_watch_ignore_patterns(
+                &working_dir,
+                &ignore_patterns,
+                &self.base_dir,
+                &self.config.watch_ignore,
+            );
             items.push(GraphRequeryRequestItem {
                 name: name.clone(),
                 bazel,
@@ -3655,17 +3754,20 @@ impl Runner {
             if rt.config.bazel.is_none() && rt.config.turbo.is_none() {
                 continue;
             }
-            let working_dir = match rt.config.dir.as_deref() {
-                Some(d) => self.base_dir.join(d),
-                None => self.base_dir.clone(),
-            };
+            let working_dir = working_dir_for(&self.base_dir, rt.config.dir.as_deref());
+            let ignore = resolve_watch_ignore_patterns(
+                &working_dir,
+                &rt.config.ignore,
+                &self.base_dir,
+                &self.config.watch_ignore,
+            );
             items.push(BatchBuildItem {
                 name: name.clone(),
                 kind: NodeKind::Task,
                 bazel: rt.config.bazel.clone(),
                 turbo: rt.config.turbo.clone(),
                 working_dir,
-                ignore: rt.config.ignore.clone(),
+                ignore,
             });
         }
 
@@ -3677,17 +3779,20 @@ impl Runner {
     /// [`Self::collect_batch_build_items`] so the chain logic doesn't care
     /// whether the build is startup-batched or JIT.
     fn build_batch_item(&self, name: &str, kind: NodeKind, rs: &RuntimeService) -> BatchBuildItem {
-        let working_dir = match rs.resolved.dir.as_deref() {
-            Some(d) => self.base_dir.join(d),
-            None => self.base_dir.clone(),
-        };
+        let working_dir = working_dir_for(&self.base_dir, rs.resolved.dir.as_deref());
+        let ignore = resolve_watch_ignore_patterns(
+            &working_dir,
+            &rs.resolved.ignore,
+            &self.base_dir,
+            &self.config.watch_ignore,
+        );
         BatchBuildItem {
             name: name.to_string(),
             kind,
             bazel: rs.resolved.bazel_config().cloned(),
             turbo: rs.resolved.turbo_config().cloned(),
             working_dir,
-            ignore: rs.resolved.ignore.clone(),
+            ignore,
         }
     }
 
@@ -5990,6 +6095,7 @@ async fn run_batch_build_chain(
     base_dir: PathBuf,
     emitter: crate::output::LifecycleEmitter,
     watch_update_tx: Option<mpsc::Sender<crate::watch::WatchUpdate>>,
+    global_watch_ignore: Vec<String>,
 ) -> BatchBuildOutcome {
     let scan_since = SystemTime::now();
     let mut outcome = BatchBuildOutcome {
@@ -6146,7 +6252,7 @@ async fn run_batch_build_chain(
                     format!("{}__graph", item.name),
                     crate::watch::WatchItemKind::BuildGraph,
                     info.graph_definition_globs.clone(),
-                    Vec::new(),
+                    global_watch_ignore.clone(),
                     base_dir.clone(),
                 )
                 .await;
@@ -6455,13 +6561,25 @@ fn check_gitignore(base_dir: &std::path::Path, output: &OutputManager) {
 /// services and tasks, walks `depends_on` recursively to include everything
 /// needed.
 pub fn resolve_profile_items(config: &Config, profile: &crate::config::Profile) -> HashSet<String> {
+    resolve_profile_items_inner(config, profile, None)
+}
+
+fn resolve_profile_items_for_platform(
+    config: &Config,
+    profile: &crate::config::Profile,
+    platform: Platform,
+) -> HashSet<String> {
+    resolve_profile_items_inner(config, profile, Some(platform))
+}
+
+fn resolve_profile_items_inner(
+    config: &Config,
+    profile: &crate::config::Profile,
+    platform: Option<Platform>,
+) -> HashSet<String> {
     let mut result = HashSet::new();
-    let mut queue: Vec<String> = profile
-        .services
-        .iter()
-        .chain(profile.tasks.iter())
-        .cloned()
-        .collect();
+    let mut queue = config.expand_profile_services(&profile.services);
+    queue.extend(profile.tasks.iter().cloned());
 
     while let Some(name) = queue.pop() {
         if !result.insert(name.clone()) {
@@ -6469,7 +6587,11 @@ pub fn resolve_profile_items(config: &Config, profile: &crate::config::Profile) 
         }
         // Follow deps from services.
         if let Some(svc) = config.services.get(&name) {
-            for dep in &svc.depends_on {
+            let service_deps = match platform {
+                Some(platform) => config.expand_dependency_refs(&svc.resolve(platform).depends_on),
+                None => config.expand_dependency_refs(&svc.depends_on),
+            };
+            for dep in &service_deps {
                 if !result.contains(dep) {
                     queue.push(dep.clone());
                 }
@@ -6477,7 +6599,7 @@ pub fn resolve_profile_items(config: &Config, profile: &crate::config::Profile) 
         }
         // Follow deps from tasks.
         if let Some(task) = config.tasks.get(&name) {
-            for dep in &task.depends_on {
+            for dep in &config.expand_dependency_refs(&task.depends_on) {
                 if !result.contains(dep) {
                     queue.push(dep.clone());
                 }
@@ -6763,9 +6885,11 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            service_groups: HashMap::new(),
             tasks: HashMap::new(),
             profiles: HashMap::new(),
             default_profile: None,
+            watch_ignore: Vec::new(),
         };
         let output_manager = crate::output::OutputManager::new_verbose(
             &[("api", &LogConfig::Stdout)],
