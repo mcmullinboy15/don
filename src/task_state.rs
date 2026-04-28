@@ -44,14 +44,21 @@ impl TaskState {
         &self,
         task_name: &str,
         watch_patterns: &[String],
+        ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<bool, TaskStateError> {
         let this = self.clone();
         let task_name = task_name.to_string();
         let watch_patterns = watch_patterns.to_vec();
+        let ignore_patterns = ignore_patterns.to_vec();
         let base_dir = base_dir.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
-            this.needs_run_sync(&task_name, &watch_patterns, base_dir.as_deref())
+            this.needs_run_sync(
+                &task_name,
+                &watch_patterns,
+                &ignore_patterns,
+                base_dir.as_deref(),
+            )
         })
         .await
         .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
@@ -67,14 +74,21 @@ impl TaskState {
         &self,
         task_name: &str,
         watch_patterns: &[String],
+        ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<(), TaskStateError> {
         let this = self.clone();
         let task_name = task_name.to_string();
         let watch_patterns = watch_patterns.to_vec();
+        let ignore_patterns = ignore_patterns.to_vec();
         let base_dir = base_dir.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
-            this.record_success_sync(&task_name, &watch_patterns, base_dir.as_deref())
+            this.record_success_sync(
+                &task_name,
+                &watch_patterns,
+                &ignore_patterns,
+                base_dir.as_deref(),
+            )
         })
         .await
         .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
@@ -97,13 +111,14 @@ impl TaskState {
         &self,
         task_name: &str,
         watch_patterns: &[String],
+        ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<bool, TaskStateError> {
         if watch_patterns.is_empty() {
             return Ok(true);
         }
 
-        let current_hash = self.compute_hash(watch_patterns, base_dir)?;
+        let current_hash = self.compute_hash(watch_patterns, ignore_patterns, base_dir)?;
         let stored_hash = self.read_stored_hash(task_name)?;
 
         Ok(stored_hash.as_ref() != Some(&current_hash))
@@ -113,13 +128,14 @@ impl TaskState {
         &self,
         task_name: &str,
         watch_patterns: &[String],
+        ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<(), TaskStateError> {
         if watch_patterns.is_empty() {
             return Ok(());
         }
 
-        let hash = self.compute_hash(watch_patterns, base_dir)?;
+        let hash = self.compute_hash(watch_patterns, ignore_patterns, base_dir)?;
         let path = self.hash_file_path(task_name);
         std::fs::create_dir_all(&self.state_dir)?;
         std::fs::write(&path, hash.as_bytes())?;
@@ -134,19 +150,31 @@ impl TaskState {
     fn compute_hash(
         &self,
         watch_patterns: &[String],
+        ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<String, TaskStateError> {
+        let compiled_ignore: Vec<glob::Pattern> = ignore_patterns
+            .iter()
+            .map(|pattern| {
+                let full_pattern = resolve_pattern(base_dir, pattern);
+                glob::Pattern::new(&full_pattern.to_string_lossy())
+                    .map_err(|e| TaskStateError::Glob(e.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
         let mut paths = Vec::new();
         for pattern in watch_patterns {
-            let full_pattern = match base_dir {
-                Some(dir) => dir.join(pattern).to_string_lossy().into_owned(),
-                None => pattern.clone(),
-            };
+            let full_pattern = resolve_pattern(base_dir, pattern)
+                .to_string_lossy()
+                .into_owned();
             for entry in
                 glob::glob(&full_pattern).map_err(|e| TaskStateError::Glob(e.to_string()))?
             {
                 let path = entry.map_err(|e| TaskStateError::Io(e.into_error()))?;
-                if path.is_file() {
+                let path_str = path.to_string_lossy();
+                let ignored = compiled_ignore
+                    .iter()
+                    .any(|ignore| ignore.matches(&path_str));
+                if path.is_file() && !ignored {
                     paths.push(path);
                 }
             }
@@ -182,6 +210,18 @@ impl TaskState {
             Ok(hash) => Ok(Some(hash)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(TaskStateError::Io(e)),
+        }
+    }
+}
+
+fn resolve_pattern(base_dir: Option<&Path>, pattern: &str) -> PathBuf {
+    let pattern_path = Path::new(pattern);
+    if pattern_path.is_absolute() {
+        pattern_path.to_path_buf()
+    } else {
+        match base_dir {
+            Some(dir) => dir.join(pattern_path),
+            None => pattern_path.to_path_buf(),
         }
     }
 }
@@ -236,6 +276,7 @@ mod tests {
             name: &'static str,
             setup: fn(&Path),
             patterns: Vec<String>,
+            ignore_patterns: Vec<String>,
             expect_needs_run_before: bool,
             record_success: bool,
             mutate: Option<fn(&Path)>,
@@ -247,6 +288,7 @@ mod tests {
                 name: "no watch patterns always needs run",
                 setup: |_| {},
                 patterns: vec![],
+                ignore_patterns: vec![],
                 expect_needs_run_before: true,
                 record_success: true,
                 mutate: None,
@@ -258,6 +300,7 @@ mod tests {
                     fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
                 },
                 patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                ignore_patterns: vec![],
                 expect_needs_run_before: true,
                 record_success: true,
                 mutate: None,
@@ -269,6 +312,7 @@ mod tests {
                     fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
                 },
                 patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                ignore_patterns: vec![],
                 expect_needs_run_before: true,
                 record_success: true,
                 mutate: None,
@@ -280,6 +324,7 @@ mod tests {
                     fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
                 },
                 patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                ignore_patterns: vec![],
                 expect_needs_run_before: true,
                 record_success: true,
                 mutate: Some(|dir| {
@@ -293,6 +338,7 @@ mod tests {
                     fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
                 },
                 patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                ignore_patterns: vec![],
                 expect_needs_run_before: true,
                 record_success: true,
                 mutate: Some(|dir| {
@@ -307,6 +353,7 @@ mod tests {
                     fs::write(dir.join("b.sql"), "CREATE TABLE b;").unwrap();
                 },
                 patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                ignore_patterns: vec![],
                 expect_needs_run_before: true,
                 record_success: true,
                 mutate: Some(|dir| {
@@ -315,11 +362,27 @@ mod tests {
                 expect_needs_run_after: true,
             },
             TestCase {
+                name: "ignored file changes do not trigger re-run",
+                setup: |dir| {
+                    fs::create_dir_all(dir.join("generated")).unwrap();
+                    fs::write(dir.join("generated/schema.sql"), "CREATE TABLE a;").unwrap();
+                },
+                patterns: vec!["PLACEHOLDER/**/*.sql".to_string()],
+                ignore_patterns: vec!["PLACEHOLDER/generated/**".to_string()],
+                expect_needs_run_before: true,
+                record_success: true,
+                mutate: Some(|dir| {
+                    fs::write(dir.join("generated/schema.sql"), "CREATE TABLE a_v2;").unwrap();
+                }),
+                expect_needs_run_after: false,
+            },
+            TestCase {
                 name: "failed task still needs run",
                 setup: |dir| {
                     fs::write(dir.join("a.sql"), "CREATE TABLE a;").unwrap();
                 },
                 patterns: vec!["PLACEHOLDER/*.sql".to_string()],
+                ignore_patterns: vec![],
                 expect_needs_run_before: true,
                 record_success: false, // simulate failure
                 mutate: None,
@@ -339,8 +402,16 @@ mod tests {
                 .iter()
                 .map(|p| p.replace("PLACEHOLDER", &dir.path().to_string_lossy()))
                 .collect();
+            let ignore_patterns: Vec<String> = case
+                .ignore_patterns
+                .iter()
+                .map(|p| p.replace("PLACEHOLDER", &dir.path().to_string_lossy()))
+                .collect();
 
-            let needs_run = state.needs_run("test-task", &patterns, None).await.unwrap();
+            let needs_run = state
+                .needs_run("test-task", &patterns, &ignore_patterns, None)
+                .await
+                .unwrap();
             assert_eq!(
                 needs_run, case.expect_needs_run_before,
                 "case '{}': needs_run before",
@@ -349,7 +420,7 @@ mod tests {
 
             if case.record_success {
                 state
-                    .record_success("test-task", &patterns, None)
+                    .record_success("test-task", &patterns, &ignore_patterns, None)
                     .await
                     .unwrap();
             }
@@ -358,7 +429,10 @@ mod tests {
                 mutate(dir.path());
             }
 
-            let needs_run = state.needs_run("test-task", &patterns, None).await.unwrap();
+            let needs_run = state
+                .needs_run("test-task", &patterns, &ignore_patterns, None)
+                .await
+                .unwrap();
             assert_eq!(
                 needs_run, case.expect_needs_run_after,
                 "case '{}': needs_run after",
@@ -378,10 +452,10 @@ mod tests {
         let patterns = vec!["*.sql".to_string()];
 
         // Without base_dir: glob resolves from cwd, won't find files in subdir
-        let needs_run_no_base = state.needs_run("test", &patterns, None).await.unwrap();
+        let needs_run_no_base = state.needs_run("test", &patterns, &[], None).await.unwrap();
         // With base_dir pointing to subdir: should find the file
         let needs_run_with_base = state
-            .needs_run("test", &patterns, Some(&sub))
+            .needs_run("test", &patterns, &[], Some(&sub))
             .await
             .unwrap();
 
@@ -392,18 +466,18 @@ mod tests {
 
         // Record success with base_dir
         state
-            .record_success("test", &patterns, Some(&sub))
+            .record_success("test", &patterns, &[], Some(&sub))
             .await
             .unwrap();
         // Now it should skip
         assert!(
             !state
-                .needs_run("test", &patterns, Some(&sub))
+                .needs_run("test", &patterns, &[], Some(&sub))
                 .await
                 .unwrap()
         );
         // But without base_dir it still needs run (different glob results)
-        assert!(state.needs_run("test", &patterns, None).await.unwrap());
+        assert!(state.needs_run("test", &patterns, &[], None).await.unwrap());
     }
 
     #[tokio::test]
@@ -415,13 +489,23 @@ mod tests {
         let patterns = vec![format!("{}/*.txt", dir.path().to_string_lossy())];
 
         state
-            .record_success("my-task", &patterns, None)
+            .record_success("my-task", &patterns, &[], None)
             .await
             .unwrap();
-        assert!(!state.needs_run("my-task", &patterns, None).await.unwrap());
+        assert!(
+            !state
+                .needs_run("my-task", &patterns, &[], None)
+                .await
+                .unwrap()
+        );
 
         state.clear("my-task").await.unwrap();
-        assert!(state.needs_run("my-task", &patterns, None).await.unwrap());
+        assert!(
+            state
+                .needs_run("my-task", &patterns, &[], None)
+                .await
+                .unwrap()
+        );
 
         // Clear on non-existent is fine
         state.clear("never-existed").await.unwrap();

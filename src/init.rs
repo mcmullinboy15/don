@@ -11,6 +11,8 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 
 # Pick a default profile to limit what `don start` brings up without `--profile`.
 # default_profile = "dev"
+# Ignore generated files across every watch rule in the workspace.
+# watch_ignore = ["target/**", ".don/**"]
 
 # ── Services ────────────────────────────────────────────────────────────────
 # Long-running processes. Don keeps them alive and restarts on file changes.

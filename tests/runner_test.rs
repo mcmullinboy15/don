@@ -906,7 +906,7 @@ fn integration_task_watch_skip() {
         let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
         let patterns = vec![format!("{}/*.sql", dir.path().display())];
         task_state
-            .record_success("migrate", &patterns, None)
+            .record_success("migrate", &patterns, &[], None)
             .await
             .unwrap();
 
@@ -928,6 +928,42 @@ fn integration_task_watch_skip() {
     });
 }
 
+#[test]
+fn integration_task_global_watch_ignore_skip() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("task-watch-global-ignore-skip");
+        let generated_dir = dir.path().join("generated");
+        std::fs::create_dir_all(&generated_dir).unwrap();
+        std::fs::write(generated_dir.join("data.sql"), "CREATE TABLE test;").unwrap();
+
+        let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
+        let patterns = vec![format!("{}/**/*.sql", dir.path().display())];
+        let ignore_patterns = vec![format!("{}/generated/**", dir.path().display())];
+        task_state
+            .record_success("migrate", &patterns, &ignore_patterns, None)
+            .await
+            .unwrap();
+
+        std::fs::write(generated_dir.join("data.sql"), "CREATE TABLE test_v2;").unwrap();
+
+        let toml = ConfigBuilder::new()
+            .watch_ignore(&["generated/**"])
+            .add_task("migrate", "echo", &["running migration"])
+            .watch(&["**/*.sql"])
+            .done()
+            .build();
+
+        let (runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        runner.run().await.unwrap();
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("skipped (no changes)"),
+            "task should be skipped when only globally ignored files changed: {output}"
+        );
+    });
+}
+
 // --- Task with watch files: run on changes ---
 
 #[test]
@@ -940,7 +976,7 @@ fn integration_task_watch_run_on_change() {
         let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
         let patterns = vec![format!("{}/*.sql", dir.path().display())];
         task_state
-            .record_success("migrate", &patterns, None)
+            .record_success("migrate", &patterns, &[], None)
             .await
             .unwrap();
 

@@ -547,6 +547,54 @@ fn integration_reload_false_skips_file_watch() {
     });
 }
 
+#[test]
+fn integration_global_watch_ignore_skips_service_rebuild() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-global-ignore");
+
+        let src_dir = dir.path().join("src");
+        let generated_dir = src_dir.join("generated");
+        std::fs::create_dir_all(&generated_dir).unwrap();
+        std::fs::write(src_dir.join("main.rs"), "initial").unwrap();
+        std::fs::write(generated_dir.join("schema.rs"), "initial").unwrap();
+
+        let toml = ConfigBuilder::new()
+            .watch_ignore(&["src/generated/**"])
+            .add_custom_service("api", "bash", &["-c", "echo STARTED && sleep 60"])
+            .watch(&["src/**/*.rs"])
+            .debounce("100ms")
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+            "timed out waiting for services to start. output: {}",
+            read_buf(&buf)
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(generated_dir.join("schema.rs"), "modified").unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let output = read_buf(&buf);
+        assert!(
+            !output.contains("rebuilding"),
+            "global watch_ignore should prevent rebuilds on ignored file change. output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- Integration test: task with auto_run=false skips initial run and goes pending on change ---
 
 #[test]

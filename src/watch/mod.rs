@@ -208,6 +208,15 @@ impl WatchManager {
         let base_dir = std::fs::canonicalize(base_dir)
             .map_err(|e| WatchError::Io(base_dir.to_path_buf(), e))?;
         let base_dir = base_dir.as_path();
+        let global_ignore_patterns: Vec<String> = config
+            .watch_ignore
+            .iter()
+            .map(|pattern| {
+                resolve_pattern(base_dir, pattern)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
 
         let mut items: HashMap<String, WatchedItem> = HashMap::new();
         // Track which directories we've already registered, with the mode we
@@ -267,7 +276,7 @@ impl WatchManager {
 
             let mut compiled_patterns = Vec::new();
             for pattern_str in &watch_patterns {
-                let full_pattern = svc_dir.join(pattern_str);
+                let full_pattern = resolve_pattern(&svc_dir, pattern_str);
                 match Pattern::new(&full_pattern.to_string_lossy()) {
                     Ok(pat) => compiled_patterns.push(pat),
                     Err(e) => {
@@ -292,8 +301,14 @@ impl WatchManager {
             }
 
             let mut compiled_ignore = Vec::new();
-            for pattern_str in &resolved.ignore {
-                let full_pattern = svc_dir.join(pattern_str);
+            let ignore_patterns: Vec<String> = resolved
+                .ignore
+                .iter()
+                .cloned()
+                .chain(global_ignore_patterns.iter().cloned())
+                .collect();
+            for pattern_str in &ignore_patterns {
+                let full_pattern = resolve_pattern(&svc_dir, pattern_str);
                 match Pattern::new(&full_pattern.to_string_lossy()) {
                     Ok(pat) => compiled_ignore.push(pat),
                     Err(e) => {
@@ -335,7 +350,7 @@ impl WatchManager {
 
             let mut compiled_patterns = Vec::new();
             for pattern_str in &task.watch {
-                let full_pattern = task_dir.join(pattern_str);
+                let full_pattern = resolve_pattern(&task_dir, pattern_str);
                 match Pattern::new(&full_pattern.to_string_lossy()) {
                     Ok(pat) => compiled_patterns.push(pat),
                     Err(e) => {
@@ -357,8 +372,14 @@ impl WatchManager {
             }
 
             let mut compiled_ignore = Vec::new();
-            for pattern_str in &task.ignore {
-                let full_pattern = task_dir.join(pattern_str);
+            let ignore_patterns: Vec<String> = task
+                .ignore
+                .iter()
+                .cloned()
+                .chain(global_ignore_patterns.iter().cloned())
+                .collect();
+            for pattern_str in &ignore_patterns {
+                let full_pattern = resolve_pattern(&task_dir, pattern_str);
                 match Pattern::new(&full_pattern.to_string_lossy()) {
                     Ok(pat) => compiled_ignore.push(pat),
                     Err(e) => {
@@ -422,11 +443,15 @@ impl WatchManager {
 
                 let mut compiled_patterns = Vec::new();
                 for file_name in &root_file_names {
-                    let full_pattern = base_dir.join(file_name);
+                    let full_pattern = resolve_pattern(base_dir, file_name);
                     if let Ok(pat) = Pattern::new(&full_pattern.to_string_lossy()) {
                         compiled_patterns.push(pat);
                     }
                 }
+                let compiled_ignore: Vec<Pattern> = global_ignore_patterns
+                    .iter()
+                    .filter_map(|pattern| Pattern::new(pattern).ok())
+                    .collect();
 
                 // Non-recursive watch on the workspace root is enough for
                 // these specific filenames. No symlink spelunking.
@@ -453,7 +478,7 @@ impl WatchManager {
                             stale: false,
                             kind: WatchItemKind::BuildGraph,
                             patterns: compiled_patterns,
-                            ignore_patterns: vec![],
+                            ignore_patterns: compiled_ignore,
                             last_error: None,
                         },
                     );
@@ -585,7 +610,7 @@ impl WatchManager {
 
         let mut compiled_patterns = Vec::new();
         for pattern_str in &update.patterns {
-            let full_pattern = base_dir.join(pattern_str);
+            let full_pattern = resolve_pattern(&base_dir, pattern_str);
             if let Ok(pat) = Pattern::new(&full_pattern.to_string_lossy()) {
                 compiled_patterns.push(pat);
 
@@ -635,7 +660,7 @@ impl WatchManager {
 
         let mut compiled_ignore = Vec::new();
         for pattern_str in &update.ignore_patterns {
-            let full_pattern = base_dir.join(pattern_str);
+            let full_pattern = resolve_pattern(&base_dir, pattern_str);
             if let Ok(pat) = Pattern::new(&full_pattern.to_string_lossy()) {
                 compiled_ignore.push(pat);
             }
@@ -1094,6 +1119,15 @@ fn glob_base_dir(pattern: &Path) -> PathBuf {
         PathBuf::from(".")
     } else {
         base
+    }
+}
+
+fn resolve_pattern(base_dir: &Path, pattern: &str) -> PathBuf {
+    let pattern_path = Path::new(pattern);
+    if pattern_path.is_absolute() {
+        pattern_path.to_path_buf()
+    } else {
+        base_dir.join(pattern_path)
     }
 }
 
