@@ -1,4 +1,5 @@
-use super::{NodeKind, any_glob_path_changed_since};
+use super::NodeKind;
+use super::paths::any_glob_path_changed_since;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

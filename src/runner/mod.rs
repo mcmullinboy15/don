@@ -8,6 +8,7 @@
 mod build_tools;
 mod completions;
 mod params;
+mod paths;
 mod state;
 
 pub(crate) mod service;
@@ -25,6 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(test)]
 use std::time::SystemTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -37,6 +39,9 @@ use self::build_tools::{
     TurboRebuildItem, run_batch_build_chain, run_graph_requery_worker, run_rebuild_batch_worker,
     send_watch_update,
 };
+#[cfg(test)]
+use self::paths::any_glob_path_changed_since;
+use self::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use self::service::ServiceHandle;
 
 /// Signal counter: 0 = running, 1 = graceful shutdown, 2 = force shutdown.
@@ -503,132 +508,6 @@ fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {
         service.state(),
         ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
     )
-}
-
-fn working_dir_for(base_dir: &std::path::Path, dir: Option<&std::path::Path>) -> PathBuf {
-    match dir {
-        Some(dir) => base_dir.join(dir),
-        None => base_dir.to_path_buf(),
-    }
-}
-
-fn resolve_glob_pattern(base_dir: &std::path::Path, pattern: &str) -> String {
-    let path = std::path::Path::new(pattern);
-    if path.is_absolute() {
-        path.to_string_lossy().into_owned()
-    } else {
-        base_dir.join(path).to_string_lossy().into_owned()
-    }
-}
-
-fn resolve_watch_ignore_patterns(
-    item_base_dir: &std::path::Path,
-    item_ignore_patterns: &[String],
-    workspace_base_dir: &std::path::Path,
-    global_watch_ignore: &[String],
-) -> Vec<String> {
-    let mut patterns: Vec<String> = item_ignore_patterns
-        .iter()
-        .map(|pattern| resolve_glob_pattern(item_base_dir, pattern))
-        .collect();
-    patterns.extend(
-        global_watch_ignore
-            .iter()
-            .map(|pattern| resolve_glob_pattern(workspace_base_dir, pattern)),
-    );
-    patterns
-}
-
-fn any_glob_path_changed_since(
-    base_dir: &std::path::Path,
-    patterns: &[String],
-    ignore_patterns: &[String],
-    since: SystemTime,
-) -> bool {
-    let absolute_patterns: Vec<glob::Pattern> = patterns
-        .iter()
-        .filter_map(|pattern| glob::Pattern::new(&resolve_glob_pattern(base_dir, pattern)).ok())
-        .collect();
-    let absolute_ignore: Vec<glob::Pattern> = ignore_patterns
-        .iter()
-        .filter_map(|pattern| glob::Pattern::new(&resolve_glob_pattern(base_dir, pattern)).ok())
-        .collect();
-    let mut roots: Vec<PathBuf> = patterns
-        .iter()
-        .map(|pattern| {
-            glob_pattern_base_dir(std::path::Path::new(&resolve_glob_pattern(
-                base_dir, pattern,
-            )))
-        })
-        .collect();
-    roots.sort();
-    roots.dedup();
-
-    roots
-        .into_iter()
-        .any(|root| scan_tree_for_changes(&root, &absolute_patterns, &absolute_ignore, since))
-}
-
-fn scan_tree_for_changes(
-    path: &std::path::Path,
-    patterns: &[glob::Pattern],
-    ignore_patterns: &[glob::Pattern],
-    since: SystemTime,
-) -> bool {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    let path_str = path.to_string_lossy();
-    let ignored = ignore_patterns
-        .iter()
-        .any(|ignore| ignore.matches(&path_str));
-    if !ignored && patterns.iter().any(|pattern| pattern.matches(&path_str)) {
-        let Ok(modified) = metadata.modified() else {
-            return false;
-        };
-        if modified > since {
-            return true;
-        }
-    }
-
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return false;
-    }
-
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        if scan_tree_for_changes(&entry.path(), patterns, ignore_patterns, since) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn glob_pattern_base_dir(pattern: &std::path::Path) -> PathBuf {
-    let mut base = PathBuf::new();
-    let mut hit_glob = false;
-    for component in pattern.components() {
-        let s = component.as_os_str().to_string_lossy();
-        if s.contains('*') || s.contains('?') || s.contains('[') {
-            hit_glob = true;
-            break;
-        }
-        base.push(component);
-    }
-    if !hit_glob {
-        base = base
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_default();
-    }
-    if base.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        base
-    }
 }
 
 async fn run_task_worker(
