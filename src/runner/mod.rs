@@ -10,12 +10,14 @@ mod completions;
 mod health;
 mod params;
 mod paths;
+mod profile;
 mod state;
 
 pub(crate) mod service;
 pub(crate) mod task;
 
 pub(crate) use params::resolve_task_params;
+pub use profile::resolve_profile_items;
 
 use crate::config::{Config, Platform, TaskAutoRun};
 use crate::output::OutputManager;
@@ -44,6 +46,7 @@ use self::health::{format_unexpected_exit, run_health_monitor, unhealthy_restart
 #[cfg(test)]
 use self::paths::any_glob_path_changed_since;
 use self::paths::{resolve_watch_ignore_patterns, working_dir_for};
+use self::profile::resolve_profile_items_for_platform;
 use self::service::ServiceHandle;
 
 /// Signal counter: 0 = running, 1 = graceful shutdown, 2 = force shutdown.
@@ -5672,59 +5675,6 @@ fn check_gitignore(base_dir: &std::path::Path, output: &OutputManager) {
             // No .gitignore or not a git repo — skip silently.
         }
     }
-}
-
-/// Resolve a profile into the full set of items (services + tasks) to run,
-/// including transitive dependencies. Starting with the profile's explicit
-/// services and tasks, walks `depends_on` recursively to include everything
-/// needed.
-pub fn resolve_profile_items(config: &Config, profile: &crate::config::Profile) -> HashSet<String> {
-    resolve_profile_items_inner(config, profile, None)
-}
-
-fn resolve_profile_items_for_platform(
-    config: &Config,
-    profile: &crate::config::Profile,
-    platform: Platform,
-) -> HashSet<String> {
-    resolve_profile_items_inner(config, profile, Some(platform))
-}
-
-fn resolve_profile_items_inner(
-    config: &Config,
-    profile: &crate::config::Profile,
-    platform: Option<Platform>,
-) -> HashSet<String> {
-    let mut result = HashSet::new();
-    let mut queue = config.expand_profile_services(&profile.services);
-    queue.extend(profile.tasks.iter().cloned());
-
-    while let Some(name) = queue.pop() {
-        if !result.insert(name.clone()) {
-            continue; // already visited
-        }
-        // Follow deps from services.
-        if let Some(svc) = config.services.get(&name) {
-            let service_deps = match platform {
-                Some(platform) => config.expand_dependency_refs(&svc.resolve(platform).depends_on),
-                None => config.expand_dependency_refs(&svc.depends_on),
-            };
-            for dep in &service_deps {
-                if !result.contains(dep) {
-                    queue.push(dep.clone());
-                }
-            }
-        }
-        // Follow deps from tasks.
-        if let Some(task) = config.tasks.get(&name) {
-            for dep in &config.expand_dependency_refs(&task.depends_on) {
-                if !result.contains(dep) {
-                    queue.push(dep.clone());
-                }
-            }
-        }
-    }
-    result
 }
 
 /// Install signal handlers for SIGINT and SIGTERM.
