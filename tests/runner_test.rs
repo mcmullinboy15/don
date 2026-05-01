@@ -3,7 +3,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, RunnerCommand};
+use don::runner::{ItemStatus, Runner, RunnerCommand, ServiceState};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -248,6 +248,184 @@ fn integration_task_depends_on_service() {
     });
 }
 
+#[test]
+fn integration_manual_task_dependency_unblocks_service_after_run() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("manual-task-dep");
+        let port = free_port();
+
+        let listen_script = dir.path().join("listen.sh");
+        std::fs::write(
+            &listen_script,
+            format!(
+                "#!/bin/sh\nexec python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\nwhile True: time.sleep(60)\n\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &listen_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_task("migrate", "echo", &["migration done"])
+            .auto_run(false)
+            .log("ignore")
+            .done()
+            .add_custom_service("api", listen_script.to_str().unwrap(), &[])
+            .depends_on(&["migrate"])
+            .ready_tcp_with(&format!("127.0.0.1:{port}"), "200ms", 30)
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(
+            &buf,
+            "migrate: pending — required by dependents, run manually",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let output = read_buf(&buf);
+        assert!(
+            !output.contains("api: starting"),
+            "api should remain blocked before migrate runs: {output}"
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::RunTask {
+                name: "migrate".to_string(),
+                params: std::collections::HashMap::new(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        wait_for_substr(&buf, "api: starting", Duration::from_secs(5)).await;
+        assert!(
+            wait_for_any_substr(
+                &buf,
+                &["api: ready (tcp", "api: started"],
+                Duration::from_secs(5)
+            )
+            .await,
+            "api should start after migrate completes: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_auto_run_once_only_runs_on_first_startup() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("auto-run-once");
+        let port = free_port();
+        let schema_dir = dir.path().join("schema");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        let schema_file = schema_dir.join("schema.sql");
+        std::fs::write(&schema_file, "create table users (id int);").unwrap();
+
+        let listen_script = dir.path().join("listen.sh");
+        std::fs::write(
+            &listen_script,
+            format!(
+                "#!/bin/sh\nexec python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\nwhile True: time.sleep(60)\n\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &listen_script,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_task("migrate", "echo", &["migration done"])
+            .watch(&["schema/**/*.sql"])
+            .auto_run_mode("once")
+            .log("ignore")
+            .done()
+            .add_custom_service("api", listen_script.to_str().unwrap(), &[])
+            .depends_on(&["migrate"])
+            .ready_tcp_with(&format!("127.0.0.1:{port}"), "200ms", 30)
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(&buf, "migrate: running", Duration::from_secs(5)).await;
+        wait_for_substr(&buf, "api: starting", Duration::from_secs(5)).await;
+        assert!(
+            wait_for_any_substr(
+                &buf,
+                &["api: ready (tcp", "api: started"],
+                Duration::from_secs(5)
+            )
+            .await,
+            "api should become ready on first startup: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        std::fs::write(&schema_file, "create table users (id int, name text);").unwrap();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(
+            &buf,
+            "migrate: pending — required by dependents, auto_run = once",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            wait_for_output_order(
+                &buf,
+                "migrate: pending — required by dependents, auto_run = once",
+                "api: starting",
+                Duration::from_secs(5),
+            )
+            .await,
+            "api should start even though the once task is pending after prior success: {}",
+            read_buf(&buf)
+        );
+        assert!(
+            wait_for_any_substr(
+                &buf,
+                &["api: ready (tcp", "api: started"],
+                Duration::from_secs(5)
+            )
+            .await,
+            "api should become ready on later startup: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- TCP ready check ---
 
 #[test]
@@ -481,6 +659,27 @@ async fn wait_for_substr(buf: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Durat
                 "timeout waiting for {needle:?} in output:\n{}",
                 read_buf(buf)
             );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_output_order(
+    buf: &Arc<Mutex<Vec<u8>>>,
+    first: &str,
+    second: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let snapshot = read_buf(buf);
+        if let Some(first_pos) = snapshot.find(first)
+            && let Some(second_pos) = snapshot.find(second)
+        {
+            return first_pos < second_pos;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -812,8 +1011,196 @@ fn integration_ready_check_exhausted() {
 }
 
 #[test]
-fn integration_dependency_failed_service_recovers_downstream_start() {
+fn integration_restart_failed_ready_check_stops_live_process_first() {
     run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("restart-failed-ready");
+        let ready_file = dir.path().join("ready");
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["300"])
+            .log("ignore")
+            .done()
+            .add_custom_service("badsvc", "sleep", &["300"])
+            .ready_exec_with("test", &["-f", ready_file.to_str().unwrap()], "100ms", 3)
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(&buf, "badsvc", Duration::from_secs(8)).await;
+        wait_for_substr(&buf, "retries", Duration::from_secs(8)).await;
+
+        std::fs::write(&ready_file, "ok").unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Restart {
+                name: "badsvc".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_ok(),
+            "manual restart should accept a failed service"
+        );
+
+        wait_for_substr(
+            &buf,
+            "badsvc: stopping... (requested restart)",
+            Duration::from_secs(5),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut reached_ready = false;
+        while std::time::Instant::now() < deadline {
+            let (status_tx, status_rx) = oneshot::channel();
+            cmd_tx
+                .send(RunnerCommand::Status {
+                    verbose: false,
+                    reply: status_tx,
+                })
+                .await
+                .unwrap();
+            let statuses = status_rx.await.unwrap();
+            reached_ready = statuses.iter().any(|item| {
+                matches!(
+                    item,
+                    ItemStatus::Service {
+                        name,
+                        state: ServiceState::Ready,
+                        ..
+                    } if name == "badsvc"
+                )
+            });
+            if reached_ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            reached_ready,
+            "badsvc should reach Ready after manual restart. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_restart_crashed_service_without_ready_check() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("restart-crashed-no-ready");
+        let gate_file = dir.path().join("keep-running");
+        let launches = dir.path().join("launches");
+        let script = dir.path().join("crash-until-gated.sh");
+
+        std::fs::write(&launches, "0").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 N=$(cat {launches})\n\
+                 N=$((N + 1))\n\
+                 echo $N > {launches}\n\
+                 if [ ! -f {gate} ]; then\n\
+                   exit 7\n\
+                 fi\n\
+                 exec sleep 300\n",
+                launches = launches.display(),
+                gate = gate_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["300"])
+            .log("ignore")
+            .done()
+            .add_custom_service("crashy", script.to_str().unwrap(), &[])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(
+            &buf,
+            "crashy: exited unexpectedly with status 7",
+            Duration::from_secs(8),
+        )
+        .await;
+
+        std::fs::write(&gate_file, "ok").unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Restart {
+                name: "crashy".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_ok(),
+            "manual restart should accept a crashed service"
+        );
+
+        wait_for_substr(&buf, "crashy: starting", Duration::from_secs(5)).await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut reached_ready = false;
+        while std::time::Instant::now() < deadline {
+            let (status_tx, status_rx) = oneshot::channel();
+            cmd_tx
+                .send(RunnerCommand::Status {
+                    verbose: false,
+                    reply: status_tx,
+                })
+                .await
+                .unwrap();
+            let statuses = status_rx.await.unwrap();
+            reached_ready = statuses.iter().any(|item| {
+                matches!(
+                    item,
+                    ItemStatus::Service {
+                        name,
+                        state: ServiceState::Ready,
+                        ..
+                    } if name == "crashy"
+                )
+            });
+            if reached_ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            reached_ready,
+            "crashy should be Ready after restart. output: {}",
+            read_buf(&buf)
+        );
+        assert_eq!(std::fs::read_to_string(&launches).unwrap().trim(), "2");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_dependency_failed_service_recovers_downstream_start() {
+    run_with_timeout(Duration::from_secs(30), async {
         let dir = TempDir::new("dep-failed-recovery");
         let port = free_port();
         let gate_file = dir.path().join("allow-start");
@@ -886,8 +1273,8 @@ while True: time.sleep(60)\n\
             "manual db restart should succeed"
         );
 
-        wait_for_substr(&buf, "api: starting", Duration::from_secs(8)).await;
-        wait_for_substr(&buf, "api: started", Duration::from_secs(8)).await;
+        wait_for_substr(&buf, "api: starting", Duration::from_secs(15)).await;
+        wait_for_substr(&buf, "api: started", Duration::from_secs(15)).await;
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

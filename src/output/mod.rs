@@ -355,7 +355,7 @@ pub(crate) fn assign_colors(names: &[&str]) -> HashMap<String, Color> {
 /// Any argument containing whitespace, quotes, or shell metacharacters gets
 /// single-quoted with embedded `'` escaped as `'\''`. Safe to copy-paste
 /// into a shell.
-fn format_cmdline<S: AsRef<str>>(cmd: &str, args: &[S]) -> String {
+pub(crate) fn format_cmdline<S: AsRef<str>>(cmd: &str, args: &[S]) -> String {
     let mut out = shell_quote(cmd);
     for arg in args {
         out.push(' ');

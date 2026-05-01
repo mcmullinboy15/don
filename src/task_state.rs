@@ -1,8 +1,11 @@
 //! Task state tracking — determines whether a task needs to re-run
 //! based on file content hashes.
 //!
-//! State is stored in `.don/task-state/<task-name>.sha256`.
-//! A hash is only written after a task exits successfully (exit code 0).
+//! State is stored in `.don/task-state/`:
+//! - `<task-name>.sha256` stores the watched-input hash for watch-based reruns
+//! - `<task-name>.success` records that the task has succeeded at least once
+//!
+//! Success state is only written after a task exits successfully (exit code 0).
 
 use hex::encode;
 use sha2::{Digest, Sha256};
@@ -10,8 +13,9 @@ use std::path::{Path, PathBuf};
 
 /// Manages task state — tracks file hashes to determine whether a task needs to re-run.
 ///
-/// State is stored in `.don/task-state/<task-name>.sha256`.
-/// A hash is only written after a task exits successfully (exit code 0).
+/// State is stored in `.don/task-state/`.
+/// Successful task runs persist a generic success marker, and watch-based
+/// tasks also persist a content hash for their watched inputs.
 #[derive(Clone)]
 pub struct TaskState {
     state_dir: PathBuf,
@@ -94,17 +98,22 @@ impl TaskState {
         .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
     }
 
+    /// Return whether the task has at least one recorded successful run.
+    pub async fn has_success(&self, task_name: &str) -> Result<bool, TaskStateError> {
+        let task_name = task_name.to_string();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.has_success_sync(&task_name))
+            .await
+            .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
+    }
+
     /// Clear stored state for a task, forcing it to re-run next time.
     ///
     /// Runs filesystem I/O on a blocking thread to avoid stalling the tokio runtime.
     pub async fn clear(&self, task_name: &str) -> Result<(), TaskStateError> {
         let task_name = task_name.to_string();
-        let path = self.hash_file_path(&task_name);
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(TaskStateError::Io(e)),
-        }
+        remove_file_if_exists(self.hash_file_path(&task_name)).await?;
+        remove_file_if_exists(self.success_file_path(&task_name)).await
     }
 
     fn needs_run_sync(
@@ -131,14 +140,13 @@ impl TaskState {
         ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<(), TaskStateError> {
-        if watch_patterns.is_empty() {
-            return Ok(());
-        }
-
-        let hash = self.compute_hash(watch_patterns, ignore_patterns, base_dir)?;
-        let path = self.hash_file_path(task_name);
         std::fs::create_dir_all(&self.state_dir)?;
-        std::fs::write(&path, hash.as_bytes())?;
+        if !watch_patterns.is_empty() {
+            let hash = self.compute_hash(watch_patterns, ignore_patterns, base_dir)?;
+            let hash_path = self.hash_file_path(task_name);
+            std::fs::write(&hash_path, hash.as_bytes())?;
+        }
+        std::fs::write(self.success_file_path(task_name), b"success\n")?;
         Ok(())
     }
 
@@ -204,6 +212,18 @@ impl TaskState {
         self.state_dir.join(format!("{task_name}.sha256"))
     }
 
+    fn success_file_path(&self, task_name: &str) -> PathBuf {
+        self.state_dir.join(format!("{task_name}.success"))
+    }
+
+    fn has_success_sync(&self, task_name: &str) -> Result<bool, TaskStateError> {
+        match std::fs::metadata(self.success_file_path(task_name)) {
+            Ok(meta) => Ok(meta.is_file()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(TaskStateError::Io(e)),
+        }
+    }
+
     fn read_stored_hash(&self, task_name: &str) -> Result<Option<String>, TaskStateError> {
         let path = self.hash_file_path(task_name);
         match std::fs::read_to_string(&path) {
@@ -223,6 +243,14 @@ fn resolve_pattern(base_dir: Option<&Path>, pattern: &str) -> PathBuf {
             Some(dir) => dir.join(pattern_path),
             None => pattern_path.to_path_buf(),
         }
+    }
+}
+
+async fn remove_file_if_exists(path: PathBuf) -> Result<(), TaskStateError> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(TaskStateError::Io(e)),
     }
 }
 
@@ -438,6 +466,13 @@ mod tests {
                 "case '{}': needs_run after",
                 case.name
             );
+
+            let has_success = state.has_success("test-task").await.unwrap();
+            assert_eq!(
+                has_success, case.record_success,
+                "case '{}': has_success after record_success",
+                case.name
+            );
         }
     }
 
@@ -492,6 +527,7 @@ mod tests {
             .record_success("my-task", &patterns, &[], None)
             .await
             .unwrap();
+        assert!(state.has_success("my-task").await.unwrap());
         assert!(
             !state
                 .needs_run("my-task", &patterns, &[], None)
@@ -500,6 +536,7 @@ mod tests {
         );
 
         state.clear("my-task").await.unwrap();
+        assert!(!state.has_success("my-task").await.unwrap());
         assert!(
             state
                 .needs_run("my-task", &patterns, &[], None)
@@ -509,5 +546,19 @@ mod tests {
 
         // Clear on non-existent is fine
         state.clear("never-existed").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_watchless_task_still_records_success() {
+        let dir = TempDir::new("watchless-success");
+        let state = TaskState::new(dir.path().join(".don-state"));
+
+        assert!(!state.has_success("bootstrap").await.unwrap());
+        state
+            .record_success("bootstrap", &[], &[], None)
+            .await
+            .unwrap();
+        assert!(state.has_success("bootstrap").await.unwrap());
+        assert!(state.needs_run("bootstrap", &[], &[], None).await.unwrap());
     }
 }

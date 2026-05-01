@@ -96,6 +96,19 @@ impl CandidateState {
     }
 }
 
+/// Visible window into a field's filtered candidate list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CandidateWindow {
+    /// Candidates currently visible in the dropdown.
+    pub(crate) items: Vec<String>,
+    /// Highlight index relative to `items`.
+    pub(crate) highlight: usize,
+    /// Number of filtered candidates above the visible window.
+    pub(crate) hidden_above: usize,
+    /// Number of filtered candidates below the visible window.
+    pub(crate) hidden_below: usize,
+}
+
 /// Top-level form state, one instance lives on [`super::app::App`] while
 /// the form modal is open.
 #[derive(Debug, Clone)]
@@ -310,6 +323,35 @@ impl Field {
         fuzzy_match(&self.value, list)
     }
 
+    /// Return a scrollable window into the filtered candidates, keeping the
+    /// highlighted item visible when there are more matches than fit.
+    pub(crate) fn visible_candidate_window(&self, max_rows: usize) -> CandidateWindow {
+        let visible = self.visible_candidates();
+        if visible.is_empty() || max_rows == 0 {
+            return CandidateWindow {
+                items: Vec::new(),
+                highlight: 0,
+                hidden_above: 0,
+                hidden_below: 0,
+            };
+        }
+
+        let highlight = self.candidate_highlight.min(visible.len() - 1);
+        let window_rows = max_rows.min(visible.len());
+        let start = if highlight < window_rows {
+            0
+        } else {
+            highlight + 1 - window_rows
+        };
+        let end = start + window_rows;
+        CandidateWindow {
+            items: visible[start..end].to_vec(),
+            highlight: highlight - start,
+            hidden_above: start,
+            hidden_below: visible.len() - end,
+        }
+    }
+
     /// Accept the currently highlighted candidate into `value`.
     pub(crate) fn accept_highlighted_candidate(&mut self) {
         let visible = self.visible_candidates();
@@ -366,7 +408,7 @@ mod tests {
             ignore: vec![],
             timeout: None,
             log: LogConfig::Stdout,
-            auto_run: true,
+            auto_run: crate::config::TaskAutoRun::Always,
             download: None,
             bazel: None,
             turbo: None,
@@ -594,5 +636,48 @@ mod tests {
         let got = field.visible_candidates();
         assert!(got.iter().any(|s| s == "beta"));
         assert!(!got.iter().any(|s| s == "gamma"));
+    }
+
+    #[test]
+    fn visible_candidate_window_scrolls_with_highlight() {
+        let mut field = Field::from_param(&TaskParam {
+            choices: vec![
+                "a0".into(),
+                "a1".into(),
+                "a2".into(),
+                "a3".into(),
+                "a4".into(),
+                "a5".into(),
+                "a6".into(),
+            ],
+            ..string_param("x")
+        });
+        field.candidate_highlight = 5;
+
+        let got = field.visible_candidate_window(5);
+        assert_eq!(got.items, vec!["a1", "a2", "a3", "a4", "a5"]);
+        assert_eq!(got.highlight, 4);
+        assert_eq!(got.hidden_above, 1);
+        assert_eq!(got.hidden_below, 1);
+    }
+
+    #[test]
+    fn accept_highlighted_candidate_uses_full_filtered_list() {
+        let mut field = Field::from_param(&TaskParam {
+            choices: vec![
+                "alpha".into(),
+                "beta".into(),
+                "gamma".into(),
+                "delta".into(),
+                "zeta".into(),
+                "theta".into(),
+            ],
+            ..string_param("x")
+        });
+        field.candidate_highlight = 5;
+
+        field.accept_highlighted_candidate();
+
+        assert_eq!(field.value, "theta");
     }
 }

@@ -16,7 +16,7 @@ pub mod task_state;
 pub mod tui;
 pub mod watch;
 
-pub use config::{Config, ConfigError, Platform};
+pub use config::{Config, ConfigError, Platform, TaskAutoRun};
 pub use duration::{DurationError, parse_duration};
 pub use output::{OutputError, OutputManager, ServiceWriter};
 pub use runner::{Runner, RunnerError, VerboseInfo};

@@ -115,7 +115,7 @@ depends_on = ["postgres"]
 watch = ["db/migrations/**/*.sql"]
 ```
 
-Set `auto_run = false` to defer execution — the task stays in `pending_run` on startup and on watched-file changes until you explicitly trigger it:
+Set `auto_run = false` to defer execution — when the task actually needs to run (because watched inputs changed, or another item depends on it), it moves to `pending_run` until you explicitly trigger it:
 
 ```toml
 [tasks.seed]
@@ -125,6 +125,65 @@ depends_on = ["migrate"]
 ```
 
 Run deferred tasks with `don run --all-pending` or from the TUI action palette.
+
+Set `auto_run = "once"` to run a task automatically on startup until it has
+one successful run, then require manual triggers forever after:
+
+```toml
+[tasks.bootstrap]
+cmd = "./scripts/bootstrap-db"
+auto_run = "once"
+depends_on = ["postgres"]
+```
+
+Tasks can also declare parameters. Parametrized tasks are interactive: values are supplied at run time via `don run <task> --<name>=<value>` or the TUI form, then substituted into `cmd`, `args`, `env`, and `dir` via `{{name}}` placeholders.
+
+```toml
+[tasks.sync]
+cmd = "sh"
+args = ["-c", "echo index={{index}} batch={{batch_size}} dry_run=$DON_PARAM_DRY_RUN"]
+auto_run = false
+
+[[tasks.sync.params]]
+name = "index"
+required = true
+
+[[tasks.sync.params]]
+name = "batch_size"
+kind = "int"
+default = "100"
+validate = { min = 1, max = 10000 }
+
+[[tasks.sync.params]]
+name = "dry_run"
+kind = "bool"
+default = "false"
+```
+
+Run it with:
+
+```sh
+don run sync --index=users --batch_size=500 --dry_run
+```
+
+Accepted CLI forms are `--name=value`, `--name value`, and bare `--flag` for bool params. Task params are also exported to the child process as `DON_PARAM_<NAME>` environment variables.
+
+For fixed or dynamic candidate values, use `choices` or `completions`:
+
+```toml
+[[tasks.deploy.params]]
+name = "environment"
+choices = ["dev", "staging", "prod"]
+
+[[tasks.deploy.params]]
+name = "service"
+
+[tasks.deploy.params.completions]
+cmd = "./scripts/list-services"
+args = ["--json"]
+parse = "json"
+cache = "5m"
+```
 
 ### Dependency Graph
 
@@ -422,7 +481,21 @@ See [`examples/`](examples/) for complete working configs.
 | `ready.unhealthy_after` | u32 | Consecutive monitor failures → Unhealthy (default: 3) |
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
 | `reload` | bool | Whether file-watch events restart the service (default: true) |
-| `auto_run` | bool | (tasks) Run automatically at startup and on watch events (default: true) |
+| `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
+| `params` | [[table]] | (tasks) Declare run-time parameters for interactive tasks |
+| `params.name` | string | Parameter name, referenced as `{{name}}` and passed as `--name=value` |
+| `params.prompt` | string | Optional prompt shown in the TUI form |
+| `params.required` | bool | Require an explicit value unless `default` is set |
+| `params.default` | string | Default value when the user omits the param |
+| `params.kind` | string | `"string"`, `"int"`, `"bool"`, or `"choice"` |
+| `params.choices` | [string] | Fixed candidate values; constrains the accepted set |
+| `params.validate.min` | i64 | Minimum allowed value for `kind = "int"` |
+| `params.validate.max` | i64 | Maximum allowed value for `kind = "int"` |
+| `params.completions.cmd` | string | Command to resolve dynamic candidate values |
+| `params.completions.args` | [string] | Arguments for the completions command |
+| `params.completions.parse` | string | Parse mode: `"lines"`, `"null_separated"`, or `"json"` |
+| `params.completions.cache` | string | Cache TTL for completion results |
+| `params.completions.timeout` | string | Completion command timeout (default: `"10s"`) |
 | `shutdown.signal` | string | Shutdown signal (default: "SIGTERM") |
 | `shutdown.timeout` | string | Grace period (default: "10s") |
 | `log` | string | Output routing: "stdout", "ignore", or a file path |

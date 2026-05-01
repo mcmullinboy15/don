@@ -37,6 +37,7 @@ pub enum TaskError {
 pub(crate) struct TaskSpawn {
     pub handle: crate::process::ProcessHandle,
     pub child_output: ChildOutput,
+    pub rendered_cmdline: String,
 }
 
 /// Spawn a task process. Does not wait for completion.
@@ -128,6 +129,7 @@ pub(crate) async fn spawn_task(
     Ok(TaskSpawn {
         handle,
         child_output,
+        rendered_cmdline: crate::output::format_cmdline(&cmd_str, &args),
     })
 }
 

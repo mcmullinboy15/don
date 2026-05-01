@@ -7,6 +7,61 @@ use super::param::TaskParam;
 use super::platform::Platform;
 use super::types::{BazelConfig, LogConfig, TurboConfig};
 
+/// Automatic run policy for a task.
+///
+/// This controls whether don may start the task without an explicit manual
+/// trigger when the task is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskAutoRun {
+    /// Run automatically whenever the runner decides the task is needed.
+    #[default]
+    Always,
+    /// Never run automatically; move to `PendingRun` instead.
+    Never,
+    /// Run automatically only on startup, and only until the task has one
+    /// successful run recorded. After that, the task becomes manual forever
+    /// unless the user explicitly triggers it.
+    Once,
+}
+
+impl TaskAutoRun {
+    pub(crate) fn runs_automatically_on_startup(self, has_success: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Once => !has_success,
+        }
+    }
+
+    pub(crate) fn runs_automatically_on_watch(self) -> bool {
+        matches!(self, Self::Always)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskAutoRun {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawTaskAutoRun {
+            Bool(bool),
+            String(String),
+        }
+
+        match RawTaskAutoRun::deserialize(deserializer)? {
+            RawTaskAutoRun::Bool(true) => Ok(TaskAutoRun::Always),
+            RawTaskAutoRun::Bool(false) => Ok(TaskAutoRun::Never),
+            RawTaskAutoRun::String(value) => match value.as_str() {
+                "always" => Ok(TaskAutoRun::Always),
+                "never" => Ok(TaskAutoRun::Never),
+                "once" => Ok(TaskAutoRun::Once),
+                _ => Err(serde::de::Error::custom(format!(
+                    "unknown auto_run value '{value}', expected true, false, \"always\", \"never\", or \"once\""
+                ))),
+            },
+        }
+    }
+}
+
 /// A one-shot task that runs to completion.
 ///
 /// Tasks can depend on services (waits for ready) and other tasks.
@@ -39,11 +94,17 @@ pub struct Task {
     #[serde(default)]
     pub log: LogConfig,
     /// Whether the task runs automatically.
-    /// When false, the task starts in a pending state (both at startup and on
-    /// file-watch changes) and must be triggered manually via `don run --all-pending`.
-    /// Defaults to true.
-    #[serde(default = "default_auto_run")]
-    pub auto_run: bool,
+    ///
+    /// Supported values:
+    /// - `true` / `"always"`: run automatically whenever needed
+    /// - `false` / `"never"`: never auto-run; enter `PendingRun` when needed
+    /// - `"once"`: auto-run on startup until the first successful run, then
+    ///   become manual forever unless explicitly triggered
+    ///
+    /// “Needed” means a dependent is waiting on the task, or watched inputs
+    /// have changed. Defaults to `true`.
+    #[serde(default)]
+    pub auto_run: TaskAutoRun,
     /// Optional download configuration — artifacts to fetch before running.
     /// When a download exists for the current platform, its binary path
     /// replaces `cmd`. Without a matching platform entry, `cmd` is looked up on PATH.
@@ -55,9 +116,10 @@ pub struct Task {
     /// Mutually exclusive with `bazel`.
     pub turbo: Option<TurboConfig>,
     /// Optional parameter declarations. When non-empty, the task is
-    /// considered "interactive" — file-watch changes park it in
-    /// `PendingRun` instead of auto-running, and the user supplies values
-    /// via `don run <task> --<name>=<value>` or the TUI form.
+    /// considered "interactive" — when the task is needed, file-watch
+    /// changes or dependent startup will park it in `PendingRun` instead
+    /// of auto-running, and the user supplies values via `don run <task>
+    /// --<name>=<value>` or the TUI form.
     /// Values substitute into `cmd`/`args`/`env`/`dir` via `{{name}}`
     /// placeholders.
     #[serde(default)]
@@ -93,8 +155,4 @@ impl Task {
         };
         Ok(executable)
     }
-}
-
-fn default_auto_run() -> bool {
-    true
 }

@@ -315,10 +315,7 @@ async fn follow_lines(
             continue;
         }
         // Parse chunked transfer encoding: <size hex>\r\n<data>\r\n...
-        loop {
-            let Some(rn) = buffer.windows(2).position(|w| w == b"\r\n") else {
-                break;
-            };
+        while let Some(rn) = buffer.windows(2).position(|w| w == b"\r\n") {
             let size_str = std::str::from_utf8(&buffer[..rn]).unwrap_or("").trim();
             let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
             if size == 0 {

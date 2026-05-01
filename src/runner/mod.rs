@@ -14,7 +14,7 @@ pub mod task;
 
 pub(crate) use params::resolve_task_params;
 
-use crate::config::{Config, Platform};
+use crate::config::{Config, Platform, TaskAutoRun};
 use crate::output::OutputManager;
 use crate::process::pid_file::PidFile;
 use crate::runner::service::stop_service;
@@ -50,7 +50,7 @@ enum TaskRunIntent {
 
 #[derive(Clone, Copy)]
 enum TaskRunMode {
-    Startup,
+    Startup { has_dependents: bool },
     Triggered,
 }
 
@@ -113,7 +113,7 @@ struct BatchBuildReplayItem {
 
 enum TaskRunPrepared {
     PendingRun { message: String },
-    Skipped,
+    Skipped { message: String },
     Spawned(Box<task::TaskSpawn>),
 }
 
@@ -217,16 +217,9 @@ pub enum TaskItemState {
     /// A transitive dependency failed, so we never ran this task. See
     /// [`ServiceState::DependencyFailed`] for the rationale.
     DependencyFailed,
-    /// The task is waiting for a manual trigger via `don run --all-pending`.
-    /// Set at startup when `auto_run = false`, or on file-watch changes for
-    /// such tasks.
+    /// The task is waiting for a manual trigger. Dependency satisfaction also
+    /// depends on task history and auto-run policy.
     PendingRun,
-}
-
-impl TaskItemState {
-    pub(crate) fn is_satisfied(&self) -> bool {
-        matches!(self, Self::Completed | Self::Skipped | Self::PendingRun)
-    }
 }
 
 /// An item in the dependency graph — either a service or a task.
@@ -934,19 +927,8 @@ async fn run_task_worker(
         emitter,
         global_watch_ignore,
     } = ctx;
-    if matches!(mode, TaskRunMode::Startup) {
-        if !task_cfg.auto_run {
-            return Ok(TaskRunPrepared::PendingRun {
-                message: "pending — auto_run = false".to_string(),
-            });
-        }
-        if !task_cfg.params.is_empty() {
-            return Ok(TaskRunPrepared::PendingRun {
-                message: "pending — task has params, run manually".to_string(),
-            });
-        }
-
-        let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
+    if let TaskRunMode::Startup { has_dependents } = mode {
+        let has_watch = !task_cfg.watch.is_empty();
         let watch_base = working_dir_for(&base_dir, task_cfg.dir.as_deref());
         let ignore_patterns = resolve_watch_ignore_patterns(
             &watch_base,
@@ -954,12 +936,65 @@ async fn run_task_worker(
             &base_dir,
             &global_watch_ignore,
         );
-        let needs_run = task_state
-            .needs_run(name, &task_cfg.watch, &ignore_patterns, Some(&watch_base))
-            .await
-            .unwrap_or(true);
-        if !needs_run {
-            return Ok(TaskRunPrepared::Skipped);
+        let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
+        let needs_watch_run = if has_watch {
+            task_state
+                .needs_run(name, &task_cfg.watch, &ignore_patterns, Some(&watch_base))
+                .await
+                .unwrap_or(true)
+        } else {
+            false
+        };
+        let has_success = task_state.has_success(name).await.unwrap_or(false);
+        if has_watch && !needs_watch_run {
+            return Ok(TaskRunPrepared::Skipped {
+                message: "skipped (no changes)".to_string(),
+            });
+        }
+
+        let should_run_or_prompt = if !task_cfg.params.is_empty() {
+            needs_watch_run || (!has_success && has_dependents)
+        } else {
+            match task_cfg.auto_run {
+                TaskAutoRun::Always => !has_watch || needs_watch_run,
+                TaskAutoRun::Never => !has_success && (has_dependents || needs_watch_run),
+                TaskAutoRun::Once => !has_success || needs_watch_run,
+            }
+        };
+        if !should_run_or_prompt {
+            return Ok(TaskRunPrepared::Skipped {
+                message: "skipped (not needed)".to_string(),
+            });
+        }
+        if !task_cfg.params.is_empty() {
+            return Ok(TaskRunPrepared::PendingRun {
+                message: if has_dependents {
+                    "pending — required by dependents, task has params".to_string()
+                } else {
+                    "pending — watch inputs changed, task has params".to_string()
+                },
+            });
+        }
+        if !task_cfg.auto_run.runs_automatically_on_startup(has_success) {
+            return Ok(TaskRunPrepared::PendingRun {
+                message: match task_cfg.auto_run {
+                    TaskAutoRun::Always => "pending — run manually".to_string(),
+                    TaskAutoRun::Never => {
+                        if has_dependents {
+                            "pending — required by dependents, run manually".to_string()
+                        } else {
+                            "pending — watch inputs changed, auto_run = false".to_string()
+                        }
+                    }
+                    TaskAutoRun::Once => {
+                        if has_dependents {
+                            "pending — required by dependents, auto_run = once".to_string()
+                        } else {
+                            "pending — watch inputs changed, auto_run = once".to_string()
+                        }
+                    }
+                },
+            });
         }
     }
 
@@ -1698,12 +1733,17 @@ impl Runner {
             }
         }
 
+        let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
         let mut tasks = HashMap::new();
         for (name, task) in &config.tasks {
             if active_tasks.contains(name) {
                 let mut task = task.clone();
                 task.depends_on = config.expand_dependency_refs(&task.depends_on);
-                tasks.insert(name.clone(), RuntimeTask::new(task, TaskItemState::Pending));
+                let has_success = task_state.has_success(name).await.unwrap_or(false);
+                tasks.insert(
+                    name.clone(),
+                    RuntimeTask::new(task, TaskItemState::Pending, has_success),
+                );
             }
         }
 
@@ -2573,18 +2613,22 @@ impl Runner {
                 }
             } else if self.tasks.contains_key(&name)
                 && let Some(task_cfg) = self.tasks.get(&name).map(|rt| rt.config.clone())
-                && let Err(e) = self.spawn_task_worker(
+            {
+                let has_dependents = dep_map
+                    .values()
+                    .any(|deps| deps.iter().any(|dep| dep == &name));
+                if let Err(e) = self.spawn_task_worker(
                     &name,
                     task_cfg,
                     HashMap::new(),
-                    TaskRunMode::Startup,
+                    TaskRunMode::Startup { has_dependents },
                     TaskRunIntent::Startup {
                         done_tx: done_tx.clone(),
                     },
-                )
-            {
-                self.output_manager
-                    .service_error_event(&name, &e.to_string());
+                ) {
+                    self.output_manager
+                        .service_error_event(&name, &e.to_string());
+                }
             }
         }
 
@@ -2819,13 +2863,13 @@ impl Runner {
         true
     }
 
-    /// Check if a dependency is satisfied (ready service or completed task).
+    /// Check if a dependency is satisfied.
     fn is_dep_satisfied(&self, dep: &str) -> bool {
         if let Some(rs) = self.services.get(dep) {
             return rs.state().is_satisfied();
         }
         if let Some(rt) = self.tasks.get(dep) {
-            return rt.state().is_satisfied();
+            return rt.dependency_satisfied();
         }
         false
     }
@@ -2849,9 +2893,10 @@ impl Runner {
         false
     }
 
-    /// Re-queue items stranded in `DependencyFailed` once no upstream
-    /// dependency is failed anymore. They remain `Pending` until the normal
-    /// pending-item sweep sees all dependencies as satisfied and starts them.
+    /// Re-queue items stranded in `DependencyFailed` once every upstream
+    /// dependency is satisfied. A dependency that is merely retrying is not
+    /// enough; starting descendants before it reaches Ready violates the
+    /// same dependency contract that stranded them in the first place.
     fn restore_dependency_failed_items(&mut self) -> bool {
         let dep_map = self.build_dep_map();
         let order = match topological_sort(&dep_map) {
@@ -2875,6 +2920,9 @@ impl Runner {
 
             let deps = dep_map.get(&name).cloned().unwrap_or_default();
             if deps.iter().any(|dep| self.is_dep_failed(dep)) {
+                continue;
+            }
+            if deps.iter().any(|dep| !self.is_dep_satisfied(dep)) {
                 continue;
             }
 
@@ -3077,6 +3125,7 @@ impl Runner {
                             success,
                             message: ready_result.err().map(|e| e.to_string()),
                             elapsed: None,
+                            task_run_generation: None,
                         })
                         .await;
                 } else {
@@ -3098,6 +3147,7 @@ impl Runner {
                     success: true,
                     message: None,
                     elapsed: None,
+                    task_run_generation: None,
                 })
                 .await;
         } else {
@@ -3175,6 +3225,7 @@ impl Runner {
                 let task::TaskSpawn {
                     handle,
                     child_output,
+                    rendered_cmdline: _rendered_cmdline,
                 } = *spawn;
                 drop(child_output);
                 tokio::spawn(async move {
@@ -3195,6 +3246,9 @@ impl Runner {
 
         match result {
             Ok(TaskRunPrepared::PendingRun { message }) => {
+                if let Some(rt) = self.tasks.get_mut(name) {
+                    rt.set_needs_run_now(true);
+                }
                 self.set_task_state(name, TaskItemState::PendingRun);
                 self.output_manager.service_event(name, &message);
                 if let TaskRunIntent::Startup { done_tx } = intent {
@@ -3205,14 +3259,17 @@ impl Runner {
                             success: true,
                             message: None,
                             elapsed: None,
+                            task_run_generation: None,
                         })
                         .await;
                 }
             }
-            Ok(TaskRunPrepared::Skipped) => {
+            Ok(TaskRunPrepared::Skipped { message }) => {
+                if let Some(rt) = self.tasks.get_mut(name) {
+                    rt.set_needs_run_now(false);
+                }
                 self.set_task_state(name, TaskItemState::Skipped);
-                self.output_manager
-                    .service_event(name, "skipped (no changes)");
+                self.output_manager.service_event(name, &message);
                 if let TaskRunIntent::Startup { done_tx } = intent {
                     let _ = done_tx
                         .send(ItemDone {
@@ -3221,15 +3278,23 @@ impl Runner {
                             success: true,
                             message: None,
                             elapsed: None,
+                            task_run_generation: None,
                         })
                         .await;
                 }
             }
             Ok(TaskRunPrepared::Spawned(spawn)) => {
+                if matches!(intent, TaskRunIntent::Startup { .. })
+                    && let Some(rt) = self.tasks.get_mut(name)
+                {
+                    rt.set_needs_run_now(true);
+                }
                 self.output_manager.service_debug_event(
                     name,
                     &format!("process spawned (pid {})", spawn.handle.pgid()),
                 );
+                self.output_manager
+                    .service_event(name, &format!("spawn {}", spawn.rendered_cmdline));
                 let done_tx = match intent {
                     TaskRunIntent::Startup { done_tx } => {
                         self.output_manager.service_event(name, "running...");
@@ -3242,6 +3307,11 @@ impl Runner {
                     .await;
             }
             Err(message) => {
+                if matches!(intent, TaskRunIntent::Startup { .. })
+                    && let Some(rt) = self.tasks.get_mut(name)
+                {
+                    rt.set_needs_run_now(true);
+                }
                 self.set_task_state(name, TaskItemState::Failed);
                 self.output_manager.service_error_event(name, &message);
                 match intent {
@@ -3253,6 +3323,7 @@ impl Runner {
                                 success: false,
                                 message: Some(message),
                                 elapsed: None,
+                                task_run_generation: None,
                             })
                             .await;
                     }
@@ -3283,6 +3354,7 @@ impl Runner {
         let task::TaskSpawn {
             mut handle,
             child_output,
+            rendered_cmdline: _rendered_cmdline,
         } = spawn;
 
         let pgid = handle.pgid();
@@ -3357,6 +3429,7 @@ impl Runner {
                         success,
                         message,
                         elapsed: Some(elapsed),
+                        task_run_generation: None,
                     })
                     .await;
             } else {
@@ -4124,6 +4197,7 @@ impl Runner {
                                 success: false,
                                 message: Some(message),
                                 elapsed: None,
+                                task_run_generation: None,
                             })
                             .await;
                     }
@@ -4637,10 +4711,7 @@ impl Runner {
                 return;
             }
         };
-        if matches!(
-            state,
-            ServiceState::Lazy | ServiceState::Stopped | ServiceState::Failed
-        ) {
+        if matches!(state, ServiceState::Lazy | ServiceState::Stopped) {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
         }
@@ -5039,10 +5110,11 @@ impl Runner {
 
     /// Handle a file-watch-triggered task re-run.
     ///
-    /// Respects `auto_run = false` — tasks that have opted out transition to
-    /// `PendingRun` instead of spawning. Explicit-run paths (the user
-    /// triggering a task via `don run <name>` or `--all-pending`) bypass
-    /// this gate by calling [`spawn_task_rerun`] directly.
+    /// Respects the task's auto-run policy — tasks that should not auto-rerun
+    /// from a watch event transition to `PendingRun` instead of spawning.
+    /// Explicit-run paths (the user triggering a task via `don run <name>` or
+    /// `--all-pending`) bypass this gate by calling [`spawn_task_rerun`]
+    /// directly.
     async fn handle_task_rerun(&mut self, name: &str) {
         let task_cfg = match self.tasks.get(name) {
             Some(rt) => rt.config.clone(),
@@ -5073,12 +5145,20 @@ impl Runner {
         // a matching file changed. The hash check is only needed at startup
         // (to skip tasks whose inputs haven't changed since the last run).
 
-        // If the task has opted out of auto-reruns, mark it pending and don't spawn.
-        // The user will need to trigger a manual rerun when they're ready.
-        if !task_cfg.auto_run {
+        // Only `auto_run = true` / `"always"` allows watch-triggered reruns.
+        // `"once"` is intentionally startup-only, and `false` / `"never"`
+        // keeps the task manual forever.
+        if !task_cfg.auto_run.runs_automatically_on_watch() {
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.set_needs_run_now(true);
+            }
             self.set_task_state(name, TaskItemState::PendingRun);
-            self.output_manager
-                .service_event(name, "files changed (pending — auto_run = false)");
+            let message = match task_cfg.auto_run {
+                TaskAutoRun::Always => "files changed (pending)",
+                TaskAutoRun::Never => "files changed (pending — auto_run = false)",
+                TaskAutoRun::Once => "files changed (pending — auto_run = once)",
+            };
+            self.output_manager.service_event(name, message);
             let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
                 name: name.to_string(),
                 success: true,
@@ -5090,6 +5170,9 @@ impl Runner {
         // triggers park them in PendingRun so the user can run them explicitly
         // (via the palette's form or `don run <task> --<param>=<value>`).
         if !task_cfg.params.is_empty() {
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.set_needs_run_now(true);
+            }
             self.set_task_state(name, TaskItemState::PendingRun);
             self.output_manager.service_event(
                 name,
@@ -5128,6 +5211,7 @@ impl Runner {
     ) {
         if let Some(rt) = self.tasks.get_mut(name) {
             rt.last_params = params.clone();
+            rt.set_needs_run_now(true);
         }
         // Release attach lock and close follow sinks so any active attach
         // session exits cleanly before the new process starts.
@@ -5391,6 +5475,14 @@ impl Runner {
     }
 
     fn handle_task_done(&mut self, item: &ItemDone) {
+        if let Some(task_generation) = item.task_run_generation
+            && self
+                .tasks
+                .get(&item.name)
+                .is_some_and(|rt| rt.run_generation != task_generation)
+        {
+            return;
+        }
         if let Some(rt) = self.tasks.get_mut(&item.name)
             && rt.pgid.take().is_some()
         {
@@ -5403,7 +5495,16 @@ impl Runner {
 
         if item.success {
             let cur = self.tasks.get(&item.name).map(|rt| rt.state());
-            if cur != Some(TaskItemState::Skipped) && cur != Some(TaskItemState::PendingRun) {
+            if cur != Some(TaskItemState::Skipped)
+                && cur != Some(TaskItemState::PendingRun)
+                && let Some(rt) = self.tasks.get_mut(&item.name)
+            {
+                rt.mark_success();
+            }
+            if cur != Some(TaskItemState::Skipped)
+                && cur != Some(TaskItemState::PendingRun)
+                && cur != Some(TaskItemState::Completed)
+            {
                 self.set_task_state(&item.name, TaskItemState::Completed);
                 let msg = if timing.is_empty() {
                     "complete".to_string()
@@ -5414,6 +5515,9 @@ impl Runner {
             }
             self.unblock_dependency_failed_items();
         } else {
+            if let Some(rt) = self.tasks.get_mut(&item.name) {
+                rt.set_needs_run_now(true);
+            }
             self.set_task_state(&item.name, TaskItemState::Failed);
             if let Some(ref err_msg) = item.message {
                 let msg = if timing.is_empty() {
@@ -5446,6 +5550,9 @@ impl Runner {
 
         let timing = elapsed.map(format_duration).unwrap_or_default();
         if success {
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.mark_success();
+            }
             self.set_task_state(name, TaskItemState::Completed);
             self.unblock_dependency_failed_items();
             let msg = if timing.is_empty() {
@@ -5454,7 +5561,26 @@ impl Runner {
                 format!("complete ({timing})")
             };
             self.output_manager.service_event(name, &msg);
+            let run_generation = self.tasks.get(name).map(|rt| rt.run_generation);
+            if let Some(done_tx) = self.done_tx.clone() {
+                let name = name.to_string();
+                tokio::spawn(async move {
+                    let _ = done_tx
+                        .send(ItemDone {
+                            name,
+                            kind: NodeKind::Task,
+                            success: true,
+                            message: None,
+                            elapsed: None,
+                            task_run_generation: run_generation,
+                        })
+                        .await;
+                });
+            }
         } else {
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.set_needs_run_now(true);
+            }
             self.set_task_state(name, TaskItemState::Failed);
             if let Some(ref err_msg) = message {
                 let msg = if timing.is_empty() {
@@ -6672,6 +6798,10 @@ struct ItemDone {
     message: Option<String>,
     /// How long the item took (for tasks).
     elapsed: Option<std::time::Duration>,
+    /// Run generation for manually-triggered task completions that need to
+    /// re-notify startup dependency resolution. `None` for normal startup
+    /// item completions.
+    task_run_generation: Option<u64>,
 }
 
 #[cfg(test)]
@@ -7272,7 +7402,7 @@ mod tests {
                 ignore: Vec::new(),
                 timeout: None,
                 log: LogConfig::Stdout,
-                auto_run: true,
+                auto_run: crate::config::TaskAutoRun::Always,
                 download: None,
                 bazel: None,
                 turbo: None,
@@ -7280,6 +7410,7 @@ mod tests {
                 hidden: false,
             },
             TaskItemState::Pending,
+            false,
         );
 
         assert_eq!(rt.state(), TaskItemState::Pending);

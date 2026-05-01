@@ -174,7 +174,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(
-            " don status — [j/k ↑↓] move  [enter] start/stop  [r] restart  [R] restart all failed  [/] filter  [esc] clear filter/dismiss ",
+            " don status — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] restart all failed  [/] filter  [esc] clear filter/dismiss ",
         );
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -649,29 +649,6 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
     spans
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    fn line_text(line: Line<'static>) -> String {
-        line.spans
-            .into_iter()
-            .map(|span| span.content.into_owned())
-            .collect::<Vec<String>>()
-            .join("")
-    }
-
-    #[test]
-    fn shutdown_bar_hides_interactive_controls() {
-        let text = line_text(shutdown_bar_line(&StatusCounts::default(), 0));
-        assert!(text.contains("shutting down"));
-        assert!(!text.contains("[/] logs"));
-        assert!(!text.contains("[t] tasks"));
-        assert!(!text.contains("[s] status"));
-    }
-}
-
 fn service_state_label(state: ServiceState) -> &'static str {
     match state {
         ServiceState::Pending => "pending",
@@ -761,7 +738,7 @@ fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
     };
 
     let title = format!(
-        " Run {}  — [tab] next/refresh  [↑↓] move  [enter] next/submit  [ctrl-enter] submit  [esc] cancel ",
+        " Run {}  — [tab] next/refresh  [↑↓] move  [enter] accept/next/submit  [ctrl-enter] submit  [esc] cancel ",
         form.task
     );
     let outer = Block::default().borders(Borders::ALL).title(title);
@@ -784,7 +761,9 @@ fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
     let mut used = 0usize;
     for (idx, field) in form.fields.iter().enumerate() {
         let is_focused = idx == form.focus;
-        let field_rows = field_render_rows(field, is_focused);
+        let remaining_fields = form.fields.len().saturating_sub(idx + 1);
+        let max_rows_for_field = available.saturating_sub(used + remaining_fields);
+        let field_rows = field_render_rows(field, is_focused, max_rows_for_field);
         if used + field_rows.len() > available {
             break;
         }
@@ -816,7 +795,7 @@ fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
                 .map(|f| match f.kind {
                     ParamKind::Bool => "space flips the toggle",
                     ParamKind::Int => "↑/↓ steps the value",
-                    _ => "↑/↓ selects candidate · → accepts",
+                    _ => "↑/↓ selects candidate · enter/→ accepts",
                 })
                 .unwrap_or("");
             Line::from(vec![dim(hint)])
@@ -829,7 +808,11 @@ fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
 
 /// Build the lines for one field — at least one row for the input itself,
 /// plus optional dropdown rows when the field is focused and has candidates.
-fn field_render_rows(field: &super::form::Field, is_focused: bool) -> Vec<Line<'static>> {
+fn field_render_rows(
+    field: &super::form::Field,
+    is_focused: bool,
+    max_total_rows: usize,
+) -> Vec<Line<'static>> {
     use super::form::CandidateState;
     use crate::config::ParamKind;
 
@@ -866,6 +849,9 @@ fn field_render_rows(field: &super::form::Field, is_focused: bool) -> Vec<Line<'
         Span::styled(value_str, Style::default().fg(Color::White)),
         Span::styled(cursor, Style::default().fg(Color::DarkGray)),
     ]));
+    if lines.len() >= max_total_rows {
+        return lines;
+    }
 
     // Error / status banner.
     match &field.candidates {
@@ -884,12 +870,29 @@ fn field_render_rows(field: &super::form::Field, is_focused: bool) -> Vec<Line<'
         }
         _ => {}
     }
+    if lines.len() >= max_total_rows {
+        return lines;
+    }
 
     if is_focused {
-        let visible = field.visible_candidates();
-        let cap = 5.min(visible.len());
-        for (i, cand) in visible.iter().take(cap).enumerate() {
-            let style = if i == field.candidate_highlight.min(cap.saturating_sub(1)) {
+        let remaining_rows = max_total_rows.saturating_sub(lines.len());
+        let candidate_rows = remaining_rows.min(field.visible_candidates().len());
+        if candidate_rows == 0 {
+            return lines;
+        }
+        let window = field.visible_candidate_window(candidate_rows);
+        let spare_rows = remaining_rows.saturating_sub(window.items.len());
+        let show_above = window.hidden_above > 0 && spare_rows >= 2;
+        let show_below = window.hidden_below > 0 && spare_rows > usize::from(show_above);
+
+        if show_above {
+            lines.push(Line::from(dim(format!(
+                "    … {} above",
+                window.hidden_above
+            ))));
+        }
+        for (i, cand) in window.items.iter().enumerate() {
+            let style = if i == window.highlight {
                 Style::default()
                     .bg(Color::DarkGray)
                     .fg(Color::White)
@@ -899,13 +902,79 @@ fn field_render_rows(field: &super::form::Field, is_focused: bool) -> Vec<Line<'
             };
             lines.push(Line::from(Span::styled(format!("    {cand}"), style)));
         }
-        if visible.len() > cap {
+        if show_below {
             lines.push(Line::from(dim(format!(
                 "    … {} more",
-                visible.len() - cap
+                window.hidden_below
             ))));
         }
     }
 
     lines
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::config::ParamKind;
+    use crate::tui::form::{CandidateState, Field};
+
+    fn line_text(line: Line<'static>) -> String {
+        line.spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    #[test]
+    fn shutdown_bar_hides_interactive_controls() {
+        let text = line_text(shutdown_bar_line(&StatusCounts::default(), 0));
+        assert!(text.contains("shutting down"));
+        assert!(!text.contains("[/] logs"));
+        assert!(!text.contains("[t] tasks"));
+        assert!(!text.contains("[s] status"));
+    }
+
+    #[test]
+    fn focused_field_uses_available_space_for_candidates() {
+        let field = Field {
+            name: "index".into(),
+            prompt: "index".into(),
+            required: false,
+            kind: ParamKind::String,
+            value: String::new(),
+            static_choices: vec![
+                "c0".into(),
+                "c1".into(),
+                "c2".into(),
+                "c3".into(),
+                "c4".into(),
+                "c5".into(),
+                "c6".into(),
+            ],
+            has_dynamic_completions: false,
+            candidates: CandidateState::Static(vec![
+                "c0".into(),
+                "c1".into(),
+                "c2".into(),
+                "c3".into(),
+                "c4".into(),
+                "c5".into(),
+                "c6".into(),
+            ]),
+            candidate_highlight: 0,
+            error: None,
+            int_min: None,
+            int_max: None,
+        };
+
+        let rows = field_render_rows(&field, true, 8);
+        let texts: Vec<String> = rows.into_iter().map(line_text).collect();
+
+        assert_eq!(texts.len(), 8);
+        assert!(texts.iter().any(|t| t.contains("c0")));
+        assert!(texts.iter().any(|t| t.contains("c6")));
+    }
 }

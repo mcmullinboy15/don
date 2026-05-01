@@ -58,12 +58,18 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # depends_on = ["postgres"]
 # watch = ["db/migrations/**/*.sql"]
 
-# Set auto_run = false to defer execution — trigger with `don run <name>`
-# or `don run --all-pending`.
+# Set auto_run = false to defer execution — when the task needs to run,
+# trigger it with `don run <name>` or `don run --all-pending`.
 # [tasks.seed]
 # cmd = "./scripts/seed-db"
 # auto_run = false
 # depends_on = ["migrate"]
+
+# Set auto_run = "once" to auto-run on startup until the first successful run,
+# then require manual triggers forever after.
+# [tasks.bootstrap]
+# cmd = "./scripts/bootstrap-db"
+# auto_run = "once"
 
 # ── Profiles ────────────────────────────────────────────────────────────────
 # Named subsets for focused work. Transitive deps are included automatically.

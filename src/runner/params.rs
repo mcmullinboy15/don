@@ -135,7 +135,7 @@ mod tests {
             ignore: vec![],
             timeout: None,
             log: crate::config::LogConfig::Stdout,
-            auto_run: true,
+            auto_run: crate::config::TaskAutoRun::Always,
             download: None,
             bazel: None,
             turbo: None,

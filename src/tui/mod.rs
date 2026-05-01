@@ -65,7 +65,7 @@ use backend::FixedBottomBackend;
 
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
-use crate::runner::{RunnerCommand, RunnerEvent, ServiceState};
+use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState};
 use app::{App, OverlayItem, ViewMode};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
@@ -511,7 +511,9 @@ fn handle_key(
         ViewMode::Normal => handle_normal_key(key, app, terminal, store, modal)?,
         ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
         ViewMode::Palette => handle_palette_key(key, app, terminal, store, command_tx, modal)?,
-        ViewMode::Overlay => handle_overlay_key(key, app, terminal, store, command_tx, modal)?,
+        ViewMode::Overlay => {
+            handle_overlay_key(key, app, terminal, store, command_tx, controls, modal)?;
+        }
         ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
     }
     Ok(())
@@ -730,6 +732,7 @@ fn handle_overlay_key(
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
     command_tx: &mpsc::Sender<RunnerCommand>,
+    controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     const PAGE: usize = 10;
@@ -798,15 +801,14 @@ fn handle_overlay_key(
         KeyCode::Enter => {
             // Start or stop the highlighted service, depending on its state.
             if let Some(cmd) = overlay_toggle_command(app) {
-                dispatch_runner_command(command_tx, cmd);
+                dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
             }
         }
         KeyCode::Char('r') => {
             // Restart the highlighted service, if it's in a state that can
             // be restarted.
-            if let Some(name) = highlighted_service_for_restart(app) {
-                let (reply, _rx) = oneshot::channel();
-                dispatch_runner_command(command_tx, RunnerCommand::Restart { name, reply });
+            if let Some(cmd) = highlighted_service_restart_command(app) {
+                dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
             }
         }
         KeyCode::Char('R') => {
@@ -821,8 +823,8 @@ fn handle_overlay_key(
                 .map(|(n, _)| n.clone())
                 .collect();
             for name in failed {
-                let (reply, _rx) = oneshot::channel();
-                dispatch_runner_command(command_tx, RunnerCommand::Restart { name, reply });
+                let cmd = overlay_restart_command(name);
+                dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
             }
         }
         KeyCode::Esc => {
@@ -846,7 +848,7 @@ fn handle_overlay_key(
 /// Build the Start/Stop command for the highlighted row, if it's an
 /// actionable service. Returns `None` for tasks, in-flight services, or
 /// when no row is highlighted.
-fn overlay_toggle_command(app: &App) -> Option<RunnerCommand> {
+fn overlay_toggle_command(app: &App) -> Option<OverlayCommand> {
     let items = app.overlay_items();
     let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
     let item = items.get(idx)?;
@@ -855,21 +857,11 @@ fn overlay_toggle_command(app: &App) -> Option<RunnerCommand> {
     };
     match state {
         ServiceState::Ready | ServiceState::Running | ServiceState::Unhealthy => {
-            let (reply, _rx) = oneshot::channel();
-            Some(RunnerCommand::Stop {
-                name: name.clone(),
-                reply,
-            })
+            Some(overlay_stop_command(name.clone()))
         }
-        ServiceState::Stopped
-        | ServiceState::Failed
-        | ServiceState::DependencyFailed
-        | ServiceState::Lazy => {
-            let (reply, _rx) = oneshot::channel();
-            Some(RunnerCommand::Start {
-                name: name.clone(),
-                reply,
-            })
+        ServiceState::Stopped | ServiceState::Lazy => Some(overlay_start_command(name.clone())),
+        ServiceState::Failed | ServiceState::DependencyFailed => {
+            Some(overlay_restart_command(name.clone()))
         }
         ServiceState::Pending
         | ServiceState::Building
@@ -878,8 +870,8 @@ fn overlay_toggle_command(app: &App) -> Option<RunnerCommand> {
     }
 }
 
-/// Service name for `r` (restart) — only services in a restartable state.
-fn highlighted_service_for_restart(app: &App) -> Option<String> {
+/// Restart command for `r` — only services in a restartable state.
+fn highlighted_service_restart_command(app: &App) -> Option<OverlayCommand> {
     let items = app.overlay_items();
     let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
     let item = items.get(idx)?;
@@ -892,17 +884,70 @@ fn highlighted_service_for_restart(app: &App) -> Option<String> {
         | ServiceState::Unhealthy
         | ServiceState::Failed
         | ServiceState::DependencyFailed
-        | ServiceState::Stopped => Some(name.clone()),
+        | ServiceState::Stopped => Some(overlay_restart_command(name.clone())),
         _ => None,
     }
 }
 
-/// Send a `RunnerCommand` without waiting for the reply. Mirrors the
-/// fire-and-forget pattern used by `dispatch_action`.
-fn dispatch_runner_command(command_tx: &mpsc::Sender<RunnerCommand>, cmd: RunnerCommand) {
+struct OverlayCommand {
+    name: String,
+    action: &'static str,
+    command: RunnerCommand,
+    reply: oneshot::Receiver<CommandResult>,
+}
+
+fn overlay_start_command(name: String) -> OverlayCommand {
+    let (reply, rx) = oneshot::channel();
+    OverlayCommand {
+        name: name.clone(),
+        action: "start",
+        command: RunnerCommand::Start { name, reply },
+        reply: rx,
+    }
+}
+
+fn overlay_stop_command(name: String) -> OverlayCommand {
+    let (reply, rx) = oneshot::channel();
+    OverlayCommand {
+        name: name.clone(),
+        action: "stop",
+        command: RunnerCommand::Stop { name, reply },
+        reply: rx,
+    }
+}
+
+fn overlay_restart_command(name: String) -> OverlayCommand {
+    let (reply, rx) = oneshot::channel();
+    OverlayCommand {
+        name: name.clone(),
+        action: "restart",
+        command: RunnerCommand::Restart { name, reply },
+        reply: rx,
+    }
+}
+
+fn dispatch_overlay_command(
+    command_tx: &mpsc::Sender<RunnerCommand>,
+    emitter: &LifecycleEmitter,
+    pending: OverlayCommand,
+) {
     let command_tx = command_tx.clone();
+    let emitter = emitter.clone();
     tokio::spawn(async move {
-        let _ = command_tx.send(cmd).await;
+        emitter.service_event(&pending.name, &format!("{} requested", pending.action));
+        if command_tx.send(pending.command).await.is_err() {
+            emitter.service_error_event(&pending.name, "control failed: runner unavailable");
+            return;
+        }
+        match pending.reply.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => emitter
+                .service_error_event(&pending.name, &format!("{} failed: {e}", pending.action)),
+            Err(_) => emitter.service_error_event(
+                &pending.name,
+                &format!("{} failed: runner dropped reply", pending.action),
+            ),
+        }
     });
 }
 
@@ -1112,6 +1157,13 @@ fn handle_form_key(
             return Ok(());
         }
         KeyCode::Enter => {
+            if let Some(form) = app.form.as_mut()
+                && let Some(field) = form.focused_mut()
+                && !matches!(field.kind, ParamKind::Bool)
+                && !field.visible_candidates().is_empty()
+            {
+                field.accept_highlighted_candidate();
+            }
             // If focused field is on the last row → submit. Otherwise advance.
             if let Some(form) = app.form.as_ref()
                 && form.focus + 1 >= form.fields.len()
@@ -1306,5 +1358,57 @@ fn parse_ansi(bytes: &[u8]) -> Text<'static> {
     match bytes.into_text() {
         Ok(text) => text,
         Err(_) => Text::raw(String::from_utf8_lossy(bytes).into_owned()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn app_with_service_state(state: ServiceState) -> App {
+        let mut app = App::new(
+            vec!["api".to_string()],
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashSet::new(),
+            false,
+        );
+        app.apply_service_state("api".to_string(), state);
+        app
+    }
+
+    #[test]
+    fn overlay_enter_restarts_failed_service_rows() {
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+        }
+
+        let cases = vec![
+            Case {
+                name: "failed",
+                state: ServiceState::Failed,
+            },
+            Case {
+                name: "dependency failed",
+                state: ServiceState::DependencyFailed,
+            },
+        ];
+
+        for case in cases {
+            let app = app_with_service_state(case.state);
+            let Some(command) = overlay_toggle_command(&app) else {
+                panic!("{}: expected command", case.name);
+            };
+            match command.command {
+                RunnerCommand::Restart { name, .. } => {
+                    assert_eq!(name, "api", "{}: wrong service", case.name);
+                }
+                _ => panic!("{}: expected restart command", case.name),
+            }
+        }
     }
 }

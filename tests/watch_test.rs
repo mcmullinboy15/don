@@ -626,10 +626,15 @@ fn integration_task_auto_run_false_skips_initial_and_goes_pending() {
             runner.run().await.unwrap();
         });
 
-        // Task should NOT run at startup — auto_run = false means it starts
-        // in PendingRun state immediately.
+        // Task should NOT run at startup. Its watch inputs are considered
+        // changed on first evaluation, so it starts in PendingRun.
         assert!(
-            wait_for_output(&buf, "pending — auto_run = false", Duration::from_secs(5)).await,
+            wait_for_output(
+                &buf,
+                "pending — watch inputs changed, auto_run = false",
+                Duration::from_secs(5)
+            )
+            .await,
             "migrate should be pending at startup. output: {}",
             read_buf(&buf)
         );
@@ -653,6 +658,66 @@ fn integration_task_auto_run_false_skips_initial_and_goes_pending() {
             output.matches("migrate complete").count(),
             0,
             "migrate should never have run; output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_task_auto_run_once_runs_initially_then_goes_pending_on_change() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-task-once");
+
+        let defs_dir = dir.path().join("definitions");
+        std::fs::create_dir_all(&defs_dir).unwrap();
+        let schema = defs_dir.join("users.sql");
+        std::fs::write(&schema, "CREATE TABLE users (id INT);").unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "bash", &["-c", "sleep 60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task("migrate", "echo", &["migrating"])
+            .watch(&["definitions/**/*.sql"])
+            .auto_run_mode("once")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "migrate: running", Duration::from_secs(5)).await,
+            "migrate should auto-run on first startup. output: {}",
+            read_buf(&buf)
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(&schema, "CREATE TABLE users (id INT, name TEXT);").unwrap();
+
+        assert!(
+            wait_for_output(
+                &buf,
+                "files changed (pending — auto_run = once)",
+                Duration::from_secs(5)
+            )
+            .await,
+            "expected pending event on file change. output: {}",
+            read_buf(&buf)
+        );
+
+        let output = read_buf(&buf);
+        let first_run = output.find("migrate: running");
+        let pending = output.find("files changed (pending — auto_run = once)");
+        assert!(
+            first_run.is_some() && pending.is_some() && first_run < pending,
+            "task should run first, then become pending on later changes. output: {output}"
         );
 
         let _ = shutdown_tx.send(()).await;

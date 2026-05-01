@@ -1,6 +1,6 @@
 //! End-to-end tests for task params: schema, CLI parsing, runner dispatch,
-//! template substitution, and the file-watch gate that parks param'd tasks
-//! at PendingRun.
+//! template substitution, and the file-watch/dependency gate that only parks
+//! param'd tasks in PendingRun when they are actually needed.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
@@ -217,14 +217,81 @@ default = "100"
 }
 
 #[test]
+fn integration_task_logs_rendered_spawn_command() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("task-params-spawn-log");
+        let out_path = dir.path().join("captured.txt");
+
+        let toml = toml_with_keeper(&format!(
+            r#"
+[tasks.sync]
+cmd = "sh"
+args = ["-c", "echo index={{{{index}}}} batch={{{{batch_size}}}} > {}"]
+log = "ignore"
+
+[[tasks.sync.params]]
+name = "index"
+required = true
+
+[[tasks.sync.params]]
+name = "batch_size"
+kind = "int"
+default = "100"
+"#,
+            out_path.display()
+        ));
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let mut events = runner.subscribe();
+
+        let runner_handle = tokio::spawn(async move { runner.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut params = HashMap::new();
+        params.insert("index".to_string(), "users".to_string());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::RunTask {
+                name: "sync".to_string(),
+                params,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        assert!(
+            wait_for_task_state(&mut events, "sync", TaskItemState::Completed).await,
+            "task didn't reach Completed"
+        );
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("sync: running (manual trigger)"),
+            "missing manual trigger line in {output:?}"
+        );
+        assert!(
+            output.contains("sync: spawn sh -c"),
+            "missing spawn line in {output:?}"
+        );
+        assert!(
+            output.contains("index=users batch=100"),
+            "spawn line did not include rendered params in {output:?}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = runner_handle.await;
+    });
+}
+
+#[test]
 fn integration_task_without_params_keeps_working() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("task-params-backcompat");
         let out_path = dir.path().join("captured.txt");
 
-        // auto_run = false so the task starts in PendingRun and we can drive
-        // it explicitly via RunTask. With auto_run = true the task would
-        // already have run by the time we send the command.
+        // auto_run = false keeps the task manual; with no watch inputs or
+        // dependents it starts skipped, but RunTask should still work.
         let toml = toml_with_keeper(&format!(
             r#"
 [tasks.plain]
@@ -284,7 +351,7 @@ auto_run = false
 "#,
             out_path.display()
         ));
-        let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
         let mut events = runner.subscribe();
 
@@ -303,13 +370,22 @@ auto_run = false
                 .unwrap();
             reply_rx.await.unwrap().unwrap();
             assert!(
+                wait_for_task_state(&mut events, "plain", TaskItemState::Running).await,
+                "task didn't reach Running"
+            );
+            assert!(
                 wait_for_task_state(&mut events, "plain", TaskItemState::Completed).await,
                 "task didn't reach Completed"
             );
         }
 
         let captured = std::fs::read_to_string(&out_path).unwrap();
-        assert_eq!(captured.lines().count(), 2, "captured: {captured:?}");
+        assert_eq!(
+            captured.lines().count(),
+            2,
+            "captured: {captured:?}\noutput: {}",
+            read_buf(&buf)
+        );
 
         let _ = shutdown_tx.send(()).await;
         let _ = runner_handle.await;
@@ -491,9 +567,10 @@ name = "index"
 }
 
 #[test]
-fn integration_paramd_task_initial_state_is_pending_run() {
-    // Param'd tasks must NOT auto-run at startup — the user has to trigger
-    // them explicitly with values.
+fn integration_paramd_task_without_watch_or_dependents_starts_skipped() {
+    // Param'd tasks that are neither watched nor required by dependents are
+    // not considered "needed", so startup should skip them rather than
+    // parking them in PendingRun.
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("task-params-pending");
 
@@ -512,10 +589,7 @@ name = "x"
         let mut events = runner.subscribe();
         let runner_handle = tokio::spawn(async move { runner.run().await });
 
-        // The runner emits a TaskStateChanged for every task it considers at
-        // startup. For our param'd task that should be PendingRun, never
-        // Running/Completed without an explicit trigger.
-        let mut saw_pending = false;
+        let mut saw_skipped = false;
         let mut saw_run = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -525,7 +599,7 @@ name = "x"
             match tokio::time::timeout(timeout, events.recv()).await {
                 Ok(Ok(RunnerEvent::TaskStateChanged { name, state })) if name == "interactive" => {
                     match state {
-                        TaskItemState::PendingRun => saw_pending = true,
+                        TaskItemState::Skipped => saw_skipped = true,
                         TaskItemState::Running | TaskItemState::Completed => saw_run = true,
                         _ => {}
                     }
@@ -534,7 +608,7 @@ name = "x"
                 Err(_) => break,
             }
         }
-        assert!(saw_pending, "expected PendingRun state for param'd task");
+        assert!(saw_skipped, "expected Skipped state for param'd task");
         assert!(!saw_run, "param'd task should NOT have auto-run at startup");
 
         let _ = shutdown_tx.send(()).await;

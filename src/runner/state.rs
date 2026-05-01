@@ -17,6 +17,7 @@
 use super::{
     AttachWaiter, CommandResult, ServiceHandle, ServiceState, ServiceStopAction, TaskItemState,
 };
+use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 
@@ -170,10 +171,22 @@ pub(crate) struct RuntimeTask {
     /// Monotonic generation for task run workers so stale completions can
     /// be ignored.
     pub run_generation: u64,
+    /// Whether the task has ever completed successfully.
+    pub has_success: bool,
+    /// Whether the runner has finished the initial startup dependency-gate
+    /// evaluation for this task.
+    pub dependency_evaluated: bool,
+    /// Whether the task currently needs another run to bring its watched
+    /// inputs up to date.
+    pub needs_run_now: bool,
 }
 
 impl RuntimeTask {
-    pub(crate) fn new(config: crate::config::task::Task, initial_state: TaskItemState) -> Self {
+    pub(crate) fn new(
+        config: crate::config::task::Task,
+        initial_state: TaskItemState,
+        has_success: bool,
+    ) -> Self {
         Self {
             state: initial_state,
             config,
@@ -185,6 +198,9 @@ impl RuntimeTask {
             resolved_watch_paths: Vec::new(),
             run_worker: None,
             run_generation: 0,
+            has_success,
+            dependency_evaluated: false,
+            needs_run_now: false,
         }
     }
 
@@ -202,5 +218,35 @@ impl RuntimeTask {
         }
         self.state = new_state;
         Some(new_state)
+    }
+
+    pub(crate) fn set_needs_run_now(&mut self, needs_run_now: bool) {
+        self.dependency_evaluated = true;
+        self.needs_run_now = needs_run_now;
+    }
+
+    pub(crate) fn mark_success(&mut self) {
+        self.has_success = true;
+        self.dependency_evaluated = true;
+        self.needs_run_now = false;
+    }
+
+    pub(crate) fn dependency_satisfied(&self) -> bool {
+        if matches!(self.state, TaskItemState::DependencyFailed) {
+            return false;
+        }
+        if !self.dependency_evaluated && self.state == TaskItemState::Pending {
+            return false;
+        }
+        if !self.has_success {
+            return false;
+        }
+        if self.needs_run_now
+            && self.config.params.is_empty()
+            && matches!(self.config.auto_run, TaskAutoRun::Always)
+        {
+            return false;
+        }
+        true
     }
 }

@@ -374,6 +374,12 @@ impl TaskBuilder {
         self
     }
 
+    /// Set auto_run to a named policy such as `"once"`.
+    pub fn auto_run_mode(mut self, value: &str) -> Self {
+        self.lines.push(format!("auto_run = \"{value}\""));
+        self
+    }
+
     /// Finalize this task and return to the config builder.
     pub fn done(mut self) -> ConfigBuilder {
         writeln!(self.builder.toml, "[tasks.{}]", self.name).unwrap();
