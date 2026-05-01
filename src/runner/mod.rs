@@ -11,6 +11,7 @@ mod health;
 mod params;
 mod paths;
 mod profile;
+mod service_worker;
 mod signals;
 mod state;
 mod task_worker;
@@ -29,7 +30,6 @@ use crate::runner::service::stop_service;
 use crate::task_state::TaskState;
 use crate::watch::WatchManager;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::time::SystemTime;
@@ -50,6 +50,9 @@ use self::paths::any_glob_path_changed_since;
 use self::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use self::profile::resolve_profile_items_for_platform;
 use self::service::ServiceHandle;
+use self::service_worker::{
+    ServiceStartContext, ServiceStartMode, run_service_build_worker, start_service_worker,
+};
 use self::signals::{force_shutdown_requested, shutdown_requested};
 use self::task_worker::{TaskRunMode, TaskRunPrepared, TaskWorkerContext, run_task_worker};
 
@@ -68,26 +71,12 @@ enum TaskRunIntent {
     Background,
 }
 
-#[derive(Clone, Copy)]
-enum ServiceStartMode {
-    Full,
-    SpawnOnly,
-}
-
 #[derive(Clone, Copy, Default)]
 pub(crate) enum ServiceStopAction {
     #[default]
     None,
     RestartFull,
     RestartSpawnOnly,
-}
-
-#[derive(Clone)]
-struct ServiceStartContext {
-    resolved: crate::config::ResolvedService,
-    batch_built: bool,
-    listen_fds: Vec<RawFd>,
-    listen_fds_env: HashMap<String, String>,
 }
 
 /// The state of a service in the runner.
@@ -267,223 +256,6 @@ impl std::fmt::Display for CompletionError {
             None => write!(f, "{}", self.message),
         }
     }
-}
-
-async fn ensure_download_for_config_worker(
-    base_dir: &std::path::Path,
-    platform: Platform,
-    name: &str,
-    download: Option<&crate::config::DownloadConfig>,
-    service_writer: Option<&crate::output::ServiceWriter>,
-    emitter: &crate::output::LifecycleEmitter,
-) -> Result<(), crate::download::DownloadError> {
-    let download = match download {
-        Some(dl) => dl,
-        None => return Ok(()),
-    };
-    let artifact = match download.for_platform(platform) {
-        Some(a) => a,
-        None => return Ok(()),
-    };
-    let cache_base = base_dir.join(".don").join("cache");
-    let bin_dir = base_dir.join(".don").join("bin");
-    emitter.service_event(name, "ensuring artifact...");
-    crate::download::ensure_artifact(artifact, &cache_base, name, service_writer).await?;
-    if let Some(bin_name) = download.effective_bin_name(platform) {
-        crate::download::link_binary(artifact, &cache_base, name, &bin_name, &bin_dir)?;
-    }
-    emitter.service_event(name, "artifact ready");
-    Ok(())
-}
-
-async fn run_preset_build_worker(
-    base_dir: &std::path::Path,
-    emitter: &crate::output::LifecycleEmitter,
-    name: &str,
-    cmd: &str,
-    args: &[String],
-    resolved: &crate::config::ResolvedService,
-) -> Result<(), String> {
-    emitter.service_event(name, &format!("running {cmd} build..."));
-
-    let work_dir = match resolved.dir.as_deref() {
-        Some(d) => base_dir.join(d),
-        None => base_dir.to_path_buf(),
-    };
-    let work_dir = work_dir.as_path();
-    let mut env: HashMap<String, String> = std::env::vars().collect();
-    env.extend(resolved.env.clone());
-
-    match crate::process::spawn_process(crate::process::SpawnConfig {
-        cmd,
-        args,
-        dir: Some(work_dir),
-        env,
-        pgid_file_path: None,
-        force_pipe: true,
-        listen_fds: vec![],
-    })
-    .await
-    {
-        Ok((mut handle, child_output)) => {
-            let build_name = name.to_string();
-            let emitter_clone = emitter.clone();
-            tokio::spawn(async move {
-                let mut reader = tokio::io::BufReader::new(child_output);
-                let mut line_buf = Vec::new();
-                loop {
-                    line_buf.clear();
-                    match tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line_buf)
-                        .await
-                    {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if line_buf.last() == Some(&b'\n') {
-                                line_buf.pop();
-                            }
-                            if line_buf.last() == Some(&b'\r') {
-                                line_buf.pop();
-                            }
-                            let text = String::from_utf8_lossy(&line_buf);
-                            emitter_clone.service_event(&build_name, &text);
-                        }
-                        Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            match handle.wait().await {
-                Ok(status) if status.success() => {
-                    emitter.service_event(name, &format!("{cmd} build succeeded"));
-                    Ok(())
-                }
-                Ok(status) => {
-                    let code = status.code().unwrap_or(-1);
-                    Err(format!("{cmd} build failed (exit code {code})"))
-                }
-                Err(e) => Err(format!("{cmd} build error: {e}")),
-            }
-        }
-        Err(e) => Err(format!("failed to start {cmd} build: {e}")),
-    }
-}
-
-async fn run_service_build_worker(
-    base_dir: &std::path::Path,
-    docker_client: Option<&bollard::Docker>,
-    emitter: &crate::output::LifecycleEmitter,
-    name: &str,
-    resolved: &crate::config::ResolvedService,
-    batch_built: bool,
-    service_writer: Option<&crate::output::ServiceWriter>,
-) -> Result<(), String> {
-    if batch_built {
-        return Ok(());
-    }
-
-    match &resolved.kind {
-        Some(crate::config::ServiceKind::Docker(docker_config)) => {
-            if let Some(build_config) = &docker_config.build {
-                emitter.service_event(name, "building docker image...");
-                if let Some(client) = docker_client
-                    && let Some(writer) = service_writer
-                {
-                    crate::docker::build::build_image(
-                        client,
-                        build_config,
-                        &docker_config.image,
-                        base_dir,
-                        writer,
-                    )
-                    .await
-                    .map_err(|e| format!("docker build failed: {e}"))?;
-                    emitter.service_event(name, "docker build succeeded");
-                }
-            }
-            Ok(())
-        }
-        Some(crate::config::ServiceKind::Rust(rust_config)) => {
-            let build_args = service::rust_build_args(rust_config);
-            run_preset_build_worker(base_dir, emitter, name, "cargo", &build_args, resolved).await
-        }
-        Some(crate::config::ServiceKind::Go(go_config)) => {
-            let output_path = service::go_binary_path(go_config, name, base_dir);
-            if let Some(parent) = output_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let build_args = service::go_build_args(go_config, &output_path);
-            run_preset_build_worker(base_dir, emitter, name, "go", &build_args, resolved).await
-        }
-        Some(crate::config::ServiceKind::Custom { build, .. }) => {
-            if let Some(build_cmd) = build {
-                run_preset_build_worker(
-                    base_dir,
-                    emitter,
-                    name,
-                    &build_cmd.cmd,
-                    &build_cmd.args,
-                    resolved,
-                )
-                .await
-            } else {
-                Ok(())
-            }
-        }
-        _ => Ok(()),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn start_service_worker(
-    base_dir: &std::path::Path,
-    pid_dir: &std::path::Path,
-    platform: Platform,
-    docker_client: Option<&bollard::Docker>,
-    emitter: &crate::output::LifecycleEmitter,
-    name: &str,
-    context: &ServiceStartContext,
-    mode: ServiceStartMode,
-    service_writer: Option<&crate::output::ServiceWriter>,
-) -> Result<service::StartResult, String> {
-    if matches!(mode, ServiceStartMode::Full) {
-        ensure_download_for_config_worker(
-            base_dir,
-            platform,
-            name,
-            context.resolved.download.as_ref(),
-            service_writer,
-            emitter,
-        )
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-
-        run_service_build_worker(
-            base_dir,
-            docker_client,
-            emitter,
-            name,
-            &context.resolved,
-            context.batch_built,
-            service_writer,
-        )
-        .await?;
-    }
-
-    service::start_service(
-        name,
-        &context.resolved,
-        base_dir,
-        pid_dir,
-        &context.listen_fds,
-        &context.listen_fds_env,
-        docker_client,
-        service_writer,
-        platform,
-        Some(emitter),
-    )
-    .await
-    .map_err(|e| e.to_string())
 }
 
 fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {

@@ -1,5 +1,6 @@
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::{ensure_download_for_config_worker, task};
+use super::service_worker::ensure_download_for_config_worker;
+use super::task;
 use crate::config::{Platform, TaskAutoRun};
 use crate::task_state::TaskState;
 use std::collections::HashMap;
