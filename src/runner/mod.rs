@@ -77,9 +77,22 @@ struct ServiceStartContext {
 }
 
 struct RebuildBatchRequest {
-    bazel_items: Vec<(String, String)>,
-    turbo_by_task: HashMap<String, Vec<(String, String)>>,
+    bazel_items: Vec<BazelRebuildItem>,
+    turbo_items: Vec<TurboRebuildItem>,
     plain_rebuilds: Vec<String>,
+}
+
+struct BazelRebuildItem {
+    name: String,
+    target: String,
+    working_dir: PathBuf,
+}
+
+struct TurboRebuildItem {
+    name: String,
+    filter: String,
+    build_task: String,
+    working_dir: PathBuf,
 }
 
 struct RebuildBatchOutcome {
@@ -522,7 +535,6 @@ async fn start_service_worker(
 
 async fn run_rebuild_batch_worker(
     request: RebuildBatchRequest,
-    base_dir: PathBuf,
     emitter: crate::output::LifecycleEmitter,
     bazel_build_mutex: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) -> RebuildBatchOutcome {
@@ -530,85 +542,109 @@ async fn run_rebuild_batch_worker(
     let mut up_to_date: HashSet<String> = HashSet::new();
     let mut failed: Vec<(String, String)> = Vec::new();
 
-    if !request.bazel_items.is_empty() {
-        let _guard = bazel_build_mutex.lock().await;
-        let targets: Vec<String> = request
-            .bazel_items
-            .iter()
-            .map(|(_, target)| target.clone())
-            .collect();
-        let target_to_names: HashMap<String, Vec<String>> = {
-            let mut names: HashMap<String, Vec<String>> = HashMap::new();
-            for (name, target) in &request.bazel_items {
-                names.entry(target.clone()).or_default().push(name.clone());
-            }
-            names
-        };
+    let mut bazel_by_dir: HashMap<PathBuf, Vec<BazelRebuildItem>> = HashMap::new();
+    for item in request.bazel_items {
+        bazel_by_dir
+            .entry(bazel_graph_requery_group_dir(&item.working_dir))
+            .or_default()
+            .push(item);
+    }
 
-        let resolver = crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
-        let all_up_to_date = resolver
-            .check_up_to_date(&targets, &base_dir)
-            .await
-            .unwrap_or_default();
-        if all_up_to_date {
-            let count = targets.len();
-            emitter.bazel_event(&format!(
-                "{count} target{} up to date, skipping rebuild",
-                if count == 1 { "" } else { "s" }
-            ));
-            for (name, _) in &request.bazel_items {
-                up_to_date.insert(name.clone());
-            }
-        } else {
-            let count = targets.len();
-            emitter.bazel_event(&format!(
-                "rebuilding {count} target{}...",
-                if count == 1 { "" } else { "s" }
-            ));
-            let line_emitter = emitter.clone();
-            match resolver
-                .build_targets(
-                    &targets,
-                    &base_dir,
-                    move |line| {
-                        line_emitter.bazel_event(line);
-                    },
-                    Some(&emitter),
-                )
-                .await
-            {
-                Ok(result) => {
-                    for target in &result.succeeded {
-                        if let Some(names) = target_to_names.get(target) {
-                            for name in names {
-                                build_succeeded.insert(name.clone());
-                            }
-                        }
-                    }
-                    for (target, message) in &result.failed {
-                        if let Some(names) = target_to_names.get(target) {
-                            for name in names {
-                                failed
-                                    .push((name.clone(), format!("bazel build failed: {message}")));
-                            }
-                        }
-                    }
+    if !bazel_by_dir.is_empty() {
+        let _guard = bazel_build_mutex.lock().await;
+
+        for (working_dir, items) in bazel_by_dir {
+            let targets: Vec<String> = items.iter().map(|item| item.target.clone()).collect();
+            let target_to_names: HashMap<String, Vec<String>> = {
+                let mut names: HashMap<String, Vec<String>> = HashMap::new();
+                for item in &items {
+                    names
+                        .entry(item.target.clone())
+                        .or_default()
+                        .push(item.name.clone());
                 }
-                Err(e) => {
-                    for (name, _) in &request.bazel_items {
-                        failed.push((name.clone(), format!("bazel build error: {e}")));
+                names
+            };
+
+            let resolver =
+                crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
+            let all_up_to_date = resolver
+                .check_up_to_date(&targets, &working_dir)
+                .await
+                .unwrap_or_default();
+            if all_up_to_date {
+                let count = targets.len();
+                emitter.bazel_event(&format!(
+                    "{count} target{} up to date, skipping rebuild",
+                    if count == 1 { "" } else { "s" }
+                ));
+                for item in &items {
+                    up_to_date.insert(item.name.clone());
+                }
+            } else {
+                let count = targets.len();
+                emitter.bazel_event(&format!(
+                    "rebuilding {count} target{}...",
+                    if count == 1 { "" } else { "s" }
+                ));
+                let line_emitter = emitter.clone();
+                match resolver
+                    .build_targets(
+                        &targets,
+                        &working_dir,
+                        move |line| {
+                            line_emitter.bazel_event(line);
+                        },
+                        Some(&emitter),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        for target in &result.succeeded {
+                            if let Some(names) = target_to_names.get(target) {
+                                for name in names {
+                                    build_succeeded.insert(name.clone());
+                                }
+                            }
+                        }
+                        for (target, message) in &result.failed {
+                            if let Some(names) = target_to_names.get(target) {
+                                for name in names {
+                                    failed.push((
+                                        name.clone(),
+                                        format!("bazel build failed: {message}"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        for item in &items {
+                            failed.push((item.name.clone(), format!("bazel build error: {e}")));
+                        }
                     }
                 }
             }
         }
     }
 
-    for (build_task, items) in &request.turbo_by_task {
-        let filters: Vec<String> = items.iter().map(|(_, filter)| filter.clone()).collect();
+    let mut turbo_by_group: HashMap<(PathBuf, String), Vec<TurboRebuildItem>> = HashMap::new();
+    for item in request.turbo_items {
+        turbo_by_group
+            .entry((item.working_dir.clone(), item.build_task.clone()))
+            .or_default()
+            .push(item);
+    }
+
+    for ((working_dir, build_task), items) in turbo_by_group {
+        let filters: Vec<String> = items.iter().map(|item| item.filter.clone()).collect();
         let filter_to_names: HashMap<String, Vec<String>> = {
             let mut names: HashMap<String, Vec<String>> = HashMap::new();
-            for (name, filter) in items {
-                names.entry(filter.clone()).or_default().push(name.clone());
+            for item in &items {
+                names
+                    .entry(item.filter.clone())
+                    .or_default()
+                    .push(item.name.clone());
             }
             names
         };
@@ -619,12 +655,12 @@ async fn run_rebuild_batch_worker(
         ));
 
         let line_emitter = emitter.clone();
-        let resolver = crate::build_tool::turbo::TurboResolver::new(build_task, None);
+        let resolver = crate::build_tool::turbo::TurboResolver::new(&build_task, None);
         match resolver
             .build_packages(
-                build_task,
+                &build_task,
                 &filters,
-                &base_dir,
+                &working_dir,
                 move |line| {
                     line_emitter.turbo_event(line);
                 },
@@ -649,8 +685,8 @@ async fn run_rebuild_batch_worker(
                 }
             }
             Err(e) => {
-                for (name, _) in items {
-                    failed.push((name.clone(), format!("turbo build error: {e}")));
+                for item in &items {
+                    failed.push((item.name.clone(), format!("turbo build error: {e}")));
                 }
             }
         }
@@ -3430,11 +3466,8 @@ impl Runner {
             return;
         }
 
-        // Partition into Bazel and Turbo groups.
-        // Bazel: (service_name, target)
-        let mut bazel_items: Vec<(String, String)> = Vec::new();
-        // Turbo: grouped by build_task → (service_name, filter)
-        let mut turbo_by_task: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut bazel_items: Vec<BazelRebuildItem> = Vec::new();
+        let mut turbo_items: Vec<TurboRebuildItem> = Vec::new();
         // Services without a build tool target (shouldn't happen, but handle gracefully)
         let mut plain_rebuilds: Vec<String> = Vec::new();
 
@@ -3442,7 +3475,14 @@ impl Runner {
             if let Some(rs) = self.services.get(name) {
                 match &rs.resolved.kind {
                     Some(crate::config::ServiceKind::Bazel(bazel)) => {
-                        bazel_items.push((name.clone(), bazel.target.clone()));
+                        bazel_items.push(BazelRebuildItem {
+                            name: name.clone(),
+                            target: bazel.target.clone(),
+                            working_dir: working_dir_for(
+                                &self.base_dir,
+                                rs.resolved.dir.as_deref(),
+                            ),
+                        });
                     }
                     Some(crate::config::ServiceKind::Turbo(turbo)) => {
                         let build_task = turbo
@@ -3452,10 +3492,15 @@ impl Runner {
                         if !build_task.is_empty()
                             && let Some(ref filter) = turbo.filter
                         {
-                            turbo_by_task
-                                .entry(build_task)
-                                .or_default()
-                                .push((name.clone(), filter.clone()));
+                            turbo_items.push(TurboRebuildItem {
+                                name: name.clone(),
+                                filter: filter.clone(),
+                                build_task,
+                                working_dir: working_dir_for(
+                                    &self.base_dir,
+                                    rs.resolved.dir.as_deref(),
+                                ),
+                            });
                         } else {
                             plain_rebuilds.push(name.clone());
                         }
@@ -3468,16 +3513,14 @@ impl Runner {
         }
         let request = RebuildBatchRequest {
             bazel_items,
-            turbo_by_task,
+            turbo_items,
             plain_rebuilds,
         };
         let cmd_tx = self.internal_tx.clone();
-        let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
         let bazel_build_mutex = self.bazel_build_mutex.clone();
         let handle = tokio::spawn(async move {
-            let outcome =
-                run_rebuild_batch_worker(request, base_dir, emitter, bazel_build_mutex).await;
+            let outcome = run_rebuild_batch_worker(request, emitter, bazel_build_mutex).await;
             let _ = cmd_tx
                 .send(RunnerInternalCommand::RebuildBatchComplete(outcome))
                 .await;
@@ -6197,104 +6240,116 @@ async fn run_batch_build_chain(
         return outcome;
     }
 
-    // Step 1: resolve watch paths with ONE query per tool.
+    // Step 1: resolve watch paths with one query per build-tool working set.
     //
     // Previously we ran N parallel `bazel query` / `turbo run --dry-run`
     // subprocesses, one per item. Bazel's server has a workspace-wide
     // analysis lock, so those parallel queries mostly serialised inside
     // bazel anyway — and each process startup cost stacked. Now we issue
-    // a single `deps(T1 + ... + Tn) --output=xml` and DFS-walk per target
-    // client-side to keep accurate per-service attribution.
-    //
-    // Turbo still uses the union-attribution shape — upgrading it to
-    // per-filter attribution is a separate effort.
+    // one `deps(T1 + ... + Tn) --output=xml` per Bazel workspace and
+    // DFS-walk per target client-side to keep accurate per-service attribution.
+    // Turbo uses one dry-run per `(working_dir, task)` group; each group still
+    // shares union watch attribution within that Turbo invocation.
 
     // Partition items by tool. Each item keeps its own ignore patterns
     // (configured per service/task) but gets the same tier-1/tier-2 globs.
     let bazel_items: Vec<&BatchBuildItem> = items.iter().filter(|i| i.bazel.is_some()).collect();
     let turbo_items: Vec<&BatchBuildItem> = items.iter().filter(|i| i.turbo.is_some()).collect();
 
-    let mut bazel_info_by_target: HashMap<String, crate::build_tool::ResolvedBuildInfo> =
-        HashMap::new();
-    let mut turbo_info: Option<crate::build_tool::ResolvedBuildInfo> = None;
     let mut resolved_info_by_item: HashMap<String, crate::build_tool::ResolvedBuildInfo> =
         HashMap::new();
 
     if !bazel_items.is_empty() {
-        let targets: Vec<String> = bazel_items
-            .iter()
-            .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
-            .collect();
-        emitter.bazel_event(&format!(
-            "querying bazel watch paths for {} target{}...",
-            targets.len(),
-            if targets.len() == 1 { "" } else { "s" },
-        ));
-        // Unified query runs at the workspace root — all bazel items share a
-        // single workspace in practice, so the first item's working_dir is
-        // the workspace root.
-        let working_dir = bazel_items[0].working_dir.clone();
-        let resolver = crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
-        match resolver.resolve_per_target(&targets, &working_dir).await {
-            Ok(info_by_target) => {
-                let unique: HashSet<&String> = info_by_target
-                    .values()
-                    .flat_map(|i| i.watch_paths.iter())
-                    .collect();
-                emitter.bazel_event(&format!(
-                    "resolved {} unique watch path{} across {} target{}",
-                    unique.len(),
-                    if unique.len() == 1 { "" } else { "s" },
-                    targets.len(),
-                    if targets.len() == 1 { "" } else { "s" },
-                ));
-                bazel_info_by_target = info_by_target;
-            }
-            Err(e) => {
-                outcome.warnings.push(format!("bazel query failed: {e}"));
+        let mut bazel_by_dir: HashMap<PathBuf, Vec<&BatchBuildItem>> = HashMap::new();
+        for item in &bazel_items {
+            bazel_by_dir
+                .entry(bazel_graph_requery_group_dir(&item.working_dir))
+                .or_default()
+                .push(*item);
+        }
+
+        for (working_dir, items_for_dir) in bazel_by_dir {
+            let targets: Vec<String> = items_for_dir
+                .iter()
+                .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
+                .collect();
+            emitter.bazel_event(&format!(
+                "querying bazel watch paths for {} target{}...",
+                targets.len(),
+                if targets.len() == 1 { "" } else { "s" },
+            ));
+            let resolver =
+                crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
+            match resolver.resolve_per_target(&targets, &working_dir).await {
+                Ok(info_by_target) => {
+                    let unique: HashSet<&String> = info_by_target
+                        .values()
+                        .flat_map(|i| i.watch_paths.iter())
+                        .collect();
+                    emitter.bazel_event(&format!(
+                        "resolved {} unique watch path{} across {} target{}",
+                        unique.len(),
+                        if unique.len() == 1 { "" } else { "s" },
+                        targets.len(),
+                        if targets.len() == 1 { "" } else { "s" },
+                    ));
+                    for item in items_for_dir {
+                        let Some(target) = item.bazel.as_ref().map(|b| &b.target) else {
+                            continue;
+                        };
+                        if let Some(info) = info_by_target.get(target) {
+                            resolved_info_by_item.insert(item.name.clone(), info.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    outcome.warnings.push(format!(
+                        "bazel query failed in {}: {e}",
+                        working_dir.display()
+                    ));
+                }
             }
         }
     }
 
     if !turbo_items.is_empty() {
-        let filters: Vec<String> = turbo_items
-            .iter()
-            .filter_map(|i| i.turbo.as_ref().and_then(|t| t.filter.clone()))
-            .collect();
-        // Pick the first turbo item's task as the command's task name. All
-        // turbo items in a startup batch must share a task (this is what
-        // `turbo run <task>` takes) — if configs differ, we'd need per-task
-        // grouping. For now, emit a warning on mismatch and use the first.
-        let task = turbo_items[0]
-            .turbo
-            .as_ref()
-            .map(|t| t.task.clone())
-            .unwrap_or_default();
-        for i in &turbo_items[1..] {
-            if let Some(t) = &i.turbo
-                && t.task != task
-            {
-                outcome.warnings.push(format!(
-                    "{}: turbo.task '{}' differs from batch task '{}' — using batch task",
-                    i.name, t.task, task
-                ));
-            }
+        let mut turbo_by_group: HashMap<(PathBuf, String), Vec<&BatchBuildItem>> = HashMap::new();
+        for item in &turbo_items {
+            let Some(turbo) = item.turbo.as_ref() else {
+                continue;
+            };
+            turbo_by_group
+                .entry((item.working_dir.clone(), turbo.task.clone()))
+                .or_default()
+                .push(*item);
         }
-        let working_dir = turbo_items[0].working_dir.clone();
-        let resolver = crate::build_tool::turbo::TurboResolver::new(&task, None);
-        match resolver.resolve_union(&filters, &working_dir).await {
-            Ok(info) => {
-                emitter.turbo_event(&format!(
-                    "resolved {} watch path{} across {} filter{}",
-                    info.watch_paths.len(),
-                    if info.watch_paths.len() == 1 { "" } else { "s" },
-                    filters.len(),
-                    if filters.len() == 1 { "" } else { "s" },
-                ));
-                turbo_info = Some(info);
-            }
-            Err(e) => {
-                outcome.warnings.push(format!("turbo query failed: {e}"));
+
+        for ((working_dir, task), items_for_group) in turbo_by_group {
+            let filters: Vec<String> = items_for_group
+                .iter()
+                .filter_map(|i| i.turbo.as_ref().and_then(|t| t.filter.clone()))
+                .collect();
+            let resolver = crate::build_tool::turbo::TurboResolver::new(&task, None);
+            match resolver.resolve_union(&filters, &working_dir).await {
+                Ok(info) => {
+                    emitter.turbo_event(&format!(
+                        "resolved {} watch path{} across {} filter{}",
+                        info.watch_paths.len(),
+                        if info.watch_paths.len() == 1 { "" } else { "s" },
+                        filters.len(),
+                        if filters.len() == 1 { "" } else { "s" },
+                    ));
+                    for item in items_for_group {
+                        resolved_info_by_item.insert(item.name.clone(), info.clone());
+                    }
+                }
+                Err(e) => {
+                    outcome.warnings.push(format!(
+                        "turbo query failed in {} for task '{}': {e}",
+                        working_dir.display(),
+                        task
+                    ));
+                }
             }
         }
     }
@@ -6307,17 +6362,10 @@ async fn run_batch_build_chain(
     // via `registered_dirs`, so the actual inotify cost is paid once per
     // directory regardless of how many items claim it.
     for item in &items {
-        let info = if let Some(ref bazel) = item.bazel {
-            bazel_info_by_target.get(&bazel.target)
-        } else if item.turbo.is_some() {
-            turbo_info.as_ref()
-        } else {
-            None
-        };
+        let info = resolved_info_by_item.get(&item.name);
         let Some(info) = info else {
             continue; // query failed for this tool — warning already pushed
         };
-        resolved_info_by_item.insert(item.name.clone(), info.clone());
 
         if let Some(ref tx) = watch_update_tx {
             let watch_kind = match item.kind {
@@ -6350,13 +6398,18 @@ async fn run_batch_build_chain(
             .push((item.name.clone(), item.kind, info.watch_paths.clone()));
     }
 
-    // Step 2: batch builds, grouped by tool. Bazel and Turbo run concurrently.
-    let mut bazel_items: Vec<(BatchBuildItem, String)> = Vec::new();
-    let mut turbo_by_task: HashMap<String, Vec<(BatchBuildItem, String)>> = HashMap::new();
+    // Step 2: batch builds. Bazel/Turbo groups run concurrently, but each
+    // group stays inside the working directory its labels/filters belong to.
+    let mut bazel_by_dir: HashMap<PathBuf, Vec<(BatchBuildItem, String)>> = HashMap::new();
+    let mut turbo_by_group: HashMap<(PathBuf, String), Vec<(BatchBuildItem, String)>> =
+        HashMap::new();
 
     for item in &items {
         if let Some(ref bazel) = item.bazel {
-            bazel_items.push((item.clone(), bazel.target.clone()));
+            bazel_by_dir
+                .entry(bazel_graph_requery_group_dir(&item.working_dir))
+                .or_default()
+                .push((item.clone(), bazel.target.clone()));
         } else if let Some(ref turbo) = item.turbo {
             let build_task = turbo
                 .build_task
@@ -6364,8 +6417,8 @@ async fn run_batch_build_chain(
                 .unwrap_or_else(|| "build".to_string());
             if !build_task.is_empty() {
                 if let Some(ref filter) = turbo.filter {
-                    turbo_by_task
-                        .entry(build_task)
+                    turbo_by_group
+                        .entry((item.working_dir.clone(), build_task))
                         .or_default()
                         .push((item.clone(), filter.clone()));
                 } else {
@@ -6380,7 +6433,7 @@ async fn run_batch_build_chain(
 
     let mut build_set: JoinSet<crate::build_tool::BatchBuildResult> = JoinSet::new();
 
-    if !bazel_items.is_empty() {
+    for (working_dir, bazel_items) in bazel_by_dir {
         let targets: Vec<String> = bazel_items.iter().map(|(_, t)| t.clone()).collect();
         let target_to_names: HashMap<String, Vec<String>> = {
             let mut m: HashMap<String, Vec<String>> = HashMap::new();
@@ -6390,7 +6443,6 @@ async fn run_batch_build_chain(
             m
         };
         let count = targets.len();
-        let base = base_dir.clone();
         let em = emitter.clone();
         let em_spawn = emitter.clone();
         emitter.bazel_event(&format!(
@@ -6402,7 +6454,7 @@ async fn run_batch_build_chain(
             let result = resolver
                 .build_targets(
                     &targets,
-                    &base,
+                    &working_dir,
                     move |line| {
                         em.bazel_event(line);
                     },
@@ -6447,7 +6499,7 @@ async fn run_batch_build_chain(
         });
     }
 
-    for (build_task, items_for_task) in turbo_by_task {
+    for ((working_dir, build_task), items_for_task) in turbo_by_group {
         let filters: Vec<String> = items_for_task.iter().map(|(_, f)| f.clone()).collect();
         let filter_to_names: HashMap<String, Vec<String>> = {
             let mut m: HashMap<String, Vec<String>> = HashMap::new();
@@ -6457,7 +6509,6 @@ async fn run_batch_build_chain(
             m
         };
         let count = filters.len();
-        let base = base_dir.clone();
         let em = emitter.clone();
         let em_spawn = emitter.clone();
         let bt = build_task.clone();
@@ -6471,7 +6522,7 @@ async fn run_batch_build_chain(
                 .build_packages(
                     &bt,
                     &filters,
-                    &base,
+                    &working_dir,
                     move |line| {
                         em.turbo_event(line);
                     },
@@ -6538,9 +6589,9 @@ async fn run_batch_build_chain(
         ));
     }
 
-    // Step 3: ONE `bazel cquery` to resolve every succeeded bazel service's
-    // built-binary path. Lets the runner spawn the artifact directly instead
-    // of via `bazel run`. Tasks and turbo services don't need this.
+    // Step 3: resolve every succeeded bazel service's built-binary path,
+    // grouped by workspace. Lets the runner spawn the artifact directly
+    // instead of via `bazel run`. Tasks and turbo services don't need this.
     let bazel_services_to_resolve: Vec<&BatchBuildItem> = items
         .iter()
         .filter(|i| {
@@ -6549,50 +6600,59 @@ async fn run_batch_build_chain(
         .collect();
 
     if !bazel_services_to_resolve.is_empty() {
-        let targets: Vec<String> = bazel_services_to_resolve
-            .iter()
-            .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
-            .collect();
-        emitter.bazel_event(&format!(
-            "resolving bazel binary paths for {} target{}...",
-            targets.len(),
-            if targets.len() == 1 { "" } else { "s" },
-        ));
-        // All bazel items share a workspace in practice — same rationale as
-        // the watch-resolution step above.
-        let working_dir = bazel_services_to_resolve[0].working_dir.clone();
-        let resolver = crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
-        match resolver.resolve_binary_paths(&targets, &working_dir).await {
-            Ok(paths_by_label) => {
-                for item in &bazel_services_to_resolve {
-                    let Some(ref bazel) = item.bazel else {
-                        continue;
-                    };
-                    match paths_by_label.get(&bazel.target) {
-                        Some(rel_path) => {
-                            let abs_path = item.working_dir.join(rel_path);
-                            let path_str = abs_path.to_string_lossy().to_string();
-                            emitter.service_debug_event(
-                                &item.name,
-                                &format!("resolved binary {rel_path}"),
-                            );
-                            outcome.binary_paths.insert(item.name.clone(), path_str);
-                        }
-                        None => {
-                            outcome.warnings.push(format!(
-                                "{}: no binary output for {} — falling back to bazel run",
-                                item.name, bazel.target
-                            ));
+        let mut services_by_dir: HashMap<PathBuf, Vec<&BatchBuildItem>> = HashMap::new();
+        for item in &bazel_services_to_resolve {
+            services_by_dir
+                .entry(bazel_graph_requery_group_dir(&item.working_dir))
+                .or_default()
+                .push(*item);
+        }
+
+        for (working_dir, items_for_dir) in services_by_dir {
+            let targets: Vec<String> = items_for_dir
+                .iter()
+                .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
+                .collect();
+            emitter.bazel_event(&format!(
+                "resolving bazel binary paths for {} target{}...",
+                targets.len(),
+                if targets.len() == 1 { "" } else { "s" },
+            ));
+            let resolver =
+                crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
+            match resolver.resolve_binary_paths(&targets, &working_dir).await {
+                Ok(paths_by_label) => {
+                    for item in &items_for_dir {
+                        let Some(ref bazel) = item.bazel else {
+                            continue;
+                        };
+                        match paths_by_label.get(&bazel.target) {
+                            Some(rel_path) => {
+                                let abs_path = item.working_dir.join(rel_path);
+                                let path_str = abs_path.to_string_lossy().to_string();
+                                emitter.service_debug_event(
+                                    &item.name,
+                                    &format!("resolved binary {rel_path}"),
+                                );
+                                outcome.binary_paths.insert(item.name.clone(), path_str);
+                            }
+                            None => {
+                                outcome.warnings.push(format!(
+                                    "{}: no binary output for {} — falling back to bazel run",
+                                    item.name, bazel.target
+                                ));
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                outcome.warnings.push(format!(
-                    "bazel cquery for binary paths failed: {e} — falling back to bazel run for {} service{}",
-                    bazel_services_to_resolve.len(),
-                    if bazel_services_to_resolve.len() == 1 { "" } else { "s" },
-                ));
+                Err(e) => {
+                    outcome.warnings.push(format!(
+                        "bazel cquery for binary paths failed in {}: {e} — falling back to bazel run for {} service{}",
+                        working_dir.display(),
+                        items_for_dir.len(),
+                        if items_for_dir.len() == 1 { "" } else { "s" },
+                    ));
+                }
             }
         }
     }
