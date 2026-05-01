@@ -31,7 +31,7 @@ pub enum ChildOutput {
     /// Piped stdout from a non-PTY process (stderr merged via dup2).
     Pipe(tokio::process::ChildStdout),
     /// Log stream from a Docker container (via bollard).
-    DockerLogs(crate::docker::stream::DockerLogReader),
+    DockerLogs(crate::DockerLogReader),
 }
 
 impl AsyncRead for ChildOutput {

@@ -2,7 +2,7 @@ pub(crate) mod build_tool;
 pub mod client;
 pub mod completions;
 pub mod config;
-pub mod docker;
+pub(crate) mod docker;
 pub mod download;
 pub mod duration;
 pub mod exec;
@@ -17,6 +17,7 @@ pub(crate) mod tui;
 pub(crate) mod watch;
 
 pub use config::{Config, ConfigError, Platform, TaskAutoRun};
+pub use docker::stream::DockerLogReader;
 pub use duration::{DurationError, parse_duration};
 pub use output::{OutputError, OutputManager, ServiceWriter};
 pub use runner::{Runner, RunnerError, VerboseInfo};
