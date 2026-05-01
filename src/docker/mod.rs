@@ -4,9 +4,9 @@
 //! Each Docker service gets a [`DockerHandle`] that wraps the container ID and
 //! provides stop/remove operations analogous to process cleanup.
 
-pub mod build;
-pub mod parse;
-pub mod stream;
+pub(crate) mod build;
+pub(crate) mod parse;
+pub(crate) mod stream;
 
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig};

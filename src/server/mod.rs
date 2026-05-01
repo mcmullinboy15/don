@@ -5,8 +5,8 @@
 //! The runner binds the socket synchronously (so bind errors surface
 //! immediately) and then spawns the accept loop as a background task.
 
-pub mod attach;
-pub mod routes;
+pub(crate) mod attach;
+pub(crate) mod routes;
 
 use crate::runner::RunnerCommand;
 use hyper_util::rt::{TokioExecutor, TokioIo};
