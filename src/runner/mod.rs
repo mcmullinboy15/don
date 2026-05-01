@@ -1014,12 +1014,7 @@ async fn run_task_worker(
     Ok(TaskRunPrepared::Spawned(Box::new(spawn)))
 }
 
-/// A command sent to the runner via its `mpsc` channel.
-///
-/// `BatchBuildComplete` carries a crate-private payload. The enum itself
-/// stays `pub` for callers that hold a [`Runner::command_sender`], but the
-/// variant is only ever constructed by the runner's own detached task.
-#[allow(private_interfaces)]
+/// A command sent to the runner via its public `mpsc` channel.
 pub enum RunnerCommand {
     /// Start a stopped service.
     Start {
@@ -1035,23 +1030,6 @@ pub enum RunnerCommand {
     Restart {
         name: String,
         reply: oneshot::Sender<CommandResult>,
-    },
-    /// Completion from a detached task run worker.
-    TaskRunPrepared {
-        name: String,
-        op_id: u64,
-        task_cfg: Box<crate::config::Task>,
-        intent: TaskRunIntent,
-        result: Result<TaskRunPrepared, String>,
-    },
-    /// A task process exited after an explicit run/restart.
-    TaskExited {
-        name: String,
-        pgid: i32,
-        success: bool,
-        message: Option<String>,
-        elapsed: Option<std::time::Duration>,
-        rerun: bool,
     },
     /// Rebuild a service triggered by a file watch event.
     /// Runs the build command (if any), then restarts the service.
@@ -1130,61 +1108,46 @@ pub enum RunnerCommand {
         force_refresh: bool,
         reply: oneshot::Sender<Result<Vec<String>, CompletionError>>,
     },
-    /// Result of the startup-phase batch build. Sent by the detached
-    /// [`run_batch_build_chain`] task. Transitions `Building` items to
-    /// `Pending`/`Failed` and re-runs the ready-item sweep.
+    /// Initiate graceful shutdown.
+    Shutdown,
+}
+
+/// Runner-private messages emitted by detached workers.
+enum RunnerInternalCommand {
+    /// Completion from a detached task run worker.
+    TaskRunPrepared {
+        name: String,
+        op_id: u64,
+        task_cfg: Box<crate::config::Task>,
+        intent: TaskRunIntent,
+        result: Result<TaskRunPrepared, String>,
+    },
+    /// A task process exited after an explicit run/restart.
+    TaskExited {
+        name: String,
+        pgid: i32,
+        success: bool,
+        message: Option<String>,
+        elapsed: Option<std::time::Duration>,
+        rerun: bool,
+    },
+    /// Result of the startup-phase batch build.
     BatchBuildComplete(BatchBuildOutcome),
     /// Result of a detached file-watch build-tool rebuild batch.
     RebuildBatchComplete(RebuildBatchOutcome),
-    /// Result of a just-in-time build for a single lazy service triggered
-    /// by its first proxy connection. The handler applies the outcome and
-    /// (on success) calls `start_service` directly — the service is not in
-    /// the `pending` startup set, so the usual `start_ready_items` sweep
-    /// wouldn't pick it up.
+    /// Result of a just-in-time build for a single lazy service.
     LazyBuildComplete {
         name: String,
         outcome: BatchBuildOutcome,
     },
     /// Health-check monitor reported a state transition for a service.
-    /// Sent by the per-service monitor task spawned after the service
-    /// reaches Ready when `ready.monitor = true`. The runner translates
-    /// this into Ready ↔ Unhealthy transitions and (optionally) schedules
-    /// an auto-restart.
-    ServiceHealthChanged {
-        name: String,
-        /// `true` after a recovery, `false` after `unhealthy_after`
-        /// consecutive failures.
-        healthy: bool,
-    },
-    /// Backoff timer fired — restart a service that's `Unhealthy`
-    /// (monitor-driven) or `Failed` (crash-driven). Sent by the detached
-    /// task spawned in `schedule_auto_restart`. The `attempt` field is
-    /// informational (used in the lifecycle event) and matches
-    /// `restart_attempts` at scheduling time.
+    ServiceHealthChanged { name: String, healthy: bool },
+    /// Backoff timer fired for an auto-restart.
     AutoRestart { name: String, attempt: u32 },
-    /// A service process exited (its output stream hit EOF). Sent by the
-    /// per-spawn crash-watcher task. The `pgid` identifies *which* spawn
-    /// — the runner ignores the event if the current handle has a
-    /// different pgid (the service was already restarted) or if the
-    /// state is not Running/Ready/Unhealthy (an explicit stop is in
-    /// flight). When it does act, the handler reaps the [`Child`] to
-    /// read the real [`std::process::ExitStatus`], transitions the
-    /// service to `Failed`, and emits a lifecycle event with the code
-    /// or terminating signal.
-    ///
-    /// [`Child`]: tokio::process::Child
+    /// A service process exited.
     ServiceExited { name: String, pgid: i32 },
-    /// Ready-check completed for a manual-start or rebuild spawn (no
-    /// `done_tx` path). Sent from the async task inside
-    /// `spawn_and_wire_service` so the runner — running on the main task
-    /// with exclusive access to `self.services` — can flip internal state
-    /// to `Ready`/`Failed`. Without this, observers get the broadcast but
-    /// the runner's own state map never updates, and later
-    /// `handle_service_health_changed` probes short-circuit because
-    /// `current != Ready`.
+    /// Ready-check completed for a manual-start or rebuild spawn.
     ReadyCheckComplete { name: String, success: bool },
-    /// Initiate graceful shutdown.
-    Shutdown,
     /// Completion from a detached manual service stop/restart worker.
     ServiceStopComplete {
         name: String,
@@ -1515,6 +1478,8 @@ pub struct Runner {
     // Channels
     cmd_tx: mpsc::Sender<RunnerCommand>,
     cmd_rx: mpsc::Receiver<RunnerCommand>,
+    internal_tx: mpsc::Sender<RunnerInternalCommand>,
+    internal_rx: mpsc::Receiver<RunnerInternalCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
 
     /// Item-completion sender shared between the initial startup and config
@@ -1529,7 +1494,7 @@ pub struct Runner {
     shutdown_rx: Option<mpsc::Receiver<()>>,
 
     /// Detached batch-build task spawned at startup for services/tasks with
-    /// a bazel/turbo config. `Some` until [`RunnerCommand::BatchBuildComplete`]
+    /// a bazel/turbo config. `Some` until [`RunnerInternalCommand::BatchBuildComplete`]
     /// arrives and the handle is consumed. Wrapped in [`AbortOnDrop`] so
     /// shutting the runner down — or dropping the field before completion —
     /// aborts the task, dropping the in-flight `Child` (with `kill_on_drop`)
@@ -1538,7 +1503,7 @@ pub struct Runner {
 
     /// Detached JIT build tasks spawned when a lazy service's proxy gets
     /// its first connection. Keyed by service name. Entries are inserted
-    /// on spawn and removed when [`RunnerCommand::LazyBuildComplete`]
+    /// on spawn and removed when [`RunnerInternalCommand::LazyBuildComplete`]
     /// arrives. Wrapped in [`AbortOnDrop`] for the same reason as
     /// [`Self::batch_build_handle`]: on shutdown we abort any in-flight
     /// JIT builds so bazel/turbo output stops streaming before
@@ -1601,6 +1566,7 @@ impl Runner {
         shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (internal_tx, internal_rx) = mpsc::channel(64);
         let (event_tx, _) = broadcast::channel(256);
         let (lazy_start_tx, lazy_start_rx) = mpsc::channel(16);
         let (shutdown_flag_tx, _shutdown_flag_rx) = tokio::sync::watch::channel(false);
@@ -1759,6 +1725,8 @@ impl Runner {
             docker_client,
             cmd_tx,
             cmd_rx,
+            internal_tx,
+            internal_rx,
             event_tx,
             done_tx: None,
             shutdown_rx: Some(shutdown_rx),
@@ -2106,7 +2074,7 @@ impl Runner {
         // keeps processing the main command loop — shutdown signals,
         // connection-triggered lazy starts, and non-build-tool services all
         // stay responsive while bazel crunches. On completion the task posts
-        // `RunnerCommand::BatchBuildComplete`, which transitions `Building`
+        // `RunnerInternalCommand::BatchBuildComplete`, which transitions `Building`
         // items to `Pending`/`Failed` and triggers the ready-item sweep.
         //
         // The handle is stored as `AbortOnDrop` on `self` so `Shutdown` drops
@@ -2243,65 +2211,6 @@ impl Runner {
                                     self.handle_restart_service_cmd(&name, reply).await;
                                 }
                             }
-                            RunnerCommand::TaskRunPrepared {
-                                name,
-                                op_id,
-                                task_cfg,
-                                intent,
-                                result,
-                            } => {
-                                self.handle_task_run_prepared(&name, op_id, &task_cfg, intent, result)
-                                    .await;
-                            }
-                            RunnerCommand::ServiceStopComplete { name, op_id, result } => {
-                                self.handle_service_stop_complete(&name, op_id, result).await;
-                            }
-                            RunnerCommand::ServiceStartPrepared {
-                                name,
-                                op_id,
-                                context,
-                                intent,
-                                result,
-                            } => {
-                                self.handle_service_start_prepared(
-                                    &name,
-                                    op_id,
-                                    context,
-                                    intent,
-                                    result,
-                                )
-                                .await;
-                            }
-                            RunnerCommand::ServiceRebuildPrepared {
-                                name,
-                                op_id,
-                                result,
-                            } => {
-                                self.handle_service_rebuild_prepared(&name, op_id, result)
-                                    .await;
-                            }
-                            RunnerCommand::TaskExited {
-                                name,
-                                pgid,
-                                success,
-                                message,
-                                elapsed,
-                                rerun,
-                            } => {
-                                self.handle_task_exit(&name, pgid, success, message, elapsed, rerun);
-                            }
-                            RunnerCommand::ServiceHealthChanged { name, healthy } => {
-                                self.handle_service_health_changed(&name, healthy).await;
-                            }
-                            RunnerCommand::AutoRestart { name, attempt } => {
-                                self.handle_auto_restart(&name, attempt).await;
-                            }
-                            RunnerCommand::ServiceExited { name, pgid } => {
-                                self.handle_service_exited(&name, pgid).await;
-                            }
-                            RunnerCommand::ReadyCheckComplete { name, success } => {
-                                self.handle_ready_check_complete(&name, success);
-                            }
                             RunnerCommand::Attach { name, pid, reply } => {
                                 self.handle_attach_cmd(&name, pid, reply).await;
                             }
@@ -2345,7 +2254,70 @@ impl Runner {
                                 )
                                 .await;
                             }
-                            RunnerCommand::BatchBuildComplete(outcome) => {
+                        }
+                    }
+                    Some(cmd) = self.internal_rx.recv() => {
+                        match cmd {
+                            RunnerInternalCommand::TaskRunPrepared {
+                                name,
+                                op_id,
+                                task_cfg,
+                                intent,
+                                result,
+                            } => {
+                                self.handle_task_run_prepared(&name, op_id, &task_cfg, intent, result)
+                                    .await;
+                            }
+                            RunnerInternalCommand::ServiceStopComplete { name, op_id, result } => {
+                                self.handle_service_stop_complete(&name, op_id, result).await;
+                            }
+                            RunnerInternalCommand::ServiceStartPrepared {
+                                name,
+                                op_id,
+                                context,
+                                intent,
+                                result,
+                            } => {
+                                self.handle_service_start_prepared(
+                                    &name,
+                                    op_id,
+                                    context,
+                                    intent,
+                                    result,
+                                )
+                                .await;
+                            }
+                            RunnerInternalCommand::ServiceRebuildPrepared {
+                                name,
+                                op_id,
+                                result,
+                            } => {
+                                self.handle_service_rebuild_prepared(&name, op_id, result)
+                                    .await;
+                            }
+                            RunnerInternalCommand::TaskExited {
+                                name,
+                                pgid,
+                                success,
+                                message,
+                                elapsed,
+                                rerun,
+                            } => {
+                                self.handle_task_exit(&name, pgid, success, message, elapsed, rerun);
+                            }
+                            RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
+                                self.handle_service_health_changed(&name, healthy).await;
+                            }
+                            RunnerInternalCommand::AutoRestart { name, attempt } => {
+                                self.handle_auto_restart(&name, attempt).await;
+                            }
+                            RunnerInternalCommand::ServiceExited { name, pgid } => {
+                                self.handle_service_exited(&name, pgid).await;
+                            }
+                            RunnerInternalCommand::ReadyCheckComplete { name, success } => {
+                                self.handle_ready_check_complete(&name, success);
+                            }
+                            RunnerInternalCommand::BatchBuildComplete(outcome) => {
                                 // Drop the abort-on-drop handle: the task is done,
                                 // and leaving the handle live would abort after the
                                 // task has already returned (harmless but noisy).
@@ -2375,11 +2347,11 @@ impl Runner {
                                     break;
                                 }
                             }
-                            RunnerCommand::RebuildBatchComplete(outcome) => {
+                            RunnerInternalCommand::RebuildBatchComplete(outcome) => {
                                 self.rebuild_batch_handle = None;
                                 self.handle_rebuild_batch_complete(outcome).await;
                             }
-                            RunnerCommand::LazyBuildComplete { name, outcome } => {
+                            RunnerInternalCommand::LazyBuildComplete { name, outcome } => {
                                 // Drop the abort-on-drop handle: the task is done,
                                 // and leaving it live would abort after the task
                                 // has already returned (harmless but noisy).
@@ -2419,7 +2391,7 @@ impl Runner {
                                     }
                                 }
                             }
-                            RunnerCommand::GraphRequeryComplete(outcomes) => {
+                            RunnerInternalCommand::GraphRequeryComplete(outcomes) => {
                                 self.graph_requery_handle = None;
                                 self.handle_graph_requery_complete(outcomes).await;
                             }
@@ -2737,7 +2709,7 @@ impl Runner {
             return;
         }
 
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
         let watch_update_tx = self.watch_update_tx.clone();
@@ -2757,14 +2729,14 @@ impl Runner {
             )
             .await;
             let _ = cmd_tx
-                .send(RunnerCommand::BatchBuildComplete(outcome))
+                .send(RunnerInternalCommand::BatchBuildComplete(outcome))
                 .await;
         });
         self.batch_build_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
     }
 
     fn spawn_lazy_build(&mut self, name: &str, item: BatchBuildItem) {
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
         let watch_update_tx = self.watch_update_tx.clone();
@@ -2785,7 +2757,7 @@ impl Runner {
             )
             .await;
             let _ = cmd_tx
-                .send(RunnerCommand::LazyBuildComplete {
+                .send(RunnerInternalCommand::LazyBuildComplete {
                     name: svc_name,
                     outcome,
                 })
@@ -3001,12 +2973,12 @@ impl Runner {
         // code path. The pgid lets the handler ignore stale events that
         // arrive after the service has already been respawned.
         if let Some(pgid) = spawned_pgid {
-            let cmd_tx = self.cmd_tx.clone();
+            let cmd_tx = self.internal_tx.clone();
             let watch_name = name.to_string();
             tokio::spawn(async move {
                 let _ = crash_exit_rx.await;
                 let _ = cmd_tx
-                    .send(RunnerCommand::ServiceExited {
+                    .send(RunnerInternalCommand::ServiceExited {
                         name: watch_name,
                         pgid,
                     })
@@ -3060,8 +3032,8 @@ impl Runner {
             } else {
                 None
             };
-            let cmd_tx_for_monitor = self.cmd_tx.clone();
-            let cmd_tx_for_state = self.cmd_tx.clone();
+            let cmd_tx_for_monitor = self.internal_tx.clone();
+            let cmd_tx_for_state = self.internal_tx.clone();
             tokio::spawn(async move {
                 let ready_result = tokio::select! {
                     result = service::run_ready_check(&ready) => result,
@@ -3088,7 +3060,7 @@ impl Runner {
                 //     health-monitor probes short-circuit.
                 if done_tx.is_none() {
                     let _ = cmd_tx_for_state
-                        .send(RunnerCommand::ReadyCheckComplete {
+                        .send(RunnerInternalCommand::ReadyCheckComplete {
                             name: name_owned.clone(),
                             success,
                         })
@@ -3167,7 +3139,7 @@ impl Runner {
         rt.run_generation = rt.run_generation.saturating_add(1);
         let op_id = rt.run_generation;
 
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let platform = self.platform;
         let emitter = self.output_manager.clone_lifecycle_emitter();
@@ -3184,7 +3156,7 @@ impl Runner {
             let result =
                 run_task_worker(ctx, &name_owned, &task_cfg_for_worker, &params, mode).await;
             let _ = cmd_tx
-                .send(RunnerCommand::TaskRunPrepared {
+                .send(RunnerInternalCommand::TaskRunPrepared {
                     name: name_owned,
                     op_id,
                     task_cfg: Box::new(task_cfg),
@@ -3374,7 +3346,7 @@ impl Runner {
         let base_dir_owned = self.base_dir.clone();
         let global_watch_ignore = self.config.watch_ignore.clone();
         let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let rerun = done_tx.is_none();
 
         tokio::spawn(async move {
@@ -3423,7 +3395,7 @@ impl Runner {
                     .await;
             } else {
                 let _ = cmd_tx
-                    .send(RunnerCommand::TaskExited {
+                    .send(RunnerInternalCommand::TaskExited {
                         name: name_owned,
                         pgid,
                         success,
@@ -3499,7 +3471,7 @@ impl Runner {
             turbo_by_task,
             plain_rebuilds,
         };
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
         let bazel_build_mutex = self.bazel_build_mutex.clone();
@@ -3507,7 +3479,7 @@ impl Runner {
             let outcome =
                 run_rebuild_batch_worker(request, base_dir, emitter, bazel_build_mutex).await;
             let _ = cmd_tx
-                .send(RunnerCommand::RebuildBatchComplete(outcome))
+                .send(RunnerInternalCommand::RebuildBatchComplete(outcome))
                 .await;
         });
         self.rebuild_batch_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
@@ -3782,12 +3754,12 @@ impl Runner {
         if items.is_empty() {
             return;
         }
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
         let handle = tokio::spawn(async move {
             let outcomes = run_graph_requery_worker(items, emitter).await;
             let _ = cmd_tx
-                .send(RunnerCommand::GraphRequeryComplete(outcomes))
+                .send(RunnerInternalCommand::GraphRequeryComplete(outcomes))
                 .await;
         });
         self.graph_requery_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
@@ -4074,7 +4046,7 @@ impl Runner {
         rs.start_generation = rs.start_generation.saturating_add(1);
         let op_id = rs.start_generation;
 
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let name_owned = name.to_string();
         let base_dir = self.base_dir.clone();
         let pid_dir = self.base_dir.join(".don").join("pids");
@@ -4099,7 +4071,7 @@ impl Runner {
             .await;
 
             let _ = cmd_tx
-                .send(RunnerCommand::ServiceStartPrepared {
+                .send(RunnerInternalCommand::ServiceStartPrepared {
                     name: name_owned,
                     op_id,
                     context: Box::new(context),
@@ -4215,7 +4187,7 @@ impl Runner {
         rs.rebuild_generation = rs.rebuild_generation.saturating_add(1);
         let op_id = rs.rebuild_generation;
 
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let name_owned = name.to_string();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
@@ -4233,7 +4205,7 @@ impl Runner {
             )
             .await;
             let _ = cmd_tx
-                .send(RunnerCommand::ServiceRebuildPrepared {
+                .send(RunnerInternalCommand::ServiceRebuildPrepared {
                     name: name_owned,
                     op_id,
                     result,
@@ -4438,7 +4410,7 @@ impl Runner {
         rs.control_reply = Some(reply);
         rs.stop_action = stop_action;
 
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let name_owned = name.to_string();
         let shutdown_rx = self.shutdown_flag_tx.subscribe();
         let worker = tokio::spawn(async move {
@@ -4451,7 +4423,7 @@ impl Runner {
             .await
             .map_err(|e| e.to_string());
             let _ = cmd_tx
-                .send(RunnerCommand::ServiceStopComplete {
+                .send(RunnerInternalCommand::ServiceStopComplete {
                     name: name_owned,
                     op_id,
                     result,
@@ -4585,7 +4557,7 @@ impl Runner {
         );
     }
 
-    /// Runner-internal handler for [`RunnerCommand::ReadyCheckComplete`].
+    /// Runner-internal handler for [`RunnerInternalCommand::ReadyCheckComplete`].
     ///
     /// Emitted by the async ready-check task inside
     /// [`wire_service_output_and_ready_check`] when there's no `done_tx`
@@ -4808,12 +4780,12 @@ impl Runner {
             name,
             &format!("{reason} — auto-restart in {backoff_secs}s (attempt {attempt})"),
         );
-        let cmd_tx = self.cmd_tx.clone();
+        let cmd_tx = self.internal_tx.clone();
         let name_owned = name.to_string();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
             let _ = cmd_tx
-                .send(RunnerCommand::AutoRestart {
+                .send(RunnerInternalCommand::AutoRestart {
                     name: name_owned,
                     attempt,
                 })
@@ -6110,12 +6082,12 @@ fn unhealthy_restart_backoff_secs(attempt: u32) -> u64 {
 /// Long-lived per-service health monitor. Spawned once a service reaches
 /// `Ready` when `ready.monitor = true`. Polls `run_one_check` at
 /// `monitor_interval` and reports state transitions back to the runner via
-/// `RunnerCommand::ServiceHealthChanged`. Exits when the cancel oneshot
+/// `RunnerInternalCommand::ServiceHealthChanged`. Exits when the cancel oneshot
 /// fires (sent or dropped) — typically on stop/restart/process exit.
 async fn run_health_monitor(
     name: String,
     ready: crate::config::ReadyCheck,
-    cmd_tx: mpsc::Sender<RunnerCommand>,
+    cmd_tx: mpsc::Sender<RunnerInternalCommand>,
     mut cancel: oneshot::Receiver<()>,
 ) {
     let interval_str = ready.monitor_interval.as_str();
@@ -6139,7 +6111,7 @@ async fn run_health_monitor(
                 if currently_unhealthy {
                     currently_unhealthy = false;
                     let _ = cmd_tx
-                        .send(RunnerCommand::ServiceHealthChanged {
+                        .send(RunnerInternalCommand::ServiceHealthChanged {
                             name: name.clone(),
                             healthy: true,
                         })
@@ -6151,7 +6123,7 @@ async fn run_health_monitor(
                 if !currently_unhealthy && consecutive_failures >= unhealthy_after {
                     currently_unhealthy = true;
                     let _ = cmd_tx
-                        .send(RunnerCommand::ServiceHealthChanged {
+                        .send(RunnerInternalCommand::ServiceHealthChanged {
                             name: name.clone(),
                             healthy: false,
                         })
@@ -6178,7 +6150,7 @@ pub(crate) struct BatchBuildItem {
 }
 
 /// Everything the detached batch-build task produces. Applied to runner
-/// state in the main loop when [`RunnerCommand::BatchBuildComplete`]
+/// state in the main loop when [`RunnerInternalCommand::BatchBuildComplete`]
 /// arrives — keeps all `&mut self` mutations on the runner task.
 pub(crate) struct BatchBuildOutcome {
     /// Per-item resolved watch paths — applied to `resolved_watch_paths` on
@@ -6912,7 +6884,7 @@ mod tests {
             .expect("timeout waiting for unhealthy event")
             .expect("monitor channel closed unexpectedly");
         match msg {
-            RunnerCommand::ServiceHealthChanged { name, healthy } => {
+            RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
                 assert_eq!(name, "svc");
                 assert!(!healthy, "expected unhealthy event first");
             }
@@ -6930,7 +6902,7 @@ mod tests {
             .expect("timeout waiting for recovery event")
             .expect("monitor channel closed unexpectedly");
         match msg {
-            RunnerCommand::ServiceHealthChanged { name, healthy } => {
+            RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
                 assert_eq!(name, "svc");
                 assert!(healthy, "expected recovery event after rebind");
             }
