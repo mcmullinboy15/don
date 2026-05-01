@@ -4,11 +4,23 @@ mod helpers;
 use don::config::{Config, ConfigError, Platform};
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
+use helpers::timeout::run_with_timeout;
+use std::time::Duration;
 
 const TEST_PLATFORM: Platform = Platform::LinuxX86_64;
 
-#[test]
-fn validate_valid_config() {
+macro_rules! bounded_test {
+    ($name:ident, $body:ident) => {
+        #[test]
+        fn $name() {
+            run_with_timeout(Duration::from_secs(10), async {
+                $body();
+            });
+        }
+    };
+}
+
+fn validate_valid_config_body() {
     let dir = TempDir::new("validate-valid");
     let config_path = ConfigBuilder::new()
         .add_custom_service("api", "mybin", &["serve"])
@@ -21,8 +33,7 @@ fn validate_valid_config() {
     assert!(config.validate(TEST_PLATFORM).is_ok());
 }
 
-#[test]
-fn validate_invalid_config_unknown_dep() {
+fn validate_invalid_config_unknown_dep_body() {
     let dir = TempDir::new("validate-invalid-dep");
     let config_path = ConfigBuilder::new()
         .add_custom_service("api", "mybin", &[])
@@ -37,8 +48,7 @@ fn validate_invalid_config_unknown_dep() {
     assert!(errors[0].contains("unknown service, task, or service group 'ghost'"));
 }
 
-#[test]
-fn validate_missing_config_file() {
+fn validate_missing_config_file_body() {
     let dir = TempDir::new("validate-missing");
     let config_path = dir.child("nonexistent.toml");
 
@@ -46,8 +56,7 @@ fn validate_missing_config_file() {
     assert!(matches!(err, ConfigError::ReadFile { .. }));
 }
 
-#[test]
-fn validate_malformed_toml() {
+fn validate_malformed_toml_body() {
     let dir = TempDir::new("validate-malformed");
     let config_path = dir.child("don.toml");
     std::fs::write(&config_path, "this is not [valid toml").unwrap();
@@ -56,8 +65,7 @@ fn validate_malformed_toml() {
     assert!(matches!(err, ConfigError::Parse(_)));
 }
 
-#[test]
-fn validate_empty_config_is_valid() {
+fn validate_empty_config_is_valid_body() {
     let dir = TempDir::new("validate-empty");
     let config_path = dir.child("don.toml");
     std::fs::write(&config_path, "").unwrap();
@@ -66,8 +74,7 @@ fn validate_empty_config_is_valid() {
     assert!(config.validate(TEST_PLATFORM).is_ok());
 }
 
-#[test]
-fn validate_config_with_tasks_and_profiles() {
+fn validate_config_with_tasks_and_profiles_body() {
     let dir = TempDir::new("validate-full");
     let config_path = ConfigBuilder::new()
         .add_docker_service("postgres", "postgres:16")
@@ -87,8 +94,7 @@ fn validate_config_with_tasks_and_profiles() {
     assert_eq!(config.profiles.len(), 1);
 }
 
-#[test]
-fn validate_cycle_detected() {
+fn validate_cycle_detected_body() {
     let dir = TempDir::new("validate-cycle");
     let config_path = ConfigBuilder::new()
         .add_custom_service("a", "a", &[])
@@ -106,8 +112,7 @@ fn validate_cycle_detected() {
     assert!(errors.iter().any(|e| e.contains("dependency cycle")));
 }
 
-#[test]
-fn validate_invalid_duration_strings() {
+fn validate_invalid_duration_strings_body() {
     let dir = TempDir::new("validate-duration");
     let config_path = ConfigBuilder::new()
         .raw(
@@ -127,8 +132,7 @@ fn validate_invalid_duration_strings() {
     assert!(errors.iter().any(|e| e.contains("invalid debounce")));
 }
 
-#[test]
-fn validate_invalid_watch_pattern() {
+fn validate_invalid_watch_pattern_body() {
     let dir = TempDir::new("validate-watch-pattern");
     let config_path = ConfigBuilder::new()
         .raw(
@@ -163,8 +167,7 @@ fn validate_invalid_watch_pattern() {
     );
 }
 
-#[test]
-fn validate_invalid_global_watch_ignore_pattern() {
+fn validate_invalid_global_watch_ignore_pattern_body() {
     let dir = TempDir::new("validate-global-watch-ignore-pattern");
     let config_path = ConfigBuilder::new()
         .raw(
@@ -190,8 +193,7 @@ fn validate_invalid_global_watch_ignore_pattern() {
     );
 }
 
-#[test]
-fn validate_tcp_ready_check_on_listen_address_warns() {
+fn validate_tcp_ready_check_on_listen_address_warns_body() {
     let toml = ConfigBuilder::new()
         .add_custom_service("api", "mybin", &[])
         .listen(&["0.0.0.0:3000"])
@@ -209,8 +211,7 @@ fn validate_tcp_ready_check_on_listen_address_warns() {
     );
 }
 
-#[test]
-fn validate_tcp_ready_check_on_different_address_no_warning() {
+fn validate_tcp_ready_check_on_different_address_no_warning_body() {
     let toml = ConfigBuilder::new()
         .add_custom_service("api", "mybin", &[])
         .listen(&["0.0.0.0:3000"])
@@ -226,8 +227,7 @@ fn validate_tcp_ready_check_on_different_address_no_warning() {
     );
 }
 
-#[test]
-fn don_validate_cli_valid_config() {
+fn don_validate_cli_valid_config_body() {
     let dir = TempDir::new("cli-validate-valid");
     ConfigBuilder::new()
         .add_custom_service("api", "mybin", &[])
@@ -251,8 +251,7 @@ fn don_validate_cli_valid_config() {
     assert!(stdout.contains("Config is valid"));
 }
 
-#[test]
-fn don_validate_cli_invalid_config() {
+fn don_validate_cli_invalid_config_body() {
     let dir = TempDir::new("cli-validate-invalid");
     let config_path = dir.child("don.toml");
     std::fs::write(&config_path, "[services.broken]\nenv = { FOO = \"bar\" }").unwrap();
@@ -267,8 +266,7 @@ fn don_validate_cli_invalid_config() {
     assert!(stderr.contains("validation failed"));
 }
 
-#[test]
-fn don_validate_cli_missing_config() {
+fn don_validate_cli_missing_config_body() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
         .args([
             "--config",
@@ -300,8 +298,7 @@ path = "tool"
     )
 }
 
-#[test]
-fn validate_download_bad_sha256_length() {
+fn validate_download_bad_sha256_length_body() {
     let toml = r#"
 [services.tool]
 run.cmd = "tool"
@@ -321,8 +318,7 @@ sha256 = "tooshort"
     );
 }
 
-#[test]
-fn validate_download_bad_url_scheme() {
+fn validate_download_bad_url_scheme_body() {
     let toml = r#"
 [services.tool]
 run.cmd = "tool"
@@ -342,8 +338,7 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     );
 }
 
-#[test]
-fn validate_download_without_run_cmd() {
+fn validate_download_without_run_cmd_body() {
     // Download but no run.cmd → should error.
     let toml = r#"
 [services.tool]
@@ -365,15 +360,13 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     );
 }
 
-#[test]
-fn validate_valid_download_config_passes() {
+fn validate_valid_download_config_passes_body() {
     let toml = download_toml("");
     let config: Config = toml.parse().unwrap();
     assert!(config.validate(TEST_PLATFORM).is_ok());
 }
 
-#[test]
-fn validate_download_bin_name_collision() {
+fn validate_download_bin_name_collision_body() {
     // Two services download different binaries that would both link to
     // `.don/bin/cockroach` — must error unless disambiguated.
     let toml = r#"
@@ -404,8 +397,7 @@ path = "cockroach-v24/cockroach"
     );
 }
 
-#[test]
-fn validate_download_bin_name_override_resolves_collision() {
+fn validate_download_bin_name_override_resolves_collision_body() {
     // Same two-crdb setup but with explicit bin_names → passes.
     let toml = r#"
 [services.crdb_v25]
@@ -433,8 +425,7 @@ path = "cockroach-v24/cockroach"
     );
 }
 
-#[test]
-fn validate_download_missing_current_platform_warns() {
+fn validate_download_missing_current_platform_warns_body() {
     // TEST_PLATFORM is LinuxX86_64. Provide only macos entries — should warn.
     let toml = r#"
 [services.tool]
@@ -454,3 +445,83 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "expected platform warning, got: {warnings:?}"
     );
 }
+
+bounded_test!(validate_valid_config, validate_valid_config_body);
+bounded_test!(
+    validate_invalid_config_unknown_dep,
+    validate_invalid_config_unknown_dep_body
+);
+bounded_test!(
+    validate_missing_config_file,
+    validate_missing_config_file_body
+);
+bounded_test!(validate_malformed_toml, validate_malformed_toml_body);
+bounded_test!(
+    validate_empty_config_is_valid,
+    validate_empty_config_is_valid_body
+);
+bounded_test!(
+    validate_config_with_tasks_and_profiles,
+    validate_config_with_tasks_and_profiles_body
+);
+bounded_test!(validate_cycle_detected, validate_cycle_detected_body);
+bounded_test!(
+    validate_invalid_duration_strings,
+    validate_invalid_duration_strings_body
+);
+bounded_test!(
+    validate_invalid_watch_pattern,
+    validate_invalid_watch_pattern_body
+);
+bounded_test!(
+    validate_invalid_global_watch_ignore_pattern,
+    validate_invalid_global_watch_ignore_pattern_body
+);
+bounded_test!(
+    validate_tcp_ready_check_on_listen_address_warns,
+    validate_tcp_ready_check_on_listen_address_warns_body
+);
+bounded_test!(
+    validate_tcp_ready_check_on_different_address_no_warning,
+    validate_tcp_ready_check_on_different_address_no_warning_body
+);
+bounded_test!(
+    don_validate_cli_valid_config,
+    don_validate_cli_valid_config_body
+);
+bounded_test!(
+    don_validate_cli_invalid_config,
+    don_validate_cli_invalid_config_body
+);
+bounded_test!(
+    don_validate_cli_missing_config,
+    don_validate_cli_missing_config_body
+);
+bounded_test!(
+    validate_download_bad_sha256_length,
+    validate_download_bad_sha256_length_body
+);
+bounded_test!(
+    validate_download_bad_url_scheme,
+    validate_download_bad_url_scheme_body
+);
+bounded_test!(
+    validate_download_without_run_cmd,
+    validate_download_without_run_cmd_body
+);
+bounded_test!(
+    validate_valid_download_config_passes,
+    validate_valid_download_config_passes_body
+);
+bounded_test!(
+    validate_download_bin_name_collision,
+    validate_download_bin_name_collision_body
+);
+bounded_test!(
+    validate_download_bin_name_override_resolves_collision,
+    validate_download_bin_name_override_resolves_collision_body
+);
+bounded_test!(
+    validate_download_missing_current_platform_warns,
+    validate_download_missing_current_platform_warns_body
+);
