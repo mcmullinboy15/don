@@ -14,9 +14,8 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::{
-    AttachWaiter, CommandResult, ServiceHandle, ServiceState, ServiceStopAction, TaskItemState,
-};
+use super::service::ServiceHandle;
+use super::{AttachWaiter, CommandResult, ServiceState, ServiceStopAction, TaskItemState};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
