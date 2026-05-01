@@ -10,7 +10,7 @@
 //! across restarts, and [`ServiceWriter`] is cloneable for reuse.
 
 pub(crate) mod osc;
-pub mod ring_buffer;
+pub(crate) mod ring_buffer;
 pub(crate) mod sanitize;
 
 use bytes::Bytes;

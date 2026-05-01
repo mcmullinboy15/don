@@ -1,8 +1,8 @@
 //! Docker service lifecycle — container creation, starting, stopping, and log streaming.
 //!
 //! Uses the bollard crate to communicate with the Docker daemon via its Unix socket.
-//! Each Docker service gets a [`DockerHandle`] that wraps the container ID and provides
-//! stop/wait operations analogous to [`crate::process::ProcessHandle`].
+//! Each Docker service gets a [`DockerHandle`] that wraps the container ID and
+//! provides stop/remove operations analogous to process cleanup.
 
 pub mod build;
 pub mod parse;
@@ -12,12 +12,10 @@ use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
-    StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
+    StopContainerOptionsBuilder,
 };
-use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::task::JoinHandle;
 
 use crate::config::service::DockerConfig;
 use crate::process::ChildOutput;
@@ -32,27 +30,20 @@ pub enum DockerError {
     BuildFailed(String),
     #[error("failed to create build context: {0}")]
     Tar(#[source] std::io::Error),
-    #[error("container vanished unexpectedly")]
-    ContainerVanished,
     #[error("invalid port mapping '{0}': {1}")]
     InvalidPort(String, String),
-    #[error("docker not available")]
-    NotAvailable,
     #[error("env file error: {0}")]
     EnvFile(#[source] std::io::Error),
 }
 
 /// Handle to a running Docker container.
 ///
-/// Provides stop/wait operations analogous to [`crate::process::ProcessHandle`].
-/// The container is identified by ID and name. A background task waits for
-/// the container to exit so `wait()` can return the exit code.
+/// Provides stop/remove operations analogous to [`crate::process::ProcessHandle`].
+/// The container is identified by ID and name.
 pub struct DockerHandle {
     client: Docker,
     container_id: String,
     container_name: String,
-    /// Background task waiting for container exit.
-    wait_handle: Option<JoinHandle<Result<i64, DockerError>>>,
 }
 
 impl std::fmt::Debug for DockerHandle {
@@ -85,17 +76,6 @@ impl DockerHandle {
         Ok(())
     }
 
-    /// Wait for the container to exit and return the exit code.
-    pub async fn wait(&mut self) -> Result<i64, DockerError> {
-        match self.wait_handle.take() {
-            Some(handle) => match handle.await {
-                Ok(result) => result,
-                Err(_join_err) => Err(DockerError::ContainerVanished),
-            },
-            None => Err(DockerError::ContainerVanished),
-        }
-    }
-
     /// Force-remove the container (for cleanup).
     pub async fn remove(&self) -> Result<(), DockerError> {
         let options = RemoveContainerOptionsBuilder::new().force(true).build();
@@ -103,11 +83,6 @@ impl DockerHandle {
             .remove_container(&self.container_id, Some(options))
             .await?;
         Ok(())
-    }
-
-    /// The container name.
-    pub fn container_name(&self) -> &str {
-        &self.container_name
     }
 }
 
@@ -185,21 +160,6 @@ pub(crate) async fn start_docker_service(
     // Start container.
     client.start_container(&container_id, None).await?;
 
-    // Spawn a background task to wait for container exit.
-    let wait_client = client.clone();
-    let wait_id = container_id.clone();
-    let wait_handle = tokio::spawn(async move {
-        let wait_options = WaitContainerOptionsBuilder::new()
-            .condition("not-running")
-            .build();
-        let mut stream = wait_client.wait_container(&wait_id, Some(wait_options));
-        match stream.next().await {
-            Some(Ok(response)) => Ok(response.status_code),
-            Some(Err(e)) => Err(DockerError::Api(e)),
-            None => Err(DockerError::ContainerVanished),
-        }
-    });
-
     // Start log streaming.
     let log_options = LogsOptionsBuilder::new()
         .follow(true)
@@ -214,7 +174,6 @@ pub(crate) async fn start_docker_service(
         client: client.clone(),
         container_id,
         container_name,
-        wait_handle: Some(wait_handle),
     };
 
     Ok((handle, child_output))

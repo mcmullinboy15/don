@@ -100,16 +100,19 @@ impl RingBuffer {
     }
 
     /// Total number of entries ever pushed (including evicted ones).
+    #[cfg(test)]
     pub fn total_written(&self) -> usize {
         self.total_written
     }
 
     /// Number of entries currently stored in the buffer.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the buffer is empty.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

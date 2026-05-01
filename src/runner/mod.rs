@@ -9,8 +9,8 @@ mod completions;
 mod params;
 mod state;
 
-pub mod service;
-pub mod task;
+pub(crate) mod service;
+pub(crate) mod task;
 
 pub(crate) use params::resolve_task_params;
 
