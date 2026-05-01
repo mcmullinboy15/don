@@ -326,6 +326,7 @@ from `depends_on`:
 ```toml
 [service_groups]
 datastores = ["postgres", "redis"]
+backend = ["datastores", "api"]
 
 [services.api]
 rust.binary = "api-server"
@@ -333,6 +334,8 @@ depends_on = ["datastores"]
 ```
 
 Depending on a service group is equivalent to depending on each member service.
+Groups may include other groups; nested groups are expanded recursively and
+cycles between groups are rejected during validation.
 
 ## Project-Local State
 

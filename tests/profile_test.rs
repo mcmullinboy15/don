@@ -124,6 +124,24 @@ fn resolve_profile_transitive_deps() {
             profile_name: "backend",
             expected: vec!["api", "postgres", "redis"],
         },
+        Case {
+            name: "profile expands nested service groups",
+            toml: r#"
+                [services.postgres]
+                run.cmd = "pg"
+                [services.redis]
+                run.cmd = "redis"
+                [services.api]
+                run.cmd = "api"
+                [service_groups]
+                datastores = ["postgres", "redis"]
+                backend = ["datastores", "api"]
+                [profiles.dev]
+                services = ["backend"]
+            "#,
+            profile_name: "dev",
+            expected: vec!["api", "postgres", "redis"],
+        },
     ];
 
     for case in cases {

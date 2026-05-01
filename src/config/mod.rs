@@ -37,8 +37,8 @@ pub struct Config {
     /// Long-running services (databases, APIs, workers, etc.).
     #[serde(default)]
     pub services: HashMap<String, Service>,
-    /// Named groups of services that can be referenced from `depends_on`
-    /// and `profiles.*.services`.
+    /// Named groups of services or other service groups that can be referenced
+    /// from `depends_on` and `profiles.*.services`.
     #[serde(default)]
     pub service_groups: HashMap<String, Vec<String>>,
     /// One-shot tasks (migrations, codegen, etc.).
@@ -137,20 +137,47 @@ impl Config {
     pub(crate) fn expand_dependency_refs(&self, refs: &[String]) -> Vec<String> {
         let mut expanded = Vec::new();
         let mut seen = HashSet::new();
+        let mut group_stack = Vec::new();
 
         for name in refs {
-            if let Some(group) = self.service_groups.get(name) {
-                for member in group {
-                    if seen.insert(member.clone()) {
-                        expanded.push(member.clone());
-                    }
-                }
-            } else if seen.insert(name.clone()) {
-                expanded.push(name.clone());
-            }
+            self.expand_dependency_ref(name, &mut expanded, &mut seen, &mut group_stack);
         }
 
         expanded
+    }
+
+    fn expand_dependency_ref(
+        &self,
+        name: &str,
+        expanded: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+        group_stack: &mut Vec<String>,
+    ) {
+        if self.service_groups.contains_key(name) {
+            self.expand_service_group(name, expanded, seen, group_stack);
+        } else if seen.insert(name.to_string()) {
+            expanded.push(name.to_string());
+        }
+    }
+
+    fn expand_service_group(
+        &self,
+        name: &str,
+        expanded: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+        group_stack: &mut Vec<String>,
+    ) {
+        if group_stack.iter().any(|group| group == name) {
+            return;
+        }
+
+        group_stack.push(name.to_string());
+        if let Some(group) = self.service_groups.get(name) {
+            for member in group {
+                self.expand_dependency_ref(member, expanded, seen, group_stack);
+            }
+        }
+        group_stack.pop();
     }
 
     pub(crate) fn expand_profile_services(&self, refs: &[String]) -> Vec<String> {
@@ -164,7 +191,7 @@ impl Config {
     pub fn validate(&self, platform: Platform) -> Result<Vec<String>, ConfigError> {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
-        let all_service_names = self.all_service_names();
+        let service_group_reference_names = self.profile_service_reference_names();
         let dependency_reference_names = self.dependency_reference_names();
         let profile_service_reference_names = self.profile_service_reference_names();
 
@@ -198,10 +225,10 @@ impl Config {
 
         for (name, members) in &self.service_groups {
             for member in members {
-                if !self.services.contains_key(member) {
-                    let suggestion = suggest_typo(member, &all_service_names);
+                if !service_group_reference_names.contains(member.as_str()) {
+                    let suggestion = suggest_typo(member, &service_group_reference_names);
                     errors.push(format!(
-                        "service group '{name}': references unknown service '{member}'{suggestion}"
+                        "service group '{name}': references unknown service or service group '{member}'{suggestion}"
                     ));
                 }
             }
@@ -482,6 +509,9 @@ impl Config {
         }
 
         // Detect dependency cycles
+        if let Some(cycle) = self.detect_service_group_cycle() {
+            errors.push(format!("service group cycle: {}", cycle.join(" -> ")));
+        }
         if let Some(cycle) = self.detect_cycle(platform) {
             errors.push(format!("dependency cycle: {}", cycle.join(" -> ")));
         }
@@ -525,6 +555,72 @@ impl Config {
         } else {
             Err(ConfigError::Validation { errors })
         }
+    }
+
+    /// Detect cycles among service groups. Group cycles are invalid even if
+    /// no service currently depends on the group, because expansion would be
+    /// ambiguous and could otherwise recurse forever.
+    fn detect_service_group_cycle(&self) -> Option<Vec<String>> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum State {
+            Unvisited,
+            Visiting,
+            Visited,
+        }
+
+        let mut state: HashMap<String, State> = self
+            .service_groups
+            .keys()
+            .map(|k| (k.clone(), State::Unvisited))
+            .collect();
+        let mut path: Vec<String> = Vec::new();
+
+        fn dfs(
+            node: &str,
+            groups: &HashMap<String, Vec<String>>,
+            state: &mut HashMap<String, State>,
+            path: &mut Vec<String>,
+        ) -> Option<Vec<String>> {
+            state.insert(node.to_string(), State::Visiting);
+            path.push(node.to_string());
+
+            if let Some(members) = groups.get(node) {
+                for member in members {
+                    if !groups.contains_key(member) {
+                        continue;
+                    }
+                    match state.get(member.as_str()) {
+                        Some(State::Visiting) => {
+                            let cycle_start = path.iter().position(|n| n == member)?;
+                            let mut cycle: Vec<String> = path[cycle_start..].to_vec();
+                            cycle.push(member.clone());
+                            return Some(cycle);
+                        }
+                        Some(State::Unvisited) | None => {
+                            if let Some(cycle) = dfs(member, groups, state, path) {
+                                return Some(cycle);
+                            }
+                        }
+                        Some(State::Visited) => {}
+                    }
+                }
+            }
+
+            path.pop();
+            state.insert(node.to_string(), State::Visited);
+            None
+        }
+
+        let all_groups: Vec<String> = self.service_groups.keys().cloned().collect();
+        for group in &all_groups {
+            if state.get(group) == Some(&State::Unvisited)
+                && let Some(cycle) = dfs(group, &self.service_groups, &mut state, &mut path)
+            {
+                return Some(cycle);
+            }
+        }
+
+        None
     }
 
     /// Detect dependency cycles using DFS. Returns the cycle path if one exists.
@@ -1548,6 +1644,42 @@ mod tests {
                 },
             },
             ConfigTestCase {
+                name: "service groups can reference other service groups",
+                input: r#"
+                    [services.postgres]
+                    run.cmd = "postgres"
+
+                    [services.redis]
+                    run.cmd = "redis"
+
+                    [services.api]
+                    run.cmd = "api"
+
+                    [services.worker]
+                    run.cmd = "worker"
+                    depends_on = ["backend"]
+
+                    [service_groups]
+                    datastores = ["postgres", "redis"]
+                    backend = ["datastores", "api"]
+
+                    [profiles.dev]
+                    services = ["backend"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    assert_eq!(
+                        config.expand_dependency_refs(&["backend".to_string()]),
+                        vec![
+                            "postgres".to_string(),
+                            "redis".to_string(),
+                            "api".to_string(),
+                        ]
+                    );
+                },
+            },
+            ConfigTestCase {
                 name: "service group with unknown service is a validation error",
                 input: r#"
                     [services.api]
@@ -1564,8 +1696,27 @@ mod tests {
                     };
                     assert!(errors.iter().any(|e| {
                         e.contains("service group 'datastores'")
-                            && e.contains("unknown service 'postgres'")
+                            && e.contains("unknown service or service group 'postgres'")
                     }));
+                },
+            },
+            ConfigTestCase {
+                name: "service group cycle is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+
+                    [service_groups]
+                    first = ["second"]
+                    second = ["first"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("service group cycle")));
                 },
             },
             ConfigTestCase {
