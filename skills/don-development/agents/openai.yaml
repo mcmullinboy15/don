@@ -1,0 +1,7 @@
+interface:
+  display_name: "Don Development"
+  short_description: "Work safely in the Don Rust codebase"
+  default_prompt: "Use $don-development to implement or review a Don codebase change with process-safety and shutdown checks."
+
+policy:
+  allow_implicit_invocation: true
