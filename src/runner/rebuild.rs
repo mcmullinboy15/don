@@ -1,0 +1,462 @@
+use super::build_tools::{
+    BazelRebuildItem, GraphRequeryOutcomeItem, GraphRequeryRequestItem, RebuildBatchOutcome,
+    RebuildBatchRequest, TurboRebuildItem, run_graph_requery_worker, run_rebuild_batch_worker,
+    send_watch_update,
+};
+use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
+use super::{
+    Runner, RunnerEvent, RunnerInternalCommand, ServiceState, should_rebuild_after_graph_requery,
+};
+
+impl Runner {
+    /// Flush all pending build-tool rebuilds as a single batch.
+    ///
+    /// Collects Bazel targets and Turbo filters from the queued services,
+    /// runs one build per tool, then restarts each affected service.
+    pub(in crate::runner) async fn flush_pending_rebuilds(&mut self) {
+        let names = std::mem::take(&mut self.pending_bt_rebuilds);
+        self.bt_rebuild_deadline = None;
+
+        if names.is_empty() {
+            return;
+        }
+        if self.rebuild_batch_handle.is_some() {
+            for name in names {
+                if !self.pending_bt_rebuilds.contains(&name) {
+                    self.pending_bt_rebuilds.push(name);
+                }
+            }
+            self.bt_rebuild_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+            return;
+        }
+
+        let mut bazel_items: Vec<BazelRebuildItem> = Vec::new();
+        let mut turbo_items: Vec<TurboRebuildItem> = Vec::new();
+        // Services without a build tool target (shouldn't happen, but handle gracefully)
+        let mut plain_rebuilds: Vec<String> = Vec::new();
+
+        for name in &names {
+            if let Some(rs) = self.services.get(name) {
+                match &rs.resolved.kind {
+                    Some(crate::config::ServiceKind::Bazel(bazel)) => {
+                        bazel_items.push(BazelRebuildItem {
+                            name: name.clone(),
+                            target: bazel.target.clone(),
+                            working_dir: working_dir_for(
+                                &self.base_dir,
+                                rs.resolved.dir.as_deref(),
+                            ),
+                        });
+                    }
+                    Some(crate::config::ServiceKind::Turbo(turbo)) => {
+                        let build_task = turbo
+                            .build_task
+                            .clone()
+                            .unwrap_or_else(|| "build".to_string());
+                        if !build_task.is_empty()
+                            && let Some(ref filter) = turbo.filter
+                        {
+                            turbo_items.push(TurboRebuildItem {
+                                name: name.clone(),
+                                filter: filter.clone(),
+                                build_task,
+                                working_dir: working_dir_for(
+                                    &self.base_dir,
+                                    rs.resolved.dir.as_deref(),
+                                ),
+                            });
+                        } else {
+                            plain_rebuilds.push(name.clone());
+                        }
+                    }
+                    _ => {
+                        plain_rebuilds.push(name.clone());
+                    }
+                }
+            }
+        }
+        let request = RebuildBatchRequest {
+            bazel_items,
+            turbo_items,
+            plain_rebuilds,
+        };
+        let cmd_tx = self.internal_tx.clone();
+        let emitter = self.output_manager.clone_lifecycle_emitter();
+        let bazel_build_mutex = self.bazel_build_mutex.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = run_rebuild_batch_worker(request, emitter, bazel_build_mutex).await;
+            let _ = cmd_tx
+                .send(RunnerInternalCommand::RebuildBatchComplete(outcome))
+                .await;
+        });
+        self.rebuild_batch_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+    }
+
+    pub(in crate::runner) fn fail_rebuild(&self, name: &str, message: &str) {
+        self.output_manager.service_error_event(name, message);
+        let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+            name: name.to_string(),
+            success: false,
+        });
+    }
+
+    pub(in crate::runner) fn mark_rebuild_stale(&mut self, name: &str) {
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.rebuild_stale = true;
+        }
+    }
+
+    fn clear_rebuild_stale(&mut self, name: &str) {
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.rebuild_stale = false;
+        }
+    }
+
+    pub(in crate::runner) fn take_rebuild_stale(&mut self, name: &str) -> bool {
+        self.services.get_mut(name).is_some_and(|rs| {
+            let stale = rs.rebuild_stale;
+            rs.rebuild_stale = false;
+            stale
+        })
+    }
+
+    pub(in crate::runner) async fn handle_rebuild_batch_complete(
+        &mut self,
+        outcome: RebuildBatchOutcome,
+    ) {
+        for (name, message) in &outcome.failed {
+            self.fail_rebuild(name, message);
+        }
+        for name in &outcome.up_to_date {
+            self.output_manager
+                .service_event(name, "skipped (no changes)");
+            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                name: name.clone(),
+                success: true,
+            });
+        }
+        for name in &outcome.build_succeeded {
+            if self.take_rebuild_stale(name) {
+                let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                    name: name.clone(),
+                    success: true,
+                });
+                continue;
+            }
+            self.do_rebuild(name).await;
+        }
+        for name in &outcome.plain_rebuilds {
+            if self.take_rebuild_stale(name) {
+                let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                    name: name.clone(),
+                    success: true,
+                });
+                continue;
+            }
+            self.do_rebuild(name).await;
+        }
+        if !self.pending_bt_rebuilds.is_empty() {
+            self.bt_rebuild_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+        }
+    }
+
+    pub(in crate::runner) async fn handle_graph_requery_complete(
+        &mut self,
+        outcomes: Vec<GraphRequeryOutcomeItem>,
+    ) {
+        let watch_update_tx = self.watch_update_tx.clone();
+        let mut services_to_rebuild: Vec<String> = Vec::new();
+        let mut tasks_to_rerun: Vec<String> = Vec::new();
+        let global_watch_ignore = resolve_watch_ignore_patterns(
+            &self.base_dir,
+            &[],
+            &self.base_dir,
+            &self.config.watch_ignore,
+        );
+
+        for outcome in outcomes {
+            match outcome.result {
+                Ok(info) => {
+                    let count = info.watch_paths.len();
+                    self.output_manager.service_event(
+                        &outcome.name,
+                        &format!(
+                            "updated watch paths ({count} path{})",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                    );
+                    if let Some(rs) = self.services.get_mut(&outcome.name) {
+                        rs.resolved_watch_paths = info.watch_paths.clone();
+                    } else if let Some(rt) = self.tasks.get_mut(&outcome.name) {
+                        rt.resolved_watch_paths = info.watch_paths.clone();
+                    }
+                    if let Some(ref tx) = watch_update_tx {
+                        let kind = if self.services.contains_key(&outcome.name) {
+                            crate::watch::WatchItemKind::Service
+                        } else {
+                            crate::watch::WatchItemKind::Task
+                        };
+                        send_watch_update(
+                            tx,
+                            outcome.name.clone(),
+                            kind,
+                            info.watch_paths.clone(),
+                            outcome.ignore_patterns,
+                            self.base_dir.clone(),
+                        )
+                        .await;
+                        send_watch_update(
+                            tx,
+                            format!("{}__graph", outcome.name),
+                            crate::watch::WatchItemKind::BuildGraph,
+                            info.graph_definition_globs,
+                            global_watch_ignore.clone(),
+                            self.base_dir.clone(),
+                        )
+                        .await;
+                    }
+
+                    if let Some(rs) = self.services.get(&outcome.name) {
+                        if should_rebuild_after_graph_requery(rs)
+                            && !services_to_rebuild.contains(&outcome.name)
+                        {
+                            services_to_rebuild.push(outcome.name.clone());
+                        }
+                    } else if self.tasks.contains_key(&outcome.name)
+                        && !tasks_to_rerun.contains(&outcome.name)
+                    {
+                        tasks_to_rerun.push(outcome.name.clone());
+                    }
+                }
+                Err(e) => {
+                    self.output_manager.service_error_event(
+                        &outcome.name,
+                        &format!(
+                            "build tool re-query failed: {e} — keeping existing watch patterns"
+                        ),
+                    );
+                }
+            }
+        }
+        if !self.pending_graph_requery.is_empty() {
+            self.bt_requery_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+        }
+
+        if !services_to_rebuild.is_empty() {
+            for name in services_to_rebuild {
+                self.output_manager
+                    .service_event(&name, "build graph changed — rebuilding");
+                if !self.pending_bt_rebuilds.contains(&name) {
+                    self.pending_bt_rebuilds.push(name);
+                }
+            }
+            self.bt_rebuild_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+        }
+
+        for name in tasks_to_rerun {
+            self.output_manager
+                .service_event(&name, "build graph changed — re-running");
+            self.handle_task_rerun(&name).await;
+        }
+    }
+
+    /// Handle a build graph change event (BUILD files, package.json, etc. changed).
+    ///
+    /// Queues the item for a batched re-query instead of spawning immediately.
+    /// This prevents redundant concurrent queries when a single BUILD file
+    /// change affects multiple services.
+    pub(in crate::runner) async fn handle_build_graph_changed(&mut self, name: &str) {
+        if name == crate::watch::WORKSPACE_GRAPH_ITEM_NAME {
+            let service_names: Vec<String> = self
+                .services
+                .iter()
+                .filter(|(_, rs)| rs.resolved.is_build_tool_managed())
+                .map(|(service_name, _)| service_name.clone())
+                .collect();
+            let task_names: Vec<String> = self
+                .tasks
+                .iter()
+                .filter(|(_, rt)| rt.config.bazel.is_some() || rt.config.turbo.is_some())
+                .map(|(task_name, _)| task_name.clone())
+                .collect();
+            for item_name in service_names.into_iter().chain(task_names) {
+                if !self.pending_graph_requery.contains(&item_name) {
+                    self.pending_graph_requery.push(item_name);
+                }
+            }
+        } else if !self.pending_graph_requery.contains(&name.to_string()) {
+            self.pending_graph_requery.push(name.to_string());
+        }
+        self.bt_requery_deadline =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+    }
+
+    /// Flush all pending build-graph re-queries.
+    ///
+    /// Runs build tool queries for each queued item and sends updated watch
+    /// patterns to the WatchManager. Uses stale-while-revalidate: old watch
+    /// patterns remain active during the re-query.
+    pub(in crate::runner) async fn flush_pending_graph_requery(&mut self) {
+        let names = std::mem::take(&mut self.pending_graph_requery);
+        self.bt_requery_deadline = None;
+
+        if names.is_empty() {
+            return;
+        }
+        if self.watch_update_tx.is_none() {
+            return;
+        }
+        if self.graph_requery_handle.is_some() {
+            for name in names {
+                if !self.pending_graph_requery.contains(&name) {
+                    self.pending_graph_requery.push(name);
+                }
+            }
+            self.bt_requery_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+            return;
+        }
+
+        self.output_manager.lifecycle_event(&format!(
+            "re-querying build tool for {} item{}...",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" }
+        ));
+
+        let mut items = Vec::new();
+        for name in &names {
+            let (bazel, turbo, item_dir, ignore_patterns) =
+                if let Some(rs) = self.services.get(name) {
+                    (
+                        rs.resolved.bazel_config().cloned(),
+                        rs.resolved.turbo_config().cloned(),
+                        rs.resolved.dir.clone(),
+                        rs.resolved.ignore.clone(),
+                    )
+                } else if let Some(rt) = self.tasks.get(name) {
+                    (
+                        rt.config.bazel.clone(),
+                        rt.config.turbo.clone(),
+                        rt.config.dir.clone(),
+                        rt.config.ignore.clone(),
+                    )
+                } else {
+                    continue;
+                };
+            if bazel.is_none() && turbo.is_none() {
+                continue;
+            }
+            let working_dir = working_dir_for(&self.base_dir, item_dir.as_deref());
+            let ignore_patterns = resolve_watch_ignore_patterns(
+                &working_dir,
+                &ignore_patterns,
+                &self.base_dir,
+                &self.config.watch_ignore,
+            );
+            items.push(GraphRequeryRequestItem {
+                name: name.clone(),
+                bazel,
+                turbo,
+                working_dir,
+                ignore_patterns,
+            });
+        }
+        if items.is_empty() {
+            return;
+        }
+        let cmd_tx = self.internal_tx.clone();
+        let emitter = self.output_manager.clone_lifecycle_emitter();
+        let handle = tokio::spawn(async move {
+            let outcomes = run_graph_requery_worker(items, emitter).await;
+            let _ = cmd_tx
+                .send(RunnerInternalCommand::GraphRequeryComplete(outcomes))
+                .await;
+        });
+        self.graph_requery_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+    }
+
+    /// Runs the build (if any), stops the old process, starts a new one.
+    /// If the build fails, the old process is kept running.
+    /// Broadcasts `RebuildComplete` when done.
+    ///
+    /// For proxy services: clears the proxy backend (new connections queue),
+    /// allocates fresh ephemeral ports, starts the new instance, and sets the
+    /// backend once the ready check passes. The proxy never drops — clients
+    /// see a brief pause, not a connection refused.
+    pub(in crate::runner) async fn handle_rebuild(&mut self, name: &str) {
+        self.clear_rebuild_stale(name);
+        let rs = match self.services.get(name) {
+            Some(rs) => rs,
+            None => {
+                self.fail_rebuild(name, "rebuild requested for unknown service");
+                return;
+            }
+        };
+
+        if rs.state() == ServiceState::Building {
+            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                name: name.to_string(),
+                success: true,
+            });
+            return;
+        }
+
+        // For build-tool-managed services, queue the rebuild into a batch.
+        // Multiple services sharing the same source files will be batched into
+        // one `bazel build //a //b //c` invocation instead of separate builds.
+        if rs.resolved.is_build_tool_managed() {
+            if !self.pending_bt_rebuilds.contains(&name.to_string()) {
+                self.pending_bt_rebuilds.push(name.to_string());
+            }
+            // Set or extend the batch window (50ms). This allows multiple
+            // Rebuild commands from the watch module (which fire per-service
+            // after their individual debounce timers) to coalesce.
+            self.bt_rebuild_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+            return;
+        }
+
+        self.do_rebuild(name).await;
+    }
+
+    /// Execute a rebuild for a single service: build, stop old, restart.
+    ///
+    /// This is the core rebuild logic, called either directly (non-build-tool
+    /// services) or after a batch build completes (build-tool services).
+    async fn do_rebuild(&mut self, name: &str) {
+        let resolved = match self.services.get(name) {
+            Some(rs) => rs.resolved.clone(),
+            None => {
+                self.fail_rebuild(name, "rebuild requested for unknown service");
+                return;
+            }
+        };
+        // For build-tool-managed services the batch build has already run by
+        // the time we reach `do_rebuild`, and the actual restart is surfaced
+        // later by `queue_rebuild_service_start`'s "restarting..." event.
+        // Emitting another pre-stop "restarting" here just creates log noise.
+        //
+        // For other kinds, the detached rebuild worker will kick off the
+        // build after this lifecycle event, so "rebuilding" still lands
+        // before the build output.
+        let message = if resolved.is_build_tool_managed() {
+            None
+        } else {
+            Some("rebuilding (file changed)")
+        };
+        if let Some(message) = message {
+            self.output_manager.service_event(name, message);
+        }
+        if resolved.is_build_tool_managed() {
+            self.continue_rebuild_restart(name).await;
+            return;
+        }
+        if let Err(e) = self.spawn_service_rebuild_worker(name, resolved) {
+            self.fail_rebuild(name, &e.to_string());
+        }
+    }
+}
