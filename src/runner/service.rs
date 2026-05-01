@@ -234,6 +234,7 @@ pub(crate) async fn start_service(
 /// Returns `Ok(())` when the check passes, or `Err` when retries are exhausted.
 pub(crate) async fn run_ready_check(ready: &ReadyCheck) -> Result<(), ServiceError> {
     let interval = parse_duration(&ready.interval)?;
+    let timeout = parse_duration(&ready.timeout)?;
     let retries = ready.retries;
 
     for attempt in 0..retries {
@@ -241,12 +242,33 @@ pub(crate) async fn run_ready_check(ready: &ReadyCheck) -> Result<(), ServiceErr
             tokio::time::sleep(interval).await;
         }
 
-        if run_one_check(ready).await.is_ok() {
+        if run_one_check_with_timeout(ready, timeout).await.is_ok() {
             return Ok(());
         }
     }
 
     Err(ServiceError::ReadyCheckExhausted { retries })
+}
+
+/// Run one ready-check probe with the configured per-attempt timeout.
+pub(crate) async fn run_one_check_with_config_timeout(
+    ready: &ReadyCheck,
+) -> Result<(), ServiceError> {
+    let timeout = parse_duration(&ready.timeout)?;
+    run_one_check_with_timeout(ready, timeout).await
+}
+
+async fn run_one_check_with_timeout(
+    ready: &ReadyCheck,
+    timeout: Duration,
+) -> Result<(), ServiceError> {
+    match tokio::time::timeout(timeout, run_one_check(ready)).await {
+        Ok(result) => result,
+        Err(_) => Err(ServiceError::ReadyCheckError(format!(
+            "ready check timed out after {}",
+            ready.timeout
+        ))),
+    }
 }
 
 /// Run a single ready-check probe (one HTTP/TCP/exec attempt). Returns
@@ -673,6 +695,36 @@ mod tests {
             let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(result, expected, "{}", case.name);
         }
+    }
+
+    #[tokio::test]
+    async fn ready_exec_probe_timeout_is_bounded() {
+        let ready = ReadyCheck {
+            exec: Some(crate::config::Command {
+                cmd: "sleep".to_string(),
+                args: vec!["5".to_string()],
+            }),
+            tcp: None,
+            http: None,
+            interval: "10ms".to_string(),
+            retries: 1,
+            timeout: "100ms".to_string(),
+            monitor: false,
+            monitor_interval: "10s".to_string(),
+            unhealthy_after: 3,
+        };
+
+        let start = std::time::Instant::now();
+        let result = run_ready_check(&ready).await;
+        assert!(matches!(
+            result,
+            Err(ServiceError::ReadyCheckExhausted { retries: 1 })
+        ));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "ready check was not bounded: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

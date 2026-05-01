@@ -192,6 +192,12 @@ pub struct ReadyCheck {
     /// How many times to retry before giving up. Defaults to 30.
     #[serde(default = "ReadyCheck::default_retries")]
     pub retries: u32,
+    /// Maximum time allowed for one probe attempt. Defaults to "5s".
+    ///
+    /// This bounds slow HTTP connects and stuck exec probes so `retries` and
+    /// `interval` remain meaningful even when a target stops responding.
+    #[serde(default = "ReadyCheck::default_timeout")]
+    pub timeout: String,
     /// If true, keep running the same check after the service reaches Ready.
     /// Consecutive failures will mark the service Unhealthy. The service-level
     /// `on_failure` field controls what happens on that transition.
@@ -217,6 +223,10 @@ impl ReadyCheck {
 
     fn default_retries() -> u32 {
         30
+    }
+
+    fn default_timeout() -> String {
+        "5s".to_string()
     }
 
     fn default_unhealthy_after() -> u32 {

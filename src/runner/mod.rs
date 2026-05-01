@@ -6143,7 +6143,7 @@ async fn run_health_monitor(
             _ = &mut cancel => return,
             _ = tokio::time::sleep(interval) => {}
         }
-        let probe = service::run_one_check(&ready).await;
+        let probe = service::run_one_check_with_config_timeout(&ready).await;
         match probe {
             Ok(()) => {
                 consecutive_failures = 0;
@@ -6891,6 +6891,7 @@ mod tests {
             http: None,
             interval: "1s".to_string(),
             retries: 1,
+            timeout: "100ms".to_string(),
             monitor: true,
             monitor_interval: "20ms".to_string(),
             unhealthy_after: 2,
@@ -6962,6 +6963,7 @@ mod tests {
             http: None,
             interval: "10s".to_string(),
             retries: 1,
+            timeout: "100ms".to_string(),
             monitor: true,
             monitor_interval: "10s".to_string(),
             unhealthy_after: 5,

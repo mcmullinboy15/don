@@ -7,9 +7,9 @@
 use futures_util::StreamExt;
 use hex::encode;
 use sha2::{Digest, Sha256};
-use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt as _;
 
 use crate::config::PlatformDownload;
 
@@ -19,6 +19,12 @@ const SETUP_MARKER: &str = ".setup-marker";
 /// HTTP request timeout for downloads. Must be long enough for large archives
 /// on slow connections (e.g. CockroachDB at ~300MB).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Maximum time allowed for an artifact setup command.
+#[cfg(not(test))]
+const SETUP_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const SETUP_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Log a progress line after this many bytes received.
 const PROGRESS_INTERVAL_BYTES: u64 = 10 * 1024 * 1024;
@@ -281,15 +287,7 @@ pub async fn ensure_artifact(
             writer.write_line("SHA-256 verified").await;
         }
 
-        // Extract into staging, then rename to final location.
-        match detect_archive_type(&artifact.url) {
-            ArchiveType::TarGz => extract_tar_gz(&download_path, &staging_dir, &artifact.url)?,
-            ArchiveType::TarXz => extract_tar_xz(&download_path, &staging_dir, &artifact.url)?,
-            ArchiveType::TarBz2 => extract_tar_bz2(&download_path, &staging_dir, &artifact.url)?,
-            ArchiveType::TarZst => extract_tar_zst(&download_path, &staging_dir, &artifact.url)?,
-            ArchiveType::Zip => extract_zip(&download_path, &staging_dir, &artifact.url)?,
-            ArchiveType::None => place_bare_binary(&download_path, &staging_dir, &artifact.url)?,
-        }
+        extract_download(&download_path, &staging_dir, &artifact.url).await?;
         // Atomic rename of the extracted tree into its final home.
         std::fs::rename(&staging_dir, &cache_dir).map_err(DownloadError::Io)?;
         Ok::<(), DownloadError>(())
@@ -317,8 +315,11 @@ struct DownloadLock {
     _file: std::fs::File,
 }
 
-/// Acquire an exclusive file lock for this artifact's download. Blocks
-/// (via spawn_blocking) until the lock is available.
+/// Acquire an exclusive file lock for this artifact's download.
+///
+/// Uses non-blocking flock attempts with async sleeps so dropping the future
+/// during shutdown does not strand a `spawn_blocking` worker behind another
+/// process's long download.
 async fn acquire_download_lock(
     lock_path: &Path,
     service_writer: Option<&crate::output::ServiceWriter>,
@@ -332,37 +333,26 @@ async fn acquire_download_lock(
         .truncate(false)
         .open(&lock_path)?;
 
-    // Try non-blocking first so we can log a message if we have to wait.
-    let fd = file.as_raw_fd();
-    let try_result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if try_result == -1 {
+    let mut logged_wait = false;
+    loop {
+        let fd = file.as_raw_fd();
+        let try_result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if try_result == 0 {
+            return Ok(DownloadLock { _file: file });
+        }
         let errno = std::io::Error::last_os_error();
         if errno.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            if let Some(writer) = service_writer {
+            if !logged_wait && let Some(writer) = service_writer {
                 writer
                     .write_line("another process is downloading this artifact, waiting...")
                     .await;
             }
-            // Block until the lock is available.
-            let blocking_file = tokio::task::spawn_blocking(move || {
-                let fd = file.as_raw_fd();
-                let r = unsafe { libc::flock(fd, libc::LOCK_EX) };
-                if r == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(file)
-                }
-            })
-            .await
-            .map_err(|e| DownloadError::Io(std::io::Error::other(e)))??;
-            return Ok(DownloadLock {
-                _file: blocking_file,
-            });
+            logged_wait = true;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
         }
         return Err(DownloadError::Io(errno));
     }
-
-    Ok(DownloadLock { _file: file })
 }
 
 /// Stream a download to `dest` while computing the SHA-256 hash. Verifies the
@@ -400,7 +390,7 @@ async fn download_and_verify(
         })?;
 
     let total_size = response.content_length();
-    let mut file = std::fs::File::create(dest)?;
+    let mut file = tokio::fs::File::create(dest).await?;
     let mut hasher = Sha256::new();
     let mut stream = response.bytes_stream();
     let mut bytes_received: u64 = 0;
@@ -411,7 +401,7 @@ async fn download_and_verify(
             url: url.to_string(),
             source: e,
         })?;
-        file.write_all(&chunk)?;
+        file.write_all(&chunk).await?;
         hasher.update(&chunk);
         bytes_received += chunk.len() as u64;
 
@@ -424,7 +414,7 @@ async fn download_and_verify(
             next_progress_log += PROGRESS_INTERVAL_BYTES;
         }
     }
-    file.flush()?;
+    file.flush().await?;
     drop(file);
 
     let actual = encode(hasher.finalize());
@@ -436,6 +426,26 @@ async fn download_and_verify(
         });
     }
     Ok(())
+}
+
+async fn extract_download(
+    download_path: &Path,
+    staging_dir: &Path,
+    url: &str,
+) -> Result<(), DownloadError> {
+    let download_path = download_path.to_path_buf();
+    let staging_dir = staging_dir.to_path_buf();
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || match detect_archive_type(&url) {
+        ArchiveType::TarGz => extract_tar_gz(&download_path, &staging_dir, &url),
+        ArchiveType::TarXz => extract_tar_xz(&download_path, &staging_dir, &url),
+        ArchiveType::TarBz2 => extract_tar_bz2(&download_path, &staging_dir, &url),
+        ArchiveType::TarZst => extract_tar_zst(&download_path, &staging_dir, &url),
+        ArchiveType::Zip => extract_zip(&download_path, &staging_dir, &url),
+        ArchiveType::None => place_bare_binary(&download_path, &staging_dir, &url),
+    })
+    .await
+    .map_err(|e| DownloadError::Io(std::io::Error::other(e)))?
 }
 
 /// Expand `${VAR}` references in header values against the process
@@ -731,15 +741,29 @@ async fn run_setup_if_needed(
             .await;
     }
 
-    let output = tokio::process::Command::new(&setup.cmd)
-        .args(&setup.args)
+    let mut cmd = tokio::process::Command::new(&setup.cmd);
+    cmd.args(&setup.args)
         .current_dir(cache_dir)
-        .output()
-        .await
-        .map_err(|e| DownloadError::Setup {
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().map_err(|e| DownloadError::Setup {
+        cmd: setup.cmd.clone(),
+        message: e.to_string(),
+    })?;
+    let output = match tokio::time::timeout(SETUP_TIMEOUT, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|e| DownloadError::Setup {
             cmd: setup.cmd.clone(),
             message: e.to_string(),
-        })?;
+        })?,
+        Err(_) => {
+            return Err(DownloadError::Setup {
+                cmd: setup.cmd.clone(),
+                message: format!("timed out after {SETUP_TIMEOUT:?}"),
+            });
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1360,6 +1384,38 @@ mod tests {
         assert!(result.is_err());
 
         // Marker file should NOT exist after failure.
+        assert!(!cache_dir.join(SETUP_MARKER).exists());
+    }
+
+    #[tokio::test]
+    async fn test_setup_timeout_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let artifact = PlatformDownload {
+            url: "http://example.com/tool".to_string(),
+            sha256: "abc".to_string(),
+            path: None,
+            setup: Some(crate::config::types::Command {
+                cmd: "sleep".to_string(),
+                args: vec!["5".to_string()],
+            }),
+            headers: std::collections::HashMap::new(),
+        };
+
+        let start = std::time::Instant::now();
+        let result = run_setup_if_needed(&artifact, &cache_dir, None).await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "setup timeout was not bounded: {:?}",
+            start.elapsed()
+        );
         assert!(!cache_dir.join(SETUP_MARKER).exists());
     }
 }

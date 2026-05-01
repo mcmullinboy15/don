@@ -278,6 +278,9 @@ impl Config {
                 errors.push(format!("service '{name}': invalid ready interval: {e}"));
             }
             if let Some(ref ready) = resolved.ready {
+                if let Err(e) = crate::duration::parse_duration(&ready.timeout) {
+                    errors.push(format!("service '{name}': invalid ready timeout: {e}"));
+                }
                 if let Err(e) = crate::duration::parse_duration(&ready.monitor_interval) {
                     errors.push(format!(
                         "service '{name}': invalid ready monitor_interval: {e}"
@@ -1878,7 +1881,29 @@ mod tests {
                     assert!(!ready.monitor);
                     assert_eq!(ready.unhealthy_after, 3);
                     assert_eq!(ready.monitor_interval, "10s");
+                    assert_eq!(ready.timeout, "5s");
                     assert_eq!(resolved.on_failure, OnFailure::Notify);
+                },
+            },
+            ConfigTestCase {
+                name: "invalid ready timeout is a validation error",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    [services.api.ready]
+                    http = "http://localhost:3000/health"
+                    timeout = "eventually"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(
+                        errors.iter().any(|e| e.contains("invalid ready timeout")),
+                        "got: {errors:?}"
+                    );
                 },
             },
             ConfigTestCase {
