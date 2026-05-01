@@ -403,34 +403,29 @@ async fn run_status(config_path: &Path, verbose: bool) -> i32 {
     }
 }
 
-/// Sort bucket for the status table: genuine failures first, then the
-/// dependency-failed cascade, then running, then exited, then lazy. Putting
-/// `DependencyFailed` *below* `Failed` surfaces the actual culprit — the
-/// thing the user needs to look at — above everything that merely got
-/// stranded.
+/// Sort bucket for the status table: actionable rows first, settled rows
+/// last. Putting `DependencyFailed` *below* `Failed` surfaces the actual
+/// culprit — the thing the user needs to look at — above everything that
+/// merely got stranded.
 fn status_sort_bucket(item: &ItemStatus) -> u8 {
     match item {
         ItemStatus::Service { state, .. } => match state {
             ServiceState::Failed | ServiceState::Unhealthy => 0,
             ServiceState::DependencyFailed => 1,
-            ServiceState::Pending
-            | ServiceState::Building
-            | ServiceState::Starting
-            | ServiceState::Running
-            | ServiceState::Ready
-            | ServiceState::Stopping => 2,
-            ServiceState::Stopped => 3,
-            ServiceState::Lazy => 4,
+            ServiceState::Pending | ServiceState::Building | ServiceState::Starting => 2,
+            ServiceState::Running => 3,
+            ServiceState::Ready => 4,
+            ServiceState::Stopping => 5,
+            ServiceState::Stopped => 6,
+            ServiceState::Lazy => 7,
         },
         ItemStatus::Task { state, .. } => match state {
             TaskItemState::Failed => 0,
             TaskItemState::DependencyFailed => 1,
-            TaskItemState::Pending
-            | TaskItemState::Building
-            | TaskItemState::Running
-            | TaskItemState::Completed
-            | TaskItemState::Skipped
-            | TaskItemState::PendingRun => 2,
+            TaskItemState::Pending | TaskItemState::Building | TaskItemState::Running => 2,
+            TaskItemState::PendingRun => 7,
+            TaskItemState::Completed => 8,
+            TaskItemState::Skipped => 9,
         },
     }
 }
@@ -1110,8 +1105,9 @@ fn map_join_result<T>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::parse_task_args;
+    use super::{item_name, parse_task_args, status_sort_bucket};
     use don::config::{ParamKind, TaskParam};
+    use don::runner::{ItemStatus, ServiceState, TaskItemState};
 
     fn p(name: &str) -> TaskParam {
         TaskParam {
@@ -1123,6 +1119,77 @@ mod tests {
             choices: vec![],
             completions: None,
             validate: None,
+        }
+    }
+
+    fn service(name: &str, state: ServiceState) -> ItemStatus {
+        ItemStatus::Service {
+            name: name.to_string(),
+            state,
+            verbose: None,
+        }
+    }
+
+    fn task(name: &str, state: TaskItemState) -> ItemStatus {
+        ItemStatus::Task {
+            name: name.to_string(),
+            state,
+            verbose: None,
+        }
+    }
+
+    #[test]
+    fn status_sort_prioritizes_actionable_states() {
+        struct Case {
+            name: &'static str,
+            items: Vec<ItemStatus>,
+            want: Vec<&'static str>,
+        }
+
+        let cases = vec![Case {
+            name: "mixed services and tasks",
+            items: vec![
+                service("svc-ready", ServiceState::Ready),
+                service("svc-building", ServiceState::Building),
+                service("svc-running", ServiceState::Running),
+                service("svc-stopped", ServiceState::Stopped),
+                service("svc-lazy", ServiceState::Lazy),
+                service("svc-failed", ServiceState::Failed),
+                service("svc-dep", ServiceState::DependencyFailed),
+                service("svc-stopping", ServiceState::Stopping),
+                task("task-skipped", TaskItemState::Skipped),
+                task("task-completed", TaskItemState::Completed),
+                task("task-building", TaskItemState::Building),
+                task("task-pending-run", TaskItemState::PendingRun),
+                task("task-failed", TaskItemState::Failed),
+                task("task-dep", TaskItemState::DependencyFailed),
+            ],
+            want: vec![
+                "svc-failed",
+                "task-failed",
+                "svc-dep",
+                "task-dep",
+                "svc-building",
+                "task-building",
+                "svc-running",
+                "svc-ready",
+                "svc-stopping",
+                "svc-stopped",
+                "svc-lazy",
+                "task-pending-run",
+                "task-completed",
+                "task-skipped",
+            ],
+        }];
+
+        for mut case in cases {
+            case.items.sort_by(|a, b| {
+                status_sort_bucket(a)
+                    .cmp(&status_sort_bucket(b))
+                    .then_with(|| item_name(a).cmp(item_name(b)))
+            });
+            let got: Vec<&str> = case.items.iter().map(item_name).collect();
+            assert_eq!(got, case.want, "case: {}", case.name);
         }
     }
 

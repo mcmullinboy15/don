@@ -54,33 +54,29 @@ impl OverlayItem {
         }
     }
 
-    /// Sort bucket: genuine failures → dependency-failed cascade → running
-    /// → exited → lazy. Putting `DependencyFailed` below `Failed` keeps the
-    /// actual culprit at the top so the user sees the thing they need to
-    /// look at, not the stranded dependents.
+    /// Sort bucket: actionable rows first, settled rows last. Putting
+    /// `DependencyFailed` below `Failed` keeps the actual culprit at the top
+    /// so the user sees the thing they need to look at, not the stranded
+    /// dependents.
     fn sort_bucket(&self) -> u8 {
         match self {
             Self::Service { state, .. } => match state {
                 ServiceState::Failed | ServiceState::Unhealthy => 0,
                 ServiceState::DependencyFailed => 1,
-                ServiceState::Pending
-                | ServiceState::Building
-                | ServiceState::Starting
-                | ServiceState::Running
-                | ServiceState::Ready
-                | ServiceState::Stopping => 2,
-                ServiceState::Stopped => 3,
-                ServiceState::Lazy => 4,
+                ServiceState::Pending | ServiceState::Building | ServiceState::Starting => 2,
+                ServiceState::Running => 3,
+                ServiceState::Ready => 4,
+                ServiceState::Stopping => 5,
+                ServiceState::Stopped => 6,
+                ServiceState::Lazy => 7,
             },
             Self::Task { state, .. } => match state {
                 TaskItemState::Failed => 0,
                 TaskItemState::DependencyFailed => 1,
-                TaskItemState::Pending
-                | TaskItemState::Building
-                | TaskItemState::Running
-                | TaskItemState::Completed
-                | TaskItemState::Skipped
-                | TaskItemState::PendingRun => 2,
+                TaskItemState::Pending | TaskItemState::Building | TaskItemState::Running => 2,
+                TaskItemState::PendingRun => 7,
+                TaskItemState::Completed => 8,
+                TaskItemState::Skipped => 9,
             },
         }
     }
@@ -482,6 +478,85 @@ mod tests {
         app.apply_service_state("api".into(), ServiceState::Failed);
         assert_eq!(app.counts.services_ready, 1);
         assert_eq!(app.counts.services_failed, 1);
+    }
+
+    #[test]
+    fn overlay_items_prioritize_actionable_states() {
+        struct Case {
+            name: &'static str,
+            services: Vec<(&'static str, ServiceState)>,
+            tasks: Vec<(&'static str, TaskItemState)>,
+            want: Vec<&'static str>,
+        }
+
+        let cases = vec![Case {
+            name: "mixed services and tasks",
+            services: vec![
+                ("svc-ready", ServiceState::Ready),
+                ("svc-building", ServiceState::Building),
+                ("svc-running", ServiceState::Running),
+                ("svc-stopped", ServiceState::Stopped),
+                ("svc-lazy", ServiceState::Lazy),
+                ("svc-failed", ServiceState::Failed),
+                ("svc-dep", ServiceState::DependencyFailed),
+                ("svc-stopping", ServiceState::Stopping),
+            ],
+            tasks: vec![
+                ("task-skipped", TaskItemState::Skipped),
+                ("task-completed", TaskItemState::Completed),
+                ("task-building", TaskItemState::Building),
+                ("task-pending-run", TaskItemState::PendingRun),
+                ("task-failed", TaskItemState::Failed),
+                ("task-dep", TaskItemState::DependencyFailed),
+            ],
+            want: vec![
+                "svc-failed",
+                "task-failed",
+                "svc-dep",
+                "task-dep",
+                "svc-building",
+                "task-building",
+                "svc-running",
+                "svc-ready",
+                "svc-stopping",
+                "svc-stopped",
+                "svc-lazy",
+                "task-pending-run",
+                "task-completed",
+                "task-skipped",
+            ],
+        }];
+
+        for case in cases {
+            let service_names = case
+                .services
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect();
+            let task_names = case
+                .tasks
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect();
+            let mut app = App::new(
+                service_names,
+                task_names,
+                vec![],
+                HashMap::new(),
+                HashSet::new(),
+                false,
+            );
+            for (name, state) in case.services {
+                app.apply_service_state(name.to_string(), state);
+            }
+            for (name, state) in case.tasks {
+                app.apply_task_state(name.to_string(), state);
+            }
+
+            let items = app.overlay_items();
+            let got: Vec<&str> = items.iter().map(OverlayItem::name).collect();
+            assert_eq!(got, case.want, "case: {}", case.name);
+        }
     }
 
     #[test]
