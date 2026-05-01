@@ -2145,14 +2145,7 @@ impl Runner {
 
         // Start items whose dependencies are already satisfied.
         let startup_shutdown_requested = if self
-            .start_ready_items(
-                &order,
-                &dep_map,
-                &mut pending,
-                &mut in_flight,
-                &done_tx,
-                &mut shutdown_rx,
-            )
+            .start_ready_items(&order, &dep_map, &mut pending, &mut in_flight, &done_tx)
             .await?
         {
             self.initiate_shutdown().await;
@@ -2204,7 +2197,6 @@ impl Runner {
                                 &mut pending,
                                 &mut in_flight,
                                 &done_tx,
-                                &mut shutdown_rx,
                             )
                             .await?
                         {
@@ -2318,7 +2310,7 @@ impl Runner {
                                 self.handle_detach(&name, pty_write).await;
                             }
                             RunnerCommand::Rebuild { name } => {
-                                self.handle_rebuild(&name, &mut shutdown_rx).await;
+                                self.handle_rebuild(&name).await;
                             }
                             RunnerCommand::RebuildStale { name } => {
                                 self.mark_rebuild_stale(&name);
@@ -2377,7 +2369,6 @@ impl Runner {
                                         &mut pending,
                                         &mut in_flight,
                                         &done_tx,
-                                        &mut shutdown_rx,
                                     )
                                     .await?
                                 {
@@ -2482,7 +2473,7 @@ impl Runner {
                             None => std::future::pending().await,
                         }
                     } => {
-                        self.flush_pending_rebuilds(&mut shutdown_rx).await;
+                        self.flush_pending_rebuilds().await;
                     }
                     // Flush batched build-graph re-queries when the batch window expires.
                     _ = async {
@@ -2491,7 +2482,7 @@ impl Runner {
                             None => std::future::pending().await,
                         }
                     } => {
-                        self.flush_pending_graph_requery(&mut shutdown_rx).await;
+                        self.flush_pending_graph_requery().await;
                     }
                     _ = shutdown_rx.recv() => {
                         self.initiate_shutdown().await;
@@ -2531,7 +2522,6 @@ impl Runner {
         pending: &mut HashSet<String>,
         in_flight: &mut HashSet<String>,
         done_tx: &mpsc::Sender<ItemDone>,
-        _shutdown_rx: &mut mpsc::Receiver<()>,
     ) -> Result<bool, RunnerError> {
         // First pass: mark pending items as DependencyFailed when an upstream
         // dep failed (including another DependencyFailed — the cascade is
@@ -3451,7 +3441,7 @@ impl Runner {
     ///
     /// Collects Bazel targets and Turbo filters from the queued services,
     /// runs one build per tool, then restarts each affected service.
-    async fn flush_pending_rebuilds(&mut self, _shutdown_rx: &mut mpsc::Receiver<()>) {
+    async fn flush_pending_rebuilds(&mut self) {
         let names = std::mem::take(&mut self.pending_bt_rebuilds);
         self.bt_rebuild_deadline = None;
 
@@ -3725,7 +3715,7 @@ impl Runner {
     /// Runs build tool queries for each queued item and sends updated watch
     /// patterns to the WatchManager. Uses stale-while-revalidate: old watch
     /// patterns remain active during the re-query.
-    async fn flush_pending_graph_requery(&mut self, _shutdown_rx: &mut mpsc::Receiver<()>) {
+    async fn flush_pending_graph_requery(&mut self) {
         let names = std::mem::take(&mut self.pending_graph_requery);
         self.bt_requery_deadline = None;
 
@@ -3956,7 +3946,7 @@ impl Runner {
     /// allocates fresh ephemeral ports, starts the new instance, and sets the
     /// backend once the ready check passes. The proxy never drops — clients
     /// see a brief pause, not a connection refused.
-    async fn handle_rebuild(&mut self, name: &str, _shutdown_rx: &mut mpsc::Receiver<()>) {
+    async fn handle_rebuild(&mut self, name: &str) {
         self.clear_rebuild_stale(name);
         let rs = match self.services.get(name) {
             Some(rs) => rs,
