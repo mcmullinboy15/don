@@ -413,7 +413,6 @@ impl BazelResolver {
                 target.clone(),
                 ResolvedBuildInfo {
                     watch_paths,
-                    dependencies: Vec::new(),
                     graph_definition_globs,
                 },
             );
@@ -617,29 +616,10 @@ impl BuildGraphResolver for BazelResolver {
             .flat_map(|p| [format!("{p}/BUILD"), format!("{p}/BUILD.bazel")])
             .collect();
 
-        // Query for direct first-party dependencies (for informational purposes).
-        // External deps (prefixed with `@`) are filtered during parsing.
-        let deps_query = format!("deps({target}, 1)");
-        let deps_output = self.run_query(&deps_query, "label", working_dir).await;
-        let dependencies = match deps_output {
-            Ok(out) => out
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('@') && *l != target)
-                .map(String::from)
-                .collect(),
-            Err(_) => Vec::new(), // Non-fatal: deps query failure doesn't block watching
-        };
-
         Ok(ResolvedBuildInfo {
             watch_paths,
-            dependencies,
             graph_definition_globs,
         })
-    }
-
-    fn tool_name(&self) -> &'static str {
-        "bazel"
     }
 }
 

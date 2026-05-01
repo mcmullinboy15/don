@@ -59,9 +59,6 @@ pub struct StatusResponse {
 #[derive(Debug, Deserialize)]
 pub struct LogsResponse {
     pub lines: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]

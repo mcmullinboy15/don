@@ -866,7 +866,6 @@ async fn run_graph_requery_worker(
                         Ok(info_by_target.get(&bazel.target).cloned().unwrap_or(
                             crate::build_tool::ResolvedBuildInfo {
                                 watch_paths: Vec::new(),
-                                dependencies: Vec::new(),
                                 graph_definition_globs: Vec::new(),
                             },
                         ))

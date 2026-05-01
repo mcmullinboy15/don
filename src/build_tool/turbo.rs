@@ -205,28 +205,11 @@ impl TurboResolver {
 /// A task from Turborepo's `--dry-run=json` output.
 #[derive(serde::Deserialize)]
 struct TurboTask {
-    /// Fully qualified task ID (e.g. "@myorg/api#dev").
-    #[serde(rename = "taskId")]
-    task_id: String,
     /// Workspace-relative directory of the package.
     directory: String,
-    /// Task IDs this task depends on.
-    #[serde(default)]
-    dependencies: Vec<String>,
     /// Input files mapped to their hashes. Keys are relative file paths.
     #[serde(default)]
     inputs: std::collections::HashMap<String, String>,
-    /// The resolved task definition.
-    #[serde(default, rename = "resolvedTaskDefinition")]
-    resolved_task_definition: Option<TurboTaskDefinition>,
-}
-
-/// Resolved task definition from Turborepo.
-#[derive(serde::Deserialize, Default)]
-struct TurboTaskDefinition {
-    /// Whether this is a long-running task (like a dev server).
-    #[serde(default)]
-    persistent: bool,
 }
 
 /// Top-level structure of `turbo run --dry-run=json` output.
@@ -235,7 +218,7 @@ struct TurboDryRun {
     tasks: Vec<TurboTask>,
 }
 
-/// Parse the dry-run JSON and extract watch paths and dependencies.
+/// Parse the dry-run JSON and extract watch paths.
 ///
 /// For each task in the output, the `directory` field is the workspace package
 /// root and `inputs` contains the individual files. We use directory-level
@@ -251,11 +234,6 @@ pub(crate) fn parse_dry_run(json: &str) -> Result<Vec<ParsedTurboTask>, BuildToo
         .tasks
         .into_iter()
         .map(|task| {
-            let persistent = task
-                .resolved_task_definition
-                .as_ref()
-                .is_some_and(|d| d.persistent);
-
             // Collect unique subdirectories from input file paths.
             // This gives us directory-level watch patterns rather than
             // watching every individual file.
@@ -283,11 +261,8 @@ pub(crate) fn parse_dry_run(json: &str) -> Result<Vec<ParsedTurboTask>, BuildToo
             };
 
             ParsedTurboTask {
-                task_id: task.task_id,
                 directory: task.directory,
-                dependencies: task.dependencies,
                 watch_paths,
-                persistent,
             }
         })
         .collect())
@@ -295,18 +270,11 @@ pub(crate) fn parse_dry_run(json: &str) -> Result<Vec<ParsedTurboTask>, BuildToo
 
 /// A parsed turbo task with resolved watch information.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields are part of the public parse result; used by consumers.
 pub(crate) struct ParsedTurboTask {
-    /// Fully qualified task ID (e.g. "@myorg/api#dev").
-    pub task_id: String,
     /// Workspace-relative directory.
     pub directory: String,
-    /// Task IDs this task depends on.
-    pub dependencies: Vec<String>,
     /// Glob patterns to watch for source changes.
     pub watch_paths: Vec<String>,
-    /// Whether this is a long-running (persistent) task.
-    pub persistent: bool,
 }
 
 impl TurboResolver {
@@ -369,7 +337,6 @@ impl TurboResolver {
     /// globs from a parsed turbo dry-run task graph.
     fn aggregate(tasks: &[ParsedTurboTask]) -> ResolvedBuildInfo {
         let mut all_watch_paths = Vec::new();
-        let mut all_dependencies = Vec::new();
         let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut graph_definition_globs: Vec<String> = Vec::new();
@@ -380,11 +347,6 @@ impl TurboResolver {
                     all_watch_paths.push(path.clone());
                 }
             }
-            for dep in &task.dependencies {
-                if !all_dependencies.contains(dep) {
-                    all_dependencies.push(dep.clone());
-                }
-            }
             if seen_dirs.insert(task.directory.clone()) {
                 graph_definition_globs.push(format!("{}/package.json", task.directory));
             }
@@ -392,7 +354,6 @@ impl TurboResolver {
 
         ResolvedBuildInfo {
             watch_paths: all_watch_paths,
-            dependencies: all_dependencies,
             graph_definition_globs,
         }
     }
@@ -408,7 +369,6 @@ impl TurboResolver {
         if filters.is_empty() {
             return Ok(ResolvedBuildInfo {
                 watch_paths: Vec::new(),
-                dependencies: Vec::new(),
                 graph_definition_globs: Vec::new(),
             });
         }
@@ -430,10 +390,6 @@ impl BuildGraphResolver for TurboResolver {
         }
         let tasks = self.run_dry_run(&filters, working_dir).await?;
         Ok(Self::aggregate(&tasks))
-    }
-
-    fn tool_name(&self) -> &'static str {
-        "turbo"
     }
 }
 
@@ -488,10 +444,7 @@ mod tests {
         assert_eq!(tasks.len(), 2);
 
         let utils = &tasks[0];
-        assert_eq!(utils.task_id, "@myorg/utils#build");
         assert_eq!(utils.directory, "packages/utils");
-        assert!(utils.dependencies.is_empty());
-        assert!(!utils.persistent);
         // Should have directory-level patterns from input files
         assert!(
             utils
@@ -501,48 +454,8 @@ mod tests {
         );
 
         let web = &tasks[1];
-        assert_eq!(web.task_id, "@myorg/web#dev");
         assert_eq!(web.directory, "apps/web");
-        assert_eq!(web.dependencies, vec!["@myorg/utils#build"]);
-        assert!(web.persistent);
         assert!(web.watch_paths.iter().any(|p| p.contains("apps/web/src")));
-    }
-
-    #[test]
-    fn test_parse_dry_run_persistent_flag() {
-        struct Case {
-            name: &'static str,
-            json: &'static str,
-            expected_persistent: bool,
-        }
-
-        let cases = vec![
-            Case {
-                name: "persistent true",
-                json: r#"{"tasks": [{"taskId": "a#dev", "directory": "a", "dependencies": [], "inputs": {}, "resolvedTaskDefinition": {"persistent": true}}]}"#,
-                expected_persistent: true,
-            },
-            Case {
-                name: "persistent false",
-                json: r#"{"tasks": [{"taskId": "a#build", "directory": "a", "dependencies": [], "inputs": {}, "resolvedTaskDefinition": {"persistent": false}}]}"#,
-                expected_persistent: false,
-            },
-            Case {
-                name: "no resolved definition",
-                json: r#"{"tasks": [{"taskId": "a#test", "directory": "a", "dependencies": [], "inputs": {}}]}"#,
-                expected_persistent: false,
-            },
-        ];
-
-        for case in cases {
-            let tasks = parse_dry_run(case.json).unwrap();
-            assert_eq!(tasks.len(), 1, "case: {}", case.name);
-            assert_eq!(
-                tasks[0].persistent, case.expected_persistent,
-                "case: {}",
-                case.name
-            );
-        }
     }
 
     #[test]
