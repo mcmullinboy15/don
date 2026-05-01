@@ -294,6 +294,11 @@ pub enum RunnerCommand {
         name: String,
         reply: oneshot::Sender<CommandResult>,
     },
+    /// Force a rebuild, then start or restart a service.
+    HardRestart {
+        name: String,
+        reply: oneshot::Sender<CommandResult>,
+    },
     /// Rebuild a service triggered by a file watch event.
     /// Runs the build command (if any), then restarts the service.
     Rebuild { name: String },
@@ -1092,6 +1097,9 @@ impl Runner {
                                 } else {
                                     self.handle_restart_service_cmd(&name, reply).await;
                                 }
+                            }
+                            RunnerCommand::HardRestart { name, reply } => {
+                                self.handle_hard_restart_service_cmd(&name, reply).await;
                             }
                             RunnerCommand::Attach { name, pid, reply } => {
                                 self.handle_attach_cmd(&name, pid, reply).await;

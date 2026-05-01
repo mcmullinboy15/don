@@ -812,18 +812,9 @@ fn handle_overlay_key(
             }
         }
         KeyCode::Char('R') => {
-            // Restart every failed and dependency-failed service. The
-            // DependencyFailed ones were only stranded because something
-            // upstream broke; restarting them alongside the culprit gets
-            // the whole cascade moving again in one keystroke.
-            let failed: Vec<String> = app
-                .services_state
-                .iter()
-                .filter(|(_, s)| matches!(s, ServiceState::Failed | ServiceState::DependencyFailed))
-                .map(|(n, _)| n.clone())
-                .collect();
-            for name in failed {
-                let cmd = overlay_restart_command(name);
+            // Hard restart the highlighted service: force a rebuild, then
+            // start/restart it on success.
+            if let Some(cmd) = highlighted_service_hard_restart_command(app) {
                 dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
             }
         }
@@ -889,6 +880,26 @@ fn highlighted_service_restart_command(app: &App) -> Option<OverlayCommand> {
     }
 }
 
+/// Hard restart command for `R` — only services in a restartable state.
+fn highlighted_service_hard_restart_command(app: &App) -> Option<OverlayCommand> {
+    let items = app.overlay_items();
+    let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
+    let item = items.get(idx)?;
+    let OverlayItem::Service { name, state } = item else {
+        return None;
+    };
+    match state {
+        ServiceState::Ready
+        | ServiceState::Running
+        | ServiceState::Unhealthy
+        | ServiceState::Failed
+        | ServiceState::DependencyFailed
+        | ServiceState::Stopped
+        | ServiceState::Lazy => Some(overlay_hard_restart_command(name.clone())),
+        _ => None,
+    }
+}
+
 struct OverlayCommand {
     name: String,
     action: &'static str,
@@ -922,6 +933,16 @@ fn overlay_restart_command(name: String) -> OverlayCommand {
         name: name.clone(),
         action: "restart",
         command: RunnerCommand::Restart { name, reply },
+        reply: rx,
+    }
+}
+
+fn overlay_hard_restart_command(name: String) -> OverlayCommand {
+    let (reply, rx) = oneshot::channel();
+    OverlayCommand {
+        name: name.clone(),
+        action: "hard restart",
+        command: RunnerCommand::HardRestart { name, reply },
         reply: rx,
     }
 }
@@ -1409,6 +1430,20 @@ mod tests {
                 }
                 _ => panic!("{}: expected restart command", case.name),
             }
+        }
+    }
+
+    #[test]
+    fn overlay_uppercase_r_hard_restarts_highlighted_service() {
+        let app = app_with_service_state(ServiceState::Ready);
+        let Some(command) = highlighted_service_hard_restart_command(&app) else {
+            panic!("expected hard restart command");
+        };
+        match command.command {
+            RunnerCommand::HardRestart { name, .. } => {
+                assert_eq!(name, "api");
+            }
+            _ => panic!("expected hard restart command"),
         }
     }
 }

@@ -30,7 +30,7 @@ pub(crate) enum ViewMode {
     Palette,
     /// Full-screen status overlay (alternate screen). Arrow keys move a
     /// highlight; Enter toggles start/stop on the selected service, `r`
-    /// restarts it, `R` restarts all failed services, `Esc` dismisses.
+    /// restarts it, `R` hard-restarts it, `Esc` dismisses.
     Overlay,
     /// Param-entry form for a task. Opened from the palette when the user
     /// selects a task with declared `params`. Collects values and, on

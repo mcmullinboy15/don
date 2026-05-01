@@ -11,6 +11,7 @@ pub(crate) struct RebuildBatchRequest {
     pub(crate) bazel_items: Vec<BazelRebuildItem>,
     pub(crate) turbo_items: Vec<TurboRebuildItem>,
     pub(crate) plain_rebuilds: Vec<String>,
+    pub(crate) force: bool,
 }
 
 pub(crate) struct BazelRebuildItem {
@@ -127,10 +128,14 @@ pub(crate) async fn run_rebuild_batch_worker(
 
             let resolver =
                 crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
-            let all_up_to_date = resolver
-                .check_up_to_date(&targets, &working_dir)
-                .await
-                .unwrap_or_default();
+            let all_up_to_date = if request.force {
+                false
+            } else {
+                resolver
+                    .check_up_to_date(&targets, &working_dir)
+                    .await
+                    .unwrap_or_default()
+            };
             if all_up_to_date {
                 let count = targets.len();
                 emitter.bazel_event(&format!(

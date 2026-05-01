@@ -174,7 +174,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(
-            " don status — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] restart all failed  [/] filter  [esc] clear filter/dismiss ",
+            " don status — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] hard restart  [/] filter  [esc] clear filter/dismiss ",
         );
     let inner = outer.inner(area);
     frame.render_widget(outer, area);

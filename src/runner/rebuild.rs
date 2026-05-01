@@ -80,6 +80,7 @@ impl Runner {
             bazel_items,
             turbo_items,
             plain_rebuilds,
+            force: false,
         };
         let cmd_tx = self.internal_tx.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
@@ -107,7 +108,7 @@ impl Runner {
         }
     }
 
-    fn clear_rebuild_stale(&mut self, name: &str) {
+    pub(in crate::runner) fn clear_rebuild_stale(&mut self, name: &str) {
         if let Some(rs) = self.services.get_mut(name) {
             rs.rebuild_stale = false;
         }
@@ -137,6 +138,9 @@ impl Runner {
             });
         }
         for name in &outcome.build_succeeded {
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.batch_built = true;
+            }
             if self.take_rebuild_stale(name) {
                 let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
                     name: name.clone(),
@@ -160,6 +164,76 @@ impl Runner {
             self.bt_rebuild_deadline =
                 Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
         }
+    }
+
+    pub(in crate::runner) fn spawn_forced_build_tool_rebuild(
+        &mut self,
+        name: &str,
+    ) -> Result<(), super::CommandError> {
+        if self.rebuild_batch_handle.is_some() {
+            return Err(super::CommandError::InvalidState {
+                name: name.to_string(),
+                message: "build-tool rebuild already in progress".to_string(),
+            });
+        }
+
+        let rs = self
+            .services
+            .get(name)
+            .ok_or_else(|| super::CommandError::UnknownService {
+                name: name.to_string(),
+            })?;
+        let mut bazel_items: Vec<BazelRebuildItem> = Vec::new();
+        let mut turbo_items: Vec<TurboRebuildItem> = Vec::new();
+        let mut plain_rebuilds: Vec<String> = Vec::new();
+
+        match &rs.resolved.kind {
+            Some(crate::config::ServiceKind::Bazel(bazel)) => {
+                bazel_items.push(BazelRebuildItem {
+                    name: name.to_string(),
+                    target: bazel.target.clone(),
+                    working_dir: working_dir_for(&self.base_dir, rs.resolved.dir.as_deref()),
+                });
+            }
+            Some(crate::config::ServiceKind::Turbo(turbo)) => {
+                let build_task = turbo
+                    .build_task
+                    .clone()
+                    .unwrap_or_else(|| "build".to_string());
+                if !build_task.is_empty()
+                    && let Some(ref filter) = turbo.filter
+                {
+                    turbo_items.push(TurboRebuildItem {
+                        name: name.to_string(),
+                        filter: filter.clone(),
+                        build_task,
+                        working_dir: working_dir_for(&self.base_dir, rs.resolved.dir.as_deref()),
+                    });
+                } else {
+                    plain_rebuilds.push(name.to_string());
+                }
+            }
+            _ => plain_rebuilds.push(name.to_string()),
+        }
+        self.pending_bt_rebuilds.retain(|queued| queued != name);
+
+        let request = RebuildBatchRequest {
+            bazel_items,
+            turbo_items,
+            plain_rebuilds,
+            force: true,
+        };
+        let cmd_tx = self.internal_tx.clone();
+        let emitter = self.output_manager.clone_lifecycle_emitter();
+        let bazel_build_mutex = self.bazel_build_mutex.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = run_rebuild_batch_worker(request, emitter, bazel_build_mutex).await;
+            let _ = cmd_tx
+                .send(RunnerInternalCommand::RebuildBatchComplete(outcome))
+                .await;
+        });
+        self.rebuild_batch_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+        Ok(())
     }
 
     pub(in crate::runner) async fn handle_graph_requery_complete(

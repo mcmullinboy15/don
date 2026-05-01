@@ -413,6 +413,80 @@ impl Runner {
         }
     }
 
+    pub(in crate::runner) async fn handle_hard_restart_service_cmd(
+        &mut self,
+        name: &str,
+        reply: oneshot::Sender<CommandResult>,
+    ) {
+        if let Err(e) = self.lookup_service(name) {
+            let _ = reply.send(Err(e));
+            return;
+        }
+
+        let state = match self.services.get(name) {
+            Some(rs) => rs.state(),
+            None => {
+                let _ = reply.send(Err(CommandError::UnknownService {
+                    name: name.to_string(),
+                }));
+                return;
+            }
+        };
+        if matches!(
+            state,
+            ServiceState::Pending
+                | ServiceState::Building
+                | ServiceState::Starting
+                | ServiceState::Stopping
+        ) {
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: format!("cannot hard restart while {state:?}"),
+            }));
+            return;
+        }
+        if self.services.get(name).is_some_and(|rs| {
+            rs.rebuild_worker.is_some() || rs.control_worker.is_some() || rs.start_worker.is_some()
+        }) {
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "operation already in progress".to_string(),
+            }));
+            return;
+        }
+
+        self.clear_rebuild_stale(name);
+        self.output_manager
+            .service_event(name, "rebuilding (requested hard restart)");
+
+        let resolved = match self.services.get(name) {
+            Some(rs) => rs.resolved.clone(),
+            None => {
+                let _ = reply.send(Err(CommandError::UnknownService {
+                    name: name.to_string(),
+                }));
+                return;
+            }
+        };
+
+        let result = if resolved.is_build_tool_managed() {
+            self.spawn_forced_build_tool_rebuild(name)
+        } else {
+            self.spawn_service_rebuild_worker(name, resolved)
+        };
+
+        match result {
+            Ok(()) => {
+                let _ = reply.send(Ok(()));
+            }
+            Err(e) => {
+                self.output_manager
+                    .service_error_event(name, &e.to_string());
+                let _ = reply.send(Err(e));
+            }
+        }
+    }
+
     fn spawn_manual_service_stop_worker(
         &mut self,
         name: &str,
