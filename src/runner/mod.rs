@@ -15,6 +15,7 @@ mod paths;
 mod profile;
 mod rebuild;
 mod service_commands;
+mod service_health;
 mod service_worker;
 mod shutdown;
 mod signals;
@@ -49,7 +50,9 @@ use self::build_tools::{BatchBuildOutcome, GraphRequeryOutcomeItem, RebuildBatch
 #[cfg(test)]
 use self::graph::compute_depths;
 use self::graph::topological_sort;
-use self::health::{format_unexpected_exit, run_health_monitor, unhealthy_restart_backoff_secs};
+use self::health::run_health_monitor;
+#[cfg(test)]
+use self::health::unhealthy_restart_backoff_secs;
 #[cfg(test)]
 use self::paths::any_glob_path_changed_since;
 use self::profile::resolve_profile_items_for_platform;
@@ -1684,221 +1687,6 @@ impl Runner {
                 name: name.to_string(),
                 success: true,
             });
-        }
-    }
-
-    /// Apply a health-monitor probe transition for a service.
-    ///
-    /// Only acts when the service is in `Ready` (failure → `Unhealthy`)
-    /// or `Unhealthy` (recovery → `Ready`). Stale messages from a monitor
-    /// task whose service has since stopped/restarted are ignored.
-    async fn handle_service_health_changed(&mut self, name: &str, healthy: bool) {
-        let current = match self.services.get(name) {
-            Some(rs) => rs.state(),
-            None => return,
-        };
-        if healthy {
-            if current != ServiceState::Unhealthy {
-                return;
-            }
-            self.set_service_state(name, ServiceState::Ready);
-            let attempts = self
-                .services
-                .get(name)
-                .map(|rs| rs.restart_attempts)
-                .unwrap_or(0);
-            if let Some(rs) = self.services.get_mut(name) {
-                if let Some(handle) = rs.pending_restart.take() {
-                    handle.abort();
-                }
-                rs.restart_attempts = 0;
-            }
-            let msg = if attempts > 0 {
-                "recovered (cancelled pending restart, attempts reset)"
-            } else {
-                "recovered (health check passing)"
-            };
-            self.output_manager.service_event(name, msg);
-        } else {
-            if current != ServiceState::Ready {
-                return;
-            }
-            self.set_service_state(name, ServiceState::Unhealthy);
-            let policy = self
-                .services
-                .get(name)
-                .map(|rs| rs.resolved.on_failure)
-                .unwrap_or_default();
-            match policy {
-                crate::config::OnFailure::Notify => {
-                    self.output_manager
-                        .service_error_event(name, "unhealthy (health check failing)");
-                }
-                crate::config::OnFailure::Restart => {
-                    self.schedule_auto_restart(name, "unhealthy");
-                }
-            }
-        }
-    }
-
-    /// Schedule an automatic restart for a failed service. Used for both
-    /// `Unhealthy` (monitor-driven) and `Failed` (crash-driven) failures.
-    /// Uses exponential backoff (1, 2, 4, 8, 16, 32, 60s) on consecutive
-    /// attempts. Replaces any already-scheduled restart for this service.
-    /// `reason` is included verbatim in the lifecycle event so a reader
-    /// can tell *why* the restart was scheduled.
-    fn schedule_auto_restart(&mut self, name: &str, reason: &str) {
-        let attempt = self
-            .services
-            .get(name)
-            .map(|rs| rs.restart_attempts.saturating_add(1))
-            .unwrap_or(1);
-        let backoff_secs = unhealthy_restart_backoff_secs(attempt);
-        self.output_manager.service_error_event(
-            name,
-            &format!("{reason} — auto-restart in {backoff_secs}s (attempt {attempt})"),
-        );
-        let cmd_tx = self.internal_tx.clone();
-        let name_owned = name.to_string();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::AutoRestart {
-                    name: name_owned,
-                    attempt,
-                })
-                .await;
-        });
-        if let Some(rs) = self.services.get_mut(name)
-            && let Some(prev) = rs.pending_restart.replace(handle)
-        {
-            prev.abort();
-        }
-    }
-
-    /// Handle an unexpected exit reported by the per-spawn crash watcher.
-    ///
-    /// The watcher fires whenever the child's output stream EOFs — that
-    /// happens for *both* crashes and graceful stops. To distinguish them:
-    /// 1. Compare `pgid` against the live handle. A mismatch means the
-    ///    service has already been respawned; the event is a leftover
-    ///    from the previous instance.
-    /// 2. Filter on state. Stop / restart / shutdown paths take the
-    ///    handle and transition to `Stopping`/`Stopped`/`Failed` *before*
-    ///    the EOF arrives, so we only act if the runner still believes
-    ///    the service is `Running`/`Ready`/`Unhealthy`.
-    ///
-    /// On a real crash, reap the child to get the actual `ExitStatus`,
-    /// cancel the monitor + any pending auto-restart, transition to
-    /// `Failed`, and emit a lifecycle event with the code or signal.
-    async fn handle_service_exited(&mut self, name: &str, pgid: i32) {
-        let state = match self.services.get(name) {
-            Some(rs) => rs.state(),
-            None => return,
-        };
-        if !matches!(
-            state,
-            ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
-        ) {
-            return;
-        }
-        let current_pgid = self.services.get(name).and_then(|rs| match &rs.handle {
-            Some(ServiceHandle::Process(p)) => Some(p.pgid()),
-            _ => None,
-        });
-        if current_pgid != Some(pgid) {
-            // Stale event from a previous spawn. The current handle is a
-            // different instance; ignore.
-            return;
-        }
-        let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
-            Some(h) => h,
-            None => return,
-        };
-        // Reap the child to surface the real exit status. The wait()
-        // returns near-instantly because the process is already gone (we
-        // got here on EOF) — we're really just collecting the status code.
-        let status = if let ServiceHandle::Process(mut proc) = handle {
-            proc.wait().await.ok()
-        } else {
-            None
-        };
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.stop_health_tracking();
-        }
-        // Exit code 0 = clean self-shutdown; never treated as a failure.
-        // The service didn't ask to be restarted — it asked to exit. We
-        // mirror the graceful-stop transition (Stopped, no error) and
-        // reset restart_attempts in case the service had been flapping
-        // before deciding to exit cleanly.
-        let clean_exit = status.as_ref().is_some_and(|s| s.success());
-        if clean_exit {
-            if let Some(rs) = self.services.get_mut(name) {
-                rs.restart_attempts = 0;
-            }
-            self.set_service_state(name, ServiceState::Stopped);
-            self.output_manager
-                .service_event(name, "exited cleanly (status 0)");
-            if let Some(writer) = self.output_manager.service_writer(name) {
-                writer.close_follow_sinks().await;
-            }
-            return;
-        }
-        self.set_service_state(name, ServiceState::Failed);
-        let exit_msg = format_unexpected_exit(status);
-        self.output_manager.service_error_event(name, &exit_msg);
-        // Apply the on_failure policy. Restart routes through the same
-        // backoff machinery as the monitor's Unhealthy → Restart path,
-        // so a service that crashes repeatedly backs off the same way.
-        let policy = self
-            .services
-            .get(name)
-            .map(|rs| rs.resolved.on_failure)
-            .unwrap_or_default();
-        if matches!(policy, crate::config::OnFailure::Restart) {
-            self.schedule_auto_restart(name, &exit_msg);
-        } else if let Some(rs) = self.services.get_mut(name) {
-            // Notify policy: nothing else to do, but reset attempts so a
-            // later manual restart starts at attempt 1 again.
-            rs.restart_attempts = 0;
-        }
-        // Close follow / attach sinks so anyone watching this service
-        // detects the exit instead of blocking forever on the next read.
-        if let Some(writer) = self.output_manager.service_writer(name) {
-            writer.close_follow_sinks().await;
-        }
-    }
-
-    /// Handle a backoff-timer-fired auto-restart. Used for both monitor-
-    /// driven (`Unhealthy`) and crash-driven (`Failed`) restarts. No-op if
-    /// the service has since recovered, stopped, or been restarted manually
-    /// — those paths transition state away from Unhealthy/Failed and we
-    /// must not re-spawn what the user just stopped.
-    async fn handle_auto_restart(&mut self, name: &str, attempt: u32) {
-        let state = match self.services.get(name) {
-            Some(rs) => rs.state(),
-            None => return,
-        };
-        if !matches!(state, ServiceState::Unhealthy | ServiceState::Failed) {
-            return;
-        }
-        if let Some(rs) = self.services.get_mut(name) {
-            // Drop the handle to the just-fired pending-restart task — it has
-            // already sent the command and completed.
-            rs.pending_restart = None;
-            rs.restart_attempts = attempt;
-        }
-        self.output_manager
-            .service_event(name, &format!("auto-restart firing (attempt {attempt})"));
-        if self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.handle.is_some())
-        {
-            let (reply_tx, _reply_rx) = oneshot::channel();
-            self.handle_restart_service_cmd(name, reply_tx).await;
-        } else {
-            let _ = self.queue_background_service_start(name, ServiceStartMode::Full);
         }
     }
 
