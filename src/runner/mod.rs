@@ -11,6 +11,7 @@ mod health;
 mod params;
 mod paths;
 mod profile;
+mod signals;
 mod state;
 
 pub(crate) mod service;
@@ -18,6 +19,7 @@ pub(crate) mod task;
 
 pub(crate) use params::resolve_task_params;
 pub use profile::resolve_profile_items;
+pub use signals::{install_signal_handlers, signal_count};
 
 use crate::config::{Config, Platform, TaskAutoRun};
 use crate::output::OutputManager;
@@ -28,7 +30,6 @@ use crate::watch::WatchManager;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(test)]
 use std::time::SystemTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -48,9 +49,7 @@ use self::paths::any_glob_path_changed_since;
 use self::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use self::profile::resolve_profile_items_for_platform;
 use self::service::ServiceHandle;
-
-/// Signal counter: 0 = running, 1 = graceful shutdown, 2 = force shutdown.
-static SIGNAL_COUNT: AtomicU8 = AtomicU8::new(0);
+use self::signals::{force_shutdown_requested, shutdown_requested};
 
 enum ServiceStartIntent {
     Startup {
@@ -1728,7 +1727,7 @@ impl Runner {
         // Main loop: wait for completions, commands, and signals.
         if !startup_shutdown_requested {
             loop {
-                if SIGNAL_COUNT.load(Ordering::SeqCst) >= 1 {
+                if shutdown_requested() {
                     break;
                 }
 
@@ -2144,7 +2143,7 @@ impl Runner {
             .collect();
 
         for name in ready {
-            if SIGNAL_COUNT.load(Ordering::SeqCst) >= 1 {
+            if shutdown_requested() {
                 return Ok(true);
             }
 
@@ -5332,7 +5331,7 @@ impl Runner {
                         .services
                         .get(name)
                         .and_then(|rs| rs.resolved.shutdown.clone());
-                    let force = SIGNAL_COUNT.load(Ordering::SeqCst) >= 2;
+                    let force = force_shutdown_requested();
                     let name_owned = name.clone();
                     join_set.spawn(async move {
                         // Global shutdown — no subsequent restart, so the
@@ -5346,7 +5345,7 @@ impl Runner {
             // Wait for graceful stops, but if a second Ctrl+C arrives,
             // SIGKILL all processes being stopped and abort the futures.
             loop {
-                if SIGNAL_COUNT.load(Ordering::SeqCst) >= 2 && !join_set.is_empty() {
+                if force_shutdown_requested() && !join_set.is_empty() {
                     self.output_manager
                         .lifecycle_event("forcing immediate shutdown");
                     // SIGKILL all processes that are still being stopped.
@@ -5675,48 +5674,6 @@ fn check_gitignore(base_dir: &std::path::Path, output: &OutputManager) {
             // No .gitignore or not a git repo — skip silently.
         }
     }
-}
-
-/// Install signal handlers for SIGINT and SIGTERM.
-///
-/// Returns a receiver that gets a message on each signal. Pass this to `Runner::new()`.
-/// First signal triggers graceful shutdown. Second signal sets the force-shutdown flag
-/// (checked by `initiate_shutdown` via `SIGNAL_COUNT`).
-pub async fn install_signal_handlers() -> Result<mpsc::Receiver<()>, std::io::Error> {
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
-    let (tx, rx) = mpsc::channel(2);
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = sigint.recv() => {},
-                _ = sigterm.recv() => {},
-            }
-
-            let prev = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
-            // Notify the runner. If the channel is full or closed, that's fine.
-            let _ = tx.try_send(());
-
-            if prev >= 1 {
-                // Second signal — force flag is set via SIGNAL_COUNT.
-                break;
-            }
-        }
-    });
-
-    Ok(rx)
-}
-
-/// Current process-level shutdown signal count.
-///
-/// `0` means no shutdown signal has been seen, `1` means graceful shutdown
-/// has been requested, and `2+` means force-exit escalation has been
-/// requested. This is intentionally process-global so outer supervisors can
-/// make progress even if the runner task wedges.
-pub fn signal_count() -> u8 {
-    SIGNAL_COUNT.load(Ordering::SeqCst)
 }
 
 /// Format a duration for human display in lifecycle messages.
