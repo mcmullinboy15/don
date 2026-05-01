@@ -61,6 +61,14 @@ async fn make_runner(
     toml: &str,
     base_dir: &std::path::Path,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
+    make_runner_verbose(toml, base_dir, false).await
+}
+
+async fn make_runner_verbose(
+    toml: &str,
+    base_dir: &std::path::Path,
+    verbose: bool,
+) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
     let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
@@ -78,7 +86,9 @@ async fn make_runner(
         service_configs.into_iter().chain(task_configs).collect();
 
     let (writer, buf) = TestBuffer::new();
-    let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
+    let output_manager = OutputManager::new_verbose(&all_configs, writer, verbose)
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
     let runner = Runner::new(
         config,
@@ -1286,32 +1296,56 @@ while True: time.sleep(60)\n\
 #[test]
 fn integration_task_watch_skip() {
     run_with_timeout(Duration::from_secs(15), async {
-        let dir = TempDir::new("task-watch-skip");
+        struct Case {
+            name: &'static str,
+            verbose: bool,
+            should_log_skip: bool,
+        }
 
-        std::fs::write(dir.path().join("data.sql"), "CREATE TABLE test;").unwrap();
+        let cases = vec![
+            Case {
+                name: "default",
+                verbose: false,
+                should_log_skip: false,
+            },
+            Case {
+                name: "verbose",
+                verbose: true,
+                should_log_skip: true,
+            },
+        ];
 
-        let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
-        let patterns = vec![format!("{}/*.sql", dir.path().display())];
-        task_state
-            .record_success("migrate", &patterns, &[], None)
-            .await
-            .unwrap();
+        for case in cases {
+            let dir = TempDir::new(&format!("task-watch-skip-{}", case.name));
 
-        let toml = ConfigBuilder::new()
-            .add_task("migrate", "echo", &["running migration"])
-            .watch(&[&format!("{}/*.sql", dir.path().display())])
-            .done()
-            .build();
+            std::fs::write(dir.path().join("data.sql"), "CREATE TABLE test;").unwrap();
 
-        // Task-only config — runner exits on its own when no services remain.
-        let (runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        runner.run().await.unwrap();
+            let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
+            let patterns = vec![format!("{}/*.sql", dir.path().display())];
+            task_state
+                .record_success("migrate", &patterns, &[], None)
+                .await
+                .unwrap();
 
-        let output = read_buf(&buf);
-        assert!(
-            output.contains("skipped (no changes)"),
-            "task should be skipped when files unchanged: {output}"
-        );
+            let toml = ConfigBuilder::new()
+                .add_task("migrate", "echo", &["running migration"])
+                .watch(&[&format!("{}/*.sql", dir.path().display())])
+                .done()
+                .build();
+
+            // Task-only config — runner exits on its own when no services remain.
+            let (runner, _shutdown_tx, buf) =
+                make_runner_verbose(&toml, dir.path(), case.verbose).await;
+            runner.run().await.unwrap();
+
+            let output = read_buf(&buf);
+            assert_eq!(
+                output.contains("skipped (no changes)"),
+                case.should_log_skip,
+                "unexpected skip logging for case {}: {output}",
+                case.name
+            );
+        }
     });
 }
 
@@ -1345,8 +1379,8 @@ fn integration_task_global_watch_ignore_skip() {
 
         let output = read_buf(&buf);
         assert!(
-            output.contains("skipped (no changes)"),
-            "task should be skipped when only globally ignored files changed: {output}"
+            !output.contains("skipped (no changes)"),
+            "task skip should be hidden without verbose logging: {output}"
         );
     });
 }

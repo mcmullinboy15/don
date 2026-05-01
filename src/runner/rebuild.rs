@@ -130,7 +130,7 @@ impl Runner {
         }
         for name in &outcome.up_to_date {
             self.output_manager
-                .service_event(name, "skipped (no changes)");
+                .service_debug_event(name, "skipped (no changes)");
             let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
                 name: name.clone(),
                 success: true,

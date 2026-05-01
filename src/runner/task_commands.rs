@@ -118,7 +118,7 @@ impl Runner {
                     rt.set_needs_run_now(false);
                 }
                 self.set_task_state(name, TaskItemState::Skipped);
-                self.output_manager.service_event(name, &message);
+                self.output_manager.service_debug_event(name, &message);
                 if let TaskRunIntent::Startup { done_tx } = intent {
                     let _ = done_tx
                         .send(ItemDone {
