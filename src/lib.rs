@@ -11,13 +11,14 @@ pub mod output;
 pub mod process;
 pub(crate) mod proxy;
 pub mod runner;
-pub mod server;
+pub(crate) mod server;
 pub mod task_state;
-pub mod tui;
-pub mod watch;
+pub(crate) mod tui;
+pub(crate) mod watch;
 
 pub use config::{Config, ConfigError, Platform, TaskAutoRun};
 pub use duration::{DurationError, parse_duration};
 pub use output::{OutputError, OutputManager, ServiceWriter};
 pub use runner::{Runner, RunnerError, VerboseInfo};
 pub use task_state::{TaskState, TaskStateError};
+pub use tui::{TuiError, run_tui};

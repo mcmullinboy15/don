@@ -994,7 +994,7 @@ async fn run_start(
         // while the runner runs unattended. The log_rx closing (runner
         // shutdown) returns Ok(()) so the normal exit path is unaffected.
         let tui = tokio::spawn(async move {
-            let result = don::tui::run_tui(
+            let result = don::run_tui(
                 log_rx,
                 events,
                 commands,
