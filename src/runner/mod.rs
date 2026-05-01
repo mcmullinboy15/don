@@ -19,6 +19,7 @@ mod service_commands;
 mod service_health;
 mod service_ready;
 mod service_worker;
+mod setup;
 mod shutdown;
 mod signals;
 mod startup;
@@ -38,7 +39,6 @@ pub use signals::{install_signal_handlers, signal_count};
 use crate::config::{Config, Platform};
 use crate::output::OutputManager;
 use crate::process::pid_file::PidFile;
-use crate::task_state::TaskState;
 use crate::watch::WatchManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -59,7 +59,6 @@ use self::health::run_health_monitor;
 use self::health::unhealthy_restart_backoff_secs;
 #[cfg(test)]
 use self::paths::any_glob_path_changed_since;
-use self::profile::resolve_profile_items_for_platform;
 use self::service_worker::{ServiceStartContext, ServiceStartMode};
 use self::signals::shutdown_requested;
 use self::support::check_gitignore;
@@ -659,146 +658,27 @@ impl Runner {
         let (lazy_start_tx, lazy_start_rx) = mpsc::channel(16);
         let (shutdown_flag_tx, _shutdown_flag_rx) = tokio::sync::watch::channel(false);
 
-        // Canonicalize base_dir so all downstream path joins produce clean
-        // absolute paths (avoids `././app` when base_dir is `.`).
-        let base_dir = std::fs::canonicalize(&base_dir).map_err(RunnerError::Io)?;
+        let base_dir = setup::canonicalize_base_dir(&base_dir)?;
+        let don_dir = setup::ensure_don_dir(&base_dir)?;
+        let don_pid_file = setup::acquire_don_pid_file(&don_dir).await?;
 
-        let don_dir = base_dir.join(".don");
-        std::fs::create_dir_all(&don_dir).map_err(RunnerError::Io)?;
+        setup::cleanup_stale_state(&config, &base_dir, &output_manager).await;
+        let docker_client = setup::connect_docker_if_needed(&config)?;
 
-        // Acquire don's own PID file.
-        let don_pid_path = don_dir.join("don.pid");
-        let don_pid_file = PidFile::acquire(don_pid_path.clone(), std::process::id() as i32)
-            .await
-            .map_err(|e| match e {
-                crate::process::pid_file::PidFileError::AlreadyLocked => {
-                    RunnerError::AlreadyRunning {
-                        path: don_pid_path.display().to_string(),
-                    }
-                }
-                other => RunnerError::PidFile(other),
-            })?;
+        let active_items = setup::resolve_active_items(&config, platform, profile)?;
+        let active_services = setup::filter_active_services(&config, active_items.as_ref());
+        let active_tasks = setup::filter_active_tasks(&config, active_items.as_ref());
 
-        // Clean up stale state from a previous don run (crashed or killed).
-        // Runs after we hold the PID file lock, guaranteeing we're the only
-        // don instance. Collects docker container names from config.
-        let docker_names: Vec<String> = config
-            .services
-            .iter()
-            .filter_map(|(name, svc)| {
-                if let Some(crate::config::ServiceKind::Docker(d)) = &svc.kind {
-                    Some(d.container.clone().unwrap_or_else(|| format!("don-{name}")))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let cleanup_report = crate::process::cleanup::run_cleanup(&base_dir, &docker_names).await;
-        if cleanup_report.pid_files_removed > 0
-            || cleanup_report.sock_removed
-            || cleanup_report.containers_removed > 0
-        {
-            output_manager.lifecycle_event(&format!("cleaned stale state: {cleanup_report}"));
-        }
-        for warning in &cleanup_report.warnings {
-            output_manager.error_event(warning);
-        }
+        setup::prune_download_cache(&config, platform, &don_dir, &output_manager);
 
-        // Connect to Docker if any service uses the docker preset.
-        let has_docker = config
-            .services
-            .values()
-            .any(|s| matches!(&s.kind, Some(crate::config::ServiceKind::Docker(_))));
-        let docker_client = if has_docker {
-            Some(
-                bollard::Docker::connect_with_socket_defaults()
-                    .map_err(|e| RunnerError::Config(format!("docker connection failed: {e}")))?,
-            )
-        } else {
-            None
-        };
-
-        // Resolve which items to run: all items, or just the profile subset
-        // with transitive deps included.
-        let active_items: Option<HashSet<String>> = if let Some(profile_name) = profile {
-            let prof = config
-                .profiles
-                .get(profile_name)
-                .ok_or_else(|| RunnerError::Config(format!("unknown profile '{profile_name}'")))?;
-            Some(resolve_profile_items_for_platform(&config, prof, platform))
-        } else {
-            None // all items
-        };
-
-        let active_services: HashSet<String> = config
-            .services
-            .keys()
-            .filter(|name| active_items.as_ref().is_none_or(|s| s.contains(*name)))
-            .cloned()
-            .collect();
-
-        let active_tasks: HashSet<String> = config
-            .tasks
-            .keys()
-            .filter(|name| active_items.as_ref().is_none_or(|s| s.contains(*name)))
-            .cloned()
-            .collect();
-
-        // Prune download cache entries that aren't referenced by the current
-        // config. Collects (owner_name, composite_hash) pairs.
-        let cache_base = don_dir.join("cache");
-        let mut keep: HashSet<(String, String)> = HashSet::new();
-        for (name, svc) in &config.services {
-            let resolved = svc.resolve(platform);
-            if let Some(ref dl) = resolved.download {
-                for artifact in dl.platform.values() {
-                    keep.insert((name.clone(), artifact.composite_hash()));
-                }
-            }
-        }
-        for (name, task) in &config.tasks {
-            if let Some(ref dl) = task.download {
-                for artifact in dl.platform.values() {
-                    keep.insert((name.clone(), artifact.composite_hash()));
-                }
-            }
-        }
-        if let Ok(removed) = crate::download::prune_cache(&cache_base, &keep)
-            && !removed.is_empty()
-        {
-            output_manager.lifecycle_event(&format!(
-                "pruned {} stale cache entr{}",
-                removed.len(),
-                if removed.len() == 1 { "y" } else { "ies" }
-            ));
-        }
-
-        // Build consolidated runtime state maps.
-        let mut services = HashMap::new();
-        for (name, svc) in &config.services {
-            if active_services.contains(name) {
-                let mut resolved = svc.resolve(platform);
-                resolved.depends_on = config.expand_dependency_refs(&resolved.depends_on);
-                services.insert(
-                    name.clone(),
-                    RuntimeService::new(resolved, ServiceState::Pending),
-                );
-            }
-        }
-
-        let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
-        let mut tasks = HashMap::new();
-        for (name, task) in &config.tasks {
-            if active_tasks.contains(name) {
-                let mut task = task.clone();
-                task.depends_on = config.expand_dependency_refs(&task.depends_on);
-                let has_success = task_state.has_success(name).await.unwrap_or(false);
-                tasks.insert(
-                    name.clone(),
-                    RuntimeTask::new(task, TaskItemState::Pending, has_success),
-                );
-            }
-        }
+        let (services, tasks) = setup::build_runtime_maps(
+            &config,
+            platform,
+            &base_dir,
+            &active_services,
+            &active_tasks,
+        )
+        .await;
 
         Ok(Self {
             config,
