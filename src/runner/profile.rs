@@ -33,8 +33,10 @@ fn resolve_profile_items_inner(
         // Follow deps from services.
         if let Some(svc) = config.services.get(&name) {
             let service_deps = match platform {
-                Some(platform) => config.expand_dependency_refs(&svc.resolve(platform).depends_on),
-                None => config.expand_dependency_refs(&svc.depends_on),
+                Some(platform) => {
+                    config.effective_depends_on(&name, &svc.resolve(platform).depends_on)
+                }
+                None => config.effective_depends_on(&name, &svc.depends_on),
             };
             for dep in &service_deps {
                 if !result.contains(dep) {
@@ -44,7 +46,7 @@ fn resolve_profile_items_inner(
         }
         // Follow deps from tasks.
         if let Some(task) = config.tasks.get(&name) {
-            for dep in &config.expand_dependency_refs(&task.depends_on) {
+            for dep in &config.effective_depends_on(&name, &task.depends_on) {
                 if !result.contains(dep) {
                     queue.push(dep.clone());
                 }

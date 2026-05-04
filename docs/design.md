@@ -362,6 +362,32 @@ Depending on a service group is equivalent to depending on each member service.
 Groups may include other groups; nested groups are expanded recursively and
 cycles between groups are rejected during validation.
 
+A group may also declare its own `depends_on`, which is **additive** on top
+of each member's own dependencies. The group-level deps apply transitively
+to every member, including members reached through nested groups:
+
+```toml
+[services.api]
+rust.binary = "api"
+
+[services.web]
+rust.binary = "web"
+
+[services.admin]
+rust.binary = "admin"
+
+[service_groups."web-stack"]
+members = ["web", "admin"]
+
+[service_groups.frontend]
+members = ["web-stack"]
+depends_on = ["api"]
+```
+
+Here both `web` and `admin` effectively depend on `api`. Group-level
+`depends_on` may reference services, tasks, or other groups, just like a
+service's own `depends_on`.
+
 ## Project-Local State
 
 Don stores all mutable state under `.don/` in the project directory:

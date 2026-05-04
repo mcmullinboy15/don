@@ -4,6 +4,7 @@
 //! and profiles for a dev environment.
 
 mod download;
+mod group;
 pub(crate) mod param;
 mod platform;
 mod profile;
@@ -13,6 +14,7 @@ pub(crate) mod template;
 pub(crate) mod types;
 
 pub use self::download::{DownloadConfig, PlatformDownload};
+pub use self::group::ServiceGroup;
 pub use self::param::{CompletionParse, Completions, ParamKind, ParamValidate, TaskParam};
 pub use self::platform::Platform;
 pub use self::profile::Profile;
@@ -38,9 +40,10 @@ pub struct Config {
     #[serde(default)]
     pub services: HashMap<String, Service>,
     /// Named groups of services or other service groups that can be referenced
-    /// from `depends_on` and `profiles.*.services`.
+    /// from `depends_on` and `profiles.*.services`. A group may also declare
+    /// its own `depends_on`, which is applied to every (transitive) member.
     #[serde(default)]
-    pub service_groups: HashMap<String, Vec<String>>,
+    pub service_groups: HashMap<String, ServiceGroup>,
     /// One-shot tasks (migrations, codegen, etc.).
     /// Only re-run when watched files change since last successful run.
     #[serde(default)]
@@ -173,7 +176,7 @@ impl Config {
 
         group_stack.push(name.to_string());
         if let Some(group) = self.service_groups.get(name) {
-            for member in group {
+            for member in &group.members {
                 self.expand_dependency_ref(member, expanded, seen, group_stack);
             }
         }
@@ -182,6 +185,24 @@ impl Config {
 
     pub(crate) fn expand_profile_services(&self, refs: &[String]) -> Vec<String> {
         self.expand_dependency_refs(refs)
+    }
+
+    /// Effective `depends_on` for a service or task — its own declared deps
+    /// plus the `depends_on` from every group whose transitive member set
+    /// contains `name`. The result is fully expanded (group refs resolved to
+    /// leaf names) and deduplicated.
+    pub(crate) fn effective_depends_on(&self, name: &str, own_deps: &[String]) -> Vec<String> {
+        let mut all: Vec<String> = own_deps.to_vec();
+        for (group_name, group) in &self.service_groups {
+            if group.depends_on.is_empty() {
+                continue;
+            }
+            let members = self.expand_dependency_refs(std::slice::from_ref(group_name));
+            if members.iter().any(|m| m == name) {
+                all.extend(group.depends_on.iter().cloned());
+            }
+        }
+        self.expand_dependency_refs(&all)
     }
 
     /// Validate the entire config for a given platform.
@@ -223,12 +244,20 @@ impl Config {
             }
         }
 
-        for (name, members) in &self.service_groups {
-            for member in members {
+        for (name, group) in &self.service_groups {
+            for member in &group.members {
                 if !service_group_reference_names.contains(member.as_str()) {
                     let suggestion = suggest_typo(member, &service_group_reference_names);
                     errors.push(format!(
                         "service group '{name}': references unknown service or service group '{member}'{suggestion}"
+                    ));
+                }
+            }
+            for dep in &group.depends_on {
+                if !dependency_reference_names.contains(dep.as_str()) {
+                    let suggestion = suggest_typo(dep, &dependency_reference_names);
+                    errors.push(format!(
+                        "service group '{name}': depends on unknown service, task, or service group '{dep}'{suggestion}"
                     ));
                 }
             }
@@ -577,15 +606,15 @@ impl Config {
 
         fn dfs(
             node: &str,
-            groups: &HashMap<String, Vec<String>>,
+            groups: &HashMap<String, ServiceGroup>,
             state: &mut HashMap<String, State>,
             path: &mut Vec<String>,
         ) -> Option<Vec<String>> {
             state.insert(node.to_string(), State::Visiting);
             path.push(node.to_string());
 
-            if let Some(members) = groups.get(node) {
-                for member in members {
+            if let Some(group) = groups.get(node) {
+                for member in &group.members {
                     if !groups.contains_key(member) {
                         continue;
                     }
@@ -630,11 +659,14 @@ impl Config {
             let resolved = svc.resolve(platform);
             deps.insert(
                 name.clone(),
-                self.expand_dependency_refs(&resolved.depends_on),
+                self.effective_depends_on(name, &resolved.depends_on),
             );
         }
         for (name, task) in &self.tasks {
-            deps.insert(name.clone(), self.expand_dependency_refs(&task.depends_on));
+            deps.insert(
+                name.clone(),
+                self.effective_depends_on(name, &task.depends_on),
+            );
         }
 
         #[derive(Clone, Copy, PartialEq)]
@@ -1637,10 +1669,9 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
-                    assert_eq!(
-                        config.service_groups.get("datastores"),
-                        Some(&vec!["postgres".to_string(), "redis".to_string()])
-                    );
+                    let group = config.service_groups.get("datastores").unwrap();
+                    assert_eq!(group.members, vec!["postgres", "redis"]);
+                    assert!(group.depends_on.is_empty());
                 },
             },
             ConfigTestCase {
@@ -1753,6 +1784,202 @@ mod tests {
                     [tasks.c]
                     cmd = "c"
                     depends_on = ["a"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("dependency cycle")));
+                },
+            },
+            ConfigTestCase {
+                name: "service group with depends_on parses",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+
+                    [services.web]
+                    run.cmd = "web"
+
+                    [service_groups.frontend]
+                    members = ["web"]
+                    depends_on = ["api"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    let group = config.service_groups.get("frontend").unwrap();
+                    assert_eq!(group.members, vec!["web"]);
+                    assert_eq!(group.depends_on, vec!["api"]);
+                },
+            },
+            ConfigTestCase {
+                name: "service group with depends_on but no members parses",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+
+                    [service_groups.frontend]
+                    depends_on = ["api"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    let group = config.service_groups.get("frontend").unwrap();
+                    assert!(group.members.is_empty());
+                    assert_eq!(group.depends_on, vec!["api"]);
+                },
+            },
+            ConfigTestCase {
+                name: "group depends_on applies to direct member",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+
+                    [services.web]
+                    run.cmd = "web"
+                    depends_on = ["self-only"]
+
+                    [services."self-only"]
+                    run.cmd = "self-only"
+
+                    [service_groups.frontend]
+                    members = ["web"]
+                    depends_on = ["api"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    let mut deps =
+                        config.effective_depends_on("web", &["self-only".to_string()]);
+                    deps.sort();
+                    assert_eq!(deps, vec!["api".to_string(), "self-only".to_string()]);
+                },
+            },
+            ConfigTestCase {
+                name: "group depends_on applies transitively to nested members",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+
+                    [services.web]
+                    run.cmd = "web"
+
+                    [services.admin]
+                    run.cmd = "admin"
+
+                    [service_groups."web-stack"]
+                    members = ["web", "admin"]
+
+                    [service_groups.frontend]
+                    members = ["web-stack"]
+                    depends_on = ["api"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    assert_eq!(
+                        config.effective_depends_on("web", &[]),
+                        vec!["api".to_string()],
+                    );
+                    assert_eq!(
+                        config.effective_depends_on("admin", &[]),
+                        vec!["api".to_string()],
+                    );
+                },
+            },
+            ConfigTestCase {
+                name: "group depends_on can reference another group",
+                input: r#"
+                    [services.web]
+                    run.cmd = "web"
+
+                    [services.api]
+                    run.cmd = "api"
+
+                    [services.worker]
+                    run.cmd = "worker"
+
+                    [service_groups.backend]
+                    members = ["api", "worker"]
+
+                    [service_groups.frontend]
+                    members = ["web"]
+                    depends_on = ["backend"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    let mut deps = config.effective_depends_on("web", &[]);
+                    deps.sort();
+                    assert_eq!(deps, vec!["api".to_string(), "worker".to_string()]);
+                },
+            },
+            ConfigTestCase {
+                name: "group with unknown depends_on target is a validation error",
+                input: r#"
+                    [services.web]
+                    run.cmd = "web"
+
+                    [service_groups.frontend]
+                    members = ["web"]
+                    depends_on = ["postgres"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| {
+                        e.contains("service group 'frontend'")
+                            && e.contains(
+                                "depends on unknown service, task, or service group 'postgres'",
+                            )
+                    }));
+                },
+            },
+            ConfigTestCase {
+                name: "group depends_on typo gets a suggestion",
+                input: r#"
+                    [services.postgres]
+                    run.cmd = "postgres"
+
+                    [services.web]
+                    run.cmd = "web"
+
+                    [service_groups.frontend]
+                    members = ["web"]
+                    depends_on = ["postgre"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(
+                        errors
+                            .iter()
+                            .any(|e| e.contains("did you mean 'postgres'?"))
+                    );
+                },
+            },
+            ConfigTestCase {
+                name: "cycle introduced by group depends_on is detected",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+
+                    [services.web]
+                    run.cmd = "web"
+                    depends_on = ["api"]
+
+                    [service_groups.frontend]
+                    members = ["api"]
+                    depends_on = ["web"]
                 "#,
                 expect_err: false,
                 check: |config| {

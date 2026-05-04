@@ -190,7 +190,8 @@ impl Runner {
                     // ends up with an unexpanded `["mongo-search-deps"]` in
                     // its runtime state, and shutdown's `topological_sort`
                     // bails because the group name isn't a real node.
-                    resolved.depends_on = self.config.expand_dependency_refs(&resolved.depends_on);
+                    resolved.depends_on =
+                        self.config.effective_depends_on(&name, &resolved.depends_on);
                     rs.resolved = resolved;
                 }
             }

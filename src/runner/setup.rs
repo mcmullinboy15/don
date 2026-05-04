@@ -164,7 +164,7 @@ pub(in crate::runner) async fn build_runtime_maps(
     for (name, svc) in &config.services {
         if active_services.contains(name) {
             let mut resolved = svc.resolve(platform);
-            resolved.depends_on = config.expand_dependency_refs(&resolved.depends_on);
+            resolved.depends_on = config.effective_depends_on(name, &resolved.depends_on);
             services.insert(
                 name.clone(),
                 RuntimeService::new(resolved, ServiceState::Pending),
@@ -177,7 +177,7 @@ pub(in crate::runner) async fn build_runtime_maps(
     for (name, task) in &config.tasks {
         if active_tasks.contains(name) {
             let mut task = task.clone();
-            task.depends_on = config.expand_dependency_refs(&task.depends_on);
+            task.depends_on = config.effective_depends_on(name, &task.depends_on);
             let has_success = task_state.has_success(name).await.unwrap_or(false);
             tasks.insert(
                 name.clone(),

@@ -142,6 +142,26 @@ fn resolve_profile_transitive_deps() {
             profile_name: "dev",
             expected: vec!["api", "postgres", "redis"],
         },
+        Case {
+            name: "profile picks up group-level depends_on transitively",
+            toml: r#"
+                [services.api]
+                run.cmd = "api"
+                [services.web]
+                run.cmd = "web"
+                [services.admin]
+                run.cmd = "admin"
+                [service_groups."web-stack"]
+                members = ["web", "admin"]
+                [service_groups.frontend]
+                members = ["web-stack"]
+                depends_on = ["api"]
+                [profiles.dev]
+                services = ["frontend"]
+            "#,
+            profile_name: "dev",
+            expected: vec!["web", "admin", "api"],
+        },
     ];
 
     for case in cases {

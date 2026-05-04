@@ -237,6 +237,34 @@ depends_on = ["db"]
 depends_on = ["migrate"]
 ```
 
+### Service Groups
+
+Bundle related services under a name and reference the group from any
+`depends_on`. Group references expand to every member, including nested
+groups:
+
+```toml
+[service_groups]
+datastores = ["postgres", "redis"]
+
+[services.api]
+depends_on = ["datastores"]   # waits for postgres AND redis
+```
+
+A group can also declare its own `depends_on`. Those dependencies are
+**additive** — they apply to every (transitive) member of the group, on
+top of whatever each member already declares:
+
+```toml
+[service_groups.frontend]
+members = ["web", "admin"]
+depends_on = ["api"]          # both web and admin now depend on api
+```
+
+Group-level `depends_on` may reference services, tasks, or other groups,
+and propagates through nested groups (a member of a member group still
+inherits the outer group's deps).
+
 ### Ready Checks
 
 Don waits for services to be ready before starting dependents:
