@@ -132,6 +132,13 @@ func main() {
 
         let toml = ConfigBuilder::new()
             .add_go_service("api", ".")
+            // Disable VCS stamping for the build subprocess. Without this,
+            // `go build` walks up the temp dir looking for `.git` and can
+            // trip over an unrelated ancestor repo (e.g. a stray `/tmp/.git`
+            // on the host) with `error obtaining VCS status: exit 128`.
+            // The flag has no effect on Don's behavior — it just makes the
+            // test independent of whatever VCS state the temp parent has.
+            .env("GOFLAGS", "-buildvcs=false")
             .ready_exec("true", &[])
             .done()
             .build();
@@ -187,11 +194,14 @@ func main() {
         )
         .unwrap();
 
-        // Use ldflags to inject a version string.
+        // Use ldflags to inject a version string. GOFLAGS disables VCS
+        // stamping so the test isn't subject to the host's temp-parent
+        // VCS state — see the matching note in `go_preset_builds_and_runs`.
         let toml = r#"
 [services.api]
 go.package = "."
 go.ldflags = "-X main.version=1.2.3"
+env.GOFLAGS = "-buildvcs=false"
 ready.exec.cmd = "true"
 "#
         .to_string();
