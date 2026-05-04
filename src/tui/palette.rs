@@ -23,6 +23,9 @@ use crate::runner::TaskItemState;
 pub(crate) struct Action {
     pub(crate) label: String,
     pub(crate) kind: ActionKind,
+    pub(crate) task_name: Option<String>,
+    pub(crate) task_state: Option<TaskItemState>,
+    pub(crate) needs_run: bool,
 }
 
 /// What the action actually does. Kept separate from the display label so
@@ -159,10 +162,10 @@ impl ActionPalette {
 ///
 /// Ordering (top to bottom in the palette):
 /// 1. "Run all pending tasks" if any task is in [`PendingRun`](TaskItemState::PendingRun).
-/// 2. Per-task run actions, sorted alphabetically. Running tasks are skipped
-///    to avoid double-spawning; every other state is runnable, with a
-///    `(needs run)` suffix for states that indicate the user should run it
-///    (`Pending`, `Failed`, `PendingRun`).
+/// 2. Per-task run actions that need attention, sorted alphabetically.
+/// 3. Other runnable task actions, sorted alphabetically.
+///
+/// Running/building tasks are skipped to avoid double-spawning.
 pub(crate) fn build_actions(
     tasks: &HashMap<String, TaskItemState>,
     task_configs: &HashMap<String, Task>,
@@ -177,37 +180,29 @@ pub(crate) fn build_actions(
         actions.push(Action {
             label: format!("Run all pending tasks ({pending_count})"),
             kind: ActionKind::RunPendingTasks,
+            task_name: None,
+            task_state: None,
+            needs_run: true,
         });
     }
 
-    let mut task_names: Vec<&String> = tasks.keys().collect();
-    task_names.sort();
-    for name in task_names {
-        let Some(state) = tasks.get(name) else {
-            continue;
-        };
-        let mut suffix = match state {
-            TaskItemState::Running | TaskItemState::Building => continue,
-            TaskItemState::Pending
-            | TaskItemState::Failed
-            | TaskItemState::DependencyFailed
-            | TaskItemState::PendingRun => " (needs run)",
-            TaskItemState::Completed | TaskItemState::Skipped => "",
-        };
+    let mut task_entries: Vec<(&String, TaskItemState)> = tasks
+        .iter()
+        .filter_map(|(name, state)| match state {
+            TaskItemState::Running | TaskItemState::Building => None,
+            _ => Some((name, *state)),
+        })
+        .collect();
+    task_entries.sort_by(|(a_name, a_state), (b_name, b_state)| {
+        task_action_sort_bucket(*a_state)
+            .cmp(&task_action_sort_bucket(*b_state))
+            .then_with(|| a_name.cmp(b_name))
+    });
+
+    for (name, state) in task_entries {
+        let needs_run = task_needs_run(state);
+        let suffix = if needs_run { " (needs run)" } else { "" };
         let has_params = task_configs.get(name).is_some_and(|t| !t.params.is_empty());
-        // Param'd tasks get a visible hint so the user knows Enter will
-        // open a form rather than kick off the task directly.
-        if has_params && suffix.is_empty() {
-            suffix = " (needs input)";
-        } else if has_params {
-            // Already has " (needs run)" from a needs-run state — tack on
-            // the extra hint. Hand-rolled concat keeps the suffix &'static.
-            actions.push(Action {
-                label: format!("Run {name} (needs input)"),
-                kind: ActionKind::RunTaskWithForm(name.clone()),
-            });
-            continue;
-        }
         let kind = if has_params {
             ActionKind::RunTaskWithForm(name.clone())
         } else {
@@ -216,10 +211,27 @@ pub(crate) fn build_actions(
         actions.push(Action {
             label: format!("Run {name}{suffix}"),
             kind,
+            task_name: Some(name.clone()),
+            task_state: Some(state),
+            needs_run,
         });
     }
 
     actions
+}
+
+fn task_action_sort_bucket(state: TaskItemState) -> u8 {
+    if task_needs_run(state) { 0 } else { 1 }
+}
+
+fn task_needs_run(state: TaskItemState) -> bool {
+    matches!(
+        state,
+        TaskItemState::Pending
+            | TaskItemState::Failed
+            | TaskItemState::DependencyFailed
+            | TaskItemState::PendingRun
+    )
 }
 
 #[cfg(test)]
@@ -305,10 +317,10 @@ mod tests {
                 want_labels: vec![
                     "Run all pending tasks (1)",
                     "Run a_pending (needs run)",
-                    "Run b_completed",
-                    "Run c_skipped",
                     "Run d_failed (needs run)",
                     "Run e_pending_run (needs run)",
+                    "Run b_completed",
+                    "Run c_skipped",
                 ],
             },
             Case {
@@ -440,11 +452,11 @@ mod tests {
             "got {:?}",
             interactive.kind,
         );
-        assert!(interactive.label.contains("needs input"));
+        assert_eq!(interactive.label, "Run interactive");
     }
 
     #[test]
-    fn paramd_tasks_combine_needs_input_with_needs_run() {
+    fn paramd_tasks_keep_needs_run_label() {
         let configs = task_configs_with_params(&[("migrate", true)]);
         let tasks = tasks(&[("migrate", TaskItemState::PendingRun)]);
         let got = build_actions(&tasks, &configs);
@@ -457,5 +469,6 @@ mod tests {
             "got {:?}",
             migrate.kind,
         );
+        assert_eq!(migrate.label, "Run migrate (needs run)");
     }
 }

@@ -27,7 +27,7 @@ use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragrap
 
 use super::app::{App, OverlayItem, StatusCounts, ViewMode};
 use super::filter::{FilterFocus, FilterRow, FilterState};
-use super::palette::ActionPalette;
+use super::palette::{Action, ActionPalette};
 use crate::runner::{ServiceState, TaskItemState};
 
 /// Total rows the inline viewport reserves: 1 blank buffer row + 3 rows
@@ -156,7 +156,8 @@ fn draw_palette_modal(frame: &mut Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
-    draw_palette_list(frame, layout[0], &app.palette);
+    let name_colors = log_name_colors(app);
+    draw_palette_list(frame, layout[0], &app.palette, &name_colors);
     let bar = Paragraph::new(palette_bar_line(&app.palette));
     frame.render_widget(bar, layout[1]);
 }
@@ -372,7 +373,12 @@ fn draw_filter_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_palette_list(frame: &mut Frame<'_>, area: Rect, palette: &ActionPalette) {
+fn draw_palette_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    palette: &ActionPalette,
+    name_colors: &HashMap<String, Color>,
+) {
     if area.height == 0 {
         return;
     }
@@ -380,7 +386,7 @@ fn draw_palette_list(frame: &mut Frame<'_>, area: Rect, palette: &ActionPalette)
     // selected index in view by adjusting the scroll offset.
     let items: Vec<ListItem<'static>> = palette
         .visible()
-        .map(|(_, action)| ListItem::new(Line::from(Span::raw(action.label.clone()))))
+        .map(|(_, action)| ListItem::new(palette_action_line(action, name_colors)))
         .collect();
 
     let list = List::new(items)
@@ -397,6 +403,38 @@ fn draw_palette_list(frame: &mut Frame<'_>, area: Rect, palette: &ActionPalette)
         Some(palette.highlight())
     });
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn palette_action_line(action: &Action, name_colors: &HashMap<String, Color>) -> Line<'static> {
+    let Some(name) = action.task_name.as_ref() else {
+        return Line::from(Span::styled(
+            action.label.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    };
+
+    let name_style = name_colors
+        .get(name)
+        .copied()
+        .map(|color| Style::default().fg(color))
+        .unwrap_or_default();
+    let mut spans = vec![
+        Span::styled("Run ", Style::default().fg(Color::DarkGray)),
+        Span::styled(name.clone(), name_style),
+    ];
+    if action.needs_run {
+        let state_color = action
+            .task_state
+            .map(task_state_color)
+            .unwrap_or(Color::Cyan);
+        spans.push(Span::styled(
+            " (needs run)",
+            Style::default().fg(state_color),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn normal_bar_line(

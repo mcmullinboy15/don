@@ -17,8 +17,8 @@
 //! and never rebuilt. All non-Normal modes (Filter, Palette, Overlay) render
 //! into a separate alt-screen [`Terminal`] ([`Modal`]) that overlays the main
 //! screen. Leaving the modal restores the main screen's previous contents;
-//! new log lines received during the modal are replayed via
-//! [`clear_and_replay`] so the filtered view stays coherent.
+//! new log lines received during the modal are inserted afterward so the
+//! user sees what happened without replaying the whole retained log buffer.
 //!
 //! Avoiding inline rebuilds sidesteps a nasty crossterm race: `get_cursor_position`
 //! reads stdin for the DSR response, and racing with the input task's
@@ -113,10 +113,11 @@ struct TuiControls {
 /// inline terminal uses.
 struct Modal {
     terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+    replay_checkpoint: u64,
 }
 
 impl Modal {
-    fn enter() -> Result<Self, TuiError> {
+    fn enter(replay_checkpoint: u64) -> Result<Self, TuiError> {
         execute!(std::io::stdout(), EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(std::io::stdout());
         let terminal = Terminal::with_options(
@@ -125,7 +126,10 @@ impl Modal {
                 viewport: Viewport::Fullscreen,
             },
         )?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            replay_checkpoint,
+        })
     }
 
     fn draw(&mut self, app: &App) -> Result<(), TuiError> {
@@ -571,6 +575,33 @@ fn clear_and_replay(
     Ok(())
 }
 
+/// Leave the alt screen and insert only logs that arrived while it was open.
+///
+/// This preserves the user's current scrollback instead of clearing the
+/// screen and replaying the whole retained [`LogStore`]. Filter commits still
+/// use [`clear_and_replay`] when the active selection changed, because that is
+/// the case where visible lines may need to disappear.
+fn close_modal_and_replay_new_logs(
+    terminal: &mut TuiTerminal,
+    store: &LogStore,
+    app: &App,
+    modal: &mut Option<Modal>,
+) -> Result<(), TuiError> {
+    let Some(since) = modal.take().map(|m| m.replay_checkpoint) else {
+        draw_inline_bar(terminal, app)?;
+        return Ok(());
+    };
+
+    let width = terminal.size()?.width.max(1);
+    for entry in store.iter_since(since) {
+        if app.should_render_log(&entry.line.name, entry.line.is_lifecycle) {
+            insert_line(terminal, &entry.line, width)?;
+        }
+    }
+    draw_inline_bar(terminal, app)?;
+    Ok(())
+}
+
 /// Dispatch an input or resize event.
 fn handle_app_event(
     event: AppEvent,
@@ -702,14 +733,14 @@ fn handle_normal_key(
         KeyCode::Char('l') => {
             app.filter.enter_edit();
             app.view_mode = ViewMode::Filter;
-            let mut m = Modal::enter()?;
+            let mut m = Modal::enter(store.next_id())?;
             m.draw(app)?;
             *modal = Some(m);
         }
         KeyCode::Char('t') => {
             app.palette.open(&app.tasks_state, &app.task_configs);
             app.view_mode = ViewMode::Palette;
-            let mut m = Modal::enter()?;
+            let mut m = Modal::enter(store.next_id())?;
             m.draw(app)?;
             *modal = Some(m);
         }
@@ -718,7 +749,7 @@ fn handle_normal_key(
             app.overlay_query.clear();
             app.overlay_filtering = false;
             app.view_mode = ViewMode::Overlay;
-            let mut m = Modal::enter()?;
+            let mut m = Modal::enter(store.next_id())?;
             m.draw(app)?;
             *modal = Some(m);
         }
@@ -739,12 +770,17 @@ fn handle_filter_key(
             KeyCode::Enter => {
                 let close_after_apply = app.filter.query_has_single_match();
                 app.filter.apply_query();
+                let filter_changed = app.filter.selection_changed_from_snapshot();
                 app.filter.end_query_edit();
                 if close_after_apply {
                     app.filter.commit();
                     app.view_mode = ViewMode::Normal;
-                    *modal = None;
-                    clear_and_replay(terminal, store, app)?;
+                    if filter_changed {
+                        *modal = None;
+                        clear_and_replay(terminal, store, app)?;
+                    } else {
+                        close_modal_and_replay_new_logs(terminal, store, app, modal)?;
+                    }
                 } else {
                     redraw_modal(modal, app)?;
                 }
@@ -764,8 +800,7 @@ fn handle_filter_key(
             KeyCode::Esc => {
                 app.filter.cancel_edit();
                 app.view_mode = ViewMode::Normal;
-                *modal = None;
-                clear_and_replay(terminal, store, app)?;
+                close_modal_and_replay_new_logs(terminal, store, app, modal)?;
             }
             _ => {}
         }
@@ -774,16 +809,20 @@ fn handle_filter_key(
 
     match key.code {
         KeyCode::Enter => {
+            let filter_changed = app.filter.selection_changed_from_snapshot();
             app.filter.commit();
             app.view_mode = ViewMode::Normal;
-            *modal = None; // drops, leaves alt screen
-            clear_and_replay(terminal, store, app)?;
+            if filter_changed {
+                *modal = None; // drops, leaves alt screen
+                clear_and_replay(terminal, store, app)?;
+            } else {
+                close_modal_and_replay_new_logs(terminal, store, app, modal)?;
+            }
         }
         KeyCode::Esc => {
             app.filter.cancel_edit();
             app.view_mode = ViewMode::Normal;
-            *modal = None;
-            clear_and_replay(terminal, store, app)?;
+            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
         }
         KeyCode::Char('R') => {
             app.filter.reset_edit_to_defaults();
@@ -844,14 +883,12 @@ fn handle_palette_key(
                 None => {}
             }
             app.view_mode = ViewMode::Normal;
-            *modal = None;
-            clear_and_replay(terminal, store, app)?;
+            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
         }
         KeyCode::Esc => {
             app.palette.close();
             app.view_mode = ViewMode::Normal;
-            *modal = None;
-            clear_and_replay(terminal, store, app)?;
+            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
         }
         // `/` is the "filter" key across views — swallow it so pressing it
         // reflexively doesn't end up as the first character of the query.
@@ -979,8 +1016,7 @@ fn handle_overlay_key(
             app.view_mode = ViewMode::Normal;
             app.overlay_query.clear();
             app.overlay_filtering = false;
-            *modal = None;
-            clear_and_replay(terminal, store, app)?;
+            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
         }
         _ => {}
     }
@@ -1319,8 +1355,7 @@ fn handle_form_key(
         KeyCode::Esc => {
             app.form = None;
             app.view_mode = ViewMode::Normal;
-            *modal = None;
-            clear_and_replay(terminal, store, app)?;
+            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
             return Ok(());
         }
         KeyCode::Enter if ctrl => {
@@ -1490,8 +1525,7 @@ fn try_submit_form(
     dispatch_run_task_with_params(command_tx, task_name, params);
     app.form = None;
     app.view_mode = ViewMode::Normal;
-    *modal = None;
-    clear_and_replay(terminal, store, app)?;
+    close_modal_and_replay_new_logs(terminal, store, app, modal)?;
     Ok(())
 }
 
