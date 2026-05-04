@@ -498,16 +498,47 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Restoring the terminal happens from a background process group (the
+        // foreground task owns the tty). tcsetpgrp and tcsetattr from a bg
+        // pgrp send SIGTTOU to all members of the calling pgrp, whose default
+        // action is to STOP the process — leaving don suspended right after
+        // every foreground task. Ignore SIGTTOU around the restoration calls
+        // and put the disposition back when we're done.
+        let saved_sigttou = ignore_signal(libc::SIGTTOU);
         // Safety: best-effort terminal restoration for the saved tty fd.
         let _ = unsafe { libc::tcsetpgrp(self.fd, self.original_pgrp) };
         if let Some(termios) = self.original_termios.as_ref() {
             // Safety: termios was captured by tcgetattr for this fd.
             let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, termios) };
         }
+        restore_signal(libc::SIGTTOU, saved_sigttou);
         if self.alternate_screen {
             let _ =
                 crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         }
+    }
+}
+
+/// Set `signum`'s disposition to SIG_IGN and return the previous sigaction
+/// so it can be put back via [`restore_signal`].
+fn ignore_signal(signum: libc::c_int) -> libc::sigaction {
+    // Safety: sigaction reads/writes a struct sigaction we own; SIG_IGN is a
+    // valid handler value.
+    unsafe {
+        let mut prev: libc::sigaction = std::mem::zeroed();
+        let mut new: libc::sigaction = std::mem::zeroed();
+        new.sa_sigaction = libc::SIG_IGN;
+        libc::sigemptyset(&mut new.sa_mask);
+        libc::sigaction(signum, &new, &mut prev);
+        prev
+    }
+}
+
+/// Restore a signal disposition saved by [`ignore_signal`].
+fn restore_signal(signum: libc::c_int, prev: libc::sigaction) {
+    // Safety: prev was produced by sigaction in `ignore_signal`.
+    unsafe {
+        libc::sigaction(signum, &prev, std::ptr::null_mut());
     }
 }
 
