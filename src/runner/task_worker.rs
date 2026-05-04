@@ -16,6 +16,7 @@ pub(in crate::runner) enum TaskRunPrepared {
     PendingRun { message: String },
     Skipped { message: String },
     Spawned(Box<task::TaskSpawn>),
+    ForegroundSpawned(Box<task::ForegroundTaskSpawn>),
 }
 
 pub(in crate::runner) struct TaskWorkerContext {
@@ -120,8 +121,15 @@ pub(in crate::runner) async fn run_task_worker(
     .await
     .map_err(|e| format!("download failed: {e}"))?;
 
-    let spawn = task::spawn_task(task_cfg, name, &base_dir, platform, params)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(TaskRunPrepared::Spawned(Box::new(spawn)))
+    if task_cfg.terminal.is_foreground() {
+        let spawn = task::spawn_foreground_task(task_cfg, name, &base_dir, platform, params)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(TaskRunPrepared::ForegroundSpawned(Box::new(spawn)))
+    } else {
+        let spawn = task::spawn_task(task_cfg, name, &base_dir, platform, params)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(TaskRunPrepared::Spawned(Box::new(spawn)))
+    }
 }

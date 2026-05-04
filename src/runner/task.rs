@@ -7,11 +7,14 @@ use nix::sys::signal::Signal;
 use tokio::time;
 
 use crate::config::template::{self, TemplateError};
-use crate::config::{Platform, Task};
+use crate::config::{Platform, Task, TaskTerminalScreen};
 use crate::duration::parse_duration;
-use crate::process::{ChildOutput, SpawnConfig, spawn_process};
+use crate::process::{
+    ChildOutput, ForegroundProcessHandle, ForegroundScreen, SpawnConfig, spawn_foreground_process,
+    spawn_process,
+};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 
@@ -40,6 +43,20 @@ pub(crate) struct TaskSpawn {
     pub rendered_cmdline: String,
 }
 
+/// Result of spawning a foreground task process.
+pub(crate) struct ForegroundTaskSpawn {
+    pub handle: ForegroundProcessHandle,
+    pub rendered_cmdline: String,
+}
+
+struct PreparedTaskCommand {
+    cmd: String,
+    args: Vec<String>,
+    work_dir: PathBuf,
+    env: HashMap<String, String>,
+    rendered_cmdline: String,
+}
+
 /// Spawn a task process. Does not wait for completion.
 ///
 /// Resolves the task's command path using its download config (if any) so
@@ -53,6 +70,66 @@ pub(crate) async fn spawn_task(
     platform: Platform,
     params: &HashMap<String, String>,
 ) -> Result<TaskSpawn, TaskError> {
+    let prepared = prepare_task_command(task, task_name, base_dir, platform, params)?;
+
+    let (handle, child_output) = spawn_process(SpawnConfig {
+        cmd: &prepared.cmd,
+        args: &prepared.args,
+        dir: Some(prepared.work_dir.as_path()),
+        env: prepared.env,
+        pgid_file_path: None,
+        force_pipe: false,
+        listen_fds: vec![],
+    })
+    .await?;
+
+    Ok(TaskSpawn {
+        handle,
+        child_output,
+        rendered_cmdline: prepared.rendered_cmdline,
+    })
+}
+
+/// Spawn a foreground task process. Does not wait for completion.
+pub(crate) async fn spawn_foreground_task(
+    task: &Task,
+    task_name: &str,
+    base_dir: &Path,
+    platform: Platform,
+    params: &HashMap<String, String>,
+) -> Result<ForegroundTaskSpawn, TaskError> {
+    let prepared = prepare_task_command(task, task_name, base_dir, platform, params)?;
+    let screen = match task.terminal.screen {
+        TaskTerminalScreen::Main => ForegroundScreen::Main,
+        TaskTerminalScreen::Alternate => ForegroundScreen::Alternate,
+    };
+    let handle = spawn_foreground_process(
+        SpawnConfig {
+            cmd: &prepared.cmd,
+            args: &prepared.args,
+            dir: Some(prepared.work_dir.as_path()),
+            env: prepared.env,
+            pgid_file_path: None,
+            force_pipe: false,
+            listen_fds: vec![],
+        },
+        screen,
+    )
+    .await?;
+
+    Ok(ForegroundTaskSpawn {
+        handle,
+        rendered_cmdline: prepared.rendered_cmdline,
+    })
+}
+
+fn prepare_task_command(
+    task: &Task,
+    task_name: &str,
+    base_dir: &Path,
+    platform: Platform,
+    params: &HashMap<String, String>,
+) -> Result<PreparedTaskCommand, TaskError> {
     let render = |field: &str, s: &str| -> Result<String, TaskError> {
         template::render(s, params).map_err(|source| TaskError::Template {
             field: field.to_string(),
@@ -115,21 +192,13 @@ pub(crate) async fn spawn_task(
         .map(|(i, a)| render(&format!("args[{i}]"), a))
         .collect::<Result<_, _>>()?;
 
-    let (handle, child_output) = spawn_process(SpawnConfig {
-        cmd: &cmd_str,
-        args: &args,
-        dir: Some(work_dir),
+    let rendered_cmdline = crate::output::format_cmdline(&cmd_str, &args);
+    Ok(PreparedTaskCommand {
+        cmd: cmd_str,
+        args,
+        work_dir: work_dir.to_path_buf(),
         env,
-        pgid_file_path: None,
-        force_pipe: false,
-        listen_fds: vec![],
-    })
-    .await?;
-
-    Ok(TaskSpawn {
-        handle,
-        child_output,
-        rendered_cmdline: crate::output::format_cmdline(&cmd_str, &args),
+        rendered_cmdline,
     })
 }
 
@@ -138,6 +207,29 @@ pub(crate) async fn spawn_task(
 /// On timeout, the process group is killed and `TaskError::Timeout` is returned.
 pub(crate) async fn wait_for_task(
     handle: &mut crate::process::ProcessHandle,
+    timeout_str: Option<&str>,
+) -> Result<ExitStatus, TaskError> {
+    if let Some(timeout_str) = timeout_str {
+        let timeout = parse_duration(timeout_str)?;
+        match time::timeout(timeout, handle.wait()).await {
+            Ok(result) => Ok(result?),
+            Err(_elapsed) => {
+                let _ = handle
+                    .terminate(Signal::SIGKILL, Duration::from_millis(500))
+                    .await;
+                Err(TaskError::Timeout {
+                    timeout: timeout_str.to_string(),
+                })
+            }
+        }
+    } else {
+        Ok(handle.wait().await?)
+    }
+}
+
+/// Wait for a foreground task to complete, with an optional timeout.
+pub(crate) async fn wait_for_foreground_task(
+    handle: &mut ForegroundProcessHandle,
     timeout_str: Option<&str>,
 ) -> Result<ExitStatus, TaskError> {
     if let Some(timeout_str) = timeout_str {

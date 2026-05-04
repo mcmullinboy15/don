@@ -31,6 +31,9 @@ pub(crate) struct RuntimeService {
     pub resolved: crate::config::service::ResolvedService,
     /// Handle to the running process (if spawned).
     pub handle: Option<ServiceHandle>,
+    /// Output reader task for the current process. It must drain before
+    /// output sinks are torn down or final shutdown logs can be lost.
+    pub output_worker: Option<tokio::task::JoinHandle<()>>,
     /// OSC query sink for reclaiming PTY write on attach.
     pub osc_sink: Option<crate::output::OscSinkHandle>,
     /// PID of the client holding the interactive attach lock.
@@ -90,6 +93,7 @@ impl RuntimeService {
             state: initial_state,
             resolved,
             handle: None,
+            output_worker: None,
             osc_sink: None,
             attach_lock: None,
             attach_waiter: None,
@@ -165,6 +169,9 @@ pub(crate) struct RuntimeTask {
     pub attach_waiter: Option<AttachWaiter>,
     /// Watch paths resolved from build tool queries (bazel/turbo).
     pub resolved_watch_paths: Vec<String>,
+    /// Output reader task for the current process. It must drain before
+    /// output sinks are torn down or final shutdown logs can be lost.
+    pub output_worker: Option<tokio::task::JoinHandle<()>>,
     /// In-flight detached task run worker.
     pub run_worker: Option<tokio::task::JoinHandle<()>>,
     /// Monotonic generation for task run workers so stale completions can
@@ -195,6 +202,7 @@ impl RuntimeTask {
             attach_lock: None,
             attach_waiter: None,
             resolved_watch_paths: Vec::new(),
+            output_worker: None,
             run_worker: None,
             run_generation: 0,
             has_success,

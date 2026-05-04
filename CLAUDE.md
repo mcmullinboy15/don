@@ -12,6 +12,11 @@ cargo test           # run all tests
 cargo clippy         # lint
 ```
 
+For interactive testing of the TUI under realistic load (shutdown, log spam,
+hang detection), see [Testing the TUI](#testing-the-tui) — this is the
+preferred way to validate any change that touches `src/tui/`, `src/output/`,
+or the runner shutdown path.
+
 ## Core Principles
 
 ### No Panics in Production Code
@@ -75,6 +80,75 @@ Don manages external resources (child processes, PID files, sockets, docker cont
 - **Integration tests live in `tests/`.** Use the helpers in `tests/helpers/` (TempDir, ConfigBuilder, free_port, run_with_timeout).
 - **Tests must work without a real TTY.** PTY allocation can fail in CI/headless environments. Process spawning code must have a pipe-based fallback, and tests must not assume a PTY is available.
 - **Every integration test gets a timeout.** Use `run_with_timeout()` to prevent hangs from blocking CI.
+
+### Testing the TUI
+
+Pipe-mode integration tests cover the runner and `OutputManager`, but they
+don't exercise ratatui rendering, the inline-viewport DSR setup, the input
+task, or the broadcast/log-channel interplay that the TUI loop sits in the
+middle of. Several of the worst regressions in this codebase have been
+TUI-only — pipe mode fine, TUI hangs / loses lifecycle events / freezes the
+status bar under load. **If you touch `src/tui/`, `src/output/`, or the
+runner's shutdown path, you need to validate against a real PTY.**
+
+There are two complementary tools in `tools/`:
+
+- **`tools/tui_drive.py`** — runs `don start` under a real PTY (`pty.fork`),
+  intercepts and answers DSR cursor queries on the master side (so the TUI
+  starts cleanly the way it would in a normal terminal), waits for "all
+  services running", sends SIGINT after a configurable linger, watches for
+  "shutdown complete", and force-kills + reports HANG if the process
+  doesn't exit promptly. Captures the full ANSI byte stream on stdout and
+  writes a structured summary to stderr (lifecycle event counts, captured
+  byte total, exit code).
+- **`tools/gen_stress_config.py`** — generates a synthetic `don.toml` plus
+  per-service shell scripts that mirror the shape of a busy monorepo:
+  hidden infra services with one of them spamming on SIGTERM, hidden
+  consumers with TERM-trap floods, dozens of lazy `app-NN` services with
+  `listenfd` proxies. This is the load shape that exposes TUI render-rate
+  bugs.
+
+The standard workflow:
+
+```sh
+# Build (release — debug is too slow to expose perf issues at scale).
+cargo build --release
+
+# Generate a stress config in a scratch dir.
+python3 tools/gen_stress_config.py /tmp/don-stress
+
+# Drive don in TUI mode, send Ctrl+C 4s after steady-state.
+rm -rf /tmp/don-stress/.don
+python3 tools/tui_drive.py target/release/don /tmp/don-stress 4 \
+    > /tmp/tui-stdout.bin 2> /tmp/tui-stderr.log
+
+# Healthy run: every running (non-lazy) service shows
+# `: stopping`, `send SIGTERM`, and `: stopped`; "shutdown complete"
+# appears; exit code is 0; total runtime well under 10 s.
+tail -15 /tmp/tui-stderr.log
+```
+
+Things to look for in the stderr summary:
+
+- `saw shutdown: True` — `shutdown complete` reached the TUI.
+- `lifecycle 'stopping' / 'send SIGTERM' / 'stopped' events: N` — should
+  equal the number of running (non-lazy) services. A drop here means
+  lifecycle events were dropped or the runner skipped its shutdown loop.
+- `don exit code: 0` — clean exit. `None` + a `HANG` line means the
+  driver had to SIGKILL.
+- `captured bytes` — useful regression signal. A jump from tens of KB to
+  multiple MB without a config change means the TUI started rendering
+  log lines that should have stayed filtered.
+
+To exercise even harder, edit `tools/gen_stress_config.py` and bump the
+spam loop counts inside the noisy services' TERM traps. The current shape
+is calibrated to surface the render-rate bug we fixed; if you're chasing
+something different (lots of state events, deep dep chains, etc.) tweak
+the shape rather than reaching for a one-off shell script.
+
+When TUI behavior changes, this is the test of record. A `cargo test`
+green run is necessary but not sufficient — also run the driver and
+include before/after stderr summaries in the change description.
 
 ### Code Organization
 

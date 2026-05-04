@@ -111,6 +111,11 @@ impl Runner {
         intent: ServiceStartIntent,
         result: Result<Box<service::StartResult>, String>,
     ) {
+        if self.shutting_down {
+            self.stop_late_service_start(name.to_string(), context, result)
+                .await;
+            return;
+        }
         let is_current = self
             .services
             .get(name)
@@ -118,6 +123,10 @@ impl Runner {
         if !is_current {
             if let Ok(start_result) = result {
                 let shutdown_config = context.resolved.shutdown.clone();
+                let debug = service::StopDebug::new(
+                    name.to_string(),
+                    self.output_manager.clone_lifecycle_emitter(),
+                );
                 tokio::spawn(async move {
                     let start_result = *start_result;
                     let service::StartResult {
@@ -125,8 +134,14 @@ impl Runner {
                         child_output,
                     } = start_result;
                     drop(child_output);
-                    let _ =
-                        service::stop_service(handle, shutdown_config.as_ref(), true, false).await;
+                    let _ = service::stop_service(
+                        handle,
+                        shutdown_config.as_ref(),
+                        true,
+                        false,
+                        Some(debug),
+                    )
+                    .await;
                 });
             }
             return;
@@ -237,6 +252,9 @@ impl Runner {
     }
 
     pub(in crate::runner) async fn continue_rebuild_restart(&mut self, name: &str) {
+        if self.shutting_down {
+            return;
+        }
         let has_proxy = self.services.get(name).is_some_and(|rs| rs.proxy.is_some());
         if has_proxy
             && let Some(rs) = self.services.get(name)
@@ -316,6 +334,12 @@ impl Runner {
         name: &str,
         mode: ServiceStartMode,
     ) -> Result<(), CommandError> {
+        if self.shutting_down {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "shutdown in progress".to_string(),
+            });
+        }
         let context = self.service_start_snapshot(name)?;
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "starting...");
@@ -326,6 +350,12 @@ impl Runner {
         &mut self,
         name: &str,
     ) -> Result<(), CommandError> {
+        if self.shutting_down {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "shutdown in progress".to_string(),
+            });
+        }
         let realloc_result = if let Some(rs) = self.services.get_mut(name) {
             if let Some(ref mut proxy) = rs.proxy {
                 Some(proxy.reallocate_ephemeral_ports().await)
@@ -361,6 +391,12 @@ impl Runner {
         done_tx: mpsc::Sender<ItemDone>,
         mode: ServiceStartMode,
     ) -> Result<(), CommandError> {
+        if self.shutting_down {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "shutdown in progress".to_string(),
+            });
+        }
         let context = self.service_start_snapshot(name)?;
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "starting...");
@@ -510,12 +546,17 @@ impl Runner {
         let cmd_tx = self.internal_tx.clone();
         let name_owned = name.to_string();
         let shutdown_rx = self.shutdown_flag_tx.subscribe();
+        let debug = service::StopDebug::new(
+            name_owned.clone(),
+            self.output_manager.clone_lifecycle_emitter(),
+        );
         let worker = tokio::spawn(async move {
             let result = service::stop_service_interruptibly(
                 handle,
                 shutdown_config.as_ref(),
                 wait_full_exit,
                 shutdown_rx,
+                Some(debug),
             )
             .await
             .map_err(|e| e.to_string());

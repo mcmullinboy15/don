@@ -84,6 +84,13 @@ impl Runner {
     }
 
     fn handle_task_done(&mut self, item: &ItemDone) {
+        if self
+            .tasks
+            .get(&item.name)
+            .is_some_and(|rt| rt.config.terminal.is_foreground())
+        {
+            self.output_manager.resume_visible_output();
+        }
         if let Some(task_generation) = item.task_run_generation
             && self
                 .tasks
@@ -150,6 +157,14 @@ impl Runner {
     ) {
         if self.tasks.get(name).is_none_or(|rt| rt.pgid != Some(pgid)) {
             return;
+        }
+
+        if self
+            .tasks
+            .get(name)
+            .is_some_and(|rt| rt.config.terminal.is_foreground())
+        {
+            self.output_manager.resume_visible_output();
         }
 
         if let Some(rt) = self.tasks.get_mut(name) {

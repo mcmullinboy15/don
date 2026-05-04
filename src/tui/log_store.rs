@@ -26,6 +26,7 @@ pub(crate) struct LogStore {
 
 /// One stored log line plus its monotonically increasing sequence id.
 pub(crate) struct StoredLogLine {
+    #[allow(dead_code)] // retained for future filtering/replay needs.
     pub(crate) id: u64,
     pub(crate) line: FormattedLogLine,
 }
@@ -63,6 +64,7 @@ impl LogStore {
     }
 
     /// Id of the most recently stored line, if any.
+    #[cfg(test)]
     pub(crate) fn latest_id(&self) -> Option<u64> {
         self.next_id.checked_sub(1)
     }
@@ -82,6 +84,7 @@ mod tests {
     fn line(name: &str, body: &str) -> FormattedLogLine {
         FormattedLogLine {
             name: name.to_string(),
+            is_lifecycle: false,
             bytes: body.as_bytes().to_vec(),
         }
     }

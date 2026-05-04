@@ -46,13 +46,19 @@ impl Runner {
         // the runner can reap the child and transition state).
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         let (crash_exit_tx, crash_exit_rx) = tokio::sync::oneshot::channel();
-        if let Some(svc_writer) = self.output_manager.service_writer(name) {
-            let child_output = start_result.child_output;
+        let child_output = start_result.child_output;
+        let output_worker = self.output_manager.service_writer(name).map(|svc_writer| {
             tokio::spawn(async move {
                 let _ = svc_writer.process_stream(child_output).await;
                 let _ = exit_tx.send(());
                 let _ = crash_exit_tx.send(());
-            });
+            })
+        });
+        if let Some(rs) = self.services.get_mut(name) {
+            if let Some(old_worker) = rs.output_worker.take() {
+                old_worker.abort();
+            }
+            rs.output_worker = output_worker;
         }
 
         // Crash watcher — fires `ServiceExited` to the runner when the

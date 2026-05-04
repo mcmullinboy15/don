@@ -150,6 +150,31 @@ log = "ignore"
 | `watch` | list of globs | File patterns — task only re-runs if these changed since last success. Empty = always runs |
 | `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
+| `terminal` | string or table | `"muxed"` (default) routes through Don output; `"foreground"` gives the task exclusive terminal ownership |
+
+Foreground terminal tasks are for interactive commands that need stdin and an
+unprefixed terminal, such as REPLs, editors, interactive migrations, or test
+watchers:
+
+```toml
+[tasks.console]
+cmd = "rails"
+args = ["console"]
+terminal = "foreground"
+```
+
+`terminal = "foreground"` enters the terminal alternate screen by default.
+Use a table to choose the main screen explicitly:
+
+```toml
+terminal = { mode = "foreground", screen = "main" }
+```
+
+During startup, a foreground task is exclusive. When it becomes ready, Don
+does not start other newly-ready services/tasks until that task exits. Already
+running dependencies continue to run, and their output is still captured in
+ring buffers and log files while visible Don output is paused. Watch-triggered
+foreground tasks may also steal the terminal during development.
 
 #### Task State Tracking
 

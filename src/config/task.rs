@@ -62,6 +62,90 @@ impl<'de> Deserialize<'de> for TaskAutoRun {
     }
 }
 
+/// How a task is connected to the user's terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskTerminal {
+    /// Whether the task uses Don's log multiplexer or takes over the terminal.
+    pub mode: TaskTerminalMode,
+    /// Which terminal screen a foreground task should use.
+    pub screen: TaskTerminalScreen,
+}
+
+impl Default for TaskTerminal {
+    fn default() -> Self {
+        Self {
+            mode: TaskTerminalMode::Muxed,
+            screen: TaskTerminalScreen::Main,
+        }
+    }
+}
+
+impl TaskTerminal {
+    /// Returns true when this task takes exclusive ownership of the terminal.
+    pub fn is_foreground(self) -> bool {
+        matches!(self.mode, TaskTerminalMode::Foreground)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskTerminal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawTaskTerminal {
+            String(String),
+            Table(TaskTerminalTable),
+        }
+
+        match RawTaskTerminal::deserialize(deserializer)? {
+            RawTaskTerminal::String(value) => match value.as_str() {
+                "muxed" => Ok(Self::default()),
+                "foreground" => Ok(Self {
+                    mode: TaskTerminalMode::Foreground,
+                    screen: TaskTerminalScreen::Alternate,
+                }),
+                _ => Err(serde::de::Error::custom(format!(
+                    "unknown terminal value '{value}', expected \"muxed\" or \"foreground\""
+                ))),
+            },
+            RawTaskTerminal::Table(table) => Ok(Self {
+                mode: table.mode,
+                screen: table.screen.unwrap_or(match table.mode {
+                    TaskTerminalMode::Muxed => TaskTerminalScreen::Main,
+                    TaskTerminalMode::Foreground => TaskTerminalScreen::Alternate,
+                }),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct TaskTerminalTable {
+    mode: TaskTerminalMode,
+    #[serde(default)]
+    screen: Option<TaskTerminalScreen>,
+}
+
+/// Task terminal ownership mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskTerminalMode {
+    /// Route output through Don's prefixed log multiplexer.
+    Muxed,
+    /// Run the task alone with stdin/stdout/stderr attached to the user's terminal.
+    Foreground,
+}
+
+/// Screen used while a foreground task owns the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskTerminalScreen {
+    /// Use the current terminal screen.
+    Main,
+    /// Enter the terminal alternate screen for the task, then restore the main screen.
+    Alternate,
+}
+
 /// A one-shot task that runs to completion.
 ///
 /// Tasks can depend on services (waits for ready) and other tasks.
@@ -93,6 +177,13 @@ pub struct Task {
     /// Where to send stdout/stderr. Defaults to stdout.
     #[serde(default)]
     pub log: LogConfig,
+    /// How the task is connected to the terminal.
+    ///
+    /// Defaults to `muxed`, which routes output through Don's prefixed log
+    /// pipeline. `foreground` gives the task exclusive terminal ownership
+    /// while it runs.
+    #[serde(default)]
+    pub terminal: TaskTerminal,
     /// Whether the task runs automatically.
     ///
     /// Supported values:
@@ -154,5 +245,44 @@ impl Task {
             None => PathBuf::from(&self.cmd),
         };
         Ok(executable)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_defaults_to_muxed() {
+        let task: Task = toml::from_str(r#"cmd = "true""#).unwrap();
+        assert_eq!(task.terminal.mode, TaskTerminalMode::Muxed);
+        assert_eq!(task.terminal.screen, TaskTerminalScreen::Main);
+    }
+
+    #[test]
+    fn terminal_foreground_string_uses_alternate_screen() {
+        let task: Task = toml::from_str(
+            r#"
+            cmd = "vim"
+            terminal = "foreground"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(task.terminal.mode, TaskTerminalMode::Foreground);
+        assert_eq!(task.terminal.screen, TaskTerminalScreen::Alternate);
+    }
+
+    #[test]
+    fn terminal_foreground_table_can_use_main_screen() {
+        let task: Task = toml::from_str(
+            r#"
+            cmd = "vim"
+            terminal = { mode = "foreground", screen = "main" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(task.terminal.mode, TaskTerminalMode::Foreground);
+        assert_eq!(task.terminal.screen, TaskTerminalScreen::Main);
     }
 }

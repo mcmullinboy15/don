@@ -34,6 +34,9 @@ impl Runner {
         let name_owned = name.to_string();
         let task_cfg_for_worker = task_cfg.clone();
         let global_watch_ignore = self.config.watch_ignore.clone();
+        if task_cfg.terminal.is_foreground() {
+            self.output_manager.pause_visible_output();
+        }
         let worker = tokio::spawn(async move {
             let ctx = TaskWorkerContext {
                 base_dir,
@@ -65,27 +68,68 @@ impl Runner {
         intent: TaskRunIntent,
         result: Result<TaskRunPrepared, String>,
     ) {
+        if self.shutting_down {
+            self.stop_late_task_start(name.to_string(), result).await;
+            if task_cfg.terminal.is_foreground() {
+                self.output_manager.resume_visible_output();
+            }
+            return;
+        }
         let is_current = self
             .tasks
             .get(name)
             .is_some_and(|rt| rt.run_generation == op_id);
         if !is_current {
-            if let Ok(TaskRunPrepared::Spawned(spawn)) = result {
-                let task::TaskSpawn {
-                    handle,
-                    child_output,
-                    rendered_cmdline: _rendered_cmdline,
-                } = *spawn;
-                drop(child_output);
-                tokio::spawn(async move {
-                    let mut handle = handle;
-                    let _ = handle
-                        .terminate(
-                            nix::sys::signal::Signal::SIGKILL,
-                            std::time::Duration::from_millis(500),
-                        )
-                        .await;
-                });
+            match result {
+                Ok(TaskRunPrepared::Spawned(spawn)) => {
+                    let task::TaskSpawn {
+                        handle,
+                        child_output,
+                        rendered_cmdline: _rendered_cmdline,
+                    } = *spawn;
+                    drop(child_output);
+                    self.output_manager.service_event(
+                        name,
+                        &format!("send SIGKILL to stale task pgid {}", handle.pgid()),
+                    );
+                    tokio::spawn(async move {
+                        let mut handle = handle;
+                        let _ = handle
+                            .terminate(
+                                nix::sys::signal::Signal::SIGKILL,
+                                std::time::Duration::from_millis(500),
+                            )
+                            .await;
+                    });
+                }
+                Ok(TaskRunPrepared::ForegroundSpawned(spawn)) => {
+                    let task::ForegroundTaskSpawn {
+                        handle,
+                        rendered_cmdline: _rendered_cmdline,
+                    } = *spawn;
+                    self.output_manager.service_event(
+                        name,
+                        &format!(
+                            "send SIGKILL to stale foreground task pgid {}",
+                            handle.pgid()
+                        ),
+                    );
+                    tokio::spawn(async move {
+                        let mut handle = handle;
+                        let _ = handle
+                            .terminate(
+                                nix::sys::signal::Signal::SIGKILL,
+                                std::time::Duration::from_millis(500),
+                            )
+                            .await;
+                    });
+                }
+                Ok(TaskRunPrepared::PendingRun { .. })
+                | Ok(TaskRunPrepared::Skipped { .. })
+                | Err(_) => {}
+            }
+            if task_cfg.terminal.is_foreground() {
+                self.output_manager.resume_visible_output();
             }
             return;
         }
@@ -95,6 +139,9 @@ impl Runner {
 
         match result {
             Ok(TaskRunPrepared::PendingRun { message }) => {
+                if task_cfg.terminal.is_foreground() {
+                    self.output_manager.resume_visible_output();
+                }
                 if let Some(rt) = self.tasks.get_mut(name) {
                     rt.set_needs_run_now(true);
                 }
@@ -114,6 +161,9 @@ impl Runner {
                 }
             }
             Ok(TaskRunPrepared::Skipped { message }) => {
+                if task_cfg.terminal.is_foreground() {
+                    self.output_manager.resume_visible_output();
+                }
                 if let Some(rt) = self.tasks.get_mut(name) {
                     rt.set_needs_run_now(false);
                 }
@@ -155,7 +205,26 @@ impl Runner {
                 self.wire_task_output_and_wait(name, *spawn, task_cfg, done_tx)
                     .await;
             }
+            Ok(TaskRunPrepared::ForegroundSpawned(spawn)) => {
+                if matches!(intent, TaskRunIntent::Startup { .. })
+                    && let Some(rt) = self.tasks.get_mut(name)
+                {
+                    rt.set_needs_run_now(true);
+                }
+                let done_tx = match intent {
+                    TaskRunIntent::Startup { done_tx } => {
+                        self.set_task_state(name, TaskItemState::Running);
+                        Some(done_tx)
+                    }
+                    TaskRunIntent::Background => None,
+                };
+                self.wire_foreground_task_and_wait(name, *spawn, task_cfg, done_tx)
+                    .await;
+            }
             Err(message) => {
+                if task_cfg.terminal.is_foreground() {
+                    self.output_manager.resume_visible_output();
+                }
                 if matches!(intent, TaskRunIntent::Startup { .. })
                     && let Some(rt) = self.tasks.get_mut(name)
                 {
@@ -223,10 +292,16 @@ impl Runner {
         // Fulfill any pending attach waiter for this task.
         self.fulfill_pending_waiter(name).await;
 
-        if let Some(svc_writer) = self.output_manager.service_writer(name) {
+        let output_worker = self.output_manager.service_writer(name).map(|svc_writer| {
             tokio::spawn(async move {
                 let _ = svc_writer.process_stream(child_output).await;
-            });
+            })
+        });
+        if let Some(rt) = self.tasks.get_mut(name) {
+            if let Some(old_worker) = rt.output_worker.take() {
+                old_worker.abort();
+            }
+            rt.output_worker = output_worker;
         }
 
         let name_owned = name.to_string();
@@ -296,6 +371,93 @@ impl Runner {
         });
     }
 
+    async fn wire_foreground_task_and_wait(
+        &mut self,
+        name: &str,
+        spawn: task::ForegroundTaskSpawn,
+        task_cfg: &crate::config::Task,
+        done_tx: Option<mpsc::Sender<ItemDone>>,
+    ) {
+        let task::ForegroundTaskSpawn {
+            mut handle,
+            rendered_cmdline: _rendered_cmdline,
+        } = spawn;
+
+        let pgid = handle.pgid();
+        if let Some(rt) = self.tasks.get_mut(name) {
+            rt.pgid = Some(pgid);
+        }
+
+        let name_owned = name.to_string();
+        let task_cfg_clone = task_cfg.clone();
+        let base_dir_owned = self.base_dir.clone();
+        let global_watch_ignore = self.config.watch_ignore.clone();
+        let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
+        let cmd_tx = self.internal_tx.clone();
+        let rerun = done_tx.is_none();
+
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result =
+                task::wait_for_foreground_task(&mut handle, task_cfg_clone.timeout.as_deref())
+                    .await;
+            let elapsed = start.elapsed();
+            drop(handle);
+
+            let (success, message) = match result {
+                Ok(status) => {
+                    if status.success() {
+                        let task_dir =
+                            working_dir_for(&base_dir_owned, task_cfg_clone.dir.as_deref());
+                        let ignore_patterns = resolve_watch_ignore_patterns(
+                            &task_dir,
+                            &task_cfg_clone.ignore,
+                            &base_dir_owned,
+                            &global_watch_ignore,
+                        );
+                        let _ = task_state
+                            .record_success(
+                                &name_owned,
+                                &task_cfg_clone.watch,
+                                &ignore_patterns,
+                                Some(&task_dir),
+                            )
+                            .await;
+                        (true, None)
+                    } else {
+                        let code = status.code().unwrap_or(-1);
+                        (false, Some(format!("exit code {code}")))
+                    }
+                }
+                Err(e) => (false, Some(e.to_string())),
+            };
+
+            if let Some(done_tx) = done_tx {
+                let _ = done_tx
+                    .send(ItemDone {
+                        name: name_owned,
+                        kind: NodeKind::Task,
+                        success,
+                        message,
+                        elapsed: Some(elapsed),
+                        task_run_generation: None,
+                    })
+                    .await;
+            } else {
+                let _ = cmd_tx
+                    .send(RunnerInternalCommand::TaskExited {
+                        name: name_owned,
+                        pgid,
+                        success,
+                        message,
+                        elapsed: Some(elapsed),
+                        rerun,
+                    })
+                    .await;
+            }
+        });
+    }
+
     async fn stop_task_pgid(&mut self, name: &str, pgid: i32) -> CommandResult {
         if self.remove_attach_lock(name) {
             self.output_manager.resume_stdout_sink(name).await;
@@ -306,6 +468,8 @@ impl Runner {
 
         self.output_manager
             .service_event(name, "stopping... (requested)");
+        self.output_manager
+            .service_event(name, &format!("send SIGKILL to task pgid {pgid}"));
 
         match nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(pgid),
@@ -458,6 +622,17 @@ impl Runner {
         params: &HashMap<String, String>,
         start_message: &str,
     ) {
+        if task_cfg.terminal.is_foreground() && self.is_another_foreground_task_running(name) {
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.last_params = params.clone();
+                rt.set_needs_run_now(true);
+            }
+            self.set_task_state(name, TaskItemState::PendingRun);
+            self.output_manager
+                .service_event(name, "pending — another foreground task owns the terminal");
+            return;
+        }
+
         if let Some(rt) = self.tasks.get_mut(name) {
             rt.last_params = params.clone();
             rt.set_needs_run_now(true);
@@ -491,6 +666,14 @@ impl Runner {
                 success: false,
             });
         }
+    }
+
+    fn is_another_foreground_task_running(&self, name: &str) -> bool {
+        self.tasks.iter().any(|(task_name, rt)| {
+            task_name != name
+                && rt.config.terminal.is_foreground()
+                && rt.state() == TaskItemState::Running
+        })
     }
 
     /// Run all tasks currently in PendingRun state.

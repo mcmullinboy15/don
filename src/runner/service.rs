@@ -6,8 +6,9 @@
 use crate::config::service::{GoConfig, RustConfig, ServiceKind};
 use crate::config::{Platform, ReadyCheck, ResolvedService, ShutdownConfig};
 use crate::duration::parse_duration;
+use crate::output::LifecycleEmitter;
 use crate::process::env::merge_env;
-use crate::process::{ProcessHandle, SpawnConfig, spawn_process};
+use crate::process::{ProcessHandle, SpawnConfig, signal_name, spawn_process};
 use nix::sys::signal::Signal;
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -28,6 +29,35 @@ pub enum ServiceHandle {
 pub(crate) struct StartResult {
     pub handle: ServiceHandle,
     pub child_output: crate::process::ChildOutput,
+}
+
+#[derive(Clone)]
+pub(crate) struct StopDebug {
+    service: String,
+    emitter: LifecycleEmitter,
+}
+
+impl StopDebug {
+    pub(crate) fn new(service: impl Into<String>, emitter: LifecycleEmitter) -> Self {
+        Self {
+            service: service.into(),
+            emitter,
+        }
+    }
+
+    fn signal(&self, sig: Signal, pgid: i32) {
+        self.emitter.service_event(
+            &self.service,
+            &format!("send {} to pgid {pgid}", signal_name(sig)),
+        );
+    }
+
+    fn docker_stop(&self, signal: &str, timeout: Duration) {
+        self.emitter.service_event(
+            &self.service,
+            &format!("docker stop signal={signal} timeout={timeout:?}"),
+        );
+    }
 }
 
 /// Errors from service operations.
@@ -362,6 +392,7 @@ pub(crate) async fn stop_service(
     shutdown_config: Option<&ShutdownConfig>,
     force: bool,
     wait_full_exit: bool,
+    debug: Option<StopDebug>,
 ) -> Result<(), ServiceError> {
     match handle {
         ServiceHandle::Process(ref mut process) => {
@@ -377,19 +408,28 @@ pub(crate) async fn stop_service(
                         .unwrap_or(Duration::from_secs(10)),
                 )
             };
-            process.terminate(signal, timeout).await?;
             if wait_full_exit {
-                // `terminate` only reaps the parent. For services that
-                // fork children (daemons, DBs with background workers),
-                // the children stay in the same pgroup and may still
-                // hold exclusive resources — e.g. a fixed backend port,
-                // a data-dir lock. Poll until the pgroup is empty so a
-                // restart won't collide with a half-dead old instance.
-                // If 2s isn't enough, SIGKILL the stragglers.
-                if !process.wait_pgroup_empty(Duration::from_secs(2)).await {
-                    let _ = process.signal(Signal::SIGKILL);
-                    let _ = process.wait_pgroup_empty(Duration::from_millis(500)).await;
-                }
+                let debug = debug.clone();
+                process
+                    .terminate_process_group_with_signal_callback(
+                        signal,
+                        timeout,
+                        move |sig, pgid| {
+                            if let Some(debug) = debug.as_ref() {
+                                debug.signal(sig, pgid);
+                            }
+                        },
+                    )
+                    .await?;
+            } else {
+                let debug = debug.clone();
+                process
+                    .terminate_with_signal_callback(signal, timeout, move |sig, pgid| {
+                        if let Some(debug) = debug.as_ref() {
+                            debug.signal(sig, pgid);
+                        }
+                    })
+                    .await?;
             }
         }
         ServiceHandle::Docker(ref mut docker) => {
@@ -405,6 +445,9 @@ pub(crate) async fn stop_service(
                         .unwrap_or(Duration::from_secs(10)),
                 )
             };
+            if let Some(debug) = debug.as_ref() {
+                debug.docker_stop(signal_name, timeout);
+            }
             docker
                 .stop(signal_name, timeout)
                 .await
@@ -432,6 +475,7 @@ pub(crate) async fn stop_service_interruptibly(
     shutdown_config: Option<&ShutdownConfig>,
     wait_full_exit: bool,
     mut shutdown_rx: watch::Receiver<bool>,
+    debug: Option<StopDebug>,
 ) -> Result<(), ServiceError> {
     match handle {
         ServiceHandle::Process(ref mut process) => {
@@ -442,6 +486,9 @@ pub(crate) async fn stop_service_interruptibly(
                 .and_then(|c| parse_duration(&c.timeout).ok())
                 .unwrap_or(Duration::from_secs(10));
 
+            if let Some(debug) = debug.as_ref() {
+                debug.signal(signal, process.pgid());
+            }
             if let Err(e) = process.signal(signal)
                 && !matches!(
                     e,
@@ -470,6 +517,9 @@ pub(crate) async fn stop_service_interruptibly(
             };
 
             if shutdown_requested {
+                if let Some(debug) = debug.as_ref() {
+                    debug.signal(Signal::SIGKILL, process.pgid());
+                }
                 if let Err(e) = process.signal(Signal::SIGKILL)
                     && !matches!(
                         e,
@@ -489,6 +539,9 @@ pub(crate) async fn stop_service_interruptibly(
             }
 
             if wait_full_exit && !process.wait_pgroup_empty(Duration::from_secs(2)).await {
+                if let Some(debug) = debug.as_ref() {
+                    debug.signal(Signal::SIGKILL, process.pgid());
+                }
                 let _ = process.signal(Signal::SIGKILL);
                 let _ = process.wait_pgroup_empty(Duration::from_millis(500)).await;
             }
@@ -501,6 +554,9 @@ pub(crate) async fn stop_service_interruptibly(
                 .and_then(|c| parse_duration(&c.timeout).ok())
                 .unwrap_or(Duration::from_secs(10));
 
+            if let Some(debug) = debug.as_ref() {
+                debug.docker_stop(signal_name, timeout);
+            }
             let shutdown_requested = {
                 let stop_fut = docker.stop(signal_name, timeout);
                 let shutdown_fut = wait_for_shutdown_flag(&mut shutdown_rx);

@@ -147,7 +147,7 @@ impl Drop for Modal {
 /// two-Ctrl+C force-kill escalation).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
-    mut log_rx: mpsc::Receiver<FormattedLogLine>,
+    mut log_rx: mpsc::UnboundedReceiver<FormattedLogLine>,
     mut runner_events: broadcast::Receiver<RunnerEvent>,
     command_tx: mpsc::Sender<RunnerCommand>,
     verbosity: VerbosityControl,
@@ -199,27 +199,72 @@ pub async fn run_tui(
     // subsequent writes to land.
     terminal.draw(|f| render::draw_bar(f, &app))?;
 
+    // Cached terminal width — refreshed at the start of each log batch.
+    // Avoids a syscall per rendered log line, which becomes a real
+    // bottleneck under noisy services (one syscall × thousands of lines/sec
+    // stalls the TUI loop long enough that runner_events / shutdown
+    // signaling can't keep up). Initialized lazily; the first log batch
+    // refreshes it before the first `insert_line` call.
+    #[allow(unused_assignments)]
+    let mut cached_width: u16 = 80;
+
+    // Cap on log lines drained per `tokio::select!` round. Picked so that:
+    //  - large bursts (kafka spam, build output) still drain in a few rounds
+    //  - the runner_events / input arms still get a turn often enough that
+    //    state transitions (Stopping/Stopped) and Ctrl+C remain snappy.
+    const LOG_BATCH_LIMIT: usize = 64;
+
     loop {
         tokio::select! {
             maybe_line = log_rx.recv() => {
                 match maybe_line {
-                    Some(line) => {
-                        if is_shutdown_start_line(&line) {
-                            enter_shutdown_mode(&mut app, &mut terminal, &store, &mut modal)?;
+                    Some(first) => {
+                        // Refresh the cached terminal width once per batch.
+                        // Per-line `terminal.size()` was a bottleneck under
+                        // log spam — one syscall × thousands of lines/sec
+                        // stalls the loop long enough that runner_events
+                        // (state changes, shutdown signaling) can't keep up.
+                        cached_width = terminal.size()?.width.max(1);
+
+                        // Drain up to LOG_BATCH_LIMIT lines without yielding
+                        // back to select. Each `insert_before` is a stdout
+                        // write; batching lets us amortize the bar redraw
+                        // (the *expensive* part — full back-buffer rebuild)
+                        // across many lines instead of one redraw per line.
+                        let mut batch: Vec<FormattedLogLine> = Vec::with_capacity(LOG_BATCH_LIMIT);
+                        batch.push(first);
+                        while batch.len() < LOG_BATCH_LIMIT {
+                            match log_rx.try_recv() {
+                                Ok(line) => batch.push(line),
+                                Err(_) => break,
+                            }
                         }
-                        let line_id = store.latest_id().map_or(0, |id| id.saturating_add(1));
-                        // Skip inline writes while a modal owns stdout —
-                        // they'd go to the alt screen. `LogStore` still
-                        // captures the line, and `clear_and_replay` on
-                        // modal exit brings the inline view up to date.
-                        if modal.is_none() && app.should_render_log(&line.name, line_id) {
-                            let width = terminal.size()?.width.max(1);
-                            insert_line(&mut terminal, &line, width)?;
-                            // `insert_before` resets ratatui's back buffer;
-                            // redraw or the bar stays blank until next event.
+
+                        let mut bar_dirty = false;
+                        for line in batch {
+                            if is_shutdown_start_line(&line) && !app.shutdown_started {
+                                // Inline begin_shutdown so we don't trigger
+                                // the per-call draw inside enter_shutdown_mode
+                                // — we'll do one batched redraw at the end.
+                                app.begin_shutdown();
+                                modal = None;
+                                bar_dirty = true;
+                            }
+                            // Skip inline writes while a modal owns stdout —
+                            // they'd go to the alt screen. `LogStore` still
+                            // captures the line, and `clear_and_replay` on
+                            // modal exit brings the inline view up to date.
+                            if modal.is_none() && app.should_render_log(&line.name, line.is_lifecycle) {
+                                insert_line(&mut terminal, &line, cached_width)?;
+                                // `insert_before` resets ratatui's back buffer;
+                                // mark the bar dirty for one redraw at batch end.
+                                bar_dirty = true;
+                            }
+                            let _ = store.push(line);
+                        }
+                        if bar_dirty {
                             draw_inline_bar(&mut terminal, &app)?;
                         }
-                        let _ = store.push(line);
                     }
                     None => break, // runner closed the log channel — shut down
                 }
@@ -227,7 +272,7 @@ pub async fn run_tui(
             runner_result = runner_events.recv() => {
                 match runner_result {
                     Ok(RunnerEvent::ShutdownStarted) => {
-                        enter_shutdown_mode(&mut app, &mut terminal, &store, &mut modal)?;
+                        enter_shutdown_mode(&mut app, &mut terminal, &mut modal)?;
                     }
                     Ok(event) => {
                         apply_runner_event(event, &mut app);
@@ -350,13 +395,12 @@ fn is_shutdown_start_line(line: &FormattedLogLine) -> bool {
 fn enter_shutdown_mode(
     app: &mut App,
     terminal: &mut TuiTerminal,
-    store: &LogStore,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     if app.shutdown_started {
         return Ok(());
     }
-    app.begin_shutdown(store.latest_id());
+    app.begin_shutdown();
     *modal = None;
     draw_inline_bar(terminal, app)?;
     Ok(())
@@ -418,7 +462,7 @@ fn clear_and_replay(
     execute!(std::io::stdout(), Clear(ClearType::Purge))?;
     let width = terminal.size()?.width.max(1);
     for entry in store.iter() {
-        if app.should_render_log(&entry.line.name, entry.id) {
+        if app.should_render_log(&entry.line.name, entry.line.is_lifecycle) {
             insert_line(terminal, &entry.line, width)?;
         }
     }
@@ -446,6 +490,10 @@ fn handle_app_event(
                 // handles cursor-parking and autoresize internally.
                 clear_and_replay(terminal, store, app)?;
             }
+            // Caller-side state (cached_width in run_tui) is refreshed on the
+            // next iteration via terminal.size() — handle_app_event doesn't
+            // own that cache. The autoresize path inside ratatui has already
+            // adopted the new size by this point.
         }
         AppEvent::Key(key) => handle_key(key, app, terminal, store, command_tx, controls, modal)?,
         AppEvent::CompletionsReady {
@@ -487,6 +535,7 @@ fn handle_key(
                     nix::unistd::Pid::this(),
                     nix::sys::signal::Signal::SIGINT,
                 );
+                enter_shutdown_mode(app, terminal, modal)?;
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 let enabled = controls.verbosity.toggle();
@@ -545,6 +594,7 @@ fn handle_normal_key(
             draw_inline_bar(terminal, app)?;
             let _ = store.push(FormattedLogLine {
                 name: String::new(),
+                is_lifecycle: false,
                 bytes: Vec::new(),
             });
         }

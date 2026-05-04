@@ -59,7 +59,7 @@ impl Runner {
         // Items still in `Building` (batch build in flight) stay in `pending`
         // — they get picked up after `BatchBuildComplete` transitions them
         // back to `Pending` and `start_ready_items` is re-run.
-        let ready: Vec<String> = order
+        let mut ready: Vec<String> = order
             .iter()
             .filter(|name| pending.contains(name.as_str()))
             .filter(|name| !self.is_item_building(name))
@@ -69,6 +69,17 @@ impl Runner {
             })
             .cloned()
             .collect();
+
+        // Foreground terminal tasks are exclusive: once one is ready, it
+        // owns the terminal and no other newly-ready item should start in
+        // the same scheduler sweep. Already-running dependencies continue.
+        if let Some(foreground_name) = ready.iter().find(|name| {
+            self.tasks
+                .get(name.as_str())
+                .is_some_and(|rt| rt.config.terminal.is_foreground())
+        }) {
+            ready = vec![foreground_name.clone()];
+        }
 
         for name in ready {
             if shutdown_requested() {
@@ -171,7 +182,16 @@ impl Runner {
             if let Some(rs) = self.services.get_mut(&name) {
                 rs.bazel_binary_path = Some(path_str.clone());
                 if let Some(svc) = self.config.services.get(&name) {
-                    rs.resolved = svc.resolve_with_bazel_binary(self.platform, &path_str);
+                    let mut resolved = svc.resolve_with_bazel_binary(self.platform, &path_str);
+                    // Re-expand `depends_on` against the config's service
+                    // groups. `resolve_with_bazel_binary` walks back to the
+                    // raw user-supplied list (group refs and all) — without
+                    // this, a bazel service that lists a group as a dep
+                    // ends up with an unexpanded `["mongo-search-deps"]` in
+                    // its runtime state, and shutdown's `topological_sort`
+                    // bails because the group name isn't a real node.
+                    resolved.depends_on = self.config.expand_dependency_refs(&resolved.depends_on);
+                    rs.resolved = resolved;
                 }
             }
         }

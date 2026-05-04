@@ -77,6 +77,9 @@ When stdout is a TTY, `don start` runs a ratatui-driven interface: logs stream i
 | `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
 
 Pipe mode (non-TTY) writes prefixed lines directly to stdout unchanged.
+Configs with active foreground terminal tasks also use plain prefixed output
+instead of the TUI so those tasks can own stdin without competing with Don's
+keyboard handler.
 
 ### Services
 
@@ -134,6 +137,32 @@ one successful run, then require manual triggers forever after:
 cmd = "./scripts/bootstrap-db"
 auto_run = "once"
 depends_on = ["postgres"]
+```
+
+Some tasks need the real terminal: REPLs, editors, interactive migrations, test
+watchers, or anything that expects stdin and unprefixed output. Mark those as
+foreground terminal tasks:
+
+```toml
+[tasks.console]
+cmd = "rails"
+args = ["console"]
+depends_on = ["postgres"]
+terminal = "foreground"
+```
+
+Foreground tasks run as part of normal startup and file-watch re-runs. When one
+becomes ready, Don pauses visible Don output, gives the task stdin/stdout/stderr,
+and waits for it to exit before starting other newly-ready services or tasks.
+Already-running dependencies keep running, and their output is still captured in
+ring buffers and log files.
+
+`terminal = "foreground"` uses the alternate screen by default, giving the task a
+clean full-screen workspace that disappears when it exits. Use the main screen
+when you want the task's output to remain in normal scrollback:
+
+```toml
+terminal = { mode = "foreground", screen = "main" }
 ```
 
 Tasks can also declare parameters. Parametrized tasks are interactive: values are supplied at run time via `don run <task> --<name>=<value>` or the TUI form, then substituted into `cmd`, `args`, `env`, and `dir` via `{{name}}` placeholders.
@@ -482,6 +511,9 @@ See [`examples/`](examples/) for complete working configs.
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
 | `reload` | bool | Whether file-watch events restart the service (default: true) |
 | `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
+| `terminal` | string or table | (tasks) `"muxed"` default, or `"foreground"` for exclusive stdin/stdout/stderr ownership |
+| `terminal.mode` | string | (tasks) `"muxed"` or `"foreground"` |
+| `terminal.screen` | string | (tasks) `"alternate"` default for foreground, or `"main"` to keep output in scrollback |
 | `params` | [[table]] | (tasks) Declare run-time parameters for interactive tasks |
 | `params.name` | string | Parameter name, referenced as `{{name}}` and passed as `--name=value` |
 | `params.prompt` | string | Optional prompt shown in the TUI form |

@@ -156,11 +156,9 @@ pub(crate) struct App {
     pub(crate) view_mode: ViewMode,
     pub(crate) verbose_enabled: bool,
     /// Graceful shutdown is in progress: the inline bar becomes
-    /// non-interactive and new log lines from every service are shown.
+    /// non-interactive and `[don]`-prefixed lifecycle events bypass the
+    /// committed filter (raw service stdout still respects it).
     pub(crate) shutdown_started: bool,
-    /// Last stored log id when shutdown started. Older lines still obey the
-    /// committed filter; newer ones bypass it.
-    pub(crate) shutdown_log_cutoff: Option<u64>,
     pub(crate) filter: FilterState,
     pub(crate) palette: ActionPalette,
     /// Monotonically incrementing frame counter, driven by the TUI's timer
@@ -230,7 +228,6 @@ impl App {
             view_mode: ViewMode::Normal,
             verbose_enabled,
             shutdown_started: false,
-            shutdown_log_cutoff: None,
             filter: FilterState::new(all_filter_names, &hidden_names),
             palette: ActionPalette::default(),
             spinner_frame: 0,
@@ -244,9 +241,8 @@ impl App {
         }
     }
 
-    pub(crate) fn begin_shutdown(&mut self, cutoff: Option<u64>) {
+    pub(crate) fn begin_shutdown(&mut self) {
         self.shutdown_started = true;
-        self.shutdown_log_cutoff = cutoff;
         self.view_mode = ViewMode::Normal;
         self.palette.close();
         self.overlay_query.clear();
@@ -258,14 +254,17 @@ impl App {
         self.verbose_enabled = verbose_enabled;
     }
 
-    pub(crate) fn should_render_log(&self, name: &str, id: u64) -> bool {
-        if !self.shutdown_started {
-            return self.filter.passes(name);
+    pub(crate) fn should_render_log(&self, name: &str, _is_lifecycle: bool) -> bool {
+        // During shutdown, every line bypasses the filter — the user wants
+        // to see what's happening as each service tears down, including
+        // service stdout from previously-hidden services (kafka, mongo, …).
+        // The TUI render loop batches inserts and amortizes the bar redraw,
+        // so a noisy service can't grind shutdown to a halt the way it
+        // could before batching landed.
+        if self.shutdown_started {
+            return true;
         }
-        match self.shutdown_log_cutoff {
-            Some(cutoff) => id > cutoff || self.filter.passes(name),
-            None => true,
-        }
+        self.filter.passes(name)
     }
 
     /// Sorted rows for the status overlay: errors → running → exited → lazy,
@@ -475,8 +474,11 @@ mod tests {
         assert_eq!(app.counts.services_ready, 1);
         app.apply_service_state("db".into(), ServiceState::Ready);
         assert_eq!(app.counts.services_ready, 2);
-        app.apply_service_state("api".into(), ServiceState::Failed);
+        app.apply_service_state("db".into(), ServiceState::Stopping);
         assert_eq!(app.counts.services_ready, 1);
+        assert_eq!(app.counts.services_active, 1);
+        app.apply_service_state("api".into(), ServiceState::Failed);
+        assert_eq!(app.counts.services_ready, 0);
         assert_eq!(app.counts.services_failed, 1);
     }
 
@@ -560,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_mode_only_bypasses_filter_for_new_logs() {
+    fn shutdown_mode_bypasses_filter_for_all_logs() {
         let mut app = App::new(
             vec!["api".into(), "worker".into()],
             vec![],
@@ -574,14 +576,22 @@ mod tests {
         app.filter.select_only_highlighted();
         app.filter.commit();
 
-        assert!(app.should_render_log("api", 4));
-        assert!(!app.should_render_log("worker", 4));
+        // Without shutdown: filter passes "api", rejects "worker" — for both
+        // service stdout (is_lifecycle=false) and lifecycle events
+        // (is_lifecycle=true).
+        assert!(app.should_render_log("api", false));
+        assert!(app.should_render_log("api", true));
+        assert!(!app.should_render_log("worker", false));
+        assert!(!app.should_render_log("worker", true));
 
-        app.begin_shutdown(Some(4));
+        app.begin_shutdown();
 
-        assert!(app.should_render_log("api", 4));
-        assert!(!app.should_render_log("worker", 4));
-        assert!(app.should_render_log("worker", 5));
+        // After shutdown: every line passes regardless of filter — the user
+        // wants visibility into everything happening as services tear down.
+        assert!(app.should_render_log("api", false));
+        assert!(app.should_render_log("api", true));
+        assert!(app.should_render_log("worker", false));
+        assert!(app.should_render_log("worker", true));
     }
 
     #[test]
@@ -598,7 +608,7 @@ mod tests {
         app.overlay_query = "api".into();
         app.overlay_filtering = true;
 
-        app.begin_shutdown(None);
+        app.begin_shutdown();
 
         assert!(app.shutdown_started);
         assert_eq!(app.view_mode, ViewMode::Normal);

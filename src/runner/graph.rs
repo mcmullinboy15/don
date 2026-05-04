@@ -11,7 +11,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub(crate) fn topological_sort(
     deps: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<String>, Vec<String>> {
-    // Build in-degree map and reverse adjacency list.
+    // Build in-degree map and reverse adjacency list. Only nodes that are
+    // keys in `deps` are tracked — any reference to a name we don't have a
+    // node for (a still-unexpanded service-group reference, a dep on a
+    // service that was filtered out by the active profile, etc.) is
+    // silently ignored. Without this guard the result-size check below
+    // would treat a stray group ref as a cycle and return an empty order,
+    // which is exactly how shutdown ends up never visiting any service.
+    let known: HashSet<&str> = deps.keys().map(|k| k.as_str()).collect();
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
 
@@ -21,7 +28,9 @@ pub(crate) fn topological_sort(
 
     for (name, node_deps) in deps {
         for dep in node_deps {
-            in_degree.entry(dep.as_str()).or_insert(0);
+            if !known.contains(dep.as_str()) {
+                continue;
+            }
             dependents
                 .entry(dep.as_str())
                 .or_default()

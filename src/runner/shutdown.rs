@@ -1,7 +1,8 @@
 use super::graph::topological_sort;
 use super::service::ServiceHandle;
 use super::signals::force_shutdown_requested;
-use super::{Runner, ServiceState, ServiceStopAction};
+use super::task_worker::TaskRunPrepared;
+use super::{Runner, RunnerInternalCommand, ServiceState, ServiceStopAction};
 use crate::runner::service::stop_service;
 use std::collections::{BTreeMap, HashMap};
 use tokio::task::JoinSet;
@@ -9,6 +10,22 @@ use tokio::task::JoinSet;
 impl Runner {
     /// Initiate graceful shutdown of all services.
     pub(in crate::runner) async fn initiate_shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        // A foreground task pauses the stdout/TUI sink while it owns the
+        // terminal, and normally releases it from `handle_task_exit` /
+        // `handle_task_done`. During shutdown those completion paths can be
+        // skipped — the run_worker may be aborted before it sends
+        // `TaskRunPrepared`, or the foreground task gets SIGKILL'd at the
+        // end of this function and its `TaskExited` arrives after the main
+        // loop has already broken out. If we leave the pause engaged, every
+        // lifecycle event we emit below ("send SIGTERM…", "stopping…",
+        // "shutdown complete") and every service's own shutdown output is
+        // silently dropped by `stdout_sink_task`. Force-clear it up front so
+        // the user actually sees what shutdown is doing.
+        self.output_manager.resume_visible_output();
         let _ = self.event_tx.send(super::RunnerEvent::ShutdownStarted);
         let _ = self.shutdown_flag_tx.send(true);
         self.output_manager
@@ -28,14 +45,12 @@ impl Runner {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
-
         if let Some(guard) = self.rebuild_batch_handle.take()
             && let Some(handle) = guard.into_inner()
         {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
-
         if let Some(guard) = self.graph_requery_handle.take()
             && let Some(handle) = guard.into_inner()
         {
@@ -91,6 +106,8 @@ impl Runner {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
         }
 
+        self.drain_late_worker_results().await;
+
         // Shut down all proxy listeners first (stop accepting new connections).
         for (_, rs) in self.services.iter_mut() {
             if let Some(proxy) = rs.proxy.take() {
@@ -106,7 +123,16 @@ impl Runner {
         // Build reverse dependency order for shutdown.
         // Services at the same depth (no dependency relationship) stop concurrently.
         let dep_map = self.build_dep_map();
-        let order = topological_sort(&dep_map).unwrap_or_default();
+        let order = match topological_sort(&dep_map) {
+            Ok(o) => o,
+            Err(cycle) => {
+                self.output_manager.error_event(&format!(
+                    "shutdown: dependency graph has a cycle ({cycle:?}) — \
+                     stopping live services in arbitrary order"
+                ));
+                self.services.keys().cloned().collect()
+            }
+        };
 
         // Compute depth of each service node for grouping.
         let mut depths: HashMap<String, usize> = HashMap::new();
@@ -126,20 +152,16 @@ impl Runner {
             depths.insert(name.clone(), depth);
         }
 
-        // Group running services by depth, then iterate from highest depth
-        // (most dependent) to lowest (least dependent).
+        // Group live services by depth, then iterate from highest depth
+        // (most dependent) to lowest (least dependent). A service handle is
+        // the source of truth here: states like Unhealthy still have a live
+        // process and must be signalled during shutdown.
         let mut by_depth: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         for name in &order {
-            if !self.services.contains_key(name) {
+            let Some(service) = self.services.get(name) else {
                 continue;
-            }
-            let state = self.services.get(name).map(|rs| rs.state());
-            if !matches!(
-                state,
-                Some(ServiceState::Running)
-                    | Some(ServiceState::Ready)
-                    | Some(ServiceState::Starting)
-            ) {
+            };
+            if service.handle.is_none() {
                 continue;
             }
             let depth = depths.get(name).copied().unwrap_or(0);
@@ -151,6 +173,7 @@ impl Runner {
         // Stop from highest depth to lowest (dependents first).
         for (_depth, names) in by_depth.into_iter().rev() {
             for name in &names {
+                self.set_service_state(name, ServiceState::Stopping);
                 self.output_manager
                     .service_event(name, &format!("stopping... ({remaining} remaining)"));
             }
@@ -170,10 +193,19 @@ impl Runner {
                         .and_then(|rs| rs.resolved.shutdown.clone());
                     let force = force_shutdown_requested();
                     let name_owned = name.clone();
+                    let debug = super::service::StopDebug::new(
+                        name.clone(),
+                        self.output_manager.clone_lifecycle_emitter(),
+                    );
                     join_set.spawn(async move {
-                        // Global shutdown — no subsequent restart, so the
-                        // pgroup-empty poll adds latency without benefit.
-                        let _ = stop_service(handle, shutdown_config.as_ref(), force, false).await;
+                        let _ = stop_service(
+                            handle,
+                            shutdown_config.as_ref(),
+                            force,
+                            true,
+                            Some(debug),
+                        )
+                        .await;
                         name_owned
                     });
                 }
@@ -189,6 +221,10 @@ impl Runner {
                     let names: Vec<String> = stopping_pgids
                         .iter()
                         .map(|(name, pgid)| {
+                            self.output_manager.service_event(
+                                name,
+                                &format!("send SIGKILL to pgid {pgid} (force shutdown)"),
+                            );
                             let _ = nix::sys::signal::killpg(
                                 nix::unistd::Pid::from_raw(*pgid),
                                 nix::sys::signal::Signal::SIGKILL,
@@ -216,6 +252,7 @@ impl Runner {
                     Ok(Some(Ok(name))) => {
                         stopping_pgids.remove(&name);
                         self.set_service_state(&name, ServiceState::Stopped);
+                        self.drain_service_output(&name).await;
                         remaining -= 1;
                         self.output_manager
                             .service_event(&name, &format!("stopped ({remaining} remaining)"));
@@ -250,6 +287,8 @@ impl Runner {
                 }
             ));
             for (name, pgid) in &running_task_pgids {
+                self.output_manager
+                    .service_event(name, &format!("send SIGKILL to task pgid {pgid}"));
                 if let Err(e) = nix::sys::signal::killpg(
                     nix::unistd::Pid::from_raw(*pgid),
                     nix::sys::signal::Signal::SIGKILL,
@@ -267,8 +306,6 @@ impl Runner {
                 }
             }
         }
-
-        self.output_manager.lifecycle_event("shutdown complete");
     }
 
     /// Wait for remaining async tasks to finish after shutdown.
@@ -285,6 +322,9 @@ impl Runner {
             if let Some(worker) = rs.rebuild_worker.take() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
             }
+            if let Some(worker) = rs.output_worker.take() {
+                Self::await_output_worker(worker).await;
+            }
             rs.handle = None;
             rs.attach_lock = None;
             rs.attach_waiter = None;
@@ -295,8 +335,158 @@ impl Runner {
             if let Some(worker) = rt.run_worker.take() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
             }
+            if let Some(worker) = rt.output_worker.take() {
+                Self::await_output_worker(worker).await;
+            }
             rt.attach_lock = None;
             rt.attach_waiter = None;
+        }
+    }
+
+    async fn drain_late_worker_results(&mut self) {
+        while let Ok(cmd) = self.internal_rx.try_recv() {
+            match cmd {
+                RunnerInternalCommand::ServiceStartPrepared {
+                    name,
+                    context,
+                    result,
+                    ..
+                } => {
+                    self.stop_late_service_start(name, context, result).await;
+                }
+                RunnerInternalCommand::TaskRunPrepared { name, result, .. } => {
+                    self.stop_late_task_start(name, result).await;
+                }
+                RunnerInternalCommand::ServiceStopComplete { .. }
+                | RunnerInternalCommand::ServiceRebuildPrepared { .. }
+                | RunnerInternalCommand::GraphRequeryComplete(_)
+                | RunnerInternalCommand::TaskExited { .. }
+                | RunnerInternalCommand::BatchBuildComplete(_)
+                | RunnerInternalCommand::RebuildBatchComplete(_)
+                | RunnerInternalCommand::LazyBuildComplete { .. }
+                | RunnerInternalCommand::ServiceHealthChanged { .. }
+                | RunnerInternalCommand::AutoRestart { .. }
+                | RunnerInternalCommand::ServiceExited { .. }
+                | RunnerInternalCommand::ReadyCheckComplete { .. } => {}
+            }
+        }
+    }
+
+    pub(in crate::runner) async fn stop_late_service_start(
+        &mut self,
+        name: String,
+        context: Box<super::service_worker::ServiceStartContext>,
+        result: Result<Box<crate::runner::service::StartResult>, String>,
+    ) {
+        let Ok(start_result) = result else {
+            return;
+        };
+        self.output_manager
+            .service_event(&name, "start cancelled by shutdown");
+        let crate::runner::service::StartResult {
+            handle,
+            child_output,
+        } = *start_result;
+
+        let output_worker = self.output_manager.service_writer(&name).map(|writer| {
+            tokio::spawn(async move {
+                let _ = writer.process_stream(child_output).await;
+            })
+        });
+        let _ = stop_service(
+            handle,
+            context.resolved.shutdown.as_ref(),
+            force_shutdown_requested(),
+            true,
+            Some(super::service::StopDebug::new(
+                name.clone(),
+                self.output_manager.clone_lifecycle_emitter(),
+            )),
+        )
+        .await;
+        if let Some(worker) = output_worker {
+            Self::await_output_worker(worker).await;
+        }
+    }
+
+    pub(in crate::runner) async fn stop_late_task_start(
+        &mut self,
+        name: String,
+        result: Result<TaskRunPrepared, String>,
+    ) {
+        let Ok(prepared) = result else {
+            return;
+        };
+        match prepared {
+            TaskRunPrepared::Spawned(spawn) => {
+                self.output_manager
+                    .service_event(&name, "run cancelled by shutdown");
+                let crate::runner::task::TaskSpawn {
+                    mut handle,
+                    child_output,
+                    rendered_cmdline: _rendered_cmdline,
+                } = *spawn;
+                let output_worker = self.output_manager.service_writer(&name).map(|writer| {
+                    tokio::spawn(async move {
+                        let _ = writer.process_stream(child_output).await;
+                    })
+                });
+                self.output_manager.service_event(
+                    &name,
+                    &format!("send SIGKILL to task pgid {}", handle.pgid()),
+                );
+                let _ = handle
+                    .terminate(
+                        nix::sys::signal::Signal::SIGKILL,
+                        std::time::Duration::from_millis(500),
+                    )
+                    .await;
+                if let Some(worker) = output_worker {
+                    Self::await_output_worker(worker).await;
+                }
+            }
+            TaskRunPrepared::ForegroundSpawned(spawn) => {
+                self.output_manager
+                    .service_event(&name, "run cancelled by shutdown");
+                let crate::runner::task::ForegroundTaskSpawn {
+                    mut handle,
+                    rendered_cmdline: _rendered_cmdline,
+                } = *spawn;
+                self.output_manager.service_event(
+                    &name,
+                    &format!("send SIGKILL to foreground task pgid {}", handle.pgid()),
+                );
+                let _ = handle
+                    .terminate(
+                        nix::sys::signal::Signal::SIGKILL,
+                        std::time::Duration::from_millis(500),
+                    )
+                    .await;
+            }
+            TaskRunPrepared::PendingRun { .. } | TaskRunPrepared::Skipped { .. } => {}
+        }
+    }
+
+    async fn drain_service_output(&mut self, name: &str) {
+        let Some(worker) = self
+            .services
+            .get_mut(name)
+            .and_then(|rs| rs.output_worker.take())
+        else {
+            return;
+        };
+
+        Self::await_output_worker(worker).await;
+    }
+
+    async fn await_output_worker(worker: tokio::task::JoinHandle<()>) {
+        let mut worker = worker;
+        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker).await {
+            Ok(_) => {}
+            Err(_) => {
+                worker.abort();
+                let _ = worker.await;
+            }
         }
     }
 }

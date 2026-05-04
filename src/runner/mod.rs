@@ -642,6 +642,10 @@ pub struct Runner {
     /// Internal shutdown flag broadcast to detached control workers so they
     /// can force-kill promptly when don is exiting.
     shutdown_flag_tx: tokio::sync::watch::Sender<bool>,
+
+    /// True after graceful shutdown starts. Used to reject late starts and
+    /// to keep final shutdown output ordered after all cleanup work.
+    shutting_down: bool,
 }
 
 impl Runner {
@@ -719,6 +723,7 @@ impl Runner {
                 completions::CompletionCache::default(),
             )),
             shutdown_flag_tx,
+            shutting_down: false,
         })
     }
 
@@ -1013,7 +1018,11 @@ impl Runner {
         // Main loop: wait for completions, commands, and signals.
         if !startup_shutdown_requested {
             loop {
+                if self.shutting_down {
+                    break;
+                }
                 if shutdown_requested() {
+                    self.initiate_shutdown().await;
                     break;
                 }
 
@@ -1369,6 +1378,10 @@ impl Runner {
             let _ = handle.await;
         }
 
+        if self.shutting_down {
+            self.output_manager.lifecycle_event("shutdown complete");
+        }
+
         // Shut down the output system — flush all pending messages to sinks.
         self.output_manager.shutdown().await;
 
@@ -1686,6 +1699,21 @@ mod tests {
                 deps: vec![("a", vec![])],
                 expect_ok: true,
             },
+            // Real-world regression: a stray reference to something that
+            // isn't a node in the graph (e.g. an unexpanded service-group
+            // ref left over by a code path that re-runs `Service::resolve`)
+            // must not blow up topological_sort. Pre-fix, this returned an
+            // empty order and the runner's shutdown loop never visited any
+            // service, leaving don wedged after "shutting down gracefully".
+            Case {
+                name: "unknown dep ref is ignored",
+                deps: vec![
+                    ("a", vec![]),
+                    ("b", vec!["a", "ghost-group"]),
+                    ("c", vec!["b"]),
+                ],
+                expect_ok: true,
+            },
         ];
 
         for case in cases {
@@ -1715,8 +1743,16 @@ mod tests {
                     .collect();
                 for (name, node_deps) in &dep_map {
                     for dep in node_deps {
+                        // Unknown deps (refs to nodes that aren't in the
+                        // graph — e.g. unexpanded service-group refs) are
+                        // ignored by topological_sort, so they shouldn't
+                        // appear in `positions` either. Skip them in the
+                        // ordering check.
+                        let Some(&dep_pos) = positions.get(dep.as_str()) else {
+                            continue;
+                        };
                         assert!(
-                            positions[dep.as_str()] < positions[name.as_str()],
+                            dep_pos < positions[name.as_str()],
                             "case '{}': {} should appear before {}",
                             case.name,
                             dep,
@@ -1976,6 +2012,7 @@ mod tests {
                 ignore: Vec::new(),
                 timeout: None,
                 log: LogConfig::Stdout,
+                terminal: crate::config::TaskTerminal::default(),
                 auto_run: crate::config::TaskAutoRun::Always,
                 download: None,
                 bazel: None,

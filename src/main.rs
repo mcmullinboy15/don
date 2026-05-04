@@ -46,6 +46,11 @@ enum Commands {
         profile: Option<String>,
         /// Name of a stopped service to start (omit to start the daemon)
         name: Option<String>,
+        /// Force pipe-mode output instead of the TUI, even on a TTY. Useful
+        /// for CI, log capture, scripted shutdown tests, and any environment
+        /// where the terminal doesn't reliably answer DSR cursor queries.
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Stop a running service
     Stop {
@@ -153,7 +158,8 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Start {
             profile,
             name: None,
-        } => match run_start(&config_path, profile.as_deref(), verbose).await {
+            no_tui,
+        } => match run_start(&config_path, profile.as_deref(), verbose, no_tui).await {
             Ok(()) => 0,
             Err(e) => {
                 errln(e);
@@ -803,6 +809,7 @@ async fn run_start(
     config_path: &std::path::Path,
     profile: Option<&str>,
     verbose: bool,
+    no_tui: bool,
 ) -> Result<(), String> {
     use std::io::IsTerminal;
 
@@ -824,7 +831,7 @@ async fn run_start(
     }
 
     let base = base_dir(config_path);
-    let is_tty = std::io::stdout().is_terminal();
+    let is_tty = !no_tui && std::io::stdout().is_terminal();
 
     // Fall back to the config's default_profile when `--profile` is not given.
     // Validation above guarantees default_profile (if set) is a known profile,
@@ -852,6 +859,10 @@ async fn run_start(
         };
 
     let is_active = |name: &str| active_items.as_ref().is_none_or(|s| s.contains(name));
+    let has_foreground_tasks = config
+        .tasks
+        .iter()
+        .any(|(name, task)| is_active(name) && task.terminal.is_foreground());
 
     // Collect service names and their log configs for OutputManager.
     let service_configs: Vec<(&str, &don::config::LogConfig)> = config
@@ -904,7 +915,7 @@ async fn run_start(
         .await
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
 
-    if is_tty {
+    if is_tty && !has_foreground_tasks {
         let (output_manager, log_rx) =
             don::output::OutputManager::new_with_tui(&all_configs, verbose)
                 .await

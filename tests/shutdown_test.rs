@@ -5,7 +5,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, RunnerCommand};
+use don::runner::{Runner, RunnerCommand, RunnerEvent, ServiceState};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -76,6 +76,18 @@ async fn spawn_runner(
     tokio::task::JoinHandle<()>,
     Arc<Mutex<Vec<u8>>>,
 ) {
+    spawn_runner_with(toml, base_dir, |_| {}).await
+}
+
+async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
+    toml: &str,
+    base_dir: &std::path::Path,
+    configure: F,
+) -> (
+    mpsc::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    Arc<Mutex<Vec<u8>>>,
+) {
     let config_path = base_dir.join("don.toml");
     std::fs::write(&config_path, toml).unwrap();
 
@@ -97,6 +109,7 @@ async fn spawn_runner(
 
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
+    configure(&output_manager);
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
     let runner = Runner::new(
         config,
@@ -157,6 +170,116 @@ async fn make_runner(
 
 // --- Tests ---
 
+/// Foreground tasks pause the global stdout/TUI sink while they own the
+/// terminal. If shutdown begins before the pause is released — e.g. the
+/// task's run_worker is aborted before `TaskRunPrepared` arrives, or the
+/// foreground task gets SIGKILL'd at the end of shutdown and its
+/// `TaskExited` lands after the main loop has broken out — every lifecycle
+/// event we emit during shutdown is silently dropped. `initiate_shutdown`
+/// must force-clear the pause so the user actually sees what's happening.
+#[test]
+fn shutdown_clears_leaked_visible_output_pause() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-clear-pause");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        // Engage the pause before the runner takes ownership of the
+        // OutputManager — same end state as a foreground task that grabbed
+        // the terminal and never got to release it.
+        let (shutdown_tx, handle, buf) = spawn_runner_with(&toml, dir.path(), |om| {
+            om.pause_visible_output();
+        })
+        .await;
+
+        // Can't wait for "all services running" through the buffer — it's
+        // currently muted. Sleep long enough for the service to boot.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("shutting down gracefully"),
+            "shutdown banner should be visible after pause is cleared. output: {output:?}"
+        );
+        assert!(
+            output.contains("api: send SIGTERM to pgid"),
+            "per-service signal lifecycle event should be visible. output: {output:?}"
+        );
+        assert!(
+            output.contains("shutdown complete"),
+            "shutdown complete should be visible. output: {output:?}"
+        );
+    });
+}
+
+/// Lifecycle events ("send SIGTERM…", "stopping…") share the stdout sink
+/// with regular service output. If a noisy service spams during shutdown
+/// and the channel were bounded, lifecycle events sent via `try_send`
+/// would silently drop and the user would see "shutting down gracefully"
+/// followed by nothing but spam. Regression test for the bounded-channel
+/// design that produced exactly that symptom in the redo monorepo
+/// (kafka-relay flooding "can't connect" after kafka shutdown).
+#[test]
+fn shutdown_lifecycle_events_survive_service_spam() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-spam");
+        // A service that emits a tight burst of lines on shutdown — exactly
+        // the load shape that drowns lifecycle events under a bounded sink.
+        let script_path = dir.path().join("spam.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\n\
+             trap 'i=1; while [ $i -le 5000 ]; do echo spam line $i; i=$((i+1)); done; exit 0' TERM\n\
+             while true; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("noisy", &script_path.display().to_string(), &[])
+            .log("stdout")
+            .ready_exec("true", &[])
+            .shutdown("SIGTERM", "5s")
+            .done()
+            .build();
+
+        let (shutdown_tx, handle, buf) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("noisy: send SIGTERM to pgid"),
+            "lifecycle SIGTERM event should not be dropped under spam. output: {output:?}"
+        );
+        assert!(
+            output.contains("noisy: stopping"),
+            "lifecycle 'stopping' event should not be dropped. output: {output:?}"
+        );
+        assert!(
+            output.contains("shutdown complete"),
+            "shutdown complete should appear after spam. output: {output:?}"
+        );
+        // Service output itself should also show up — we didn't trade
+        // control-plane reliability for service-output drops.
+        assert!(
+            output.contains("spam line 5000"),
+            "noisy service's own output should still be delivered. output: {output:?}"
+        );
+    });
+}
+
 /// Verify services stop in reverse dependency order: C (depends on B, which
 /// depends on A) stops first, then B, then A.
 #[test]
@@ -209,6 +332,48 @@ fn shutdown_reverse_dependency_order() {
         );
 
         assert!(output.contains("shutdown complete"), "output: {output}");
+    });
+}
+
+#[test]
+fn shutdown_broadcasts_stopping_before_stopped() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-state-events");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let mut events = runner.subscribe();
+        let handle = tokio::spawn(async move {
+            let _ = runner.run().await;
+        });
+        assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+
+        let _ = shutdown_tx.send(()).await;
+
+        let mut shutdown_states = Vec::new();
+        while shutdown_states.len() < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let RunnerEvent::ServiceStateChanged { name, state } = event
+                && name == "api"
+                && matches!(state, ServiceState::Stopping | ServiceState::Stopped)
+            {
+                shutdown_states.push(state);
+            }
+        }
+
+        handle.await.unwrap();
+        assert_eq!(
+            shutdown_states,
+            vec![ServiceState::Stopping, ServiceState::Stopped]
+        );
     });
 }
 
@@ -628,6 +793,14 @@ fn shutdown_timeout_escalates_to_sigkill() {
 
         let output = read_buf(&buf);
         assert!(output.contains("shutdown complete"), "output: {output}");
+        assert!(
+            output.contains("stubborn: send SIGTERM to pgid"),
+            "expected SIGTERM send log. output: {output}"
+        );
+        assert!(
+            output.contains("stubborn: send SIGKILL to pgid"),
+            "expected SIGKILL send log. output: {output}"
+        );
 
         // Should take ~1s (the timeout) + a bit for SIGKILL, not the full 10s default.
         assert!(
@@ -637,6 +810,108 @@ fn shutdown_timeout_escalates_to_sigkill() {
         assert!(
             elapsed >= Duration::from_millis(800),
             "shutdown was too fast ({elapsed:?}) — SIGTERM should wait ~1s"
+        );
+    });
+}
+
+#[test]
+fn shutdown_signals_unhealthy_services() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-unhealthy-service");
+        let sentinel = dir.path().join("healthy.flag");
+        std::fs::write(&sentinel, "ok").unwrap();
+
+        let check_script = dir.path().join("check.sh");
+        std::fs::write(
+            &check_script,
+            format!(
+                "#!/bin/sh\n[ -f {} ] && exit 0 || exit 1\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&check_script, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let toml = format!(
+            r#"
+[services.svc]
+run.cmd = "sleep"
+run.args = ["300"]
+log = "ignore"
+
+[services.svc.ready]
+exec.cmd = "{}"
+interval = "100ms"
+retries = 20
+monitor = true
+monitor_interval = "100ms"
+unhealthy_after = 1
+"#,
+            check_script.display()
+        );
+
+        let (shutdown_tx, handle, buf) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_output(&buf, "svc: ready", Duration::from_secs(5)).await);
+
+        std::fs::remove_file(&sentinel).unwrap();
+        assert!(wait_for_output(&buf, "svc: unhealthy", Duration::from_secs(5)).await);
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("svc: send SIGTERM to pgid"),
+            "expected unhealthy service to be signalled. output: {output}"
+        );
+        assert!(output.contains("shutdown complete"), "output: {output}");
+    });
+}
+
+#[test]
+fn shutdown_waits_for_process_group_and_drains_logs() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("shutdown-pgroup-logs");
+        let script = "trap 'echo parent-term; exit 0' TERM; \
+            (trap '' HUP; trap 'echo child-term; sleep 1; echo child-done; exit 0' TERM; \
+            while true; do sleep 1 & wait $!; done) & \
+            echo started; wait";
+        let toml = ConfigBuilder::new()
+            .add_custom_service("tree", "bash", &["-c", script])
+            .log("stdout")
+            .ready_exec("true", &[])
+            .shutdown("SIGTERM", "3s")
+            .done()
+            .build();
+
+        let (shutdown_tx, handle, buf) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+
+        let start = std::time::Instant::now();
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+        let elapsed = start.elapsed();
+
+        let output = read_buf(&buf);
+        assert!(output.contains("parent-term"), "output: {output}");
+        assert!(output.contains("child-term"), "output: {output}");
+        assert!(output.contains("child-done"), "output: {output}");
+        assert!(output.contains("shutdown complete"), "output: {output}");
+        let child_done = output.find("child-done").unwrap();
+        let shutdown_complete = output.find("shutdown complete").unwrap();
+        assert!(
+            child_done < shutdown_complete,
+            "shutdown complete should be emitted after final service logs. output: {output}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(800),
+            "shutdown returned before descendant cleanup finished ({elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown took too long ({elapsed:?})"
         );
     });
 }

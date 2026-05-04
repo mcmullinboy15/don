@@ -32,9 +32,6 @@ const DEFAULT_RING_BUFFER_CAPACITY: usize = 10_000;
 /// from the filter dropdown. Must not collide with a user service/task name.
 pub const LIFECYCLE_EVENT_NAME: &str = "don";
 
-/// Default channel capacity for sinks.
-const SINK_CHANNEL_CAPACITY: usize = 1000;
-
 /// Terminal colors for normal service/task name prefixes.
 const SERVICE_COLORS: &[Color] = &[
     Color::Cyan,
@@ -69,7 +66,7 @@ const TURBO_COLOR: Color = Color::Grey;
 pub struct OscSinkHandle {
     /// Our copy of the sender — dropping it + removing the service's
     /// copy from the sinks list closes the channel, stopping the task.
-    tx: mpsc::Sender<SinkLine>,
+    handle: SinkHandle,
     join: JoinHandle<pty_process::OwnedWritePty>,
     service_state: Arc<Mutex<ServiceOutputState>>,
 }
@@ -82,10 +79,10 @@ impl OscSinkHandle {
         // Remove our sender from the service's sinks list.
         {
             let mut state = self.service_state.lock().await;
-            state.sinks.retain(|s| !s.tx.same_channel(&self.tx));
+            state.sinks.retain(|s| !s.same_channel(&self.handle));
         }
         // Drop our sender to close the channel.
-        drop(self.tx);
+        drop(self.handle);
         self.join.await.ok()
     }
 }
@@ -102,16 +99,64 @@ pub struct SinkLine {
     /// like any other entry — selectable, but hidden when the filter is
     /// active and doesn't include them.
     pub name: String,
+    /// True for `[don]`-prefixed lifecycle events ("api: stopping...",
+    /// "shutting down gracefully", build progress). False for raw service
+    /// stdout/stderr. The TUI uses this to keep lifecycle events visible
+    /// during shutdown even for services the user has filtered out — a
+    /// hidden kafka should still surface "send SIGTERM" without flooding
+    /// the screen with kafka's own (filtered) shutdown chatter.
+    pub is_lifecycle: bool,
 }
 
 /// A handle to a sink. Clone the sender to subscribe a service to it.
+///
+/// Two flavors:
+///
+/// - **Unbounded**: don's own internal pipeline (stdout/TUI sink, file sinks,
+///   lifecycle events). Send always succeeds unless the receiver has been
+///   dropped. We don't impose backpressure here — a noisy service is the
+///   user's problem to filter, not ours to throttle. Better to let memory
+///   grow briefly than silently drop control-plane events ("send SIGTERM…",
+///   "stopping…") because some service is spamming.
+/// - **BoundedDrop**: slow external consumers (`don logs --follow` HTTP
+///   clients, OSC response sinks). When their channel fills, drop the sink
+///   entirely so a stuck client can't stall don's output.
 #[derive(Clone)]
-pub(crate) struct SinkHandle {
-    pub tx: mpsc::Sender<SinkLine>,
-    /// When true, use `try_send` and drop the sink if the channel is full.
-    /// Used for follow sinks so that a slow HTTP client can't block the
-    /// service's output pipeline.
-    pub drop_on_full: bool,
+pub(crate) enum SinkHandle {
+    Unbounded(mpsc::UnboundedSender<SinkLine>),
+    BoundedDrop(mpsc::Sender<SinkLine>),
+}
+
+impl SinkHandle {
+    /// Send a line. Returns `Err(())` if the sink should be pruned —
+    /// receiver dropped, or (for `BoundedDrop`) the consumer is too slow.
+    pub fn send(&self, msg: SinkLine) -> Result<(), ()> {
+        match self {
+            Self::Unbounded(tx) => tx.send(msg).map_err(|_| ()),
+            Self::BoundedDrop(tx) => tx.try_send(msg).map_err(|_| ()),
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Self::Unbounded(tx) => tx.is_closed(),
+            Self::BoundedDrop(tx) => tx.is_closed(),
+        }
+    }
+
+    pub fn same_channel(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unbounded(a), Self::Unbounded(b)) => a.same_channel(b),
+            (Self::BoundedDrop(a), Self::BoundedDrop(b)) => a.same_channel(b),
+            _ => false,
+        }
+    }
+
+    /// True when this sink should be dropped on `close_follow_sinks` —
+    /// follow/OSC sinks for transient external clients, not stdout/file.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::BoundedDrop(_))
+    }
 }
 
 /// A fully formatted, sanitized log line emitted by the stdout pipeline.
@@ -126,6 +171,10 @@ pub struct FormattedLogLine {
     /// [`LIFECYCLE_EVENT_NAME`] so the filter treats them as a selectable
     /// entry rather than always passing them.
     pub name: String,
+    /// True for `[don]`-prefixed lifecycle events; false for raw service
+    /// stdout/stderr. Lets the TUI keep lifecycle events visible even when
+    /// the source service is filtered out (esp. during shutdown).
+    pub is_lifecycle: bool,
     /// Fully formatted line bytes. Does NOT include a trailing newline —
     /// the renderer appends one (or, for ratatui, treats it as one row).
     pub bytes: Vec<u8>,
@@ -166,6 +215,31 @@ impl VerbosityControl {
     }
 }
 
+#[derive(Clone, Debug)]
+struct StdoutPauseControl {
+    paused: Arc<AtomicBool>,
+}
+
+impl StdoutPauseControl {
+    fn new() -> Self {
+        Self {
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Where the stdout sink task sends its formatted lines.
 ///
 /// Pipe-mode output writes bytes directly to an `AsyncWrite` (today's stdout).
@@ -173,7 +247,7 @@ impl VerbosityControl {
 /// render via `Terminal::insert_before`.
 enum StdoutTarget<W: tokio::io::AsyncWrite + Unpin + Send> {
     Writer(W),
-    Tui(mpsc::Sender<FormattedLogLine>),
+    Tui(mpsc::UnboundedSender<FormattedLogLine>),
 }
 
 /// Per-service output state. Owned by OutputManager, never removed.
@@ -226,7 +300,7 @@ impl ServiceWriter {
                     // Prune closed sinks (e.g. disconnected follow clients) inline.
                     let (name, prefix, sinks) = {
                         let mut state = self.state.lock().await;
-                        state.sinks.retain(|s| !s.tx.is_closed());
+                        state.sinks.retain(|s| !s.is_closed());
                         state.ring_buffer.push_chunk(&chunk);
                         (
                             state.name.clone(),
@@ -235,28 +309,23 @@ impl ServiceWriter {
                         )
                     };
 
-                    let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
+                    let mut dropped: Vec<SinkHandle> = Vec::new();
                     for sink in &sinks {
                         let msg = SinkLine {
                             prefix: prefix.clone(),
                             line: chunk.clone(),
                             name: name.clone(),
+                            is_lifecycle: false,
                         };
-                        if sink.drop_on_full {
-                            // Non-blocking: if the client can't keep up, drop
-                            // the sink so the service's output isn't stalled.
-                            if sink.tx.try_send(msg).is_err() {
-                                dropped.push(sink.tx.clone());
-                            }
-                        } else {
-                            let _ = sink.tx.send(msg).await;
+                        if sink.send(msg).is_err() {
+                            dropped.push(sink.clone());
                         }
                     }
                     if !dropped.is_empty() {
                         let mut state = self.state.lock().await;
                         state
                             .sinks
-                            .retain(|s| !dropped.iter().any(|d| d.same_channel(&s.tx)));
+                            .retain(|s| !dropped.iter().any(|d| d.same_channel(s)));
                     }
                 }
                 Err(e) => return Err(e),
@@ -276,11 +345,11 @@ impl ServiceWriter {
     /// stream ends (process exited) so that attach sessions and log followers
     /// detect the closure and exit instead of blocking forever.
     ///
-    /// Only removes sinks with `drop_on_full = true` (follow/attach sinks).
-    /// Persistent sinks (stdout, file) are kept for the next process lifecycle.
+    /// Only removes transient sinks (follow/OSC). Persistent sinks (stdout,
+    /// file) are kept for the next process lifecycle.
     pub async fn close_follow_sinks(&self) {
         let mut state = self.state.lock().await;
-        state.sinks.retain(|s| !s.drop_on_full);
+        state.sinks.retain(|s| !s.is_transient());
     }
 
     /// Write a single line to the ring buffer and sinks.
@@ -292,7 +361,7 @@ impl ServiceWriter {
         let data = Bytes::from(format!("{line}\n"));
         let (name, prefix, sinks) = {
             let mut state = self.state.lock().await;
-            state.sinks.retain(|s| !s.tx.is_closed());
+            state.sinks.retain(|s| !s.is_closed());
             state.ring_buffer.push_chunk(data.as_ref());
             (
                 state.name.clone(),
@@ -300,26 +369,23 @@ impl ServiceWriter {
                 state.sinks.clone(),
             )
         };
-        let mut dropped: Vec<mpsc::Sender<SinkLine>> = Vec::new();
+        let mut dropped: Vec<SinkHandle> = Vec::new();
         for sink in &sinks {
             let msg = SinkLine {
                 prefix: prefix.clone(),
                 line: data.clone(),
                 name: name.clone(),
+                is_lifecycle: false,
             };
-            if sink.drop_on_full {
-                if sink.tx.try_send(msg).is_err() {
-                    dropped.push(sink.tx.clone());
-                }
-            } else {
-                let _ = sink.tx.send(msg).await;
+            if sink.send(msg).is_err() {
+                dropped.push(sink.clone());
             }
         }
         if !dropped.is_empty() {
             let mut state = self.state.lock().await;
             state
                 .sinks
-                .retain(|s| !dropped.iter().any(|d| d.same_channel(&s.tx)));
+                .retain(|s| !dropped.iter().any(|d| d.same_channel(s)));
         }
     }
 }
@@ -417,6 +483,9 @@ pub struct OutputManager {
     /// Shared runtime verbose mode — enables extra diagnostic lifecycle events
     /// and timestamps on stdout/TUI log lines.
     verbosity: VerbosityControl,
+    /// Global mute for visible stdout/TUI output while a foreground task owns
+    /// the terminal. Ring buffers and file sinks continue to receive output.
+    stdout_pause: StdoutPauseControl,
     /// Cached formatted prefix for the synthetic "bazel" stream. Populated
     /// by [`Self::register_build_tool`]; `None` means build output falls
     /// back to a `[don]`-prefixed lifecycle event with a `bazel:` text
@@ -478,8 +547,8 @@ impl OutputManager {
     pub async fn new_with_tui(
         services: &[(&str, &crate::config::LogConfig)],
         verbose: bool,
-    ) -> Result<(Self, mpsc::Receiver<FormattedLogLine>), OutputError> {
-        let (log_tx, log_rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
+    ) -> Result<(Self, mpsc::UnboundedReceiver<FormattedLogLine>), OutputError> {
+        let (log_tx, log_rx) = mpsc::unbounded_channel();
         // `tokio::io::Sink` only satisfies the generic bound — `StdoutTarget::Tui`
         // never touches the writer arm, so the value is never exercised.
         let target: StdoutTarget<tokio::io::Sink> = StdoutTarget::Tui(log_tx);
@@ -496,14 +565,17 @@ impl OutputManager {
         let color_map = assign_colors(&names);
         let max_name_len = names.iter().map(|n| n.len()).max().unwrap_or(0).max(5);
         let verbosity = VerbosityControl::new(verbose);
+        let stdout_pause = StdoutPauseControl::new();
 
         // Spawn stdout sink task.
-        let (stdout_tx, stdout_rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
-        let stdout_handle = tokio::spawn(stdout_sink_task(stdout_rx, target, verbosity.clone()));
-        let stdout_sink = SinkHandle {
-            tx: stdout_tx,
-            drop_on_full: false,
-        };
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        let stdout_handle = tokio::spawn(stdout_sink_task(
+            stdout_rx,
+            target,
+            verbosity.clone(),
+            stdout_pause.clone(),
+        ));
+        let stdout_sink = SinkHandle::Unbounded(stdout_tx);
 
         // Spawn file sink tasks (deduplicated by path).
         let mut file_sinks: HashMap<PathBuf, SinkHandle> = HashMap::new();
@@ -514,15 +586,9 @@ impl OutputManager {
                 && !file_sinks.contains_key(path)
             {
                 let file = open_log_file(path).await?;
-                let (tx, rx) = mpsc::channel(SINK_CHANNEL_CAPACITY);
+                let (tx, rx) = mpsc::unbounded_channel();
                 writer_handles.push(tokio::spawn(file_sink_task(rx, file)));
-                file_sinks.insert(
-                    path.clone(),
-                    SinkHandle {
-                        tx,
-                        drop_on_full: false,
-                    },
-                );
+                file_sinks.insert(path.clone(), SinkHandle::Unbounded(tx));
             }
         }
 
@@ -571,6 +637,7 @@ impl OutputManager {
             stdout_sink,
             writer_handles,
             verbosity,
+            stdout_pause,
             bazel_prefix: None,
             turbo_prefix: None,
         })
@@ -606,10 +673,11 @@ impl OutputManager {
     pub fn bazel_event(&self, message: &str) {
         match self.bazel_prefix.as_ref() {
             Some(prefix) => {
-                let _ = self.stdout_sink.tx.try_send(SinkLine {
+                let _ = self.stdout_sink.send(SinkLine {
                     prefix: prefix.clone(),
                     line: Bytes::from(format!("{message}\n")),
                     name: "bazel".to_string(),
+                    is_lifecycle: true,
                 });
             }
             None => self.lifecycle_event(&format!("bazel: {message}")),
@@ -620,10 +688,11 @@ impl OutputManager {
     pub fn turbo_event(&self, message: &str) {
         match self.turbo_prefix.as_ref() {
             Some(prefix) => {
-                let _ = self.stdout_sink.tx.try_send(SinkLine {
+                let _ = self.stdout_sink.send(SinkLine {
                     prefix: prefix.clone(),
                     line: Bytes::from(format!("{message}\n")),
                     name: "turbo".to_string(),
+                    is_lifecycle: true,
                 });
             }
             None => self.lifecycle_event(&format!("turbo: {message}")),
@@ -672,15 +741,17 @@ impl OutputManager {
                 prefix: prefix.clone(),
                 line: Bytes::copy_from_slice(line),
                 name: svc_name.clone(),
+                // Ring-buffer replays mostly carry raw service stdout. Even
+                // if a few lifecycle events are mixed in, marking them all
+                // as non-lifecycle is correct for follow consumers, which
+                // don't have a TUI filter to short-circuit anyway.
+                is_lifecycle: false,
             };
             if tx.try_send(sink_line).is_err() {
                 break;
             }
         }
-        state.sinks.push(SinkHandle {
-            tx,
-            drop_on_full: true,
-        });
+        state.sinks.push(SinkHandle::BoundedDrop(tx));
         Some(rx)
     }
 
@@ -688,7 +759,7 @@ impl OutputManager {
     /// terminal queries (OSC 10/11, cursor position) and writes responses
     /// directly to the PTY write handle.
     ///
-    /// The sink uses `drop_on_full = true` so it never blocks the output
+    /// The sink uses bounded-drop semantics so it never blocks the output
     /// pipeline. Returns a [`OscSinkHandle`] that can be used to reclaim
     /// the PTY write handle (e.g., for attach).
     pub async fn add_osc_sink(
@@ -698,16 +769,14 @@ impl OutputManager {
     ) -> Option<OscSinkHandle> {
         let state_arc = self.services.get(name)?.clone();
         let (tx, rx) = mpsc::channel::<SinkLine>(16);
+        let handle = SinkHandle::BoundedDrop(tx);
         {
             let mut state = state_arc.lock().await;
-            state.sinks.push(SinkHandle {
-                tx: tx.clone(),
-                drop_on_full: true,
-            });
+            state.sinks.push(handle.clone());
         }
         let join = tokio::spawn(osc_sink_task(rx, pty_write));
         Some(OscSinkHandle {
-            tx,
+            handle,
             join,
             service_state: state_arc,
         })
@@ -787,6 +856,19 @@ impl OutputManager {
         self.verbosity.clone()
     }
 
+    /// Pause all visible output routed through Don's stdout/TUI sink.
+    ///
+    /// Service ring buffers and file sinks continue to receive output. This
+    /// is used while a foreground task owns the user's terminal.
+    pub fn pause_visible_output(&self) {
+        self.stdout_pause.pause();
+    }
+
+    /// Resume visible output after a foreground task releases the terminal.
+    pub fn resume_visible_output(&self) {
+        self.stdout_pause.resume();
+    }
+
     /// Get a lightweight, cloneable handle for emitting `[don]` lifecycle
     /// events from spawned tasks (e.g. build output).
     pub fn clone_lifecycle_emitter(&self) -> LifecycleEmitter {
@@ -801,10 +883,11 @@ impl OutputManager {
 
     /// Emit a `[don]` lifecycle event.
     pub fn lifecycle_event(&self, message: &str) {
-        let _ = self.stdout_sink.tx.try_send(SinkLine {
+        let _ = self.stdout_sink.send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{message}\n")),
             name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
         });
     }
 
@@ -829,10 +912,11 @@ impl OutputManager {
     /// so it passes the TUI filter when the service is selected — `[don] api:
     /// restarted` shows up under the "api" filter, not under "don".
     pub fn service_event(&self, service: &str, message: &str) {
-        let _ = self.stdout_sink.tx.try_send(SinkLine {
+        let _ = self.stdout_sink.send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
+            is_lifecycle: true,
         });
     }
 
@@ -846,10 +930,11 @@ impl OutputManager {
 
     /// Emit a `[don]` error event.
     pub fn error_event(&self, message: &str) {
-        let _ = self.stdout_sink.tx.try_send(SinkLine {
+        let _ = self.stdout_sink.send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{message}\n")),
             name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
         });
     }
 
@@ -857,10 +942,11 @@ impl OutputManager {
     /// service name so the filter surfaces it alongside that service's own
     /// output. See [`Self::service_event`] for rationale.
     pub fn service_error_event(&self, service: &str, message: &str) {
-        let _ = self.stdout_sink.tx.try_send(SinkLine {
+        let _ = self.stdout_sink.send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
+            is_lifecycle: true,
         });
     }
 
@@ -874,11 +960,9 @@ impl OutputManager {
             let had_stdout = state
                 .sinks
                 .iter()
-                .any(|s| s.tx.same_channel(&self.stdout_sink.tx));
+                .any(|s| s.same_channel(&self.stdout_sink));
             if had_stdout {
-                state
-                    .sinks
-                    .retain(|s| !s.tx.same_channel(&self.stdout_sink.tx));
+                state.sinks.retain(|s| !s.same_channel(&self.stdout_sink));
                 state.stdout_paused = true;
             }
         }
@@ -896,7 +980,7 @@ impl OutputManager {
                 let already_present = state
                     .sinks
                     .iter()
-                    .any(|s| s.tx.same_channel(&self.stdout_sink.tx));
+                    .any(|s| s.same_channel(&self.stdout_sink));
                 if !already_present {
                     state.sinks.push(self.stdout_sink.clone());
                 }
@@ -961,10 +1045,11 @@ pub struct LifecycleEmitter {
 impl LifecycleEmitter {
     /// Emit a `[don]` lifecycle event.
     pub fn lifecycle_event(&self, message: &str) {
-        let _ = self.stdout_sink.tx.try_send(SinkLine {
+        let _ = self.stdout_sink.send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{message}\n")),
             name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
         });
     }
 
@@ -972,20 +1057,22 @@ impl LifecycleEmitter {
     /// the service name so the TUI filter shows it when the service is
     /// selected. See [`OutputManager::service_event`] for rationale.
     pub fn service_event(&self, service: &str, message: &str) {
-        let _ = self.stdout_sink.tx.try_send(SinkLine {
+        let _ = self.stdout_sink.send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
+            is_lifecycle: true,
         });
     }
 
     /// Emit a `[don]` error event scoped to a service. Tagged with the
     /// service name.
     pub fn service_error_event(&self, service: &str, message: &str) {
-        let _ = self.stdout_sink.tx.try_send(SinkLine {
+        let _ = self.stdout_sink.send(SinkLine {
             prefix: Bytes::from(self.don_prefix.clone()),
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
+            is_lifecycle: true,
         });
     }
 
@@ -1022,10 +1109,11 @@ impl LifecycleEmitter {
     pub fn bazel_event(&self, message: &str) {
         match self.bazel_prefix.as_ref() {
             Some(prefix) => {
-                let _ = self.stdout_sink.tx.try_send(SinkLine {
+                let _ = self.stdout_sink.send(SinkLine {
                     prefix: prefix.clone(),
                     line: Bytes::from(format!("{message}\n")),
                     name: "bazel".to_string(),
+                    is_lifecycle: true,
                 });
             }
             None => self.lifecycle_event(&format!("bazel: {message}")),
@@ -1036,10 +1124,11 @@ impl LifecycleEmitter {
     pub fn turbo_event(&self, message: &str) {
         match self.turbo_prefix.as_ref() {
             Some(prefix) => {
-                let _ = self.stdout_sink.tx.try_send(SinkLine {
+                let _ = self.stdout_sink.send(SinkLine {
                     prefix: prefix.clone(),
                     line: Bytes::from(format!("{message}\n")),
                     name: "turbo".to_string(),
+                    is_lifecycle: true,
                 });
             }
             None => self.lifecycle_event(&format!("turbo: {message}")),
@@ -1055,9 +1144,10 @@ impl LifecycleEmitter {
 /// interleaved chunks from different services don't produce garbled output.
 /// Runs until all senders are dropped.
 async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
-    mut rx: mpsc::Receiver<SinkLine>,
+    mut rx: mpsc::UnboundedReceiver<SinkLine>,
     mut target: StdoutTarget<W>,
     verbosity: VerbosityControl,
+    pause: StdoutPauseControl,
 ) {
     use bytes::BytesMut;
 
@@ -1073,6 +1163,11 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     let mut cr_flushed: HashSet<Bytes> = HashSet::new();
 
     while let Some(msg) = rx.recv().await {
+        if pause.is_paused() {
+            accumulators.remove(&msg.prefix);
+            cr_flushed.remove(&msg.prefix);
+            continue;
+        }
         let acc = accumulators.entry(msg.prefix.clone()).or_default();
 
         for &byte in msg.line.iter() {
@@ -1098,6 +1193,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
+                        msg.is_lifecycle,
                         &verbosity,
                         start,
                     )
@@ -1120,6 +1216,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
+                        msg.is_lifecycle,
                         &verbosity,
                         start,
                     )
@@ -1142,6 +1239,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
+                        msg.is_lifecycle,
                         &verbosity,
                         start,
                     )
@@ -1163,7 +1261,12 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             } else {
                 sanitize::sanitize_terminal_output(acc)
             };
-            emit_line(&mut target, "", prefix, &sanitized, &verbosity, start).await;
+            // End-of-stream partial line: lifecycle vs not is unknowable at
+            // this point (the accumulator key is the prefix, not the source
+            // flag). Defaulting to false is correct — these are usually
+            // service-stdout fragments that didn't end in `\n` before the
+            // child closed its pipe.
+            emit_line(&mut target, "", prefix, &sanitized, false, &verbosity, start).await;
         }
     }
 }
@@ -1194,6 +1297,7 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     name: &str,
     prefix: &[u8],
     line: &[u8],
+    is_lifecycle: bool,
     verbosity: &VerbosityControl,
     start: std::time::Instant,
 ) {
@@ -1205,19 +1309,18 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
             let _ = writer.write_all(b"\n").await;
         }
         StdoutTarget::Tui(tx) => {
-            let _ = tx
-                .send(FormattedLogLine {
-                    name: name.to_string(),
-                    bytes,
-                })
-                .await;
+            let _ = tx.send(FormattedLogLine {
+                name: name.to_string(),
+                is_lifecycle,
+                bytes,
+            });
         }
     }
 }
 
 /// File sink writer task. Receives raw byte chunks and writes them directly.
 /// Runs until all senders are dropped.
-async fn file_sink_task(mut rx: mpsc::Receiver<SinkLine>, mut file: tokio::fs::File) {
+async fn file_sink_task(mut rx: mpsc::UnboundedReceiver<SinkLine>, mut file: tokio::fs::File) {
     use tokio::io::AsyncWriteExt;
     while let Some(msg) = rx.recv().await {
         let _ = file.write_all(&msg.line).await;
