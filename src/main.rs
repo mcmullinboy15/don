@@ -51,6 +51,13 @@ enum Commands {
         /// where the terminal doesn't reliably answer DSR cursor queries.
         #[arg(long)]
         no_tui: bool,
+        /// Restrict displayed log lines to the given comma-separated set of
+        /// service/task names. Affects pipe-mode output and seeds the TUI
+        /// filter on startup (overriding any `hidden = true` defaults).
+        /// Ring buffers and file sinks are unaffected — `don logs <name>`
+        /// still returns full output. Example: `--log-filter=web,api,db`.
+        #[arg(long, value_delimiter = ',')]
+        log_filter: Vec<String>,
     },
     /// Stop a running service
     Stop {
@@ -159,13 +166,24 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             profile,
             name: None,
             no_tui,
-        } => match run_start(&config_path, profile.as_deref(), verbose, no_tui).await {
-            Ok(()) => 0,
-            Err(e) => {
-                errln(e);
-                1
+            log_filter,
+        } => {
+            match run_start(
+                &config_path,
+                profile.as_deref(),
+                verbose,
+                no_tui,
+                log_filter,
+            )
+            .await
+            {
+                Ok(()) => 0,
+                Err(e) => {
+                    errln(e);
+                    1
+                }
             }
-        },
+        }
         Commands::Start {
             name: Some(name), ..
         } => run_client(&config_path, |c| async move { c.start(&name).await }).await,
@@ -805,11 +823,49 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Lightweight Levenshtein-style typo suggestion for `--log-filter` names.
+/// Returns ` — did you mean '<best>'?` or empty if nothing close is found.
+/// Mirrors the shape used by `config::suggest_typo` so error messages read
+/// the same on both surfaces; kept local to avoid widening the config
+/// module's public API for a single CLI-side caller.
+fn suggest_log_filter_typo(input: &str, candidates: &std::collections::HashSet<&str>) -> String {
+    fn distance(a: &str, b: &str) -> usize {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        let mut curr = vec![0usize; b.len() + 1];
+        for i in 1..=a.len() {
+            curr[0] = i;
+            for j in 1..=b.len() {
+                let cost = usize::from(a[i - 1] != b[j - 1]);
+                curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+        prev[b.len()]
+    }
+    let max = match input.len() {
+        0..=2 => 1,
+        3..=5 => 2,
+        _ => 3,
+    };
+    let mut best: Option<(&str, usize)> = None;
+    for &cand in candidates {
+        let d = distance(input, cand);
+        if d > 0 && d <= max && best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((cand, d));
+        }
+    }
+    best.map(|(n, _)| format!(" — did you mean '{n}'?"))
+        .unwrap_or_default()
+}
+
 async fn run_start(
     config_path: &std::path::Path,
     profile: Option<&str>,
     verbose: bool,
     no_tui: bool,
+    log_filter: Vec<String>,
 ) -> Result<(), String> {
     use std::io::IsTerminal;
 
@@ -909,6 +965,38 @@ async fn run_start(
         .chain(build_tool_configs.iter().copied())
         .collect();
 
+    // Validate `--log-filter` against the active item set so typos surface
+    // before the runner spawns anything. The synthetic `[don]` lifecycle
+    // entry is implicitly allowed everywhere — `don::output` keeps it
+    // visible regardless of the allowlist — so accepting "don" here is a
+    // harmless no-op rather than an error.
+    let log_filter_set: Option<std::collections::HashSet<String>> = if log_filter.is_empty() {
+        None
+    } else {
+        let valid: std::collections::HashSet<&str> = all_configs
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(std::iter::once(don::output::LIFECYCLE_EVENT_NAME))
+            .collect();
+        let mut invalid: Vec<(String, String)> = Vec::new();
+        for name in &log_filter {
+            if !valid.contains(name.as_str()) {
+                invalid.push((name.clone(), suggest_log_filter_typo(name, &valid)));
+            }
+        }
+        if !invalid.is_empty() {
+            let msg = invalid
+                .iter()
+                .map(|(n, s)| format!("'{n}'{s}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Error: --log-filter references unknown service or task: {msg}"
+            ));
+        }
+        Some(log_filter.into_iter().collect())
+    };
+
     // Install signal handlers before building the runner so Ctrl+C still
     // reaches the graceful-shutdown path even during a slow startup.
     let shutdown_rx = don::runner::install_signal_handlers()
@@ -999,6 +1087,7 @@ async fn run_start(
         // the user sees a free-floating cursor and can type into the shell
         // while the runner runs unattended. The log_rx closing (runner
         // shutdown) returns Ok(()) so the normal exit path is unaffected.
+        let tui_log_filter = log_filter_set.clone();
         let tui = tokio::spawn(async move {
             let result = don::run_tui(
                 log_rx,
@@ -1011,6 +1100,7 @@ async fn run_start(
                 build_tool_names,
                 task_configs,
                 hidden_names,
+                tui_log_filter,
             )
             .await;
             if result.is_err() {
@@ -1047,6 +1137,10 @@ async fn run_start(
             don::output::OutputManager::new_verbose(&all_configs, tokio::io::stdout(), verbose)
                 .await
                 .map_err(|e| format!("Error creating output manager: {e}"))?;
+
+        if let Some(allow) = log_filter_set {
+            output_manager.set_log_filter(allow);
+        }
 
         let runner = await_with_shutdown_supervision(
             tokio::spawn({

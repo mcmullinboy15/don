@@ -197,6 +197,7 @@ impl App {
         build_tool_names: Vec<String>,
         task_configs: HashMap<String, Task>,
         hidden_names: HashSet<String>,
+        cli_log_filter: Option<HashSet<String>>,
         verbose_enabled: bool,
     ) -> Self {
         let services_state: HashMap<String, ServiceState> = service_names
@@ -228,7 +229,7 @@ impl App {
             view_mode: ViewMode::Normal,
             verbose_enabled,
             shutdown_started: false,
-            filter: FilterState::new(all_filter_names, &hidden_names),
+            filter: FilterState::new(all_filter_names, &hidden_names, cli_log_filter.as_ref()),
             palette: ActionPalette::default(),
             spinner_frame: 0,
             services_state,
@@ -467,6 +468,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashSet::new(),
+            None,
             false,
         );
         assert_eq!(app.counts.services_ready, 0);
@@ -546,6 +548,7 @@ mod tests {
                 vec![],
                 HashMap::new(),
                 HashSet::new(),
+                None,
                 false,
             );
             for (name, state) in case.services {
@@ -569,6 +572,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashSet::new(),
+            None,
             false,
         );
         app.filter.enter_edit();
@@ -602,6 +606,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashSet::new(),
+            None,
             false,
         );
         app.view_mode = ViewMode::Overlay;

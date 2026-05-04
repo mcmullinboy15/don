@@ -93,17 +93,33 @@ pub(crate) struct FilterState {
 }
 
 impl FilterState {
-    /// Initialize with the full set of filterable names and the set of names
-    /// that should start hidden. `active_selected` is seeded to
-    /// `all_names - hidden`; that same set is remembered as the reset target.
-    pub(crate) fn new(mut all_names: Vec<String>, hidden: &HashSet<String>) -> Self {
+    /// Initialize with the full set of filterable names. When `cli_override`
+    /// is `Some`, it takes precedence over `hidden`: the seeded selection is
+    /// `cli_override ∩ all_names` plus the synthetic `[don]` lifecycle entry
+    /// (so users always see runner control output even when narrowing logs).
+    /// Otherwise `active_selected` is `all_names - hidden`. The seeded set
+    /// becomes the reset target — pressing Reset restores it.
+    pub(crate) fn new(
+        mut all_names: Vec<String>,
+        hidden: &HashSet<String>,
+        cli_override: Option<&HashSet<String>>,
+    ) -> Self {
         all_names.sort();
         all_names.dedup();
-        let default_selected: HashSet<String> = all_names
-            .iter()
-            .filter(|n| !hidden.contains(n.as_str()))
-            .cloned()
-            .collect();
+        let default_selected: HashSet<String> = match cli_override {
+            Some(allow) => all_names
+                .iter()
+                .filter(|n| {
+                    allow.contains(n.as_str()) || n.as_str() == crate::output::LIFECYCLE_EVENT_NAME
+                })
+                .cloned()
+                .collect(),
+            None => all_names
+                .iter()
+                .filter(|n| !hidden.contains(n.as_str()))
+                .cloned()
+                .collect(),
+        };
         let active_selected = default_selected.clone();
         let hidden_from_display = HashSet::new();
         let rows = build_rows(&all_names, "", &hidden_from_display);
@@ -384,12 +400,17 @@ mod tests {
         FilterState::new(
             names.iter().map(|s| s.to_string()).collect(),
             &HashSet::new(),
+            None,
         )
     }
 
     fn state_with_hidden(names: &[&str], hidden: &[&str]) -> FilterState {
         let hidden_set: HashSet<String> = hidden.iter().map(|s| s.to_string()).collect();
-        FilterState::new(names.iter().map(|s| s.to_string()).collect(), &hidden_set)
+        FilterState::new(
+            names.iter().map(|s| s.to_string()).collect(),
+            &hidden_set,
+            None,
+        )
     }
 
     #[test]
@@ -476,6 +497,64 @@ mod tests {
         s.commit();
         let active: Vec<&str> = s.active_names();
         assert_eq!(active, vec!["api"]);
+    }
+
+    #[test]
+    fn cli_override_seeds_active_and_overrides_hidden() {
+        struct Case {
+            name: &'static str,
+            all: &'static [&'static str],
+            hidden: &'static [&'static str],
+            cli: &'static [&'static str],
+            want_passes: &'static [&'static str],
+            want_blocks: &'static [&'static str],
+        }
+
+        // `don` is always added to `all_names` in the production wiring
+        // (App::new), so test cases mirror that — the FilterState itself
+        // doesn't synthesize unknown names.
+        let cases = vec![
+            Case {
+                name: "cli filter overrides hidden defaults",
+                all: &["api", "worker", "db", "don"],
+                hidden: &["db"],
+                cli: &["worker"],
+                want_passes: &["worker", "don"],
+                want_blocks: &["api", "db"],
+            },
+            Case {
+                name: "cli filter still admits don lifecycle",
+                all: &["api", "worker", "don"],
+                hidden: &[],
+                cli: &["api"],
+                want_passes: &["api", "don"],
+                want_blocks: &["worker"],
+            },
+            Case {
+                name: "cli filter that re-enables a hidden name shows it",
+                all: &["api", "db", "don"],
+                hidden: &["db"],
+                cli: &["db"],
+                want_passes: &["db", "don"],
+                want_blocks: &["api"],
+            },
+        ];
+
+        for case in cases {
+            let hidden: HashSet<String> = case.hidden.iter().map(|s| (*s).to_string()).collect();
+            let cli: HashSet<String> = case.cli.iter().map(|s| (*s).to_string()).collect();
+            let s = FilterState::new(
+                case.all.iter().map(|s| (*s).to_string()).collect(),
+                &hidden,
+                Some(&cli),
+            );
+            for n in case.want_passes {
+                assert!(s.passes(n), "case {}: expected pass for '{n}'", case.name);
+            }
+            for n in case.want_blocks {
+                assert!(!s.passes(n), "case {}: expected block for '{n}'", case.name);
+            }
+        }
     }
 
     #[test]

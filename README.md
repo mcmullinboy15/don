@@ -81,6 +81,13 @@ Configs with active foreground terminal tasks also use plain prefixed output
 instead of the TUI so those tasks can own stdin without competing with Don's
 keyboard handler.
 
+Pass `--log-filter=<name1,name2,...>` to scope visible output to a subset of
+services or tasks — useful in pipe mode (CI, log capture) and as a way to
+seed the TUI filter from the command line, overriding any `hidden = true`
+defaults. `[don]` lifecycle events stay visible regardless of the filter.
+Ring buffers and file sinks are unaffected, so `don logs <name>` still
+returns the full output for filtered services.
+
 ### Services
 
 Long-running processes (servers, databases, workers). Don keeps them alive and restarts them on file changes.

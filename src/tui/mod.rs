@@ -157,6 +157,7 @@ pub async fn run_tui(
     build_tool_names: Vec<String>,
     task_configs: std::collections::HashMap<String, crate::config::Task>,
     hidden_names: std::collections::HashSet<String>,
+    cli_log_filter: Option<std::collections::HashSet<String>>,
 ) -> Result<(), TuiError> {
     let _raw_guard = RawModeGuard::enter()?;
     let controls = TuiControls {
@@ -170,6 +171,7 @@ pub async fn run_tui(
         build_tool_names,
         task_configs,
         hidden_names,
+        cli_log_filter,
         controls.verbosity.is_enabled(),
     );
     let mut terminal = build_inline_terminal()?;
@@ -1445,6 +1447,7 @@ mod tests {
             Vec::new(),
             HashMap::new(),
             HashSet::new(),
+            None,
             false,
         );
         app.apply_service_state("api".to_string(), state);

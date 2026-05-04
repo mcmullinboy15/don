@@ -240,6 +240,42 @@ impl StdoutPauseControl {
     }
 }
 
+/// Allowlist applied at the stdout sink so pipe-mode runs can scope output
+/// to a subset of services without a TUI filter modal. When the inner
+/// `OnceLock` is unset, no filter is active and everything passes.
+///
+/// When set, a line passes when any of:
+/// - its `name` is in the allowlist (the user's chosen services), or
+/// - its `name` is [`LIFECYCLE_EVENT_NAME`] (top-level `[don]` events —
+///   shutdown progress, errors, restart info — are control plane and stay
+///   unconditionally visible so the user can still tell what the runner
+///   is doing), or
+/// - its `name` is empty (only the end-of-stream accumulator flush emits
+///   nameless lines; partial lines at shutdown should always surface).
+///
+/// Per-service lifecycle events (`[don] api: restarted`) carry the service
+/// name, so they're allowlisted with the service — matching the TUI filter.
+///
+/// Set once at startup via [`OutputManager::set_log_filter`] before the
+/// runner spawns any service. Subsequent set attempts are silently ignored.
+#[derive(Clone, Debug, Default)]
+struct LogFilterControl {
+    allowlist: Arc<std::sync::OnceLock<HashSet<String>>>,
+}
+
+impl LogFilterControl {
+    fn passes(&self, name: &str) -> bool {
+        match self.allowlist.get() {
+            None => true,
+            Some(set) => name.is_empty() || name == LIFECYCLE_EVENT_NAME || set.contains(name),
+        }
+    }
+
+    fn set(&self, names: HashSet<String>) {
+        let _ = self.allowlist.set(names);
+    }
+}
+
 /// Where the stdout sink task sends its formatted lines.
 ///
 /// Pipe-mode output writes bytes directly to an `AsyncWrite` (today's stdout).
@@ -486,6 +522,11 @@ pub struct OutputManager {
     /// Global mute for visible stdout/TUI output while a foreground task owns
     /// the terminal. Ring buffers and file sinks continue to receive output.
     stdout_pause: StdoutPauseControl,
+    /// Allowlist applied to stdout-bound lines. None until
+    /// [`Self::set_log_filter`] is called; once set, only lines whose name
+    /// is in the allowlist (or empty, for `[don]` lifecycle events) reach
+    /// the writer. Ring buffers and file sinks are unaffected.
+    log_filter: LogFilterControl,
     /// Cached formatted prefix for the synthetic "bazel" stream. Populated
     /// by [`Self::register_build_tool`]; `None` means build output falls
     /// back to a `[don]`-prefixed lifecycle event with a `bazel:` text
@@ -566,6 +607,7 @@ impl OutputManager {
         let max_name_len = names.iter().map(|n| n.len()).max().unwrap_or(0).max(5);
         let verbosity = VerbosityControl::new(verbose);
         let stdout_pause = StdoutPauseControl::new();
+        let log_filter = LogFilterControl::default();
 
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
@@ -574,6 +616,7 @@ impl OutputManager {
             target,
             verbosity.clone(),
             stdout_pause.clone(),
+            log_filter.clone(),
         ));
         let stdout_sink = SinkHandle::Unbounded(stdout_tx);
 
@@ -638,6 +681,7 @@ impl OutputManager {
             writer_handles,
             verbosity,
             stdout_pause,
+            log_filter,
             bazel_prefix: None,
             turbo_prefix: None,
         })
@@ -651,6 +695,23 @@ impl OutputManager {
     /// stays intact. Name must be either `"bazel"` or `"turbo"` (panics
     /// otherwise in debug builds; silently drops the prefix cache in
     /// release).
+    /// Restrict stdout-bound output to lines whose source name is in
+    /// `allowlist`. Top-level `[don]` lifecycle events (whose `name` is
+    /// empty) always pass; per-service lifecycle events (`[don] api: ...`)
+    /// pass only when `api` is in the allowlist, mirroring the TUI filter.
+    ///
+    /// File sinks and ring buffers are unaffected — `don logs <name>`
+    /// still returns the full output, and `log = { file = ... }` continues
+    /// to receive every line.
+    ///
+    /// Idempotent guard: only the first call takes effect. Call this once
+    /// at startup, before the runner spawns any service. Pass an empty set
+    /// to silence every per-service line while keeping `[don]` events
+    /// visible.
+    pub fn set_log_filter(&self, allowlist: HashSet<String>) {
+        self.log_filter.set(allowlist);
+    }
+
     pub async fn register_build_tool(&mut self, name: &str) {
         self.register_service(name, &crate::config::LogConfig::Stdout)
             .await;
@@ -1148,6 +1209,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut target: StdoutTarget<W>,
     verbosity: VerbosityControl,
     pause: StdoutPauseControl,
+    filter: LogFilterControl,
 ) {
     use bytes::BytesMut;
 
@@ -1164,6 +1226,16 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
 
     while let Some(msg) = rx.recv().await {
         if pause.is_paused() {
+            accumulators.remove(&msg.prefix);
+            cr_flushed.remove(&msg.prefix);
+            continue;
+        }
+        // Drop messages whose source service isn't in the active allowlist.
+        // Wipe any partial accumulator for that prefix too — carrying half a
+        // line across a filter change would replay it the next time the
+        // service became visible. Empty `name` (top-level lifecycle events)
+        // always passes; see `LogFilterControl::passes`.
+        if !filter.passes(&msg.name) {
             accumulators.remove(&msg.prefix);
             cr_flushed.remove(&msg.prefix);
             continue;
@@ -1767,6 +1839,132 @@ mod tests {
                 .is_some_and(|ch| ch.is_ascii_digit()),
             "third line should gain a verbose timestamp after toggle: {:?}",
             lines[2]
+        );
+    }
+
+    #[test]
+    fn log_filter_passes_table() {
+        struct Case {
+            name: &'static str,
+            allowlist: Option<&'static [&'static str]>,
+            line_name: &'static str,
+            want: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "no filter set passes everything",
+                allowlist: None,
+                line_name: "api",
+                want: true,
+            },
+            Case {
+                name: "no filter set passes don",
+                allowlist: None,
+                line_name: LIFECYCLE_EVENT_NAME,
+                want: true,
+            },
+            Case {
+                name: "filter passes allowlisted name",
+                allowlist: Some(&["api"]),
+                line_name: "api",
+                want: true,
+            },
+            Case {
+                name: "filter rejects non-allowlisted name",
+                allowlist: Some(&["api"]),
+                line_name: "worker",
+                want: false,
+            },
+            Case {
+                name: "filter passes lifecycle even when not in allowlist",
+                allowlist: Some(&["api"]),
+                line_name: LIFECYCLE_EVENT_NAME,
+                want: true,
+            },
+            Case {
+                name: "filter passes empty-name shutdown flush",
+                allowlist: Some(&["api"]),
+                line_name: "",
+                want: true,
+            },
+            Case {
+                name: "empty allowlist still passes lifecycle",
+                allowlist: Some(&[]),
+                line_name: LIFECYCLE_EVENT_NAME,
+                want: true,
+            },
+            Case {
+                name: "empty allowlist drops services",
+                allowlist: Some(&[]),
+                line_name: "api",
+                want: false,
+            },
+            Case {
+                name: "build-tool name is filterable like services",
+                allowlist: Some(&["bazel"]),
+                line_name: "bazel",
+                want: true,
+            },
+        ];
+
+        for case in cases {
+            let filter = LogFilterControl::default();
+            if let Some(names) = case.allowlist {
+                filter.set(names.iter().map(|s| (*s).to_string()).collect());
+            }
+            assert_eq!(
+                filter.passes(case.line_name),
+                case.want,
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_log_filter_drops_non_allowlisted_service_output() {
+        let (writer, buf) = TestBuffer::new();
+        let config = crate::config::LogConfig::Stdout;
+        let mgr = OutputManager::new(&[("api", &config), ("worker", &config)], writer)
+            .await
+            .unwrap();
+        mgr.set_log_filter(["api".to_string()].into_iter().collect());
+
+        let api = mgr.service_writer("api").unwrap();
+        let worker = mgr.service_writer("worker").unwrap();
+        api.process_stream(std::io::Cursor::new(b"api line\n".to_vec()))
+            .await
+            .unwrap();
+        worker
+            .process_stream(std::io::Cursor::new(b"worker line\n".to_vec()))
+            .await
+            .unwrap();
+        // Lifecycle events stay visible regardless of the allowlist.
+        mgr.lifecycle_event("shutdown complete");
+        // Per-service lifecycle events are tagged with the service name, so
+        // they follow the allowlist alongside that service's own output.
+        mgr.service_event("worker", "send SIGTERM");
+        mgr.service_event("api", "ready");
+        mgr.shutdown().await;
+
+        let output = strip_ansi(read_buf(&buf).as_bytes());
+        assert!(output.contains("api line"), "api stdout should pass");
+        assert!(
+            !output.contains("worker line"),
+            "worker stdout should be filtered out: {output:?}"
+        );
+        assert!(
+            output.contains("shutdown complete"),
+            "top-level lifecycle should pass: {output:?}"
+        );
+        assert!(
+            !output.contains("worker: send SIGTERM"),
+            "per-service lifecycle for filtered name should drop: {output:?}"
+        );
+        assert!(
+            output.contains("api: ready"),
+            "per-service lifecycle for allowlisted name should pass: {output:?}"
         );
     }
 }
