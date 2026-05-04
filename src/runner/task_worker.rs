@@ -1,6 +1,7 @@
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ensure_download_for_config_worker;
 use super::task;
+use super::terminal::TerminalCoordinator;
 use crate::config::{Platform, TaskAutoRun};
 use crate::task_state::TaskState;
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ pub(in crate::runner) struct TaskWorkerContext {
     pub(in crate::runner) platform: Platform,
     pub(in crate::runner) emitter: crate::output::LifecycleEmitter,
     pub(in crate::runner) global_watch_ignore: Vec<String>,
+    pub(in crate::runner) terminal_coordinator: TerminalCoordinator,
 }
 
 pub(in crate::runner) async fn run_task_worker(
@@ -38,6 +40,7 @@ pub(in crate::runner) async fn run_task_worker(
         platform,
         emitter,
         global_watch_ignore,
+        terminal_coordinator,
     } = ctx;
     if let TaskRunMode::Startup { has_dependents } = mode {
         let has_watch = !task_cfg.watch.is_empty();
@@ -122,9 +125,22 @@ pub(in crate::runner) async fn run_task_worker(
     .map_err(|e| format!("download failed: {e}"))?;
 
     if task_cfg.terminal.is_foreground() {
-        let spawn = task::spawn_foreground_task(task_cfg, name, &base_dir, platform, params)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Pause the TUI before spawn_foreground_task touches termios /
+        // tcsetpgrp so the inline viewport, raw mode, and input task are
+        // gone before the child takes over the terminal.
+        terminal_coordinator.acquire().await;
+        let spawn = match task::spawn_foreground_task(
+            task_cfg, name, &base_dir, platform, params,
+        )
+        .await
+        {
+            Ok(spawn) => spawn,
+            Err(e) => {
+                // The fg task never took the terminal — restore the TUI.
+                terminal_coordinator.release().await;
+                return Err(e.to_string());
+            }
+        };
         Ok(TaskRunPrepared::ForegroundSpawned(Box::new(spawn)))
     } else {
         let spawn = task::spawn_task(task_cfg, name, &base_dir, platform, params)

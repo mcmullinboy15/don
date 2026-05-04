@@ -65,7 +65,7 @@ use backend::FixedBottomBackend;
 
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
-use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState};
+use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState, TerminalRequest};
 use app::{App, OverlayItem, ViewMode};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
@@ -140,6 +140,49 @@ impl Drop for Modal {
     }
 }
 
+/// Bundle of terminal-side state owned only while the TUI controls the
+/// terminal. Torn down when a foreground task acquires the terminal and
+/// rebuilt when it releases. State that has to survive the handoff
+/// (`App`, [`LogStore`], the input channel) lives outside this struct.
+struct ActiveTerm {
+    _raw_guard: RawModeGuard,
+    terminal: TuiTerminal,
+    modal: Option<Modal>,
+    input_handle: tokio::task::JoinHandle<()>,
+}
+
+impl ActiveTerm {
+    fn enter(input_tx: &mpsc::Sender<AppEvent>) -> Result<Self, TuiError> {
+        let raw_guard = RawModeGuard::enter()?;
+        let terminal = build_inline_terminal()?;
+        let input_handle = tokio::spawn(input::run(input_tx.clone()));
+        Ok(Self {
+            _raw_guard: raw_guard,
+            terminal,
+            modal: None,
+            input_handle,
+        })
+    }
+
+    /// Tear down terminal-side state cleanly so a foreground task can take
+    /// the tty. `_raw_guard`'s Drop disables raw mode after `terminal.clear`
+    /// flushes the inline viewport wipe.
+    fn tear_down(self) -> Result<(), TuiError> {
+        self.input_handle.abort();
+        // `modal` drops first (LeaveAlternateScreen) before we touch the main
+        // screen below.
+        drop(self.modal);
+        let mut terminal = self.terminal;
+        // Clear the inline viewport rows so the foreground task doesn't
+        // start writing on top of a stale status bar.
+        let _ = terminal.clear();
+        // Drop the terminal explicitly so any pending writes flush before
+        // we disable raw mode (via `_raw_guard.drop`).
+        drop(terminal);
+        Ok(())
+    }
+}
+
 /// Run the interactive TUI until the runner shuts down or the user quits.
 ///
 /// Ctrl+C raises SIGINT to our own process so the installed signal handler
@@ -158,8 +201,8 @@ pub async fn run_tui(
     task_configs: std::collections::HashMap<String, crate::config::Task>,
     hidden_names: std::collections::HashSet<String>,
     cli_log_filter: Option<std::collections::HashSet<String>>,
+    mut terminal_request_rx: mpsc::Receiver<TerminalRequest>,
 ) -> Result<(), TuiError> {
-    let _raw_guard = RawModeGuard::enter()?;
     let controls = TuiControls {
         verbosity,
         lifecycle_emitter,
@@ -174,32 +217,41 @@ pub async fn run_tui(
         cli_log_filter,
         controls.verbosity.is_enabled(),
     );
-    let mut terminal = build_inline_terminal()?;
     let mut store = LogStore::with_capacity(DEFAULT_CAPACITY);
-    let mut modal: Option<Modal> = None;
 
     let (input_tx, mut input_rx) = mpsc::channel::<AppEvent>(64);
     // Publish the sender so background tasks (completion replies) can
-    // inject events back into the loop.
+    // inject events back into the loop. Set once for the lifetime of the
+    // process — across pause/resume cycles we keep the same sender so
+    // pending replies can still land.
     let _ = INPUT_TX.set(input_tx.clone());
-    let input_handle = tokio::spawn(input::run(input_tx));
     // Tracks whether the input task's channel is still open. When the input
     // task exits (crossterm EventStream error), we gate its select arm off
     // so the select loop doesn't busy-spin on a perpetually-ready None.
     let mut input_open = true;
 
+    // Terminal-side state — Some while the TUI owns the terminal, None
+    // while a foreground task does. We start in the active state.
+    let mut active: Option<ActiveTerm> = Some(ActiveTerm::enter(&input_tx)?);
+    // Snapshot of `LogStore::next_id` taken when we hand the terminal to a
+    // foreground task. On resume we replay only entries with id ≥ this so
+    // pre-pause lines (already in the user's scrollback) aren't repeated.
+    // Lines that arrived during the pause get rendered above the new
+    // viewport via `insert_before`, preserving the foreground task's
+    // output that's already in scrollback above them.
+    let mut paused_checkpoint: Option<u64> = None;
+    if let Some(act) = active.as_mut() {
+        // Seed the viewport so the terminal reserves the bottom region
+        // before the first `insert_before` call. Raw `draw` (not the
+        // park-then-draw helper) avoids moving the cursor away from where
+        // FixedBottomBackend just placed it.
+        act.terminal.draw(|f| render::draw_bar(f, &app))?;
+    }
+
     // Drives the spinner and any other time-based UI. Skip-on-miss so the
     // spinner doesn't catch up in a burst after a slow render.
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // Seed the viewport so the terminal reserves the bottom region before
-    // the first `insert_before` call. Use the raw `terminal.draw` here
-    // (not `draw_inline_bar`) so we don't park the cursor — the wrapper
-    // just did a real DSR and placed the viewport at the shell's cursor
-    // row; parking would move that cursor away from where ratatui expects
-    // subsequent writes to land.
-    terminal.draw(|f| render::draw_bar(f, &app))?;
 
     // Cached terminal width — refreshed at the start of each log batch.
     // Avoids a syscall per rendered log line, which becomes a real
@@ -217,16 +269,14 @@ pub async fn run_tui(
     const LOG_BATCH_LIMIT: usize = 64;
 
     loop {
+        let active_present = active.is_some();
         tokio::select! {
             maybe_line = log_rx.recv() => {
                 match maybe_line {
                     Some(first) => {
-                        // Refresh the cached terminal width once per batch.
-                        // Per-line `terminal.size()` was a bottleneck under
-                        // log spam — one syscall × thousands of lines/sec
-                        // stalls the loop long enough that runner_events
-                        // (state changes, shutdown signaling) can't keep up.
-                        cached_width = terminal.size()?.width.max(1);
+                        if let Some(act) = active.as_mut() {
+                            cached_width = act.terminal.size()?.width.max(1);
+                        }
 
                         // Drain up to LOG_BATCH_LIMIT lines without yielding
                         // back to select. Each `insert_before` is a stdout
@@ -245,27 +295,28 @@ pub async fn run_tui(
                         let mut bar_dirty = false;
                         for line in batch {
                             if is_shutdown_start_line(&line) && !app.shutdown_started {
-                                // Inline begin_shutdown so we don't trigger
-                                // the per-call draw inside enter_shutdown_mode
-                                // — we'll do one batched redraw at the end.
                                 app.begin_shutdown();
-                                modal = None;
+                                if let Some(act) = active.as_mut() {
+                                    act.modal = None;
+                                }
                                 bar_dirty = true;
                             }
-                            // Skip inline writes while a modal owns stdout —
-                            // they'd go to the alt screen. `LogStore` still
-                            // captures the line, and `clear_and_replay` on
-                            // modal exit brings the inline view up to date.
-                            if modal.is_none() && app.should_render_log(&line.name, line.is_lifecycle) {
-                                insert_line(&mut terminal, &line, cached_width)?;
-                                // `insert_before` resets ratatui's back buffer;
-                                // mark the bar dirty for one redraw at batch end.
+                            // Only render to the terminal if we own it.
+                            // While paused, the line still lands in
+                            // `LogStore` so it can be replayed on resume.
+                            if let Some(act) = active.as_mut()
+                                && act.modal.is_none()
+                                && app.should_render_log(&line.name, line.is_lifecycle)
+                            {
+                                insert_line(&mut act.terminal, &line, cached_width)?;
                                 bar_dirty = true;
                             }
                             let _ = store.push(line);
                         }
-                        if bar_dirty {
-                            draw_inline_bar(&mut terminal, &app)?;
+                        if bar_dirty
+                            && let Some(act) = active.as_mut()
+                        {
+                            draw_inline_bar(&mut act.terminal, &app)?;
                         }
                     }
                     None => break, // runner closed the log channel — shut down
@@ -274,14 +325,14 @@ pub async fn run_tui(
             runner_result = runner_events.recv() => {
                 match runner_result {
                     Ok(RunnerEvent::ShutdownStarted) => {
-                        enter_shutdown_mode(&mut app, &mut terminal, &mut modal)?;
+                        if let Some(act) = active.as_mut() {
+                            enter_shutdown_mode(&mut app, &mut act.terminal, &mut act.modal)?;
+                        } else if !app.shutdown_started {
+                            app.begin_shutdown();
+                        }
                     }
                     Ok(event) => {
                         apply_runner_event(event, &mut app);
-                        // Lazy services clutter the filter modal with names
-                        // that have never produced a log line. Recompute the
-                        // hidden set after each state change so triggered
-                        // services (Lazy → Running) reappear automatically.
                         let lazy: std::collections::HashSet<String> = app
                             .services_state
                             .iter()
@@ -289,57 +340,105 @@ pub async fn run_tui(
                             .map(|(n, _)| n.clone())
                             .collect();
                         app.filter.set_hidden_from_display(lazy);
-                        if let Some(m) = modal.as_mut() {
-                            m.draw(&app)?;
-                        } else {
-                            draw_inline_bar(&mut terminal, &app)?;
+                        if let Some(act) = active.as_mut() {
+                            if let Some(m) = act.modal.as_mut() {
+                                m.draw(&app)?;
+                            } else {
+                                draw_inline_bar(&mut act.terminal, &app)?;
+                            }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed events — next one resyncs us; nothing to do.
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // Runner dropped its broadcast end. The log channel
-                        // will close next; the loop exits via that branch.
-                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {}
                 }
             }
-            maybe_event = input_rx.recv(), if input_open => {
+            maybe_event = input_rx.recv(), if input_open && active_present => {
                 match maybe_event {
                     Some(event) => {
-                        handle_app_event(
-                            event,
-                            &mut app,
-                            &mut terminal,
-                            &mut store,
-                            &command_tx,
-                            &controls,
-                            &mut modal,
-                        )?;
+                        if let Some(act) = active.as_mut() {
+                            handle_app_event(
+                                event,
+                                &mut app,
+                                &mut act.terminal,
+                                &mut store,
+                                &command_tx,
+                                &controls,
+                                &mut act.modal,
+                            )?;
+                        }
                     }
                     None => {
-                        // Input task exited — keep rendering logs and runner
-                        // state, but no more keyboard input. Gate the arm so
-                        // we don't spin on an always-ready closed channel.
                         input_open = false;
                     }
                 }
             }
-            _ = ticker.tick() => {
+            terminal_req = terminal_request_rx.recv() => {
+                match terminal_req {
+                    Some(TerminalRequest::Acquire(ack)) => {
+                        if let Some(act) = active.take() {
+                            // Snapshot the log boundary so we know which
+                            // lines arrived during the pause. Lines already
+                            // in scrollback at this moment must NOT be
+                            // replayed — they'd appear above the foreground
+                            // task's output, which is jarring.
+                            paused_checkpoint = Some(store.next_id());
+                            act.tear_down()?;
+                        }
+                        let _ = ack.send(());
+                    }
+                    Some(TerminalRequest::Release) if active.is_none() => {
+                        {
+                            // Don't clear the screen — the foreground task's
+                            // output stays in scrollback. Build a fresh
+                            // inline terminal anchored at the current cursor
+                            // row (the row right after the task's output)
+                            // via the DSR FixedBottomBackend issues during
+                            // construction.
+                            let mut act = ActiveTerm::enter(&input_tx)?;
+                            act.terminal.draw(|f| render::draw_bar(f, &app))?;
+                            cached_width = act.terminal.size()?.width.max(1);
+                            // Replay only lines that arrived during the
+                            // pause via `insert_before`. They land in
+                            // scrollback right after the foreground task's
+                            // output — the bar drifts down accordingly.
+                            let since = paused_checkpoint.take().unwrap_or(0);
+                            let mut replayed_any = false;
+                            for entry in store.iter_since(since) {
+                                if app.should_render_log(&entry.line.name, entry.line.is_lifecycle) {
+                                    insert_line(&mut act.terminal, &entry.line, cached_width)?;
+                                    replayed_any = true;
+                                }
+                            }
+                            if replayed_any {
+                                draw_inline_bar(&mut act.terminal, &app)?;
+                            }
+                            active = Some(act);
+                        }
+                    }
+                    Some(TerminalRequest::Release) => {
+                        // Already active — nothing to do. Lets the runner
+                        // be conservative with release calls in error paths.
+                    }
+                    None => {
+                        // Coordinator dropped — runner is gone. Loop exits
+                        // via log_rx close or shutdown event.
+                    }
+                }
+            }
+            _ = ticker.tick(), if active_present => {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
-                // Only touch the inline terminal; modals own stdout in alt
-                // screen. We redraw unconditionally so the spinner animates —
-                // ratatui's diff skips the cost when no cells changed.
-                if modal.is_none() {
-                    draw_inline_bar(&mut terminal, &app)?;
+                if let Some(act) = active.as_mut()
+                    && act.modal.is_none()
+                {
+                    draw_inline_bar(&mut act.terminal, &app)?;
                 }
             }
         }
     }
 
-    input_handle.abort();
-    drop(modal);
-    terminal.clear()?;
+    if let Some(act) = active.take() {
+        act.tear_down()?;
+    }
     Ok(())
 }
 

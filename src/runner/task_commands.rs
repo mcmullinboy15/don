@@ -34,6 +34,7 @@ impl Runner {
         let name_owned = name.to_string();
         let task_cfg_for_worker = task_cfg.clone();
         let global_watch_ignore = self.config.watch_ignore.clone();
+        let terminal_coordinator = self.terminal_coordinator.clone();
         if task_cfg.terminal.is_foreground() {
             self.output_manager.pause_visible_output();
         }
@@ -43,6 +44,7 @@ impl Runner {
                 platform,
                 emitter,
                 global_watch_ignore,
+                terminal_coordinator,
             };
             let result =
                 run_task_worker(ctx, &name_owned, &task_cfg_for_worker, &params, mode).await;
@@ -72,6 +74,9 @@ impl Runner {
             self.stop_late_task_start(name.to_string(), result).await;
             if task_cfg.terminal.is_foreground() {
                 self.output_manager.resume_visible_output();
+                // Release the TUI even though we're shutting down — the
+                // worker had already paused it before the foreground spawn.
+                self.terminal_coordinator.release().await;
             }
             return;
         }
@@ -130,6 +135,12 @@ impl Runner {
             }
             if task_cfg.terminal.is_foreground() {
                 self.output_manager.resume_visible_output();
+                // For the ForegroundSpawned branch above, the worker had
+                // already paused the TUI before the spawn; release it.
+                // The TUI ignores Release while it's not paused, so this
+                // is safe in the other branches too (where the worker
+                // never acquired in the first place).
+                self.terminal_coordinator.release().await;
             }
             return;
         }
@@ -394,6 +405,7 @@ impl Runner {
         let global_watch_ignore = self.config.watch_ignore.clone();
         let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
         let cmd_tx = self.internal_tx.clone();
+        let terminal_coordinator = self.terminal_coordinator.clone();
         let rerun = done_tx.is_none();
 
         tokio::spawn(async move {
@@ -403,6 +415,10 @@ impl Runner {
                     .await;
             let elapsed = start.elapsed();
             drop(handle);
+            // Hand the terminal back to the TUI now that the child has
+            // released it. Drop happened above; tcsetpgrp/tcsetattr already
+            // restored pgrp + termios.
+            terminal_coordinator.release().await;
 
             let (success, message) = match result {
                 Ok(status) => {

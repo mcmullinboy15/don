@@ -5,7 +5,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, resolve_profile_items};
+use don::runner::{Runner, TerminalCoordinator, resolve_profile_items};
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -273,6 +273,7 @@ async fn spawn_runner_with_profile(
         base_dir.to_path_buf(),
         profile,
         shutdown_rx,
+    TerminalCoordinator::detached(),
     )
     .await
     .unwrap();

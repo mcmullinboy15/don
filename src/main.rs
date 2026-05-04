@@ -1003,13 +1003,21 @@ async fn run_start(
         .await
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
 
-    if is_tty && !has_foreground_tasks {
+    let _ = has_foreground_tasks; // logged earlier; TUI now handles fg tasks via pause/resume
+
+    if is_tty {
         let (output_manager, log_rx) =
             don::output::OutputManager::new_with_tui(&all_configs, verbose)
                 .await
                 .map_err(|e| format!("Error creating output manager: {e}"))?;
         let verbosity = output_manager.verbosity_control();
         let lifecycle_emitter = output_manager.clone_lifecycle_emitter();
+
+        // Channel that lets the runner ask the TUI to release/re-take the
+        // terminal when a foreground task is about to run.
+        let (terminal_request_tx, terminal_request_rx) = tokio::sync::mpsc::channel(8);
+        let terminal_coordinator =
+            don::runner::TerminalCoordinator::with_channel(terminal_request_tx);
 
         let service_names: Vec<String> = config
             .services
@@ -1068,6 +1076,7 @@ async fn run_start(
                         base,
                         profile.as_deref(),
                         shutdown_rx,
+                        terminal_coordinator,
                     )
                     .await
                     .map_err(|e| format!("Error: {e}"))
@@ -1101,6 +1110,7 @@ async fn run_start(
                 task_configs,
                 hidden_names,
                 tui_log_filter,
+                terminal_request_rx,
             )
             .await;
             if result.is_err() {
@@ -1153,6 +1163,7 @@ async fn run_start(
                         base,
                         profile.as_deref(),
                         shutdown_rx,
+                        don::runner::TerminalCoordinator::detached(),
                     )
                     .await
                     .map_err(|e| format!("Error: {e}"))

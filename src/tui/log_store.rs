@@ -63,6 +63,20 @@ impl LogStore {
         self.entries.iter()
     }
 
+    /// Iterate oldest-first over entries with `id >= since`. Used by the
+    /// TUI to replay only lines that arrived during a pause window without
+    /// re-emitting earlier lines that are already in the user's scrollback.
+    pub(crate) fn iter_since(&self, since: u64) -> impl Iterator<Item = &StoredLogLine> {
+        self.entries.iter().filter(move |e| e.id >= since)
+    }
+
+    /// Id the next pushed line will receive. Save this before a pause to
+    /// distinguish lines that arrive during the pause from those already
+    /// stored.
+    pub(crate) fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// Id of the most recently stored line, if any.
     #[cfg(test)]
     pub(crate) fn latest_id(&self) -> Option<u64> {

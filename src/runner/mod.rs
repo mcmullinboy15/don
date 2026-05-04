@@ -28,6 +28,7 @@ mod status;
 mod support;
 mod task_commands;
 mod task_worker;
+mod terminal;
 
 pub(crate) mod service;
 pub(crate) mod task;
@@ -35,6 +36,7 @@ pub(crate) mod task;
 pub(crate) use params::resolve_task_params;
 pub use profile::resolve_profile_items;
 pub use signals::{install_signal_handlers, signal_count};
+pub use terminal::{TerminalCoordinator, TerminalRequest};
 
 use crate::config::{Config, Platform};
 use crate::output::OutputManager;
@@ -646,6 +648,10 @@ pub struct Runner {
     /// True after graceful shutdown starts. Used to reject late starts and
     /// to keep final shutdown output ordered after all cleanup work.
     shutting_down: bool,
+
+    /// Coordinates terminal handoff with the TUI for foreground tasks.
+    /// Detached in non-TUI runs.
+    pub(crate) terminal_coordinator: TerminalCoordinator,
 }
 
 impl Runner {
@@ -660,6 +666,7 @@ impl Runner {
         base_dir: PathBuf,
         profile: Option<&str>,
         shutdown_rx: mpsc::Receiver<()>,
+        terminal_coordinator: TerminalCoordinator,
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (internal_tx, internal_rx) = mpsc::channel(64);
@@ -724,6 +731,7 @@ impl Runner {
             )),
             shutdown_flag_tx,
             shutting_down: false,
+            terminal_coordinator,
         })
     }
 
@@ -1623,6 +1631,7 @@ mod tests {
             temp.path().to_path_buf(),
             None,
             shutdown_rx,
+            TerminalCoordinator::detached(),
         )
         .await
         .unwrap();

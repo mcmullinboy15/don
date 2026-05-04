@@ -3,7 +3,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{ItemStatus, Runner, RunnerCommand, ServiceState};
+use don::runner::{ItemStatus, Runner, RunnerCommand, ServiceState, TerminalCoordinator};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -97,6 +97,7 @@ async fn make_runner_verbose(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
+    TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -1533,6 +1534,7 @@ fn integration_don_pid_file_prevents_double_start() {
             dir.path().to_path_buf(),
             None,
             shutdown_rx1,
+            TerminalCoordinator::detached(),
         )
         .await
         .unwrap();
@@ -1552,6 +1554,7 @@ fn integration_don_pid_file_prevents_double_start() {
             dir.path().to_path_buf(),
             None,
             shutdown_rx2,
+            TerminalCoordinator::detached(),
         )
         .await;
 

@@ -5,7 +5,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, RunnerCommand, RunnerEvent, ServiceState};
+use don::runner::{Runner, RunnerCommand, RunnerEvent, ServiceState, TerminalCoordinator};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -118,6 +118,7 @@ async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
+    TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -162,6 +163,7 @@ async fn make_runner(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
+    TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
