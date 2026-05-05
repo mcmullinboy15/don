@@ -20,4 +20,4 @@ install-updater = false
 # Homebrew tap repository
 tap = "pjtatlow/homebrew-tap"
 # Publish jobs
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "./publish-crates-io"]

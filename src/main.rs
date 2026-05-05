@@ -2,6 +2,8 @@
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
 
+mod wisdom;
+
 use clap::{Parser, Subcommand};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use don::client::{Client, ClientError};
@@ -22,6 +24,11 @@ fn errln(msg: impl std::fmt::Display) {
 #[command(
     name = "don",
     about = "Boss of your dev environment",
+    long_about = "Boss of your dev environment.\n\n\
+        Tell the Don what services and tasks you run. He'll see they get \
+        started in the right order, stay alive, and shut down clean. \
+        No loose ends.",
+    version,
     arg_required_else_help = true
 )]
 struct Cli {
@@ -116,6 +123,10 @@ enum Commands {
     },
     /// Validate the config file
     Validate,
+    /// Print the don version
+    Version,
+    #[command(hide = true)]
+    Wisdom,
     /// Print shell completion script to stdout
     Completions {
         /// Target shell (bash, zsh, fish, powershell, elvish)
@@ -152,6 +163,16 @@ async fn main() {
 
 async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
     match command {
+        Commands::Version => {
+            println!("don {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        Commands::Wisdom => {
+            let q = wisdom::random();
+            println!("\"{}\"", q.text);
+            println!("    — {}, {}", q.speaker, q.source);
+            0
+        }
         Commands::Validate => match validate(&config_path) {
             Ok(()) => {
                 println!("Config is valid.");

@@ -1,12 +1,12 @@
 # don
 
-Boss of your dev environment. Start every service, task, and dependency with one command.
+Boss of your dev environment. One command starts your whole stack — and shuts it down clean when you're done.
 
 ```sh
 don start
 ```
 
-Don reads a `don.toml` in your project root and orchestrates your entire dev stack: databases, API servers, background workers, migration tasks, file watchers — all with dependency ordering, ready checks, and color-coded output in a single terminal.
+Don reads a `don.toml` in your project root and orchestrates your entire dev stack: databases, API servers, background workers, migration tasks, file watchers — all with dependency ordering, ready checks, and color-coded output in a single terminal. No loose ends.
 
 ## Install
 
