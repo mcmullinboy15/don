@@ -724,38 +724,26 @@ fn spawn_pty(
     //
     // Safety: prctl is async-signal-safe per signal-safety(7). Runs between
     // fork and exec in the child process only.
-    #[cfg(target_os = "linux")]
-    {
-        cmd = unsafe {
-            cmd.pre_exec(|| {
-                if libc::prctl(
-                    libc::PR_SET_PDEATHSIG,
-                    libc::SIGKILL as libc::c_ulong,
-                    0,
-                    0,
-                    0,
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            })
-        };
-    }
-
-    // If we're passing listener fds, register a pre_exec hook that runs after
-    // session_leader (pty-process chains them in order) to place the fds at
-    // 3, 4, 5… with CLOEXEC cleared. `LISTEN_PID` is handled by the shell
-    // shim that wraps the command (see `listen_pid_shim`) — `setenv` in
-    // `pre_exec` doesn't survive `execve` with an explicit envp, which
-    // `std::process::Command` always uses once `.env_clear()`/`.envs()` is
-    // called.
-    if !config.listen_fds.is_empty() {
-        let listen_fds = config.listen_fds.clone();
-        // Safety: place_fds_for_exec calls dup/dup2/fcntl/close. All operations
-        // happen between fork and exec in the child process only.
+    let listen_fds = config.listen_fds.clone();
+    if cfg!(target_os = "linux") || !listen_fds.is_empty() {
+        // Safety: pty-process wraps this hook after its session_leader hook.
+        // prctl, dup/dup2/fcntl/close via place_fds_for_exec are
+        // async-signal-safe. Runs between fork and exec in the child only.
         cmd = unsafe {
             cmd.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                {
+                    if libc::prctl(
+                        libc::PR_SET_PDEATHSIG,
+                        libc::SIGKILL as libc::c_ulong,
+                        0,
+                        0,
+                        0,
+                    ) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 socket::place_fds_for_exec(&listen_fds)?;
                 Ok(())
             })

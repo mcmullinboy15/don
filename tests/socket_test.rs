@@ -255,6 +255,85 @@ while True:
     });
 }
 
+// --- Integration test: Node can use the passed fd with server.listen({ fd }) ---
+
+#[test]
+fn integration_node_accepts_on_listen_fd() {
+    run_with_timeout(Duration::from_secs(15), async {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("[skip] node not available");
+            return;
+        }
+
+        let dir = TempDir::new("socket-node-accept");
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let script_path = dir.path().join("server.js");
+        std::fs::write(
+            &script_path,
+            r#"
+const http = require('http');
+const server = http.createServer((_req, res) => {
+  res.end('hello from node fd 3');
+});
+server.on('error', (err) => {
+  console.error(`${err.code || err.name}: ${err.message}`);
+  process.exit(1);
+});
+server.listen({ fd: 3 }, () => {
+  console.log('node listening fd=3');
+});
+setInterval(() => {}, 1000);
+"#,
+        )
+        .unwrap();
+
+        let script = script_path.to_str().unwrap().to_string();
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "node", &[&script])
+            .listen(&[&addr])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "node listening fd=3", Duration::from_secs(5)).await,
+            "timed out waiting for node to listen on fd 3. output: {}",
+            read_buf(&buf)
+        );
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response.contains("hello from node fd 3"),
+            "expected node response over inherited fd. response: {response}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- Integration test: socket stays bound during restart ---
 
 #[test]

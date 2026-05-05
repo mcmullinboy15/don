@@ -239,15 +239,16 @@ pub(crate) async fn start_service(
         em.debug_spawn(name, &cmd, &args);
     }
 
-    // Spawn the process. Force pipe mode when passing listen fds
-    // (pty-process doesn't expose pre_exec for fd placement).
+    // Spawn the process. Listen-fd services still use PTY mode when available;
+    // fd placement is handled in the spawn pre_exec hook for both PTY and pipe
+    // fallback paths.
     let (handle, child_output) = spawn_process(SpawnConfig {
         cmd: &cmd,
         args: &args,
         dir: Some(service_dir),
         env,
         pgid_file_path: Some(pgid_file_path),
-        force_pipe: !listen_fds.is_empty(),
+        force_pipe: false,
         listen_fds: listen_fds.to_vec(),
     })
     .await?;

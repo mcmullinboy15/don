@@ -10,11 +10,14 @@
 //! [`crate::process::listen_pid_shim`] (setenv from `pre_exec` doesn't
 //! survive `execve` with an explicit envp).
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 
 /// The first fd number for passed sockets (per systemd convention).
 const SD_LISTEN_FDS_START: i32 = 3;
+
+/// Hard cap for socket activation fds. This keeps fd placement
+/// allocation-free in the child-side `pre_exec` hook.
+const MAX_LISTEN_FDS: usize = 128;
 
 /// Place file descriptors at fd 3, 4, 5... for LISTEN_FDS.
 ///
@@ -34,29 +37,51 @@ pub(crate) fn place_fds_for_exec(source_fds: &[RawFd]) -> std::io::Result<()> {
         return Ok(());
     }
 
+    if source_fds.len() > MAX_LISTEN_FDS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many listen fds",
+        ));
+    }
+
+    let mut temp_fds = [-1; MAX_LISTEN_FDS];
+    let temp_start = SD_LISTEN_FDS_START + source_fds.len() as i32;
+
     // Pass 1: dup source fds to high temp fds to avoid collisions.
     // (A source fd might be 3 or 4, which we need as target positions.)
-    let mut temp_fds = Vec::with_capacity(source_fds.len());
-    for &src in source_fds {
-        let temp = unsafe { libc::dup(src) };
+    for (i, &src) in source_fds.iter().enumerate() {
+        let temp = unsafe { libc::fcntl(src, libc::F_DUPFD, temp_start) };
         if temp < 0 {
+            close_temp_fds(&temp_fds[..i]);
             return Err(std::io::Error::last_os_error());
         }
-        let temp = unsafe { OwnedFd::from_raw_fd(temp) };
-        temp_fds.push(temp);
+        temp_fds[i] = temp;
     }
 
     // Pass 2: dup2 temp fds to target positions (3, 4, 5...) and clear CLOEXEC.
-    for (i, temp) in temp_fds.iter().enumerate() {
+    for (i, &temp) in temp_fds[..source_fds.len()].iter().enumerate() {
         let target = SD_LISTEN_FDS_START + i as i32;
-        let result = unsafe { libc::dup2(temp.as_raw_fd(), target) };
+        let result = unsafe { libc::dup2(temp, target) };
         if result < 0 {
+            close_temp_fds(&temp_fds[..source_fds.len()]);
             return Err(std::io::Error::last_os_error());
         }
-        clear_cloexec(target)?;
+        if let Err(err) = clear_cloexec(target) {
+            close_temp_fds(&temp_fds[..source_fds.len()]);
+            return Err(err);
+        }
     }
 
+    close_temp_fds(&temp_fds[..source_fds.len()]);
     Ok(())
+}
+
+fn close_temp_fds(fds: &[RawFd]) {
+    for &fd in fds {
+        if fd >= 0 {
+            let _ = unsafe { libc::close(fd) };
+        }
+    }
 }
 
 /// Clear the FD_CLOEXEC flag on a file descriptor.
