@@ -100,7 +100,7 @@ async fn make_runner_inner(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -130,13 +130,13 @@ fn integration_service_receives_listen_env_vars() {
         let port = free_port();
         let addr = format!("127.0.0.1:{port}");
 
-        // Service prints its LISTEN_FDS, LISTEN_FDNAMES, LISTEN_PID, and its own
-        // $$ PID so the test can verify LISTEN_PID matches the child process.
+        // Service prints its socket activation env, including $$ PID so the
+        // test can verify LISTEN_PID matches the child process.
         let toml = ConfigBuilder::new()
             .add_custom_service(
                 "api",
                 "bash",
-                &["-c", "echo LISTEN_FDS=$LISTEN_FDS LISTEN_FDNAMES=$LISTEN_FDNAMES LISTEN_PID=$LISTEN_PID SELF_PID=$$ && sleep 60"],
+                &["-c", "echo LISTEN_FD=$LISTEN_FD LISTEN_FDS=$LISTEN_FDS LISTEN_FDNAMES=$LISTEN_FDNAMES LISTEN_PID=$LISTEN_PID SELF_PID=$$ && sleep 60"],
             )
             .listen(&[&addr])
             .ready_exec("true", &[])
@@ -157,6 +157,10 @@ fn integration_service_receives_listen_env_vars() {
         );
 
         let output = read_buf(&buf);
+        assert!(
+            output.contains("LISTEN_FD=3"),
+            "expected LISTEN_FD=3 for a single passed fd. output: {output}"
+        );
         assert!(
             output.contains(&format!("LISTEN_FDNAMES={addr}")),
             "expected LISTEN_FDNAMES={addr} in output. output: {output}"
@@ -255,7 +259,7 @@ while True:
     });
 }
 
-// --- Integration test: Node can use the passed fd with server.listen({ fd }) ---
+// --- Integration test: Node can use the passed fd from LISTEN_FD ---
 
 #[test]
 fn integration_node_accepts_on_listen_fd() {
@@ -279,14 +283,19 @@ fn integration_node_accepts_on_listen_fd() {
             r#"
 const http = require('http');
 const server = http.createServer((_req, res) => {
-  res.end('hello from node fd 3');
+  res.end('hello from node listen fd');
 });
 server.on('error', (err) => {
   console.error(`${err.code || err.name}: ${err.message}`);
   process.exit(1);
 });
-server.listen({ fd: 3 }, () => {
-  console.log('node listening fd=3');
+const fd = Number.parseInt(process.env.LISTEN_FD || '', 10);
+if (!Number.isInteger(fd)) {
+  console.error(`missing LISTEN_FD: ${process.env.LISTEN_FD || ''}`);
+  process.exit(1);
+}
+server.listen({ fd }, () => {
+  console.log(`node listening fd=${fd}`);
 });
 setInterval(() => {}, 1000);
 "#,
@@ -325,7 +334,7 @@ setInterval(() => {}, 1000);
             .unwrap()
             .unwrap();
         assert!(
-            response.contains("hello from node fd 3"),
+            response.contains("hello from node listen fd"),
             "expected node response over inherited fd. response: {response}"
         );
 

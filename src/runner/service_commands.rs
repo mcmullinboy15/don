@@ -753,6 +753,10 @@ impl Runner {
                 return;
             }
         };
+        if state == ServiceState::Failed && self.reap_exited_process_handle(name).await {
+            let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
+            return;
+        }
         if matches!(state, ServiceState::Lazy | ServiceState::Stopped) {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
@@ -788,5 +792,26 @@ impl Runner {
             reply,
             ServiceStopAction::RestartFull,
         );
+    }
+
+    async fn reap_exited_process_handle(&mut self, name: &str) -> bool {
+        let exited = match self.services.get_mut(name).and_then(|rs| rs.handle.as_mut()) {
+            Some(ServiceHandle::Process(process)) => match process.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) | Err(_) => false,
+            },
+            _ => false,
+        };
+        if !exited {
+            return false;
+        }
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.handle = None;
+            rs.stop_health_tracking();
+        }
+        if let Some(writer) = self.output_manager.service_writer(name) {
+            writer.close_follow_sinks().await;
+        }
+        true
     }
 }

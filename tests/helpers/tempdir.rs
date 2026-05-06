@@ -11,7 +11,16 @@ impl TempDir {
     /// Create a new temp directory under the system temp dir.
     /// The `name` is used for human-readable identification in the path.
     pub fn new(name: &str) -> Self {
-        let path = std::env::temp_dir()
+        let temp_root = if cfg!(target_os = "macos") {
+            // macOS expands the default per-user temp dir to a long
+            // /private/var/folders/... path when canonicalized. Don's API
+            // socket lives under this directory in tests, and Darwin Unix
+            // socket paths must fit in sockaddr_un.sun_path.
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let path = temp_root
             .join("don-integration-test")
             .join(name)
             .join(format!("{}", std::process::id()));

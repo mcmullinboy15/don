@@ -69,7 +69,9 @@ async fn spawn_runner(
     .unwrap();
     let socket_path = base_dir.join(".don").join("don.sock");
     let handle = tokio::spawn(async move {
-        let _ = runner.run().await;
+        if let Err(err) = runner.run().await {
+            eprintln!("runner failed: {err}");
+        }
     });
     (socket_path, shutdown_tx, handle)
 }

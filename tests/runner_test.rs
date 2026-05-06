@@ -1279,9 +1279,11 @@ while True: time.sleep(60)\n\
             })
             .await
             .unwrap();
+        let restart_result = reply_rx.await.unwrap();
         assert!(
-            reply_rx.await.unwrap().is_ok(),
-            "manual db restart should succeed"
+            restart_result.is_ok(),
+            "manual db restart should succeed, got {restart_result:?}. output: {}",
+            read_buf(&buf)
         );
 
         wait_for_substr(&buf, "api: starting", Duration::from_secs(15)).await;
