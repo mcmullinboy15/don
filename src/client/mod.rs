@@ -112,6 +112,15 @@ impl Client {
         self.control("/restart/", name).await
     }
 
+    /// `POST /shutdown` — gracefully stop the daemon and all running services.
+    pub async fn shutdown(&self) -> Result<(), ClientError> {
+        let (status, body) = self.request("POST", "/shutdown", false).await?;
+        if status == 204 {
+            return Ok(());
+        }
+        Err(classify_error(status, &body))
+    }
+
     /// `POST /run-pending` — trigger all tasks in PendingRun state.
     pub async fn run_pending(&self) -> Result<(), ClientError> {
         let (status, body) = self.request("POST", "/run-pending", false).await?;

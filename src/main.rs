@@ -51,6 +51,9 @@ enum Commands {
         /// Run only services/tasks in this profile
         #[arg(short, long)]
         profile: Option<String>,
+        /// Start don in the background and exit once the daemon is launching
+        #[arg(short = 'd', long, conflicts_with = "name")]
+        detached: bool,
         /// Name of a stopped service to start (omit to start the daemon)
         name: Option<String>,
         /// Force pipe-mode output instead of the TUI, even on a TTY. Useful
@@ -66,10 +69,10 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         log_filter: Vec<String>,
     },
-    /// Stop a running service
+    /// Stop the daemon, or stop one running service when a name is given
     Stop {
-        /// Name of the service to stop
-        name: String,
+        /// Name of the service to stop (omit to stop the daemon)
+        name: Option<String>,
     },
     /// Restart a running service
     Restart {
@@ -186,18 +189,23 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Start {
             profile,
             name: None,
+            detached,
             no_tui,
             log_filter,
         } => {
-            match run_start(
-                &config_path,
-                profile.as_deref(),
-                verbose,
-                no_tui,
-                log_filter,
-            )
-            .await
-            {
+            let result = if detached {
+                run_start_detached(&config_path, profile.as_deref(), verbose, log_filter).await
+            } else {
+                run_start(
+                    &config_path,
+                    profile.as_deref(),
+                    verbose,
+                    no_tui,
+                    log_filter,
+                )
+                .await
+            };
+            match result {
                 Ok(()) => 0,
                 Err(e) => {
                     errln(e);
@@ -208,9 +216,10 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Start {
             name: Some(name), ..
         } => run_client(&config_path, |c| async move { c.start(&name).await }).await,
-        Commands::Stop { name } => {
+        Commands::Stop { name: Some(name) } => {
             run_client(&config_path, |c| async move { c.stop(&name).await }).await
         }
+        Commands::Stop { name: None } => run_stop_daemon(&config_path).await,
         Commands::Restart { name } => {
             run_client(&config_path, |c| async move { c.restart(&name).await }).await
         }
@@ -426,6 +435,47 @@ where
             errln(e);
             1
         }
+    }
+}
+
+async fn run_stop_daemon(config_path: &Path) -> i32 {
+    let base = base_dir(config_path);
+    let client = Client::new(&base);
+    if let Err(e) = client.shutdown().await {
+        errln(e);
+        return 1;
+    }
+
+    let socket_path = base.join(".don").join("don.sock");
+    match wait_for_daemon_socket_gone(&socket_path, std::time::Duration::from_secs(60)).await {
+        Ok(()) => {
+            println!("don daemon stopped");
+            0
+        }
+        Err(e) => {
+            errln(e);
+            1
+        }
+    }
+}
+
+async fn wait_for_daemon_socket_gone(
+    socket_path: &Path,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let client = Client::with_socket_path(socket_path.to_path_buf());
+    let start = tokio::time::Instant::now();
+    loop {
+        if let Err(ClientError::NotRunning { .. }) = client.status(false).await {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "shutdown requested, but don daemon did not stop within {}s",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -879,6 +929,153 @@ fn suggest_log_filter_typo(input: &str, candidates: &std::collections::HashSet<&
     }
     best.map(|(n, _)| format!(" — did you mean '{n}'?"))
         .unwrap_or_default()
+}
+
+async fn run_start_detached(
+    config_path: &Path,
+    profile: Option<&str>,
+    verbose: bool,
+    log_filter: Vec<String>,
+) -> Result<(), String> {
+    let base = base_dir(config_path);
+    let client = Client::new(&base);
+    match client.status(false).await {
+        Ok(_) => return Err("don daemon is already running".to_string()),
+        Err(ClientError::NotRunning { .. }) => {}
+        Err(e) => return Err(format!("failed to check daemon status: {e}")),
+    }
+
+    let log_path = base.join(".don").join("logs").join("detached.log");
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    append_detached_log_header(&log_path)?;
+
+    let exe = std::env::current_exe().map_err(|e| format!("failed to locate don binary: {e}"))?;
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("failed to open {}: {e}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|e| format!("failed to clone {}: {e}", log_path.display()))?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--config")
+        .arg(config_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr));
+    if verbose {
+        cmd.arg("--verbose");
+    }
+    cmd.arg("start").arg("--no-tui");
+    if let Some(profile_name) = profile {
+        cmd.arg("--profile").arg(profile_name);
+    }
+    if !log_filter.is_empty() {
+        cmd.arg("--log-filter").arg(log_filter.join(","));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Run the daemon in a new session so terminal-generated signals for
+        // the parent shell do not also hit the detached don process.
+        unsafe {
+            cmd.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn detached don: {e}"))?;
+    let pid = child.id();
+    wait_for_detached_start(&mut child, &base, &log_path, pid).await
+}
+
+fn append_detached_log_header(log_path: &Path) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| format!("failed to open {}: {e}", log_path.display()))?;
+    writeln!(file, "\n--- don start --detached ---")
+        .map_err(|e| format!("failed to write {}: {e}", log_path.display()))?;
+    Ok(())
+}
+
+async fn wait_for_detached_start(
+    child: &mut std::process::Child,
+    base: &Path,
+    log_path: &Path,
+    pid: u32,
+) -> Result<(), String> {
+    let client = Client::new(base);
+    let start = tokio::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(5);
+
+    loop {
+        match client.status(false).await {
+            Ok(_) => {
+                println!(
+                    "don started in background (pid {pid}, log: {})",
+                    log_path.display()
+                );
+                return Ok(());
+            }
+            Err(ClientError::NotRunning { .. }) => {}
+            Err(_) => {}
+        }
+
+        match child
+            .try_wait()
+            .map_err(|e| format!("failed to check detached don process: {e}"))?
+        {
+            Some(status) => {
+                let status_text = match status.code() {
+                    Some(code) => format!("exit code {code}"),
+                    None => "terminated by signal".to_string(),
+                };
+                let tail = read_log_tail(log_path, 20);
+                let mut msg = format!(
+                    "detached don exited before the daemon was ready ({status_text}); log: {}",
+                    log_path.display()
+                );
+                if !tail.is_empty() {
+                    msg.push_str("\n\n");
+                    msg.push_str(&tail);
+                }
+                return Err(msg);
+            }
+            None if start.elapsed() >= timeout => {
+                println!(
+                    "don started in background (pid {pid}, still initializing; log: {})",
+                    log_path.display()
+                );
+                return Ok(());
+            }
+            None => {}
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn read_log_tail(path: &Path, max_lines: usize) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let mut lines: Vec<&str> = content.lines().rev().take(max_lines).collect();
+    lines.reverse();
+    lines.join("\n")
 }
 
 async fn run_start(
