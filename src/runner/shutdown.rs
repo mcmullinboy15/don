@@ -233,6 +233,9 @@ impl Runner {
                         })
                         .collect();
                     for name in names {
+                        if let Some(rs) = self.services.get_mut(&name) {
+                            rs.pgid = None;
+                        }
                         self.set_service_state(&name, ServiceState::Stopped);
                     }
                     join_set.abort_all();
@@ -251,6 +254,9 @@ impl Runner {
                 {
                     Ok(Some(Ok(name))) => {
                         stopping_pgids.remove(&name);
+                        if let Some(rs) = self.services.get_mut(&name) {
+                            rs.pgid = None;
+                        }
                         self.set_service_state(&name, ServiceState::Stopped);
                         self.drain_service_output(&name).await;
                         remaining -= 1;

@@ -3,7 +3,7 @@
 //! Derived from the runner's current task state at open time: "run all
 //! pending tasks" if any are in `PendingRun`, plus a per-task run action
 //! for every non-running task. Service lifecycle actions (start/stop/
-//! restart) live on the status overlay instead — they're tied to a
+//! restart) live on the services overlay instead — they're tied to a
 //! specific highlighted service and keyed by state.
 //!
 //! The palette snapshots the list on open and holds it until close — state

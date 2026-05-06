@@ -25,7 +25,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
 
-use super::app::{App, OverlayItem, StatusCounts, ViewMode};
+use super::app::{App, StatusCounts, ViewMode};
 use super::filter::{FilterFocus, FilterRow, FilterState};
 use super::palette::{Action, ActionPalette};
 use crate::runner::{ServiceState, TaskItemState};
@@ -162,10 +162,10 @@ fn draw_palette_modal(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(bar, layout[1]);
 }
 
-/// Render the full-screen status overlay — a table of every known service
-/// and task with its current state, sorted errors → running → exited → lazy
-/// then alphabetical within each bucket. Arrow keys move a highlight; the
-/// render path scrolls so the highlighted row stays visible.
+/// Render the full-screen services overlay — a table of every known service
+/// with its current state, sorted errors → running → exited → lazy then
+/// alphabetical within each bucket. Arrow keys move a highlight; the render
+/// path scrolls so the highlighted row stays visible.
 fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     if area.height == 0 || area.width == 0 {
@@ -175,7 +175,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(
-            " don status — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] hard restart  [/] filter  [esc] clear filter/dismiss ",
+            " don services — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] hard restart  [/] filter  [esc] clear filter/dismiss ",
         );
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -190,7 +190,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let table_area = layout[0];
     let bar_area = layout[1];
 
-    let header = Row::new(vec!["KIND", "NAME", "STATE"]).style(
+    let header = Row::new(vec!["NAME", "PID", "STATE"]).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(Color::Cyan),
@@ -223,28 +223,21 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
         .skip(scroll)
         .take(body_height)
         .map(|(i, item)| {
-            let (kind, name, state_cell) = match item {
-                OverlayItem::Service { name, state } => (
-                    "service",
-                    name.clone(),
-                    Cell::from(service_state_label(*state))
-                        .style(Style::default().fg(service_state_color(*state))),
-                ),
-                OverlayItem::Task { name, state } => (
-                    "task",
-                    name.clone(),
-                    Cell::from(task_state_label(*state))
-                        .style(Style::default().fg(task_state_color(*state))),
-                ),
-            };
+            let name = item.name.clone();
+            let pid = item
+                .pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let state_cell = Cell::from(service_state_label(item.state))
+                .style(Style::default().fg(service_state_color(item.state)));
             let name_style = name_colors
                 .get(&name)
                 .copied()
                 .map(|color| Style::default().fg(color))
                 .unwrap_or_default();
             let row = Row::new(vec![
-                Cell::from(kind).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(name).style(name_style),
+                Cell::from(pid).style(Style::default().fg(Color::DarkGray)),
                 state_cell,
             ]);
             if i == highlight {
@@ -258,9 +251,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let table = Table::new(
         visible,
         [
-            Constraint::Length(9),
-            Constraint::Percentage(40),
-            Constraint::Percentage(60),
+            Constraint::Percentage(45),
+            Constraint::Length(10),
+            Constraint::Percentage(55),
         ],
     )
     .header(header);
@@ -289,7 +282,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
         spans.push(dim(if has_query {
             "no matches".to_string()
         } else {
-            "(no services or tasks)".to_string()
+            "(no services)".to_string()
         }));
     } else {
         let scroll_hint = if showing_more_above || showing_more_below {
@@ -483,7 +476,7 @@ fn normal_bar_line(
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
     }
-    spans.push(dim("  [t] tasks  [s] status"));
+    spans.push(dim("  [t] tasks  [s] services"));
     if verbose_enabled {
         spans.push(separator());
         spans.push(dim("verbose"));
@@ -717,19 +710,6 @@ fn service_state_color(state: ServiceState) -> Color {
         // Dim red: same family as Failed but visually quieter, reflecting
         // that it's a downstream casualty, not the root cause.
         ServiceState::DependencyFailed => Color::Rgb(150, 60, 60),
-    }
-}
-
-fn task_state_label(state: TaskItemState) -> &'static str {
-    match state {
-        TaskItemState::Pending => "pending",
-        TaskItemState::Building => "building",
-        TaskItemState::Running => "running",
-        TaskItemState::Completed => "completed",
-        TaskItemState::Skipped => "skipped",
-        TaskItemState::Failed => "failed",
-        TaskItemState::DependencyFailed => "dep failed",
-        TaskItemState::PendingRun => "pending_run",
     }
 }
 
@@ -972,7 +952,7 @@ mod tests {
         assert!(text.contains("shutting down"));
         assert!(!text.contains("[/] logs"));
         assert!(!text.contains("[t] tasks"));
-        assert!(!text.contains("[s] status"));
+        assert!(!text.contains("[s] services"));
     }
 
     #[test]

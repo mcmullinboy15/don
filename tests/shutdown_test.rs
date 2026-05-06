@@ -363,7 +363,7 @@ fn shutdown_broadcasts_stopping_before_stopped() {
                 .await
                 .unwrap()
                 .unwrap();
-            if let RunnerEvent::ServiceStateChanged { name, state } = event
+            if let RunnerEvent::ServiceStateChanged { name, state, .. } = event
                 && name == "api"
                 && matches!(state, ServiceState::Stopping | ServiceState::Stopped)
             {

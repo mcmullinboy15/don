@@ -599,6 +599,9 @@ impl Runner {
 
         match result {
             Ok(()) => {
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.pgid = None;
+                }
                 self.set_service_state(name, ServiceState::Stopped);
                 let next_result = match stop_action {
                     ServiceStopAction::None => Ok(()),
@@ -622,6 +625,9 @@ impl Runner {
                 }
             }
             Err(message) => {
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.pgid = None;
+                }
                 self.set_service_state(name, ServiceState::Failed);
                 self.output_manager.service_error_event(name, &message);
                 if let Some(reply) = reply {

@@ -512,7 +512,11 @@ pub struct VerboseInfo {
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
     /// A service changed state.
-    ServiceStateChanged { name: String, state: ServiceState },
+    ServiceStateChanged {
+        name: String,
+        state: ServiceState,
+        pid: Option<i32>,
+    },
     /// A task changed state.
     TaskStateChanged { name: String, state: TaskItemState },
     /// A rebuild cycle completed (file watch triggered).
@@ -747,9 +751,11 @@ impl Runner {
             .get_mut(name)
             .and_then(|rs| rs.set_state(new_state));
         if let Some(state) = changed {
+            let pid = self.services.get(name).and_then(|rs| rs.pgid);
             let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
                 name: name.to_string(),
                 state,
+                pid,
             });
         }
     }

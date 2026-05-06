@@ -31,6 +31,10 @@ pub(crate) struct RuntimeService {
     pub resolved: crate::config::service::ResolvedService,
     /// Handle to the running process (if spawned).
     pub handle: Option<ServiceHandle>,
+    /// Process group ID for the current local process. This is equal to the
+    /// child PID for services spawned by don. Docker services do not expose a
+    /// local PID here.
+    pub pgid: Option<i32>,
     /// Output reader task for the current process. It must drain before
     /// output sinks are torn down or final shutdown logs can be lost.
     pub output_worker: Option<tokio::task::JoinHandle<()>>,
@@ -93,6 +97,7 @@ impl RuntimeService {
             state: initial_state,
             resolved,
             handle: None,
+            pgid: None,
             output_worker: None,
             osc_sink: None,
             attach_lock: None,

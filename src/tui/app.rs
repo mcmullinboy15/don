@@ -28,7 +28,7 @@ pub(crate) enum ViewMode {
     Filter,
     /// Tasks palette — typing filters tasks, Enter dispatches.
     Palette,
-    /// Full-screen status overlay (alternate screen). Arrow keys move a
+    /// Full-screen services overlay (alternate screen). Arrow keys move a
     /// highlight; Enter toggles start/stop on the selected service, `r`
     /// restarts it, `R` hard-restarts it, `Esc` dismisses.
     Overlay,
@@ -38,20 +38,19 @@ pub(crate) enum ViewMode {
     Form,
 }
 
-/// A row in the status overlay — a service or task with its current state.
+/// A row in the services overlay.
 /// Exposed so the render path and the key handler agree on which row is
 /// highlighted at `overlay_highlight`.
 #[derive(Debug, Clone)]
-pub(crate) enum OverlayItem {
-    Service { name: String, state: ServiceState },
-    Task { name: String, state: TaskItemState },
+pub(crate) struct OverlayItem {
+    pub(crate) name: String,
+    pub(crate) state: ServiceState,
+    pub(crate) pid: Option<i32>,
 }
 
 impl OverlayItem {
     pub(crate) fn name(&self) -> &str {
-        match self {
-            Self::Service { name, .. } | Self::Task { name, .. } => name.as_str(),
-        }
+        self.name.as_str()
     }
 
     /// Sort bucket: actionable rows first, settled rows last. Putting
@@ -59,25 +58,15 @@ impl OverlayItem {
     /// so the user sees the thing they need to look at, not the stranded
     /// dependents.
     fn sort_bucket(&self) -> u8 {
-        match self {
-            Self::Service { state, .. } => match state {
-                ServiceState::Failed | ServiceState::Unhealthy => 0,
-                ServiceState::DependencyFailed => 1,
-                ServiceState::Pending | ServiceState::Building | ServiceState::Starting => 2,
-                ServiceState::Running => 3,
-                ServiceState::Ready => 4,
-                ServiceState::Stopping => 5,
-                ServiceState::Stopped => 6,
-                ServiceState::Lazy => 7,
-            },
-            Self::Task { state, .. } => match state {
-                TaskItemState::Failed => 0,
-                TaskItemState::DependencyFailed => 1,
-                TaskItemState::Pending | TaskItemState::Building | TaskItemState::Running => 2,
-                TaskItemState::PendingRun => 7,
-                TaskItemState::Completed => 8,
-                TaskItemState::Skipped => 9,
-            },
+        match self.state {
+            ServiceState::Failed | ServiceState::Unhealthy => 0,
+            ServiceState::DependencyFailed => 1,
+            ServiceState::Pending | ServiceState::Building | ServiceState::Starting => 2,
+            ServiceState::Running => 3,
+            ServiceState::Ready => 4,
+            ServiceState::Stopping => 5,
+            ServiceState::Stopped => 6,
+            ServiceState::Lazy => 7,
         }
     }
 }
@@ -168,11 +157,12 @@ pub(crate) struct App {
     /// action palette reads it at open time. Seeded with every service name
     /// in `ServiceState::Pending` so the bar shows `0/N ready` from frame 1.
     pub(crate) services_state: HashMap<String, ServiceState>,
+    pub(crate) service_pids: HashMap<String, Option<i32>>,
     pub(crate) tasks_state: HashMap<String, TaskItemState>,
-    /// Highlighted row index in the status overlay. Reset to 0 each time the
+    /// Highlighted row index in the services overlay. Reset to 0 each time the
     /// overlay opens. The render path scrolls so this row stays visible.
     pub(crate) overlay_highlight: usize,
-    /// Fuzzy-filter query applied to the status overlay rows. Empty = show
+    /// Fuzzy-filter query applied to the services overlay rows. Empty = show
     /// everything. Activated via `/` inside the overlay; `overlay_filtering`
     /// tracks whether key input is currently editing the query.
     pub(crate) overlay_query: String,
@@ -204,6 +194,8 @@ impl App {
             .iter()
             .map(|n| (n.clone(), ServiceState::Pending))
             .collect();
+        let service_pids: HashMap<String, Option<i32>> =
+            service_names.iter().map(|n| (n.clone(), None)).collect();
         let tasks_state: HashMap<String, TaskItemState> = task_names
             .iter()
             .map(|n| (n.clone(), TaskItemState::Pending))
@@ -233,6 +225,7 @@ impl App {
             palette: ActionPalette::default(),
             spinner_frame: 0,
             services_state,
+            service_pids,
             tasks_state,
             overlay_highlight: 0,
             overlay_query: String::new(),
@@ -268,26 +261,18 @@ impl App {
         self.filter.passes(name)
     }
 
-    /// Sorted rows for the status overlay: errors → running → exited → lazy,
-    /// alphabetical within a bucket. Services and tasks are interleaved by
-    /// the same sort; kind is preserved per row. When `overlay_query` is
-    /// non-empty, rows are narrowed by fuzzy name-match before sorting.
+    /// Sorted rows for the services overlay: errors → running → exited →
+    /// lazy, alphabetical within a bucket. When `overlay_query` is non-empty,
+    /// rows are narrowed by fuzzy name-match before sorting.
     pub(crate) fn overlay_items(&self) -> Vec<OverlayItem> {
         let mut items: Vec<OverlayItem> = self
             .services_state
             .iter()
-            .map(|(name, state)| OverlayItem::Service {
+            .map(|(name, state)| OverlayItem {
                 name: name.clone(),
                 state: *state,
+                pid: self.service_pids.get(name).copied().flatten(),
             })
-            .chain(
-                self.tasks_state
-                    .iter()
-                    .map(|(name, state)| OverlayItem::Task {
-                        name: name.clone(),
-                        state: *state,
-                    }),
-            )
             .collect();
         if !self.overlay_query.is_empty() {
             let names: Vec<String> = items.iter().map(|i| i.name().to_string()).collect();
@@ -305,8 +290,14 @@ impl App {
 
     /// Apply a runner-emitted state change. Returns `true` when counts
     /// changed (so the main loop can limit redraws to interesting events).
-    pub(crate) fn apply_service_state(&mut self, name: String, state: ServiceState) {
-        self.services_state.insert(name, state);
+    pub(crate) fn apply_service_runtime(
+        &mut self,
+        name: String,
+        state: ServiceState,
+        pid: Option<i32>,
+    ) {
+        self.services_state.insert(name.clone(), state);
+        self.service_pids.insert(name, pid);
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
     }
 
@@ -472,20 +463,20 @@ mod tests {
             false,
         );
         assert_eq!(app.counts.services_ready, 0);
-        app.apply_service_state("api".into(), ServiceState::Ready);
+        app.apply_service_runtime("api".into(), ServiceState::Ready, None);
         assert_eq!(app.counts.services_ready, 1);
-        app.apply_service_state("db".into(), ServiceState::Ready);
+        app.apply_service_runtime("db".into(), ServiceState::Ready, None);
         assert_eq!(app.counts.services_ready, 2);
-        app.apply_service_state("db".into(), ServiceState::Stopping);
+        app.apply_service_runtime("db".into(), ServiceState::Stopping, None);
         assert_eq!(app.counts.services_ready, 1);
         assert_eq!(app.counts.services_active, 1);
-        app.apply_service_state("api".into(), ServiceState::Failed);
+        app.apply_service_runtime("api".into(), ServiceState::Failed, None);
         assert_eq!(app.counts.services_ready, 0);
         assert_eq!(app.counts.services_failed, 1);
     }
 
     #[test]
-    fn overlay_items_prioritize_actionable_states() {
+    fn overlay_items_prioritize_service_states_and_exclude_tasks() {
         struct Case {
             name: &'static str,
             services: Vec<(&'static str, ServiceState)>,
@@ -515,19 +506,13 @@ mod tests {
             ],
             want: vec![
                 "svc-failed",
-                "task-failed",
                 "svc-dep",
-                "task-dep",
                 "svc-building",
-                "task-building",
                 "svc-running",
                 "svc-ready",
                 "svc-stopping",
                 "svc-stopped",
                 "svc-lazy",
-                "task-pending-run",
-                "task-completed",
-                "task-skipped",
             ],
         }];
 
@@ -552,7 +537,7 @@ mod tests {
                 false,
             );
             for (name, state) in case.services {
-                app.apply_service_state(name.to_string(), state);
+                app.apply_service_runtime(name.to_string(), state, None);
             }
             for (name, state) in case.tasks {
                 app.apply_task_state(name.to_string(), state);
@@ -562,6 +547,26 @@ mod tests {
             let got: Vec<&str> = items.iter().map(OverlayItem::name).collect();
             assert_eq!(got, case.want, "case: {}", case.name);
         }
+    }
+
+    #[test]
+    fn overlay_items_include_service_pid() {
+        let mut app = App::new(
+            vec!["api".into()],
+            vec![],
+            vec![],
+            HashMap::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+
+        app.apply_service_runtime("api".into(), ServiceState::Running, Some(12_345));
+
+        let items = app.overlay_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name(), "api");
+        assert_eq!(items[0].pid, Some(12_345));
     }
 
     #[test]

@@ -66,7 +66,7 @@ use backend::FixedBottomBackend;
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
 use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState, TerminalRequest};
-use app::{App, OverlayItem, ViewMode};
+use app::{App, ViewMode};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
 use palette::ActionKind;
@@ -514,8 +514,8 @@ fn enter_shutdown_mode(
 /// Apply one [`RunnerEvent`] to the cached state on [`App`].
 fn apply_runner_event(event: RunnerEvent, app: &mut App) {
     match event {
-        RunnerEvent::ServiceStateChanged { name, state } => {
-            app.apply_service_state(name, state);
+        RunnerEvent::ServiceStateChanged { name, state, pid } => {
+            app.apply_service_runtime(name, state, pid);
         }
         RunnerEvent::TaskStateChanged { name, state } => {
             app.apply_task_state(name, state);
@@ -1024,22 +1024,21 @@ fn handle_overlay_key(
 }
 
 /// Build the Start/Stop command for the highlighted row, if it's an
-/// actionable service. Returns `None` for tasks, in-flight services, or
-/// when no row is highlighted.
+/// actionable service. Returns `None` for in-flight services or when no row
+/// is highlighted.
 fn overlay_toggle_command(app: &App) -> Option<OverlayCommand> {
     let items = app.overlay_items();
     let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
     let item = items.get(idx)?;
-    let OverlayItem::Service { name, state } = item else {
-        return None;
-    };
-    match state {
+    match item.state {
         ServiceState::Ready | ServiceState::Running | ServiceState::Unhealthy => {
-            Some(overlay_stop_command(name.clone()))
+            Some(overlay_stop_command(item.name.clone()))
         }
-        ServiceState::Stopped | ServiceState::Lazy => Some(overlay_start_command(name.clone())),
+        ServiceState::Stopped | ServiceState::Lazy => {
+            Some(overlay_start_command(item.name.clone()))
+        }
         ServiceState::Failed | ServiceState::DependencyFailed => {
-            Some(overlay_restart_command(name.clone()))
+            Some(overlay_restart_command(item.name.clone()))
         }
         ServiceState::Pending
         | ServiceState::Building
@@ -1053,16 +1052,13 @@ fn highlighted_service_restart_command(app: &App) -> Option<OverlayCommand> {
     let items = app.overlay_items();
     let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
     let item = items.get(idx)?;
-    let OverlayItem::Service { name, state } = item else {
-        return None;
-    };
-    match state {
+    match item.state {
         ServiceState::Ready
         | ServiceState::Running
         | ServiceState::Unhealthy
         | ServiceState::Failed
         | ServiceState::DependencyFailed
-        | ServiceState::Stopped => Some(overlay_restart_command(name.clone())),
+        | ServiceState::Stopped => Some(overlay_restart_command(item.name.clone())),
         _ => None,
     }
 }
@@ -1072,17 +1068,14 @@ fn highlighted_service_hard_restart_command(app: &App) -> Option<OverlayCommand>
     let items = app.overlay_items();
     let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
     let item = items.get(idx)?;
-    let OverlayItem::Service { name, state } = item else {
-        return None;
-    };
-    match state {
+    match item.state {
         ServiceState::Ready
         | ServiceState::Running
         | ServiceState::Unhealthy
         | ServiceState::Failed
         | ServiceState::DependencyFailed
         | ServiceState::Stopped
-        | ServiceState::Lazy => Some(overlay_hard_restart_command(name.clone())),
+        | ServiceState::Lazy => Some(overlay_hard_restart_command(item.name.clone())),
         _ => None,
     }
 }
@@ -1583,7 +1576,7 @@ mod tests {
             None,
             false,
         );
-        app.apply_service_state("api".to_string(), state);
+        app.apply_service_runtime("api".to_string(), state, None);
         app
     }
 
