@@ -198,6 +198,10 @@ async fn follow_logs(state: Arc<ApiState>, name: String, last: usize) -> Respons
 struct RunTaskBody {
     #[serde(default)]
     params: HashMap<String, String>,
+    #[serde(default)]
+    wait: bool,
+    #[serde(default)]
+    wait_timeout: Option<String>,
 }
 
 /// `POST /run/:name` — run a specific task by name, bypassing auto_run.
@@ -208,13 +212,16 @@ async fn post_run_task(
     Path(name): Path<String>,
     body: Option<Json<RunTaskBody>>,
 ) -> Response {
-    let params = body.map(|Json(b)| b.params).unwrap_or_default();
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let wait = body.wait || body.wait_timeout.is_some();
     let (tx, rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(RunnerCommand::RunTask {
             name: name.clone(),
-            params,
+            params: body.params,
+            wait,
+            wait_timeout: body.wait_timeout,
             reply: tx,
         })
         .await
@@ -222,7 +229,12 @@ async fn post_run_task(
     {
         return runner_unavailable();
     }
-    map_command_reply(&name, rx.await).await
+    let failed_status = if wait {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    map_command_reply(&name, rx.await, failed_status).await
 }
 
 /// Shared command-reply-to-response mapping, shared between `post_run_task`
@@ -231,6 +243,7 @@ async fn post_run_task(
 async fn map_command_reply(
     name: &str,
     reply: Result<Result<(), CommandError>, oneshot::error::RecvError>,
+    failed_status: StatusCode,
 ) -> Response {
     match reply {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
@@ -246,8 +259,11 @@ async fn map_command_reply(
         Ok(Err(e @ CommandError::InvalidParams { .. })) => {
             (StatusCode::BAD_REQUEST, Json(error_body(&e.to_string()))).into_response()
         }
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(Err(e @ CommandError::Failed { .. })) => {
+            (failed_status, Json(error_body(&e.to_string()))).into_response()
+        }
+        Ok(Err(e @ CommandError::TimedOut { .. })) => (
+            StatusCode::REQUEST_TIMEOUT,
             Json(error_body(&e.to_string())),
         )
             .into_response(),
@@ -347,7 +363,7 @@ where
     {
         return runner_unavailable();
     }
-    map_command_reply(name, rx.await).await
+    map_command_reply(name, rx.await, StatusCode::INTERNAL_SERVER_ERROR).await
 }
 
 fn runner_unavailable() -> Response {

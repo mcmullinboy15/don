@@ -3,9 +3,10 @@ use super::task;
 use super::task_worker::{TaskRunMode, TaskRunPrepared, TaskWorkerContext, run_task_worker};
 use super::{
     CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
-    TaskItemState, TaskRunIntent, resolve_task_params,
+    TaskItemState, TaskRunIntent, TaskRunWaiter, resolve_task_params,
 };
 use crate::config::TaskAutoRun;
+use crate::duration::parse_duration;
 use crate::task_state::TaskState;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
@@ -18,7 +19,7 @@ impl Runner {
         params: HashMap<String, String>,
         mode: TaskRunMode,
         intent: TaskRunIntent,
-    ) -> Result<(), CommandError> {
+    ) -> Result<u64, CommandError> {
         let Some(rt) = self.tasks.get_mut(name) else {
             return Err(CommandError::UnknownTask {
                 name: name.to_string(),
@@ -59,7 +60,7 @@ impl Runner {
                 .await;
         });
         rt.run_worker = Some(worker);
-        Ok(())
+        Ok(op_id)
     }
 
     pub(in crate::runner) async fn handle_task_run_prepared(
@@ -257,6 +258,14 @@ impl Runner {
                             .await;
                     }
                     TaskRunIntent::Background => {
+                        if let Some(rt) = self.tasks.get_mut(name)
+                            && let Some(waiter) = rt.run_waiter.take()
+                        {
+                            waiter.complete(Err(CommandError::Failed {
+                                name: name.to_string(),
+                                message: message.clone(),
+                            }));
+                        }
                         let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
                             name: name.to_string(),
                             success: false,
@@ -532,8 +541,14 @@ impl Runner {
             self.stop_task_pgid(name, pgid).await?;
         }
 
-        self.spawn_task_rerun(name, &task_cfg, &last_params, "restarting (manual trigger)")
-            .await;
+        self.spawn_task_rerun(
+            name,
+            &task_cfg,
+            &last_params,
+            "restarting (manual trigger)",
+            None,
+        )
+        .await;
         Ok(())
     }
 
@@ -619,6 +634,7 @@ impl Runner {
             &task_cfg,
             &HashMap::new(),
             "re-running (file changed)",
+            None,
         )
         .await;
     }
@@ -637,6 +653,7 @@ impl Runner {
         task_cfg: &crate::config::Task,
         params: &HashMap<String, String>,
         start_message: &str,
+        wait_reply: Option<(oneshot::Sender<CommandResult>, Option<String>)>,
     ) {
         if task_cfg.terminal.is_foreground() && self.is_another_foreground_task_running(name) {
             if let Some(rt) = self.tasks.get_mut(name) {
@@ -646,10 +663,22 @@ impl Runner {
             self.set_task_state(name, TaskItemState::PendingRun);
             self.output_manager
                 .service_event(name, "pending — another foreground task owns the terminal");
+            if let Some(reply) = wait_reply {
+                let _ = reply.0.send(Err(CommandError::InvalidState {
+                    name: name.to_string(),
+                    message: "another foreground task owns the terminal".to_string(),
+                }));
+            }
             return;
         }
 
         if let Some(rt) = self.tasks.get_mut(name) {
+            if let Some(waiter) = rt.run_waiter.take() {
+                waiter.complete(Err(CommandError::Failed {
+                    name: name.to_string(),
+                    message: "task run was superseded".to_string(),
+                }));
+            }
             rt.last_params = params.clone();
             rt.set_needs_run_now(true);
         }
@@ -667,20 +696,85 @@ impl Runner {
 
         self.output_manager
             .service_debug_event(name, "spawning process...");
-        if let Err(e) = self.spawn_task_worker(
+        match self.spawn_task_worker(
             name,
             task_cfg.clone(),
             params.clone(),
             TaskRunMode::Triggered,
             TaskRunIntent::Background,
         ) {
-            self.set_task_state(name, TaskItemState::Failed);
-            self.output_manager
-                .service_error_event(name, &format!("failed to start: {e}"));
-            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+            Ok(generation) => {
+                if let Some((reply, timeout)) = wait_reply {
+                    self.register_task_run_waiter(name, generation, reply, timeout);
+                }
+            }
+            Err(e) => {
+                self.set_task_state(name, TaskItemState::Failed);
+                self.output_manager
+                    .service_error_event(name, &format!("failed to start: {e}"));
+                if let Some((reply, _)) = wait_reply {
+                    let _ = reply.send(Err(CommandError::Failed {
+                        name: name.to_string(),
+                        message: format!("failed to start: {e}"),
+                    }));
+                }
+                let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                    name: name.to_string(),
+                    success: false,
+                });
+            }
+        }
+    }
+
+    fn register_task_run_waiter(
+        &mut self,
+        name: &str,
+        generation: u64,
+        reply: oneshot::Sender<CommandResult>,
+        timeout: Option<String>,
+    ) {
+        let timeout_task = timeout.as_ref().and_then(|timeout| {
+            let duration = parse_duration(timeout).ok()?;
+            let cmd_tx = self.internal_tx.clone();
+            let name = name.to_string();
+            let timeout = timeout.clone();
+            Some(tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                let _ = cmd_tx
+                    .send(RunnerInternalCommand::TaskRunWaitTimedOut {
+                        name,
+                        generation,
+                        timeout,
+                    })
+                    .await;
+            }))
+        });
+        if let Some(rt) = self.tasks.get_mut(name) {
+            rt.run_waiter = Some(TaskRunWaiter::new(generation, reply, timeout_task));
+        }
+    }
+
+    pub(in crate::runner) fn handle_task_run_wait_timeout(
+        &mut self,
+        name: &str,
+        generation: u64,
+        timeout: &str,
+    ) {
+        let Some(rt) = self.tasks.get_mut(name) else {
+            return;
+        };
+        let is_matching_waiter = rt
+            .run_waiter
+            .as_ref()
+            .is_some_and(|waiter| waiter.generation() == generation);
+        if !is_matching_waiter {
+            return;
+        }
+        if let Some(waiter) = rt.run_waiter.take() {
+            waiter.complete(Err(CommandError::TimedOut {
                 name: name.to_string(),
-                success: false,
-            });
+                timeout: timeout.to_string(),
+            }));
         }
     }
 
@@ -738,7 +832,7 @@ impl Runner {
         let empty_params = HashMap::new();
         for (name, cfg) in &runnable {
             // Explicit-run path — bypass the auto_run gate in handle_task_rerun.
-            self.spawn_task_rerun(name, cfg, &empty_params, "running (manual trigger)")
+            self.spawn_task_rerun(name, cfg, &empty_params, "running (manual trigger)", None)
                 .await;
         }
 
@@ -751,6 +845,8 @@ impl Runner {
         &mut self,
         name: &str,
         params: HashMap<String, String>,
+        wait: bool,
+        wait_timeout: Option<String>,
         reply: oneshot::Sender<CommandResult>,
     ) {
         // Services and unknown names get a dedicated error. Services don't go
@@ -798,8 +894,30 @@ impl Runner {
             }
         };
 
-        self.spawn_task_rerun(name, &cfg, &resolved, "running (manual trigger)")
+        let wait = wait || wait_timeout.is_some();
+        if let Some(timeout) = wait_timeout.as_deref()
+            && let Err(e) = parse_duration(timeout)
+        {
+            let _ = reply.send(Err(CommandError::InvalidParams {
+                name: name.to_string(),
+                message: format!("invalid wait timeout: {e}"),
+            }));
+            return;
+        }
+
+        if wait {
+            self.spawn_task_rerun(
+                name,
+                &cfg,
+                &resolved,
+                "running (manual trigger)",
+                Some((reply, wait_timeout)),
+            )
             .await;
-        let _ = reply.send(Ok(()));
+        } else {
+            self.spawn_task_rerun(name, &cfg, &resolved, "running (manual trigger)", None)
+                .await;
+            let _ = reply.send(Ok(()));
+        }
     }
 }

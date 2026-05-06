@@ -85,7 +85,7 @@ async fn make_runner(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -185,6 +185,8 @@ default = "100"
             .send(RunnerCommand::RunTask {
                 name: "sync".to_string(),
                 params,
+                wait: false,
+                wait_timeout: None,
                 reply: reply_tx,
             })
             .await
@@ -255,6 +257,8 @@ default = "100"
             .send(RunnerCommand::RunTask {
                 name: "sync".to_string(),
                 params,
+                wait: false,
+                wait_timeout: None,
                 reply: reply_tx,
             })
             .await
@@ -318,6 +322,8 @@ auto_run = false
             .send(RunnerCommand::RunTask {
                 name: "plain".to_string(),
                 params: HashMap::new(),
+                wait: false,
+                wait_timeout: None,
                 reply: reply_tx,
             })
             .await
@@ -365,6 +371,8 @@ auto_run = false
                 .send(RunnerCommand::RunTask {
                     name: "plain".to_string(),
                     params: HashMap::new(),
+                    wait: false,
+                    wait_timeout: None,
                     reply: reply_tx,
                 })
                 .await
@@ -389,6 +397,178 @@ auto_run = false
         );
 
         let _ = shutdown_tx.send(()).await;
+        let _ = runner_handle.await;
+    });
+}
+
+#[test]
+fn integration_run_task_wait_replies_after_task_exits() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("task-run-wait");
+        let out_path = dir.path().join("captured.txt");
+
+        let toml = toml_with_keeper(&format!(
+            r#"
+[tasks.slow]
+cmd = "sh"
+args = ["-c", "sleep 0.2; echo done > {}"]
+log = "ignore"
+auto_run = false
+"#,
+            out_path.display()
+        ));
+        let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+
+        let runner_handle = tokio::spawn(async move { runner.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::RunTask {
+                name: "slow".to_string(),
+                params: HashMap::new(),
+                wait: true,
+                wait_timeout: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut reply_rx)
+                .await
+                .is_err(),
+            "wait reply arrived before the task could exit"
+        );
+
+        let (reply_tx, conflict_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::RunTask {
+                name: "slow".to_string(),
+                params: HashMap::new(),
+                wait: true,
+                wait_timeout: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let result = conflict_rx.await.unwrap();
+        assert!(result.is_err(), "second run should reject while running");
+
+        reply_rx.await.unwrap().unwrap();
+        assert!(
+            wait_for_line_count(&out_path, 1).await,
+            "task did not write output"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = runner_handle.await;
+    });
+}
+
+#[test]
+fn integration_run_task_wait_returns_task_failure() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("task-run-wait-failure");
+
+        let toml = toml_with_keeper(
+            r#"
+[tasks.fail]
+cmd = "sh"
+args = ["-c", "exit 7"]
+log = "ignore"
+auto_run = false
+"#,
+        );
+        let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+
+        let runner_handle = tokio::spawn(async move { runner.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::RunTask {
+                name: "fail".to_string(),
+                params: HashMap::new(),
+                wait: true,
+                wait_timeout: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let result = reply_rx.await.unwrap();
+        match result {
+            Err(don::runner::CommandError::Failed { name, message }) => {
+                assert_eq!(name, "fail");
+                assert!(
+                    message.contains("exit code 7"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected task failure, got {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = runner_handle.await;
+    });
+}
+
+#[test]
+fn integration_run_task_waiter_is_failed_on_shutdown() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("task-run-wait-shutdown");
+
+        let toml = toml_with_keeper(
+            r#"
+[tasks.long]
+cmd = "sleep"
+args = ["60"]
+log = "ignore"
+auto_run = false
+"#,
+        );
+        let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let mut events = runner.subscribe();
+
+        let runner_handle = tokio::spawn(async move { runner.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::RunTask {
+                name: "long".to_string(),
+                params: HashMap::new(),
+                wait: true,
+                wait_timeout: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            wait_for_task_state(&mut events, "long", TaskItemState::Running).await,
+            "task did not start"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("wait reply hung during shutdown")
+            .unwrap();
+        match result {
+            Err(don::runner::CommandError::Failed { name, message }) => {
+                assert_eq!(name, "long");
+                assert!(
+                    message.contains("cancelled by shutdown"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected shutdown cancellation, got {other:?}"),
+        }
+
         let _ = runner_handle.await;
     });
 }
@@ -429,6 +609,8 @@ required = true
             .send(RunnerCommand::RunTask {
                 name: "sync".to_string(),
                 params,
+                wait: false,
+                wait_timeout: None,
                 reply: reply_tx,
             })
             .await
@@ -498,6 +680,8 @@ required = true
             .send(RunnerCommand::RunTask {
                 name: "sync".to_string(),
                 params: HashMap::new(),
+                wait: false,
+                wait_timeout: None,
                 reply: reply_tx,
             })
             .await
@@ -547,6 +731,8 @@ name = "index"
             .send(RunnerCommand::RunTask {
                 name: "sync".to_string(),
                 params,
+                wait: false,
+                wait_timeout: None,
                 reply: reply_tx,
             })
             .await

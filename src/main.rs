@@ -6,7 +6,7 @@ mod wisdom;
 
 use clap::{Parser, Subcommand};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
-use don::client::{Client, ClientError};
+use don::client::{Client, ClientError, RunTaskOptions};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -115,6 +115,12 @@ enum Commands {
         /// when stdin isn't a TTY. Useful in scripts / CI.
         #[arg(long, conflicts_with = "all_pending")]
         no_prompt: bool,
+        /// Wait until the task exits before returning
+        #[arg(long)]
+        wait: bool,
+        /// Maximum time to wait for task completion (implies --wait)
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
         /// Per-param flags. Parsed dynamically against the task's declared
         /// params: `--<param>=<value>`, `--<param> <value>`, or bare
         /// `--<flag>` (treated as `"true"` for bool params).
@@ -223,9 +229,15 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             all_pending,
             raw,
             no_prompt,
+            wait,
+            timeout,
         } => match (name, all_pending) {
-            (Some(n), _) => run_run_task(&config_path, n, raw, no_prompt).await,
+            (Some(n), _) => run_run_task(&config_path, n, raw, no_prompt, wait, timeout).await,
             (None, true) => {
+                if wait || timeout.is_some() {
+                    errln("don run --all-pending does not support --wait or --timeout");
+                    return 2;
+                }
                 run_client(&config_path, |c| async move { c.run_pending().await }).await
             }
             (None, false) => {
@@ -283,7 +295,14 @@ fn client_for(config_path: &Path) -> Client {
 
 /// Handle `don run <task> [flags]`. Parses `raw` against the task's declared
 /// params and dispatches via the client.
-async fn run_run_task(config_path: &Path, name: String, raw: Vec<String>, no_prompt: bool) -> i32 {
+async fn run_run_task(
+    config_path: &Path,
+    name: String,
+    raw: Vec<String>,
+    no_prompt: bool,
+    wait: bool,
+    timeout: Option<String>,
+) -> i32 {
     // Load config to look up the task's params. This duplicates what the
     // runner does server-side, but we need the param list *here* to
     // parse the trailing args correctly.
@@ -297,6 +316,14 @@ async fn run_run_task(config_path: &Path, name: String, raw: Vec<String>, no_pro
     let Some(task) = config.tasks.get(&name) else {
         errln(format!("unknown task '{name}'"));
         return 1;
+    };
+
+    let (wait, wait_timeout, raw) = match split_run_flags(&raw, wait, timeout) {
+        Ok(v) => v,
+        Err(msg) => {
+            errln(msg);
+            return 2;
+        }
     };
 
     let parsed = match parse_task_args(&raw, &task.params) {
@@ -323,14 +350,69 @@ async fn run_run_task(config_path: &Path, name: String, raw: Vec<String>, no_pro
         }
     }
 
+    if let Some(timeout_str) = wait_timeout.as_deref()
+        && let Err(e) = don::duration::parse_duration(timeout_str)
+    {
+        errln(format!("invalid --timeout: {e}"));
+        return 2;
+    }
+
     let client = client_for(config_path);
-    match client.run_task(&name, parsed).await {
+    let options = RunTaskOptions { wait, wait_timeout };
+    match client.run_task_with_options(&name, parsed, options).await {
         Ok(()) => 0,
+        Err(ClientError::WaitTimeout { message }) => {
+            errln(message);
+            124
+        }
         Err(e) => {
             errln(e);
             1
         }
     }
+}
+
+/// Split `don run`'s own control flags out of the trailing task-param args.
+/// Clap parses `don run --wait task`, but `don run task --wait` lands in
+/// `raw` because task params are intentionally accepted as arbitrary flags.
+fn split_run_flags(
+    raw: &[String],
+    initial_wait: bool,
+    initial_timeout: Option<String>,
+) -> Result<(bool, Option<String>, Vec<String>), String> {
+    let mut wait = initial_wait || initial_timeout.is_some();
+    let mut timeout = initial_timeout;
+    let mut params = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = &raw[i];
+        if arg == "--wait" {
+            wait = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--timeout" {
+            let Some(value) = raw.get(i + 1) else {
+                return Err("missing value for --timeout (use --timeout=<duration>)".to_string());
+            };
+            if value.starts_with("--") {
+                return Err("missing value for --timeout (use --timeout=<duration>)".to_string());
+            }
+            timeout = Some(value.clone());
+            wait = true;
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--timeout=") {
+            timeout = Some(value.to_string());
+            wait = true;
+            i += 1;
+            continue;
+        }
+        params.push(arg.clone());
+        i += 1;
+    }
+    Ok((wait, timeout, params))
 }
 
 /// Parse the trailing raw args from `don run <task> …` against the task's
@@ -1242,7 +1324,7 @@ fn map_join_result<T>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{item_name, parse_task_args, status_sort_bucket};
+    use super::{item_name, parse_task_args, split_run_flags, status_sort_bucket};
     use don::config::{ParamKind, TaskParam};
     use don::runner::{ItemStatus, ServiceState, TaskItemState};
 
@@ -1450,5 +1532,28 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn split_run_flags_accepts_flags_after_task_name() {
+        let raw = vec![
+            "--wait".to_string(),
+            "--timeout".to_string(),
+            "2s".to_string(),
+            "--index=users".to_string(),
+        ];
+        let (wait, timeout, params) = split_run_flags(&raw, false, None).unwrap();
+        assert!(wait);
+        assert_eq!(timeout.as_deref(), Some("2s"));
+        assert_eq!(params, vec!["--index=users"]);
+    }
+
+    #[test]
+    fn split_run_flags_timeout_implies_wait() {
+        let raw = vec!["--timeout=100ms".to_string(), "--dry_run".to_string()];
+        let (wait, timeout, params) = split_run_flags(&raw, false, None).unwrap();
+        assert!(wait);
+        assert_eq!(timeout.as_deref(), Some("100ms"));
+        assert_eq!(params, vec!["--dry_run"]);
     }
 }

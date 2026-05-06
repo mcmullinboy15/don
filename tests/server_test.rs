@@ -17,12 +17,25 @@ const PLATFORM: Platform = Platform::LinuxX86_64;
 
 /// Minimal HTTP-over-unix-socket client for tests. Returns (status, body).
 async fn request(socket_path: &Path, method: &str, path: &str) -> (u16, String) {
+    request_with_body(socket_path, method, path, None).await
+}
+
+async fn request_with_body(
+    socket_path: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, String) {
     let mut stream = UnixStream::connect(socket_path).await.unwrap();
+    let body = body.unwrap_or("");
     let req = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: localhost\r\n\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\r\n"
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body,
     );
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut response = Vec::new();
@@ -90,7 +103,7 @@ async fn spawn_runner(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -216,6 +229,123 @@ fn integration_stop_on_task_returns_400() {
             body.contains("task") && body.contains("services"),
             "body should explain task vs service: {body}"
         );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_run_task_wait_endpoint_returns_after_success() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-run-wait-success");
+        let out_path = dir.path().join("ran.txt");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task(
+                "once",
+                "sh",
+                &[
+                    "-c",
+                    &format!("sleep 0.1; echo done > {}", out_path.display()),
+                ],
+            )
+            .log("ignore")
+            .auto_run(false)
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let (status, body) =
+            request_with_body(&socket, "POST", "/run/once", Some(r#"{"wait":true}"#)).await;
+        assert_eq!(status, 204, "body: {body}");
+        let captured = std::fs::read_to_string(&out_path).unwrap();
+        assert_eq!(captured.trim(), "done");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_run_task_wait_endpoint_maps_task_failure_to_422() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-run-wait-failure");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task("fail", "sh", &["-c", "exit 7"])
+            .log("ignore")
+            .auto_run(false)
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let (status, body) =
+            request_with_body(&socket, "POST", "/run/fail", Some(r#"{"wait":true}"#)).await;
+        assert_eq!(status, 422, "body: {body}");
+        assert!(body.contains("exit code 7"), "body: {body}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_run_task_wait_timeout_returns_408_without_stopping_task() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-run-wait-timeout");
+        let out_path = dir.path().join("ran.txt");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task(
+                "slow",
+                "sh",
+                &[
+                    "-c",
+                    &format!("sleep 0.3; echo done > {}", out_path.display()),
+                ],
+            )
+            .log("ignore")
+            .auto_run(false)
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let (status, body) = request_with_body(
+            &socket,
+            "POST",
+            "/run/slow",
+            Some(r#"{"wait_timeout":"50ms"}"#),
+        )
+        .await;
+        assert_eq!(status, 408, "body: {body}");
+        assert!(body.contains("did not finish within 50ms"), "body: {body}");
+        assert!(
+            !out_path.exists(),
+            "task should still be sleeping when the wait times out"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !out_path.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let captured = std::fs::read_to_string(&out_path).unwrap();
+        assert_eq!(captured.trim(), "done");
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

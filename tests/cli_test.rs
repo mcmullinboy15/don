@@ -51,7 +51,7 @@ async fn spawn_runner(toml: &str, base_dir: &Path) -> (PathBuf, mpsc::Sender<()>
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -315,6 +315,116 @@ fn cli_start_subcommand_starts_stopped_service() {
                 .await
                 .unwrap();
         assert_eq!(code, 0, "stderr: {stderr}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn cli_run_wait_after_task_name_waits_for_completion() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("cli-run-wait");
+        let out_path = dir.path().join("task-output.txt");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task(
+                "slow",
+                "sh",
+                &[
+                    "-c",
+                    &format!("sleep 0.2; echo done >> {}", out_path.display()),
+                ],
+            )
+            .log("ignore")
+            .auto_run(false)
+            .done()
+            .build();
+        let config_path = dir.path().join("don.toml");
+        std::fs::write(&config_path, &toml).unwrap();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let cp = config_path.clone();
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["run", "--wait", "slow"]))
+                .await
+                .unwrap();
+        assert_eq!(code, 0, "stderr: {stderr}");
+
+        let cp = config_path.clone();
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["run", "slow", "--wait"]))
+                .await
+                .unwrap();
+        assert_eq!(code, 0, "stderr: {stderr}");
+
+        let cp = config_path.clone();
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["run", "--timeout", "5s", "slow"]))
+                .await
+                .unwrap();
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let captured = std::fs::read_to_string(&out_path).unwrap();
+        assert_eq!(
+            captured.lines().collect::<Vec<_>>(),
+            vec!["done", "done", "done"]
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn cli_run_timeout_after_task_name_limits_wait() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("cli-run-timeout");
+        let out_path = dir.path().join("task-output.txt");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task(
+                "slow",
+                "sh",
+                &[
+                    "-c",
+                    &format!("sleep 2; echo done > {}", out_path.display()),
+                ],
+            )
+            .log("ignore")
+            .auto_run(false)
+            .done()
+            .build();
+        let config_path = dir.path().join("don.toml");
+        std::fs::write(&config_path, &toml).unwrap();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let cp = config_path.clone();
+        let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+            run_cli(&cp, &["run", "slow", "--timeout", "100ms"])
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, 124, "stderr: {stderr}");
+        assert!(
+            stderr.contains("did not finish within 100ms"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            !out_path.exists(),
+            "task should still be sleeping when the CLI wait times out"
+        );
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
