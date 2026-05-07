@@ -1611,6 +1611,7 @@ mod tests {
                     hidden: false,
                     kind: Some(ServiceKind::Bazel(BazelConfig {
                         target: "//api:api".to_string(),
+                        watch: true,
                     })),
                 },
             )]

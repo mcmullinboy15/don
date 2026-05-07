@@ -113,6 +113,14 @@ watch = ["src/**/*.tsx"]
 reload = false   # don tracks changes for status, but doesn't restart
 ```
 
+Bazel and Turbo services/tasks can opt out of auto-resolved build-tool watches while still using the build tool for startup builds:
+
+```toml
+[services.api]
+bazel.target = "//services/api:api"
+bazel.watch = false
+```
+
 ### Tasks
 
 One-shot commands that run to completion (migrations, codegen, seeding). Only re-run when watched files change.

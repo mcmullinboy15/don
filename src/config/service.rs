@@ -573,6 +573,18 @@ impl ResolvedService {
         )
     }
 
+    pub(crate) fn build_tool_watch_enabled(&self) -> bool {
+        if !self.reload {
+            return false;
+        }
+
+        match &self.kind {
+            Some(ServiceKind::Bazel(bazel)) => bazel.watch,
+            Some(ServiceKind::Turbo(turbo)) => turbo.watch,
+            _ => false,
+        }
+    }
+
     /// Resolve the run command for a custom service, taking downloads into account.
     ///
     /// If a download exists for this platform, the binary path from the download

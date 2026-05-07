@@ -2652,6 +2652,23 @@ bazel.target = "//services/api:api"
             panic!("expected bazel kind");
         };
         assert_eq!(bazel.target, "//services/api:api");
+        assert!(bazel.watch);
+    }
+
+    #[test]
+    fn test_parse_bazel_watch_false() {
+        let toml = r#"
+[services.api]
+bazel.target = "//services/api:api"
+bazel.watch = false
+"#;
+        let config: Config = toml.parse().unwrap();
+        let svc = config.services.get("api").unwrap();
+        let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
+            panic!("expected bazel kind");
+        };
+        assert_eq!(bazel.target, "//services/api:api");
+        assert!(!bazel.watch);
     }
 
     #[test]
@@ -2668,6 +2685,25 @@ turbo.filter = "@myorg/web"
         };
         assert_eq!(turbo.task, "dev");
         assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
+        assert!(turbo.watch);
+    }
+
+    #[test]
+    fn test_parse_turbo_watch_false() {
+        let toml = r#"
+[services.web]
+turbo.task = "dev"
+turbo.filter = "@myorg/web"
+turbo.watch = false
+"#;
+        let config: Config = toml.parse().unwrap();
+        let svc = config.services.get("web").unwrap();
+        let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
+            panic!("expected turbo kind");
+        };
+        assert_eq!(turbo.task, "dev");
+        assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
+        assert!(!turbo.watch);
     }
 
     #[test]

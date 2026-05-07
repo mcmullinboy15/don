@@ -223,6 +223,11 @@ pub struct Task {
 }
 
 impl Task {
+    pub(crate) fn build_tool_watch_enabled(&self) -> bool {
+        self.bazel.as_ref().is_some_and(|bazel| bazel.watch)
+            || self.turbo.as_ref().is_some_and(|turbo| turbo.watch)
+    }
+
     /// Resolve the task's command path, using the cached download binary
     /// if one is configured for this platform.
     pub fn resolved_cmd(

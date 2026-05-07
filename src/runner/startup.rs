@@ -249,6 +249,7 @@ impl Runner {
             kind: NodeKind::Task,
             bazel: rt.config.bazel.clone(),
             turbo: rt.config.turbo.clone(),
+            watch_enabled: rt.config.build_tool_watch_enabled(),
             working_dir,
             ignore,
         })
@@ -508,6 +509,7 @@ impl Runner {
                 kind: NodeKind::Task,
                 bazel: rt.config.bazel.clone(),
                 turbo: rt.config.turbo.clone(),
+                watch_enabled: rt.config.build_tool_watch_enabled(),
                 working_dir,
                 ignore,
             });
@@ -538,6 +540,7 @@ impl Runner {
             kind,
             bazel: rs.resolved.bazel_config().cloned(),
             turbo: rs.resolved.turbo_config().cloned(),
+            watch_enabled: rs.resolved.build_tool_watch_enabled(),
             working_dir,
             ignore,
         }
