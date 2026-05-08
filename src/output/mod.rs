@@ -1338,7 +1338,16 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             // flag). Defaulting to false is correct — these are usually
             // service-stdout fragments that didn't end in `\n` before the
             // child closed its pipe.
-            emit_line(&mut target, "", prefix, &sanitized, false, &verbosity, start).await;
+            emit_line(
+                &mut target,
+                "",
+                prefix,
+                &sanitized,
+                false,
+                &verbosity,
+                start,
+            )
+            .await;
         }
     }
 }

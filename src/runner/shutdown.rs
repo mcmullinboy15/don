@@ -366,7 +366,7 @@ impl Runner {
                 RunnerInternalCommand::ServiceStopComplete { .. }
                 | RunnerInternalCommand::ServiceRebuildPrepared { .. }
                 | RunnerInternalCommand::GraphRequeryComplete(_)
-                | RunnerInternalCommand::TaskExited { .. }
+                | RunnerInternalCommand::TaskExited(_)
                 | RunnerInternalCommand::BatchBuildComplete(_)
                 | RunnerInternalCommand::RebuildBatchComplete(_)
                 | RunnerInternalCommand::LazyBuildComplete { .. }

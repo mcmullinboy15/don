@@ -9,10 +9,22 @@ pub(in crate::runner) struct ItemDone {
     pub(in crate::runner) message: Option<String>,
     /// How long the item took (for tasks).
     pub(in crate::runner) elapsed: Option<std::time::Duration>,
+    /// Metadata for a task process that actually ran.
+    pub(in crate::runner) last_run: Option<crate::task_state::TaskRunInfo>,
     /// Run generation for manually-triggered task completions that need to
     /// re-notify startup dependency resolution. `None` for normal startup
     /// item completions.
     pub(in crate::runner) task_run_generation: Option<u64>,
+}
+
+pub(in crate::runner) struct TaskExit {
+    pub(in crate::runner) name: String,
+    pub(in crate::runner) pgid: i32,
+    pub(in crate::runner) success: bool,
+    pub(in crate::runner) message: Option<String>,
+    pub(in crate::runner) elapsed: Option<std::time::Duration>,
+    pub(in crate::runner) last_run: Option<crate::task_state::TaskRunInfo>,
+    pub(in crate::runner) rerun: bool,
 }
 
 impl Runner {
@@ -116,6 +128,7 @@ impl Runner {
                 && let Some(rt) = self.tasks.get_mut(&item.name)
             {
                 rt.mark_success();
+                rt.last_run = item.last_run.clone();
             }
             if cur != Some(TaskItemState::Skipped)
                 && cur != Some(TaskItemState::PendingRun)
@@ -133,6 +146,7 @@ impl Runner {
         } else {
             if let Some(rt) = self.tasks.get_mut(&item.name) {
                 rt.set_needs_run_now(true);
+                rt.last_run = item.last_run.clone();
             }
             self.set_task_state(&item.name, TaskItemState::Failed);
             if let Some(ref err_msg) = item.message {
@@ -146,15 +160,17 @@ impl Runner {
         }
     }
 
-    pub(in crate::runner) fn handle_task_exit(
-        &mut self,
-        name: &str,
-        pgid: i32,
-        success: bool,
-        message: Option<String>,
-        elapsed: Option<std::time::Duration>,
-        rerun: bool,
-    ) {
+    pub(in crate::runner) fn handle_task_exit(&mut self, exit: TaskExit) {
+        let TaskExit {
+            name,
+            pgid,
+            success,
+            message,
+            elapsed,
+            last_run,
+            rerun,
+        } = exit;
+        let name = name.as_str();
         if self.tasks.get(name).is_none_or(|rt| rt.pgid != Some(pgid)) {
             return;
         }
@@ -176,6 +192,7 @@ impl Runner {
         if success {
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.mark_success();
+                rt.last_run = last_run;
             }
             self.set_task_state(name, TaskItemState::Completed);
             self.unblock_dependency_failed_items();
@@ -196,6 +213,7 @@ impl Runner {
                             success: true,
                             message: None,
                             elapsed: None,
+                            last_run: None,
                             task_run_generation: run_generation,
                         })
                         .await;
@@ -204,6 +222,7 @@ impl Runner {
         } else {
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.set_needs_run_now(true);
+                rt.last_run = last_run;
             }
             self.set_task_state(name, TaskItemState::Failed);
             if let Some(ref err_msg) = message {

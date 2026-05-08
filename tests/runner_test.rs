@@ -97,7 +97,7 @@ async fn make_runner_verbose(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();

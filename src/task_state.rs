@@ -8,8 +8,49 @@
 //! Success state is only written after a task exits successfully (exit code 0).
 
 use hex::encode;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Metadata for the most recent task process that actually ran.
+///
+/// This is separate from the success marker: failed runs update this record
+/// without making dependency gates consider the task satisfied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRunInfo {
+    /// Unix timestamp, in seconds, when the run finished.
+    pub finished_at_unix_secs: u64,
+    /// Process runtime in milliseconds, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Whether the process exited successfully.
+    pub success: bool,
+    /// Exit code for normal process exits. Timeouts/signals may not have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Short failure description, when the run failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl TaskRunInfo {
+    /// Build a metadata record for a run that finished now.
+    pub fn finished_now(
+        success: bool,
+        elapsed: Option<Duration>,
+        exit_code: Option<i32>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            finished_at_unix_secs: current_unix_secs(),
+            duration_ms: elapsed.map(duration_millis_saturating),
+            success,
+            exit_code,
+            message,
+        }
+    }
+}
 
 /// Manages task state — tracks file hashes to determine whether a task needs to re-run.
 ///
@@ -87,15 +128,64 @@ impl TaskState {
         let ignore_patterns = ignore_patterns.to_vec();
         let base_dir = base_dir.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
+            let run_info = TaskRunInfo::finished_now(true, None, Some(0), None);
             this.record_success_sync(
                 &task_name,
                 &watch_patterns,
                 &ignore_patterns,
                 base_dir.as_deref(),
+                Some(&run_info),
             )
         })
         .await
         .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Record a successful task run with caller-supplied run metadata.
+    ///
+    /// This writes both the success marker/hash and the latest run metadata.
+    pub async fn record_success_with_info(
+        &self,
+        task_name: &str,
+        watch_patterns: &[String],
+        ignore_patterns: &[String],
+        base_dir: Option<&Path>,
+        run_info: &TaskRunInfo,
+    ) -> Result<(), TaskStateError> {
+        let this = self.clone();
+        let task_name = task_name.to_string();
+        let watch_patterns = watch_patterns.to_vec();
+        let ignore_patterns = ignore_patterns.to_vec();
+        let base_dir = base_dir.map(Path::to_path_buf);
+        let run_info = run_info.clone();
+        tokio::task::spawn_blocking(move || {
+            this.record_success_sync(
+                &task_name,
+                &watch_patterns,
+                &ignore_patterns,
+                base_dir.as_deref(),
+                Some(&run_info),
+            )
+        })
+        .await
+        .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Record the most recent task run without changing success/hash state.
+    ///
+    /// Use this for failed runs: status can show the failure, but dependency
+    /// gates still require the previous successful run.
+    pub async fn record_run(
+        &self,
+        task_name: &str,
+        run_info: &TaskRunInfo,
+    ) -> Result<(), TaskStateError> {
+        let task_name = task_name.to_string();
+        let run_info = run_info.clone();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.record_run_sync(&task_name, &run_info))
+            .await
+            .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
     }
 
     /// Return whether the task has at least one recorded successful run.
@@ -107,13 +197,23 @@ impl TaskState {
             .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
     }
 
+    /// Return metadata for the most recent actual task run, if recorded.
+    pub async fn last_run(&self, task_name: &str) -> Result<Option<TaskRunInfo>, TaskStateError> {
+        let task_name = task_name.to_string();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.last_run_sync(&task_name))
+            .await
+            .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
+    }
+
     /// Clear stored state for a task, forcing it to re-run next time.
     ///
     /// Runs filesystem I/O on a blocking thread to avoid stalling the tokio runtime.
     pub async fn clear(&self, task_name: &str) -> Result<(), TaskStateError> {
         let task_name = task_name.to_string();
         remove_file_if_exists(self.hash_file_path(&task_name)).await?;
-        remove_file_if_exists(self.success_file_path(&task_name)).await
+        remove_file_if_exists(self.success_file_path(&task_name)).await?;
+        remove_file_if_exists(self.last_run_file_path(&task_name)).await
     }
 
     fn needs_run_sync(
@@ -139,6 +239,7 @@ impl TaskState {
         watch_patterns: &[String],
         ignore_patterns: &[String],
         base_dir: Option<&Path>,
+        run_info: Option<&TaskRunInfo>,
     ) -> Result<(), TaskStateError> {
         std::fs::create_dir_all(&self.state_dir)?;
         if !watch_patterns.is_empty() {
@@ -147,6 +248,9 @@ impl TaskState {
             std::fs::write(&hash_path, hash.as_bytes())?;
         }
         std::fs::write(self.success_file_path(task_name), b"success\n")?;
+        if let Some(run_info) = run_info {
+            self.record_run_sync(task_name, run_info)?;
+        }
         Ok(())
     }
 
@@ -216,6 +320,10 @@ impl TaskState {
         self.state_dir.join(format!("{task_name}.success"))
     }
 
+    fn last_run_file_path(&self, task_name: &str) -> PathBuf {
+        self.state_dir.join(format!("{task_name}.last-run.json"))
+    }
+
     fn has_success_sync(&self, task_name: &str) -> Result<bool, TaskStateError> {
         match std::fs::metadata(self.success_file_path(task_name)) {
             Ok(meta) => Ok(meta.is_file()),
@@ -231,6 +339,41 @@ impl TaskState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(TaskStateError::Io(e)),
         }
+    }
+
+    fn record_run_sync(
+        &self,
+        task_name: &str,
+        run_info: &TaskRunInfo,
+    ) -> Result<(), TaskStateError> {
+        std::fs::create_dir_all(&self.state_dir)?;
+        let bytes = serde_json::to_vec(run_info)?;
+        std::fs::write(self.last_run_file_path(task_name), bytes)?;
+        Ok(())
+    }
+
+    fn last_run_sync(&self, task_name: &str) -> Result<Option<TaskRunInfo>, TaskStateError> {
+        let path = self.last_run_file_path(task_name);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(TaskStateError::Io(e)),
+        }
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    let millis = duration.as_millis();
+    if millis > u128::from(u64::MAX) {
+        u64::MAX
+    } else {
+        millis as u64
     }
 }
 
@@ -264,6 +407,9 @@ pub enum TaskStateError {
     /// A watch glob pattern was invalid.
     #[error("glob error: {0}")]
     Glob(String),
+    /// Latest-run metadata could not be serialized or parsed.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -560,5 +706,32 @@ mod tests {
             .unwrap();
         assert!(state.has_success("bootstrap").await.unwrap());
         assert!(state.needs_run("bootstrap", &[], &[], None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_last_run_metadata() {
+        let dir = TempDir::new("last-run");
+        let state = TaskState::new(dir.path().join(".don-state"));
+
+        assert!(state.last_run("build").await.unwrap().is_none());
+
+        let failed = TaskRunInfo::finished_now(
+            false,
+            Some(Duration::from_millis(42)),
+            Some(2),
+            Some("exit code 2".to_string()),
+        );
+        state.record_run("build", &failed).await.unwrap();
+        assert!(!state.has_success("build").await.unwrap());
+        assert_eq!(state.last_run("build").await.unwrap(), Some(failed));
+
+        let succeeded =
+            TaskRunInfo::finished_now(true, Some(Duration::from_millis(7)), Some(0), None);
+        state
+            .record_success_with_info("build", &[], &[], None, &succeeded)
+            .await
+            .unwrap();
+        assert!(state.has_success("build").await.unwrap());
+        assert_eq!(state.last_run("build").await.unwrap(), Some(succeeded));
     }
 }

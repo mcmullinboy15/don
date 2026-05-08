@@ -14,7 +14,7 @@
 //! ## Viewport model
 //!
 //! The inline [`Terminal`] is created once at startup with `Viewport::Inline(1)`
-//! and never rebuilt. All non-Normal modes (Filter, Palette, Overlay) render
+//! and never rebuilt. All non-Normal modes (Filter, task/service tables) render
 //! into a separate alt-screen [`Terminal`] ([`Modal`]) that overlays the main
 //! screen. Leaving the modal restores the main screen's previous contents;
 //! new log lines received during the modal are inserted afterward so the
@@ -45,8 +45,8 @@ mod form;
 mod fuzzy;
 mod input;
 mod log_store;
-mod palette;
 mod render;
+mod status_table;
 
 use ansi_to_tui::IntoText;
 use crossterm::cursor::MoveTo;
@@ -66,10 +66,10 @@ use backend::FixedBottomBackend;
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
 use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState, TerminalRequest};
-use app::{App, ViewMode};
+use app::{App, AppInit, ViewMode};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
-use palette::ActionKind;
+use status_table::StatusTableKeyOutcome;
 
 /// Errors that can escape the TUI event loop.
 #[derive(Debug, thiserror::Error)]
@@ -203,6 +203,7 @@ pub async fn run_tui(
     task_names: Vec<String>,
     build_tool_names: Vec<String>,
     task_configs: std::collections::HashMap<String, crate::config::Task>,
+    task_last_runs: std::collections::HashMap<String, crate::task_state::TaskRunInfo>,
     hidden_names: std::collections::HashSet<String>,
     cli_log_filter: Option<std::collections::HashSet<String>>,
     mut terminal_request_rx: mpsc::Receiver<TerminalRequest>,
@@ -212,15 +213,16 @@ pub async fn run_tui(
         lifecycle_emitter,
     };
 
-    let mut app = App::new(
+    let mut app = App::new(AppInit {
         service_names,
         task_names,
         build_tool_names,
         task_configs,
+        task_last_runs,
         hidden_names,
         cli_log_filter,
-        controls.verbosity.is_enabled(),
-    );
+        verbose_enabled: controls.verbosity.is_enabled(),
+    });
     let mut store = LogStore::with_capacity(DEFAULT_CAPACITY);
 
     let (input_tx, mut input_rx) = mpsc::channel::<AppEvent>(64);
@@ -256,6 +258,10 @@ pub async fn run_tui(
     // spinner doesn't catch up in a burst after a slow render.
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Relative timestamps in modals ("5s ago") need wall-clock invalidation
+    // even when no runner/key event arrives.
+    let mut wall_clock_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    wall_clock_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Cached terminal width — refreshed at the start of each log batch.
     // Avoids a syscall per rendered log line, which becomes a real
@@ -437,6 +443,14 @@ pub async fn run_tui(
                     draw_inline_bar(&mut act.terminal, &app)?;
                 }
             }
+            _ = wall_clock_ticker.tick(), if active_present => {
+                if app.view_mode.needs_wall_clock_redraw()
+                    && let Some(act) = active.as_mut()
+                    && let Some(m) = act.modal.as_mut()
+                {
+                    m.draw(&app)?;
+                }
+            }
         }
     }
 
@@ -517,8 +531,12 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) {
         RunnerEvent::ServiceStateChanged { name, state, pid } => {
             app.apply_service_runtime(name, state, pid);
         }
-        RunnerEvent::TaskStateChanged { name, state } => {
-            app.apply_task_state(name, state);
+        RunnerEvent::TaskStateChanged {
+            name,
+            state,
+            last_run,
+        } => {
+            app.apply_task_state(name, state, last_run);
         }
         RunnerEvent::RebuildComplete { .. }
         | RunnerEvent::TaskRerunComplete { .. }
@@ -691,9 +709,9 @@ fn handle_key(
     match app.view_mode {
         ViewMode::Normal => handle_normal_key(key, app, terminal, store, modal)?,
         ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
-        ViewMode::Palette => handle_palette_key(key, app, terminal, store, command_tx, modal)?,
-        ViewMode::Overlay => {
-            handle_overlay_key(key, app, terminal, store, command_tx, controls, modal)?;
+        ViewMode::Tasks => handle_tasks_key(key, app, terminal, store, command_tx, modal)?,
+        ViewMode::Services => {
+            handle_services_key(key, app, terminal, store, command_tx, controls, modal)?;
         }
         ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
     }
@@ -738,17 +756,15 @@ fn handle_normal_key(
             *modal = Some(m);
         }
         KeyCode::Char('t') => {
-            app.palette.open(&app.tasks_state, &app.task_configs);
-            app.view_mode = ViewMode::Palette;
+            app.tasks_table.reset();
+            app.view_mode = ViewMode::Tasks;
             let mut m = Modal::enter(store.next_id())?;
             m.draw(app)?;
             *modal = Some(m);
         }
         KeyCode::Char('s') => {
-            app.overlay_highlight = 0;
-            app.overlay_query.clear();
-            app.overlay_filtering = false;
-            app.view_mode = ViewMode::Overlay;
+            app.services_table.reset();
+            app.view_mode = ViewMode::Services;
             let mut m = Modal::enter(store.next_id())?;
             m.draw(app)?;
             *modal = Some(m);
@@ -857,7 +873,7 @@ fn handle_filter_key(
     Ok(())
 }
 
-fn handle_palette_key(
+fn handle_tasks_key(
     key: KeyEvent,
     app: &mut App,
     terminal: &mut TuiTerminal,
@@ -865,56 +881,39 @@ fn handle_palette_key(
     command_tx: &mpsc::Sender<RunnerCommand>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
-    match key.code {
-        KeyCode::Enter => {
-            let selected_kind = app.palette.selected().map(|a| a.kind.clone());
-            app.palette.close();
-            match selected_kind {
-                Some(ActionKind::RunTaskWithForm(task_name)) => {
-                    open_form_for_task(app, &task_name, command_tx)?;
-                    // open_form_for_task switched to ViewMode::Form and
-                    // rendered the form modal — nothing more to do here.
-                    redraw_modal(modal, app)?;
-                    return Ok(());
-                }
-                Some(kind) => {
-                    dispatch_action(command_tx, kind);
-                }
-                None => {}
-            }
+    let total = app.task_items().len();
+    match app.tasks_table.handle_key(key, total) {
+        StatusTableKeyOutcome::Redraw => {
+            redraw_modal(modal, app)?;
+            return Ok(());
+        }
+        StatusTableKeyOutcome::Close => {
             app.view_mode = ViewMode::Normal;
             close_modal_and_replay_new_logs(terminal, store, app, modal)?;
+            return Ok(());
         }
-        KeyCode::Esc => {
-            app.palette.close();
-            app.view_mode = ViewMode::Normal;
-            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
+        StatusTableKeyOutcome::None => {}
+    }
+
+    if key.code == KeyCode::Enter {
+        let Some(item) = highlighted_task_item(app) else {
+            return Ok(());
+        };
+        if !item.runnable() {
+            return Ok(());
         }
-        // `/` is the "filter" key across views — swallow it so pressing it
-        // reflexively doesn't end up as the first character of the query.
-        KeyCode::Char('/') => {}
-        KeyCode::Char(c) => {
-            app.palette.push_query_char(c);
+        if item.has_params {
+            open_form_for_task(app, &item.name, command_tx)?;
             redraw_modal(modal, app)?;
+        } else {
+            dispatch_run_task(command_tx, item.name);
         }
-        KeyCode::Backspace => {
-            app.palette.pop_query_char();
-            redraw_modal(modal, app)?;
-        }
-        KeyCode::Up => {
-            app.palette.highlight_prev();
-            redraw_modal(modal, app)?;
-        }
-        KeyCode::Down => {
-            app.palette.highlight_next();
-            redraw_modal(modal, app)?;
-        }
-        _ => {}
+        redraw_modal(modal, app)?;
     }
     Ok(())
 }
 
-fn handle_overlay_key(
+fn handle_services_key(
     key: KeyEvent,
     app: &mut App,
     terminal: &mut TuiTerminal,
@@ -923,69 +922,21 @@ fn handle_overlay_key(
     controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
-    const PAGE: usize = 10;
-
-    // Filter sub-mode: typing narrows, Enter exits keeping the query,
-    // Esc clears and exits.
-    if app.overlay_filtering {
-        match key.code {
-            KeyCode::Enter => {
-                app.overlay_filtering = false;
-                app.overlay_highlight = 0;
-                redraw_modal(modal, app)?;
-            }
-            KeyCode::Esc => {
-                app.overlay_filtering = false;
-                app.overlay_query.clear();
-                app.overlay_highlight = 0;
-                redraw_modal(modal, app)?;
-            }
-            KeyCode::Backspace if app.overlay_query.pop().is_some() => {
-                app.overlay_highlight = 0;
-                redraw_modal(modal, app)?;
-            }
-            KeyCode::Backspace => {}
-            KeyCode::Char(c) => {
-                app.overlay_query.push(c);
-                app.overlay_highlight = 0;
-                redraw_modal(modal, app)?;
-            }
-            _ => {}
+    let total = app.service_items().len();
+    match app.services_table.handle_key(key, total) {
+        StatusTableKeyOutcome::Redraw => {
+            redraw_modal(modal, app)?;
+            return Ok(());
         }
-        return Ok(());
+        StatusTableKeyOutcome::Close => {
+            app.view_mode = ViewMode::Normal;
+            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
+            return Ok(());
+        }
+        StatusTableKeyOutcome::None => {}
     }
 
-    let total = app.overlay_items().len();
-    let max_idx = total.saturating_sub(1);
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.overlay_highlight = app.overlay_highlight.saturating_sub(1);
-            redraw_modal(modal, app)?;
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.overlay_highlight = (app.overlay_highlight + 1).min(max_idx);
-            redraw_modal(modal, app)?;
-        }
-        KeyCode::PageUp => {
-            app.overlay_highlight = app.overlay_highlight.saturating_sub(PAGE);
-            redraw_modal(modal, app)?;
-        }
-        KeyCode::PageDown => {
-            app.overlay_highlight = (app.overlay_highlight + PAGE).min(max_idx);
-            redraw_modal(modal, app)?;
-        }
-        KeyCode::Home => {
-            app.overlay_highlight = 0;
-            redraw_modal(modal, app)?;
-        }
-        KeyCode::End => {
-            app.overlay_highlight = max_idx;
-            redraw_modal(modal, app)?;
-        }
-        KeyCode::Char('/') => {
-            app.overlay_filtering = true;
-            redraw_modal(modal, app)?;
-        }
         KeyCode::Enter => {
             // Start or stop the highlighted service, depending on its state.
             if let Some(cmd) = overlay_toggle_command(app) {
@@ -1006,29 +957,23 @@ fn handle_overlay_key(
                 dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
             }
         }
-        KeyCode::Esc => {
-            if !app.overlay_query.is_empty() {
-                app.overlay_query.clear();
-                app.overlay_highlight = 0;
-                redraw_modal(modal, app)?;
-                return Ok(());
-            }
-            app.view_mode = ViewMode::Normal;
-            app.overlay_query.clear();
-            app.overlay_filtering = false;
-            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
-        }
         _ => {}
     }
     Ok(())
+}
+
+fn highlighted_task_item(app: &App) -> Option<app::TaskStatusItem> {
+    let items = app.task_items();
+    let idx = app.tasks_table.selected_index(items.len())?;
+    items.get(idx).cloned()
 }
 
 /// Build the Start/Stop command for the highlighted row, if it's an
 /// actionable service. Returns `None` for in-flight services or when no row
 /// is highlighted.
 fn overlay_toggle_command(app: &App) -> Option<OverlayCommand> {
-    let items = app.overlay_items();
-    let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
+    let items = app.service_items();
+    let idx = app.services_table.selected_index(items.len())?;
     let item = items.get(idx)?;
     match item.state {
         ServiceState::Ready | ServiceState::Running | ServiceState::Unhealthy => {
@@ -1049,8 +994,8 @@ fn overlay_toggle_command(app: &App) -> Option<OverlayCommand> {
 
 /// Restart command for `r` — only services in a restartable state.
 fn highlighted_service_restart_command(app: &App) -> Option<OverlayCommand> {
-    let items = app.overlay_items();
-    let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
+    let items = app.service_items();
+    let idx = app.services_table.selected_index(items.len())?;
     let item = items.get(idx)?;
     match item.state {
         ServiceState::Ready
@@ -1065,8 +1010,8 @@ fn highlighted_service_restart_command(app: &App) -> Option<OverlayCommand> {
 
 /// Hard restart command for `R` — only services in a restartable state.
 fn highlighted_service_hard_restart_command(app: &App) -> Option<OverlayCommand> {
-    let items = app.overlay_items();
-    let idx = app.overlay_highlight.min(items.len().saturating_sub(1));
+    let items = app.service_items();
+    let idx = app.services_table.selected_index(items.len())?;
     let item = items.get(idx)?;
     match item.state {
         ServiceState::Ready
@@ -1159,34 +1104,16 @@ fn redraw_modal(modal: &mut Option<Modal>, app: &App) -> Result<(), TuiError> {
     Ok(())
 }
 
-/// Fire a [`RunnerCommand`] without waiting for the reply.
-///
-/// Command replies are intentionally discarded — the user sees the effect
-/// reflected in the status bar as soon as the runner emits the state change
-/// event. Blocking on the reply would freeze the UI for the duration of a
-/// service restart, which can be several seconds.
-fn dispatch_action(command_tx: &mpsc::Sender<RunnerCommand>, action: ActionKind) {
+/// Fire a param-less [`RunnerCommand::RunTask`] without waiting for the reply.
+/// State updates come through the runner event broadcast.
+fn dispatch_run_task(command_tx: &mpsc::Sender<RunnerCommand>, name: String) {
     let command_tx = command_tx.clone();
     tokio::spawn(async move {
-        let cmd = match action {
-            ActionKind::RunPendingTasks => {
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                RunnerCommand::RunPendingTasks { reply: reply_tx }
-            }
-            ActionKind::RunTask(name) => {
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                RunnerCommand::RunTask {
-                    name,
-                    params: std::collections::HashMap::new(),
-                    reply: reply_tx,
-                }
-            }
-            ActionKind::RunTaskWithForm(_) => {
-                // Palette's Enter handler intercepts this variant and opens
-                // the form modal instead — it never reaches `dispatch_action`.
-                // Return early to avoid sending a placeholder command.
-                return;
-            }
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let cmd = RunnerCommand::RunTask {
+            name,
+            params: std::collections::HashMap::new(),
+            reply: reply_tx,
         };
         let _ = command_tx.send(cmd).await;
     });
@@ -1567,15 +1494,16 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn app_with_service_state(state: ServiceState) -> App {
-        let mut app = App::new(
-            vec!["api".to_string()],
-            Vec::new(),
-            Vec::new(),
-            HashMap::new(),
-            HashSet::new(),
-            None,
-            false,
-        );
+        let mut app = App::new(AppInit {
+            service_names: vec!["api".to_string()],
+            task_names: Vec::new(),
+            build_tool_names: Vec::new(),
+            task_configs: HashMap::new(),
+            task_last_runs: HashMap::new(),
+            hidden_names: HashSet::new(),
+            cli_log_filter: None,
+            verbose_enabled: false,
+        });
         app.apply_service_runtime("api".to_string(), state, None);
         app
     }

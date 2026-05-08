@@ -6,10 +6,12 @@ mod wisdom;
 
 use clap::{Parser, Subcommand};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
+use don::TaskRunInfo;
 use don::client::{Client, ClientError};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Write a line to stderr. Used for CLI error messages so they stay on the
 /// error stream (scripts / tests / shell redirection expect it). We avoid
@@ -615,9 +617,23 @@ fn print_status_table(items: &[ItemStatus], verbose: bool) {
             .unwrap_or(0),
     );
 
-    println!("{:<kind_w$}  {:<name_w$}  STATE", "KIND", "NAME");
+    let state_w = "STATE".len().max(
+        items
+            .iter()
+            .map(|i| match i {
+                ItemStatus::Service { state, .. } => service_state_label(*state).len(),
+                ItemStatus::Task { state, .. } => task_state_label(*state).len(),
+            })
+            .max()
+            .unwrap_or(0),
+    );
+
+    println!(
+        "{:<kind_w$}  {:<name_w$}  {:<state_w$}  LAST RUN  RESULT  DURATION",
+        "KIND", "NAME", "STATE"
+    );
     for item in items {
-        let (kind, name, state_str, color, verbose_info) = match item {
+        let (kind, name, state_str, color, last_run, result, duration, verbose_info) = match item {
             ItemStatus::Service {
                 name,
                 state,
@@ -627,31 +643,94 @@ fn print_status_table(items: &[ItemStatus], verbose: bool) {
                 name.as_str(),
                 service_state_label(*state),
                 service_state_color(*state),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
                 verbose.as_ref(),
             ),
             ItemStatus::Task {
                 name,
                 state,
+                last_run,
                 verbose,
             } => (
                 "task",
                 name.as_str(),
                 task_state_label(*state),
                 task_state_color(*state),
+                format_last_run_time(last_run.as_ref()),
+                format_last_run_result(last_run.as_ref()),
+                format_last_run_duration(last_run.as_ref()),
                 verbose.as_ref(),
             ),
         };
         println!(
-            "{:<kind_w$}  {:<name_w$}  {}{}{}",
+            "{:<kind_w$}  {:<name_w$}  {}{:<state_w$}{}  {:<8}  {:<6}  {}",
             kind,
             name,
             SetForegroundColor(color),
             state_str,
             ResetColor,
+            last_run,
+            result,
+            duration,
         );
 
         if verbose && let Some(info) = verbose_info {
             print_verbose_info(info);
+        }
+    }
+}
+
+fn format_last_run_time(last_run: Option<&TaskRunInfo>) -> String {
+    let Some(last_run) = last_run else {
+        return "-".to_string();
+    };
+    format_relative_unix_secs(last_run.finished_at_unix_secs)
+}
+
+fn format_last_run_result(last_run: Option<&TaskRunInfo>) -> String {
+    match last_run {
+        Some(last_run) if last_run.success => "ok".to_string(),
+        Some(_) => "failed".to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn format_last_run_duration(last_run: Option<&TaskRunInfo>) -> String {
+    last_run
+        .and_then(|run| run.duration_ms)
+        .map(format_duration_ms)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_relative_unix_secs(timestamp: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(timestamp, |duration| duration.as_secs());
+    if timestamp > now.saturating_add(5) {
+        return "in the future".to_string();
+    }
+    let elapsed = now.saturating_sub(timestamp);
+    match elapsed {
+        0..=4 => "just now".to_string(),
+        5..=59 => format!("{elapsed}s ago"),
+        60..=3_599 => format!("{}m ago", elapsed / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed / 3_600),
+        _ => format!("{}d ago", elapsed / 86_400),
+    }
+}
+
+fn format_duration_ms(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms}ms")
+    } else {
+        let seconds = duration_ms / 1_000;
+        let tenths = (duration_ms % 1_000) / 100;
+        if tenths == 0 {
+            format!("{seconds}s")
+        } else {
+            format!("{seconds}.{tenths}s")
         }
     }
 }
@@ -1255,6 +1334,13 @@ async fn run_start(
         // per-param completion requests.
         let task_configs: std::collections::HashMap<String, don::config::Task> =
             config.tasks.clone();
+        let task_state = don::TaskState::new(base.join(".don").join("task-state"));
+        let mut task_last_runs = std::collections::HashMap::new();
+        for name in &task_names {
+            if let Ok(Some(last_run)) = task_state.last_run(name).await {
+                task_last_runs.insert(name.clone(), last_run);
+            }
+        }
 
         // Synthetic build-tool stream names that should appear in the TUI
         // filter. Without these entries, lines emitted by the bazel/turbo
@@ -1326,6 +1412,7 @@ async fn run_start(
                 task_names,
                 build_tool_names,
                 task_configs,
+                task_last_runs,
                 hidden_names,
                 tui_log_filter,
                 terminal_request_rx,
@@ -1468,6 +1555,7 @@ mod tests {
         ItemStatus::Task {
             name: name.to_string(),
             state,
+            last_run: None,
             verbose: None,
         }
     }

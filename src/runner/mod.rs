@@ -51,7 +51,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 #[cfg(test)]
 use self::build_tools::bazel_graph_requery_group_dir;
 use self::build_tools::{BatchBuildOutcome, GraphRequeryOutcomeItem, RebuildBatchOutcome};
-use self::events::ItemDone;
+use self::events::{ItemDone, TaskExit};
 #[cfg(test)]
 use self::graph::compute_depths;
 use self::graph::topological_sort;
@@ -393,14 +393,7 @@ enum RunnerInternalCommand {
         result: Result<TaskRunPrepared, String>,
     },
     /// A task process exited after an explicit run/restart.
-    TaskExited {
-        name: String,
-        pgid: i32,
-        success: bool,
-        message: Option<String>,
-        elapsed: Option<std::time::Duration>,
-        rerun: bool,
-    },
+    TaskExited(TaskExit),
     /// Result of the startup-phase batch build.
     BatchBuildComplete(BatchBuildOutcome),
     /// Result of a detached file-watch build-tool rebuild batch.
@@ -471,6 +464,8 @@ pub enum ItemStatus {
         name: String,
         state: TaskItemState,
         #[serde(skip_serializing_if = "Option::is_none")]
+        last_run: Option<crate::task_state::TaskRunInfo>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         verbose: Option<VerboseInfo>,
     },
 }
@@ -518,7 +513,11 @@ pub enum RunnerEvent {
         pid: Option<i32>,
     },
     /// A task changed state.
-    TaskStateChanged { name: String, state: TaskItemState },
+    TaskStateChanged {
+        name: String,
+        state: TaskItemState,
+        last_run: Option<crate::task_state::TaskRunInfo>,
+    },
     /// A rebuild cycle completed (file watch triggered).
     RebuildComplete { name: String, success: bool },
     /// A task re-run completed (file watch triggered).
@@ -767,9 +766,11 @@ impl Runner {
             .get_mut(name)
             .and_then(|rt| rt.set_state(new_state));
         if let Some(state) = changed {
+            let last_run = self.tasks.get(name).and_then(|rt| rt.last_run.clone());
             let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
                 name: name.to_string(),
                 state,
+                last_run,
             });
         }
     }
@@ -1208,15 +1209,8 @@ impl Runner {
                                 self.handle_service_rebuild_prepared(&name, op_id, result)
                                     .await;
                             }
-                            RunnerInternalCommand::TaskExited {
-                                name,
-                                pgid,
-                                success,
-                                message,
-                                elapsed,
-                                rerun,
-                            } => {
-                                self.handle_task_exit(&name, pgid, success, message, elapsed, rerun);
+                            RunnerInternalCommand::TaskExited(exit) => {
+                                self.handle_task_exit(exit);
                             }
                             RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
                                 self.handle_service_health_changed(&name, healthy).await;
@@ -2038,6 +2032,7 @@ mod tests {
             },
             TaskItemState::Pending,
             false,
+            None,
         );
 
         assert_eq!(rt.state(), TaskItemState::Pending);

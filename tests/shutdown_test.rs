@@ -118,7 +118,7 @@ async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -163,7 +163,7 @@ async fn make_runner(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();

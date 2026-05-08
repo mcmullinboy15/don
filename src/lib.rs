@@ -21,5 +21,5 @@ pub use docker::stream::DockerLogReader;
 pub use duration::{DurationError, parse_duration};
 pub use output::{OutputError, OutputManager, ServiceWriter};
 pub use runner::{Runner, RunnerError, VerboseInfo};
-pub use task_state::{TaskState, TaskStateError};
+pub use task_state::{TaskRunInfo, TaskState, TaskStateError};
 pub use tui::{TuiError, run_tui};

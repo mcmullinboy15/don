@@ -188,6 +188,7 @@ impl Runner {
             statuses.push(ItemStatus::Task {
                 name: name.clone(),
                 state: rt.state(),
+                last_run: rt.last_run.clone(),
                 verbose: verbose_info,
             });
         }

@@ -184,6 +184,8 @@ pub(crate) struct RuntimeTask {
     pub run_generation: u64,
     /// Whether the task has ever completed successfully.
     pub has_success: bool,
+    /// Metadata for the most recent process run, including failures.
+    pub last_run: Option<crate::task_state::TaskRunInfo>,
     /// Whether the runner has finished the initial startup dependency-gate
     /// evaluation for this task.
     pub dependency_evaluated: bool,
@@ -197,6 +199,7 @@ impl RuntimeTask {
         config: crate::config::task::Task,
         initial_state: TaskItemState,
         has_success: bool,
+        last_run: Option<crate::task_state::TaskRunInfo>,
     ) -> Self {
         Self {
             state: initial_state,
@@ -211,6 +214,7 @@ impl RuntimeTask {
             run_worker: None,
             run_generation: 0,
             has_success,
+            last_run,
             dependency_evaluated: false,
             needs_run_now: false,
         }

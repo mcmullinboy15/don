@@ -1,10 +1,10 @@
 //! Interactive form modal for collecting task param values.
 //!
-//! Opened by the palette when the user selects a task with declared
+//! Opened by the task table when the user selects a task with declared
 //! [`params`](crate::config::TaskParam). Owns the value for each declared
 //! param, the focus index, and any in-flight completion-resolve state.
 //!
-//! The form is a `ratatui` alt-screen modal like the palette. One field per
+//! The form is a `ratatui` alt-screen modal like the status tables. One field per
 //! param, rendered top-to-bottom. Tab/Shift-Tab navigates between fields;
 //! Enter advances (or submits on the last field); Ctrl+Enter submits from
 //! any field; Esc cancels.
@@ -135,7 +135,7 @@ impl FormState {
     /// Build a form for `task` using its config. Seeds each field with its
     /// default value (empty string when absent). Returns `None` when the
     /// task has no declared params — callers should have already guarded
-    /// against this via [`ActionKind::RunTaskWithForm`](super::palette::ActionKind::RunTaskWithForm).
+    /// against this before opening the form.
     pub(crate) fn new(task_name: &str, task: &Task) -> Option<Self> {
         if task.params.is_empty() {
             return None;

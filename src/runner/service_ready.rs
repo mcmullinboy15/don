@@ -181,6 +181,7 @@ impl Runner {
                             success,
                             message: ready_result.err().map(|e| e.to_string()),
                             elapsed: None,
+                            last_run: None,
                             task_run_generation: None,
                         })
                         .await;
@@ -203,6 +204,7 @@ impl Runner {
                     success: true,
                     message: None,
                     elapsed: None,
+                    last_run: None,
                     task_run_generation: None,
                 })
                 .await;

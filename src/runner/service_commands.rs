@@ -193,6 +193,7 @@ impl Runner {
                                 success: false,
                                 message: Some(message),
                                 elapsed: None,
+                                last_run: None,
                                 task_run_generation: None,
                             })
                             .await;
@@ -801,7 +802,11 @@ impl Runner {
     }
 
     async fn reap_exited_process_handle(&mut self, name: &str) -> bool {
-        let exited = match self.services.get_mut(name).and_then(|rs| rs.handle.as_mut()) {
+        let exited = match self
+            .services
+            .get_mut(name)
+            .and_then(|rs| rs.handle.as_mut())
+        {
             Some(ServiceHandle::Process(process)) => match process.try_wait() {
                 Ok(Some(_)) => true,
                 Ok(None) | Err(_) => false,

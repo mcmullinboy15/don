@@ -1852,8 +1852,7 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
-                    let mut deps =
-                        config.effective_depends_on("web", &["self-only".to_string()]);
+                    let mut deps = config.effective_depends_on("web", &["self-only".to_string()]);
                     deps.sort();
                     assert_eq!(deps, vec!["api".to_string(), "self-only".to_string()]);
                 },
