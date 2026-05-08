@@ -142,6 +142,7 @@ mod tests {
             turbo: None,
             params: vec![],
             hidden: false,
+            auto_filter_on_failure: None,
         }
     }
 

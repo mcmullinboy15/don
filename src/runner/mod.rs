@@ -1603,6 +1603,7 @@ mod tests {
                     on_failure: crate::config::OnFailure::Notify,
                     platform: HashMap::new(),
                     hidden: false,
+                    auto_filter_on_failure: None,
                     kind: Some(ServiceKind::Bazel(BazelConfig {
                         target: "//api:api".to_string(),
                         watch: true,
@@ -1616,6 +1617,7 @@ mod tests {
             profiles: HashMap::new(),
             default_profile: None,
             watch_ignore: Vec::new(),
+            auto_filter_on_failure: true,
         };
         let output_manager = crate::output::OutputManager::new_verbose(
             &[("api", &LogConfig::Stdout)],
@@ -1988,6 +1990,7 @@ mod tests {
                 log: LogConfig::Stdout,
                 reload: true,
                 on_failure: crate::config::OnFailure::Notify,
+                auto_filter_on_failure: None,
                 kind: None,
                 resolved_binary_path: None,
             },
@@ -2029,6 +2032,7 @@ mod tests {
                 turbo: None,
                 params: Vec::new(),
                 hidden: false,
+                auto_filter_on_failure: None,
             },
             TaskItemState::Pending,
             false,
@@ -2107,6 +2111,7 @@ mod tests {
                     log: LogConfig::Stdout,
                     reload: true,
                     on_failure: crate::config::OnFailure::Notify,
+                    auto_filter_on_failure: None,
                     kind: None,
                     resolved_binary_path: None,
                 },

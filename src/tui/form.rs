@@ -415,6 +415,7 @@ mod tests {
             turbo: None,
             params,
             hidden: false,
+            auto_filter_on_failure: None,
         }
     }
 

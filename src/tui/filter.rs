@@ -165,6 +165,21 @@ impl FilterState {
         self.active_selected.contains(name)
     }
 
+    /// Add a name to the committed selection. Returns `true` when this made
+    /// the active filter more permissive. If a filter edit modal is open, the
+    /// edit snapshot is updated too so Esc does not undo externally-triggered
+    /// failure visibility.
+    pub(crate) fn select_name(&mut self, name: &str) -> bool {
+        if !self.all_names.iter().any(|n| n == name) {
+            return false;
+        }
+        let changed = self.active_selected.insert(name.to_string());
+        if changed && let Some(snapshot) = self.snapshot_selected.as_mut() {
+            snapshot.insert(name.to_string());
+        }
+        changed
+    }
+
     /// Start editing. Captures the current selection so Esc can restore it.
     pub(crate) fn enter_edit(&mut self) {
         self.query.clear();
@@ -442,6 +457,18 @@ mod tests {
             s.is_active(),
             "filter reports active when any name is hidden"
         );
+    }
+
+    #[test]
+    fn select_name_admits_hidden_name_and_survives_cancel() {
+        let mut s = state_with_hidden(&["api", "db"], &["db"]);
+        assert!(!s.passes("db"));
+
+        s.enter_edit();
+        assert!(s.select_name("db"));
+        s.cancel_edit();
+
+        assert!(s.passes("db"));
     }
 
     #[test]

@@ -220,6 +220,10 @@ pub struct Task {
     /// Defaults to `false` (visible).
     #[serde(default)]
     pub hidden: bool,
+    /// Override the top-level `auto_filter_on_failure` setting for this task.
+    /// When enabled, a task failure adds this task to the TUI log filter.
+    #[serde(default)]
+    pub auto_filter_on_failure: Option<bool>,
 }
 
 impl Task {

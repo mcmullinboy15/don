@@ -199,6 +199,9 @@ pub(crate) struct App {
     /// the runner. Immutable for the session; the runner re-validates on
     /// submit anyway.
     pub(crate) task_configs: HashMap<String, Task>,
+    /// Names that should be inserted into the committed log filter when they
+    /// fail. Derived from top-level/service/task config at TUI startup.
+    auto_filter_on_failure_names: HashSet<String>,
     /// Active form modal, or `None` when not in [`ViewMode::Form`].
     pub(crate) form: Option<FormState>,
 }
@@ -210,6 +213,7 @@ pub(crate) struct AppInit {
     pub(crate) task_configs: HashMap<String, Task>,
     pub(crate) task_last_runs: HashMap<String, TaskRunInfo>,
     pub(crate) hidden_names: HashSet<String>,
+    pub(crate) auto_filter_on_failure_names: HashSet<String>,
     pub(crate) cli_log_filter: Option<HashSet<String>>,
     pub(crate) verbose_enabled: bool,
 }
@@ -223,6 +227,7 @@ impl App {
             task_configs,
             task_last_runs,
             hidden_names,
+            auto_filter_on_failure_names,
             cli_log_filter,
             verbose_enabled,
         } = init;
@@ -266,6 +271,7 @@ impl App {
             services_table: StatusTableState::default(),
             tasks_table: StatusTableState::default(),
             task_configs,
+            auto_filter_on_failure_names,
             form: None,
         }
     }
@@ -347,10 +353,14 @@ impl App {
         name: String,
         state: ServiceState,
         pid: Option<i32>,
-    ) {
+    ) -> bool {
+        let filter_changed = state == ServiceState::Failed
+            && self.auto_filter_on_failure_names.contains(&name)
+            && self.filter.select_name(&name);
         self.services_state.insert(name.clone(), state);
         self.service_pids.insert(name, pid);
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
+        filter_changed
     }
 
     pub(crate) fn apply_task_state(
@@ -358,12 +368,16 @@ impl App {
         name: String,
         state: TaskItemState,
         last_run: Option<TaskRunInfo>,
-    ) {
+    ) -> bool {
+        let filter_changed = state == TaskItemState::Failed
+            && self.auto_filter_on_failure_names.contains(&name)
+            && self.filter.select_name(&name);
         self.tasks_state.insert(name.clone(), state);
         if let Some(last_run) = last_run {
             self.tasks_last_run.insert(name, last_run);
         }
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
+        filter_changed
     }
 }
 
@@ -387,6 +401,14 @@ mod tests {
     }
 
     fn app_with_names(service_names: Vec<String>, task_names: Vec<String>) -> App {
+        app_with_names_and_auto_filter(service_names, task_names, HashSet::new())
+    }
+
+    fn app_with_names_and_auto_filter(
+        service_names: Vec<String>,
+        task_names: Vec<String>,
+        auto_filter_on_failure_names: HashSet<String>,
+    ) -> App {
         App::new(AppInit {
             service_names,
             task_names,
@@ -394,6 +416,7 @@ mod tests {
             task_configs: HashMap::new(),
             task_last_runs: HashMap::new(),
             hidden_names: HashSet::new(),
+            auto_filter_on_failure_names,
             cli_log_filter: None,
             verbose_enabled: false,
         })
@@ -544,6 +567,61 @@ mod tests {
         app.apply_service_runtime("api".into(), ServiceState::Failed, None);
         assert_eq!(app.counts.services_ready, 0);
         assert_eq!(app.counts.services_failed, 1);
+    }
+
+    #[test]
+    fn failed_service_is_added_to_log_filter_when_configured() {
+        let mut app = app_with_names_and_auto_filter(
+            vec!["api".into(), "db".into()],
+            vec![],
+            HashSet::from(["db".to_string()]),
+        );
+        app.filter.enter_edit();
+        app.filter.select_only_highlighted(); // [all] row keeps everything selected.
+        app.filter.toggle_highlighted(); // clear all
+        app.filter.commit();
+
+        assert!(!app.should_render_log("db", false));
+        let changed = app.apply_service_runtime("db".into(), ServiceState::Failed, None);
+
+        assert!(changed);
+        assert!(app.should_render_log("db", false));
+        assert!(!app.should_render_log("api", false));
+    }
+
+    #[test]
+    fn dependency_failed_service_does_not_auto_filter() {
+        let mut app = app_with_names_and_auto_filter(
+            vec!["api".into()],
+            vec![],
+            HashSet::from(["api".to_string()]),
+        );
+        app.filter.enter_edit();
+        app.filter.toggle_highlighted(); // clear all
+        app.filter.commit();
+
+        let changed = app.apply_service_runtime("api".into(), ServiceState::DependencyFailed, None);
+
+        assert!(!changed);
+        assert!(!app.should_render_log("api", false));
+    }
+
+    #[test]
+    fn failed_task_is_added_to_log_filter_when_configured() {
+        let mut app = app_with_names_and_auto_filter(
+            vec![],
+            vec!["build".into(), "lint".into()],
+            HashSet::from(["lint".to_string()]),
+        );
+        app.filter.enter_edit();
+        app.filter.toggle_highlighted(); // clear all
+        app.filter.commit();
+
+        let changed = app.apply_task_state("lint".into(), TaskItemState::Failed, None);
+
+        assert!(changed);
+        assert!(app.should_render_log("lint", false));
+        assert!(!app.should_render_log("build", false));
     }
 
     #[test]

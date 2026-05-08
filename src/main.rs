@@ -1369,6 +1369,31 @@ async fn run_start(
             )
             .collect();
 
+        let auto_filter_on_failure_names: std::collections::HashSet<String> = config
+            .services
+            .iter()
+            .filter(|(name, svc)| {
+                is_active(name)
+                    && svc
+                        .resolve(platform)
+                        .auto_filter_on_failure
+                        .unwrap_or(config.auto_filter_on_failure)
+            })
+            .map(|(name, _)| name.clone())
+            .chain(
+                config
+                    .tasks
+                    .iter()
+                    .filter(|(name, task)| {
+                        is_active(name)
+                            && task
+                                .auto_filter_on_failure
+                                .unwrap_or(config.auto_filter_on_failure)
+                    })
+                    .map(|(name, _)| name.clone()),
+            )
+            .collect();
+
         let runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
@@ -1414,6 +1439,7 @@ async fn run_start(
                 task_configs,
                 task_last_runs,
                 hidden_names,
+                auto_filter_on_failure_names,
                 tui_log_filter,
                 terminal_request_rx,
             )

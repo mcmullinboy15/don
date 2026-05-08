@@ -205,6 +205,7 @@ pub async fn run_tui(
     task_configs: std::collections::HashMap<String, crate::config::Task>,
     task_last_runs: std::collections::HashMap<String, crate::task_state::TaskRunInfo>,
     hidden_names: std::collections::HashSet<String>,
+    auto_filter_on_failure_names: std::collections::HashSet<String>,
     cli_log_filter: Option<std::collections::HashSet<String>>,
     mut terminal_request_rx: mpsc::Receiver<TerminalRequest>,
 ) -> Result<(), TuiError> {
@@ -220,6 +221,7 @@ pub async fn run_tui(
         task_configs,
         task_last_runs,
         hidden_names,
+        auto_filter_on_failure_names,
         cli_log_filter,
         verbose_enabled: controls.verbosity.is_enabled(),
     });
@@ -342,7 +344,7 @@ pub async fn run_tui(
                         }
                     }
                     Ok(event) => {
-                        apply_runner_event(event, &mut app);
+                        let filter_changed = apply_runner_event(event, &mut app);
                         let lazy: std::collections::HashSet<String> = app
                             .services_state
                             .iter()
@@ -353,6 +355,8 @@ pub async fn run_tui(
                         if let Some(act) = active.as_mut() {
                             if let Some(m) = act.modal.as_mut() {
                                 m.draw(&app)?;
+                            } else if filter_changed {
+                                clear_and_replay(&mut act.terminal, &store, &app)?;
                             } else {
                                 draw_inline_bar(&mut act.terminal, &app)?;
                             }
@@ -526,22 +530,20 @@ fn enter_shutdown_mode(
 }
 
 /// Apply one [`RunnerEvent`] to the cached state on [`App`].
-fn apply_runner_event(event: RunnerEvent, app: &mut App) {
+fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
     match event {
         RunnerEvent::ServiceStateChanged { name, state, pid } => {
-            app.apply_service_runtime(name, state, pid);
+            app.apply_service_runtime(name, state, pid)
         }
         RunnerEvent::TaskStateChanged {
             name,
             state,
             last_run,
-        } => {
-            app.apply_task_state(name, state, last_run);
-        }
+        } => app.apply_task_state(name, state, last_run),
         RunnerEvent::RebuildComplete { .. }
         | RunnerEvent::TaskRerunComplete { .. }
         | RunnerEvent::ShutdownStarted
-        | RunnerEvent::ShutdownComplete => {}
+        | RunnerEvent::ShutdownComplete => false,
     }
 }
 
@@ -1501,6 +1503,7 @@ mod tests {
             task_configs: HashMap::new(),
             task_last_runs: HashMap::new(),
             hidden_names: HashSet::new(),
+            auto_filter_on_failure_names: HashSet::new(),
             cli_log_filter: None,
             verbose_enabled: false,
         });
