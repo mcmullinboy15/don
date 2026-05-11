@@ -216,6 +216,16 @@ impl FilterState {
         self.active_selected = self.default_selected.clone();
     }
 
+    /// Reset the committed selection to the config-derived defaults. Returns
+    /// `true` when the committed selection changed.
+    pub(crate) fn reset_to_defaults(&mut self) -> bool {
+        if self.active_selected == self.default_selected {
+            return false;
+        }
+        self.active_selected = self.default_selected.clone();
+        true
+    }
+
     /// Enter query-input sub-mode so subsequent typed characters refine the
     /// visible row list.
     pub(crate) fn begin_query_edit(&mut self) {
@@ -612,6 +622,24 @@ mod tests {
         s.commit();
         assert!(!s.passes("api"));
         assert!(s.passes("worker"));
+    }
+
+    #[test]
+    fn committed_reset_to_defaults_reports_changes() {
+        let mut s = state_with_hidden(&["api", "worker"], &["api"]);
+        assert!(!s.reset_to_defaults());
+
+        s.enter_edit();
+        s.push_query_char('a');
+        s.select_only_highlighted();
+        s.commit();
+        assert!(s.passes("api"));
+        assert!(!s.passes("worker"));
+
+        assert!(s.reset_to_defaults());
+        assert!(!s.passes("api"));
+        assert!(s.passes("worker"));
+        assert!(!s.reset_to_defaults());
     }
 
     #[test]

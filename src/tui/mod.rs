@@ -66,7 +66,7 @@ use backend::FixedBottomBackend;
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
 use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState, TerminalRequest};
-use app::{App, AppInit, ViewMode};
+use app::{App, AppInit, ViewMode, line_matches_log_popup};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
 use status_table::StatusTableKeyOutcome;
@@ -305,6 +305,7 @@ pub async fn run_tui(
                         }
 
                         let mut bar_dirty = false;
+                        let mut modal_dirty = false;
                         for line in batch {
                             if is_shutdown_start_line(&line) && !app.shutdown_started {
                                 app.begin_shutdown();
@@ -323,12 +324,17 @@ pub async fn run_tui(
                                 insert_line(&mut act.terminal, &line, cached_width)?;
                                 bar_dirty = true;
                             }
+                            modal_dirty |= app.append_log_popup_line(&line);
                             let _ = store.push(line);
                         }
-                        if bar_dirty
-                            && let Some(act) = active.as_mut()
-                        {
-                            draw_inline_bar(&mut act.terminal, &app)?;
+                        if let Some(act) = active.as_mut() {
+                            if modal_dirty {
+                                if let Some(m) = act.modal.as_mut() {
+                                    m.draw(&app)?;
+                                }
+                            } else if bar_dirty {
+                                draw_inline_bar(&mut act.terminal, &app)?;
+                            }
                         }
                     }
                     None => break, // runner closed the log channel — shut down
@@ -771,6 +777,9 @@ fn handle_normal_key(
             m.draw(app)?;
             *modal = Some(m);
         }
+        KeyCode::Char('R') if app.filter.reset_to_defaults() => {
+            clear_and_replay(terminal, store, app)?;
+        }
         _ => {}
     }
     Ok(())
@@ -884,6 +893,11 @@ fn handle_tasks_key(
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
+    if app.log_popup.is_some() {
+        handle_log_popup_key(key, app);
+        redraw_modal(modal, app)?;
+        return Ok(());
+    }
     match app.tasks_table.handle_key(key, total) {
         StatusTableKeyOutcome::Redraw => {
             redraw_modal(modal, app)?;
@@ -908,8 +922,15 @@ fn handle_tasks_key(
             open_form_for_task(app, &item.name, command_tx)?;
             redraw_modal(modal, app)?;
         } else {
-            dispatch_run_task(command_tx, item.name);
+            let task_name = item.name;
+            dispatch_run_task(command_tx, task_name.clone());
+            return_to_logs_after_task_run(&task_name, app, terminal, store, modal)?;
         }
+    } else if key.code == KeyCode::Char('l') {
+        let Some(item) = highlighted_task_item(app) else {
+            return Ok(());
+        };
+        open_log_popup_for_name(app, store, item.name);
         redraw_modal(modal, app)?;
     }
     Ok(())
@@ -925,6 +946,11 @@ fn handle_services_key(
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     let total = app.service_items().len();
+    if app.log_popup.is_some() {
+        handle_log_popup_key(key, app);
+        redraw_modal(modal, app)?;
+        return Ok(());
+    }
     match app.services_table.handle_key(key, total) {
         StatusTableKeyOutcome::Redraw => {
             redraw_modal(modal, app)?;
@@ -959,14 +985,49 @@ fn handle_services_key(
                 dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
             }
         }
+        KeyCode::Char('l') => {
+            let Some(item) = highlighted_service_item(app) else {
+                return Ok(());
+            };
+            open_log_popup_for_name(app, store, item.name);
+            redraw_modal(modal, app)?;
+        }
         _ => {}
     }
     Ok(())
 }
 
+fn handle_log_popup_key(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_log_popup(),
+        KeyCode::Up | KeyCode::Char('k') => app.scroll_log_popup_by(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.scroll_log_popup_by(1),
+        KeyCode::PageUp => app.scroll_log_popup_by(-10),
+        KeyCode::PageDown => app.scroll_log_popup_by(10),
+        KeyCode::Home | KeyCode::Char('g') => app.scroll_log_popup_to_top(),
+        KeyCode::End | KeyCode::Char('G') => app.scroll_log_popup_to_bottom(),
+        _ => {}
+    }
+}
+
+fn open_log_popup_for_name(app: &mut App, store: &LogStore, name: String) {
+    let lines = store
+        .iter()
+        .filter(|entry| line_matches_log_popup(&name, &entry.line))
+        .map(|entry| entry.line.bytes.clone())
+        .collect();
+    app.open_log_popup(name, lines);
+}
+
 fn highlighted_task_item(app: &App) -> Option<app::TaskStatusItem> {
     let items = app.task_items();
     let idx = app.tasks_table.selected_index(items.len())?;
+    items.get(idx).cloned()
+}
+
+fn highlighted_service_item(app: &App) -> Option<app::OverlayItem> {
+    let items = app.service_items();
+    let idx = app.services_table.selected_index(items.len())?;
     items.get(idx).cloned()
 }
 
@@ -1102,6 +1163,26 @@ fn dispatch_overlay_command(
 fn redraw_modal(modal: &mut Option<Modal>, app: &App) -> Result<(), TuiError> {
     if let Some(m) = modal.as_mut() {
         m.draw(app)?;
+    }
+    Ok(())
+}
+
+fn return_to_logs_after_task_run(
+    task_name: &str,
+    app: &mut App,
+    terminal: &mut TuiTerminal,
+    store: &LogStore,
+    modal: &mut Option<Modal>,
+) -> Result<(), TuiError> {
+    let filter_changed = app.filter.select_name(task_name);
+    app.view_mode = ViewMode::Normal;
+    app.log_popup = None;
+
+    if filter_changed {
+        *modal = None;
+        clear_and_replay(terminal, store, app)?;
+    } else {
+        close_modal_and_replay_new_logs(terminal, store, app, modal)?;
     }
     Ok(())
 }
@@ -1444,10 +1525,9 @@ fn try_submit_form(
             }
         }
     };
-    dispatch_run_task_with_params(command_tx, task_name, params);
+    dispatch_run_task_with_params(command_tx, task_name.clone(), params);
     app.form = None;
-    app.view_mode = ViewMode::Normal;
-    close_modal_and_replay_new_logs(terminal, store, app, modal)?;
+    return_to_logs_after_task_run(&task_name, app, terminal, store, modal)?;
     Ok(())
 }
 

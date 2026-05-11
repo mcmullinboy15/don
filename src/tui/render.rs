@@ -18,12 +18,13 @@
 
 use std::collections::HashMap;
 
+use ansi_to_tui::IntoText;
 use crossterm::style::Color as CrosstermColor;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row};
 
 use super::app::{App, OverlayItem, StatusCounts, TaskStatusItem, ViewMode};
 use super::filter::{FilterFocus, FilterRow, FilterState};
@@ -98,6 +99,7 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         ViewMode::Form => draw_form_modal(frame, app),
         ViewMode::Normal => {}
     }
+    draw_log_popup(frame, app);
 }
 
 fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
@@ -155,7 +157,7 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
         frame,
         area,
         StatusTableView {
-            title: " don tasks — [j/k ↑↓] move  [enter] run/form  [/] filter  [esc] clear/dismiss "
+            title: " don tasks — [j/k ↑↓] move  [enter] run/form  [l] logs  [/] filter  [esc] clear/dismiss "
                 .to_string(),
             header,
             rows,
@@ -194,7 +196,7 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
         area,
         StatusTableView {
             title:
-                " don services — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] hard restart  [/] filter  [esc] clear/dismiss "
+                " don services — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] hard restart  [l] logs  [/] filter  [esc] clear/dismiss "
                     .to_string(),
             header,
             rows,
@@ -208,6 +210,77 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
             selected_hint: service_selected_hint(app),
         },
     );
+}
+
+fn draw_log_popup(frame: &mut Frame<'_>, app: &App) {
+    let Some(popup) = app.log_popup.as_ref() else {
+        return;
+    };
+    let area = centered_rect(frame.area(), 86, 72);
+    if area.height < 3 || area.width < 8 {
+        return;
+    }
+
+    frame.render_widget(Clear, area);
+    let title = format!(
+        " logs: {} — [esc] close  [j/k ↑↓] scroll  [home/end] top/bottom ",
+        popup.name
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    if popup.lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![dim("(no logs captured yet)")])),
+            inner,
+        );
+        return;
+    }
+
+    let visible_rows = inner.height as usize;
+    let max_scroll = popup.lines.len().saturating_sub(visible_rows);
+    let scroll = popup.scroll.min(max_scroll);
+    let mut text = Text::default();
+    for bytes in popup.lines.iter().skip(scroll).take(visible_rows) {
+        let parsed = parse_ansi_text(bytes);
+        if parsed.lines.is_empty() {
+            text.lines.push(Line::default());
+        } else {
+            text.lines.extend(parsed.lines);
+        }
+    }
+
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+fn parse_ansi_text(bytes: &[u8]) -> Text<'static> {
+    bytes
+        .into_text()
+        .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(bytes).into_owned()))
 }
 
 fn service_table_row(item: &OverlayItem, name_colors: &HashMap<String, Color>) -> Row<'static> {
@@ -465,6 +538,7 @@ fn normal_bar_line(
     spans.push(dim("[l] logs"));
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
+        spans.push(dim("  [R] reset"));
     }
     spans.push(dim("  [t] tasks"));
     if counts.tasks_pending_run > 0 {
@@ -968,6 +1042,30 @@ mod tests {
 
         assert!(text.contains("[t] tasks"));
         assert!(!text.contains("[t] tasks*"));
+    }
+
+    #[test]
+    fn normal_bar_shows_reset_hint_when_filter_is_active() {
+        let mut filter = FilterState::new(
+            vec!["api".to_string(), "worker".to_string()],
+            &std::collections::HashSet::new(),
+            None,
+        );
+        filter.enter_edit();
+        filter.push_query_char('a');
+        filter.select_only_highlighted();
+        filter.commit();
+
+        let text = line_text(normal_bar_line(
+            &StatusCounts::default(),
+            &filter,
+            0,
+            1,
+            2,
+            false,
+        ));
+
+        assert!(text.contains("[l] logs (1/2)  [R] reset"));
     }
 
     #[test]

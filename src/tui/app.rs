@@ -13,9 +13,12 @@ use super::filter::FilterState;
 use super::form::FormState;
 use super::status_table::{StatusTableState, retain_fuzzy_matches};
 use crate::config::Task;
-use crate::output::LIFECYCLE_EVENT_NAME;
+use crate::output::{FormattedLogLine, LIFECYCLE_EVENT_NAME};
 use crate::runner::{ServiceState, TaskItemState};
 use crate::task_state::TaskRunInfo;
+
+const LOG_POPUP_MAX_LINES: usize = 500;
+const LOG_POPUP_DEFAULT_VISIBLE_LINES: usize = 30;
 
 /// Top-level view mode. Determines how keys are interpreted and how the
 /// inline viewport is laid out.
@@ -57,6 +60,15 @@ pub(crate) struct TaskStatusItem {
     pub(crate) state: TaskItemState,
     pub(crate) last_run: Option<TaskRunInfo>,
     pub(crate) has_params: bool,
+}
+
+/// In-table popup showing recent logs for the highlighted service/task.
+#[derive(Debug, Clone)]
+pub(crate) struct LogPopup {
+    pub(crate) name: String,
+    pub(crate) lines: Vec<Vec<u8>>,
+    pub(crate) scroll: usize,
+    pub(crate) follow_tail: bool,
 }
 
 impl TaskStatusItem {
@@ -204,6 +216,8 @@ pub(crate) struct App {
     auto_filter_on_failure_names: HashSet<String>,
     /// Active form modal, or `None` when not in [`ViewMode::Form`].
     pub(crate) form: Option<FormState>,
+    /// Active service/task log popup shown over the services/tasks table.
+    pub(crate) log_popup: Option<LogPopup>,
 }
 
 pub(crate) struct AppInit {
@@ -273,6 +287,7 @@ impl App {
             task_configs,
             auto_filter_on_failure_names,
             form: None,
+            log_popup: None,
         }
     }
 
@@ -282,6 +297,7 @@ impl App {
         self.services_table.reset();
         self.tasks_table.reset();
         self.form = None;
+        self.log_popup = None;
     }
 
     pub(crate) fn set_verbose_enabled(&mut self, verbose_enabled: bool) {
@@ -379,6 +395,88 @@ impl App {
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
         filter_changed
     }
+
+    pub(crate) fn open_log_popup(&mut self, name: String, mut lines: Vec<Vec<u8>>) {
+        if lines.len() > LOG_POPUP_MAX_LINES {
+            lines.drain(0..lines.len() - LOG_POPUP_MAX_LINES);
+        }
+        let scroll = lines.len().saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
+        self.log_popup = Some(LogPopup {
+            name,
+            lines,
+            scroll,
+            follow_tail: true,
+        });
+    }
+
+    pub(crate) fn close_log_popup(&mut self) {
+        self.log_popup = None;
+    }
+
+    pub(crate) fn append_log_popup_line(&mut self, line: &FormattedLogLine) -> bool {
+        let Some(popup) = self.log_popup.as_mut() else {
+            return false;
+        };
+        if !line_matches_log_popup(&popup.name, line) {
+            return false;
+        }
+        popup.lines.push(line.bytes.clone());
+        if popup.lines.len() > LOG_POPUP_MAX_LINES {
+            popup.lines.remove(0);
+            if !popup.follow_tail {
+                popup.scroll = popup.scroll.saturating_sub(1);
+            }
+        }
+        if popup.follow_tail {
+            popup.scroll = popup
+                .lines
+                .len()
+                .saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
+        }
+        true
+    }
+
+    pub(crate) fn scroll_log_popup_by(&mut self, delta: isize) {
+        let Some(popup) = self.log_popup.as_mut() else {
+            return;
+        };
+        popup.follow_tail = false;
+        if delta < 0 {
+            popup.scroll = popup.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            popup.scroll = popup
+                .scroll
+                .saturating_add(delta as usize)
+                .min(popup.lines.len().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn scroll_log_popup_to_top(&mut self) {
+        if let Some(popup) = self.log_popup.as_mut() {
+            popup.scroll = 0;
+            popup.follow_tail = false;
+        }
+    }
+
+    pub(crate) fn scroll_log_popup_to_bottom(&mut self) {
+        if let Some(popup) = self.log_popup.as_mut() {
+            popup.scroll = popup
+                .lines
+                .len()
+                .saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
+            popup.follow_tail = true;
+        }
+    }
+}
+
+pub(crate) fn line_matches_log_popup(name: &str, line: &FormattedLogLine) -> bool {
+    if line.name == name {
+        return true;
+    }
+    if line.name != LIFECYCLE_EVENT_NAME {
+        return false;
+    }
+    String::from_utf8_lossy(&line.bytes).contains(&format!("{name}:"))
 }
 
 impl ViewMode {
@@ -622,6 +720,29 @@ mod tests {
         assert!(changed);
         assert!(app.should_render_log("lint", false));
         assert!(!app.should_render_log("build", false));
+    }
+
+    #[test]
+    fn log_popup_matches_source_and_named_lifecycle_lines() {
+        let direct = FormattedLogLine {
+            name: "api".to_string(),
+            is_lifecycle: false,
+            bytes: b"api output".to_vec(),
+        };
+        let lifecycle = FormattedLogLine {
+            name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            bytes: b"[don] api: started".to_vec(),
+        };
+        let other = FormattedLogLine {
+            name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            bytes: b"[don] worker: started".to_vec(),
+        };
+
+        assert!(line_matches_log_popup("api", &direct));
+        assert!(line_matches_log_popup("api", &lifecycle));
+        assert!(!line_matches_log_popup("api", &other));
     }
 
     #[test]
