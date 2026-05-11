@@ -1,5 +1,7 @@
 use super::support::format_duration;
-use super::{NodeKind, Runner, RunnerEvent, ServiceState, TaskItemState};
+use super::{
+    CommandError, CommandResult, NodeKind, Runner, RunnerEvent, ServiceState, TaskItemState,
+};
 
 /// Completion notification from a spawned item.
 pub(in crate::runner) struct ItemDone {
@@ -189,6 +191,14 @@ impl Runner {
         }
 
         let timing = elapsed.map(format_duration).unwrap_or_default();
+        let wait_result: CommandResult = if success {
+            Ok(())
+        } else {
+            Err(CommandError::Failed {
+                name: name.to_string(),
+                message: message.clone().unwrap_or_else(|| "task failed".to_string()),
+            })
+        };
         if success {
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.mark_success();
@@ -240,6 +250,15 @@ impl Runner {
                 name: name.to_string(),
                 success,
             });
+        }
+        if let Some(rt) = self.tasks.get_mut(name)
+            && rt
+                .run_waiter
+                .as_ref()
+                .is_some_and(|waiter| waiter.generation() == rt.run_generation)
+            && let Some(waiter) = rt.run_waiter.take()
+        {
+            waiter.complete(wait_result);
         }
     }
 }

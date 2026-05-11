@@ -315,6 +315,8 @@ fn integration_manual_task_dependency_unblocks_service_after_run() {
             .send(RunnerCommand::RunTask {
                 name: "migrate".to_string(),
                 params: std::collections::HashMap::new(),
+                wait: false,
+                wait_timeout: None,
                 reply: reply_tx,
             })
             .await

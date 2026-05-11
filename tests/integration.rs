@@ -94,6 +94,27 @@ fn validate_config_with_tasks_and_profiles_body() {
     assert_eq!(config.profiles.len(), 1);
 }
 
+fn validate_task_params_reject_run_flag_collisions_body() {
+    let toml = r#"
+[tasks.sync]
+cmd = "true"
+
+[[tasks.sync.params]]
+name = "timeout"
+"#;
+    let config: Config = toml.parse().unwrap();
+    let err = config.validate(TEST_PLATFORM).unwrap_err();
+    let ConfigError::Validation { errors } = &err else {
+        panic!("expected validation error");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("param name 'timeout'") && e.contains("built-in")),
+        "expected reserved param error, got: {errors:?}"
+    );
+}
+
 fn validate_cycle_detected_body() {
     let dir = TempDir::new("validate-cycle");
     let config_path = ConfigBuilder::new()
@@ -463,6 +484,10 @@ bounded_test!(
 bounded_test!(
     validate_config_with_tasks_and_profiles,
     validate_config_with_tasks_and_profiles_body
+);
+bounded_test!(
+    validate_task_params_reject_run_flag_collisions,
+    validate_task_params_reject_run_flag_collisions_body
 );
 bounded_test!(validate_cycle_detected, validate_cycle_detected_body);
 bounded_test!(

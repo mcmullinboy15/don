@@ -208,9 +208,10 @@ Run it with:
 
 ```sh
 don run sync --index=users --batch_size=500 --dry_run
+don run sync --wait --timeout=30s --index=users
 ```
 
-Accepted CLI forms are `--name=value`, `--name value`, and bare `--flag` for bool params. Task params are also exported to the child process as `DON_PARAM_<NAME>` environment variables.
+Accepted CLI forms are `--name=value`, `--name value`, and bare `--flag` for bool params. Add `--wait` to block until the task exits; `--timeout=<duration>` sets a maximum wait time, implies `--wait`, and stops waiting without stopping the task. Param names cannot collide with built-in `don run` flags such as `wait` and `timeout`. Task params are also exported to the child process as `DON_PARAM_<NAME>` environment variables.
 
 For fixed or dynamic candidate values, use `choices` or `completions`:
 
@@ -504,6 +505,8 @@ don logs <name> --follow     # stream output
 don logs <name> --last 50    # last N lines
 don attach <name>            # attach stdin/stdout to a running service
 don run <name>               # run a specific task (bypasses auto_run)
+don run <name> --wait        # run a task and wait for it to finish
+don run <name> --timeout 30s # wait up to 30s without stopping the task
 don run --all-pending        # run all tasks sitting in pending_run
 don exec <cmd> [args...]     # run a command with .don/bin on PATH
 don validate                 # check config without starting
@@ -524,7 +527,7 @@ GET  /status                 → service/task states
 POST /start/:name            → start a stopped service
 POST /stop/:name             → stop a service
 POST /restart/:name          → restart a service
-POST /run/:name              → run a specific task (bypasses auto_run)
+POST /run/:name              → run a specific task (body: {"params": {...}, "wait": true})
 POST /run-pending            → run all tasks in pending_run state
 GET  /logs/:name?last=N      → ring buffer output
 GET  /logs/:name?follow=true → streaming NDJSON

@@ -1196,6 +1196,8 @@ fn dispatch_run_task(command_tx: &mpsc::Sender<RunnerCommand>, name: String) {
         let cmd = RunnerCommand::RunTask {
             name,
             params: std::collections::HashMap::new(),
+            wait: false,
+            wait_timeout: None,
             reply: reply_tx,
         };
         let _ = command_tx.send(cmd).await;
@@ -1217,6 +1219,8 @@ fn dispatch_run_task_with_params(
             .send(RunnerCommand::RunTask {
                 name,
                 params,
+                wait: false,
+                wait_timeout: None,
                 reply: reply_tx,
             })
             .await;

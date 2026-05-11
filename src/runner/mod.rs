@@ -81,6 +81,47 @@ enum TaskRunIntent {
     Background,
 }
 
+pub(crate) struct TaskRunWaiter {
+    generation: u64,
+    reply: Option<oneshot::Sender<CommandResult>>,
+    timeout_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TaskRunWaiter {
+    pub(crate) fn new(
+        generation: u64,
+        reply: oneshot::Sender<CommandResult>,
+        timeout_task: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            generation,
+            reply: Some(reply),
+            timeout_task,
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn complete(mut self, result: CommandResult) {
+        if let Some(timeout_task) = self.timeout_task.take() {
+            timeout_task.abort();
+        }
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(result);
+        }
+    }
+}
+
+impl Drop for TaskRunWaiter {
+    fn drop(&mut self) {
+        if let Some(timeout_task) = self.timeout_task.take() {
+            timeout_task.abort();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) enum ServiceStopAction {
     #[default]
@@ -215,6 +256,8 @@ pub enum CommandError {
     InvalidState { name: String, message: String },
     /// The operation itself failed.
     Failed { name: String, message: String },
+    /// A synchronous `don run --wait --timeout` request stopped waiting.
+    TimedOut { name: String, timeout: String },
     /// User supplied params that the task doesn't declare, or the validation
     /// rules on a declared param rejected the value.
     InvalidParams { name: String, message: String },
@@ -239,6 +282,9 @@ impl std::fmt::Display for CommandError {
             }
             Self::InvalidState { name, message } => write!(f, "{name}: {message}"),
             Self::Failed { name, message } => write!(f, "{name}: {message}"),
+            Self::TimedOut { name, timeout } => {
+                write!(f, "{name}: did not finish within {timeout}")
+            }
             Self::InvalidParams { name, message } => write!(f, "{name}: {message}"),
         }
     }
@@ -357,10 +403,13 @@ pub enum RunnerCommand {
     /// Run a specific task by name, bypassing the `auto_run` gate. Used by
     /// `don run <name>` and the TUI action palette. `params` carries the
     /// user-supplied values for the task's declared params — empty for
-    /// tasks that don't declare any.
+    /// tasks that don't declare any. When `wait` is true, the reply is held
+    /// until the task process exits.
     RunTask {
         name: String,
         params: HashMap<String, String>,
+        wait: bool,
+        wait_timeout: Option<String>,
         reply: oneshot::Sender<CommandResult>,
     },
     /// Resolve candidate values for a single param of a task by running
@@ -394,6 +443,12 @@ enum RunnerInternalCommand {
     },
     /// A task process exited after an explicit run/restart.
     TaskExited(TaskExit),
+    /// A manually-triggered task wait exceeded its requested wait deadline.
+    TaskRunWaitTimedOut {
+        name: String,
+        generation: u64,
+        timeout: String,
+    },
     /// Result of the startup-phase batch build.
     BatchBuildComplete(BatchBuildOutcome),
     /// Result of a detached file-watch build-tool rebuild batch.
@@ -1149,8 +1204,15 @@ impl Runner {
                             RunnerCommand::RunPendingTasks { reply } => {
                                 self.handle_run_pending_tasks(reply).await;
                             }
-                            RunnerCommand::RunTask { name, params, reply } => {
-                                self.handle_run_task(&name, params, reply).await;
+                            RunnerCommand::RunTask {
+                                name,
+                                params,
+                                wait,
+                                wait_timeout,
+                                reply,
+                            } => {
+                                self.handle_run_task(&name, params, wait, wait_timeout, reply)
+                                    .await;
                             }
                             RunnerCommand::ResolveCompletions {
                                 task,
@@ -1211,6 +1273,13 @@ impl Runner {
                             }
                             RunnerInternalCommand::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
+                            }
+                            RunnerInternalCommand::TaskRunWaitTimedOut {
+                                name,
+                                generation,
+                                timeout,
+                            } => {
+                                self.handle_task_run_wait_timeout(&name, generation, &timeout);
                             }
                             RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
                                 self.handle_service_health_changed(&name, healthy).await;

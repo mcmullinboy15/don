@@ -15,7 +15,9 @@
 //! [`RunnerEvent`]: super::RunnerEvent
 
 use super::service::ServiceHandle;
-use super::{AttachWaiter, CommandResult, ServiceState, ServiceStopAction, TaskItemState};
+use super::{
+    AttachWaiter, CommandResult, ServiceState, ServiceStopAction, TaskItemState, TaskRunWaiter,
+};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
@@ -182,6 +184,8 @@ pub(crate) struct RuntimeTask {
     /// Monotonic generation for task run workers so stale completions can
     /// be ignored.
     pub run_generation: u64,
+    /// Pending reply for a manually-triggered `don run --wait` request.
+    pub run_waiter: Option<TaskRunWaiter>,
     /// Whether the task has ever completed successfully.
     pub has_success: bool,
     /// Metadata for the most recent process run, including failures.
@@ -213,6 +217,7 @@ impl RuntimeTask {
             output_worker: None,
             run_worker: None,
             run_generation: 0,
+            run_waiter: None,
             has_success,
             last_run,
             dependency_evaluated: false,

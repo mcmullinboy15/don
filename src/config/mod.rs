@@ -775,6 +775,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
 const RESERVED_PARAM_NAMES: &[&str] = &[
     "all-pending",
     "no-prompt",
+    "wait",
+    "timeout",
     "help",
     "version",
     "config",

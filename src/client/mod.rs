@@ -30,6 +30,12 @@ pub enum ClientError {
     /// Command rejected because the target is in the wrong state.
     #[error("{message}")]
     Conflict { message: String },
+    /// A synchronous task run exceeded the requested wait deadline.
+    #[error("{message}")]
+    WaitTimeout { message: String },
+    /// Command reached the daemon but the requested operation failed.
+    #[error("{message}")]
+    CommandFailed { message: String },
     /// Any other non-2xx response.
     #[error("server error (HTTP {status}): {message}")]
     Server { status: u16, message: String },
@@ -59,6 +65,15 @@ pub struct StatusResponse {
 #[derive(Debug, Deserialize)]
 pub struct LogsResponse {
     pub lines: Vec<String>,
+}
+
+/// Options for running a task through the daemon API.
+#[derive(Debug, Clone, Default)]
+pub struct RunTaskOptions {
+    /// Wait until the task process exits before returning.
+    pub wait: bool,
+    /// Maximum time the daemon should wait for task completion.
+    pub wait_timeout: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,8 +154,23 @@ impl Client {
         name: &str,
         params: HashMap<String, String>,
     ) -> Result<(), ClientError> {
+        self.run_task_with_options(name, params, RunTaskOptions::default())
+            .await
+    }
+
+    /// `POST /run/:name` with options such as synchronous completion waiting.
+    pub async fn run_task_with_options(
+        &self,
+        name: &str,
+        params: HashMap<String, String>,
+        options: RunTaskOptions,
+    ) -> Result<(), ClientError> {
         let path = format!("/run/{}", urlencode(name));
-        let body = serde_json::to_vec(&serde_json::json!({ "params": params }))?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "params": params,
+            "wait": options.wait,
+            "wait_timeout": options.wait_timeout,
+        }))?;
         let (status, body) = self
             .request_with_body("POST", &path, Some(body.as_slice()))
             .await?;
@@ -331,7 +361,9 @@ pub(crate) fn classify_error(status: u16, body: &[u8]) -> ClientError {
     match status {
         404 => ClientError::NotFound { message },
         400 => ClientError::BadRequest { message },
+        408 => ClientError::WaitTimeout { message },
         409 => ClientError::Conflict { message },
+        422 => ClientError::CommandFailed { message },
         other => ClientError::Server {
             status: other,
             message,
@@ -604,6 +636,10 @@ mod tests {
         assert!(matches!(err, ClientError::BadRequest { .. }));
         let err = classify_error(409, br#"{"error":"already running"}"#);
         assert!(matches!(err, ClientError::Conflict { .. }));
+        let err = classify_error(408, br#"{"error":"task did not finish"}"#);
+        assert!(matches!(err, ClientError::WaitTimeout { .. }));
+        let err = classify_error(422, br#"{"error":"task failed"}"#);
+        assert!(matches!(err, ClientError::CommandFailed { .. }));
         let err = classify_error(500, br#"{"error":"boom"}"#);
         assert!(matches!(err, ClientError::Server { status: 500, .. }));
     }

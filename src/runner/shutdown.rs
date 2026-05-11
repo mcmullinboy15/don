@@ -79,6 +79,12 @@ impl Runner {
 
         let mut task_worker_handles = Vec::new();
         for (name, rt) in &mut self.tasks {
+            if let Some(waiter) = rt.run_waiter.take() {
+                waiter.complete(Err(super::CommandError::Failed {
+                    name: name.clone(),
+                    message: "run cancelled by shutdown".to_string(),
+                }));
+            }
             if let Some(worker) = rt.run_worker.take() {
                 self.output_manager
                     .service_event(name, "run cancelled by shutdown");
@@ -367,6 +373,7 @@ impl Runner {
                 | RunnerInternalCommand::ServiceRebuildPrepared { .. }
                 | RunnerInternalCommand::GraphRequeryComplete(_)
                 | RunnerInternalCommand::TaskExited(_)
+                | RunnerInternalCommand::TaskRunWaitTimedOut { .. }
                 | RunnerInternalCommand::BatchBuildComplete(_)
                 | RunnerInternalCommand::RebuildBatchComplete(_)
                 | RunnerInternalCommand::LazyBuildComplete { .. }
