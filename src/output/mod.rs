@@ -1406,6 +1406,7 @@ async fn file_sink_task(mut rx: mpsc::UnboundedReceiver<SinkLine>, mut file: tok
     while let Some(msg) = rx.recv().await {
         let _ = file.write_all(&msg.line).await;
     }
+    let _ = file.flush().await;
 }
 
 /// OSC response sink task. Scans each chunk for terminal queries and

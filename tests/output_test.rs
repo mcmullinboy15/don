@@ -62,6 +62,26 @@ fn read_buf(buf: &Arc<Mutex<Vec<u8>>>) -> String {
     String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
 }
 
+async fn wait_for_file_contains(path: &std::path::Path, needle: &str, timeout: Duration) -> String {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_content = String::new();
+    loop {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if content.contains(needle) {
+                return content;
+            }
+            last_content = content;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "file '{}' did not contain {needle:?}; last content: {last_content:?}",
+                path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Check if a `Bytes` blob contains a given byte slice as a substring.
 fn logs_contain(logs: &bytes::Bytes, needle: &[u8]) -> bool {
     logs.windows(needle.len()).any(|w| w == needle)
@@ -187,8 +207,8 @@ fn integration_service_log_file_writes_raw() {
         );
 
         // File should contain raw output without prefix.
-        let file_content = std::fs::read_to_string(&log_path).unwrap();
-        assert!(file_content.contains("file line 1"));
+        let file_content =
+            wait_for_file_contains(&log_path, "file line 1", Duration::from_secs(1)).await;
         assert!(
             !file_content.contains("filesvc"),
             "file should not contain prefix"
