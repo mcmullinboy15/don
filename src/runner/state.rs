@@ -33,6 +33,10 @@ pub(crate) struct RuntimeService {
     pub resolved: crate::config::service::ResolvedService,
     /// Handle to the running process (if spawned).
     pub handle: Option<ServiceHandle>,
+    /// Process group ID for the current local process. This is equal to the
+    /// child PID for services spawned by don. Docker services do not expose a
+    /// local PID here.
+    pub pgid: Option<i32>,
     /// Output reader task for the current process. It must drain before
     /// output sinks are torn down or final shutdown logs can be lost.
     pub output_worker: Option<tokio::task::JoinHandle<()>>,
@@ -95,6 +99,7 @@ impl RuntimeService {
             state: initial_state,
             resolved,
             handle: None,
+            pgid: None,
             output_worker: None,
             osc_sink: None,
             attach_lock: None,
@@ -183,6 +188,8 @@ pub(crate) struct RuntimeTask {
     pub run_waiter: Option<TaskRunWaiter>,
     /// Whether the task has ever completed successfully.
     pub has_success: bool,
+    /// Metadata for the most recent process run, including failures.
+    pub last_run: Option<crate::task_state::TaskRunInfo>,
     /// Whether the runner has finished the initial startup dependency-gate
     /// evaluation for this task.
     pub dependency_evaluated: bool,
@@ -196,6 +203,7 @@ impl RuntimeTask {
         config: crate::config::task::Task,
         initial_state: TaskItemState,
         has_success: bool,
+        last_run: Option<crate::task_state::TaskRunInfo>,
     ) -> Self {
         Self {
             state: initial_state,
@@ -211,6 +219,7 @@ impl RuntimeTask {
             run_generation: 0,
             run_waiter: None,
             has_success,
+            last_run,
             dependency_evaluated: false,
             needs_run_now: false,
         }

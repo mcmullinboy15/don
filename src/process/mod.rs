@@ -163,6 +163,11 @@ impl ProcessHandle {
         self.child.wait().await.map_err(ProcessError::Io)
     }
 
+    /// Check whether the direct child has exited without blocking.
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProcessError> {
+        self.child.try_wait().map_err(ProcessError::Io)
+    }
+
     /// Send a signal to the entire process group.
     pub fn signal(&self, sig: Signal) -> Result<(), ProcessError> {
         killpg(Pid::from_raw(self.pgid), sig).map_err(|source| ProcessError::Signal {

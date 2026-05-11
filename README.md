@@ -103,14 +103,22 @@ shutdown.signal = "SIGTERM"
 shutdown.timeout = "5s"
 ```
 
-Set `reload = false` to opt out of file-watch restarts — useful for services that handle their own hot-reloading (vite, webpack dev server, etc.):
+Set `reload = false` to opt out of Don-managed file watching for a service — useful for services that handle their own hot-reloading (vite, webpack dev server, etc.):
 
 ```toml
 [services.web]
 run.cmd = "npm"
 run.args = ["run", "dev"]
-watch = ["src/**/*.tsx"]
-reload = false   # don tracks changes for status, but doesn't restart
+reload = false   # no watch registration, rebuilds, or restarts for this service
+```
+
+Bazel and Turbo services/tasks also have nested `watch` flags. These are narrower: they only disable auto-resolved build-tool watch paths while still using the build tool for startup builds. Explicit service `watch = [...]` patterns still work unless `reload = false` is set.
+
+```toml
+[services.api]
+bazel.target = "//services/api:api"
+bazel.watch = false  # disable bazel query-derived watches only
+watch = ["services/api/**/*.py"]
 ```
 
 ### Tasks
@@ -297,7 +305,7 @@ on_failure = "restart"            # "notify" (default) or "restart"
 
 ### File Watching
 
-Services with `watch` patterns automatically rebuild and restart on changes:
+Services with `watch` patterns automatically rebuild and restart on changes. `watch` is always a list of glob strings, not a boolean:
 
 ```toml
 [services.api]
@@ -307,6 +315,19 @@ debounce = "500ms"   # default: 200ms
 build.cmd = "cargo"
 build.args = ["build", "--bin", "api"]
 ```
+
+Rust and Go presets get default watch patterns when `watch` is omitted. Docker and custom `run` services only watch files when `watch = [...]` is set.
+
+Use `reload = false` as the service-level master switch when Don should not watch, rebuild, or restart that service at all:
+
+```toml
+[services.web]
+run.cmd = "npm"
+run.args = ["run", "dev"]
+reload = false
+```
+
+Bazel and Turbo have a second, narrower switch: `bazel.watch = false` or `turbo.watch = false` disables build-tool-resolved watch paths, but does not disable explicit service `watch = [...]` patterns.
 
 ### Docker Services
 
@@ -382,6 +403,15 @@ Don will:
 
 Multiple services sharing the same source files are batched into one `bazel build` invocation.
 
+Set `bazel.watch = false` to keep Bazel startup builds/runs but skip Bazel-derived watch paths. This is useful when Bazel queries are too broad or too expensive and you want explicit watch globs instead:
+
+```toml
+[services.api]
+bazel.target = "//services/api:api"
+bazel.watch = false
+watch = ["services/api/**/*.py", "libs/common/**/*.py"]
+```
+
 ### Turborepo Integration
 
 For monorepos using Turborepo, Don auto-resolves the task graph:
@@ -394,6 +424,8 @@ proxy = { listen = "127.0.0.1:3000", env = "PORT" }
 ```
 
 Don queries `turbo run --dry-run=json` to discover workspace dependencies and input files, then watches them for changes. At startup, a batch `turbo run build` runs for all configured packages.
+
+Set `turbo.watch = false` to keep Turbo startup builds/runs but skip Turbo-derived watch paths. Explicit service `watch = [...]` patterns still apply unless `reload = false` is also set.
 
 ### TCP Proxy
 
@@ -534,7 +566,7 @@ See [`examples/`](examples/) for complete working configs.
 | `env` | {key: value} | Environment variables |
 | `env_file` | [string] | Env files to load |
 | `depends_on` | [string] | Services/tasks to wait for |
-| `watch` | [string] | Glob patterns to watch for changes |
+| `watch` | [string] | Glob patterns to watch for changes; not a boolean |
 | `ignore` | [string] | Glob patterns to exclude from watch |
 | `debounce` | string | Debounce duration ("200ms", "1s") |
 | `listen` | [string] | TCP addresses for socket passing |
@@ -547,7 +579,7 @@ See [`examples/`](examples/) for complete working configs.
 | `ready.monitor_interval` | string | Poll interval while monitoring (default: "10s") |
 | `ready.unhealthy_after` | u32 | Consecutive monitor failures → Unhealthy (default: 3) |
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
-| `reload` | bool | Whether file-watch events restart the service (default: true) |
+| `reload` | bool | Service-level master switch for Don-managed watches, rebuilds, and restarts (default: true) |
 | `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
 | `terminal` | string or table | (tasks) `"muxed"` default, or `"foreground"` for exclusive stdin/stdout/stderr ownership |
 | `terminal.mode` | string | (tasks) `"muxed"` or `"foreground"` |
@@ -578,9 +610,11 @@ See [`examples/`](examples/) for complete working configs.
 | `proxy` | string or table | TCP proxy: `"addr"` or `{ listen, env }` |
 | `lazy` | bool | Delay start until first proxy connection |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
+| `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
 | `turbo.task` | string | Turborepo task name |
 | `turbo.filter` | string | Turborepo package filter |
 | `turbo.build_task` | string | Task to run during batch build (default: "build") |
+| `turbo.watch` | bool | Auto-resolve Turbo watch paths from the task graph (default: true); does not disable explicit service `watch` |
 | `download.platform.<platform>` | table | Per-platform download config |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
 

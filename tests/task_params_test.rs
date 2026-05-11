@@ -101,7 +101,7 @@ async fn wait_for_task_state(
 ) -> bool {
     loop {
         match events.recv().await {
-            Ok(RunnerEvent::TaskStateChanged { name, state })
+            Ok(RunnerEvent::TaskStateChanged { name, state, .. })
                 if name == task_name && state == target =>
             {
                 return true;
@@ -784,7 +784,9 @@ name = "x"
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::from_millis(0));
             match tokio::time::timeout(timeout, events.recv()).await {
-                Ok(Ok(RunnerEvent::TaskStateChanged { name, state })) if name == "interactive" => {
+                Ok(Ok(RunnerEvent::TaskStateChanged { name, state, .. }))
+                    if name == "interactive" =>
+                {
                     match state {
                         TaskItemState::Skipped => saw_skipped = true,
                         TaskItemState::Running | TaskItemState::Completed => saw_run = true,

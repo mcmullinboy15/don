@@ -167,6 +167,7 @@ impl Runner {
                             success: true,
                             message: None,
                             elapsed: None,
+                            last_run: None,
                             task_run_generation: None,
                         })
                         .await;
@@ -189,6 +190,7 @@ impl Runner {
                             success: true,
                             message: None,
                             elapsed: None,
+                            last_run: None,
                             task_run_generation: None,
                         })
                         .await;
@@ -253,6 +255,7 @@ impl Runner {
                                 success: false,
                                 message: Some(message),
                                 elapsed: None,
+                                last_run: None,
                                 task_run_generation: None,
                             })
                             .await;
@@ -337,33 +340,43 @@ impl Runner {
             let result = task::wait_for_task(&mut handle, task_cfg_clone.timeout.as_deref()).await;
             let elapsed = start.elapsed();
 
-            let (success, message) = match result {
+            let (success, exit_code, message) = match result {
                 Ok(status) => {
                     if status.success() {
-                        let task_dir =
-                            working_dir_for(&base_dir_owned, task_cfg_clone.dir.as_deref());
-                        let ignore_patterns = resolve_watch_ignore_patterns(
-                            &task_dir,
-                            &task_cfg_clone.ignore,
-                            &base_dir_owned,
-                            &global_watch_ignore,
-                        );
-                        let _ = task_state
-                            .record_success(
-                                &name_owned,
-                                &task_cfg_clone.watch,
-                                &ignore_patterns,
-                                Some(&task_dir),
-                            )
-                            .await;
-                        (true, None)
+                        (true, status.code(), None)
                     } else {
                         let code = status.code().unwrap_or(-1);
-                        (false, Some(format!("exit code {code}")))
+                        (false, status.code(), Some(format!("exit code {code}")))
                     }
                 }
-                Err(e) => (false, Some(e.to_string())),
+                Err(e) => (false, None, Some(e.to_string())),
             };
+            let last_run = crate::task_state::TaskRunInfo::finished_now(
+                success,
+                Some(elapsed),
+                exit_code,
+                message.clone(),
+            );
+            if success {
+                let task_dir = working_dir_for(&base_dir_owned, task_cfg_clone.dir.as_deref());
+                let ignore_patterns = resolve_watch_ignore_patterns(
+                    &task_dir,
+                    &task_cfg_clone.ignore,
+                    &base_dir_owned,
+                    &global_watch_ignore,
+                );
+                let _ = task_state
+                    .record_success_with_info(
+                        &name_owned,
+                        &task_cfg_clone.watch,
+                        &ignore_patterns,
+                        Some(&task_dir),
+                        &last_run,
+                    )
+                    .await;
+            } else {
+                let _ = task_state.record_run(&name_owned, &last_run).await;
+            }
 
             if let Some(done_tx) = done_tx {
                 let _ = done_tx
@@ -373,19 +386,21 @@ impl Runner {
                         success,
                         message,
                         elapsed: Some(elapsed),
+                        last_run: Some(last_run),
                         task_run_generation: None,
                     })
                     .await;
             } else {
                 let _ = cmd_tx
-                    .send(RunnerInternalCommand::TaskExited {
+                    .send(RunnerInternalCommand::TaskExited(super::TaskExit {
                         name: name_owned,
                         pgid,
                         success,
                         message,
                         elapsed: Some(elapsed),
+                        last_run: Some(last_run),
                         rerun,
-                    })
+                    }))
                     .await;
             }
         });
@@ -429,33 +444,43 @@ impl Runner {
             // restored pgrp + termios.
             terminal_coordinator.release().await;
 
-            let (success, message) = match result {
+            let (success, exit_code, message) = match result {
                 Ok(status) => {
                     if status.success() {
-                        let task_dir =
-                            working_dir_for(&base_dir_owned, task_cfg_clone.dir.as_deref());
-                        let ignore_patterns = resolve_watch_ignore_patterns(
-                            &task_dir,
-                            &task_cfg_clone.ignore,
-                            &base_dir_owned,
-                            &global_watch_ignore,
-                        );
-                        let _ = task_state
-                            .record_success(
-                                &name_owned,
-                                &task_cfg_clone.watch,
-                                &ignore_patterns,
-                                Some(&task_dir),
-                            )
-                            .await;
-                        (true, None)
+                        (true, status.code(), None)
                     } else {
                         let code = status.code().unwrap_or(-1);
-                        (false, Some(format!("exit code {code}")))
+                        (false, status.code(), Some(format!("exit code {code}")))
                     }
                 }
-                Err(e) => (false, Some(e.to_string())),
+                Err(e) => (false, None, Some(e.to_string())),
             };
+            let last_run = crate::task_state::TaskRunInfo::finished_now(
+                success,
+                Some(elapsed),
+                exit_code,
+                message.clone(),
+            );
+            if success {
+                let task_dir = working_dir_for(&base_dir_owned, task_cfg_clone.dir.as_deref());
+                let ignore_patterns = resolve_watch_ignore_patterns(
+                    &task_dir,
+                    &task_cfg_clone.ignore,
+                    &base_dir_owned,
+                    &global_watch_ignore,
+                );
+                let _ = task_state
+                    .record_success_with_info(
+                        &name_owned,
+                        &task_cfg_clone.watch,
+                        &ignore_patterns,
+                        Some(&task_dir),
+                        &last_run,
+                    )
+                    .await;
+            } else {
+                let _ = task_state.record_run(&name_owned, &last_run).await;
+            }
 
             if let Some(done_tx) = done_tx {
                 let _ = done_tx
@@ -465,19 +490,21 @@ impl Runner {
                         success,
                         message,
                         elapsed: Some(elapsed),
+                        last_run: Some(last_run),
                         task_run_generation: None,
                     })
                     .await;
             } else {
                 let _ = cmd_tx
-                    .send(RunnerInternalCommand::TaskExited {
+                    .send(RunnerInternalCommand::TaskExited(super::TaskExit {
                         name: name_owned,
                         pgid,
                         success,
                         message,
                         elapsed: Some(elapsed),
+                        last_run: Some(last_run),
                         rerun,
-                    })
+                    }))
                     .await;
             }
         });

@@ -193,6 +193,7 @@ impl Runner {
                                 success: false,
                                 message: Some(message),
                                 elapsed: None,
+                                last_run: None,
                                 task_run_generation: None,
                             })
                             .await;
@@ -599,6 +600,9 @@ impl Runner {
 
         match result {
             Ok(()) => {
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.pgid = None;
+                }
                 self.set_service_state(name, ServiceState::Stopped);
                 let next_result = match stop_action {
                     ServiceStopAction::None => Ok(()),
@@ -622,6 +626,9 @@ impl Runner {
                 }
             }
             Err(message) => {
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.pgid = None;
+                }
                 self.set_service_state(name, ServiceState::Failed);
                 self.output_manager.service_error_event(name, &message);
                 if let Some(reply) = reply {
@@ -753,6 +760,10 @@ impl Runner {
                 return;
             }
         };
+        if state == ServiceState::Failed && self.reap_exited_process_handle(name).await {
+            let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
+            return;
+        }
         if matches!(state, ServiceState::Lazy | ServiceState::Stopped) {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
@@ -788,5 +799,30 @@ impl Runner {
             reply,
             ServiceStopAction::RestartFull,
         );
+    }
+
+    async fn reap_exited_process_handle(&mut self, name: &str) -> bool {
+        let exited = match self
+            .services
+            .get_mut(name)
+            .and_then(|rs| rs.handle.as_mut())
+        {
+            Some(ServiceHandle::Process(process)) => match process.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) | Err(_) => false,
+            },
+            _ => false,
+        };
+        if !exited {
+            return false;
+        }
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.handle = None;
+            rs.stop_health_tracking();
+        }
+        if let Some(writer) = self.output_manager.service_writer(name) {
+            writer.close_follow_sinks().await;
+        }
+        true
     }
 }

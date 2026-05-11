@@ -23,6 +23,7 @@ impl Runner {
             if let ServiceHandle::Process(ref proc) = start_result.handle {
                 spawned_pgid = Some(proc.pgid());
             }
+            rs.pgid = spawned_pgid;
             rs.handle = Some(start_result.handle);
 
             // Add OSC response sink if we have a PTY write handle.
@@ -180,6 +181,7 @@ impl Runner {
                             success,
                             message: ready_result.err().map(|e| e.to_string()),
                             elapsed: None,
+                            last_run: None,
                             task_run_generation: None,
                         })
                         .await;
@@ -202,6 +204,7 @@ impl Runner {
                     success: true,
                     message: None,
                     elapsed: None,
+                    last_run: None,
                     task_run_generation: None,
                 })
                 .await;

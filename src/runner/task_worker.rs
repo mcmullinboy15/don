@@ -129,18 +129,15 @@ pub(in crate::runner) async fn run_task_worker(
         // tcsetpgrp so the inline viewport, raw mode, and input task are
         // gone before the child takes over the terminal.
         terminal_coordinator.acquire().await;
-        let spawn = match task::spawn_foreground_task(
-            task_cfg, name, &base_dir, platform, params,
-        )
-        .await
-        {
-            Ok(spawn) => spawn,
-            Err(e) => {
-                // The fg task never took the terminal — restore the TUI.
-                terminal_coordinator.release().await;
-                return Err(e.to_string());
-            }
-        };
+        let spawn =
+            match task::spawn_foreground_task(task_cfg, name, &base_dir, platform, params).await {
+                Ok(spawn) => spawn,
+                Err(e) => {
+                    // The fg task never took the terminal — restore the TUI.
+                    terminal_coordinator.release().await;
+                    return Err(e.to_string());
+                }
+            };
         Ok(TaskRunPrepared::ForegroundSpawned(Box::new(spawn)))
     } else {
         let spawn = task::spawn_task(task_cfg, name, &base_dir, platform, params)

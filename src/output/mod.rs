@@ -1338,7 +1338,16 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             // flag). Defaulting to false is correct — these are usually
             // service-stdout fragments that didn't end in `\n` before the
             // child closed its pipe.
-            emit_line(&mut target, "", prefix, &sanitized, false, &verbosity, start).await;
+            emit_line(
+                &mut target,
+                "",
+                prefix,
+                &sanitized,
+                false,
+                &verbosity,
+                start,
+            )
+            .await;
         }
     }
 }
@@ -1397,6 +1406,7 @@ async fn file_sink_task(mut rx: mpsc::UnboundedReceiver<SinkLine>, mut file: tok
     while let Some(msg) = rx.recv().await {
         let _ = file.write_all(&msg.line).await;
     }
+    let _ = file.flush().await;
 }
 
 /// OSC response sink task. Scans each chunk for terminal queries and

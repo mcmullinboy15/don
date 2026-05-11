@@ -165,6 +165,21 @@ impl FilterState {
         self.active_selected.contains(name)
     }
 
+    /// Add a name to the committed selection. Returns `true` when this made
+    /// the active filter more permissive. If a filter edit modal is open, the
+    /// edit snapshot is updated too so Esc does not undo externally-triggered
+    /// failure visibility.
+    pub(crate) fn select_name(&mut self, name: &str) -> bool {
+        if !self.all_names.iter().any(|n| n == name) {
+            return false;
+        }
+        let changed = self.active_selected.insert(name.to_string());
+        if changed && let Some(snapshot) = self.snapshot_selected.as_mut() {
+            snapshot.insert(name.to_string());
+        }
+        changed
+    }
+
     /// Start editing. Captures the current selection so Esc can restore it.
     pub(crate) fn enter_edit(&mut self) {
         self.query.clear();
@@ -199,6 +214,16 @@ impl FilterState {
     /// Reset the active selection to the config-derived defaults.
     pub(crate) fn reset_edit_to_defaults(&mut self) {
         self.active_selected = self.default_selected.clone();
+    }
+
+    /// Reset the committed selection to the config-derived defaults. Returns
+    /// `true` when the committed selection changed.
+    pub(crate) fn reset_to_defaults(&mut self) -> bool {
+        if self.active_selected == self.default_selected {
+            return false;
+        }
+        self.active_selected = self.default_selected.clone();
+        true
     }
 
     /// Enter query-input sub-mode so subsequent typed characters refine the
@@ -445,6 +470,18 @@ mod tests {
     }
 
     #[test]
+    fn select_name_admits_hidden_name_and_survives_cancel() {
+        let mut s = state_with_hidden(&["api", "db"], &["db"]);
+        assert!(!s.passes("db"));
+
+        s.enter_edit();
+        assert!(s.select_name("db"));
+        s.cancel_edit();
+
+        assert!(s.passes("db"));
+    }
+
+    #[test]
     fn unknown_names_are_blocked_even_without_config() {
         // With the filter always on, names the runner didn't declare at
         // startup are unrecognized — gated out rather than silently passing.
@@ -585,6 +622,24 @@ mod tests {
         s.commit();
         assert!(!s.passes("api"));
         assert!(s.passes("worker"));
+    }
+
+    #[test]
+    fn committed_reset_to_defaults_reports_changes() {
+        let mut s = state_with_hidden(&["api", "worker"], &["api"]);
+        assert!(!s.reset_to_defaults());
+
+        s.enter_edit();
+        s.push_query_char('a');
+        s.select_only_highlighted();
+        s.commit();
+        assert!(s.passes("api"));
+        assert!(!s.passes("worker"));
+
+        assert!(s.reset_to_defaults());
+        assert!(!s.passes("api"));
+        assert!(s.passes("worker"));
+        assert!(!s.reset_to_defaults());
     }
 
     #[test]

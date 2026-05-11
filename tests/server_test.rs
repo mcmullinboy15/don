@@ -142,6 +142,45 @@ fn integration_status_endpoint_returns_items() {
 }
 
 #[test]
+fn integration_status_endpoint_includes_task_last_run() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-task-last-run");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task("prep", "true", &[])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let mut body = String::new();
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            let (status, next_body) = request(&socket, "GET", "/status").await;
+            assert_eq!(status, 200, "body: {next_body}");
+            body = next_body;
+            if body.contains("\"name\":\"prep\"") && body.contains("\"state\":\"completed\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(body.contains("\"name\":\"prep\""), "body: {body}");
+        assert!(body.contains("\"state\":\"completed\""), "body: {body}");
+        assert!(body.contains("\"last_run\""), "body: {body}");
+        assert!(body.contains("\"success\":true"), "body: {body}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
 fn integration_stop_endpoint_stops_service() {
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("server-stop");

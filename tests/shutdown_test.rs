@@ -118,7 +118,7 @@ async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -163,7 +163,7 @@ async fn make_runner(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();
@@ -363,7 +363,7 @@ fn shutdown_broadcasts_stopping_before_stopped() {
                 .await
                 .unwrap()
                 .unwrap();
-            if let RunnerEvent::ServiceStateChanged { name, state } = event
+            if let RunnerEvent::ServiceStateChanged { name, state, .. } = event
                 && name == "api"
                 && matches!(state, ServiceState::Stopping | ServiceState::Stopped)
             {
@@ -876,12 +876,50 @@ unhealthy_after = 1
 fn shutdown_waits_for_process_group_and_drains_logs() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("shutdown-pgroup-logs");
-        let script = "trap 'echo parent-term; exit 0' TERM; \
-            (trap '' HUP; trap 'echo child-term; sleep 1; echo child-done; exit 0' TERM; \
-            while true; do sleep 1 & wait $!; done) & \
-            echo started; wait";
+        let script_path = dir.child("process_tree.py");
+        std::fs::write(
+            &script_path,
+            r#"
+import os
+import signal
+import sys
+import time
+
+pid = os.fork()
+if pid == 0:
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    def child_term(_signum, _frame):
+        print("child-term", flush=True)
+        time.sleep(1)
+        print("child-done", flush=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, child_term)
+    while True:
+        time.sleep(10)
+
+
+def parent_term(_signum, _frame):
+    print("parent-term", flush=True)
+    while True:
+        try:
+            os.waitpid(pid, 0)
+            break
+        except InterruptedError:
+            continue
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, parent_term)
+print("started", flush=True)
+while True:
+    time.sleep(10)
+"#,
+        )
+        .unwrap();
         let toml = ConfigBuilder::new()
-            .add_custom_service("tree", "bash", &["-c", script])
+            .add_custom_service("tree", "python3", &[script_path.to_str().unwrap()])
             .log("stdout")
             .ready_exec("true", &[])
             .shutdown("SIGTERM", "3s")
@@ -890,6 +928,7 @@ fn shutdown_waits_for_process_group_and_drains_logs() {
 
         let (shutdown_tx, handle, buf) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+        assert!(wait_for_output(&buf, "started", Duration::from_secs(5)).await);
 
         let start = std::time::Instant::now();
         let _ = shutdown_tx.send(()).await;

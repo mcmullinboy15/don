@@ -1,7 +1,7 @@
 //! TUI application state — the single source of truth for what to render.
 //!
 //! Derived from runner events (status counts, service/task state for the
-//! action palette) and from user input (view mode, filter, palette). Kept
+//! status tables) and from user input (view mode, filter, tables). Kept
 //! deliberately small so rendering is a pure function of this struct plus
 //! the terminal size.
 //!
@@ -11,10 +11,14 @@ use std::collections::{HashMap, HashSet};
 
 use super::filter::FilterState;
 use super::form::FormState;
-use super::palette::ActionPalette;
+use super::status_table::{StatusTableState, retain_fuzzy_matches};
 use crate::config::Task;
-use crate::output::LIFECYCLE_EVENT_NAME;
+use crate::output::{FormattedLogLine, LIFECYCLE_EVENT_NAME};
 use crate::runner::{ServiceState, TaskItemState};
+use crate::task_state::TaskRunInfo;
+
+const LOG_POPUP_MAX_LINES: usize = 500;
+const LOG_POPUP_DEFAULT_VISIBLE_LINES: usize = 30;
 
 /// Top-level view mode. Determines how keys are interpreted and how the
 /// inline viewport is laid out.
@@ -26,32 +30,72 @@ pub(crate) enum ViewMode {
     /// Log-filter modal. Navigation edits the pending selection; `/` enters
     /// query input, Enter commits, Esc cancels.
     Filter,
-    /// Tasks palette — typing filters tasks, Enter dispatches.
-    Palette,
-    /// Full-screen status overlay (alternate screen). Arrow keys move a
+    /// Full-screen tasks table. Arrow keys move a highlight; Enter runs the
+    /// selected task or opens its param form.
+    Tasks,
+    /// Full-screen services table (alternate screen). Arrow keys move a
     /// highlight; Enter toggles start/stop on the selected service, `r`
     /// restarts it, `R` hard-restarts it, `Esc` dismisses.
-    Overlay,
-    /// Param-entry form for a task. Opened from the palette when the user
+    Services,
+    /// Param-entry form for a task. Opened from the task table when the user
     /// selects a task with declared `params`. Collects values and, on
     /// submit, dispatches `RunnerCommand::RunTask { name, params, reply }`.
     Form,
 }
 
-/// A row in the status overlay — a service or task with its current state.
+/// A row in the services status table.
 /// Exposed so the render path and the key handler agree on which row is
-/// highlighted at `overlay_highlight`.
+/// highlighted.
 #[derive(Debug, Clone)]
-pub(crate) enum OverlayItem {
-    Service { name: String, state: ServiceState },
-    Task { name: String, state: TaskItemState },
+pub(crate) struct OverlayItem {
+    pub(crate) name: String,
+    pub(crate) state: ServiceState,
+    pub(crate) pid: Option<i32>,
+}
+
+/// A row in the tasks status table.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskStatusItem {
+    pub(crate) name: String,
+    pub(crate) state: TaskItemState,
+    pub(crate) last_run: Option<TaskRunInfo>,
+    pub(crate) has_params: bool,
+}
+
+/// In-table popup showing recent logs for the highlighted service/task.
+#[derive(Debug, Clone)]
+pub(crate) struct LogPopup {
+    pub(crate) name: String,
+    pub(crate) lines: Vec<Vec<u8>>,
+    pub(crate) scroll: usize,
+    pub(crate) follow_tail: bool,
+}
+
+impl TaskStatusItem {
+    pub(crate) fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub(crate) fn runnable(&self) -> bool {
+        !matches!(self.state, TaskItemState::Running | TaskItemState::Building)
+    }
+
+    fn sort_bucket(&self) -> u8 {
+        match self.state {
+            TaskItemState::Failed => 0,
+            TaskItemState::DependencyFailed => 1,
+            TaskItemState::PendingRun => 2,
+            TaskItemState::Running | TaskItemState::Building => 3,
+            TaskItemState::Pending => 4,
+            TaskItemState::Completed => 5,
+            TaskItemState::Skipped => 6,
+        }
+    }
 }
 
 impl OverlayItem {
     pub(crate) fn name(&self) -> &str {
-        match self {
-            Self::Service { name, .. } | Self::Task { name, .. } => name.as_str(),
-        }
+        self.name.as_str()
     }
 
     /// Sort bucket: actionable rows first, settled rows last. Putting
@@ -59,25 +103,15 @@ impl OverlayItem {
     /// so the user sees the thing they need to look at, not the stranded
     /// dependents.
     fn sort_bucket(&self) -> u8 {
-        match self {
-            Self::Service { state, .. } => match state {
-                ServiceState::Failed | ServiceState::Unhealthy => 0,
-                ServiceState::DependencyFailed => 1,
-                ServiceState::Pending | ServiceState::Building | ServiceState::Starting => 2,
-                ServiceState::Running => 3,
-                ServiceState::Ready => 4,
-                ServiceState::Stopping => 5,
-                ServiceState::Stopped => 6,
-                ServiceState::Lazy => 7,
-            },
-            Self::Task { state, .. } => match state {
-                TaskItemState::Failed => 0,
-                TaskItemState::DependencyFailed => 1,
-                TaskItemState::Pending | TaskItemState::Building | TaskItemState::Running => 2,
-                TaskItemState::PendingRun => 7,
-                TaskItemState::Completed => 8,
-                TaskItemState::Skipped => 9,
-            },
+        match self.state {
+            ServiceState::Failed | ServiceState::Unhealthy => 0,
+            ServiceState::DependencyFailed => 1,
+            ServiceState::Pending | ServiceState::Building | ServiceState::Starting => 2,
+            ServiceState::Running => 3,
+            ServiceState::Ready => 4,
+            ServiceState::Stopping => 5,
+            ServiceState::Stopped => 6,
+            ServiceState::Lazy => 7,
         }
     }
 }
@@ -160,50 +194,63 @@ pub(crate) struct App {
     /// committed filter (raw service stdout still respects it).
     pub(crate) shutdown_started: bool,
     pub(crate) filter: FilterState,
-    pub(crate) palette: ActionPalette,
     /// Monotonically incrementing frame counter, driven by the TUI's timer
     /// tick. The renderer mods into the spinner frame table. Wraps freely.
     pub(crate) spinner_frame: usize,
     /// Current service state — tracked here (not in a side task) because the
-    /// action palette reads it at open time. Seeded with every service name
+    /// status tables read it at render time. Seeded with every service name
     /// in `ServiceState::Pending` so the bar shows `0/N ready` from frame 1.
     pub(crate) services_state: HashMap<String, ServiceState>,
+    pub(crate) service_pids: HashMap<String, Option<i32>>,
     pub(crate) tasks_state: HashMap<String, TaskItemState>,
-    /// Highlighted row index in the status overlay. Reset to 0 each time the
-    /// overlay opens. The render path scrolls so this row stays visible.
-    pub(crate) overlay_highlight: usize,
-    /// Fuzzy-filter query applied to the status overlay rows. Empty = show
-    /// everything. Activated via `/` inside the overlay; `overlay_filtering`
-    /// tracks whether key input is currently editing the query.
-    pub(crate) overlay_query: String,
-    /// True when `/` has been pressed inside the overlay and subsequent
-    /// keystrokes feed the query. Enter commits and exits the sub-mode
-    /// (keeping the query active so r/R/Enter operate on the filtered list);
-    /// Esc clears the query and exits.
-    pub(crate) overlay_filtering: bool,
+    pub(crate) tasks_last_run: HashMap<String, TaskRunInfo>,
+    pub(crate) services_table: StatusTableState,
+    pub(crate) tasks_table: StatusTableState,
     /// Static task-config snapshot — populated at TUI startup so the
-    /// palette/form can inspect declared params without reaching back into
+    /// table/form can inspect declared params without reaching back into
     /// the runner. Immutable for the session; the runner re-validates on
     /// submit anyway.
     pub(crate) task_configs: HashMap<String, Task>,
+    /// Names that should be inserted into the committed log filter when they
+    /// fail. Derived from top-level/service/task config at TUI startup.
+    auto_filter_on_failure_names: HashSet<String>,
     /// Active form modal, or `None` when not in [`ViewMode::Form`].
     pub(crate) form: Option<FormState>,
+    /// Active service/task log popup shown over the services/tasks table.
+    pub(crate) log_popup: Option<LogPopup>,
+}
+
+pub(crate) struct AppInit {
+    pub(crate) service_names: Vec<String>,
+    pub(crate) task_names: Vec<String>,
+    pub(crate) build_tool_names: Vec<String>,
+    pub(crate) task_configs: HashMap<String, Task>,
+    pub(crate) task_last_runs: HashMap<String, TaskRunInfo>,
+    pub(crate) hidden_names: HashSet<String>,
+    pub(crate) auto_filter_on_failure_names: HashSet<String>,
+    pub(crate) cli_log_filter: Option<HashSet<String>>,
+    pub(crate) verbose_enabled: bool,
 }
 
 impl App {
-    pub(crate) fn new(
-        service_names: Vec<String>,
-        task_names: Vec<String>,
-        build_tool_names: Vec<String>,
-        task_configs: HashMap<String, Task>,
-        hidden_names: HashSet<String>,
-        cli_log_filter: Option<HashSet<String>>,
-        verbose_enabled: bool,
-    ) -> Self {
+    pub(crate) fn new(init: AppInit) -> Self {
+        let AppInit {
+            service_names,
+            task_names,
+            build_tool_names,
+            task_configs,
+            task_last_runs,
+            hidden_names,
+            auto_filter_on_failure_names,
+            cli_log_filter,
+            verbose_enabled,
+        } = init;
         let services_state: HashMap<String, ServiceState> = service_names
             .iter()
             .map(|n| (n.clone(), ServiceState::Pending))
             .collect();
+        let service_pids: HashMap<String, Option<i32>> =
+            service_names.iter().map(|n| (n.clone(), None)).collect();
         let tasks_state: HashMap<String, TaskItemState> = task_names
             .iter()
             .map(|n| (n.clone(), TaskItemState::Pending))
@@ -230,25 +277,27 @@ impl App {
             verbose_enabled,
             shutdown_started: false,
             filter: FilterState::new(all_filter_names, &hidden_names, cli_log_filter.as_ref()),
-            palette: ActionPalette::default(),
             spinner_frame: 0,
             services_state,
+            service_pids,
             tasks_state,
-            overlay_highlight: 0,
-            overlay_query: String::new(),
-            overlay_filtering: false,
+            tasks_last_run: task_last_runs,
+            services_table: StatusTableState::default(),
+            tasks_table: StatusTableState::default(),
             task_configs,
+            auto_filter_on_failure_names,
             form: None,
+            log_popup: None,
         }
     }
 
     pub(crate) fn begin_shutdown(&mut self) {
         self.shutdown_started = true;
         self.view_mode = ViewMode::Normal;
-        self.palette.close();
-        self.overlay_query.clear();
-        self.overlay_filtering = false;
+        self.services_table.reset();
+        self.tasks_table.reset();
         self.form = None;
+        self.log_popup = None;
     }
 
     pub(crate) fn set_verbose_enabled(&mut self, verbose_enabled: bool) {
@@ -268,33 +317,43 @@ impl App {
         self.filter.passes(name)
     }
 
-    /// Sorted rows for the status overlay: errors → running → exited → lazy,
-    /// alphabetical within a bucket. Services and tasks are interleaved by
-    /// the same sort; kind is preserved per row. When `overlay_query` is
-    /// non-empty, rows are narrowed by fuzzy name-match before sorting.
-    pub(crate) fn overlay_items(&self) -> Vec<OverlayItem> {
+    /// Sorted rows for the services table: errors → running → exited →
+    /// lazy, alphabetical within a bucket. When its query is non-empty,
+    /// rows are narrowed by fuzzy name-match before sorting.
+    pub(crate) fn service_items(&self) -> Vec<OverlayItem> {
         let mut items: Vec<OverlayItem> = self
             .services_state
             .iter()
-            .map(|(name, state)| OverlayItem::Service {
+            .map(|(name, state)| OverlayItem {
                 name: name.clone(),
                 state: *state,
+                pid: self.service_pids.get(name).copied().flatten(),
             })
-            .chain(
-                self.tasks_state
-                    .iter()
-                    .map(|(name, state)| OverlayItem::Task {
-                        name: name.clone(),
-                        state: *state,
-                    }),
-            )
             .collect();
-        if !self.overlay_query.is_empty() {
-            let names: Vec<String> = items.iter().map(|i| i.name().to_string()).collect();
-            let matched = super::fuzzy::fuzzy_match(&self.overlay_query, &names);
-            let set: std::collections::HashSet<&str> = matched.iter().map(String::as_str).collect();
-            items.retain(|i| set.contains(i.name()));
-        }
+        retain_fuzzy_matches(&self.services_table.query, &mut items, OverlayItem::name);
+        items.sort_by(|a, b| {
+            a.sort_bucket()
+                .cmp(&b.sort_bucket())
+                .then_with(|| a.name().cmp(b.name()))
+        });
+        items
+    }
+
+    pub(crate) fn task_items(&self) -> Vec<TaskStatusItem> {
+        let mut items: Vec<TaskStatusItem> = self
+            .tasks_state
+            .iter()
+            .map(|(name, state)| TaskStatusItem {
+                name: name.clone(),
+                state: *state,
+                last_run: self.tasks_last_run.get(name).cloned(),
+                has_params: self
+                    .task_configs
+                    .get(name)
+                    .is_some_and(|task| !task.params.is_empty()),
+            })
+            .collect();
+        retain_fuzzy_matches(&self.tasks_table.query, &mut items, TaskStatusItem::name);
         items.sort_by(|a, b| {
             a.sort_bucket()
                 .cmp(&b.sort_bucket())
@@ -305,14 +364,124 @@ impl App {
 
     /// Apply a runner-emitted state change. Returns `true` when counts
     /// changed (so the main loop can limit redraws to interesting events).
-    pub(crate) fn apply_service_state(&mut self, name: String, state: ServiceState) {
-        self.services_state.insert(name, state);
+    pub(crate) fn apply_service_runtime(
+        &mut self,
+        name: String,
+        state: ServiceState,
+        pid: Option<i32>,
+    ) -> bool {
+        let filter_changed = state == ServiceState::Failed
+            && self.auto_filter_on_failure_names.contains(&name)
+            && self.filter.select_name(&name);
+        self.services_state.insert(name.clone(), state);
+        self.service_pids.insert(name, pid);
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
+        filter_changed
     }
 
-    pub(crate) fn apply_task_state(&mut self, name: String, state: TaskItemState) {
-        self.tasks_state.insert(name, state);
+    pub(crate) fn apply_task_state(
+        &mut self,
+        name: String,
+        state: TaskItemState,
+        last_run: Option<TaskRunInfo>,
+    ) -> bool {
+        let filter_changed = state == TaskItemState::Failed
+            && self.auto_filter_on_failure_names.contains(&name)
+            && self.filter.select_name(&name);
+        self.tasks_state.insert(name.clone(), state);
+        if let Some(last_run) = last_run {
+            self.tasks_last_run.insert(name, last_run);
+        }
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
+        filter_changed
+    }
+
+    pub(crate) fn open_log_popup(&mut self, name: String, mut lines: Vec<Vec<u8>>) {
+        if lines.len() > LOG_POPUP_MAX_LINES {
+            lines.drain(0..lines.len() - LOG_POPUP_MAX_LINES);
+        }
+        let scroll = lines.len().saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
+        self.log_popup = Some(LogPopup {
+            name,
+            lines,
+            scroll,
+            follow_tail: true,
+        });
+    }
+
+    pub(crate) fn close_log_popup(&mut self) {
+        self.log_popup = None;
+    }
+
+    pub(crate) fn append_log_popup_line(&mut self, line: &FormattedLogLine) -> bool {
+        let Some(popup) = self.log_popup.as_mut() else {
+            return false;
+        };
+        if !line_matches_log_popup(&popup.name, line) {
+            return false;
+        }
+        popup.lines.push(line.bytes.clone());
+        if popup.lines.len() > LOG_POPUP_MAX_LINES {
+            popup.lines.remove(0);
+            if !popup.follow_tail {
+                popup.scroll = popup.scroll.saturating_sub(1);
+            }
+        }
+        if popup.follow_tail {
+            popup.scroll = popup
+                .lines
+                .len()
+                .saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
+        }
+        true
+    }
+
+    pub(crate) fn scroll_log_popup_by(&mut self, delta: isize) {
+        let Some(popup) = self.log_popup.as_mut() else {
+            return;
+        };
+        popup.follow_tail = false;
+        if delta < 0 {
+            popup.scroll = popup.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            popup.scroll = popup
+                .scroll
+                .saturating_add(delta as usize)
+                .min(popup.lines.len().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn scroll_log_popup_to_top(&mut self) {
+        if let Some(popup) = self.log_popup.as_mut() {
+            popup.scroll = 0;
+            popup.follow_tail = false;
+        }
+    }
+
+    pub(crate) fn scroll_log_popup_to_bottom(&mut self) {
+        if let Some(popup) = self.log_popup.as_mut() {
+            popup.scroll = popup
+                .lines
+                .len()
+                .saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
+            popup.follow_tail = true;
+        }
+    }
+}
+
+pub(crate) fn line_matches_log_popup(name: &str, line: &FormattedLogLine) -> bool {
+    if line.name == name {
+        return true;
+    }
+    if line.name != LIFECYCLE_EVENT_NAME {
+        return false;
+    }
+    String::from_utf8_lossy(&line.bytes).contains(&format!("{name}:"))
+}
+
+impl ViewMode {
+    pub(crate) fn needs_wall_clock_redraw(self) -> bool {
+        matches!(self, Self::Tasks)
     }
 }
 
@@ -327,6 +496,28 @@ mod tests {
 
     fn tasks(entries: &[(&str, TaskItemState)]) -> HashMap<String, TaskItemState> {
         entries.iter().map(|(n, s)| (n.to_string(), *s)).collect()
+    }
+
+    fn app_with_names(service_names: Vec<String>, task_names: Vec<String>) -> App {
+        app_with_names_and_auto_filter(service_names, task_names, HashSet::new())
+    }
+
+    fn app_with_names_and_auto_filter(
+        service_names: Vec<String>,
+        task_names: Vec<String>,
+        auto_filter_on_failure_names: HashSet<String>,
+    ) -> App {
+        App::new(AppInit {
+            service_names,
+            task_names,
+            build_tool_names: vec![],
+            task_configs: HashMap::new(),
+            task_last_runs: HashMap::new(),
+            hidden_names: HashSet::new(),
+            auto_filter_on_failure_names,
+            cli_log_filter: None,
+            verbose_enabled: false,
+        })
     }
 
     #[test]
@@ -462,30 +653,100 @@ mod tests {
 
     #[test]
     fn apply_state_refreshes_counts() {
-        let mut app = App::new(
-            vec!["api".into(), "db".into()],
-            vec![],
-            vec![],
-            HashMap::new(),
-            HashSet::new(),
-            None,
-            false,
-        );
+        let mut app = app_with_names(vec!["api".into(), "db".into()], vec![]);
         assert_eq!(app.counts.services_ready, 0);
-        app.apply_service_state("api".into(), ServiceState::Ready);
+        app.apply_service_runtime("api".into(), ServiceState::Ready, None);
         assert_eq!(app.counts.services_ready, 1);
-        app.apply_service_state("db".into(), ServiceState::Ready);
+        app.apply_service_runtime("db".into(), ServiceState::Ready, None);
         assert_eq!(app.counts.services_ready, 2);
-        app.apply_service_state("db".into(), ServiceState::Stopping);
+        app.apply_service_runtime("db".into(), ServiceState::Stopping, None);
         assert_eq!(app.counts.services_ready, 1);
         assert_eq!(app.counts.services_active, 1);
-        app.apply_service_state("api".into(), ServiceState::Failed);
+        app.apply_service_runtime("api".into(), ServiceState::Failed, None);
         assert_eq!(app.counts.services_ready, 0);
         assert_eq!(app.counts.services_failed, 1);
     }
 
     #[test]
-    fn overlay_items_prioritize_actionable_states() {
+    fn failed_service_is_added_to_log_filter_when_configured() {
+        let mut app = app_with_names_and_auto_filter(
+            vec!["api".into(), "db".into()],
+            vec![],
+            HashSet::from(["db".to_string()]),
+        );
+        app.filter.enter_edit();
+        app.filter.select_only_highlighted(); // [all] row keeps everything selected.
+        app.filter.toggle_highlighted(); // clear all
+        app.filter.commit();
+
+        assert!(!app.should_render_log("db", false));
+        let changed = app.apply_service_runtime("db".into(), ServiceState::Failed, None);
+
+        assert!(changed);
+        assert!(app.should_render_log("db", false));
+        assert!(!app.should_render_log("api", false));
+    }
+
+    #[test]
+    fn dependency_failed_service_does_not_auto_filter() {
+        let mut app = app_with_names_and_auto_filter(
+            vec!["api".into()],
+            vec![],
+            HashSet::from(["api".to_string()]),
+        );
+        app.filter.enter_edit();
+        app.filter.toggle_highlighted(); // clear all
+        app.filter.commit();
+
+        let changed = app.apply_service_runtime("api".into(), ServiceState::DependencyFailed, None);
+
+        assert!(!changed);
+        assert!(!app.should_render_log("api", false));
+    }
+
+    #[test]
+    fn failed_task_is_added_to_log_filter_when_configured() {
+        let mut app = app_with_names_and_auto_filter(
+            vec![],
+            vec!["build".into(), "lint".into()],
+            HashSet::from(["lint".to_string()]),
+        );
+        app.filter.enter_edit();
+        app.filter.toggle_highlighted(); // clear all
+        app.filter.commit();
+
+        let changed = app.apply_task_state("lint".into(), TaskItemState::Failed, None);
+
+        assert!(changed);
+        assert!(app.should_render_log("lint", false));
+        assert!(!app.should_render_log("build", false));
+    }
+
+    #[test]
+    fn log_popup_matches_source_and_named_lifecycle_lines() {
+        let direct = FormattedLogLine {
+            name: "api".to_string(),
+            is_lifecycle: false,
+            bytes: b"api output".to_vec(),
+        };
+        let lifecycle = FormattedLogLine {
+            name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            bytes: b"[don] api: started".to_vec(),
+        };
+        let other = FormattedLogLine {
+            name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            bytes: b"[don] worker: started".to_vec(),
+        };
+
+        assert!(line_matches_log_popup("api", &direct));
+        assert!(line_matches_log_popup("api", &lifecycle));
+        assert!(!line_matches_log_popup("api", &other));
+    }
+
+    #[test]
+    fn service_items_prioritize_service_states_and_exclude_tasks() {
         struct Case {
             name: &'static str,
             services: Vec<(&'static str, ServiceState)>,
@@ -515,19 +776,13 @@ mod tests {
             ],
             want: vec![
                 "svc-failed",
-                "task-failed",
                 "svc-dep",
-                "task-dep",
                 "svc-building",
-                "task-building",
                 "svc-running",
                 "svc-ready",
                 "svc-stopping",
                 "svc-stopped",
                 "svc-lazy",
-                "task-pending-run",
-                "task-completed",
-                "task-skipped",
             ],
         }];
 
@@ -542,39 +797,35 @@ mod tests {
                 .iter()
                 .map(|(name, _)| (*name).to_string())
                 .collect();
-            let mut app = App::new(
-                service_names,
-                task_names,
-                vec![],
-                HashMap::new(),
-                HashSet::new(),
-                None,
-                false,
-            );
+            let mut app = app_with_names(service_names, task_names);
             for (name, state) in case.services {
-                app.apply_service_state(name.to_string(), state);
+                app.apply_service_runtime(name.to_string(), state, None);
             }
             for (name, state) in case.tasks {
-                app.apply_task_state(name.to_string(), state);
+                app.apply_task_state(name.to_string(), state, None);
             }
 
-            let items = app.overlay_items();
+            let items = app.service_items();
             let got: Vec<&str> = items.iter().map(OverlayItem::name).collect();
             assert_eq!(got, case.want, "case: {}", case.name);
         }
     }
 
     #[test]
+    fn service_items_include_service_pid() {
+        let mut app = app_with_names(vec!["api".into()], vec![]);
+
+        app.apply_service_runtime("api".into(), ServiceState::Running, Some(12_345));
+
+        let items = app.service_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name(), "api");
+        assert_eq!(items[0].pid, Some(12_345));
+    }
+
+    #[test]
     fn shutdown_mode_bypasses_filter_for_all_logs() {
-        let mut app = App::new(
-            vec!["api".into(), "worker".into()],
-            vec![],
-            vec![],
-            HashMap::new(),
-            HashSet::new(),
-            None,
-            false,
-        );
+        let mut app = app_with_names(vec!["api".into(), "worker".into()], vec![]);
         app.filter.enter_edit();
         app.filter.push_query_char('a');
         app.filter.select_only_highlighted();
@@ -600,24 +851,84 @@ mod tests {
 
     #[test]
     fn begin_shutdown_returns_to_normal_view() {
-        let mut app = App::new(
-            vec!["api".into()],
-            vec![],
-            vec![],
-            HashMap::new(),
-            HashSet::new(),
-            None,
-            false,
-        );
-        app.view_mode = ViewMode::Overlay;
-        app.overlay_query = "api".into();
-        app.overlay_filtering = true;
+        let mut app = app_with_names(vec!["api".into()], vec![]);
+        app.view_mode = ViewMode::Services;
+        app.services_table.query = "api".into();
+        app.services_table.filtering = true;
 
         app.begin_shutdown();
 
         assert!(app.shutdown_started);
         assert_eq!(app.view_mode, ViewMode::Normal);
-        assert!(app.overlay_query.is_empty());
-        assert!(!app.overlay_filtering);
+        assert!(app.services_table.query.is_empty());
+        assert!(!app.services_table.filtering);
+    }
+
+    #[test]
+    fn task_items_prioritize_actionable_states_and_include_metadata() {
+        let mut app = app_with_names(
+            vec![],
+            vec![
+                "completed".into(),
+                "failed".into(),
+                "pending-run".into(),
+                "running".into(),
+            ],
+        );
+        app.apply_task_state("completed".into(), TaskItemState::Completed, None);
+        app.apply_task_state("failed".into(), TaskItemState::Failed, None);
+        app.apply_task_state("pending-run".into(), TaskItemState::PendingRun, None);
+        app.apply_task_state("running".into(), TaskItemState::Running, None);
+        app.tasks_last_run.insert(
+            "completed".into(),
+            TaskRunInfo {
+                finished_at_unix_secs: 1,
+                duration_ms: Some(42),
+                success: true,
+                exit_code: Some(0),
+                message: None,
+            },
+        );
+
+        let items = app.task_items();
+        let got: Vec<&str> = items.iter().map(TaskStatusItem::name).collect();
+
+        assert_eq!(got, vec!["failed", "pending-run", "running", "completed"]);
+        assert_eq!(items[3].last_run.as_ref().unwrap().duration_ms, Some(42));
+    }
+
+    #[test]
+    fn only_task_table_needs_wall_clock_redraws() {
+        struct Case {
+            mode: ViewMode,
+            want: bool,
+        }
+
+        let cases = vec![
+            Case {
+                mode: ViewMode::Tasks,
+                want: true,
+            },
+            Case {
+                mode: ViewMode::Services,
+                want: false,
+            },
+            Case {
+                mode: ViewMode::Normal,
+                want: false,
+            },
+            Case {
+                mode: ViewMode::Filter,
+                want: false,
+            },
+            Case {
+                mode: ViewMode::Form,
+                want: false,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(case.mode.needs_wall_clock_redraw(), case.want);
+        }
     }
 }

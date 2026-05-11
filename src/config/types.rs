@@ -1,6 +1,10 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+fn default_true() -> bool {
+    true
+}
+
 /// Bazel build tool integration for a service or task.
 ///
 /// When configured, Don queries Bazel at startup to determine which source
@@ -10,6 +14,9 @@ use std::path::PathBuf;
 pub struct BazelConfig {
     /// Bazel target label (e.g. `"//services/api:api"`).
     pub target: String,
+    /// Whether Don should auto-watch source packages resolved from the Bazel graph.
+    #[serde(default = "default_true")]
+    pub watch: bool,
 }
 
 /// Turborepo build tool integration for a service or task.
@@ -20,6 +27,9 @@ pub struct BazelConfig {
 pub struct TurboConfig {
     /// Turbo task name to query for watch resolution (e.g. `"dev"`, `"build"`).
     pub task: String,
+    /// Whether Don should auto-watch package inputs resolved from the Turbo graph.
+    #[serde(default = "default_true")]
+    pub watch: bool,
     /// Turbo task to run during the batch build phase (e.g. `"build"`).
     /// Defaults to `"build"`. Set to `""` to skip the batch build for this item.
     pub build_task: Option<String>,

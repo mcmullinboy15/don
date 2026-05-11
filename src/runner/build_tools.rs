@@ -38,12 +38,14 @@ pub(crate) struct GraphRequeryRequestItem {
     pub(crate) name: String,
     pub(crate) bazel: Option<crate::config::BazelConfig>,
     pub(crate) turbo: Option<crate::config::TurboConfig>,
+    pub(crate) watch_enabled: bool,
     pub(crate) working_dir: PathBuf,
     pub(crate) ignore_patterns: Vec<String>,
 }
 
 pub(crate) struct GraphRequeryOutcomeItem {
     pub(crate) name: String,
+    pub(crate) watch_enabled: bool,
     pub(crate) ignore_patterns: Vec<String>,
     pub(crate) result: Result<crate::build_tool::ResolvedBuildInfo, String>,
 }
@@ -65,6 +67,8 @@ pub(crate) struct BatchBuildItem {
     pub(crate) kind: NodeKind,
     pub(crate) bazel: Option<crate::config::BazelConfig>,
     pub(crate) turbo: Option<crate::config::TurboConfig>,
+    /// Whether build-tool-resolved source and graph paths should be watched.
+    pub(crate) watch_enabled: bool,
     /// Absolute directory where the build tool should be invoked.
     pub(crate) working_dir: PathBuf,
     /// Ignore patterns to carry through to the watch manager.
@@ -269,6 +273,21 @@ pub(crate) fn bazel_graph_requery_group_dir(working_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| working_dir.to_path_buf())
 }
 
+fn watch_resolution_items(
+    items: &[BatchBuildItem],
+) -> (Vec<&BatchBuildItem>, Vec<&BatchBuildItem>) {
+    let bazel_items: Vec<&BatchBuildItem> = items
+        .iter()
+        .filter(|i| i.watch_enabled && i.bazel.is_some())
+        .collect();
+    let turbo_items: Vec<&BatchBuildItem> = items
+        .iter()
+        .filter(|i| i.watch_enabled && i.turbo.is_some())
+        .collect();
+
+    (bazel_items, turbo_items)
+}
+
 pub(crate) async fn send_watch_update(
     tx: &mpsc::Sender<crate::watch::WatchUpdate>,
     name: String,
@@ -306,7 +325,17 @@ pub(crate) async fn run_graph_requery_worker(
     let mut other_items: Vec<(usize, GraphRequeryRequestItem)> = Vec::new();
 
     for (idx, item) in items.into_iter().enumerate() {
-        if item.bazel.is_some() {
+        if !item.watch_enabled {
+            outcomes[idx] = Some(GraphRequeryOutcomeItem {
+                name: item.name,
+                watch_enabled: false,
+                ignore_patterns: item.ignore_patterns,
+                result: Ok(crate::build_tool::ResolvedBuildInfo {
+                    watch_paths: Vec::new(),
+                    graph_definition_globs: Vec::new(),
+                }),
+            });
+        } else if item.bazel.is_some() {
             bazel_groups
                 .entry(bazel_graph_requery_group_dir(&item.working_dir))
                 .or_default()
@@ -337,6 +366,7 @@ pub(crate) async fn run_graph_requery_worker(
                     };
                     outcomes[idx] = Some(GraphRequeryOutcomeItem {
                         name: item.name,
+                        watch_enabled: item.watch_enabled,
                         ignore_patterns: item.ignore_patterns,
                         result,
                     });
@@ -347,6 +377,7 @@ pub(crate) async fn run_graph_requery_worker(
                 for (idx, item) in group {
                     outcomes[idx] = Some(GraphRequeryOutcomeItem {
                         name: item.name,
+                        watch_enabled: item.watch_enabled,
                         ignore_patterns: item.ignore_patterns,
                         result: Err(message.clone()),
                     });
@@ -368,6 +399,7 @@ pub(crate) async fn run_graph_requery_worker(
         };
         outcomes[idx] = Some(GraphRequeryOutcomeItem {
             name: item.name,
+            watch_enabled: item.watch_enabled,
             ignore_patterns: item.ignore_patterns,
             result,
         });
@@ -376,8 +408,8 @@ pub(crate) async fn run_graph_requery_worker(
     outcomes.into_iter().flatten().collect()
 }
 
-/// Run the full startup-phase batch build: watch resolution → batch build
-/// → bazel binary-path cquery. Pure off-task function that takes owned
+/// Run the full startup-phase batch build: optional watch resolution → batch
+/// build → bazel binary-path cquery. Pure off-task function that takes owned
 /// inputs and returns an [`BatchBuildOutcome`] the main loop applies.
 ///
 /// Sends [`crate::watch::WatchUpdate`]s directly to the watch manager as
@@ -415,8 +447,7 @@ pub(crate) async fn run_batch_build_chain(
 
     // Partition items by tool. Each item keeps its own ignore patterns
     // (configured per service/task) but gets the same tier-1/tier-2 globs.
-    let bazel_items: Vec<&BatchBuildItem> = items.iter().filter(|i| i.bazel.is_some()).collect();
-    let turbo_items: Vec<&BatchBuildItem> = items.iter().filter(|i| i.turbo.is_some()).collect();
+    let (bazel_items, turbo_items) = watch_resolution_items(&items);
 
     let mut resolved_info_by_item: HashMap<String, crate::build_tool::ResolvedBuildInfo> =
         HashMap::new();
@@ -529,7 +560,9 @@ pub(crate) async fn run_batch_build_chain(
             continue; // query failed for this tool — warning already pushed
         };
 
-        if let Some(ref tx) = watch_update_tx {
+        if item.watch_enabled
+            && let Some(ref tx) = watch_update_tx
+        {
             let watch_kind = match item.kind {
                 NodeKind::Service => crate::watch::WatchItemKind::Service,
                 NodeKind::Task => crate::watch::WatchItemKind::Task,
@@ -820,7 +853,7 @@ pub(crate) async fn run_batch_build_chain(
     }
 
     for item in &items {
-        if !outcome.succeeded.contains(&item.name) {
+        if !item.watch_enabled || !outcome.succeeded.contains(&item.name) {
             continue;
         }
         let Some(info) = resolved_info_by_item.get(&item.name) else {
@@ -841,4 +874,99 @@ pub(crate) async fn run_batch_build_chain(
     }
 
     outcome
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::config::{BazelConfig, LogConfig, TurboConfig};
+
+    fn bazel_item(name: &str, watch_enabled: bool) -> BatchBuildItem {
+        BatchBuildItem {
+            name: name.to_string(),
+            kind: NodeKind::Service,
+            bazel: Some(BazelConfig {
+                target: format!("//services/{name}:{name}"),
+                watch: watch_enabled,
+            }),
+            turbo: None,
+            watch_enabled,
+            working_dir: PathBuf::from("."),
+            ignore: Vec::new(),
+        }
+    }
+
+    fn turbo_item(name: &str, watch_enabled: bool) -> BatchBuildItem {
+        BatchBuildItem {
+            name: name.to_string(),
+            kind: NodeKind::Service,
+            bazel: None,
+            turbo: Some(TurboConfig {
+                task: "dev".to_string(),
+                watch: watch_enabled,
+                build_task: None,
+                filter: Some(format!("@test/{name}")),
+            }),
+            watch_enabled,
+            working_dir: PathBuf::from("."),
+            ignore: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn watch_resolution_items_excludes_watch_disabled_build_tools() {
+        let items = vec![
+            bazel_item("api", true),
+            bazel_item("worker", false),
+            turbo_item("web", true),
+            turbo_item("docs", false),
+        ];
+
+        let (bazel_items, turbo_items) = watch_resolution_items(&items);
+
+        assert_eq!(
+            bazel_items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["api"]
+        );
+        assert_eq!(
+            turbo_items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web"]
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_requery_worker_skips_watch_disabled_build_tools() {
+        let output =
+            crate::output::OutputManager::new(&[("api", &LogConfig::Stdout)], tokio::io::sink())
+                .await
+                .unwrap();
+        let outcomes = run_graph_requery_worker(
+            vec![GraphRequeryRequestItem {
+                name: "api".to_string(),
+                bazel: Some(BazelConfig {
+                    target: "//services/api:api".to_string(),
+                    watch: false,
+                }),
+                turbo: None,
+                watch_enabled: false,
+                working_dir: PathBuf::from("."),
+                ignore_patterns: Vec::new(),
+            }],
+            output.clone_lifecycle_emitter(),
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(!outcomes[0].watch_enabled);
+        let info = outcomes[0].result.as_ref().unwrap();
+        assert!(info.watch_paths.is_empty());
+        assert!(info.graph_definition_globs.is_empty());
+    }
 }

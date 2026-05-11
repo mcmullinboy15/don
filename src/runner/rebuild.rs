@@ -266,7 +266,9 @@ impl Runner {
                     } else if let Some(rt) = self.tasks.get_mut(&outcome.name) {
                         rt.resolved_watch_paths = info.watch_paths.clone();
                     }
-                    if let Some(ref tx) = watch_update_tx {
+                    if outcome.watch_enabled
+                        && let Some(ref tx) = watch_update_tx
+                    {
                         let kind = if self.services.contains_key(&outcome.name) {
                             crate::watch::WatchItemKind::Service
                         } else {
@@ -292,13 +294,16 @@ impl Runner {
                         .await;
                     }
 
-                    if let Some(rs) = self.services.get(&outcome.name) {
+                    if outcome.watch_enabled
+                        && let Some(rs) = self.services.get(&outcome.name)
+                    {
                         if should_rebuild_after_graph_requery(rs)
                             && !services_to_rebuild.contains(&outcome.name)
                         {
                             services_to_rebuild.push(outcome.name.clone());
                         }
-                    } else if self.tasks.contains_key(&outcome.name)
+                    } else if outcome.watch_enabled
+                        && self.tasks.contains_key(&outcome.name)
                         && !tasks_to_rerun.contains(&outcome.name)
                     {
                         tasks_to_rerun.push(outcome.name.clone());
@@ -348,13 +353,13 @@ impl Runner {
             let service_names: Vec<String> = self
                 .services
                 .iter()
-                .filter(|(_, rs)| rs.resolved.is_build_tool_managed())
+                .filter(|(_, rs)| rs.resolved.build_tool_watch_enabled())
                 .map(|(service_name, _)| service_name.clone())
                 .collect();
             let task_names: Vec<String> = self
                 .tasks
                 .iter()
-                .filter(|(_, rt)| rt.config.bazel.is_some() || rt.config.turbo.is_some())
+                .filter(|(_, rt)| rt.config.build_tool_watch_enabled())
                 .map(|(task_name, _)| task_name.clone())
                 .collect();
             for item_name in service_names.into_iter().chain(task_names) {
@@ -403,18 +408,26 @@ impl Runner {
 
         let mut items = Vec::new();
         for name in &names {
-            let (bazel, turbo, item_dir, ignore_patterns) =
+            let (bazel, turbo, watch_enabled, item_dir, ignore_patterns) =
                 if let Some(rs) = self.services.get(name) {
+                    if !rs.resolved.build_tool_watch_enabled() {
+                        continue;
+                    }
                     (
                         rs.resolved.bazel_config().cloned(),
                         rs.resolved.turbo_config().cloned(),
+                        rs.resolved.build_tool_watch_enabled(),
                         rs.resolved.dir.clone(),
                         rs.resolved.ignore.clone(),
                     )
                 } else if let Some(rt) = self.tasks.get(name) {
+                    if !rt.config.build_tool_watch_enabled() {
+                        continue;
+                    }
                     (
                         rt.config.bazel.clone(),
                         rt.config.turbo.clone(),
+                        rt.config.build_tool_watch_enabled(),
                         rt.config.dir.clone(),
                         rt.config.ignore.clone(),
                     )
@@ -435,6 +448,7 @@ impl Runner {
                 name: name.clone(),
                 bazel,
                 turbo,
+                watch_enabled,
                 working_dir,
                 ignore_patterns,
             });

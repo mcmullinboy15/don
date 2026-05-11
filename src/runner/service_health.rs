@@ -138,6 +138,7 @@ impl Runner {
         if clean_exit {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.restart_attempts = 0;
+                rs.pgid = None;
             }
             self.set_service_state(name, ServiceState::Stopped);
             self.output_manager
@@ -148,6 +149,9 @@ impl Runner {
             return;
         }
 
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.pgid = None;
+        }
         self.set_service_state(name, ServiceState::Failed);
         let exit_msg = format_unexpected_exit(status);
         self.output_manager.service_error_event(name, &exit_msg);

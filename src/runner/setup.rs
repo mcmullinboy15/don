@@ -179,9 +179,10 @@ pub(in crate::runner) async fn build_runtime_maps(
             let mut task = task.clone();
             task.depends_on = config.effective_depends_on(name, &task.depends_on);
             let has_success = task_state.has_success(name).await.unwrap_or(false);
+            let last_run = task_state.last_run(name).await.unwrap_or(None);
             tasks.insert(
                 name.clone(),
-                RuntimeTask::new(task, TaskItemState::Pending, has_success),
+                RuntimeTask::new(task, TaskItemState::Pending, has_success, last_run),
             );
         }
     }

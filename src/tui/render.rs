@@ -3,8 +3,8 @@
 //! Two entry points:
 //! - [`draw_bar`] fills the single-row inline viewport with the status bar.
 //!   It's called on every state change while the inline terminal is active.
-//! - [`draw_modal`] renders full-screen content (filter, palette, status
-//!   overlay) into an alt-screen [`Terminal`]. It's called whenever the
+//! - [`draw_modal`] renders full-screen content (filter, task/service tables,
+//!   form) into an alt-screen [`Terminal`]. It's called whenever the
 //!   modal's app state changes.
 //!
 //! All UI output is a pure function of the [`App`] state plus the frame size —
@@ -18,17 +18,19 @@
 
 use std::collections::HashMap;
 
+use ansi_to_tui::IntoText;
 use crossterm::style::Color as CrosstermColor;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row};
 
-use super::app::{App, OverlayItem, StatusCounts, ViewMode};
+use super::app::{App, OverlayItem, StatusCounts, TaskStatusItem, ViewMode};
 use super::filter::{FilterFocus, FilterRow, FilterState};
-use super::palette::{Action, ActionPalette};
+use super::status_table::{StatusTableView, draw_status_table};
 use crate::runner::{ServiceState, TaskItemState};
+use crate::task_state::TaskRunInfo;
 
 /// Total rows the inline viewport reserves: 1 blank buffer row + 3 rows
 /// for the bordered status box (top border + content + bottom border).
@@ -92,11 +94,12 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
 pub(crate) fn draw_modal(frame: &mut Frame<'_>, app: &App) {
     match app.view_mode {
         ViewMode::Filter => draw_filter_modal(frame, app),
-        ViewMode::Palette => draw_palette_modal(frame, app),
-        ViewMode::Overlay => draw_overlay(frame, app),
+        ViewMode::Tasks => draw_tasks_table(frame, app),
+        ViewMode::Services => draw_services_table(frame, app),
         ViewMode::Form => draw_form_modal(frame, app),
         ViewMode::Normal => {}
     }
+    draw_log_popup(frame, app);
 }
 
 fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
@@ -137,171 +140,195 @@ fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(bar, layout[2]);
 }
 
-fn draw_palette_modal(frame: &mut Frame<'_>, app: &App) {
+fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
-    if area.height < 3 || area.width == 0 {
-        return;
-    }
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(" Tasks — [↑↓] move  [enter] run  [esc] cancel ");
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    if inner.height < 2 {
-        return;
-    }
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
     let name_colors = log_name_colors(app);
-    draw_palette_list(frame, layout[0], &app.palette, &name_colors);
-    let bar = Paragraph::new(palette_bar_line(&app.palette));
-    frame.render_widget(bar, layout[1]);
-}
-
-/// Render the full-screen status overlay — a table of every known service
-/// and task with its current state, sorted errors → running → exited → lazy
-/// then alphabetical within each bucket. Arrow keys move a highlight; the
-/// render path scrolls so the highlighted row stays visible.
-fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(
-            " don status — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] hard restart  [/] filter  [esc] clear filter/dismiss ",
-        );
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-    if inner.height < 2 {
-        return;
-    }
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let table_area = layout[0];
-    let bar_area = layout[1];
-
-    let header = Row::new(vec!["KIND", "NAME", "STATE"]).style(
+    let items = app.task_items();
+    let header = Row::new(vec!["NAME", "STATE", "LAST RUN", "RESULT", "DURATION"]).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(Color::Cyan),
     );
-
-    let items = app.overlay_items();
-    let name_colors = log_name_colors(app);
-    let total = items.len();
-
-    // Body height = table area minus header row.
-    let body_height = table_area.height.saturating_sub(1) as usize;
-    let highlight = app.overlay_highlight.min(total.saturating_sub(1));
-    // Scroll so the highlighted row is inside [scroll, scroll + body_height).
-    let scroll = if body_height == 0 {
-        0
-    } else if highlight >= body_height {
-        highlight + 1 - body_height
-    } else {
-        0
-    };
-    let max_scroll = total.saturating_sub(body_height);
-    let scroll = scroll.min(max_scroll);
-    let showing_more_below = scroll + body_height < total;
-    let showing_more_above = scroll > 0;
-
-    let highlight_style = Style::default().add_modifier(Modifier::REVERSED);
-    let visible: Vec<Row<'static>> = items
+    let rows = items
         .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(body_height)
-        .map(|(i, item)| {
-            let (kind, name, state_cell) = match item {
-                OverlayItem::Service { name, state } => (
-                    "service",
-                    name.clone(),
-                    Cell::from(service_state_label(*state))
-                        .style(Style::default().fg(service_state_color(*state))),
-                ),
-                OverlayItem::Task { name, state } => (
-                    "task",
-                    name.clone(),
-                    Cell::from(task_state_label(*state))
-                        .style(Style::default().fg(task_state_color(*state))),
-                ),
-            };
-            let name_style = name_colors
-                .get(&name)
-                .copied()
-                .map(|color| Style::default().fg(color))
-                .unwrap_or_default();
-            let row = Row::new(vec![
-                Cell::from(kind).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(name).style(name_style),
-                state_cell,
-            ]);
-            if i == highlight {
-                row.style(highlight_style)
-            } else {
-                row
-            }
-        })
+        .map(|item| task_table_row(item, &name_colors))
         .collect();
+    draw_status_table(
+        frame,
+        area,
+        StatusTableView {
+            title: " don tasks — [j/k ↑↓] move  [enter] run/form  [l] logs  [/] filter  [esc] clear/dismiss "
+                .to_string(),
+            header,
+            rows,
+            widths: vec![
+                Constraint::Percentage(32),
+                Constraint::Length(14),
+                Constraint::Length(14),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+            state: &app.tasks_table,
+            empty_label: "(no tasks)",
+            selected_hint: task_selected_hint(app),
+        },
+    );
+}
 
-    let table = Table::new(
-        visible,
-        [
-            Constraint::Length(9),
-            Constraint::Percentage(40),
-            Constraint::Percentage(60),
-        ],
-    )
-    .header(header);
-    frame.render_widget(table, table_area);
+/// Render the full-screen services table — a table of every known service
+/// with its current state, sorted errors → running → exited → lazy then
+/// alphabetical within each bucket.
+fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+    let header = Row::new(vec!["NAME", "PID", "STATE"]).style(
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
+    );
+    let name_colors = log_name_colors(app);
+    let rows = app
+        .service_items()
+        .iter()
+        .map(|item| service_table_row(item, &name_colors))
+        .collect();
+    draw_status_table(
+        frame,
+        area,
+        StatusTableView {
+            title:
+                " don services — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] hard restart  [l] logs  [/] filter  [esc] clear/dismiss "
+                    .to_string(),
+            header,
+            rows,
+            widths: vec![
+                Constraint::Percentage(45),
+                Constraint::Length(10),
+                Constraint::Percentage(55),
+            ],
+            state: &app.services_table,
+            empty_label: "(no services)",
+            selected_hint: service_selected_hint(app),
+        },
+    );
+}
 
-    // Bottom bar: filter input (when active or non-empty) and scroll indicator.
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let has_query = !app.overlay_query.is_empty();
-    if app.overlay_filtering || has_query {
-        spans.push(bold_cyan("filter: "));
-        spans.push(Span::styled(
-            app.overlay_query.clone(),
-            Style::default().fg(Color::White),
-        ));
-        if app.overlay_filtering {
-            spans.push(Span::styled(
-                "▌",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ));
+fn draw_log_popup(frame: &mut Frame<'_>, app: &App) {
+    let Some(popup) = app.log_popup.as_ref() else {
+        return;
+    };
+    let area = centered_rect(frame.area(), 86, 72);
+    if area.height < 3 || area.width < 8 {
+        return;
+    }
+
+    frame.render_widget(Clear, area);
+    let title = format!(
+        " logs: {} — [esc] close  [j/k ↑↓] scroll  [home/end] top/bottom ",
+        popup.name
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    if popup.lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![dim("(no logs captured yet)")])),
+            inner,
+        );
+        return;
+    }
+
+    let visible_rows = inner.height as usize;
+    let max_scroll = popup.lines.len().saturating_sub(visible_rows);
+    let scroll = popup.scroll.min(max_scroll);
+    let mut text = Text::default();
+    for bytes in popup.lines.iter().skip(scroll).take(visible_rows) {
+        let parsed = parse_ansi_text(bytes);
+        if parsed.lines.is_empty() {
+            text.lines.push(Line::default());
+        } else {
+            text.lines.extend(parsed.lines);
         }
-        spans.push(separator());
     }
-    if total == 0 {
-        spans.push(dim(if has_query {
-            "no matches".to_string()
-        } else {
-            "(no services or tasks)".to_string()
-        }));
-    } else {
-        let scroll_hint = if showing_more_above || showing_more_below {
-            let up = if showing_more_above { "↑" } else { " " };
-            let down = if showing_more_below { "↓" } else { " " };
-            format!("{up}{down} {}/{}", (highlight + 1).min(total), total)
-        } else {
-            format!("{}/{total}", highlight + 1)
-        };
-        spans.push(dim(scroll_hint));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), bar_area);
+
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+fn parse_ansi_text(bytes: &[u8]) -> Text<'static> {
+    bytes
+        .into_text()
+        .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(bytes).into_owned()))
+}
+
+fn service_table_row(item: &OverlayItem, name_colors: &HashMap<String, Color>) -> Row<'static> {
+    let name = item.name.clone();
+    let pid = item
+        .pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let state_cell = Cell::from(service_state_label(item.state))
+        .style(Style::default().fg(service_state_color(item.state)));
+    let name_style = name_colors
+        .get(&name)
+        .copied()
+        .map(|color| Style::default().fg(color))
+        .unwrap_or_default();
+    Row::new(vec![
+        Cell::from(name).style(name_style),
+        Cell::from(pid).style(Style::default().fg(Color::DarkGray)),
+        state_cell,
+    ])
+}
+
+fn task_table_row(item: &TaskStatusItem, name_colors: &HashMap<String, Color>) -> Row<'static> {
+    let name_style = name_colors
+        .get(&item.name)
+        .copied()
+        .map(|color| Style::default().fg(color))
+        .unwrap_or_default();
+    Row::new(vec![
+        Cell::from(item.name.clone()).style(name_style),
+        Cell::from(task_state_label(item.state))
+            .style(Style::default().fg(task_state_color(item.state))),
+        Cell::from(format_task_last_run_time(item.last_run.as_ref()))
+            .style(Style::default().fg(Color::Gray)),
+        Cell::from(format_task_result(item.last_run.as_ref())).style(
+            Style::default().fg(item
+                .last_run
+                .as_ref()
+                .map(task_result_color)
+                .unwrap_or(Color::DarkGray)),
+        ),
+        Cell::from(format_task_duration(
+            item.last_run
+                .as_ref()
+                .and_then(|last_run| last_run.duration_ms),
+        ))
+        .style(Style::default().fg(Color::Gray)),
+    ])
 }
 
 fn draw_filter_list(
@@ -373,68 +400,97 @@ fn draw_filter_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_palette_list(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    palette: &ActionPalette,
-    name_colors: &HashMap<String, Color>,
-) {
-    if area.height == 0 {
-        return;
+fn service_selected_hint(app: &App) -> Option<String> {
+    let items = app.service_items();
+    let item = app
+        .services_table
+        .selected_index(items.len())
+        .and_then(|idx| items.get(idx))?;
+    match item.state {
+        ServiceState::Ready | ServiceState::Running | ServiceState::Unhealthy => {
+            Some(format!("enter stop {}", item.name))
+        }
+        ServiceState::Stopped | ServiceState::Lazy => Some(format!("enter start {}", item.name)),
+        ServiceState::Failed | ServiceState::DependencyFailed => {
+            Some(format!("enter retry {}", item.name))
+        }
+        ServiceState::Pending
+        | ServiceState::Building
+        | ServiceState::Starting
+        | ServiceState::Stopping => Some("transitioning".to_string()),
     }
-    // Hand every matching action to ratatui — its `ListState` keeps the
-    // selected index in view by adjusting the scroll offset.
-    let items: Vec<ListItem<'static>> = palette
-        .visible()
-        .map(|(_, action)| ListItem::new(palette_action_line(action, name_colors)))
-        .collect();
-
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▸ ");
-    let mut state = ListState::default().with_selected(if palette.visible_count() == 0 {
-        None
-    } else {
-        Some(palette.highlight())
-    });
-    frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn palette_action_line(action: &Action, name_colors: &HashMap<String, Color>) -> Line<'static> {
-    let Some(name) = action.task_name.as_ref() else {
-        return Line::from(Span::styled(
-            action.label.clone(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    };
-
-    let name_style = name_colors
-        .get(name)
-        .copied()
-        .map(|color| Style::default().fg(color))
-        .unwrap_or_default();
-    let mut spans = vec![
-        Span::styled("Run ", Style::default().fg(Color::DarkGray)),
-        Span::styled(name.clone(), name_style),
-    ];
-    if action.needs_run {
-        let state_color = action
-            .task_state
-            .map(task_state_color)
-            .unwrap_or(Color::Cyan);
-        spans.push(Span::styled(
-            " (needs run)",
-            Style::default().fg(state_color),
-        ));
+fn task_selected_hint(app: &App) -> Option<String> {
+    let items = app.task_items();
+    let item = app
+        .tasks_table
+        .selected_index(items.len())
+        .and_then(|idx| items.get(idx))?;
+    if !item.runnable() {
+        return Some("transitioning".to_string());
     }
-    Line::from(spans)
+    if item.has_params {
+        Some(format!("enter form {}", item.name))
+    } else {
+        Some(format!("enter run {}", item.name))
+    }
+}
+
+fn format_task_last_run_time(last_run: Option<&TaskRunInfo>) -> String {
+    last_run
+        .map(|run| format_relative_unix_secs(run.finished_at_unix_secs))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_task_result(last_run: Option<&TaskRunInfo>) -> String {
+    match last_run {
+        Some(run) if run.success => "ok".to_string(),
+        Some(_) => "failed".to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn task_result_color(last_run: &TaskRunInfo) -> Color {
+    if last_run.success {
+        Color::Green
+    } else {
+        Color::Red
+    }
+}
+
+fn format_relative_unix_secs(timestamp: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(timestamp, |duration| duration.as_secs());
+    if timestamp > now.saturating_add(5) {
+        return "in the future".to_string();
+    }
+    let elapsed = now.saturating_sub(timestamp);
+    match elapsed {
+        0..=4 => "just now".to_string(),
+        5..=59 => format!("{elapsed}s ago"),
+        60..=3_599 => format!("{}m ago", elapsed / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed / 3_600),
+        _ => format!("{}d ago", elapsed / 86_400),
+    }
+}
+
+fn format_task_duration(duration_ms: Option<u64>) -> String {
+    let Some(duration_ms) = duration_ms else {
+        return "-".to_string();
+    };
+    if duration_ms < 1_000 {
+        format!("{duration_ms}ms")
+    } else {
+        let seconds = duration_ms / 1_000;
+        let tenths = (duration_ms % 1_000) / 100;
+        if tenths == 0 {
+            format!("{seconds}s")
+        } else {
+            format!("{seconds}.{tenths}s")
+        }
+    }
 }
 
 fn normal_bar_line(
@@ -482,8 +538,18 @@ fn normal_bar_line(
     spans.push(dim("[l] logs"));
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
+        spans.push(dim("  [R] reset"));
     }
-    spans.push(dim("  [t] tasks  [s] status"));
+    spans.push(dim("  [t] tasks"));
+    if counts.tasks_pending_run > 0 {
+        spans.push(Span::styled(
+            "*",
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(dim("  [s] services"));
     if verbose_enabled {
         spans.push(separator());
         spans.push(dim("verbose"));
@@ -608,29 +674,6 @@ fn shutdown_bar_line(counts: &StatusCounts, spinner_frame: usize) -> Line<'stati
     Line::from(spans)
 }
 
-fn palette_bar_line(palette: &ActionPalette) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(bold_cyan("tasks: "));
-    spans.push(Span::styled(
-        palette.query().to_string(),
-        Style::default().fg(Color::White),
-    ));
-    spans.push(Span::styled(
-        "▌",
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::SLOW_BLINK),
-    ));
-    if let Some(action) = palette.selected() {
-        spans.push(separator());
-        spans.push(Span::styled(
-            format!("→ {}", action.label),
-            Style::default().fg(Color::Green),
-        ));
-    }
-    Line::from(spans)
-}
-
 fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
@@ -669,21 +712,6 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
         ));
     }
 
-    if counts.tasks_pending_run > 0 {
-        spans.push(separator());
-        let label = if counts.tasks_pending_run == 1 {
-            "1 task pending".to_string()
-        } else {
-            format!("{} tasks pending", counts.tasks_pending_run)
-        };
-        spans.push(Span::styled(
-            label,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
     spans
 }
 
@@ -703,6 +731,19 @@ fn service_state_label(state: ServiceState) -> &'static str {
     }
 }
 
+fn task_state_label(state: TaskItemState) -> &'static str {
+    match state {
+        TaskItemState::Pending => "pending",
+        TaskItemState::Building => "building",
+        TaskItemState::Running => "running",
+        TaskItemState::Completed => "completed",
+        TaskItemState::Skipped => "skipped",
+        TaskItemState::Failed => "failed",
+        TaskItemState::DependencyFailed => "dep failed",
+        TaskItemState::PendingRun => "pending run",
+    }
+}
+
 fn service_state_color(state: ServiceState) -> Color {
     match state {
         ServiceState::Ready | ServiceState::Running => Color::Green,
@@ -717,19 +758,6 @@ fn service_state_color(state: ServiceState) -> Color {
         // Dim red: same family as Failed but visually quieter, reflecting
         // that it's a downstream casualty, not the root cause.
         ServiceState::DependencyFailed => Color::Rgb(150, 60, 60),
-    }
-}
-
-fn task_state_label(state: TaskItemState) -> &'static str {
-    match state {
-        TaskItemState::Pending => "pending",
-        TaskItemState::Building => "building",
-        TaskItemState::Running => "running",
-        TaskItemState::Completed => "completed",
-        TaskItemState::Skipped => "skipped",
-        TaskItemState::Failed => "failed",
-        TaskItemState::DependencyFailed => "dep failed",
-        TaskItemState::PendingRun => "pending_run",
     }
 }
 
@@ -972,7 +1000,72 @@ mod tests {
         assert!(text.contains("shutting down"));
         assert!(!text.contains("[/] logs"));
         assert!(!text.contains("[t] tasks"));
-        assert!(!text.contains("[s] status"));
+        assert!(!text.contains("[s] services"));
+    }
+
+    #[test]
+    fn normal_bar_marks_tasks_shortcut_when_tasks_are_pending() {
+        let line = normal_bar_line(
+            &StatusCounts {
+                tasks_pending_run: 2,
+                ..Default::default()
+            },
+            &FilterState::new(Vec::new(), &std::collections::HashSet::new(), None),
+            0,
+            0,
+            0,
+            false,
+        );
+        let star = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "*")
+            .expect("pending-task marker missing");
+
+        assert_eq!(star.style.fg, Some(Color::LightYellow));
+        assert!(star.style.add_modifier.contains(Modifier::BOLD));
+        let text = line_text(line);
+        assert!(text.contains("[t] tasks*"));
+        assert!(!text.contains("tasks pending"));
+    }
+
+    #[test]
+    fn normal_bar_leaves_tasks_shortcut_unmarked_without_pending_tasks() {
+        let text = line_text(normal_bar_line(
+            &StatusCounts::default(),
+            &FilterState::new(Vec::new(), &std::collections::HashSet::new(), None),
+            0,
+            0,
+            0,
+            false,
+        ));
+
+        assert!(text.contains("[t] tasks"));
+        assert!(!text.contains("[t] tasks*"));
+    }
+
+    #[test]
+    fn normal_bar_shows_reset_hint_when_filter_is_active() {
+        let mut filter = FilterState::new(
+            vec!["api".to_string(), "worker".to_string()],
+            &std::collections::HashSet::new(),
+            None,
+        );
+        filter.enter_edit();
+        filter.push_query_char('a');
+        filter.select_only_highlighted();
+        filter.commit();
+
+        let text = line_text(normal_bar_line(
+            &StatusCounts::default(),
+            &filter,
+            0,
+            1,
+            2,
+            false,
+        ));
+
+        assert!(text.contains("[l] logs (1/2)  [R] reset"));
     }
 
     #[test]
@@ -1014,5 +1107,29 @@ mod tests {
         assert_eq!(texts.len(), 8);
         assert!(texts.iter().any(|t| t.contains("c0")));
         assert!(texts.iter().any(|t| t.contains("c6")));
+    }
+
+    #[test]
+    fn task_table_row_shows_last_run_result_and_duration() {
+        let item = TaskStatusItem {
+            name: "lint".to_string(),
+            state: TaskItemState::Completed,
+            last_run: Some(TaskRunInfo {
+                finished_at_unix_secs: 0,
+                duration_ms: Some(1_250),
+                success: true,
+                exit_code: Some(0),
+                message: None,
+            }),
+            has_params: false,
+        };
+
+        let _row = task_table_row(&item, &HashMap::new());
+
+        assert_eq!(format_task_result(item.last_run.as_ref()), "ok");
+        assert_eq!(
+            format_task_duration(item.last_run.as_ref().and_then(|run| run.duration_ms)),
+            "1.2s"
+        );
     }
 }

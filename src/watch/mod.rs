@@ -421,16 +421,24 @@ impl WatchManager {
         // pnpm-workspace.yaml). These change rarely but must trigger a full
         // build-graph re-query.
         {
-            let has_bazel = config
-                .services
+            let has_bazel = config.services.values().any(|s| {
+                let resolved = s.resolve(platform);
+                resolved
+                    .bazel_config()
+                    .is_some_and(|bazel| resolved.reload && bazel.watch)
+            }) || config
+                .tasks
                 .values()
-                .any(|s| s.resolve(platform).bazel_config().is_some())
-                || config.tasks.values().any(|t| t.bazel.is_some());
-            let has_turbo = config
-                .services
+                .any(|t| t.bazel.as_ref().is_some_and(|bazel| bazel.watch));
+            let has_turbo = config.services.values().any(|s| {
+                let resolved = s.resolve(platform);
+                resolved
+                    .turbo_config()
+                    .is_some_and(|turbo| resolved.reload && turbo.watch)
+            }) || config
+                .tasks
                 .values()
-                .any(|s| s.resolve(platform).turbo_config().is_some())
-                || config.tasks.values().any(|t| t.turbo.is_some());
+                .any(|t| t.turbo.as_ref().is_some_and(|turbo| turbo.watch));
 
             if has_bazel || has_turbo {
                 let mut root_file_names: Vec<&str> = Vec::new();
@@ -1271,6 +1279,79 @@ mod tests {
             assert_eq!(
                 is_covered(Path::new(case.path), case.mode, &map),
                 case.expected,
+                "case: {}",
+                case.name,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_tool_watch_opt_outs_skip_workspace_graph_watch() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            expect_watches: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "bazel watch false",
+                toml: r#"
+[services.api]
+bazel.target = "//services/api:api"
+bazel.watch = false
+"#,
+                expect_watches: false,
+            },
+            Case {
+                name: "bazel reload false",
+                toml: r#"
+[services.api]
+bazel.target = "//services/api:api"
+reload = false
+"#,
+                expect_watches: false,
+            },
+            Case {
+                name: "bazel default watches workspace graph",
+                toml: r#"
+[services.api]
+bazel.target = "//services/api:api"
+"#,
+                expect_watches: true,
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let config: crate::config::Config = case.toml.parse().unwrap();
+            let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+            let (_event_tx, event_rx) = broadcast::channel(8);
+            let (_update_tx, update_rx) = mpsc::channel(8);
+            let (_query_tx, query_rx) = mpsc::channel(8);
+            let output = crate::output::OutputManager::new(
+                &[("api", &crate::config::LogConfig::Stdout)],
+                tokio::io::sink(),
+            )
+            .await
+            .unwrap();
+
+            let (watch_mgr, warnings) = WatchManager::new(
+                &config,
+                crate::config::Platform::LinuxX86_64,
+                temp.path(),
+                cmd_tx,
+                event_rx,
+                update_rx,
+                query_rx,
+                output.clone_lifecycle_emitter(),
+            )
+            .unwrap();
+
+            assert!(warnings.is_empty(), "case: {}", case.name);
+            assert_eq!(
+                watch_mgr.has_watches(),
+                case.expect_watches,
                 "case: {}",
                 case.name,
             );

@@ -19,6 +19,7 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/start/{name}", post(post_start))
         .route("/stop/{name}", post(post_stop))
         .route("/restart/{name}", post(post_restart))
+        .route("/shutdown", post(post_shutdown))
         .route("/logs/{name}", get(get_logs))
         .route("/attach/{name}", get(super::attach::attach_handler))
         .route("/attach/{name}/resize", post(super::attach::resize_handler))
@@ -91,6 +92,14 @@ async fn post_restart(State(state): State<Arc<ApiState>>, Path(name): Path<Strin
         reply,
     })
     .await
+}
+
+/// `POST /shutdown` — gracefully stop the daemon.
+async fn post_shutdown(State(state): State<Arc<ApiState>>) -> Response {
+    if state.cmd_tx.send(RunnerCommand::Shutdown).await.is_err() {
+        return runner_unavailable();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]

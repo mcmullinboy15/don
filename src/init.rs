@@ -42,6 +42,7 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # Bazel preset — auto-resolves watch patterns from `bazel query`.
 # [services.api]
 # bazel.target = "//services/api:api"
+# bazel.watch = false  # disable auto-resolved file watches, keep startup build
 # proxy = { listen = "127.0.0.1:8080", env = "PORT" }
 
 # Turborepo preset — auto-resolves watch patterns from the task graph.

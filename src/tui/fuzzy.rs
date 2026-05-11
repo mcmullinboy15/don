@@ -1,5 +1,5 @@
 //! Tiny subsequence-based fuzzy matcher. Used for filter queries and action
-//! palette queries — both want "type a few chars, see relevant matches."
+//! status-table queries — both want "type a few chars, see relevant matches."
 //!
 //! Matching is case-insensitive. A name matches the query when every query
 //! char appears in order inside the name. Results are sorted so tighter

@@ -255,13 +255,18 @@ impl ServiceProxy {
             .any(|f| matches!(f.backend, ForwardBackend::Fixed(_)))
     }
 
-    /// `LISTEN_FDS` / `LISTEN_FDNAMES` env vars for listenfd entries. Empty
-    /// if the service has no listenfd proxy entries. `LISTEN_PID` is set by
-    /// the shell shim at spawn time — see `process::mod::listen_pid_shim`.
+    /// Socket-activation env vars for listenfd entries. Empty if the service
+    /// has no listenfd proxy entries. `LISTEN_FD=3` is a single-fd convenience
+    /// for Node-style bootstraps; `LISTEN_FDS` / `LISTEN_FDNAMES` remain the
+    /// systemd-compatible source of truth. `LISTEN_PID` is set by the shell
+    /// shim at spawn time — see `process::mod::listen_pid_shim`.
     pub(crate) fn listenfd_env(&self) -> HashMap<String, String> {
         let mut env = HashMap::new();
         if self.listenfd.is_empty() {
             return env;
+        }
+        if self.listenfd.len() == 1 {
+            env.insert("LISTEN_FD".to_string(), "3".to_string());
         }
         env.insert("LISTEN_FDS".to_string(), self.listenfd.len().to_string());
         let names: Vec<String> = self

@@ -220,9 +220,18 @@ pub struct Task {
     /// Defaults to `false` (visible).
     #[serde(default)]
     pub hidden: bool,
+    /// Override the top-level `auto_filter_on_failure` setting for this task.
+    /// When enabled, a task failure adds this task to the TUI log filter.
+    #[serde(default)]
+    pub auto_filter_on_failure: Option<bool>,
 }
 
 impl Task {
+    pub(crate) fn build_tool_watch_enabled(&self) -> bool {
+        self.bazel.as_ref().is_some_and(|bazel| bazel.watch)
+            || self.turbo.as_ref().is_some_and(|turbo| turbo.watch)
+    }
+
     /// Resolve the task's command path, using the cached download binary
     /// if one is configured for this platform.
     pub fn resolved_cmd(

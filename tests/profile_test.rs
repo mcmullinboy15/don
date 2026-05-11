@@ -273,7 +273,7 @@ async fn spawn_runner_with_profile(
         base_dir.to_path_buf(),
         profile,
         shutdown_rx,
-    TerminalCoordinator::detached(),
+        TerminalCoordinator::detached(),
     )
     .await
     .unwrap();

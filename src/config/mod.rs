@@ -33,6 +33,10 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+fn default_true() -> bool {
+    true
+}
+
 /// Top-level don configuration, typically loaded from `don.toml`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
@@ -59,6 +63,11 @@ pub struct Config {
     /// file-watch and watch-derived change detection.
     #[serde(default)]
     pub watch_ignore: Vec<String>,
+    /// Whether failed services/tasks should be added to the TUI log filter
+    /// automatically. Individual services/tasks can override this with their
+    /// own `auto_filter_on_failure` setting. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub auto_filter_on_failure: bool,
 }
 
 impl std::str::FromStr for Config {
@@ -1854,8 +1863,7 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
-                    let mut deps =
-                        config.effective_depends_on("web", &["self-only".to_string()]);
+                    let mut deps = config.effective_depends_on("web", &["self-only".to_string()]);
                     deps.sort();
                     assert_eq!(deps, vec!["api".to_string(), "self-only".to_string()]);
                 },
@@ -2654,6 +2662,23 @@ bazel.target = "//services/api:api"
             panic!("expected bazel kind");
         };
         assert_eq!(bazel.target, "//services/api:api");
+        assert!(bazel.watch);
+    }
+
+    #[test]
+    fn test_parse_bazel_watch_false() {
+        let toml = r#"
+[services.api]
+bazel.target = "//services/api:api"
+bazel.watch = false
+"#;
+        let config: Config = toml.parse().unwrap();
+        let svc = config.services.get("api").unwrap();
+        let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
+            panic!("expected bazel kind");
+        };
+        assert_eq!(bazel.target, "//services/api:api");
+        assert!(!bazel.watch);
     }
 
     #[test]
@@ -2670,6 +2695,25 @@ turbo.filter = "@myorg/web"
         };
         assert_eq!(turbo.task, "dev");
         assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
+        assert!(turbo.watch);
+    }
+
+    #[test]
+    fn test_parse_turbo_watch_false() {
+        let toml = r#"
+[services.web]
+turbo.task = "dev"
+turbo.filter = "@myorg/web"
+turbo.watch = false
+"#;
+        let config: Config = toml.parse().unwrap();
+        let svc = config.services.get("web").unwrap();
+        let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
+            panic!("expected turbo kind");
+        };
+        assert_eq!(turbo.task, "dev");
+        assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
+        assert!(!turbo.watch);
     }
 
     #[test]
@@ -3039,5 +3083,51 @@ turbo.build_task = ""
                 (Err(e), _) => panic!("case '{}': unexpected error kind {e}", case.name),
             }
         }
+    }
+
+    #[test]
+    fn auto_filter_on_failure_defaults_and_overrides_parse() {
+        let config: Config = r#"
+            auto_filter_on_failure = false
+
+            [services.api]
+            run.cmd = "true"
+            auto_filter_on_failure = true
+
+            [services.worker]
+            run.cmd = "true"
+
+            [tasks.lint]
+            cmd = "true"
+            auto_filter_on_failure = true
+
+            [tasks.test]
+            cmd = "true"
+        "#
+        .parse()
+        .unwrap();
+
+        assert!(!config.auto_filter_on_failure);
+        assert_eq!(config.services["api"].auto_filter_on_failure, Some(true));
+        assert_eq!(config.services["worker"].auto_filter_on_failure, None);
+        assert_eq!(config.tasks["lint"].auto_filter_on_failure, Some(true));
+        assert_eq!(config.tasks["test"].auto_filter_on_failure, None);
+    }
+
+    #[test]
+    fn auto_filter_on_failure_defaults_to_enabled() {
+        let config: Config = r#"
+            [services.api]
+            run.cmd = "true"
+
+            [tasks.lint]
+            cmd = "true"
+        "#
+        .parse()
+        .unwrap();
+
+        assert!(config.auto_filter_on_failure);
+        assert_eq!(config.services["api"].auto_filter_on_failure, None);
+        assert_eq!(config.tasks["lint"].auto_filter_on_failure, None);
     }
 }

@@ -84,6 +84,10 @@ pub struct Service {
     /// filter. Users can still unhide it interactively from the filter view.
     /// Defaults to `false` (visible).
     pub hidden: bool,
+    /// Override the top-level `auto_filter_on_failure` setting for this
+    /// service. When enabled, a service failure adds this service to the TUI
+    /// log filter.
+    pub auto_filter_on_failure: Option<bool>,
 
     /// The service kind. `None` when the base service has no preset
     /// and relies on a platform override to supply one.
@@ -123,6 +127,8 @@ struct RawService {
     platform: HashMap<Platform, ServiceOverride>,
     #[serde(default)]
     hidden: bool,
+    #[serde(default)]
+    auto_filter_on_failure: Option<bool>,
 
     bazel: Option<BazelConfig>,
     turbo: Option<TurboConfig>,
@@ -205,6 +211,7 @@ impl TryFrom<RawService> for Service {
             on_failure: raw.on_failure,
             platform: raw.platform,
             hidden: raw.hidden,
+            auto_filter_on_failure: raw.auto_filter_on_failure,
             kind,
         })
     }
@@ -240,6 +247,7 @@ pub struct ServiceOverride {
     pub log: Option<LogConfig>,
     pub reload: Option<bool>,
     pub on_failure: Option<OnFailure>,
+    pub auto_filter_on_failure: Option<bool>,
 
     /// If set, completely replaces the base service kind.
     pub kind: Option<ServiceKind>,
@@ -265,6 +273,7 @@ struct RawServiceOverride {
     log: Option<LogConfig>,
     reload: Option<bool>,
     on_failure: Option<OnFailure>,
+    auto_filter_on_failure: Option<bool>,
 
     bazel: Option<BazelConfig>,
     turbo: Option<TurboConfig>,
@@ -299,6 +308,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             log: raw.log,
             reload: raw.reload,
             on_failure: raw.on_failure,
+            auto_filter_on_failure: raw.auto_filter_on_failure,
             kind,
         })
     }
@@ -334,6 +344,9 @@ pub struct ResolvedService {
     pub reload: bool,
     /// What to do when this service fails (Unhealthy or non-zero crash).
     pub on_failure: OnFailure,
+    /// Optional per-service override for automatic log-filter selection on
+    /// failure.
+    pub auto_filter_on_failure: Option<bool>,
 
     /// The resolved service kind. `None` only if validation hasn't caught
     /// a missing preset (shouldn't happen after validation).
@@ -467,6 +480,7 @@ impl Service {
                 log: self.log.clone(),
                 reload: self.reload,
                 on_failure: self.on_failure,
+                auto_filter_on_failure: self.auto_filter_on_failure,
                 kind: self.kind.clone(),
                 resolved_binary_path: None,
             },
@@ -500,6 +514,9 @@ impl Service {
                     log: ov.log.clone().unwrap_or_else(|| self.log.clone()),
                     reload: ov.reload.unwrap_or(self.reload),
                     on_failure: ov.on_failure.unwrap_or(self.on_failure),
+                    auto_filter_on_failure: ov
+                        .auto_filter_on_failure
+                        .or(self.auto_filter_on_failure),
                     kind,
                     resolved_binary_path: None,
                 }
@@ -571,6 +588,18 @@ impl ResolvedService {
             &self.kind,
             Some(ServiceKind::Bazel(_)) | Some(ServiceKind::Turbo(_))
         )
+    }
+
+    pub(crate) fn build_tool_watch_enabled(&self) -> bool {
+        if !self.reload {
+            return false;
+        }
+
+        match &self.kind {
+            Some(ServiceKind::Bazel(bazel)) => bazel.watch,
+            Some(ServiceKind::Turbo(turbo)) => turbo.watch,
+            _ => false,
+        }
     }
 
     /// Resolve the run command for a custom service, taking downloads into account.
