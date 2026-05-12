@@ -171,8 +171,11 @@ impl ActiveTerm {
     /// Tear down terminal-side state cleanly so a foreground task can take
     /// the tty. `_raw_guard`'s Drop disables raw mode after `terminal.clear`
     /// flushes the inline viewport wipe.
-    fn tear_down(self) -> Result<(), TuiError> {
+    async fn tear_down(self) -> Result<(), TuiError> {
         self.input_handle.abort();
+        // Wait until EventStream is dropped so stdin has a single owner
+        // before the foreground task or rebuilt TUI starts reading it.
+        let _ = self.input_handle.await;
         // `modal` drops first (LeaveAlternateScreen) before we touch the main
         // screen below.
         drop(self.modal);
@@ -402,7 +405,7 @@ pub async fn run_tui(
                             // replayed — they'd appear above the foreground
                             // task's output, which is jarring.
                             paused_checkpoint = Some(store.next_id());
-                            act.tear_down()?;
+                            act.tear_down().await?;
                         }
                         let _ = ack.send(());
                     }
@@ -465,7 +468,7 @@ pub async fn run_tui(
     }
 
     if let Some(act) = active.take() {
-        act.tear_down()?;
+        act.tear_down().await?;
     }
     Ok(())
 }
