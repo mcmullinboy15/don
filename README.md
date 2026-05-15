@@ -71,8 +71,8 @@ When stdout is a TTY, `don start` runs a ratatui-driven interface: logs stream i
 | Key | Action |
 |-----|--------|
 | `l` | Filter services/tasks — space toggles, enter commits, esc clears |
-| `a` | Action palette — Start / Stop / Restart / Rebuild / run pending tasks |
-| `s` | Full-screen service/task status overlay |
+| `s` | Full-screen service status overlay |
+| `t` | Full-screen task status overlay |
 | `Enter` | Insert a blank line separator into scrollback |
 | `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
 
@@ -87,6 +87,17 @@ seed the TUI filter from the command line, overriding any `hidden = true`
 defaults. `[don]` lifecycle events stay visible regardless of the filter.
 Ring buffers and file sinks are unaffected, so `don logs <name>` still
 returns the full output for filtered services.
+
+Use `log_filter` to keep only matching log lines before any output routing.
+Top-level `log_filter` applies globally; service-level `log_filter` adds
+service-specific regexes.
+
+```toml
+log_filter = ["ERROR", "WARN"]
+
+[services.api]
+log_filter = ["request_id=abc", "^database:"]
+```
 
 ### Services
 
@@ -601,6 +612,7 @@ See [`examples/`](examples/) for complete working configs.
 | `shutdown.signal` | string | Shutdown signal (default: "SIGTERM") |
 | `shutdown.timeout` | string | Grace period (default: "10s") |
 | `log` | string | Output routing: "stdout", "ignore", or a file path |
+| `log_filter` | [string] | Regexes for service output lines to keep before routing |
 | `docker.image` | string | Docker image |
 | `docker.ports` | [string] | Port mappings |
 | `docker.volumes` | [string] | Volume mounts |

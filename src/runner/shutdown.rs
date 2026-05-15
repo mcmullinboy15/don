@@ -193,10 +193,7 @@ impl Runner {
                     if let ServiceHandle::Process(ref proc) = handle {
                         stopping_pgids.insert(name.clone(), proc.pgid());
                     }
-                    let shutdown_config = self
-                        .services
-                        .get(name)
-                        .and_then(|rs| rs.resolved.shutdown.clone());
+                    let shutdown_config = self.effective_shutdown_config(name);
                     let force = force_shutdown_requested();
                     let name_owned = name.clone();
                     let debug = super::service::StopDebug::new(
@@ -204,14 +201,9 @@ impl Runner {
                         self.output_manager.clone_lifecycle_emitter(),
                     );
                     join_set.spawn(async move {
-                        let _ = stop_service(
-                            handle,
-                            shutdown_config.as_ref(),
-                            force,
-                            true,
-                            Some(debug),
-                        )
-                        .await;
+                        let _ =
+                            stop_service(handle, Some(&shutdown_config), force, true, Some(debug))
+                                .await;
                         name_owned
                     });
                 }
@@ -406,9 +398,15 @@ impl Runner {
                 let _ = writer.process_stream(child_output).await;
             })
         });
+        let shutdown_config = context
+            .resolved
+            .shutdown
+            .clone()
+            .map(|shutdown| shutdown.merged_over(&self.config.shutdown))
+            .unwrap_or_else(|| self.config.shutdown.clone());
         let _ = stop_service(
             handle,
-            context.resolved.shutdown.as_ref(),
+            Some(&shutdown_config),
             force_shutdown_requested(),
             true,
             Some(super::service::StopDebug::new(

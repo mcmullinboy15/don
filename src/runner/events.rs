@@ -60,6 +60,12 @@ impl Runner {
             {
                 proxy.set_backend();
             }
+            if let Some(rs) = self.services.get_mut(&item.name) {
+                if let Some(handle) = rs.pending_restart.take() {
+                    handle.abort();
+                }
+                rs.restart_attempts = 0;
+            }
             self.set_service_state(&item.name, ServiceState::Ready);
             self.unblock_dependency_failed_items();
             if let Some(message) = message {
@@ -92,6 +98,18 @@ impl Runner {
                 self.set_service_state(&item.name, ServiceState::Failed);
                 if let Some(ref msg) = item.message {
                     self.output_manager.service_error_event(&item.name, msg);
+                }
+                let policy = self
+                    .services
+                    .get(&item.name)
+                    .map(|rs| rs.resolved.on_failure)
+                    .unwrap_or_default();
+                if matches!(policy, crate::config::OnFailure::Restart) {
+                    let reason = item
+                        .message
+                        .as_deref()
+                        .unwrap_or("service failed before becoming ready");
+                    self.schedule_auto_restart(&item.name, reason, true);
                 }
             }
         }

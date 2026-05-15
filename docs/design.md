@@ -43,9 +43,33 @@ The config has `[services]`, `[tasks]`, `[service_groups]`, and `[profiles]`
 sections, plus a few optional top-level keys such as `default_profile` and
 `watch_ignore`.
 
+Don also loads a sibling local override file when it exists. For the default
+config path, that file is `don.local.toml`; for `--config workspace.toml`, it is
+`workspace.local.toml`. The local file is intended for user-specific changes and
+should not be committed. Tables are merged recursively, so a local file can add
+new services, tasks, groups, or profiles and can override individual fields on
+existing entries without repeating the whole entry. Scalars and arrays replace
+the base value.
+
 ```toml
 # Ignore generated and state files across every watcher in the workspace.
 watch_ignore = ["target/**", ".don/**", "src/generated/**"]
+```
+
+```toml
+# don.local.toml
+default_profile = "pj"
+
+[services.api]
+dir = "./api-local"
+env = { DATABASE_URL = "postgres://localhost:5433/dev" }
+
+[services.scratch]
+run.cmd = "node"
+run.args = ["scratch.js"]
+
+[profiles.pj]
+services = ["api", "scratch"]
 ```
 
 ### Services
@@ -122,7 +146,9 @@ These fields are available on all service presets:
 | `ready` | table | Ready check configuration (see below) |
 | `shutdown` | table | Shutdown behavior (see below) |
 | `log` | string or table | Logging output destination (see below) |
+| `log_filter` | list of regex strings | Per-service regex keep filters for log lines |
 | `download` | table | Binary download configuration (see below) |
+| `on_failure` | string | `"notify"` or `"restart"`; controls service crash/unhealthy handling |
 | `platform` | map | Per-platform overrides (see below) |
 
 ### Tasks
@@ -218,15 +244,26 @@ http = "http://localhost:3000/healthz"
 ### Shutdown
 
 Controls graceful shutdown behavior. If a service doesn't exit within the timeout after receiving the signal, it gets `SIGKILL`.
+Set a top-level `[shutdown]` table to change the default for every service.
+Set `[services.<name>.shutdown]` to override that default for one service.
 
 ```toml
+[shutdown]
+graceful = true
+signal = "SIGTERM"
+timeout = "10s"
+
 [services.api.shutdown]
 signal = "SIGINT"
 timeout = "30s"
+
+[services.worker.shutdown]
+graceful = false
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `graceful` | boolean | `true` | If `false`, skip the graceful window and send `SIGKILL` immediately |
 | `signal` | string | `"SIGTERM"` | Signal to send for graceful shutdown |
 | `timeout` | duration string | `"10s"` | Time to wait before SIGKILL |
 
@@ -246,7 +283,20 @@ log = "logs/myservice.log"
 
 # Write to a file (table form)
 log.file = "logs/myservice.log"
+
+# Keep only matching output lines before stdout/file/ring-buffer routing
+log_filter = ["ERROR", "WARN"]
+
+[services.api]
+log_filter = ["request_id=abc", "^database:"]
 ```
+
+Top-level `log_filter = [...]` applies to every service, task, and synthetic
+build-tool stream. A service-level `log_filter = [...]` adds service-specific
+keep patterns. Filters are line-based regexes; when any filter is configured
+for a stream, only matching service output reaches stdout/TUI, file sinks,
+`don logs`, and `don logs --follow`. Lifecycle events are not filtered by
+these regexes.
 
 ### Downloads
 
@@ -315,7 +365,7 @@ Override merge rules:
 - **`env`**: merged — override entries win on conflict, base entries are preserved
 - **`watch`, `depends_on`, `listen`, `env_file`**: replaced entirely if set in the override
 - **Preset fields** (`docker`, `rust`, `run`): if the override sets any preset field, all base preset fields are cleared and replaced
-- **`build`, `dir`, `ready`, `shutdown`, `log`, `download`**: override wins if set, otherwise base is kept
+- **`build`, `dir`, `ready`, `shutdown`, `log`, `log_filter`, `download`**: override wins if set, otherwise base is kept
 
 A service can have no base preset and define it entirely via platform overrides. Platforms without an override and no base preset will fail validation.
 
@@ -564,6 +614,10 @@ When `log` is set on a service:
 - `"ignore"` — output is discarded, but lifecycle events still print. Output is still captured in the ring buffer.
 - `"path/to/file.log"` — output is written to the file without the prefix (raw output), lifecycle events still print to the terminal. Output is still captured in the ring buffer.
 
+`log_filter = [...]` is applied before all log routing. If any regex is
+configured for a service or task, Don keeps only matching output lines in
+stdout, files, follow streams, and the ring buffer.
+
 ### Build Failures
 
 When a watched file changes and triggers a rebuild, but the build fails:
@@ -576,11 +630,18 @@ This means a syntax error doesn't take down your running service.
 
 ### Service Crashes
 
-If a service exits, don prints the exit code (or signal) and leaves it stopped. It does not automatically restart. The user can manually restart it via the CLI.
+If a service exits, don prints the exit code (or signal). By default
+(`on_failure = "notify"`), it leaves the service stopped and the user can
+manually restart it via the CLI.
 
 ```
 [don] api exited with code 1
 ```
+
+Set `on_failure = "restart"` to have Don restart crashed or unhealthy services
+with exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, then 60s. If a service
+fails three starts in a row without ever becoming ready, Don gives up and leaves
+it Failed. The failure streak resets as soon as the service reaches Ready.
 
 ## Execution Model
 
@@ -772,9 +833,9 @@ Idle ──[file change]──▶ Debouncing ──[200ms]──▶ Building ─
 
 1. Print `[don] shutting down gracefully... (Ctrl+C again to force)`
 2. Stop services in reverse dependency order (no dependents first)
-3. Send each service its configured `shutdown.signal` (default `SIGTERM`) via `killpg`
+3. For services with `shutdown.graceful = true`, send each service its configured `shutdown.signal` (default `SIGTERM`) via `killpg`
 4. Wait up to `shutdown.timeout` (default `10s`) for graceful exit
-5. Send `SIGKILL` to any service that hasn't exited
+5. Send `SIGKILL` to any service that hasn't exited; services with `shutdown.graceful = false` receive `SIGKILL` immediately
 
 **Second `SIGINT`/`SIGTERM`** — immediate kill:
 

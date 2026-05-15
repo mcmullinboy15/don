@@ -1107,6 +1107,104 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
 }
 
 #[test]
+fn integration_startup_failures_backoff_then_give_up() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("startup-restart-give-up");
+        let counter = dir.path().join("launches");
+        std::fs::write(&counter, "0").unwrap();
+
+        let script = dir.path().join("start-and-count.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 N=$(cat {ctr})\n\
+                 N=$((N + 1))\n\
+                 echo $N > {ctr}\n\
+                 sleep 60\n",
+                ctr = counter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let toml = format!(
+            r#"
+[services.flaky]
+run.cmd = "{}"
+log = "ignore"
+on_failure = "restart"
+
+[services.flaky.ready]
+exec.cmd = "false"
+interval = "50ms"
+retries = 1
+"#,
+            script.display()
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(
+            &buf,
+            "auto-restart in 1s (attempt 1)",
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_substr(
+            &buf,
+            "auto-restart firing (attempt 1)",
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_substr(
+            &buf,
+            "auto-restart in 2s (attempt 2)",
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_substr(
+            &buf,
+            "auto-restart firing (attempt 2)",
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_substr(
+            &buf,
+            "giving up after 3 failed starts without becoming ready",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        // Give a stale attempt-3 timer a chance to fire if one was scheduled.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let output = read_buf(&buf);
+        assert!(
+            !output.contains("auto-restart firing (attempt 3)"),
+            "attempt 3 should give up instead of scheduling another restart: {output}"
+        );
+        let launches: i32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            launches, 3,
+            "initial start plus two retries should produce exactly three failed starts"
+        );
+    });
+}
+
+#[test]
 fn integration_restart_crashed_service_without_ready_check() {
     run_with_timeout(Duration::from_secs(20), async {
         let dir = TempDir::new("restart-crashed-no-ready");

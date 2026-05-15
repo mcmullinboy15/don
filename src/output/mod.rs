@@ -13,7 +13,7 @@ pub(crate) mod osc;
 pub(crate) mod ring_buffer;
 pub(crate) mod sanitize;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use ring_buffer::RingBuffer;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 
 /// Default ring buffer capacity per service (lines).
 const DEFAULT_RING_BUFFER_CAPACITY: usize = 10_000;
+const MAX_FILTER_PENDING: usize = 16 * 1024;
 
 /// Name stamped on `[don]` lifecycle events so the TUI filter can treat them
 /// like any other service/task: gated when a filter is active, selectable
@@ -276,6 +277,42 @@ impl LogFilterControl {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct CompiledLogKeepFilter {
+    patterns: Vec<regex::bytes::Regex>,
+}
+
+impl CompiledLogKeepFilter {
+    fn from_config(
+        name: &str,
+        config: Option<&crate::config::LogFilterConfig>,
+    ) -> Result<Self, OutputError> {
+        let Some(config) = config else {
+            return Ok(Self::default());
+        };
+        let mut patterns = Vec::with_capacity(config.patterns.len());
+        for pattern in &config.patterns {
+            let compiled = regex::bytes::Regex::new(pattern).map_err(|source| {
+                OutputError::InvalidLogFilter {
+                    name: name.to_string(),
+                    pattern: pattern.clone(),
+                    source,
+                }
+            })?;
+            patterns.push(compiled);
+        }
+        Ok(Self { patterns })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    fn keeps(&self, line: &[u8]) -> bool {
+        self.patterns.iter().any(|pattern| pattern.is_match(line))
+    }
+}
+
 /// Where the stdout sink task sends its formatted lines.
 ///
 /// Pipe-mode output writes bytes directly to an `AsyncWrite` (today's stdout).
@@ -293,12 +330,68 @@ struct ServiceOutputState {
     name: String,
     prefix: Bytes,
     ring_buffer: RingBuffer,
+    log_keep_filter: CompiledLogKeepFilter,
+    filter_pending: BytesMut,
     /// Dynamic list of sinks this service writes to.
     sinks: Vec<SinkHandle>,
     /// True while the stdout sink is temporarily removed (during attach).
     /// Used to ensure `resume_stdout_sink` only restores it if it was
     /// actually present before the pause.
     stdout_paused: bool,
+}
+
+impl ServiceOutputState {
+    fn output_chunks(&mut self, chunk: Bytes) -> Vec<Bytes> {
+        if self.log_keep_filter.is_empty() {
+            self.ring_buffer.push_chunk(chunk.as_ref());
+            return vec![chunk];
+        }
+
+        self.filter_chunk(chunk.as_ref(), false)
+    }
+
+    fn flush_output(&mut self) -> Vec<Bytes> {
+        if self.log_keep_filter.is_empty() {
+            self.ring_buffer.flush_pending();
+            return Vec::new();
+        }
+
+        self.filter_chunk(&[], true)
+    }
+
+    fn filter_chunk(&mut self, chunk: &[u8], flush: bool) -> Vec<Bytes> {
+        self.filter_pending.extend_from_slice(chunk);
+        let mut accepted = Vec::new();
+
+        loop {
+            let end = if let Some(pos) = self.filter_pending.iter().position(|&b| b == b'\n') {
+                pos + 1
+            } else if self.filter_pending.len() >= MAX_FILTER_PENDING {
+                MAX_FILTER_PENDING
+            } else {
+                break;
+            };
+
+            let line = self.filter_pending.split_to(end).freeze();
+            self.accept_line(line, &mut accepted);
+        }
+
+        if flush && !self.filter_pending.is_empty() {
+            let line = self.filter_pending.split().freeze();
+            self.accept_line(line, &mut accepted);
+            self.ring_buffer.flush_pending();
+        }
+
+        accepted
+    }
+
+    fn accept_line(&mut self, line: Bytes, accepted: &mut Vec<Bytes>) {
+        if !self.log_keep_filter.keeps(line.as_ref()) {
+            return;
+        }
+        self.ring_buffer.push_chunk(line.as_ref());
+        accepted.push(line);
+    }
 }
 
 /// Per-service handle for writing output. Cloneable, reusable across restarts.
@@ -334,45 +427,36 @@ impl ServiceWriter {
 
                     // Lock: push to ring buffer + snapshot sinks. Released before sends.
                     // Prune closed sinks (e.g. disconnected follow clients) inline.
-                    let (name, prefix, sinks) = {
+                    let (name, prefix, sinks, chunks) = {
                         let mut state = self.state.lock().await;
                         state.sinks.retain(|s| !s.is_closed());
-                        state.ring_buffer.push_chunk(&chunk);
+                        let chunks = state.output_chunks(chunk);
                         (
                             state.name.clone(),
                             state.prefix.clone(),
                             state.sinks.clone(),
+                            chunks,
                         )
                     };
 
-                    let mut dropped: Vec<SinkHandle> = Vec::new();
-                    for sink in &sinks {
-                        let msg = SinkLine {
-                            prefix: prefix.clone(),
-                            line: chunk.clone(),
-                            name: name.clone(),
-                            is_lifecycle: false,
-                        };
-                        if sink.send(msg).is_err() {
-                            dropped.push(sink.clone());
-                        }
-                    }
-                    if !dropped.is_empty() {
-                        let mut state = self.state.lock().await;
-                        state
-                            .sinks
-                            .retain(|s| !dropped.iter().any(|d| d.same_channel(s)));
-                    }
+                    self.send_chunks(name, prefix, sinks, chunks).await;
                 }
                 Err(e) => return Err(e),
             }
         }
 
         // Flush any partial line remaining in the ring buffer.
-        {
+        let (name, prefix, sinks, chunks) = {
             let mut state = self.state.lock().await;
-            state.ring_buffer.flush_pending();
-        }
+            let chunks = state.flush_output();
+            (
+                state.name.clone(),
+                state.prefix.clone(),
+                state.sinks.clone(),
+                chunks,
+            )
+        };
+        self.send_chunks(name, prefix, sinks, chunks).await;
 
         Ok(())
     }
@@ -395,26 +479,42 @@ impl ServiceWriter {
     /// the data so sinks can flush immediately.
     pub async fn write_line(&self, line: &str) {
         let data = Bytes::from(format!("{line}\n"));
-        let (name, prefix, sinks) = {
+        let (name, prefix, sinks, chunks) = {
             let mut state = self.state.lock().await;
             state.sinks.retain(|s| !s.is_closed());
-            state.ring_buffer.push_chunk(data.as_ref());
+            let chunks = state.output_chunks(data);
             (
                 state.name.clone(),
                 state.prefix.clone(),
                 state.sinks.clone(),
+                chunks,
             )
         };
+        self.send_chunks(name, prefix, sinks, chunks).await;
+    }
+
+    async fn send_chunks(
+        &self,
+        name: String,
+        prefix: Bytes,
+        sinks: Vec<SinkHandle>,
+        chunks: Vec<Bytes>,
+    ) {
+        if chunks.is_empty() {
+            return;
+        }
         let mut dropped: Vec<SinkHandle> = Vec::new();
-        for sink in &sinks {
-            let msg = SinkLine {
-                prefix: prefix.clone(),
-                line: data.clone(),
-                name: name.clone(),
-                is_lifecycle: false,
-            };
-            if sink.send(msg).is_err() {
-                dropped.push(sink.clone());
+        for chunk in chunks {
+            for sink in &sinks {
+                let msg = SinkLine {
+                    prefix: prefix.clone(),
+                    line: chunk.clone(),
+                    name: name.clone(),
+                    is_lifecycle: false,
+                };
+                if sink.send(msg).is_err() {
+                    dropped.push(sink.clone());
+                }
             }
         }
         if !dropped.is_empty() {
@@ -549,6 +649,14 @@ pub enum OutputError {
     /// I/O error reading from child output.
     #[error("error reading service output: {0}")]
     Read(#[from] std::io::Error),
+    /// Invalid regex in a log keep filter.
+    #[error("service '{name}': invalid log_filter regex '{pattern}': {source}")]
+    InvalidLogFilter {
+        name: String,
+        pattern: String,
+        #[source]
+        source: regex::Error,
+    },
 }
 
 impl OutputManager {
@@ -565,6 +673,15 @@ impl OutputManager {
         Self::new_verbose(services, writer, false).await
     }
 
+    /// Create a new output manager with per-service regex keep filters.
+    pub async fn new_with_log_filters<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+        services: &[(&str, &crate::config::LogConfig)],
+        log_filters: &HashMap<String, crate::config::LogFilterConfig>,
+        writer: W,
+    ) -> Result<Self, OutputError> {
+        Self::new_verbose_with_log_filters(services, log_filters, writer, false).await
+    }
+
     /// Create a new output manager. When `verbose` is true, every output
     /// line is prefixed with an elapsed timestamp.
     pub async fn new_verbose<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
@@ -572,7 +689,23 @@ impl OutputManager {
         writer: W,
         verbose: bool,
     ) -> Result<Self, OutputError> {
-        Self::new_inner(services, verbose, StdoutTarget::Writer(writer)).await
+        Self::new_inner(
+            services,
+            &HashMap::new(),
+            verbose,
+            StdoutTarget::Writer(writer),
+        )
+        .await
+    }
+
+    /// Create a new verbose output manager with per-service regex keep filters.
+    pub async fn new_verbose_with_log_filters<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+        services: &[(&str, &crate::config::LogConfig)],
+        log_filters: &HashMap<String, crate::config::LogFilterConfig>,
+        writer: W,
+        verbose: bool,
+    ) -> Result<Self, OutputError> {
+        Self::new_inner(services, log_filters, verbose, StdoutTarget::Writer(writer)).await
     }
 
     /// Create a new output manager that emits formatted log lines to the TUI
@@ -589,16 +722,26 @@ impl OutputManager {
         services: &[(&str, &crate::config::LogConfig)],
         verbose: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<FormattedLogLine>), OutputError> {
+        Self::new_with_tui_and_log_filters(services, &HashMap::new(), verbose).await
+    }
+
+    /// Create a TUI output manager with per-service regex keep filters.
+    pub async fn new_with_tui_and_log_filters(
+        services: &[(&str, &crate::config::LogConfig)],
+        log_filters: &HashMap<String, crate::config::LogFilterConfig>,
+        verbose: bool,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<FormattedLogLine>), OutputError> {
         let (log_tx, log_rx) = mpsc::unbounded_channel();
         // `tokio::io::Sink` only satisfies the generic bound — `StdoutTarget::Tui`
         // never touches the writer arm, so the value is never exercised.
         let target: StdoutTarget<tokio::io::Sink> = StdoutTarget::Tui(log_tx);
-        let mgr = Self::new_inner(services, verbose, target).await?;
+        let mgr = Self::new_inner(services, log_filters, verbose, target).await?;
         Ok((mgr, log_rx))
     }
 
     async fn new_inner<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         services: &[(&str, &crate::config::LogConfig)],
+        log_filters: &HashMap<String, crate::config::LogFilterConfig>,
         verbose: bool,
         target: StdoutTarget<W>,
     ) -> Result<Self, OutputError> {
@@ -653,6 +796,10 @@ impl OutputManager {
 
             let color = color_map.get(*name).copied().unwrap_or(Color::White);
             let prefix = format_prefix(name, color, max_name_len);
+            let log_keep_filter = CompiledLogKeepFilter::from_config(
+                name,
+                log_filters.get(*name).filter(|filter| !filter.is_empty()),
+            )?;
 
             service_map.insert(
                 name.to_string(),
@@ -660,6 +807,8 @@ impl OutputManager {
                     name: name.to_string(),
                     prefix,
                     ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
+                    log_keep_filter,
+                    filter_pending: BytesMut::new(),
                     sinks,
                     stdout_paused: false,
                 })),
@@ -906,6 +1055,8 @@ impl OutputManager {
                 name: name.to_string(),
                 prefix,
                 ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
+                log_keep_filter: CompiledLogKeepFilter::default(),
+                filter_pending: BytesMut::new(),
                 sinks,
                 stdout_paused: false,
             })),

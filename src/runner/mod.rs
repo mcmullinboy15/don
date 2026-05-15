@@ -38,7 +38,7 @@ pub use profile::resolve_profile_items;
 pub use signals::{install_signal_handlers, signal_count};
 pub use terminal::{TerminalCoordinator, TerminalRequest};
 
-use crate::config::{Config, Platform};
+use crate::config::{Config, Platform, ShutdownConfig};
 use crate::output::OutputManager;
 use crate::process::pid_file::PidFile;
 use crate::watch::WatchManager;
@@ -465,7 +465,11 @@ enum RunnerInternalCommand {
     /// A service process exited.
     ServiceExited { name: String, pgid: i32 },
     /// Ready-check completed for a manual-start or rebuild spawn.
-    ReadyCheckComplete { name: String, success: bool },
+    ReadyCheckComplete {
+        name: String,
+        success: bool,
+        message: Option<String>,
+    },
     /// Completion from a detached manual service stop/restart worker.
     ServiceStopComplete {
         name: String,
@@ -834,6 +838,14 @@ impl Runner {
         self.cmd_tx.clone()
     }
 
+    pub(crate) fn effective_shutdown_config(&self, name: &str) -> ShutdownConfig {
+        self.services
+            .get(name)
+            .and_then(|rs| rs.resolved.shutdown.clone())
+            .map(|shutdown| shutdown.merged_over(&self.config.shutdown))
+            .unwrap_or_else(|| self.config.shutdown.clone())
+    }
+
     /// Subscribe to runner events.
     pub fn subscribe(&self) -> broadcast::Receiver<RunnerEvent> {
         self.event_tx.subscribe()
@@ -1106,7 +1118,8 @@ impl Runner {
                                 | ServiceState::Ready
                                 | ServiceState::Starting
                                 | ServiceState::Lazy
-                        )
+                        ) || rs.pending_restart.is_some()
+                            || rs.start_worker.is_some()
                     });
 
                     if has_running_services {
@@ -1290,8 +1303,12 @@ impl Runner {
                             RunnerInternalCommand::ServiceExited { name, pgid } => {
                                 self.handle_service_exited(&name, pgid).await;
                             }
-                            RunnerInternalCommand::ReadyCheckComplete { name, success } => {
-                                self.handle_ready_check_complete(&name, success);
+                            RunnerInternalCommand::ReadyCheckComplete {
+                                name,
+                                success,
+                                message,
+                            } => {
+                                self.handle_ready_check_complete(&name, success, message);
                             }
                             RunnerInternalCommand::BatchBuildComplete(outcome) => {
                                 // Drop the abort-on-drop handle: the task is done,
@@ -1648,7 +1665,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn up_to_date_batch_rebuild_still_emits_rebuild_complete() {
         use crate::config::service::{Service, ServiceKind};
-        use crate::config::types::{BazelConfig, LogConfig};
+        use crate::config::types::{BazelConfig, LogConfig, LogFilterConfig};
 
         let temp = tempfile::tempdir().unwrap();
         let config = crate::config::Config {
@@ -1668,6 +1685,7 @@ mod tests {
                     ready: None,
                     shutdown: None,
                     log: LogConfig::Stdout,
+                    log_filter: LogFilterConfig::default(),
                     reload: true,
                     on_failure: crate::config::OnFailure::Notify,
                     platform: HashMap::new(),
@@ -1686,6 +1704,8 @@ mod tests {
             profiles: HashMap::new(),
             default_profile: None,
             watch_ignore: Vec::new(),
+            shutdown: crate::config::ShutdownConfig::default(),
+            log_filter: LogFilterConfig::default(),
             auto_filter_on_failure: true,
         };
         let output_manager = crate::output::OutputManager::new_verbose(
@@ -2039,7 +2059,7 @@ mod tests {
     #[test]
     fn runtime_service_default_state() {
         use crate::config::service::ResolvedService;
-        use crate::config::types::LogConfig;
+        use crate::config::types::{LogConfig, LogFilterConfig};
         use std::collections::HashMap;
 
         let rs = RuntimeService::new(
@@ -2057,6 +2077,7 @@ mod tests {
                 ready: None,
                 shutdown: None,
                 log: LogConfig::Stdout,
+                log_filter: LogFilterConfig::default(),
                 reload: true,
                 on_failure: crate::config::OnFailure::Notify,
                 auto_filter_on_failure: None,
@@ -2120,7 +2141,7 @@ mod tests {
     #[test]
     fn test_should_rebuild_after_graph_requery() {
         use crate::config::service::ResolvedService;
-        use crate::config::types::LogConfig;
+        use crate::config::types::{LogConfig, LogFilterConfig};
         use std::collections::HashMap;
 
         struct Case {
@@ -2178,6 +2199,7 @@ mod tests {
                     ready: None,
                     shutdown: None,
                     log: LogConfig::Stdout,
+                    log_filter: LogFilterConfig::default(),
                     reload: true,
                     on_failure: crate::config::OnFailure::Notify,
                     auto_filter_on_failure: None,

@@ -158,6 +158,7 @@ impl Runner {
                         .send(RunnerInternalCommand::ReadyCheckComplete {
                             name: name_owned.clone(),
                             success,
+                            message: ready_result.as_ref().err().map(ToString::to_string),
                         })
                         .await;
                 }
@@ -210,6 +211,12 @@ impl Runner {
                 .await;
         } else {
             // No ready check, rebuild path — mark ready immediately.
+            if let Some(rs) = self.services.get_mut(name) {
+                if let Some(handle) = rs.pending_restart.take() {
+                    handle.abort();
+                }
+                rs.restart_attempts = 0;
+            }
             self.set_service_state(name, ServiceState::Ready);
             self.unblock_dependency_failed_items();
             self.output_manager.service_event(name, "restarted");

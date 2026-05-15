@@ -4,6 +4,8 @@ use super::service_worker::ServiceStartMode;
 use super::{Runner, RunnerInternalCommand, ServiceState};
 use tokio::sync::oneshot;
 
+const MAX_STARTUP_FAILURES_BEFORE_GIVE_UP: u32 = 3;
+
 impl Runner {
     /// Apply a health-monitor probe transition for a service.
     ///
@@ -57,7 +59,7 @@ impl Runner {
                         .service_error_event(name, "unhealthy (health check failing)");
                 }
                 crate::config::OnFailure::Restart => {
-                    self.schedule_auto_restart(name, "unhealthy");
+                    self.schedule_auto_restart(name, "unhealthy", false);
                 }
             }
         }
@@ -69,12 +71,32 @@ impl Runner {
     /// attempts. Replaces any already-scheduled restart for this service.
     /// `reason` is included verbatim in the lifecycle event so a reader
     /// can tell why the restart was scheduled.
-    fn schedule_auto_restart(&mut self, name: &str, reason: &str) {
+    pub(in crate::runner) fn schedule_auto_restart(
+        &mut self,
+        name: &str,
+        reason: &str,
+        limit_startup_failures: bool,
+    ) {
         let attempt = self
             .services
             .get(name)
             .map(|rs| rs.restart_attempts.saturating_add(1))
             .unwrap_or(1);
+        if limit_startup_failures && attempt >= MAX_STARTUP_FAILURES_BEFORE_GIVE_UP {
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.restart_attempts = attempt;
+                if let Some(prev) = rs.pending_restart.take() {
+                    prev.abort();
+                }
+            }
+            self.output_manager.service_error_event(
+                name,
+                &format!(
+                    "{reason} — giving up after {attempt} failed starts without becoming ready"
+                ),
+            );
+            return;
+        }
         let backoff_secs = unhealthy_restart_backoff_secs(attempt);
         self.output_manager.service_error_event(
             name,
@@ -91,10 +113,11 @@ impl Runner {
                 })
                 .await;
         });
-        if let Some(rs) = self.services.get_mut(name)
-            && let Some(prev) = rs.pending_restart.replace(handle)
-        {
-            prev.abort();
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.restart_attempts = attempt;
+            if let Some(prev) = rs.pending_restart.replace(handle) {
+                prev.abort();
+            }
         }
     }
 
@@ -161,7 +184,7 @@ impl Runner {
             .map(|rs| rs.resolved.on_failure)
             .unwrap_or_default();
         if matches!(policy, crate::config::OnFailure::Restart) {
-            self.schedule_auto_restart(name, &exit_msg);
+            self.schedule_auto_restart(name, &exit_msg, state == ServiceState::Running);
         } else if let Some(rs) = self.services.get_mut(name) {
             rs.restart_attempts = 0;
         }
@@ -181,7 +204,6 @@ impl Runner {
         }
         if let Some(rs) = self.services.get_mut(name) {
             rs.pending_restart = None;
-            rs.restart_attempts = attempt;
         }
         self.output_manager
             .service_event(name, &format!("auto-restart firing (attempt {attempt})"));
@@ -191,9 +213,43 @@ impl Runner {
             .is_some_and(|rs| rs.handle.is_some())
         {
             let (reply_tx, _reply_rx) = oneshot::channel();
-            self.handle_restart_service_cmd(name, reply_tx).await;
+            self.handle_auto_restart_running_service(name, reply_tx)
+                .await;
         } else {
             let _ = self.queue_background_service_start(name, ServiceStartMode::Full);
         }
+    }
+
+    async fn handle_auto_restart_running_service(
+        &mut self,
+        name: &str,
+        reply: oneshot::Sender<super::CommandResult>,
+    ) {
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.stop_health_tracking();
+        }
+        let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
+            Some(h) => h,
+            None => {
+                let _ =
+                    reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
+                return;
+            }
+        };
+        let shutdown_config = self.effective_shutdown_config(name);
+        if self.remove_attach_lock(name) {
+            self.output_manager.resume_stdout_sink(name).await;
+        }
+        self.set_service_state(name, ServiceState::Stopping);
+        self.output_manager
+            .service_event(name, "stopping... (auto-restart)");
+        self.spawn_manual_service_stop_worker(
+            name,
+            handle,
+            shutdown_config,
+            false,
+            reply,
+            super::ServiceStopAction::RestartFull,
+        );
     }
 }

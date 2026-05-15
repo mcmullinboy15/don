@@ -817,6 +817,102 @@ fn shutdown_timeout_escalates_to_sigkill() {
 }
 
 #[test]
+fn shutdown_graceful_disabled_sends_sigkill_immediately() {
+    run_with_timeout(Duration::from_secs(15), async {
+        struct Case {
+            name: &'static str,
+            toml: String,
+        }
+
+        let cases = vec![
+            Case {
+                name: "global",
+                toml: ConfigBuilder::new()
+                    .raw(
+                        r#"
+[shutdown]
+graceful = false
+"#,
+                    )
+                    .add_custom_service(
+                        "stubborn",
+                        "bash",
+                        &[
+                            "-c",
+                            "trap 'echo got-term; sleep 2; exit 0' TERM; echo started; sleep 60",
+                        ],
+                    )
+                    .log("stdout")
+                    .ready_exec("true", &[])
+                    .shutdown("SIGTERM", "5s")
+                    .done()
+                    .build(),
+            },
+            Case {
+                name: "per-service",
+                toml: ConfigBuilder::new()
+                    .add_custom_service(
+                        "stubborn",
+                        "bash",
+                        &[
+                            "-c",
+                            "trap 'echo got-term; sleep 2; exit 0' TERM; echo started; sleep 60",
+                        ],
+                    )
+                    .log("stdout")
+                    .ready_exec("true", &[])
+                    .shutdown("SIGTERM", "5s")
+                    .graceful_shutdown(false)
+                    .done()
+                    .build(),
+            },
+        ];
+
+        for case in cases {
+            let dir = TempDir::new(&format!("shutdown-no-graceful-{}", case.name));
+            let (shutdown_tx, handle, buf) = spawn_runner(&case.toml, dir.path()).await;
+            assert!(
+                wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+                "{}: service did not start",
+                case.name
+            );
+
+            let start = std::time::Instant::now();
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+            let elapsed = start.elapsed();
+
+            let output = read_buf(&buf);
+            assert!(
+                output.contains("shutdown complete"),
+                "{}: output: {output}",
+                case.name
+            );
+            assert!(
+                output.contains("stubborn: send SIGKILL to pgid"),
+                "{}: expected immediate SIGKILL. output: {output}",
+                case.name
+            );
+            assert!(
+                !output.contains("stubborn: send SIGTERM to pgid"),
+                "{}: graceful SIGTERM should be skipped. output: {output}",
+                case.name
+            );
+            assert!(
+                !output.contains("got-term"),
+                "{}: process should not receive SIGTERM. output: {output}",
+                case.name
+            );
+            assert!(
+                elapsed < Duration::from_millis(900),
+                "{}: shutdown should not wait for graceful timeout ({elapsed:?})",
+                case.name
+            );
+        }
+    });
+}
+
+#[test]
 fn shutdown_signals_unhealthy_services() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -9,8 +9,8 @@ fn default_true() -> bool {
 }
 use super::platform::Platform;
 use super::types::{
-    BazelConfig, Command, LogConfig, OnFailure, ProxyEntry, ReadyCheck, ShutdownConfig,
-    TurboConfig, deserialize_proxy, deserialize_proxy_option,
+    BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ReadyCheck,
+    ShutdownConfig, TurboConfig, deserialize_proxy, deserialize_proxy_option,
 };
 
 /// The kind of service — exactly one of these must be set.
@@ -69,6 +69,8 @@ pub struct Service {
     pub shutdown: Option<ShutdownConfig>,
     /// Where to send stdout/stderr. Defaults to stdout.
     pub log: LogConfig,
+    /// Regex-based service log filter. When set, only matching output lines are kept.
+    pub log_filter: LogFilterConfig,
     /// Whether don should watch files and rebuild/restart this service on changes.
     /// Defaults to `true`. Set to `false` for services that handle their own
     /// hot-reloading internally (e.g. vite, webpack dev server).
@@ -119,6 +121,8 @@ struct RawService {
     shutdown: Option<ShutdownConfig>,
     #[serde(default)]
     log: LogConfig,
+    #[serde(default)]
+    log_filter: LogFilterConfig,
     #[serde(default = "default_true")]
     reload: bool,
     #[serde(default)]
@@ -207,6 +211,7 @@ impl TryFrom<RawService> for Service {
             ready: raw.ready,
             shutdown: raw.shutdown,
             log: raw.log,
+            log_filter: raw.log_filter,
             reload: raw.reload,
             on_failure: raw.on_failure,
             platform: raw.platform,
@@ -245,6 +250,7 @@ pub struct ServiceOverride {
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
     pub log: Option<LogConfig>,
+    pub log_filter: Option<LogFilterConfig>,
     pub reload: Option<bool>,
     pub on_failure: Option<OnFailure>,
     pub auto_filter_on_failure: Option<bool>,
@@ -271,6 +277,7 @@ struct RawServiceOverride {
     ready: Option<ReadyCheck>,
     shutdown: Option<ShutdownConfig>,
     log: Option<LogConfig>,
+    log_filter: Option<LogFilterConfig>,
     reload: Option<bool>,
     on_failure: Option<OnFailure>,
     auto_filter_on_failure: Option<bool>,
@@ -306,6 +313,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             ready: raw.ready,
             shutdown: raw.shutdown,
             log: raw.log,
+            log_filter: raw.log_filter,
             reload: raw.reload,
             on_failure: raw.on_failure,
             auto_filter_on_failure: raw.auto_filter_on_failure,
@@ -340,6 +348,7 @@ pub struct ResolvedService {
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
     pub log: LogConfig,
+    pub log_filter: LogFilterConfig,
     /// Whether don should watch files and rebuild/restart this service on changes.
     pub reload: bool,
     /// What to do when this service fails (Unhealthy or non-zero crash).
@@ -478,6 +487,7 @@ impl Service {
                 ready: self.ready.clone(),
                 shutdown: self.shutdown.clone(),
                 log: self.log.clone(),
+                log_filter: self.log_filter.clone(),
                 reload: self.reload,
                 on_failure: self.on_failure,
                 auto_filter_on_failure: self.auto_filter_on_failure,
@@ -512,6 +522,10 @@ impl Service {
                     ready: ov.ready.clone().or_else(|| self.ready.clone()),
                     shutdown: ov.shutdown.clone().or_else(|| self.shutdown.clone()),
                     log: ov.log.clone().unwrap_or_else(|| self.log.clone()),
+                    log_filter: ov
+                        .log_filter
+                        .clone()
+                        .unwrap_or_else(|| self.log_filter.clone()),
                     reload: ov.reload.unwrap_or(self.reload),
                     on_failure: ov.on_failure.unwrap_or(self.on_failure),
                     auto_filter_on_failure: ov

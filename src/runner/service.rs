@@ -397,7 +397,8 @@ pub(crate) async fn stop_service(
 ) -> Result<(), ServiceError> {
     match handle {
         ServiceHandle::Process(ref mut process) => {
-            let (signal, timeout) = if force {
+            let skip_graceful = force || shutdown_config.is_some_and(|config| !config.graceful);
+            let (signal, timeout) = if skip_graceful {
                 (Signal::SIGKILL, Duration::from_millis(500))
             } else {
                 (
@@ -434,7 +435,8 @@ pub(crate) async fn stop_service(
             }
         }
         ServiceHandle::Docker(ref mut docker) => {
-            let (signal_name, timeout) = if force {
+            let skip_graceful = force || shutdown_config.is_some_and(|config| !config.graceful);
+            let (signal_name, timeout) = if skip_graceful {
                 ("SIGKILL", Duration::from_millis(500))
             } else {
                 (
@@ -480,12 +482,18 @@ pub(crate) async fn stop_service_interruptibly(
 ) -> Result<(), ServiceError> {
     match handle {
         ServiceHandle::Process(ref mut process) => {
-            let signal = shutdown_config
-                .map(|c| parse_signal(&c.signal))
-                .unwrap_or(Signal::SIGTERM);
-            let timeout = shutdown_config
-                .and_then(|c| parse_duration(&c.timeout).ok())
-                .unwrap_or(Duration::from_secs(10));
+            let (signal, timeout) = if shutdown_config.is_some_and(|config| !config.graceful) {
+                (Signal::SIGKILL, Duration::from_millis(500))
+            } else {
+                (
+                    shutdown_config
+                        .map(|c| parse_signal(&c.signal))
+                        .unwrap_or(Signal::SIGTERM),
+                    shutdown_config
+                        .and_then(|c| parse_duration(&c.timeout).ok())
+                        .unwrap_or(Duration::from_secs(10)),
+                )
+            };
 
             if let Some(debug) = debug.as_ref() {
                 debug.signal(signal, process.pgid());
@@ -548,12 +556,18 @@ pub(crate) async fn stop_service_interruptibly(
             }
         }
         ServiceHandle::Docker(ref mut docker) => {
-            let signal_name = shutdown_config
-                .map(|c| c.signal.as_str())
-                .unwrap_or("SIGTERM");
-            let timeout = shutdown_config
-                .and_then(|c| parse_duration(&c.timeout).ok())
-                .unwrap_or(Duration::from_secs(10));
+            let (signal_name, timeout) = if shutdown_config.is_some_and(|config| !config.graceful) {
+                ("SIGKILL", Duration::from_millis(500))
+            } else {
+                (
+                    shutdown_config
+                        .map(|c| c.signal.as_str())
+                        .unwrap_or("SIGTERM"),
+                    shutdown_config
+                        .and_then(|c| parse_duration(&c.timeout).ok())
+                        .unwrap_or(Duration::from_secs(10)),
+                )
+            };
 
             if let Some(debug) = debug.as_ref() {
                 debug.docker_stop(signal_name, timeout);

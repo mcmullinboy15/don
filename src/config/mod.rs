@@ -23,15 +23,16 @@ pub use self::service::{
 };
 pub use self::task::{Task, TaskAutoRun, TaskTerminal, TaskTerminalMode, TaskTerminalScreen};
 pub use self::types::{
-    BazelConfig, Command, LogConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck, ShutdownConfig,
-    TurboConfig,
+    BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
+    ShutdownConfig, TurboConfig,
 };
 
 pub use self::service::{GoConfig, ServiceOverride};
 
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 fn default_true() -> bool {
     true
@@ -63,6 +64,13 @@ pub struct Config {
     /// file-watch and watch-derived change detection.
     #[serde(default)]
     pub watch_ignore: Vec<String>,
+    /// Default shutdown behavior for services that do not define their own
+    /// `[services.<name>.shutdown]` table.
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
+    /// Global regex-based log filter. Service filters are added on top.
+    #[serde(default)]
+    pub log_filter: LogFilterConfig,
     /// Whether failed services/tasks should be added to the TUI log filter
     /// automatically. Individual services/tasks can override this with their
     /// own `auto_filter_on_failure` setting. Defaults to `true`.
@@ -111,14 +119,58 @@ fn validate_platform_download(artifact: &PlatformDownload) -> Result<(), String>
     Ok(())
 }
 
+fn validate_log_filter(label: &str, filter: &LogFilterConfig, errors: &mut Vec<String>) {
+    for pattern in &filter.patterns {
+        if let Err(e) = regex::bytes::Regex::new(pattern) {
+            errors.push(format!("{label}: invalid keep regex '{pattern}': {e}"));
+        }
+    }
+}
+
 impl Config {
-    /// Load and parse a config from a file path.
+    /// Load and parse a config from a file path, then merge a sibling
+    /// `.local.toml` override file if one exists.
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
             path: path.to_path_buf(),
             source,
         })?;
-        Ok(content.parse()?)
+        let mut value: toml::Value = toml::from_str(&content)?;
+
+        let local_path = Self::local_override_path(path);
+        match std::fs::read_to_string(&local_path) {
+            Ok(local_content) => {
+                let local_value: toml::Value = toml::from_str(&local_content)?;
+                merge_toml_values(&mut value, local_value);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ConfigError::ReadFile {
+                    path: local_path,
+                    source,
+                });
+            }
+        }
+
+        Ok(value.try_into()?)
+    }
+
+    fn local_override_path(path: &Path) -> PathBuf {
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let mut file_name = path
+            .file_stem()
+            .filter(|stem| !stem.is_empty())
+            .map(OsString::from)
+            .unwrap_or_else(|| OsString::from("don"));
+        file_name.push(".local");
+        match path.extension() {
+            Some(ext) => {
+                file_name.push(".");
+                file_name.push(ext);
+            }
+            None => file_name.push(".toml"),
+        }
+        parent.join(file_name)
     }
 
     /// All known names (services + tasks) for dependency validation.
@@ -232,6 +284,16 @@ impl Config {
                 ));
             }
         }
+        if let Err(e) = crate::duration::parse_duration(&self.shutdown.timeout) {
+            errors.push(format!("global shutdown: invalid timeout: {e}"));
+        }
+        if !is_valid_signal(&self.shutdown.signal) {
+            errors.push(format!(
+                "global shutdown: unknown signal '{}' (expected SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGUSR1, or SIGUSR2)",
+                self.shutdown.signal
+            ));
+        }
+        validate_log_filter("global log_filter", &self.log_filter, &mut errors);
 
         // Check for name collisions between services and tasks
         for name in self.services.keys() {
@@ -373,6 +435,11 @@ impl Config {
                     ));
                 }
             }
+            validate_log_filter(
+                &format!("service '{name}' log_filter"),
+                &resolved.log_filter,
+                &mut errors,
+            );
             // Validate download config.
             if let Some(ref download) = resolved.download {
                 // Downloads only apply to custom services (with run.cmd).
@@ -732,6 +799,22 @@ impl Config {
         }
 
         None
+    }
+}
+
+fn merge_toml_values(base: &mut toml::Value, override_value: toml::Value) {
+    match (base, override_value) {
+        (toml::Value::Table(base_table), toml::Value::Table(override_table)) => {
+            for (key, value) in override_table {
+                match base_table.get_mut(&key) {
+                    Some(base_value) => merge_toml_values(base_value, value),
+                    None => {
+                        base_table.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base_value, override_value) => *base_value = override_value,
     }
 }
 

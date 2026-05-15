@@ -1,13 +1,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
 
-use don::config::LogConfig;
+use don::config::{LogConfig, LogFilterConfig};
 use don::output::OutputManager;
 use don::process::{SpawnConfig, spawn_process};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 /// Helper to build a SpawnConfig for a simple command.
 fn basic_config<'a>(cmd: &'a str, args: &'a [String], force_pipe: bool) -> SpawnConfig<'a> {
@@ -213,6 +215,46 @@ fn integration_service_log_file_writes_raw() {
             !file_content.contains("filesvc"),
             "file should not contain prefix"
         );
+    });
+}
+
+#[test]
+fn integration_log_filter_keeps_matching_lines() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let (writer, buf) = TestBuffer::new();
+        let config = LogConfig::Stdout;
+        let filters = HashMap::from([(
+            "api".to_string(),
+            LogFilterConfig {
+                patterns: vec!["keep .*".to_string()],
+            },
+        )]);
+        let mgr = OutputManager::new_with_log_filters(&[("api", &config)], &filters, writer)
+            .await
+            .unwrap();
+        let svc = mgr.service_writer("api").unwrap();
+
+        let (mut tx, rx) = tokio::io::duplex(64);
+        tx.write_all(b"drop before\nkeep first half").await.unwrap();
+        tx.write_all(b" second half\ndrop after\n").await.unwrap();
+        drop(tx);
+
+        svc.process_stream(rx).await.unwrap();
+
+        let logs = mgr.read_logs("api", 10).await.unwrap();
+        assert!(logs_contain(&logs, b"keep first half second half"));
+        assert!(!logs_contain(&logs, b"drop before"), "logs: {logs:?}");
+        assert!(!logs_contain(&logs, b"drop after"), "logs: {logs:?}");
+
+        mgr.shutdown().await;
+
+        let output_str = read_buf(&buf);
+        assert!(
+            output_str.contains("keep first half second half"),
+            "output: {output_str}"
+        );
+        assert!(!output_str.contains("drop before"), "output: {output_str}");
+        assert!(!output_str.contains("drop after"), "output: {output_str}");
     });
 }
 

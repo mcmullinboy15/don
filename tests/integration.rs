@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
 
-use don::config::{Config, ConfigError, Platform};
+use don::config::{Config, ConfigError, Platform, ServiceKind};
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -92,6 +92,203 @@ fn validate_config_with_tasks_and_profiles_body() {
     assert_eq!(config.services.len(), 2);
     assert_eq!(config.tasks.len(), 1);
     assert_eq!(config.profiles.len(), 1);
+}
+
+fn validate_shutdown_graceful_flags_body() {
+    let toml = r#"
+[shutdown]
+graceful = false
+
+[services.api]
+run.cmd = "api"
+shutdown.timeout = "250ms"
+
+[services.worker]
+run.cmd = "worker"
+shutdown.graceful = true
+shutdown.signal = "SIGINT"
+"#;
+
+    let config: Config = toml.parse().unwrap();
+    config.validate(TEST_PLATFORM).unwrap();
+    assert!(!config.shutdown.graceful);
+    assert_eq!(config.shutdown.signal, "SIGTERM");
+    assert_eq!(config.shutdown.timeout, "10s");
+
+    let api_shutdown = config.services["api"]
+        .resolve(TEST_PLATFORM)
+        .shutdown
+        .unwrap();
+    assert!(api_shutdown.graceful);
+    assert_eq!(api_shutdown.timeout, "250ms");
+
+    let worker_shutdown = config.services["worker"]
+        .resolve(TEST_PLATFORM)
+        .shutdown
+        .unwrap();
+    assert!(worker_shutdown.graceful);
+    assert_eq!(worker_shutdown.signal, "SIGINT");
+}
+
+fn validate_log_filter_keep_regex_body() {
+    let toml = r#"
+log_filter = ["^global keep"]
+
+[services.api]
+run.cmd = "api"
+log_filter = ["service keep [0-9]+"]
+"#;
+
+    let config: Config = toml.parse().unwrap();
+    config.validate(TEST_PLATFORM).unwrap();
+    assert_eq!(config.log_filter.patterns, vec!["^global keep"]);
+    assert_eq!(
+        config.services["api"]
+            .resolve(TEST_PLATFORM)
+            .log_filter
+            .patterns,
+        vec!["service keep [0-9]+"]
+    );
+}
+
+fn validate_log_filter_rejects_invalid_regex_body() {
+    let toml = r#"
+[services.api]
+run.cmd = "api"
+log_filter = ["["]
+"#;
+
+    let config: Config = toml.parse().unwrap();
+    let err = config.validate(TEST_PLATFORM).unwrap_err();
+    let ConfigError::Validation { errors } = err else {
+        panic!("expected validation error");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("service 'api' log_filter") && e.contains("invalid keep regex")),
+        "errors: {errors:?}"
+    );
+}
+
+fn config_from_file_merges_local_override_body() {
+    struct LocalOverrideCase {
+        name: &'static str,
+        config_name: &'static str,
+        local_name: &'static str,
+    }
+
+    let cases = vec![
+        LocalOverrideCase {
+            name: "default don.toml",
+            config_name: "don.toml",
+            local_name: "don.local.toml",
+        },
+        LocalOverrideCase {
+            name: "custom config path",
+            config_name: "workspace.toml",
+            local_name: "workspace.local.toml",
+        },
+    ];
+
+    for case in cases {
+        let dir = TempDir::new(&format!("local-override-{}", case.name.replace(' ', "-")));
+        let config_path = dir.child(case.config_name);
+        std::fs::write(
+            &config_path,
+            r#"
+default_profile = "base"
+watch_ignore = ["target/**"]
+
+[services.api]
+run.cmd = "api"
+run.args = ["serve"]
+env = { BASE = "base", SHARED = "base" }
+watch = ["src/**"]
+
+[tasks.migrate]
+cmd = "migrate"
+env = { BASE = "base" }
+
+[profiles.base]
+services = ["api"]
+tasks = ["migrate"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.child(case.local_name),
+            r#"
+default_profile = "local"
+watch_ignore = ["node_modules/**"]
+
+[services.api]
+dir = "./local-api"
+run.args = ["dev"]
+env = { SHARED = "local", LOCAL = "yes" }
+
+[services.worker]
+run.cmd = "worker"
+
+[tasks.migrate]
+args = ["up"]
+env = { LOCAL = "yes" }
+
+[profiles.local]
+services = ["worker"]
+tasks = ["migrate"]
+"#,
+        )
+        .unwrap();
+
+        let config = Config::from_file(&config_path).unwrap();
+        config.validate(TEST_PLATFORM).unwrap();
+
+        assert_eq!(
+            config.default_profile.as_deref(),
+            Some("local"),
+            "{}: default_profile should be overridden",
+            case.name
+        );
+        assert_eq!(
+            config.watch_ignore,
+            vec!["node_modules/**"],
+            "{}: arrays should be replaced by local config",
+            case.name
+        );
+
+        let api = config.services["api"].resolve(TEST_PLATFORM);
+        assert_eq!(
+            api.dir.as_deref(),
+            Some(std::path::Path::new("./local-api"))
+        );
+        assert_eq!(api.env["BASE"], "base");
+        assert_eq!(api.env["SHARED"], "local");
+        assert_eq!(api.env["LOCAL"], "yes");
+        let Some(ServiceKind::Custom { run, .. }) = api.kind else {
+            panic!("{}: expected custom api service", case.name);
+        };
+        assert_eq!(run.cmd, "api");
+        assert_eq!(run.args, vec!["dev"]);
+
+        assert!(config.services.contains_key("worker"));
+        assert_eq!(config.tasks["migrate"].cmd, "migrate");
+        assert_eq!(config.tasks["migrate"].args, vec!["up"]);
+        assert_eq!(config.tasks["migrate"].env["BASE"], "base");
+        assert_eq!(config.tasks["migrate"].env["LOCAL"], "yes");
+        assert!(config.profiles.contains_key("base"));
+        assert_eq!(config.profiles["local"].services, vec!["worker"]);
+    }
+}
+
+fn malformed_local_override_is_parse_error_body() {
+    let dir = TempDir::new("local-override-malformed");
+    let config_path = dir.child("don.toml");
+    std::fs::write(&config_path, "").unwrap();
+    std::fs::write(dir.child("don.local.toml"), "this is not [valid toml").unwrap();
+
+    let err = Config::from_file(&config_path).unwrap_err();
+    assert!(matches!(err, ConfigError::Parse(_)));
 }
 
 fn validate_task_params_reject_run_flag_collisions_body() {
@@ -484,6 +681,26 @@ bounded_test!(
 bounded_test!(
     validate_config_with_tasks_and_profiles,
     validate_config_with_tasks_and_profiles_body
+);
+bounded_test!(
+    validate_shutdown_graceful_flags,
+    validate_shutdown_graceful_flags_body
+);
+bounded_test!(
+    validate_log_filter_keep_regex,
+    validate_log_filter_keep_regex_body
+);
+bounded_test!(
+    validate_log_filter_rejects_invalid_regex,
+    validate_log_filter_rejects_invalid_regex_body
+);
+bounded_test!(
+    config_from_file_merges_local_override,
+    config_from_file_merges_local_override_body
+);
+bounded_test!(
+    malformed_local_override_is_parse_error,
+    malformed_local_override_is_parse_error_body
 );
 bounded_test!(
     validate_task_params_reject_run_flag_collisions,

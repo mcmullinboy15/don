@@ -297,6 +297,12 @@ impl ServiceBuilder {
         self
     }
 
+    /// Enable or disable graceful shutdown for this service.
+    pub fn graceful_shutdown(mut self, value: bool) -> Self {
+        self.lines.push(format!("shutdown.graceful = {value}"));
+        self
+    }
+
     /// Finalize this service and return to the config builder.
     pub fn done(mut self) -> ConfigBuilder {
         writeln!(self.builder.toml, "[services.{}]", self.name).unwrap();

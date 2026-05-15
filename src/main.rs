@@ -1344,6 +1344,27 @@ async fn run_start(
         .chain(build_tool_configs.iter().copied())
         .collect();
 
+    let mut log_keep_filters: std::collections::HashMap<String, don::config::LogFilterConfig> =
+        std::collections::HashMap::new();
+    for (name, svc) in config.services.iter().filter(|(name, _)| is_active(name)) {
+        let effective = config
+            .log_filter
+            .merged_with(&svc.resolve(platform).log_filter);
+        if !effective.is_empty() {
+            log_keep_filters.insert(name.clone(), effective);
+        }
+    }
+    for name in config.tasks.keys().filter(|name| is_active(name)) {
+        if !config.log_filter.is_empty() {
+            log_keep_filters.insert(name.clone(), config.log_filter.clone());
+        }
+    }
+    for (name, _) in &build_tool_configs {
+        if !config.log_filter.is_empty() {
+            log_keep_filters.insert((*name).to_string(), config.log_filter.clone());
+        }
+    }
+
     // Validate `--log-filter` against the active item set so typos surface
     // before the runner spawns anything. The synthetic `[don]` lifecycle
     // entry is implicitly allowed everywhere — `don::output` keeps it
@@ -1385,10 +1406,13 @@ async fn run_start(
     let _ = has_foreground_tasks; // logged earlier; TUI now handles fg tasks via pause/resume
 
     if is_tty {
-        let (output_manager, log_rx) =
-            don::output::OutputManager::new_with_tui(&all_configs, verbose)
-                .await
-                .map_err(|e| format!("Error creating output manager: {e}"))?;
+        let (output_manager, log_rx) = don::output::OutputManager::new_with_tui_and_log_filters(
+            &all_configs,
+            &log_keep_filters,
+            verbose,
+        )
+        .await
+        .map_err(|e| format!("Error creating output manager: {e}"))?;
         let verbosity = output_manager.verbosity_control();
         let lifecycle_emitter = output_manager.clone_lifecycle_emitter();
 
@@ -1556,10 +1580,14 @@ async fn run_start(
 
         runner_result
     } else {
-        let output_manager =
-            don::output::OutputManager::new_verbose(&all_configs, tokio::io::stdout(), verbose)
-                .await
-                .map_err(|e| format!("Error creating output manager: {e}"))?;
+        let output_manager = don::output::OutputManager::new_verbose_with_log_filters(
+            &all_configs,
+            &log_keep_filters,
+            tokio::io::stdout(),
+            verbose,
+        )
+        .await
+        .map_err(|e| format!("Error creating output manager: {e}"))?;
 
         if let Some(allow) = log_filter_set {
             output_manager.set_log_filter(allow);

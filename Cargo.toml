@@ -29,6 +29,7 @@ tower-service = "0.3"
 nix = { version = "0.31", features = ["signal", "process", "fs"] }
 notify = "8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+regex = "1"
 pty-process = { version = "0.5", features = ["async"] }
 quick-xml = "0.39"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }

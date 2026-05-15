@@ -263,15 +263,18 @@ pub enum OnFailure {
     Restart,
 }
 
-/// Shutdown behavior for a service.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Shutdown behavior for services.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownConfig {
+    /// If false, skip the graceful signal/timeout window and send SIGKILL immediately.
+    pub graceful: bool,
     /// Signal to send for graceful shutdown (e.g. "SIGTERM", "SIGINT"). Defaults to "SIGTERM".
-    #[serde(default = "ShutdownConfig::default_signal")]
     pub signal: String,
     /// Time to wait for graceful shutdown before sending SIGKILL (e.g. "10s"). Defaults to "10s".
-    #[serde(default = "ShutdownConfig::default_timeout")]
     pub timeout: String,
+    graceful_set: bool,
+    signal_set: bool,
+    timeout_set: bool,
 }
 
 impl ShutdownConfig {
@@ -281,6 +284,100 @@ impl ShutdownConfig {
 
     fn default_timeout() -> String {
         "10s".to_string()
+    }
+
+    pub(crate) fn merged_over(&self, base: &Self) -> Self {
+        Self {
+            graceful: if self.graceful_set {
+                self.graceful
+            } else {
+                base.graceful
+            },
+            signal: if self.signal_set {
+                self.signal.clone()
+            } else {
+                base.signal.clone()
+            },
+            timeout: if self.timeout_set {
+                self.timeout.clone()
+            } else {
+                base.timeout.clone()
+            },
+            graceful_set: true,
+            signal_set: true,
+            timeout_set: true,
+        }
+    }
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            graceful: true,
+            signal: Self::default_signal(),
+            timeout: Self::default_timeout(),
+            graceful_set: false,
+            signal_set: false,
+            timeout_set: false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShutdownConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawShutdownConfig {
+            graceful: Option<bool>,
+            signal: Option<String>,
+            timeout: Option<String>,
+        }
+
+        let raw = RawShutdownConfig::deserialize(deserializer)?;
+        let graceful_set = raw.graceful.is_some();
+        let signal_set = raw.signal.is_some();
+        let timeout_set = raw.timeout.is_some();
+
+        Ok(Self {
+            graceful: raw.graceful.unwrap_or(true),
+            signal: raw.signal.unwrap_or_else(Self::default_signal),
+            timeout: raw.timeout.unwrap_or_else(Self::default_timeout),
+            graceful_set,
+            signal_set,
+            timeout_set,
+        })
+    }
+}
+
+/// Regex-based log filtering.
+///
+/// `patterns` contains regular expressions matched against complete service
+/// output lines. When configured, only matching lines are kept.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogFilterConfig {
+    /// Regex patterns for log lines to keep. In TOML this is `log_filter = ["..."]`.
+    pub patterns: Vec<String>,
+}
+
+impl LogFilterConfig {
+    /// Return true when the filter has no active keep patterns.
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    /// Combine global and item-specific filters. Global patterns run first;
+    /// service-specific patterns extend them.
+    pub fn merged_with(&self, item: &Self) -> Self {
+        let mut patterns = Vec::with_capacity(self.patterns.len() + item.patterns.len());
+        patterns.extend(self.patterns.iter().cloned());
+        patterns.extend(item.patterns.iter().cloned());
+        Self { patterns }
+    }
+}
+
+impl<'de> Deserialize<'de> for LogFilterConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let patterns = Vec::<String>::deserialize(deserializer)?;
+        Ok(Self { patterns })
     }
 }
 

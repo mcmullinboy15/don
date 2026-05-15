@@ -122,7 +122,12 @@ impl Runner {
             .is_some_and(|rs| rs.start_generation == op_id);
         if !is_current {
             if let Ok(start_result) = result {
-                let shutdown_config = context.resolved.shutdown.clone();
+                let shutdown_config = context
+                    .resolved
+                    .shutdown
+                    .clone()
+                    .map(|shutdown| shutdown.merged_over(&self.config.shutdown))
+                    .unwrap_or_else(|| self.config.shutdown.clone());
                 let debug = service::StopDebug::new(
                     name.to_string(),
                     self.output_manager.clone_lifecycle_emitter(),
@@ -136,7 +141,7 @@ impl Runner {
                     drop(child_output);
                     let _ = service::stop_service(
                         handle,
-                        shutdown_config.as_ref(),
+                        Some(&shutdown_config),
                         true,
                         false,
                         Some(debug),
@@ -184,6 +189,15 @@ impl Runner {
             Err(message) => {
                 self.set_service_state(name, ServiceState::Failed);
                 self.output_manager.service_error_event(name, &message);
+                let should_auto_restart = matches!(intent, ServiceStartIntent::Background)
+                    && self.services.get(name).is_some_and(|rs| {
+                        rs.resolved.on_failure == crate::config::OnFailure::Restart
+                    });
+                if should_auto_restart {
+                    self.schedule_auto_restart(name, &message, true);
+                } else if let Some(rs) = self.services.get_mut(name) {
+                    rs.restart_attempts = 0;
+                }
                 match intent {
                     ServiceStartIntent::Startup { done_tx } => {
                         let _ = done_tx
@@ -269,10 +283,7 @@ impl Runner {
                 self.output_manager.resume_stdout_sink(name).await;
             }
             self.set_service_state(name, ServiceState::Stopping);
-            let shutdown_config = self
-                .services
-                .get(name)
-                .and_then(|rs| rs.resolved.shutdown.clone());
+            let shutdown_config = self.effective_shutdown_config(name);
             let wait_full = self
                 .services
                 .get(name)
@@ -524,11 +535,11 @@ impl Runner {
         }
     }
 
-    fn spawn_manual_service_stop_worker(
+    pub(in crate::runner) fn spawn_manual_service_stop_worker(
         &mut self,
         name: &str,
         handle: ServiceHandle,
-        shutdown_config: Option<crate::config::ShutdownConfig>,
+        shutdown_config: crate::config::ShutdownConfig,
         wait_full_exit: bool,
         reply: oneshot::Sender<CommandResult>,
         stop_action: ServiceStopAction,
@@ -554,7 +565,7 @@ impl Runner {
         let worker = tokio::spawn(async move {
             let result = service::stop_service_interruptibly(
                 handle,
-                shutdown_config.as_ref(),
+                Some(&shutdown_config),
                 wait_full_exit,
                 shutdown_rx,
                 Some(debug),
@@ -684,10 +695,7 @@ impl Runner {
                 return;
             }
         };
-        let shutdown_config = self
-            .services
-            .get(name)
-            .and_then(|rs| rs.resolved.shutdown.clone());
+        let shutdown_config = self.effective_shutdown_config(name);
         // Release attach lock if held — the PTY write in the attach session
         // becomes invalid once the service stops (process gone).
         if self.remove_attach_lock(name) {
@@ -716,11 +724,22 @@ impl Runner {
     /// On failure, mirrors `handle_service_done`'s lazy-retry behaviour so
     /// a proxied lazy service resets to `Lazy` instead of getting stuck on
     /// `Failed`.
-    pub(in crate::runner) fn handle_ready_check_complete(&mut self, name: &str, success: bool) {
+    pub(in crate::runner) fn handle_ready_check_complete(
+        &mut self,
+        name: &str,
+        success: bool,
+        message: Option<String>,
+    ) {
         if !self.services.contains_key(name) {
             return;
         }
         if success {
+            if let Some(rs) = self.services.get_mut(name) {
+                if let Some(handle) = rs.pending_restart.take() {
+                    handle.abort();
+                }
+                rs.restart_attempts = 0;
+            }
             self.set_service_state(name, ServiceState::Ready);
             self.unblock_dependency_failed_items();
             return;
@@ -739,6 +758,20 @@ impl Runner {
             }
         } else {
             self.set_service_state(name, ServiceState::Failed);
+            let policy = self
+                .services
+                .get(name)
+                .map(|rs| rs.resolved.on_failure)
+                .unwrap_or_default();
+            if matches!(policy, crate::config::OnFailure::Restart) {
+                self.schedule_auto_restart(
+                    name,
+                    message
+                        .as_deref()
+                        .unwrap_or("service failed before becoming ready"),
+                    true,
+                );
+            }
         }
     }
 
@@ -781,10 +814,7 @@ impl Runner {
                 return;
             }
         };
-        let shutdown_config = self
-            .services
-            .get(name)
-            .and_then(|rs| rs.resolved.shutdown.clone());
+        let shutdown_config = self.effective_shutdown_config(name);
         if self.remove_attach_lock(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
