@@ -11,15 +11,22 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::{ProxyEntry, ProxyMode};
+
+const PROXY_FD_RESERVE: u64 = 128;
+const DEFAULT_PROXY_CONNECTION_LIMIT: u64 = 4096;
+const MIN_PROXY_CONNECTION_LIMIT: u64 = 16;
+
+static PROXY_CONNECTION_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -445,14 +452,21 @@ async fn proxy_accept_loop(
     service_name: String,
     emitter: crate::output::LifecycleEmitter,
 ) {
+    let connection_permits = proxy_connection_permits();
     let mut consecutive_errors: u32 = 0;
     loop {
+        let permit = match connection_permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+
         let (client, _peer) = match listener.accept().await {
             Ok(conn) => {
                 consecutive_errors = 0;
                 conn
             }
             Err(e) => {
+                drop(permit);
                 consecutive_errors += 1;
                 // Back off on repeated errors to avoid busy-spinning.
                 // First few errors get a short delay; persistent errors
@@ -493,7 +507,7 @@ async fn proxy_accept_loop(
         };
 
         // Spawn a forwarding task for this connection.
-        tokio::spawn(proxy_connection(client, backend_addr));
+        tokio::spawn(proxy_connection(client, backend_addr, permit));
     }
 }
 
@@ -501,7 +515,11 @@ async fn proxy_accept_loop(
 ///
 /// Retries the backend connection with exponential backoff if the service
 /// isn't listening yet (common during startup before the process binds its port).
-async fn proxy_connection(mut client: TcpStream, backend_addr: SocketAddr) {
+async fn proxy_connection(
+    mut client: TcpStream,
+    backend_addr: SocketAddr,
+    _permit: OwnedSemaphorePermit,
+) {
     let backend_candidates = backend_connect_candidates(backend_addr);
     let mut backend = None;
     for attempt in 0..20u32 {
@@ -534,6 +552,36 @@ async fn proxy_connection(mut client: TcpStream, backend_addr: SocketAddr) {
     let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
 }
 
+fn proxy_connection_permits() -> Arc<Semaphore> {
+    PROXY_CONNECTION_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(proxy_connection_limit())))
+        .clone()
+}
+
+fn proxy_connection_limit() -> usize {
+    let soft_limit = current_nofile_soft_limit().unwrap_or(DEFAULT_PROXY_CONNECTION_LIMIT * 2);
+    proxy_connection_limit_for_soft_nofile(soft_limit) as usize
+}
+
+fn proxy_connection_limit_for_soft_nofile(soft_limit: u64) -> u64 {
+    let fd_backed_limit = soft_limit.saturating_sub(PROXY_FD_RESERVE) / 2;
+    fd_backed_limit.clamp(MIN_PROXY_CONNECTION_LIMIT, DEFAULT_PROXY_CONNECTION_LIMIT)
+}
+
+fn current_nofile_soft_limit() -> Option<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // Safety: `limit` points at a valid initialized rlimit struct for
+    // getrlimit() to fill.
+    let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if ret != 0 || limit.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    Some(limit.rlim_cur)
+}
+
 fn backend_connect_candidates(backend_addr: SocketAddr) -> Vec<SocketAddr> {
     let mut candidates = vec![backend_addr];
     match backend_addr.ip() {
@@ -558,7 +606,10 @@ fn backend_connect_candidates(backend_addr: SocketAddr) -> Vec<SocketAddr> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    use super::backend_connect_candidates;
+    use super::{
+        DEFAULT_PROXY_CONNECTION_LIMIT, MIN_PROXY_CONNECTION_LIMIT, PROXY_FD_RESERVE,
+        backend_connect_candidates, proxy_connection_limit_for_soft_nofile,
+    };
 
     #[test]
     fn loopback_ipv4_backends_try_ipv6_loopback_too() {
@@ -594,5 +645,31 @@ mod tests {
         let candidates = backend_connect_candidates(SocketAddr::new(target, 46165));
 
         assert_eq!(candidates, vec![SocketAddr::new(target, 46165)]);
+    }
+
+    #[test]
+    fn proxy_connection_limit_reserves_fds_for_non_proxy_work() {
+        let soft_limit = 1024;
+
+        assert_eq!(
+            proxy_connection_limit_for_soft_nofile(soft_limit),
+            (soft_limit - PROXY_FD_RESERVE) / 2
+        );
+    }
+
+    #[test]
+    fn proxy_connection_limit_is_capped_for_large_fd_limits() {
+        assert_eq!(
+            proxy_connection_limit_for_soft_nofile(1_000_000),
+            DEFAULT_PROXY_CONNECTION_LIMIT
+        );
+    }
+
+    #[test]
+    fn proxy_connection_limit_keeps_a_small_floor() {
+        assert_eq!(
+            proxy_connection_limit_for_soft_nofile(64),
+            MIN_PROXY_CONNECTION_LIMIT
+        );
     }
 }
