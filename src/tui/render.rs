@@ -257,6 +257,14 @@ fn draw_log_popup(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Paragraph::new(text), inner);
 }
 
+pub(crate) fn log_popup_visible_rows(area: Rect) -> usize {
+    let area = centered_rect(area, 86, 72);
+    if area.height < 3 || area.width < 8 {
+        return 0;
+    }
+    area.height.saturating_sub(2) as usize
+}
+
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)

@@ -132,7 +132,9 @@ impl Modal {
         })
     }
 
-    fn draw(&mut self, app: &App) -> Result<(), TuiError> {
+    fn draw(&mut self, app: &mut App) -> Result<(), TuiError> {
+        let size = self.terminal.size()?;
+        app.sync_log_popup_scroll(render::log_popup_visible_rows(size.into()));
         self.terminal.draw(|f| render::draw_modal(f, app))?;
         Ok(())
     }
@@ -333,7 +335,7 @@ pub async fn run_tui(
                         if let Some(act) = active.as_mut() {
                             if modal_dirty {
                                 if let Some(m) = act.modal.as_mut() {
-                                    m.draw(&app)?;
+                                    m.draw(&mut app)?;
                                 }
                             } else if bar_dirty {
                                 draw_inline_bar(&mut act.terminal, &app)?;
@@ -363,7 +365,7 @@ pub async fn run_tui(
                         app.filter.set_hidden_from_display(lazy);
                         if let Some(act) = active.as_mut() {
                             if let Some(m) = act.modal.as_mut() {
-                                m.draw(&app)?;
+                                m.draw(&mut app)?;
                             } else if filter_changed {
                                 clear_and_replay(&mut act.terminal, &store, &app)?;
                             } else {
@@ -461,7 +463,7 @@ pub async fn run_tui(
                     && let Some(act) = active.as_mut()
                     && let Some(m) = act.modal.as_mut()
                 {
-                    m.draw(&app)?;
+                    m.draw(&mut app)?;
                 }
             }
         }
@@ -730,7 +732,7 @@ fn handle_key(
 }
 
 fn redraw_current_view(
-    app: &App,
+    app: &mut App,
     terminal: &mut TuiTerminal,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
@@ -1163,7 +1165,7 @@ fn dispatch_overlay_command(
     });
 }
 
-fn redraw_modal(modal: &mut Option<Modal>, app: &App) -> Result<(), TuiError> {
+fn redraw_modal(modal: &mut Option<Modal>, app: &mut App) -> Result<(), TuiError> {
     if let Some(m) = modal.as_mut() {
         m.draw(app)?;
     }

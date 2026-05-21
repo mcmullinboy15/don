@@ -467,6 +467,26 @@ impl App {
             popup.follow_tail = true;
         }
     }
+
+    pub(crate) fn sync_log_popup_scroll(&mut self, visible_rows: usize) {
+        let Some(popup) = self.log_popup.as_mut() else {
+            return;
+        };
+        let max_scroll = log_popup_max_scroll(popup.lines.len(), visible_rows);
+        if popup.follow_tail {
+            popup.scroll = max_scroll;
+        } else {
+            popup.scroll = popup.scroll.min(max_scroll);
+        }
+    }
+}
+
+fn log_popup_max_scroll(line_count: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        0
+    } else {
+        line_count.saturating_sub(visible_rows)
+    }
 }
 
 pub(crate) fn line_matches_log_popup(name: &str, line: &FormattedLogLine) -> bool {
@@ -743,6 +763,81 @@ mod tests {
         assert!(line_matches_log_popup("api", &direct));
         assert!(line_matches_log_popup("api", &lifecycle));
         assert!(!line_matches_log_popup("api", &other));
+    }
+
+    #[test]
+    fn log_popup_sync_clamps_to_actual_visible_rows() {
+        struct Case {
+            name: &'static str,
+            line_count: usize,
+            follow_tail: bool,
+            initial_scroll: usize,
+            visible_rows: usize,
+            want_scroll: usize,
+        }
+
+        let cases = vec![
+            Case {
+                name: "tail uses real taller viewport",
+                line_count: 100,
+                follow_tail: true,
+                initial_scroll: 70,
+                visible_rows: 40,
+                want_scroll: 60,
+            },
+            Case {
+                name: "tail uses real shorter viewport",
+                line_count: 100,
+                follow_tail: true,
+                initial_scroll: 70,
+                visible_rows: 10,
+                want_scroll: 90,
+            },
+            Case {
+                name: "manual over-scroll clamps to last full page",
+                line_count: 100,
+                follow_tail: false,
+                initial_scroll: 99,
+                visible_rows: 40,
+                want_scroll: 60,
+            },
+            Case {
+                name: "hidden popup area cannot accumulate scroll debt",
+                line_count: 100,
+                follow_tail: false,
+                initial_scroll: 99,
+                visible_rows: 0,
+                want_scroll: 0,
+            },
+            Case {
+                name: "viewport larger than content",
+                line_count: 5,
+                follow_tail: false,
+                initial_scroll: 4,
+                visible_rows: 40,
+                want_scroll: 0,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_names(vec!["api".to_string()], vec![]);
+            let lines = (0..case.line_count)
+                .map(|i| format!("line {i}").into_bytes())
+                .collect();
+            app.open_log_popup("api".to_string(), lines);
+            let popup = app.log_popup.as_mut().unwrap();
+            popup.follow_tail = case.follow_tail;
+            popup.scroll = case.initial_scroll;
+
+            app.sync_log_popup_scroll(case.visible_rows);
+
+            assert_eq!(
+                app.log_popup.as_ref().unwrap().scroll,
+                case.want_scroll,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]
