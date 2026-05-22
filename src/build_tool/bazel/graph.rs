@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::build_tool::BuildToolError;
@@ -187,7 +188,7 @@ fn read_name(elem: &BytesStart<'_>) -> Result<Option<String>, BuildToolError> {
         })?;
         if attr.key.as_ref() == b"name" {
             let unescaped = attr
-                .unescape_value()
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|e| BuildToolError::ParseError {
                     tool: TOOL.to_string(),
                     message: format!("xml attribute decode error: {e}"),

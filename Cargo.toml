@@ -11,7 +11,7 @@ homepage = "https://github.com/pjtatlow/don"
 [dependencies]
 ansi-to-tui = "8"
 axum = "0.8"
-bollard = "0.20"
+bollard = "0.21"
 bytes = "1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 bzip2 = "0.6"
@@ -31,7 +31,7 @@ notify = "8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 regex = "1"
 pty-process = { version = "0.5", features = ["async"] }
-quick-xml = "0.39"
+quick-xml = "0.40"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
