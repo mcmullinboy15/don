@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use ansi_to_tui::IntoText;
 use crossterm::style::Color as CrosstermColor;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row};
@@ -74,19 +74,42 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
         .filter(|(name, _)| app.filter.passes(name))
         .count();
     let total_services = countable().count();
-    let bar = if app.shutdown_started {
-        Paragraph::new(shutdown_bar_line(&app.counts, app.spinner_frame))
+    let left_line = if app.shutdown_started {
+        shutdown_bar_line(&app.counts, app.spinner_frame)
     } else {
-        Paragraph::new(normal_bar_line(
+        normal_bar_line(
             &app.counts,
             &app.filter,
             app.spinner_frame,
             visible_services,
             total_services,
             app.verbose_enabled,
-        ))
+        )
     };
-    frame.render_widget(bar, inner);
+    let update_badge = (!app.shutdown_started)
+        .then(|| app.update_badge.as_ref().map(update_badge_line))
+        .flatten();
+
+    if let Some(right_line) = update_badge {
+        let right_width = u16::try_from(line_width(&right_line)).unwrap_or(u16::MAX);
+        if right_width > 0 && right_width.saturating_add(2) < inner.width {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(right_width.saturating_add(1)),
+                ])
+                .split(inner);
+            frame.render_widget(Paragraph::new(left_line), chunks[0]);
+            frame.render_widget(
+                Paragraph::new(right_line).alignment(Alignment::Right),
+                chunks[1],
+            );
+            return;
+        }
+    }
+
+    frame.render_widget(Paragraph::new(left_line), inner);
 }
 
 /// Dispatch to the full-screen render function for the current view mode.
@@ -682,6 +705,28 @@ fn shutdown_bar_line(counts: &StatusCounts, spinner_frame: usize) -> Line<'stati
     Line::from(spans)
 }
 
+fn update_badge_line(update: &super::app::UpdateBadge) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(
+                "upgrade available {}->{}",
+                update.current_version, update.latest_version
+            ),
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ".to_string(), Style::default()),
+    ])
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
+}
+
 fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
@@ -1074,6 +1119,16 @@ mod tests {
         ));
 
         assert!(text.contains("[l] logs (1/2)  [R] reset"));
+    }
+
+    #[test]
+    fn update_badge_shows_current_and_latest_versions() {
+        let text = line_text(update_badge_line(&crate::tui::app::UpdateBadge {
+            current_version: "0.4.1".to_string(),
+            latest_version: "0.4.2".to_string(),
+        }));
+
+        assert!(text.contains("upgrade available 0.4.1->0.4.2"));
     }
 
     #[test]

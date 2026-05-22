@@ -551,6 +551,13 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
             state,
             last_run,
         } => app.apply_task_state(name, state, last_run),
+        RunnerEvent::UpdateCheckComplete {
+            current_version,
+            latest_version,
+        } => {
+            app.set_update_check(current_version, latest_version);
+            false
+        }
         RunnerEvent::RebuildComplete { .. }
         | RunnerEvent::TaskRerunComplete { .. }
         | RunnerEvent::ShutdownStarted

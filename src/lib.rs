@@ -14,6 +14,7 @@ pub mod runner;
 pub(crate) mod server;
 pub mod task_state;
 pub(crate) mod tui;
+pub(crate) mod update;
 pub(crate) mod watch;
 
 pub use config::{Config, ConfigError, Platform, TaskAutoRun};

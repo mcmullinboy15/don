@@ -71,6 +71,12 @@ pub(crate) struct LogPopup {
     pub(crate) follow_tail: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpdateBadge {
+    pub(crate) current_version: String,
+    pub(crate) latest_version: String,
+}
+
 impl TaskStatusItem {
     pub(crate) fn name(&self) -> &str {
         self.name.as_str()
@@ -204,6 +210,7 @@ pub(crate) struct App {
     pub(crate) service_pids: HashMap<String, Option<i32>>,
     pub(crate) tasks_state: HashMap<String, TaskItemState>,
     pub(crate) tasks_last_run: HashMap<String, TaskRunInfo>,
+    pub(crate) update_badge: Option<UpdateBadge>,
     pub(crate) services_table: StatusTableState,
     pub(crate) tasks_table: StatusTableState,
     /// Static task-config snapshot — populated at TUI startup so the
@@ -282,6 +289,7 @@ impl App {
             service_pids,
             tasks_state,
             tasks_last_run: task_last_runs,
+            update_badge: None,
             services_table: StatusTableState::default(),
             tasks_table: StatusTableState::default(),
             task_configs,
@@ -302,6 +310,17 @@ impl App {
 
     pub(crate) fn set_verbose_enabled(&mut self, verbose_enabled: bool) {
         self.verbose_enabled = verbose_enabled;
+    }
+
+    pub(crate) fn set_update_check(
+        &mut self,
+        current_version: String,
+        latest_version: Option<String>,
+    ) {
+        self.update_badge = latest_version.map(|latest_version| UpdateBadge {
+            current_version,
+            latest_version,
+        });
     }
 
     pub(crate) fn should_render_log(&self, name: &str, _is_lifecycle: bool) -> bool {

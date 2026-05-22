@@ -44,6 +44,7 @@ use crate::process::pid_file::PidFile;
 use crate::watch::WatchManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 #[cfg(test)]
 use std::time::SystemTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -65,6 +66,9 @@ use self::service_worker::{ServiceStartContext, ServiceStartMode};
 use self::signals::shutdown_requested;
 use self::support::check_gitignore;
 use self::task_worker::TaskRunPrepared;
+
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 enum ServiceStartIntent {
     Startup {
@@ -492,6 +496,8 @@ enum RunnerInternalCommand {
     },
     /// Completion from a detached build-graph re-query worker.
     GraphRequeryComplete(Vec<GraphRequeryOutcomeItem>),
+    /// Result of the periodic crates.io update check.
+    UpdateCheckComplete(Option<crate::update::UpdateAvailable>),
 }
 
 /// An active attach session returned to the WebSocket handler.
@@ -589,6 +595,11 @@ pub enum RunnerEvent {
     ShutdownStarted,
     /// Shutdown complete.
     ShutdownComplete,
+    /// The latest crates.io version changed, or no newer version is available.
+    UpdateCheckComplete {
+        current_version: String,
+        latest_version: Option<String>,
+    },
 }
 
 /// Errors from runner operations.
@@ -675,6 +686,9 @@ pub struct Runner {
 
     /// Detached build-graph re-query batch, if one is in flight.
     graph_requery_handle: Option<crate::build_tool::AbortOnDrop<()>>,
+
+    /// Detached periodic crates.io update checker.
+    update_check_handle: Option<tokio::task::JoinHandle<()>>,
 
     // Don's own PID file
     _don_pid_file: Option<PidFile>,
@@ -793,6 +807,7 @@ impl Runner {
             lazy_build_handles: HashMap::new(),
             rebuild_batch_handle: None,
             graph_requery_handle: None,
+            update_check_handle: None,
             bazel_build_mutex: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             pending_bt_rebuilds: Vec::new(),
             bt_rebuild_deadline: None,
@@ -861,6 +876,61 @@ impl Runner {
         self.event_tx.subscribe()
     }
 
+    fn start_update_checker(&mut self) {
+        if std::env::var_os("DON_NO_UPDATE_CHECK").is_some() {
+            return;
+        }
+
+        let internal_tx = self.internal_tx.clone();
+        let mut shutdown_rx = self.shutdown_flag_tx.subscribe();
+        self.update_check_handle = Some(tokio::spawn(async move {
+            loop {
+                let check = crate::update::check_crates_io(
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION"),
+                    UPDATE_CHECK_TIMEOUT,
+                );
+                tokio::select! {
+                    result = check => {
+                        if let Ok(update) = result
+                            && internal_tx
+                                .send(RunnerInternalCommand::UpdateCheckComplete(update))
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(UPDATE_CHECK_INTERVAL) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    fn broadcast_update_check(&self, update: Option<crate::update::UpdateAvailable>) {
+        let latest_version = update.as_ref().map(|u| u.latest_version.clone());
+        let current_version = update
+            .map(|u| u.current_version)
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let _ = self.event_tx.send(RunnerEvent::UpdateCheckComplete {
+            current_version,
+            latest_version,
+        });
+    }
+
     /// Run the orchestrator: start all services and tasks in dependency order.
     ///
     /// This is the main entry point. It:
@@ -880,6 +950,8 @@ impl Runner {
             Some(rx) => rx,
             None => return Ok(()),
         };
+
+        self.start_update_checker();
 
         self.output_manager.lifecycle_event("loading don.toml");
 
@@ -1398,6 +1470,9 @@ impl Runner {
                                 self.graph_requery_handle = None;
                                 self.handle_graph_requery_complete(outcomes).await;
                             }
+                            RunnerInternalCommand::UpdateCheckComplete(update) => {
+                                self.broadcast_update_check(update);
+                            }
                         }
                     }
                     Some(name) = self.lazy_start_rx.recv() => {
@@ -1468,6 +1543,11 @@ impl Runner {
 
         // Wait for any remaining service exits during shutdown.
         self.wait_for_shutdown().await;
+
+        if let Some(handle) = self.update_check_handle.take() {
+            handle.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        }
 
         // Stop the API server (no-op if already signalled by initiate_shutdown).
         if let Some(tx) = self.server_shutdown_tx.take() {

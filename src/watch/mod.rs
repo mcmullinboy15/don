@@ -21,7 +21,7 @@ use crate::duration::parse_duration;
 use crate::output::LifecycleEmitter;
 use crate::runner::{RunnerCommand, RunnerEvent};
 use glob::Pattern;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -134,7 +134,10 @@ pub(crate) struct WatchQuery {
 pub(crate) struct WatchManager {
     /// The notify watcher handle — kept alive to maintain watches.
     /// Named (not `_watcher`) so we can add new watch directories at runtime.
-    watcher: RecommendedWatcher,
+    watcher: Option<NotifyBackend>,
+    /// Sender captured by the notify callback. Kept so deferred watch
+    /// registration can allocate the backend only when a real directory exists.
+    notify_tx: mpsc::UnboundedSender<notify::Result<notify::Event>>,
     /// Channel receiving raw notify events.
     event_rx: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     /// Per-item (service or task) state.
@@ -166,6 +169,27 @@ pub(crate) struct WatchManager {
     last_notify_error: Option<String>,
 }
 
+enum NotifyBackend {
+    Native(RecommendedWatcher),
+    Poll(PollWatcher),
+}
+
+impl NotifyBackend {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        match self {
+            Self::Native(watcher) => watcher.watch(path, mode),
+            Self::Poll(watcher) => watcher.watch(path, mode),
+        }
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        match self {
+            Self::Native(watcher) => watcher.unwatch(path),
+            Self::Poll(watcher) => watcher.unwatch(path),
+        }
+    }
+}
+
 impl WatchManager {
     /// Create a new watch manager from the config.
     ///
@@ -194,12 +218,7 @@ impl WatchManager {
         // Without this, any `RecursiveMode::Recursive` registration at or
         // above the root walks the entire cache and blows through
         // `fs.inotify.max_user_watches` while blocking for minutes.
-        let mut watcher = RecommendedWatcher::new(
-            move |res| {
-                let _ = notify_tx.send(res);
-            },
-            notify::Config::default().with_follow_symlinks(false),
-        )?;
+        let mut watcher = None;
 
         // Canonicalize base_dir so glob patterns are absolute and match the
         // absolute paths that notify reports in events. Without this, a base_dir
@@ -295,7 +314,8 @@ impl WatchManager {
                     .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
 
                 if !is_covered(&watch_dir, RecursiveMode::Recursive, &registered_dirs) {
-                    watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
+                    ensure_notify_watcher(&mut watcher, &notify_tx)?
+                        .watch(&watch_dir, RecursiveMode::Recursive)?;
                     registered_dirs.insert(watch_dir, RecursiveMode::Recursive);
                 }
             }
@@ -366,7 +386,8 @@ impl WatchManager {
                     .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
 
                 if !is_covered(&watch_dir, RecursiveMode::Recursive, &registered_dirs) {
-                    watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
+                    ensure_notify_watcher(&mut watcher, &notify_tx)?
+                        .watch(&watch_dir, RecursiveMode::Recursive)?;
                     registered_dirs.insert(watch_dir, RecursiveMode::Recursive);
                 }
             }
@@ -464,7 +485,11 @@ impl WatchManager {
                 // Non-recursive watch on the workspace root is enough for
                 // these specific filenames. No symlink spelunking.
                 if !is_covered(base_dir, RecursiveMode::NonRecursive, &registered_dirs) {
-                    match watcher.watch(base_dir, RecursiveMode::NonRecursive) {
+                    match ensure_notify_watcher(&mut watcher, &notify_tx).and_then(|watcher| {
+                        watcher
+                            .watch(base_dir, RecursiveMode::NonRecursive)
+                            .map_err(WatchError::from)
+                    }) {
                         Ok(()) => {
                             registered_dirs
                                 .insert(base_dir.to_path_buf(), RecursiveMode::NonRecursive);
@@ -527,6 +552,7 @@ impl WatchManager {
         Ok((
             Self {
                 watcher,
+                notify_tx,
                 event_rx,
                 items,
                 cmd_tx,
@@ -637,17 +663,31 @@ impl WatchManager {
                     if mode == RecursiveMode::Recursive
                         && self.registered_dirs.get(&watch_dir)
                             == Some(&RecursiveMode::NonRecursive)
-                        && let Err(e) = self.watcher.unwatch(&watch_dir)
                     {
-                        self.record_item_error(
-                            &update.name,
-                            format!(
-                                "watch: failed to replace non-recursive watch for {}: {e}",
-                                watch_dir.display()
-                            ),
-                        );
+                        match ensure_notify_watcher(&mut self.watcher, &self.notify_tx) {
+                            Ok(watcher) => {
+                                if let Err(e) = watcher.unwatch(&watch_dir) {
+                                    self.record_item_error(
+                                        &update.name,
+                                        format!(
+                                            "watch: failed to replace non-recursive watch for {}: {e}",
+                                            watch_dir.display()
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                self.record_item_error(
+                                    &update.name,
+                                    format!("watch: failed to initialize notify backend: {e}"),
+                                );
+                                continue;
+                            }
+                        }
                     }
-                    match self.watcher.watch(&watch_dir, mode) {
+                    match ensure_notify_watcher(&mut self.watcher, &self.notify_tx).and_then(
+                        |watcher| watcher.watch(&watch_dir, mode).map_err(WatchError::from),
+                    ) {
                         Ok(()) => {
                             self.registered_dirs.insert(watch_dir, mode);
                         }
@@ -1139,6 +1179,58 @@ fn resolve_pattern(base_dir: &Path, pattern: &str) -> PathBuf {
     }
 }
 
+fn ensure_notify_watcher<'a>(
+    watcher: &'a mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+) -> Result<&'a mut NotifyBackend, WatchError> {
+    if watcher.is_none() {
+        *watcher = Some(if prefer_poll_watcher() {
+            create_poll_watcher(notify_tx)?
+        } else {
+            match create_native_watcher(notify_tx) {
+                Ok(watcher) => watcher,
+                Err(_) => create_poll_watcher(notify_tx)?,
+            }
+        });
+    }
+    watcher
+        .as_mut()
+        .ok_or_else(|| notify::Error::generic("failed to initialize notify watcher").into())
+}
+
+fn prefer_poll_watcher() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("DON_NATIVE_WATCH").is_none()
+}
+
+fn create_native_watcher(
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+) -> notify::Result<NotifyBackend> {
+    let tx = notify_tx.clone();
+    RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        notify::Config::default().with_follow_symlinks(false),
+    )
+    .map(NotifyBackend::Native)
+}
+
+fn create_poll_watcher(
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+) -> notify::Result<NotifyBackend> {
+    let tx = notify_tx.clone();
+    PollWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        notify::Config::default()
+            .with_follow_symlinks(false)
+            .with_poll_interval(Duration::from_millis(250))
+            .with_compare_contents(true),
+    )
+    .map(NotifyBackend::Poll)
+}
+
 /// Sleep until the given instant, or pend forever if `None`.
 async fn sleep_until_or_pending(deadline: Option<Instant>) {
     match deadline {
@@ -1348,7 +1440,23 @@ bazel.target = "//services/api:api"
             )
             .unwrap();
 
-            assert!(warnings.is_empty(), "case: {}", case.name);
+            if case.expect_watches {
+                // Positive cases need a real notify backend. Some developer
+                // machines can exhaust Linux's per-user inotify instance
+                // ceiling; that should not hide regressions in the opt-out
+                // cases this table primarily covers.
+                assert!(
+                    warnings.is_empty()
+                        || warnings
+                            .iter()
+                            .all(|warning| warning.contains("workspace watch registration failed")),
+                    "case: {} warnings: {:?}",
+                    case.name,
+                    warnings
+                );
+            } else {
+                assert!(warnings.is_empty(), "case: {}", case.name);
+            }
             assert_eq!(
                 watch_mgr.has_watches(),
                 case.expect_watches,

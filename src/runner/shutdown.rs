@@ -57,6 +57,10 @@ impl Runner {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
+        if let Some(handle) = self.update_check_handle.take() {
+            handle.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        }
 
         let mut service_worker_handles = Vec::new();
         for (name, rs) in &mut self.services {
@@ -372,7 +376,8 @@ impl Runner {
                 | RunnerInternalCommand::ServiceHealthChanged { .. }
                 | RunnerInternalCommand::AutoRestart { .. }
                 | RunnerInternalCommand::ServiceExited { .. }
-                | RunnerInternalCommand::ReadyCheckComplete { .. } => {}
+                | RunnerInternalCommand::ReadyCheckComplete { .. }
+                | RunnerInternalCommand::UpdateCheckComplete(_) => {}
             }
         }
     }
