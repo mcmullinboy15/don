@@ -844,6 +844,9 @@ fn print_verbose_info(info: &don::runner::VerboseInfo) {
     if let Some(ref task) = info.turbo_task {
         println!("  {dim}turbo:{reset}  {task}");
     }
+    if info.watch_count > 0 {
+        println!("  {dim}watch:{reset}  {} paths", info.watch_count);
+    }
     if !info.watch.is_empty() {
         println!(
             "  {dim}watch:{reset}  {}",

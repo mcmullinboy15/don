@@ -87,7 +87,8 @@ impl Runner {
                 }
                 Some(VerboseInfo {
                     depends_on: resolved.depends_on.clone(),
-                    watch,
+                    watch_count: watch.len(),
+                    watch: Vec::new(),
                     proxy: resolved
                         .proxy
                         .iter()
@@ -172,7 +173,8 @@ impl Runner {
                 }
                 Some(VerboseInfo {
                     depends_on: task.depends_on.clone(),
-                    watch,
+                    watch_count: watch.len(),
+                    watch: Vec::new(),
                     proxy: Vec::new(),
                     proxy_active_connections: None,
                     bazel_target: task.bazel.as_ref().map(|b| b.target.clone()),

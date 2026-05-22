@@ -544,6 +544,9 @@ pub struct VerboseInfo {
     /// File watch patterns (explicit or resolved from build tool).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch: Vec<String>,
+    /// Number of file watch patterns resolved for this item.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub watch_count: usize,
     /// Proxy entries, each formatted as `"addr (env=NAME)"` or
     /// `"addr (listenfd)"` for display.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -570,6 +573,10 @@ pub struct VerboseInfo {
     /// Extra watch diagnostics for this item.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch_notes: Vec<String>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// An event broadcast from the runner for external consumers.

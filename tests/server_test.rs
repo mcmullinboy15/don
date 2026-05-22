@@ -171,6 +171,38 @@ fn integration_verbose_status_includes_proxy_active_connections() {
 }
 
 #[test]
+fn integration_verbose_status_summarizes_watch_paths() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-status-watch-summary");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "sleep", &["60"])
+            .log("ignore")
+            .watch(&["src/hidden-by-default.ts", "src/also-hidden.ts"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let (status, body) = request(&socket, "GET", "/status?verbose=true").await;
+        assert_eq!(status, 200, "body: {body}");
+        assert!(body.contains("\"watch_count\":2"), "body: {body}");
+        assert!(
+            !body.contains("hidden-by-default.ts"),
+            "body should not include verbose watch paths by default: {body}"
+        );
+        assert!(
+            !body.contains("also-hidden.ts"),
+            "body should not include verbose watch paths by default: {body}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
 fn integration_status_endpoint_includes_task_last_run() {
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("server-task-last-run");
