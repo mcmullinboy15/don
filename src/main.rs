@@ -832,6 +832,9 @@ fn print_verbose_info(info: &don::runner::VerboseInfo) {
     if !info.proxy.is_empty() {
         println!("  {dim}proxy:{reset}  {}", info.proxy.join(", "));
     }
+    if let Some(active) = info.proxy_active_connections {
+        println!("  {dim}proxy connections:{reset}  {active} active");
+    }
     if let Some(ref ready) = info.ready {
         println!("  {dim}ready:{reset}  {ready}");
     }

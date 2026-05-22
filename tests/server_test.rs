@@ -5,6 +5,7 @@ use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::{Runner, TerminalCoordinator};
 use helpers::config::ConfigBuilder;
+use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::path::Path;
@@ -135,6 +136,34 @@ fn integration_status_endpoint_returns_items() {
         assert!(body.contains("\"items\""), "body: {body}");
         assert!(body.contains("\"name\":\"keeper\""), "body: {body}");
         assert!(body.contains("\"kind\":\"service\""), "body: {body}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_verbose_status_includes_proxy_active_connections() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-status-proxy-connections");
+        let addr = format!("127.0.0.1:{}", free_port());
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "sleep", &["60"])
+            .log("ignore")
+            .proxy_env(&addr, "PORT")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let (status, body) = request(&socket, "GET", "/status?verbose=true").await;
+        assert_eq!(status, 200, "body: {body}");
+        assert!(
+            body.contains("\"proxy_active_connections\":0"),
+            "body: {body}"
+        );
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

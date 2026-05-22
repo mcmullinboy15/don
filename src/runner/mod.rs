@@ -542,6 +542,10 @@ pub struct VerboseInfo {
     /// `"addr (listenfd)"` for display.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy: Vec<String>,
+    /// Active Don-managed proxy connections. Present only for env/forward
+    /// proxy entries; listenfd connections are owned by the child process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_active_connections: Option<usize>,
     /// Bazel target (if configured).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bazel_target: Option<String>,
@@ -735,6 +739,12 @@ impl Runner {
         let (event_tx, _) = broadcast::channel(256);
         let (lazy_start_tx, lazy_start_rx) = mpsc::channel(16);
         let (shutdown_flag_tx, _shutdown_flag_rx) = tokio::sync::watch::channel(false);
+
+        for outcome in crate::process::rlimit::raise_soft_resource_limits() {
+            if let Some(message) = crate::process::rlimit::format_outcome(&outcome) {
+                output_manager.service_debug_event("don", &message);
+            }
+        }
 
         let base_dir = setup::canonicalize_base_dir(&base_dir)?;
         let don_dir = setup::ensure_don_dir(&base_dir)?;

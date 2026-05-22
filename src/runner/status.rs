@@ -103,6 +103,10 @@ impl Runner {
                             }
                         })
                         .collect(),
+                    proxy_active_connections: rs
+                        .proxy
+                        .as_ref()
+                        .and_then(|proxy| proxy.active_forward_connections()),
                     bazel_target: resolved.bazel_config().map(|b| b.target.clone()),
                     turbo_task: resolved.turbo_config().map(|t| t.task.clone()),
                     ready,
@@ -170,6 +174,7 @@ impl Runner {
                     depends_on: task.depends_on.clone(),
                     watch,
                     proxy: Vec::new(),
+                    proxy_active_connections: None,
                     bazel_target: task.bazel.as_ref().map(|b| b.target.clone()),
                     turbo_task: task.turbo.as_ref().map(|t| t.task.clone()),
                     ready: None,

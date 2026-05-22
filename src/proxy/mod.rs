@@ -11,22 +11,23 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::{ProxyEntry, ProxyMode};
 
 const PROXY_FD_RESERVE: u64 = 128;
-const DEFAULT_PROXY_CONNECTION_LIMIT: u64 = 4096;
+const DEFAULT_PROXY_CONNECTION_LIMIT: u64 = 16_384;
 const MIN_PROXY_CONNECTION_LIMIT: u64 = 16;
 
-static PROXY_CONNECTION_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static PROXY_CONNECTION_POOL: OnceLock<ProxyConnectionPool> = OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -88,6 +89,15 @@ pub(crate) struct ServiceProxy {
     listenfd: Vec<ListenfdListener>,
     service_name: String,
     lazy_tx: Option<mpsc::Sender<String>>,
+    active_forward_connections: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct ProxyConnectionAccounting {
+    permits: Arc<Semaphore>,
+    max_connections: usize,
+    global_active_connections: Arc<AtomicUsize>,
+    service_active_connections: Arc<AtomicUsize>,
 }
 
 impl ServiceProxy {
@@ -105,6 +115,7 @@ impl ServiceProxy {
     ) -> Result<Self, ProxyError> {
         let mut forward = Vec::new();
         let mut listenfd = Vec::new();
+        let active_forward_connections = Arc::new(AtomicUsize::new(0));
 
         for entry in entries {
             let listen_addr: SocketAddr = entry.listen.parse().map_err(|e| ProxyError::Bind {
@@ -129,6 +140,7 @@ impl ServiceProxy {
                         lazy_tx.clone(),
                         service_name.to_string(),
                         emitter.clone(),
+                        active_forward_connections.clone(),
                     ));
                     forward.push(ForwardListener {
                         listen_addr,
@@ -160,6 +172,7 @@ impl ServiceProxy {
                         lazy_tx.clone(),
                         service_name.to_string(),
                         emitter.clone(),
+                        active_forward_connections.clone(),
                     ));
                     forward.push(ForwardListener {
                         listen_addr,
@@ -206,6 +219,7 @@ impl ServiceProxy {
             listenfd,
             service_name: service_name.to_string(),
             lazy_tx,
+            active_forward_connections,
         })
     }
 
@@ -311,6 +325,15 @@ impl ServiceProxy {
         let mut out: Vec<SocketAddr> = self.forward.iter().map(|f| f.listen_addr).collect();
         out.extend(self.listenfd.iter().map(|l| l.listen_addr));
         out
+    }
+
+    /// Active env/forward proxy connections owned by Don. Listenfd-mode
+    /// sockets are accepted by the child process, so Don cannot count them.
+    pub(crate) fn active_forward_connections(&self) -> Option<usize> {
+        if self.forward.is_empty() {
+            return None;
+        }
+        Some(self.active_forward_connections.load(Ordering::Relaxed))
     }
 
     /// Re-arm lazy POLLIN watchers for listenfd entries. Called after the
@@ -451,38 +474,94 @@ async fn proxy_accept_loop(
     lazy_tx: Option<mpsc::Sender<String>>,
     service_name: String,
     emitter: crate::output::LifecycleEmitter,
+    active_connections: Arc<AtomicUsize>,
 ) {
-    let connection_permits = proxy_connection_permits();
-    let mut consecutive_errors: u32 = 0;
-    loop {
-        let permit = match connection_permits.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => return,
-        };
+    let connection_pool = proxy_connection_pool();
+    let accounting = ProxyConnectionAccounting {
+        permits: connection_pool.permits,
+        max_connections: connection_pool.max_connections,
+        global_active_connections: connection_pool.active_connections,
+        service_active_connections: active_connections,
+    };
+    proxy_accept_loop_with_permits(
+        listener,
+        backend_rx,
+        lazy_tx,
+        service_name,
+        emitter,
+        accounting,
+    )
+    .await;
+}
 
+async fn proxy_accept_loop_with_permits(
+    listener: TcpListener,
+    backend_rx: watch::Receiver<Option<SocketAddr>>,
+    lazy_tx: Option<mpsc::Sender<String>>,
+    service_name: String,
+    emitter: crate::output::LifecycleEmitter,
+    accounting: ProxyConnectionAccounting,
+) {
+    let mut consecutive_errors: u32 = 0;
+    let mut connection_limit_reported = false;
+    let listen_addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    loop {
         let (client, _peer) = match listener.accept().await {
             Ok(conn) => {
                 consecutive_errors = 0;
                 conn
             }
             Err(e) => {
-                drop(permit);
                 consecutive_errors += 1;
                 // Back off on repeated errors to avoid busy-spinning.
                 // First few errors get a short delay; persistent errors
                 // get longer pauses.
                 let delay =
                     std::time::Duration::from_millis((10 * consecutive_errors.min(100)) as u64);
-                let addr = listener
-                    .local_addr()
-                    .map(|a| a.to_string())
-                    .unwrap_or_default();
                 emitter.lifecycle_event(&format!(
-                    "{service_name}: proxy {addr} accept error: {e} (backoff {delay:?})"
+                    "{service_name}: proxy {listen_addr} accept error: {e} (backoff {delay:?})"
                 ));
                 tokio::time::sleep(delay).await;
                 continue;
             }
+        };
+
+        let connection_guard = match accounting.permits.clone().try_acquire_owned() {
+            Ok(permit) => {
+                connection_limit_reported = false;
+                ProxyConnectionGuard::new(
+                    permit,
+                    accounting.service_active_connections.clone(),
+                    emitter.clone(),
+                    service_name.clone(),
+                    listen_addr.clone(),
+                    accounting.max_connections,
+                    accounting.global_active_connections.clone(),
+                )
+            }
+            Err(TryAcquireError::NoPermits) => {
+                if !connection_limit_reported {
+                    connection_limit_reported = true;
+                    let max_connections = accounting.max_connections;
+                    let message = format!(
+                        "{service_name}: proxy {listen_addr} connection limit reached; closing new connections ({max_connections}/{max_connections} active)"
+                    );
+                    emitter.lifecycle_event(&message);
+                }
+                let max_connections = accounting.max_connections;
+                emitter.service_debug_event(
+                    &service_name,
+                    &format!(
+                        "proxy {listen_addr} closed overflow connection ({max_connections}/{max_connections} active)"
+                    ),
+                );
+                drop(client);
+                continue;
+            }
+            Err(TryAcquireError::Closed) => return,
         };
 
         // Trigger lazy start if configured. The runner checks service state
@@ -507,7 +586,62 @@ async fn proxy_accept_loop(
         };
 
         // Spawn a forwarding task for this connection.
-        tokio::spawn(proxy_connection(client, backend_addr, permit));
+        tokio::spawn(proxy_connection(client, backend_addr, connection_guard));
+    }
+}
+
+struct ProxyConnectionGuard {
+    _permit: OwnedSemaphorePermit,
+    active_connections: Arc<AtomicUsize>,
+    emitter: crate::output::LifecycleEmitter,
+    service_name: String,
+    listen_addr: String,
+    max_connections: usize,
+    global_active_connections: Arc<AtomicUsize>,
+}
+
+impl ProxyConnectionGuard {
+    fn new(
+        permit: OwnedSemaphorePermit,
+        active_connections: Arc<AtomicUsize>,
+        emitter: crate::output::LifecycleEmitter,
+        service_name: String,
+        listen_addr: String,
+        max_connections: usize,
+        global_active_connections: Arc<AtomicUsize>,
+    ) -> Self {
+        active_connections.fetch_add(1, Ordering::Relaxed);
+        let active = global_active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+        emitter.service_debug_event(
+            &service_name,
+            &format!("proxy {listen_addr} accepted connection ({active}/{max_connections} active)"),
+        );
+        Self {
+            _permit: permit,
+            active_connections,
+            emitter,
+            service_name,
+            listen_addr,
+            max_connections,
+            global_active_connections,
+        }
+    }
+}
+
+impl Drop for ProxyConnectionGuard {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        let active = self
+            .global_active_connections
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        self.emitter.service_debug_event(
+            &self.service_name,
+            &format!(
+                "proxy {} closed connection ({}/{} active)",
+                self.listen_addr, active, self.max_connections
+            ),
+        );
     }
 }
 
@@ -518,7 +652,7 @@ async fn proxy_accept_loop(
 async fn proxy_connection(
     mut client: TcpStream,
     backend_addr: SocketAddr,
-    _permit: OwnedSemaphorePermit,
+    _connection_guard: ProxyConnectionGuard,
 ) {
     let backend_candidates = backend_connect_candidates(backend_addr);
     let mut backend = None;
@@ -552,9 +686,23 @@ async fn proxy_connection(
     let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
 }
 
-fn proxy_connection_permits() -> Arc<Semaphore> {
-    PROXY_CONNECTION_PERMITS
-        .get_or_init(|| Arc::new(Semaphore::new(proxy_connection_limit())))
+#[derive(Clone)]
+struct ProxyConnectionPool {
+    permits: Arc<Semaphore>,
+    max_connections: usize,
+    active_connections: Arc<AtomicUsize>,
+}
+
+fn proxy_connection_pool() -> ProxyConnectionPool {
+    PROXY_CONNECTION_POOL
+        .get_or_init(|| {
+            let max_connections = proxy_connection_limit();
+            ProxyConnectionPool {
+                permits: Arc::new(Semaphore::new(max_connections)),
+                max_connections,
+                active_connections: Arc::new(AtomicUsize::new(0)),
+            }
+        })
         .clone()
 }
 
@@ -603,12 +751,21 @@ fn backend_connect_candidates(backend_addr: SocketAddr) -> Vec<SocketAddr> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::{Semaphore, mpsc, watch};
+
+    use crate::config::LogConfig;
+    use crate::output::{LifecycleEmitter, OutputManager};
 
     use super::{
         DEFAULT_PROXY_CONNECTION_LIMIT, MIN_PROXY_CONNECTION_LIMIT, PROXY_FD_RESERVE,
-        backend_connect_candidates, proxy_connection_limit_for_soft_nofile,
+        ProxyConnectionAccounting, backend_connect_candidates, proxy_accept_loop_with_permits,
+        proxy_connection_limit_for_soft_nofile,
     };
 
     #[test]
@@ -671,5 +828,87 @@ mod tests {
             proxy_connection_limit_for_soft_nofile(64),
             MIN_PROXY_CONNECTION_LIMIT
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_accept_loop_does_not_reserve_permits_while_idle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let (_backend_tx, backend_rx) = watch::channel(None);
+        let (lazy_tx, mut lazy_rx) = mpsc::channel(1);
+        let permits = Arc::new(Semaphore::new(1));
+        let global_active_connections = Arc::new(AtomicUsize::new(0));
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let emitter = test_lifecycle_emitter().await;
+        let accounting = ProxyConnectionAccounting {
+            permits: permits.clone(),
+            max_connections: 1,
+            global_active_connections: global_active_connections.clone(),
+            service_active_connections: active_connections.clone(),
+        };
+
+        let handle = tokio::spawn(proxy_accept_loop_with_permits(
+            listener,
+            backend_rx,
+            Some(lazy_tx),
+            "svc".to_string(),
+            emitter,
+            accounting,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "idle listeners must not consume active connection permits"
+        );
+        assert_eq!(
+            active_connections.load(Ordering::Relaxed),
+            0,
+            "idle listeners must not count as active connections"
+        );
+        assert_eq!(
+            global_active_connections.load(Ordering::Relaxed),
+            0,
+            "idle listeners must not count against the global pool"
+        );
+
+        let _client = tokio::net::TcpStream::connect(listen_addr).await.unwrap();
+        let triggered = tokio::time::timeout(std::time::Duration::from_secs(1), lazy_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(triggered.as_deref(), Some("svc"));
+        assert_eq!(
+            active_connections.load(Ordering::Relaxed),
+            1,
+            "accepted connections waiting for a backend should be counted"
+        );
+        assert_eq!(
+            global_active_connections.load(Ordering::Relaxed),
+            1,
+            "accepted connections should count against the global pool"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(
+            active_connections.load(Ordering::Relaxed),
+            0,
+            "abandoned connections should release active counts"
+        );
+        assert_eq!(
+            global_active_connections.load(Ordering::Relaxed),
+            0,
+            "abandoned connections should release global active counts"
+        );
+    }
+
+    async fn test_lifecycle_emitter() -> LifecycleEmitter {
+        let log_config = LogConfig::Stdout;
+        let services = [("svc", &log_config)];
+        let output_manager = OutputManager::new(&services, tokio::io::sink())
+            .await
+            .unwrap();
+        output_manager.clone_lifecycle_emitter()
     }
 }
