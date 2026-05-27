@@ -461,10 +461,7 @@ impl Runner {
 
     /// Ask the runner loop to re-check `Pending` items on its own task.
     fn schedule_start_pending(&self) {
-        let cmd_tx = self.cmd_tx.clone();
-        tokio::spawn(async move {
-            let _ = cmd_tx.send(RunnerCommand::StartPending).await;
-        });
+        let _ = self.cmd_tx.send(RunnerCommand::StartPending);
     }
 
     /// Recover any descendants stranded in `DependencyFailed` and then kick
@@ -620,7 +617,7 @@ impl Runner {
                 let cmd_tx = self.cmd_tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let _ = cmd_tx.send(RunnerCommand::StartPending).await;
+                    let _ = cmd_tx.send(RunnerCommand::StartPending);
                 });
             }
         }

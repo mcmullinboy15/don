@@ -567,7 +567,6 @@ fn shutdown_interrupts_manual_stop_worker() {
                 name: "stubborn".to_string(),
                 reply: reply_tx,
             })
-            .await
             .unwrap();
 
         assert!(wait_for_output(&buf, "stopping... (requested)", Duration::from_secs(2)).await);
@@ -617,7 +616,6 @@ fn shutdown_interrupts_manual_restart_worker() {
                 name: "stubborn".to_string(),
                 reply: reply_tx,
             })
-            .await
             .unwrap();
 
         assert!(
@@ -673,7 +671,6 @@ fn shutdown_interrupts_manual_start_worker() {
                 name: "lazy-builder".to_string(),
                 reply: reply_tx,
             })
-            .await
             .unwrap();
 
         assert!(
@@ -734,7 +731,6 @@ fn shutdown_interrupts_rebuild_worker() {
             .send(RunnerCommand::Rebuild {
                 name: "builder".to_string(),
             })
-            .await
             .unwrap();
 
         assert!(

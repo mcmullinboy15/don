@@ -143,11 +143,11 @@ pub(crate) struct WatchManager {
     /// Per-item (service or task) state.
     items: HashMap<String, WatchedItem>,
     /// Sender to the runner's command channel.
-    cmd_tx: mpsc::Sender<RunnerCommand>,
+    cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     /// Receiver for runner events (rebuild/rerun completion).
     runner_events: broadcast::Receiver<RunnerEvent>,
     /// Receiver for watch pattern updates from the runner (build tool re-queries).
-    update_rx: mpsc::Receiver<WatchUpdate>,
+    update_rx: mpsc::UnboundedReceiver<WatchUpdate>,
     /// Receiver for debug/status queries from the runner.
     query_rx: mpsc::Receiver<WatchQuery>,
     /// Directories already registered with the watcher, keyed by path with
@@ -203,9 +203,9 @@ impl WatchManager {
         config: &Config,
         platform: Platform,
         base_dir: &Path,
-        cmd_tx: mpsc::Sender<RunnerCommand>,
+        cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
         runner_events: broadcast::Receiver<RunnerEvent>,
-        update_rx: mpsc::Receiver<WatchUpdate>,
+        update_rx: mpsc::UnboundedReceiver<WatchUpdate>,
         query_rx: mpsc::Receiver<WatchQuery>,
         emitter: LifecycleEmitter,
     ) -> Result<(Self, Vec<String>), WatchError> {
@@ -899,7 +899,7 @@ impl WatchManager {
         }
 
         for name in stale_services {
-            let _ = self.cmd_tx.send(RunnerCommand::RebuildStale { name }).await;
+            let _ = self.cmd_tx.send(RunnerCommand::RebuildStale { name });
         }
     }
 
@@ -949,8 +949,8 @@ impl WatchManager {
                         label, item.state
                     ),
                 );
-                // If the channel is full/closed, the runner is shutting down.
-                if self.cmd_tx.send(cmd).await.is_err() {
+                // If the channel is closed, the runner is shutting down.
+                if self.cmd_tx.send(cmd).is_err() {
                     self.emitter.service_debug_event(
                         &name,
                         "watch: command channel closed — runner is shutting down",
@@ -977,8 +977,7 @@ impl WatchManager {
                         );
                         let _ = self
                             .cmd_tx
-                            .send(RunnerCommand::Rebuild { name: name.clone() })
-                            .await;
+                            .send(RunnerCommand::Rebuild { name: name.clone() });
                     } else {
                         item.state = WatchState::Idle;
                         self.emitter.service_debug_event(
@@ -1004,8 +1003,7 @@ impl WatchManager {
                         );
                         let _ = self
                             .cmd_tx
-                            .send(RunnerCommand::TaskRerun { name: name.clone() })
-                            .await;
+                            .send(RunnerCommand::TaskRerun { name: name.clone() });
                     } else {
                         item.state = WatchState::Idle;
                         self.emitter.service_debug_event(
@@ -1417,9 +1415,9 @@ bazel.target = "//services/api:api"
         for case in cases {
             let temp = tempfile::tempdir().unwrap();
             let config: crate::config::Config = case.toml.parse().unwrap();
-            let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+            let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
             let (_event_tx, event_rx) = broadcast::channel(8);
-            let (_update_tx, update_rx) = mpsc::channel(8);
+            let (_update_tx, update_rx) = mpsc::unbounded_channel();
             let (_query_tx, query_rx) = mpsc::channel(8);
             let output = crate::output::OutputManager::new(
                 &[("api", &crate::config::LogConfig::Stdout)],
@@ -1551,7 +1549,7 @@ bazel.target = "//services/api:api"
         // Simulate: 10 events arrive in quick succession. Only one rebuild fires.
         tokio::time::pause();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(
@@ -1613,7 +1611,7 @@ bazel.target = "//services/api:api"
     async fn test_events_after_debounce_trigger_new_cycle() {
         tokio::time::pause();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(
@@ -1666,7 +1664,7 @@ bazel.target = "//services/api:api"
     async fn test_custom_debounce_duration() {
         tokio::time::pause();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(
@@ -1710,7 +1708,7 @@ bazel.target = "//services/api:api"
     async fn test_change_during_build_triggers_second_rebuild() {
         tokio::time::pause();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(
@@ -1757,7 +1755,7 @@ bazel.target = "//services/api:api"
     async fn test_multiple_events_during_build_one_followup() {
         tokio::time::pause();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(
@@ -1810,7 +1808,7 @@ bazel.target = "//services/api:api"
     async fn test_state_machine_full_cycle() {
         tokio::time::pause();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(
@@ -1874,7 +1872,7 @@ bazel.target = "//services/api:api"
     async fn handle_notify_event_standalone(
         items: &mut HashMap<String, WatchedItem>,
         event: &notify::Event,
-        cmd_tx: &mpsc::Sender<RunnerCommand>,
+        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
     ) {
         if !matches!(
             event.kind,
@@ -1919,13 +1917,13 @@ bazel.target = "//services/api:api"
         }
 
         for name in stale_services {
-            let _ = cmd_tx.send(RunnerCommand::RebuildStale { name }).await;
+            let _ = cmd_tx.send(RunnerCommand::RebuildStale { name });
         }
     }
 
     async fn fire_debounce_timers_standalone(
         items: &mut HashMap<String, WatchedItem>,
-        cmd_tx: &mpsc::Sender<RunnerCommand>,
+        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
     ) {
         let now = Instant::now();
         let mut to_fire: Vec<(String, WatchItemKind)> = Vec::new();
@@ -1957,7 +1955,7 @@ bazel.target = "//services/api:api"
                         RunnerCommand::BuildGraphChanged { name: item_name }
                     }
                 };
-                let _ = cmd_tx.send(cmd).await;
+                let _ = cmd_tx.send(cmd);
             }
         }
     }
@@ -1965,7 +1963,7 @@ bazel.target = "//services/api:api"
     async fn handle_runner_event_standalone(
         items: &mut HashMap<String, WatchedItem>,
         event: &RunnerEvent,
-        cmd_tx: &mpsc::Sender<RunnerCommand>,
+        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
     ) {
         match event {
             RunnerEvent::RebuildComplete { name, .. } => {
@@ -1973,9 +1971,7 @@ bazel.target = "//services/api:api"
                     if item.stale {
                         item.stale = false;
                         item.state = WatchState::Rebuilding;
-                        let _ = cmd_tx
-                            .send(RunnerCommand::Rebuild { name: name.clone() })
-                            .await;
+                        let _ = cmd_tx.send(RunnerCommand::Rebuild { name: name.clone() });
                     } else {
                         item.state = WatchState::Idle;
                     }
@@ -1986,9 +1982,7 @@ bazel.target = "//services/api:api"
                     if item.stale {
                         item.stale = false;
                         item.state = WatchState::Rebuilding;
-                        let _ = cmd_tx
-                            .send(RunnerCommand::TaskRerun { name: name.clone() })
-                            .await;
+                        let _ = cmd_tx.send(RunnerCommand::TaskRerun { name: name.clone() });
                     } else {
                         item.state = WatchState::Idle;
                     }
@@ -2002,7 +1996,7 @@ bazel.target = "//services/api:api"
     async fn test_build_graph_kind_sends_build_graph_changed() {
         tokio::time::pause();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(
@@ -2052,7 +2046,7 @@ bazel.target = "//services/api:api"
         // They go Idle -> Debouncing -> Idle (fire) directly.
         tokio::time::pause();
 
-        let (cmd_tx, _cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(
@@ -2091,7 +2085,7 @@ bazel.target = "//services/api:api"
     async fn test_workspace_build_graph_kind_preserves_workspace_sentinel() {
         tokio::time::pause();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let mut items = HashMap::new();
         items.insert(

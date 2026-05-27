@@ -201,7 +201,7 @@ impl ActiveTerm {
 pub async fn run_tui(
     mut log_rx: mpsc::UnboundedReceiver<FormattedLogLine>,
     mut runner_events: broadcast::Receiver<RunnerEvent>,
-    command_tx: mpsc::Sender<RunnerCommand>,
+    command_tx: mpsc::UnboundedSender<RunnerCommand>,
     verbosity: VerbosityControl,
     lifecycle_emitter: LifecycleEmitter,
     service_names: Vec<String>,
@@ -646,7 +646,7 @@ fn handle_app_event(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
@@ -685,7 +685,7 @@ fn handle_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
@@ -697,10 +697,7 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => {
-                let tx = command_tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx.send(RunnerCommand::Shutdown).await;
-                });
+                let _ = command_tx.send(RunnerCommand::Shutdown);
                 let _ = nix::sys::signal::kill(
                     nix::unistd::Pid::this(),
                     nix::sys::signal::Signal::SIGINT,
@@ -901,7 +898,7 @@ fn handle_tasks_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
@@ -953,7 +950,7 @@ fn handle_services_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
@@ -1148,7 +1145,7 @@ fn overlay_hard_restart_command(name: String) -> OverlayCommand {
 }
 
 fn dispatch_overlay_command(
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     emitter: &LifecycleEmitter,
     pending: OverlayCommand,
 ) {
@@ -1156,7 +1153,7 @@ fn dispatch_overlay_command(
     let emitter = emitter.clone();
     tokio::spawn(async move {
         emitter.service_event(&pending.name, &format!("{} requested", pending.action));
-        if command_tx.send(pending.command).await.is_err() {
+        if command_tx.send(pending.command).is_err() {
             emitter.service_error_event(&pending.name, "control failed: runner unavailable");
             return;
         }
@@ -1201,7 +1198,7 @@ fn return_to_logs_after_task_run(
 
 /// Fire a param-less [`RunnerCommand::RunTask`] without waiting for the reply.
 /// State updates come through the runner event broadcast.
-fn dispatch_run_task(command_tx: &mpsc::Sender<RunnerCommand>, name: String) {
+fn dispatch_run_task(command_tx: &mpsc::UnboundedSender<RunnerCommand>, name: String) {
     let command_tx = command_tx.clone();
     tokio::spawn(async move {
         let (reply_tx, _reply_rx) = oneshot::channel();
@@ -1212,7 +1209,7 @@ fn dispatch_run_task(command_tx: &mpsc::Sender<RunnerCommand>, name: String) {
             wait_timeout: None,
             reply: reply_tx,
         };
-        let _ = command_tx.send(cmd).await;
+        let _ = command_tx.send(cmd);
     });
 }
 
@@ -1220,22 +1217,20 @@ fn dispatch_run_task(command_tx: &mpsc::Sender<RunnerCommand>, name: String) {
 /// via the form modal. Reply is swallowed; state updates come through the
 /// event broadcast like any other runner command.
 fn dispatch_run_task_with_params(
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     name: String,
     params: std::collections::HashMap<String, String>,
 ) {
     let command_tx = command_tx.clone();
     tokio::spawn(async move {
         let (reply_tx, _reply_rx) = oneshot::channel();
-        let _ = command_tx
-            .send(RunnerCommand::RunTask {
-                name,
-                params,
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
-            .await;
+        let _ = command_tx.send(RunnerCommand::RunTask {
+            name,
+            params,
+            wait: false,
+            wait_timeout: None,
+            reply: reply_tx,
+        });
     });
 }
 
@@ -1249,7 +1244,7 @@ fn dispatch_run_task_with_params(
 fn open_form_for_task(
     app: &mut App,
     task_name: &str,
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
 ) -> Result<(), TuiError> {
     let Some(task) = app.task_configs.get(task_name).cloned() else {
         // Palette built the action from task_configs, so a missing entry
@@ -1287,7 +1282,7 @@ fn request_form_completion(
     task: &str,
     param: &str,
     force_refresh: bool,
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
 ) {
     let Some(form) = app.form.as_mut() else {
         return;
@@ -1316,7 +1311,6 @@ fn request_form_completion(
                 force_refresh,
                 reply: reply_tx,
             })
-            .await
             .is_err()
         {
             return;
@@ -1360,7 +1354,7 @@ fn handle_form_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     // Grab these up front so later `app.form` borrows don't conflict.
@@ -1520,7 +1514,7 @@ fn handle_form_key(
 /// form so the renderer can show it, and stay open.
 fn try_submit_form(
     app: &mut App,
-    command_tx: &mpsc::Sender<RunnerCommand>,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
     modal: &mut Option<Modal>,

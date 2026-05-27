@@ -189,7 +189,6 @@ default = "100"
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         reply_rx.await.unwrap().unwrap();
 
@@ -261,7 +260,6 @@ default = "100"
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         reply_rx.await.unwrap().unwrap();
 
@@ -326,7 +324,6 @@ auto_run = false
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         reply_rx.await.unwrap().unwrap();
 
@@ -375,7 +372,6 @@ auto_run = false
                     wait_timeout: None,
                     reply: reply_tx,
                 })
-                .await
                 .unwrap();
             reply_rx.await.unwrap().unwrap();
             assert!(
@@ -432,7 +428,6 @@ auto_run = false
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
 
         assert!(
@@ -451,7 +446,6 @@ auto_run = false
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         let result = conflict_rx.await.unwrap();
         assert!(result.is_err(), "second run should reject while running");
@@ -496,7 +490,6 @@ auto_run = false
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
 
         let result = reply_rx.await.unwrap();
@@ -546,7 +539,6 @@ auto_run = false
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         assert!(
             wait_for_task_state(&mut events, "long", TaskItemState::Running).await,
@@ -613,7 +605,6 @@ required = true
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         reply_rx.await.unwrap().unwrap();
         assert!(
@@ -631,7 +622,6 @@ required = true
                 name: "sync".to_string(),
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         reply_rx.await.unwrap().unwrap();
 
@@ -684,7 +674,6 @@ required = true
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         let result = reply_rx.await.unwrap();
         match result {
@@ -735,7 +724,6 @@ name = "index"
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         let result = reply_rx.await.unwrap();
         match result {
@@ -840,7 +828,6 @@ cmd = "false"
                 force_refresh: false,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         let result = reply_rx.await.unwrap();
         let err = result.expect_err("completion command exits 1, should be an error");
@@ -891,7 +878,6 @@ choices = ["dev", "staging", "prod"]
                 force_refresh: false,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         let values = reply_rx.await.unwrap().unwrap();
         assert_eq!(values, vec!["dev", "staging", "prod"]);

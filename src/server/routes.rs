@@ -51,7 +51,6 @@ async fn get_status(
             verbose: query.verbose,
             reply: tx,
         })
-        .await
         .is_err()
     {
         return runner_unavailable();
@@ -96,7 +95,7 @@ async fn post_restart(State(state): State<Arc<ApiState>>, Path(name): Path<Strin
 
 /// `POST /shutdown` — gracefully stop the daemon.
 async fn post_shutdown(State(state): State<Arc<ApiState>>) -> Response {
-    if state.cmd_tx.send(RunnerCommand::Shutdown).await.is_err() {
+    if state.cmd_tx.send(RunnerCommand::Shutdown).is_err() {
         return runner_unavailable();
     }
     StatusCode::NO_CONTENT.into_response()
@@ -142,7 +141,6 @@ async fn get_logs(
             last_n: query.last,
             reply: tx,
         })
-        .await
         .is_err()
     {
         return runner_unavailable();
@@ -170,7 +168,6 @@ async fn follow_logs(state: Arc<ApiState>, name: String, last: usize) -> Respons
             last_n: last,
             reply: tx,
         })
-        .await
         .is_err()
     {
         return runner_unavailable();
@@ -233,7 +230,6 @@ async fn post_run_task(
             wait_timeout: body.wait_timeout,
             reply: tx,
         })
-        .await
         .is_err()
     {
         return runner_unavailable();
@@ -316,7 +312,6 @@ async fn post_resolve_completions(
             force_refresh: body.force_refresh,
             reply: tx,
         })
-        .await
         .is_err()
     {
         return runner_unavailable();
@@ -341,7 +336,6 @@ async fn post_run_pending(State(state): State<Arc<ApiState>>) -> Response {
     if state
         .cmd_tx
         .send(RunnerCommand::RunPendingTasks { reply: tx })
-        .await
         .is_err()
     {
         return runner_unavailable();
@@ -364,12 +358,7 @@ where
     F: FnOnce(String, oneshot::Sender<Result<(), CommandError>>) -> RunnerCommand,
 {
     let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(build(name.to_string(), tx))
-        .await
-        .is_err()
-    {
+    if state.cmd_tx.send(build(name.to_string(), tx)).is_err() {
         return runner_unavailable();
     }
     map_command_reply(name, rx.await, StatusCode::INTERNAL_SERVER_ERROR).await

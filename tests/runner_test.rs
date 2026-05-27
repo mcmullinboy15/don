@@ -319,7 +319,6 @@ fn integration_manual_task_dependency_unblocks_service_after_run() {
                 wait_timeout: None,
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         reply_rx.await.unwrap().unwrap();
 
@@ -1055,7 +1054,6 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
                 name: "badsvc".to_string(),
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         assert!(
             reply_rx.await.unwrap().is_ok(),
@@ -1077,7 +1075,6 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
                     verbose: false,
                     reply: status_tx,
                 })
-                .await
                 .unwrap();
             let statuses = status_rx.await.unwrap();
             reached_ready = statuses.iter().any(|item| {
@@ -1261,7 +1258,6 @@ fn integration_restart_crashed_service_without_ready_check() {
                 name: "crashy".to_string(),
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         assert!(
             reply_rx.await.unwrap().is_ok(),
@@ -1279,7 +1275,6 @@ fn integration_restart_crashed_service_without_ready_check() {
                     verbose: false,
                     reply: status_tx,
                 })
-                .await
                 .unwrap();
             let statuses = status_rx.await.unwrap();
             reached_ready = statuses.iter().any(|item| {
@@ -1377,7 +1372,6 @@ while True: time.sleep(60)\n\
                 name: "db".to_string(),
                 reply: reply_tx,
             })
-            .await
             .unwrap();
         let restart_result = reply_rx.await.unwrap();
         assert!(

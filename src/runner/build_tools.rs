@@ -289,7 +289,7 @@ fn watch_resolution_items(
 }
 
 pub(crate) async fn send_watch_update(
-    tx: &mpsc::Sender<crate::watch::WatchUpdate>,
+    tx: &mpsc::UnboundedSender<crate::watch::WatchUpdate>,
     name: String,
     kind: crate::watch::WatchItemKind,
     patterns: Vec<String>,
@@ -306,7 +306,6 @@ pub(crate) async fn send_watch_update(
             base_dir,
             applied_tx: Some(applied_tx),
         })
-        .await
         .is_ok()
     {
         let _ = applied_rx.await;
@@ -418,7 +417,7 @@ pub(crate) async fn run_batch_build_chain(
     items: Vec<BatchBuildItem>,
     base_dir: PathBuf,
     emitter: crate::output::LifecycleEmitter,
-    watch_update_tx: Option<mpsc::Sender<crate::watch::WatchUpdate>>,
+    watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
     global_watch_ignore: Vec<String>,
 ) -> BatchBuildOutcome {
     let scan_since = SystemTime::now();

@@ -64,7 +64,6 @@ pub(crate) async fn attach_handler(
             pid: params.pid,
             reply: tx,
         })
-        .await
         .is_err()
     {
         return (
@@ -120,13 +119,10 @@ pub(crate) async fn attach_handler(
                 // Upgrade failed — clean up.
                 let mut map = state_clone.attach_resize_txs.lock().await;
                 map.remove(&name_clone);
-                let _ = state_clone
-                    .cmd_tx
-                    .send(RunnerCommand::Detach {
-                        name: name_clone,
-                        pty_write: Some(pty_write),
-                    })
-                    .await;
+                let _ = state_clone.cmd_tx.send(RunnerCommand::Detach {
+                    name: name_clone,
+                    pty_write: Some(pty_write),
+                });
                 return;
             }
         };
@@ -141,13 +137,10 @@ pub(crate) async fn attach_handler(
         }
 
         // Return PTY write handle to runner.
-        let _ = state_clone
-            .cmd_tx
-            .send(RunnerCommand::Detach {
-                name: name_clone,
-                pty_write: pty_back,
-            })
-            .await;
+        let _ = state_clone.cmd_tx.send(RunnerCommand::Detach {
+            name: name_clone,
+            pty_write: pty_back,
+        });
     });
 
     // Return 101 Switching Protocols.

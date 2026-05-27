@@ -41,7 +41,7 @@ type ResizeMap = std::collections::HashMap<String, mpsc::Sender<(u16, u16)>>;
 /// Shared state passed to all handlers.
 #[derive(Clone)]
 pub(crate) struct ApiState {
-    pub cmd_tx: mpsc::Sender<RunnerCommand>,
+    pub cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     /// Resize channels for active attach sessions. The attach bridge task
     /// registers its receiver here; the resize HTTP handler sends through it.
     pub attach_resize_txs: std::sync::Arc<tokio::sync::Mutex<ResizeMap>>,
@@ -89,7 +89,7 @@ pub fn bind_api(socket_path: &Path) -> Result<UnixListener, ServerError> {
 pub async fn serve_api(
     listener: UnixListener,
     socket_path: PathBuf,
-    cmd_tx: mpsc::Sender<RunnerCommand>,
+    cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);

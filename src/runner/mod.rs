@@ -654,8 +654,8 @@ pub struct Runner {
     docker_client: Option<bollard::Docker>,
 
     // Channels
-    cmd_tx: mpsc::Sender<RunnerCommand>,
-    cmd_rx: mpsc::Receiver<RunnerCommand>,
+    cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
+    cmd_rx: mpsc::UnboundedReceiver<RunnerCommand>,
     internal_tx: mpsc::Sender<RunnerInternalCommand>,
     internal_rx: mpsc::Receiver<RunnerInternalCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
@@ -702,7 +702,7 @@ pub struct Runner {
 
     /// Sender for pushing watch pattern updates to the WatchManager.
     /// Used after build tool re-queries to update tier-2 watch patterns.
-    watch_update_tx: Option<mpsc::Sender<crate::watch::WatchUpdate>>,
+    watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
     /// Sender for querying the live watch manager state for verbose status.
     watch_query_tx: Option<mpsc::Sender<crate::watch::WatchQuery>>,
 
@@ -755,7 +755,7 @@ impl Runner {
         shutdown_rx: mpsc::Receiver<()>,
         terminal_coordinator: TerminalCoordinator,
     ) -> Result<Self, RunnerError> {
-        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (internal_tx, internal_rx) = mpsc::channel(64);
         let (event_tx, _) = broadcast::channel(256);
         let (lazy_start_tx, lazy_start_rx) = mpsc::channel(16);
@@ -866,7 +866,7 @@ impl Runner {
         }
     }
 
-    pub fn command_sender(&self) -> mpsc::Sender<RunnerCommand> {
+    pub fn command_sender(&self) -> mpsc::UnboundedSender<RunnerCommand> {
         self.cmd_tx.clone()
     }
 
@@ -1075,7 +1075,7 @@ impl Runner {
         // Start file watchers before spawning services so we don't miss
         // changes that happen during startup (slow ready checks, long builds, etc.).
         let mut watch_handle: Option<tokio::task::JoinHandle<()>> = None;
-        let (watch_update_tx, watch_update_rx) = mpsc::channel(64);
+        let (watch_update_tx, watch_update_rx) = mpsc::unbounded_channel();
         self.watch_update_tx = Some(watch_update_tx);
         let (watch_query_tx, watch_query_rx) = mpsc::channel(8);
         self.watch_query_tx = Some(watch_query_tx);
