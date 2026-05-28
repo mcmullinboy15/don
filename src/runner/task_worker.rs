@@ -28,6 +28,106 @@ pub(in crate::runner) struct TaskWorkerContext {
     pub(in crate::runner) terminal_coordinator: TerminalCoordinator,
 }
 
+/// Inputs to the startup run/skip/pending decision for a single task.
+struct StartupTaskInputs {
+    auto_run: TaskAutoRun,
+    /// Whether the task declares any `params` (interactive task).
+    has_params: bool,
+    /// Whether the task declares any `watch` patterns.
+    has_watch: bool,
+    /// Whether the watched inputs changed since the last recorded success.
+    /// Always `false` when `has_watch` is `false`.
+    needs_watch_run: bool,
+    /// Whether the task has at least one recorded successful run.
+    has_success: bool,
+    /// Whether any other item depends on this task.
+    has_dependents: bool,
+}
+
+/// What to do with a task during the startup sweep.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupTaskDecision {
+    /// Don't run; report the reason and leave the task idle.
+    Skip { message: &'static str },
+    /// Don't auto-run, but mark the task as needing a manual run.
+    PendingRun { message: String },
+    /// Spawn the task now.
+    Run,
+}
+
+/// Decide whether a task should run, be parked as pending, or be skipped on
+/// startup.
+///
+/// Kept as a pure function so the run/skip/pending truth table is exhaustively
+/// table-tested without spinning up a runner. A task with `auto_run = false`
+/// (or `params`) never auto-runs, but it must still be parked in `PendingRun`
+/// when its watched inputs changed — otherwise a `don start` after editing the
+/// inputs would silently drop the work the user expects to see queued.
+fn decide_startup_task(inputs: StartupTaskInputs) -> StartupTaskDecision {
+    let StartupTaskInputs {
+        auto_run,
+        has_params,
+        has_watch,
+        needs_watch_run,
+        has_success,
+        has_dependents,
+    } = inputs;
+
+    if has_watch && !needs_watch_run {
+        return StartupTaskDecision::Skip {
+            message: "skipped (no changes)",
+        };
+    }
+
+    let should_run_or_prompt = if has_params {
+        needs_watch_run || (!has_success && has_dependents)
+    } else {
+        match auto_run {
+            TaskAutoRun::Always => !has_watch || needs_watch_run,
+            TaskAutoRun::Never => needs_watch_run || (!has_success && has_dependents),
+            TaskAutoRun::Once => !has_success || needs_watch_run,
+        }
+    };
+    if !should_run_or_prompt {
+        return StartupTaskDecision::Skip {
+            message: "skipped (not needed)",
+        };
+    }
+
+    if has_params {
+        return StartupTaskDecision::PendingRun {
+            message: if has_dependents {
+                "pending — required by dependents, task has params".to_string()
+            } else {
+                "pending — watch inputs changed, task has params".to_string()
+            },
+        };
+    }
+    if !auto_run.runs_automatically_on_startup(has_success) {
+        return StartupTaskDecision::PendingRun {
+            message: match auto_run {
+                TaskAutoRun::Always => "pending — run manually".to_string(),
+                TaskAutoRun::Never => {
+                    if has_dependents {
+                        "pending — required by dependents, run manually".to_string()
+                    } else {
+                        "pending — watch inputs changed, auto_run = false".to_string()
+                    }
+                }
+                TaskAutoRun::Once => {
+                    if has_dependents {
+                        "pending — required by dependents, auto_run = once".to_string()
+                    } else {
+                        "pending — watch inputs changed, auto_run = once".to_string()
+                    }
+                }
+            },
+        };
+    }
+
+    StartupTaskDecision::Run
+}
+
 pub(in crate::runner) async fn run_task_worker(
     ctx: TaskWorkerContext,
     name: &str,
@@ -61,55 +161,24 @@ pub(in crate::runner) async fn run_task_worker(
             false
         };
         let has_success = task_state.has_success(name).await.unwrap_or(false);
-        if has_watch && !needs_watch_run {
-            return Ok(TaskRunPrepared::Skipped {
-                message: "skipped (no changes)".to_string(),
-            });
-        }
 
-        let should_run_or_prompt = if !task_cfg.params.is_empty() {
-            needs_watch_run || (!has_success && has_dependents)
-        } else {
-            match task_cfg.auto_run {
-                TaskAutoRun::Always => !has_watch || needs_watch_run,
-                TaskAutoRun::Never => !has_success && (has_dependents || needs_watch_run),
-                TaskAutoRun::Once => !has_success || needs_watch_run,
+        match decide_startup_task(StartupTaskInputs {
+            auto_run: task_cfg.auto_run,
+            has_params: !task_cfg.params.is_empty(),
+            has_watch,
+            needs_watch_run,
+            has_success,
+            has_dependents,
+        }) {
+            StartupTaskDecision::Skip { message } => {
+                return Ok(TaskRunPrepared::Skipped {
+                    message: message.to_string(),
+                });
             }
-        };
-        if !should_run_or_prompt {
-            return Ok(TaskRunPrepared::Skipped {
-                message: "skipped (not needed)".to_string(),
-            });
-        }
-        if !task_cfg.params.is_empty() {
-            return Ok(TaskRunPrepared::PendingRun {
-                message: if has_dependents {
-                    "pending — required by dependents, task has params".to_string()
-                } else {
-                    "pending — watch inputs changed, task has params".to_string()
-                },
-            });
-        }
-        if !task_cfg.auto_run.runs_automatically_on_startup(has_success) {
-            return Ok(TaskRunPrepared::PendingRun {
-                message: match task_cfg.auto_run {
-                    TaskAutoRun::Always => "pending — run manually".to_string(),
-                    TaskAutoRun::Never => {
-                        if has_dependents {
-                            "pending — required by dependents, run manually".to_string()
-                        } else {
-                            "pending — watch inputs changed, auto_run = false".to_string()
-                        }
-                    }
-                    TaskAutoRun::Once => {
-                        if has_dependents {
-                            "pending — required by dependents, auto_run = once".to_string()
-                        } else {
-                            "pending — watch inputs changed, auto_run = once".to_string()
-                        }
-                    }
-                },
-            });
+            StartupTaskDecision::PendingRun { message } => {
+                return Ok(TaskRunPrepared::PendingRun { message });
+            }
+            StartupTaskDecision::Run => {}
         }
     }
 
@@ -144,5 +213,225 @@ pub(in crate::runner) async fn run_task_worker(
             .await
             .map_err(|e| e.to_string())?;
         Ok(TaskRunPrepared::Spawned(Box::new(spawn)))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn skip(message: &'static str) -> StartupTaskDecision {
+        StartupTaskDecision::Skip { message }
+    }
+
+    fn pending(message: &str) -> StartupTaskDecision {
+        StartupTaskDecision::PendingRun {
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn startup_task_decision_table() {
+        struct Case {
+            name: &'static str,
+            auto_run: TaskAutoRun,
+            has_params: bool,
+            has_watch: bool,
+            needs_watch_run: bool,
+            has_success: bool,
+            has_dependents: bool,
+            expected: StartupTaskDecision,
+        }
+
+        // `needs_watch_run` is only ever true when `has_watch` is true — the
+        // caller enforces that invariant, so the table mirrors it.
+        let cases = vec![
+            Case {
+                name: "always: no watch, never run -> run",
+                auto_run: TaskAutoRun::Always,
+                has_params: false,
+                has_watch: false,
+                needs_watch_run: false,
+                has_success: false,
+                has_dependents: false,
+                expected: StartupTaskDecision::Run,
+            },
+            Case {
+                name: "always: watch changed -> run",
+                auto_run: TaskAutoRun::Always,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: true,
+                has_success: true,
+                has_dependents: false,
+                expected: StartupTaskDecision::Run,
+            },
+            Case {
+                name: "always: watch unchanged -> skip no changes",
+                auto_run: TaskAutoRun::Always,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: false,
+                has_success: true,
+                has_dependents: false,
+                expected: skip("skipped (no changes)"),
+            },
+            // Regression: a `auto_run = false` task that already succeeded must
+            // still be parked as pending when its watched inputs change. Before
+            // the fix this returned `skipped (not needed)`.
+            Case {
+                name: "never: watch changed after success -> pending",
+                auto_run: TaskAutoRun::Never,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: true,
+                has_success: true,
+                has_dependents: false,
+                expected: pending("pending — watch inputs changed, auto_run = false"),
+            },
+            Case {
+                name: "never: watch changed, never succeeded -> pending",
+                auto_run: TaskAutoRun::Never,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: true,
+                has_success: false,
+                has_dependents: false,
+                expected: pending("pending — watch inputs changed, auto_run = false"),
+            },
+            Case {
+                name: "never: watch changed with dependents -> pending (deps)",
+                auto_run: TaskAutoRun::Never,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: true,
+                has_success: true,
+                has_dependents: true,
+                expected: pending("pending — required by dependents, run manually"),
+            },
+            Case {
+                name: "never: watch unchanged -> skip no changes",
+                auto_run: TaskAutoRun::Never,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: false,
+                has_success: true,
+                has_dependents: false,
+                expected: skip("skipped (no changes)"),
+            },
+            Case {
+                name: "never: no watch, no deps, no success -> skip not needed",
+                auto_run: TaskAutoRun::Never,
+                has_params: false,
+                has_watch: false,
+                needs_watch_run: false,
+                has_success: false,
+                has_dependents: false,
+                expected: skip("skipped (not needed)"),
+            },
+            Case {
+                name: "never: no watch, dependents, no success -> pending (deps)",
+                auto_run: TaskAutoRun::Never,
+                has_params: false,
+                has_watch: false,
+                needs_watch_run: false,
+                has_success: false,
+                has_dependents: true,
+                expected: pending("pending — required by dependents, run manually"),
+            },
+            Case {
+                name: "never: no watch, dependents already satisfied -> skip not needed",
+                auto_run: TaskAutoRun::Never,
+                has_params: false,
+                has_watch: false,
+                needs_watch_run: false,
+                has_success: true,
+                has_dependents: true,
+                expected: skip("skipped (not needed)"),
+            },
+            Case {
+                name: "once: no watch, never run -> run",
+                auto_run: TaskAutoRun::Once,
+                has_params: false,
+                has_watch: false,
+                needs_watch_run: false,
+                has_success: false,
+                has_dependents: false,
+                expected: StartupTaskDecision::Run,
+            },
+            Case {
+                name: "once: no watch after success -> skip not needed",
+                auto_run: TaskAutoRun::Once,
+                has_params: false,
+                has_watch: false,
+                needs_watch_run: false,
+                has_success: true,
+                has_dependents: false,
+                expected: skip("skipped (not needed)"),
+            },
+            Case {
+                name: "once: watch changed after success -> pending",
+                auto_run: TaskAutoRun::Once,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: true,
+                has_success: true,
+                has_dependents: false,
+                expected: pending("pending — watch inputs changed, auto_run = once"),
+            },
+            Case {
+                name: "once: watch changed after success with dependents -> pending (deps)",
+                auto_run: TaskAutoRun::Once,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: true,
+                has_success: true,
+                has_dependents: true,
+                expected: pending("pending — required by dependents, auto_run = once"),
+            },
+            Case {
+                name: "params: watch changed -> pending",
+                auto_run: TaskAutoRun::Always,
+                has_params: true,
+                has_watch: true,
+                needs_watch_run: true,
+                has_success: true,
+                has_dependents: false,
+                expected: pending("pending — watch inputs changed, task has params"),
+            },
+            Case {
+                name: "params: no watch, dependents, no success -> pending (deps)",
+                auto_run: TaskAutoRun::Always,
+                has_params: true,
+                has_watch: false,
+                needs_watch_run: false,
+                has_success: false,
+                has_dependents: true,
+                expected: pending("pending — required by dependents, task has params"),
+            },
+            Case {
+                name: "params: no watch, no deps, no success -> skip not needed",
+                auto_run: TaskAutoRun::Always,
+                has_params: true,
+                has_watch: false,
+                needs_watch_run: false,
+                has_success: false,
+                has_dependents: false,
+                expected: skip("skipped (not needed)"),
+            },
+        ];
+
+        for case in cases {
+            let got = decide_startup_task(StartupTaskInputs {
+                auto_run: case.auto_run,
+                has_params: case.has_params,
+                has_watch: case.has_watch,
+                needs_watch_run: case.needs_watch_run,
+                has_success: case.has_success,
+                has_dependents: case.has_dependents,
+            });
+            assert_eq!(got, case.expected, "case '{}'", case.name);
+        }
     }
 }
