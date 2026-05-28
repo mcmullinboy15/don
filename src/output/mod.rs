@@ -21,12 +21,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 /// Default ring buffer capacity per service (lines).
 const DEFAULT_RING_BUFFER_CAPACITY: usize = 10_000;
 const MAX_FILTER_PENDING: usize = 16 * 1024;
+
+/// Capacity of the broadcast channel that fans formatted log lines out to
+/// attached `don tui` frontends. Sized generously so a momentarily slow
+/// client doesn't drop lines under normal load; a client that lags past this
+/// many buffered lines sees a gap (broadcast drops oldest), which is the right
+/// trade for a remote viewer — better a bounded gap than unbounded daemon
+/// memory growth. The local stdout/file write and ring buffers are never
+/// affected by tap lag.
+const LOG_TAP_CAPACITY: usize = 16_384;
 
 /// Name stamped on `[don]` lifecycle events so the TUI filter can treat them
 /// like any other service/task: gated when a filter is active, selectable
@@ -207,6 +216,13 @@ impl SinkHandle {
 /// (preserving native scrollback) and stamp the `name` for filter matching.
 /// The bytes already include any verbose-mode timestamp and the color-coded
 /// service prefix; the consumer just renders them as-is.
+///
+/// `Clone` so the daemon can fan the same line out to multiple consumers
+/// (the local stdout pipeline and any number of attached `don tui` log
+/// taps). The wire form for remote frontends is a length-prefixed binary
+/// frame (see `server::logstream`), not serde — the bytes are already
+/// formatted, so framing them avoids per-line JSON cost on the hot path.
+#[derive(Clone)]
 pub struct FormattedLogLine {
     /// Owning service/task name. `[don]` lifecycle events carry
     /// [`LIFECYCLE_EVENT_NAME`] so the filter treats them as a selectable
@@ -674,6 +690,11 @@ pub struct OutputManager {
     bazel_prefix: Option<Bytes>,
     /// Same as `bazel_prefix` for the synthetic "turbo" stream.
     turbo_prefix: Option<Bytes>,
+    /// Broadcast of every formatted log line, for streaming to attached
+    /// `don tui` frontends over the socket. The stdout sink task holds a
+    /// clone and sends each line here in addition to writing the local
+    /// target. Cheap when no frontend is attached (no receivers → no clone).
+    log_tap: broadcast::Sender<FormattedLogLine>,
 }
 
 /// Errors from output handling.
@@ -792,6 +813,10 @@ impl OutputManager {
         let stdout_pause = StdoutPauseControl::new();
         let log_filter = LogFilterControl::default();
 
+        // Broadcast tap: the stdout sink fans every formatted line here so
+        // attached `don tui` frontends can stream it over the socket.
+        let (log_tap, _) = broadcast::channel(LOG_TAP_CAPACITY);
+
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
         let stdout_handle = tokio::spawn(stdout_sink_task(
@@ -800,6 +825,7 @@ impl OutputManager {
             verbosity.clone(),
             stdout_pause.clone(),
             log_filter.clone(),
+            log_tap.clone(),
         ));
         let stdout_sink = SinkHandle::Unbounded(stdout_tx);
 
@@ -873,7 +899,24 @@ impl OutputManager {
             log_filter,
             bazel_prefix: None,
             turbo_prefix: None,
+            log_tap,
         })
+    }
+
+    /// Subscribe to the live stream of formatted log lines. Each
+    /// [`FormattedLogLine`] is identical to what the local stdout/TUI target
+    /// receives. Used by the daemon's `GET /logstream` endpoint to feed
+    /// attached `don tui` frontends. A subscriber that can't keep up sees a
+    /// gap (the oldest buffered lines are dropped) but never stalls the
+    /// daemon's own output.
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<FormattedLogLine> {
+        self.log_tap.subscribe()
+    }
+
+    /// Clone the log-tap sender so the API server can hand out a fresh
+    /// receiver to each `GET /logstream` connection.
+    pub fn subscribe_logs_sender(&self) -> broadcast::Sender<FormattedLogLine> {
+        self.log_tap.clone()
     }
 
     /// Register a synthetic "tool" service (`bazel` or `turbo`) so build
@@ -1406,6 +1449,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     verbosity: VerbosityControl,
     pause: StdoutPauseControl,
     filter: LogFilterControl,
+    log_tap: broadcast::Sender<FormattedLogLine>,
 ) {
     use bytes::BytesMut;
 
@@ -1464,6 +1508,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_lifecycle,
                         &verbosity,
                         start,
+                        &log_tap,
                     )
                     .await;
                 }
@@ -1487,6 +1532,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_lifecycle,
                         &verbosity,
                         start,
+                        &log_tap,
                     )
                     .await;
                 }
@@ -1510,6 +1556,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_lifecycle,
                         &verbosity,
                         start,
+                        &log_tap,
                     )
                     .await;
                     acc.clear();
@@ -1542,6 +1589,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 false,
                 &verbosity,
                 start,
+                &log_tap,
             )
             .await;
         }
@@ -1569,6 +1617,7 @@ fn build_formatted_bytes(
 
 /// Emit a complete formatted line to the target — either write to the pipe
 /// writer with a trailing `\n`, or ship it to the TUI as a [`FormattedLogLine`].
+#[allow(clippy::too_many_arguments)]
 async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     target: &mut StdoutTarget<W>,
     name: &str,
@@ -1577,8 +1626,20 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     is_lifecycle: bool,
     verbosity: &VerbosityControl,
     start: std::time::Instant,
+    log_tap: &broadcast::Sender<FormattedLogLine>,
 ) {
     let bytes = build_formatted_bytes(prefix, line, verbosity, start);
+
+    // Fan out to attached `don tui` frontends. Only build the struct + clone
+    // when someone is listening — zero overhead on the no-frontend hot path.
+    if log_tap.receiver_count() > 0 {
+        let _ = log_tap.send(FormattedLogLine {
+            name: name.to_string(),
+            is_lifecycle,
+            bytes: bytes.clone(),
+        });
+    }
+
     match target {
         StdoutTarget::Writer(writer) => {
             use tokio::io::AsyncWriteExt;

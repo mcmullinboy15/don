@@ -380,6 +380,12 @@ impl TaskBuilder {
         self
     }
 
+    /// Set the terminal mode (`"muxed"` or `"foreground"`).
+    pub fn terminal(mut self, mode: &str) -> Self {
+        self.lines.push(format!("terminal = \"{mode}\""));
+        self
+    }
+
     /// Set auto_run to a named policy such as `"once"`.
     pub fn auto_run_mode(mut self, value: &str) -> Self {
         self.lines.push(format!("auto_run = \"{value}\""));

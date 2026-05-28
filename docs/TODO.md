@@ -610,3 +610,61 @@ Connect your terminal directly to a running service's PTY for interactive stdin/
 - [x] Integration test: first attacher disconnects, second attach succeeds
 - [x] Integration test: detach with escape sequence, verify service keeps running
 - [x] Integration test: terminal resize propagates to subprocess PTY
+
+---
+
+## Background daemon & remote TUI frontend
+
+Decouple the TUI from the in-process runner so the orchestrator can run as a
+background daemon and the TUI is a pure socket frontend. `don start` and
+`don tui` both render the same `run_tui` loop; only the data source differs.
+
+### Wire types & framing
+- [x] Make `RunnerEvent` serde-serializable; `FormattedLogLine` cloneable
+- [x] `wire.rs`: length-prefixed binary log-frame codec (no per-line JSON on the hot path)
+- [x] `TuiSnapshot` (daemon-authoritative active set + state + flags)
+
+### Server (daemon)
+- [x] `OutputManager` broadcast log tap; `emit_line` fans to it only when a frontend is attached
+- [x] `GET /snapshot` (seed), `GET /events` (NDJSON RunnerEvent), `GET /logstream` (binary frames)
+- [x] `POST /hard-restart/:name`, `POST /verbose?enabled=…`, `RunnerCommand::Snapshot` / `SetVerbose`
+
+### Client (frontend)
+- [x] `Client::snapshot/hard_restart/set_verbose/stream_events/stream_logs`
+- [x] `client::bridge::TuiBridge` — adapts the socket into run_tui's channels
+      (merged log_rx, rebroadcast events_rx, command_tx → HTTP), serviceless
+      `OutputManager` for verbosity + lifecycle emitter, snapshot replayed as
+      synthetic events to seed state, verbose-sync task
+
+### CLI & unification
+- [x] `don tui` command (attach to a running daemon)
+- [x] `don start` ensures a daemon (spawn if needed) and attaches the frontend
+- [x] `don start -d` daemon-only; `--no-tui` / non-tty stay headless in-process
+- [x] Quit prompt: Ctrl+C → Detach (leave daemon) vs Stop daemon
+- [x] `don restart --hard` (CLI parity with the TUI's `R`)
+- [x] Remove the now-dead in-process TUI path + `QuitMode`
+
+### Tests
+- [x] Integration tests: /snapshot, /events, /logstream, TuiBridge::connect
+- [x] Stress/perf re-validated via tools/tui_drive.py against the unified
+      `don start` (51-service kafka-spam shape): no byte explosion, clean
+      shutdown over the socket, no orphaned procs/socket
+
+### Foreground-task PTY forwarding
+- [x] Foreground tasks spawn on their own PTY in the daemon (no controlling
+      terminal needed); the runner parks the master in a `ForegroundRegistry`
+      and emits `ForegroundWaiting` / `ForegroundExited`.
+- [x] `GET /foreground/{name}` (HTTP upgrade) bridges the parked PTY to a
+      client; resize reuses `/attach/{name}/resize`.
+- [x] `don run <fg-task>` triggers the task and bridges this terminal to its
+      PTY (Ctrl+C passes through; the session ends on task exit).
+- [x] `don tui` releases its terminal on `ForegroundWaiting`, bridges via
+      `client::foreground`, and re-takes the terminal when the task exits.
+- [x] Verified with real-PTY drivers (`don run` + `don tui` handoff) and a
+      socket-level integration test (`foreground_task_forwards_pty_both_ways`).
+- [ ] Follow-up: remove the now-dead termios foreground path
+      (`spawn_foreground_process` / `TerminalGuard` / `ForegroundProcessHandle`
+      in `process/mod.rs`) — unused since the unify, but `pub`, so harmless.
+- [ ] Follow-up: a foreground task with `auto_run` ≠ false spawns at startup
+      and blocks on its PTY until a client attaches; consider a no-client
+      timeout or deferring foreground auto-run until a frontend connects.

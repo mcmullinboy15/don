@@ -191,6 +191,33 @@ impl StatusCounts {
 
 /// Top-level TUI app state. Owns everything the renderer reads from.
 #[derive(Debug)]
+/// The two ways to leave a remote frontend.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitChoice {
+    /// Disconnect this viewer; the daemon and its services keep running.
+    Detach,
+    /// Gracefully stop the daemon and everything it manages.
+    Stop,
+}
+
+/// State for the Ctrl+C quit prompt shown by a remote frontend.
+pub(crate) struct QuitPrompt {
+    pub(crate) selected: QuitChoice,
+    /// True when opening the prompt entered a fresh modal surface (the user
+    /// was on the inline view). Cancelling then tears that surface back down;
+    /// if a table/form modal was already open, we leave it untouched.
+    pub(crate) opened_modal: bool,
+}
+
+impl QuitPrompt {
+    pub(crate) fn toggle(&mut self) {
+        self.selected = match self.selected {
+            QuitChoice::Detach => QuitChoice::Stop,
+            QuitChoice::Stop => QuitChoice::Detach,
+        };
+    }
+}
+
 pub(crate) struct App {
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
@@ -230,6 +257,12 @@ pub(crate) struct App {
     /// (and thus moved the bar, requiring a screen clear to erase the ghost)
     /// or only the width (where the reflowed logs can stay on screen).
     pub(crate) last_screen_height: u16,
+    /// Set when the user chooses Detach from the quit prompt. The main loop
+    /// checks this after each event and breaks, returning from `run_tui`
+    /// without stopping the daemon.
+    pub(crate) should_quit: bool,
+    /// Active Ctrl+C quit prompt (detach vs stop daemon), or `None`.
+    pub(crate) quit_prompt: Option<QuitPrompt>,
 }
 
 pub(crate) struct AppInit {
@@ -302,6 +335,8 @@ impl App {
             form: None,
             log_popup: None,
             last_screen_height: 0,
+            should_quit: false,
+            quit_prompt: None,
         }
     }
 
@@ -312,6 +347,7 @@ impl App {
         self.tasks_table.reset();
         self.form = None;
         self.log_popup = None;
+        self.quit_prompt = None;
     }
 
     pub(crate) fn set_verbose_enabled(&mut self, verbose_enabled: bool) {

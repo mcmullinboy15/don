@@ -17,13 +17,22 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/status", get(get_status))
         .route("/watch", get(get_watch))
+        .route("/snapshot", get(super::stream::get_snapshot))
+        .route("/events", get(super::stream::get_events))
+        .route("/logstream", get(super::stream::get_logstream))
         .route("/start/{name}", post(post_start))
         .route("/stop/{name}", post(post_stop))
         .route("/restart/{name}", post(post_restart))
+        .route("/hard-restart/{name}", post(post_hard_restart))
+        .route("/verbose", post(post_verbose))
         .route("/shutdown", post(post_shutdown))
         .route("/logs/{name}", get(get_logs))
         .route("/attach/{name}", get(super::attach::attach_handler))
         .route("/attach/{name}/resize", post(super::attach::resize_handler))
+        .route(
+            "/foreground/{name}",
+            get(super::foreground::foreground_handler),
+        )
         .route("/run-pending", post(post_run_pending))
         .route("/run/{name}", post(post_run_task))
         .route(
@@ -119,6 +128,42 @@ async fn post_restart(State(state): State<Arc<ApiState>>, Path(name): Path<Strin
         reply,
     })
     .await
+}
+
+/// `POST /restart/:name?hard=true` — rebuild then restart a service.
+async fn post_hard_restart(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Response {
+    dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::HardRestart {
+        name,
+        reply,
+    })
+    .await
+}
+
+/// Query params for `POST /verbose`.
+#[derive(Deserialize)]
+struct VerboseQuery {
+    enabled: bool,
+}
+
+/// `POST /verbose?enabled=true` — toggle the daemon's verbose output. Used by
+/// a remote `don tui` frontend so the `v` key affects the daemon's formatting.
+async fn post_verbose(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<VerboseQuery>,
+) -> Response {
+    if state
+        .cmd_tx
+        .send(RunnerCommand::SetVerbose {
+            enabled: query.enabled,
+        })
+        .is_err()
+    {
+        return runner_unavailable();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `POST /shutdown` — gracefully stop the daemon.
@@ -392,7 +437,7 @@ where
     map_command_reply(name, rx.await, StatusCode::INTERNAL_SERVER_ERROR).await
 }
 
-fn runner_unavailable() -> Response {
+pub(crate) fn runner_unavailable() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(error_body("runner is shutting down")),

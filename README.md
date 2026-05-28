@@ -64,22 +64,48 @@ Don will:
 
 ## Features
 
-### Interactive TUI
+### Background daemon & interactive TUI
 
-When stdout is a TTY, `don start` runs a ratatui-driven interface: logs stream into native scrollback while a bordered status bar pinned to the bottom shows ready counts, running tasks, a spinner during transitions, and contextual key hints.
+The orchestrator always runs as a **daemon** (it serves a unix socket at
+`.don/don.sock`); the TUI is a **frontend** that attaches to it. This means
+the TUI behaves identically whether you launched the stack or are reconnecting
+to one already running:
+
+```sh
+don start        # launch the daemon (if needed) and attach the TUI
+don start -d      # launch the daemon in the background, don't attach
+don tui           # attach the TUI to an already-running daemon
+```
+
+When stdout is a TTY, the TUI is a ratatui-driven interface: logs stream into
+native scrollback while a bordered status bar pinned to the bottom shows ready
+counts, running tasks, a spinner during transitions, and contextual key hints.
+The log stream, state, and lifecycle events all come from the daemon over the
+socket, so multiple `don tui` sessions can watch the same daemon at once.
 
 | Key | Action |
 |-----|--------|
 | `l` | Filter services/tasks — space toggles, enter commits, esc clears |
 | `s` | Full-screen service status overlay |
 | `t` | Full-screen task status overlay |
+| `R` | Hard restart the highlighted service (rebuild, then restart) |
+| `v` | Toggle verbose (timestamped) output on the daemon |
 | `Enter` | Insert a blank line separator into scrollback |
-| `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
+| Ctrl+C | Quit prompt — **Detach** (leave the daemon running) or **Stop daemon** |
 
-Pipe mode (non-TTY) writes prefixed lines directly to stdout unchanged.
-Configs with active foreground terminal tasks also use plain prefixed output
-instead of the TUI so those tasks can own stdin without competing with Don's
-keyboard handler.
+Quitting the TUI never stops the daemon implicitly: you choose Detach or Stop
+daemon. Use `don stop` (no arguments) to stop the daemon from the CLI.
+
+Pipe mode (non-TTY) and `--no-tui` run the orchestrator headless in the
+foreground, writing prefixed lines directly to stdout unchanged — the path CI
+and the detached daemon child use.
+
+**Foreground tasks.** A `terminal = "foreground"` task (REPL, interactive
+migration) runs on its own PTY inside the daemon, and don forwards that PTY to
+your terminal — Ctrl+C goes through to the task, not to don. Run one with
+`don run <task>` from a terminal, or trigger it from an attached `don tui`
+(the TUI hands its terminal to the task and takes it back when the task exits).
+The task still participates in the dependency graph and task-state tracking.
 
 Pass `--log-filter=<name1,name2,...>` to scope visible output to a subset of
 services or tasks — useful in pipe mode (CI, log capture) and as a way to
@@ -504,11 +530,15 @@ Edit `don.toml` while don is running. Don detects the change, diffs it, and appl
 
 ```sh
 don init                     # scaffold a starter don.toml
-don start                    # start the daemon (bare `don` prints help)
+don start                    # launch the daemon (if needed) and attach the TUI
+don start -d                 # launch the daemon in the background, don't attach
+don tui                      # attach the TUI to an already-running daemon
 don start --profile <name>   # start a subset
 don start <name>             # start a stopped service in the running daemon
+don stop                     # stop the daemon and everything it manages
 don stop <name>              # stop a running service
 don restart <name>           # restart a service
+don restart <name> --hard    # rebuild, then restart a service
 don status                   # show all services and their states
 don status -v                # verbose: watch paths, ports, commands, build targets
 don logs <name>              # view recent output
@@ -535,15 +565,25 @@ Don exposes a unix socket API at `.don/don.sock` for programmatic control:
 
 ```
 GET  /status                 → service/task states
+GET  /snapshot               → active item set + state + flags (seeds `don tui`)
 POST /start/:name            → start a stopped service
 POST /stop/:name             → stop a service
 POST /restart/:name          → restart a service
+POST /hard-restart/:name     → rebuild, then restart a service
+POST /verbose?enabled=…      → toggle the daemon's verbose output
 POST /run/:name              → run a specific task (body: {"params": {...}, "wait": true})
 POST /run-pending            → run all tasks in pending_run state
 GET  /logs/:name?last=N      → ring buffer output
 GET  /logs/:name?follow=true → streaming NDJSON
+GET  /events                 → live RunnerEvent stream (NDJSON)
+GET  /logstream              → live formatted-log stream (binary frames; drives `don tui`)
 GET  /attach/:name           → raw-stream attach (stdin/stdout)
+GET  /foreground/:name       → raw-stream bridge to a foreground task's PTY
 ```
+
+The `/events` + `/logstream` + `/snapshot` trio is what `don tui` consumes to
+render remotely; `/logstream` carries length-prefixed binary frames of
+already-formatted log lines (no per-line JSON on the hot path).
 
 ### Terminal Safety
 
@@ -551,8 +591,9 @@ Service output is sanitized before display — colors and text styles pass throu
 
 ### Graceful Shutdown
 
-- First Ctrl+C: graceful shutdown in reverse dependency order (dependents stop first), respecting per-service `shutdown.signal` and `shutdown.timeout`
-- Second Ctrl+C: immediate SIGKILL on all processes
+- Triggered by `don stop`, the TUI quit prompt's **Stop daemon**, or a SIGINT/SIGTERM to the daemon process
+- First signal: graceful shutdown in reverse dependency order (dependents stop first), respecting per-service `shutdown.signal` and `shutdown.timeout`
+- Second signal: immediate SIGKILL on all processes
 - Running tasks are killed
 - PID files, sockets, and docker containers are cleaned up
 

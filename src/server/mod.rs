@@ -6,15 +6,18 @@
 //! immediately) and then spawns the accept loop as a background task.
 
 pub(crate) mod attach;
+pub(crate) mod foreground;
 pub(crate) mod routes;
+pub(crate) mod stream;
 
-use crate::runner::RunnerCommand;
+use crate::output::FormattedLogLine;
+use crate::runner::{RunnerCommand, RunnerEvent};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// Server errors.
 #[derive(Debug, thiserror::Error)]
@@ -38,13 +41,43 @@ pub enum ServerError {
 /// Map of active attach resize channels: service name → sender.
 type ResizeMap = std::collections::HashMap<String, mpsc::Sender<(u16, u16)>>;
 
+/// A foreground task's PTY master, parked for a client to claim. The runner
+/// spawns the task on its own PTY (the daemon has no controlling terminal),
+/// registers the master here, and `GET /foreground/{name}` takes it and bridges
+/// it to the attached client's real terminal. `take_pty` returns the bridging
+/// handle to the runner so it can resume capturing output if the client never
+/// claimed it (or after detach).
+pub(crate) struct ForegroundPtySession {
+    pub read: pty_process::OwnedReadPty,
+    pub write: pty_process::OwnedWritePty,
+}
+
+/// Registry of foreground PTY sessions awaiting (or holding) a client, keyed
+/// by task name. Shared between the runner (which inserts on spawn) and the
+/// API server (whose `/foreground/{name}` handler takes the session to bridge).
+pub(crate) type ForegroundRegistry =
+    std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, ForegroundPtySession>>>;
+
+/// Create an empty foreground registry.
+pub(crate) fn new_foreground_registry() -> ForegroundRegistry {
+    std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Shared state passed to all handlers.
 #[derive(Clone)]
 pub(crate) struct ApiState {
     pub cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
+    /// Runner event broadcast — `GET /events` subscribes per connection and
+    /// forwards each [`RunnerEvent`] to attached `don tui` frontends.
+    pub event_tx: broadcast::Sender<RunnerEvent>,
+    /// Formatted-log broadcast — `GET /logstream` subscribes per connection
+    /// and forwards each [`FormattedLogLine`] as a binary frame.
+    pub log_tap: broadcast::Sender<FormattedLogLine>,
     /// Resize channels for active attach sessions. The attach bridge task
     /// registers its receiver here; the resize HTTP handler sends through it.
     pub attach_resize_txs: std::sync::Arc<tokio::sync::Mutex<ResizeMap>>,
+    /// Foreground task PTY sessions awaiting a client (see [`ForegroundRegistry`]).
+    pub foreground: ForegroundRegistry,
 }
 
 /// Bind the unix socket at `socket_path` and chmod it to 0o600 so only the
@@ -90,14 +123,20 @@ pub async fn serve_api(
     listener: UnixListener,
     socket_path: PathBuf,
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
+    event_tx: broadcast::Sender<RunnerEvent>,
+    log_tap: broadcast::Sender<FormattedLogLine>,
+    foreground: ForegroundRegistry,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);
     let state = Arc::new(ApiState {
         cmd_tx,
+        event_tx,
+        log_tap,
         attach_resize_txs: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        foreground,
     });
     let app = routes::build_router(state);
     accept_loop(listener, app, shutdown).await

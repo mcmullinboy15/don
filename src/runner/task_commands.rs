@@ -111,6 +111,7 @@ impl Runner {
                 Ok(TaskRunPrepared::ForegroundSpawned(spawn)) => {
                     let task::ForegroundTaskSpawn {
                         handle,
+                        read_pty: _read_pty,
                         rendered_cmdline: _rendered_cmdline,
                     } = *spawn;
                     self.output_manager.service_event(
@@ -415,6 +416,7 @@ impl Runner {
     ) {
         let task::ForegroundTaskSpawn {
             mut handle,
+            read_pty,
             rendered_cmdline: _rendered_cmdline,
         } = spawn;
 
@@ -423,13 +425,32 @@ impl Runner {
             rt.pgid = Some(pgid);
         }
 
+        // Park the task's PTY master for a client to claim. The task runs on
+        // a real terminal (the slave) but the daemon has none of its own, so
+        // `GET /foreground/{name}` bridges the master to the attached client.
+        if let Some(write) = handle.take_pty_write() {
+            self.foreground_registry.lock().await.insert(
+                name.to_string(),
+                crate::server::ForegroundPtySession {
+                    read: read_pty,
+                    write,
+                },
+            );
+        }
+        // Tell an attached `don tui` to release its terminal and bridge in.
+        // `don run <task>` already knows to connect from the local config.
+        let _ = self.event_tx.send(RunnerEvent::ForegroundWaiting {
+            name: name.to_string(),
+        });
+
         let name_owned = name.to_string();
         let task_cfg_clone = task_cfg.clone();
         let base_dir_owned = self.base_dir.clone();
         let global_watch_ignore = self.config.watch_ignore.clone();
         let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
         let cmd_tx = self.internal_tx.clone();
-        let terminal_coordinator = self.terminal_coordinator.clone();
+        let event_tx = self.event_tx.clone();
+        let foreground_registry = self.foreground_registry.clone();
         let rerun = done_tx.is_none();
 
         tokio::spawn(async move {
@@ -439,10 +460,12 @@ impl Runner {
                     .await;
             let elapsed = start.elapsed();
             drop(handle);
-            // Hand the terminal back to the TUI now that the child has
-            // released it. Drop happened above; tcsetpgrp/tcsetattr already
-            // restored pgrp + termios.
-            terminal_coordinator.release().await;
+            // The child has exited; drop any parked (unclaimed) PTY session
+            // and let the attached client reclaim the terminal.
+            foreground_registry.lock().await.remove(&name_owned);
+            let _ = event_tx.send(RunnerEvent::ForegroundExited {
+                name: name_owned.clone(),
+            });
 
             let (success, exit_code, message) = match result {
                 Ok(status) => {

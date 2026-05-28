@@ -372,6 +372,11 @@ pub enum RunnerCommand {
     WatchStatus {
         reply: oneshot::Sender<Option<WatchReport>>,
     },
+    /// Build the initial snapshot for a remote `don tui` frontend (active
+    /// item set + current state + daemon flags).
+    Snapshot {
+        reply: oneshot::Sender<TuiSnapshot>,
+    },
     /// Read the last N lines from a service or task's ring buffer.
     /// Returns None if the name is unknown.
     Logs {
@@ -438,6 +443,10 @@ pub enum RunnerCommand {
         force_refresh: bool,
         reply: oneshot::Sender<Result<Vec<String>, CompletionError>>,
     },
+    /// Toggle verbose (timestamped) output on the daemon. Sent by a remote
+    /// `don tui` frontend when the user presses `v`, so the daemon's formatted
+    /// log bytes gain/lose the elapsed-time prefix.
+    SetVerbose { enabled: bool },
     /// Initiate graceful shutdown.
     Shutdown,
 }
@@ -661,8 +670,36 @@ pub fn all_services_ready(items: &[ItemStatus]) -> bool {
     })
 }
 
+/// Everything a remote `don tui` frontend needs to seed its initial view that
+/// only the daemon can authoritatively provide: which items are active (the
+/// daemon's resolved profile set), their current state, and daemon-wide flags.
+///
+/// Task param *schemas* are intentionally not included — the `don tui` client
+/// loads those from the local `don.toml` (it runs in the same project dir).
+/// Keeping config shapes off the wire avoids serializing the whole config tree.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TuiSnapshot {
+    /// Whether the daemon is currently emitting verbose (timestamped) output.
+    pub verbose: bool,
+    /// Active service names (already filtered to the daemon's profile).
+    pub service_names: Vec<String>,
+    /// Active task names.
+    pub task_names: Vec<String>,
+    /// Synthetic build-tool stream names in use (`bazel` / `turbo`).
+    pub build_tool_names: Vec<String>,
+    /// Items that start hidden from the TUI filter's default selection.
+    pub hidden_names: Vec<String>,
+    /// Items that auto-filter the view to themselves on failure.
+    pub auto_filter_on_failure_names: Vec<String>,
+    /// Current state of every active item.
+    pub statuses: Vec<ItemStatus>,
+}
+
 /// An event broadcast from the runner for external consumers.
-#[derive(Debug, Clone)]
+///
+/// Serializable so the daemon can forward events to remote frontends
+/// (`don tui`) over the unix socket as NDJSON on `GET /events`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum RunnerEvent {
     /// A service changed state.
     ServiceStateChanged {
@@ -680,6 +717,12 @@ pub enum RunnerEvent {
     RebuildComplete { name: String, success: bool },
     /// A task re-run completed (file watch triggered).
     TaskRerunComplete { name: String, success: bool },
+    /// A foreground task is running on a PTY and waiting for a terminal. An
+    /// attached `don tui` should release its terminal and bridge to
+    /// `/foreground/{name}`. Ignored by frontends that can't take a terminal.
+    ForegroundWaiting { name: String },
+    /// A foreground task finished; the attached client can reclaim the terminal.
+    ForegroundExited { name: String },
     /// Graceful shutdown has started.
     ShutdownStarted,
     /// Shutdown complete.
@@ -731,6 +774,11 @@ pub struct Runner {
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+
+    /// Foreground task PTY sessions awaiting a client. Shared with the API
+    /// server so `GET /foreground/{name}` can bridge a parked session to the
+    /// attached terminal. The runner inserts on spawn, removes on exit.
+    foreground_registry: crate::server::ForegroundRegistry,
 
     /// Docker API client. `Some` if any service uses the docker preset.
     docker_client: Option<bollard::Docker>,
@@ -881,6 +929,7 @@ impl Runner {
             lazy_start_rx,
             lazy_start_tx,
             server_shutdown_tx: None,
+            foreground_registry: crate::server::new_foreground_registry(),
             docker_client,
             cmd_tx,
             cmd_rx,
@@ -1131,6 +1180,9 @@ impl Runner {
             Ok(listener) => {
                 let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
                 let cmd_tx_for_server = self.cmd_tx.clone();
+                let event_tx_for_server = self.event_tx.clone();
+                let log_tap_for_server = self.output_manager.subscribe_logs_sender();
+                let foreground_for_server = self.foreground_registry.clone();
                 let socket_path_for_server = socket_path.clone();
                 let server_emitter = self.output_manager.clone_lifecycle_emitter();
                 tokio::spawn(async move {
@@ -1138,6 +1190,9 @@ impl Runner {
                         listener,
                         socket_path_for_server,
                         cmd_tx_for_server,
+                        event_tx_for_server,
+                        log_tap_for_server,
+                        foreground_for_server,
                         server_shutdown_rx,
                     )
                     .await
@@ -1334,6 +1389,15 @@ impl Runner {
                             RunnerCommand::WatchStatus { reply } => {
                                 let report = self.collect_watch_report().await;
                                 let _ = reply.send(report);
+                            }
+                            RunnerCommand::Snapshot { reply } => {
+                                let snapshot = self.build_snapshot().await;
+                                let _ = reply.send(snapshot);
+                            }
+                            RunnerCommand::SetVerbose { enabled } => {
+                                self.output_manager
+                                    .verbosity_control()
+                                    .set_enabled(enabled);
                             }
                             RunnerCommand::Logs { name, last_n, reply } => {
                                 let logs = self.output_manager

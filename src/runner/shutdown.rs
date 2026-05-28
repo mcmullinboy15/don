@@ -466,6 +466,7 @@ impl Runner {
                     .service_event(&name, "run cancelled by shutdown");
                 let crate::runner::task::ForegroundTaskSpawn {
                     mut handle,
+                    read_pty: _read_pty,
                     rendered_cmdline: _rendered_cmdline,
                 } = *spawn;
                 self.output_manager.service_event(

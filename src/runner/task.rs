@@ -7,12 +7,9 @@ use nix::sys::signal::Signal;
 use tokio::time;
 
 use crate::config::template::{self, TemplateError};
-use crate::config::{Platform, Task, TaskTerminalScreen};
+use crate::config::{Platform, Task};
 use crate::duration::parse_duration;
-use crate::process::{
-    ChildOutput, ForegroundProcessHandle, ForegroundScreen, SpawnConfig, spawn_foreground_process,
-    spawn_process,
-};
+use crate::process::{ChildOutput, ProcessHandle, SpawnConfig, spawn_process};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -33,6 +30,10 @@ pub enum TaskError {
         #[source]
         source: TemplateError,
     },
+    #[error(
+        "foreground task '{name}' could not allocate a PTY — interactive tasks need a terminal"
+    )]
+    ForegroundPty { name: String },
 }
 
 /// Result of spawning a task process: the handle for waiting and the
@@ -44,8 +45,15 @@ pub(crate) struct TaskSpawn {
 }
 
 /// Result of spawning a foreground task process.
+///
+/// A foreground task runs on its own PTY (the daemon has no controlling
+/// terminal), so its master read/write halves are handed to the API server's
+/// `/foreground/{name}` bridge for forwarding to the attached client's
+/// terminal. `handle` keeps the child for wait/signal/terminate (its own
+/// `pty_write` is taken out and moved into the bridge).
 pub(crate) struct ForegroundTaskSpawn {
-    pub handle: ForegroundProcessHandle,
+    pub handle: ProcessHandle,
+    pub read_pty: pty_process::OwnedReadPty,
     pub rendered_cmdline: String,
 }
 
@@ -90,7 +98,11 @@ pub(crate) async fn spawn_task(
     })
 }
 
-/// Spawn a foreground task process. Does not wait for completion.
+/// Spawn a foreground task on its own PTY. Does not wait for completion.
+///
+/// The task gets a real controlling terminal (the PTY slave) so interactive
+/// programs (REPLs, prompts) work, and the master read half is returned for
+/// the `/foreground/{name}` bridge to forward to the attached client.
 pub(crate) async fn spawn_foreground_task(
     task: &Task,
     task_name: &str,
@@ -99,26 +111,31 @@ pub(crate) async fn spawn_foreground_task(
     params: &HashMap<String, String>,
 ) -> Result<ForegroundTaskSpawn, TaskError> {
     let prepared = prepare_task_command(task, task_name, base_dir, platform, params)?;
-    let screen = match task.terminal.screen {
-        TaskTerminalScreen::Main => ForegroundScreen::Main,
-        TaskTerminalScreen::Alternate => ForegroundScreen::Alternate,
-    };
-    let handle = spawn_foreground_process(
-        SpawnConfig {
-            cmd: &prepared.cmd,
-            args: &prepared.args,
-            dir: Some(prepared.work_dir.as_path()),
-            env: prepared.env,
-            pgid_file_path: None,
-            force_pipe: false,
-            listen_fds: vec![],
-        },
-        screen,
-    )
+    let (handle, child_output) = spawn_process(SpawnConfig {
+        cmd: &prepared.cmd,
+        args: &prepared.args,
+        dir: Some(prepared.work_dir.as_path()),
+        env: prepared.env,
+        pgid_file_path: None,
+        force_pipe: false,
+        listen_fds: vec![],
+    })
     .await?;
+
+    let read_pty = match child_output {
+        ChildOutput::Pty(read) => read,
+        // No PTY (allocation failed / fell back to pipes): an interactive
+        // foreground task can't be forwarded without a terminal.
+        _ => {
+            return Err(TaskError::ForegroundPty {
+                name: task_name.to_string(),
+            });
+        }
+    };
 
     Ok(ForegroundTaskSpawn {
         handle,
+        read_pty,
         rendered_cmdline: prepared.rendered_cmdline,
     })
 }
@@ -229,7 +246,7 @@ pub(crate) async fn wait_for_task(
 
 /// Wait for a foreground task to complete, with an optional timeout.
 pub(crate) async fn wait_for_foreground_task(
-    handle: &mut ForegroundProcessHandle,
+    handle: &mut ProcessHandle,
     timeout_str: Option<&str>,
 ) -> Result<ExitStatus, TaskError> {
     if let Some(timeout_str) = timeout_str {

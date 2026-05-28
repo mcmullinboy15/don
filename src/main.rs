@@ -80,6 +80,9 @@ enum Commands {
     Restart {
         /// Name of the service to restart
         name: String,
+        /// Force a rebuild before restarting (same as the TUI's `R`).
+        #[arg(long)]
+        hard: bool,
     },
     /// Show status of all services and tasks, or a single one when NAME is given
     Status {
@@ -121,6 +124,14 @@ enum Commands {
     Attach {
         /// Name of the service to attach to
         name: String,
+    },
+    /// Attach the interactive TUI to a running daemon. The daemon keeps
+    /// running after you quit (you'll be asked whether to detach or stop it).
+    Tui {
+        /// Restrict the initial log view to this comma-separated set of
+        /// service/task names (seeds the filter, same as `start --log-filter`).
+        #[arg(long, value_delimiter = ',')]
+        log_filter: Vec<String>,
     },
     /// Clean up stale state from a previous run
     Cleanup {
@@ -220,17 +231,18 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             no_tui,
             log_filter,
         } => {
+            use std::io::IsTerminal;
+            // Interactive terminal → unified path: ensure a daemon is running,
+            // then attach the TUI as a socket frontend. `--no-tui` and piped
+            // stdout keep the in-process headless runner (CI, and the body of
+            // the detached daemon child, which is spawned as `start --no-tui`).
+            let interactive = !no_tui && std::io::stdout().is_terminal();
             let result = if detached {
                 run_start_detached(&config_path, profile.as_deref(), verbose, log_filter).await
+            } else if interactive {
+                run_start_attached(&config_path, profile.as_deref(), verbose, log_filter).await
             } else {
-                run_start(
-                    &config_path,
-                    profile.as_deref(),
-                    verbose,
-                    no_tui,
-                    log_filter,
-                )
-                .await
+                run_start(&config_path, profile.as_deref(), verbose, log_filter).await
             };
             match result {
                 Ok(()) => 0,
@@ -247,8 +259,15 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             run_client(&config_path, |c| async move { c.stop(&name).await }).await
         }
         Commands::Stop { name: None } => run_stop_daemon(&config_path).await,
-        Commands::Restart { name } => {
-            run_client(&config_path, |c| async move { c.restart(&name).await }).await
+        Commands::Restart { name, hard } => {
+            run_client(&config_path, |c| async move {
+                if hard {
+                    c.hard_restart(&name).await
+                } else {
+                    c.restart(&name).await
+                }
+            })
+            .await
         }
         Commands::Status {
             name,
@@ -258,6 +277,13 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
+        Commands::Tui { log_filter } => match run_tui_frontend(&config_path, log_filter).await {
+            Ok(()) => 0,
+            Err(e) => {
+                errln(e);
+                1
+            }
+        },
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
         Commands::Run {
             name,
@@ -392,6 +418,20 @@ async fn run_run_task(
         return 2;
     }
 
+    // Foreground tasks run on a PTY in the daemon and forward to this
+    // terminal. Trigger the run, then bridge — Ctrl+C goes through to the
+    // task, and the session ends when the task exits.
+    if task.terminal.is_foreground() {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            errln(format!(
+                "foreground task '{name}' needs an interactive terminal — run `don run {name}` from a terminal"
+            ));
+            return 2;
+        }
+        return run_foreground_task(config_path, &name, parsed).await;
+    }
+
     let client = client_for(config_path);
     let options = RunTaskOptions { wait, wait_timeout };
     match client.run_task_with_options(&name, parsed, options).await {
@@ -402,6 +442,30 @@ async fn run_run_task(
         }
         Err(e) => {
             errln(e);
+            1
+        }
+    }
+}
+
+/// Trigger a foreground task on the daemon, then bridge this terminal to its
+/// PTY until it exits. The daemon spawns the task on a PTY (it has no terminal
+/// of its own) and `client::foreground` forwards bytes both ways.
+async fn run_foreground_task(
+    config_path: &Path,
+    name: &str,
+    params: std::collections::HashMap<String, String>,
+) -> i32 {
+    let base = base_dir(config_path);
+    let client = Client::new(&base);
+    if let Err(e) = client.run_task(name, params).await {
+        errln(format!("failed to start '{name}': {e}"));
+        return 1;
+    }
+    let socket = base.join(".don").join("don.sock");
+    match don::client::foreground::run_foreground(&socket, name).await {
+        Ok(()) => 0,
+        Err(e) => {
+            errln(format!("foreground bridge: {e}"));
             1
         }
     }
@@ -1284,16 +1348,61 @@ fn suggest_name_typo(input: &str, candidates: &std::collections::HashSet<&str>) 
         .unwrap_or_default()
 }
 
+/// Outcome of [`ensure_daemon_running`].
+enum DaemonStartOutcome {
+    /// A daemon was already serving the socket; nothing was spawned.
+    AlreadyRunning,
+    /// A fresh detached daemon was spawned.
+    Spawned { pid: u32, log_path: PathBuf },
+}
+
+/// `don start -d` — spawn a detached daemon (error if one is already running).
 async fn run_start_detached(
     config_path: &Path,
     profile: Option<&str>,
     verbose: bool,
     log_filter: Vec<String>,
 ) -> Result<(), String> {
+    match ensure_daemon_running(config_path, profile, verbose, log_filter).await? {
+        DaemonStartOutcome::AlreadyRunning => Err("don daemon is already running".to_string()),
+        DaemonStartOutcome::Spawned { pid, log_path } => {
+            println!(
+                "don started in background (pid {pid}, log: {})",
+                log_path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `don start` in a terminal — ensure a daemon is running (spawning one if
+/// needed), then attach the interactive TUI as a socket frontend. This is the
+/// unified path: the runner always lives in the daemon, the TUI is always a
+/// frontend, so its behavior is identical whether the daemon was already up
+/// (`don tui`) or this command launched it.
+async fn run_start_attached(
+    config_path: &Path,
+    profile: Option<&str>,
+    verbose: bool,
+    log_filter: Vec<String>,
+) -> Result<(), String> {
+    ensure_daemon_running(config_path, profile, verbose, log_filter.clone()).await?;
+    run_tui_frontend(config_path, log_filter).await
+}
+
+/// Spawn a detached daemon unless one is already serving the socket. Returns
+/// once the socket is reachable (or the spawned child has died / a short
+/// initialization timeout elapses).
+async fn ensure_daemon_running(
+    config_path: &Path,
+    profile: Option<&str>,
+    verbose: bool,
+    log_filter: Vec<String>,
+) -> Result<DaemonStartOutcome, String> {
     let base = base_dir(config_path);
     let client = Client::new(&base);
     match client.status(false, None).await {
-        Ok(_) => return Err("don daemon is already running".to_string()),
+        Ok(_) => return Ok(DaemonStartOutcome::AlreadyRunning),
         Err(ClientError::NotRunning { .. }) => {}
         Err(e) => return Err(format!("failed to check daemon status: {e}")),
     }
@@ -1370,22 +1479,18 @@ async fn wait_for_detached_start(
     base: &Path,
     log_path: &Path,
     pid: u32,
-) -> Result<(), String> {
+) -> Result<DaemonStartOutcome, String> {
     let client = Client::new(base);
     let start = tokio::time::Instant::now();
     let timeout = std::time::Duration::from_secs(5);
+    let outcome = DaemonStartOutcome::Spawned {
+        pid,
+        log_path: log_path.to_path_buf(),
+    };
 
     loop {
-        match client.status(false, None).await {
-            Ok(_) => {
-                println!(
-                    "don started in background (pid {pid}, log: {})",
-                    log_path.display()
-                );
-                return Ok(());
-            }
-            Err(ClientError::NotRunning { .. }) => {}
-            Err(_) => {}
+        if client.status(false, None).await.is_ok() {
+            return Ok(outcome);
         }
 
         match child
@@ -1408,13 +1513,10 @@ async fn wait_for_detached_start(
                 }
                 return Err(msg);
             }
-            None if start.elapsed() >= timeout => {
-                println!(
-                    "don started in background (pid {pid}, still initializing; log: {})",
-                    log_path.display()
-                );
-                return Ok(());
-            }
+            // Still coming up after the timeout (slow build, etc.). The
+            // daemon is alive; return so the caller can proceed — attach
+            // retries the socket connect, and `-d` just reports it's starting.
+            None if start.elapsed() >= timeout => return Ok(outcome),
             None => {}
         }
 
@@ -1431,15 +1533,17 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
     lines.join("\n")
 }
 
+/// Run the orchestrator headlessly in this process — the daemon body. Used
+/// for `--no-tui`, non-terminal stdout (CI/pipe), and the detached daemon
+/// child (`don start -d` spawns `don start --no-tui`). Interactive terminals
+/// go through `run_start_attached`, which leaves the runner in a daemon and
+/// renders the TUI as a socket frontend.
 async fn run_start(
     config_path: &std::path::Path,
     profile: Option<&str>,
     verbose: bool,
-    no_tui: bool,
     log_filter: Vec<String>,
 ) -> Result<(), String> {
-    use std::io::IsTerminal;
-
     let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
     let platform = don::config::Platform::current().ok_or_else(|| {
@@ -1458,7 +1562,6 @@ async fn run_start(
     }
 
     let base = base_dir(config_path);
-    let is_tty = !no_tui && std::io::stdout().is_terminal();
 
     // Fall back to the config's default_profile when `--profile` is not given.
     // Validation above guarantees default_profile (if set) is a known profile,
@@ -1486,10 +1589,6 @@ async fn run_start(
         };
 
     let is_active = |name: &str| active_items.as_ref().is_none_or(|s| s.contains(name));
-    let has_foreground_tasks = config
-        .tasks
-        .iter()
-        .any(|(name, task)| is_active(name) && task.terminal.is_foreground());
 
     // Collect service names and their log configs for OutputManager.
     let service_configs: Vec<(&str, &don::config::LogConfig)> = config
@@ -1595,183 +1694,6 @@ async fn run_start(
         .await
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
 
-    let _ = has_foreground_tasks; // logged earlier; TUI now handles fg tasks via pause/resume
-
-    if is_tty {
-        let (output_manager, log_rx) = don::output::OutputManager::new_with_tui_and_log_filters(
-            &all_configs,
-            &log_keep_filters,
-            verbose,
-        )
-        .await
-        .map_err(|e| format!("Error creating output manager: {e}"))?;
-        let verbosity = output_manager.verbosity_control();
-        let lifecycle_emitter = output_manager.clone_lifecycle_emitter();
-
-        // Channel that lets the runner ask the TUI to release/re-take the
-        // terminal when a foreground task is about to run.
-        let (terminal_request_tx, terminal_request_rx) = tokio::sync::mpsc::channel(8);
-        let terminal_coordinator =
-            don::runner::TerminalCoordinator::with_channel(terminal_request_tx);
-
-        let service_names: Vec<String> = config
-            .services
-            .keys()
-            .filter(|name| is_active(name))
-            .cloned()
-            .collect();
-        let task_names: Vec<String> = config
-            .tasks
-            .keys()
-            .filter(|name| is_active(name))
-            .cloned()
-            .collect();
-
-        // Snapshot the task configs before moving `config` into the runner —
-        // the TUI form needs the param schema to render prompts and to route
-        // per-param completion requests.
-        let task_configs: std::collections::HashMap<String, don::config::Task> =
-            config.tasks.clone();
-        let task_state = don::TaskState::new(base.join(".don").join("task-state"));
-        let mut task_last_runs = std::collections::HashMap::new();
-        for name in &task_names {
-            if let Ok(Some(last_run)) = task_state.last_run(name).await {
-                task_last_runs.insert(name.clone(), last_run);
-            }
-        }
-
-        // Synthetic build-tool stream names that should appear in the TUI
-        // filter. Without these entries, lines emitted by the bazel/turbo
-        // clients (which carry `name = "bazel"` / `"turbo"`) are silently
-        // dropped by the filter's allowlist — the user sees nothing during
-        // the build phase.
-        let build_tool_names: Vec<String> = build_tool_configs
-            .iter()
-            .map(|(name, _)| (*name).to_string())
-            .collect();
-
-        // Collect names whose `hidden = true` flag should start them outside
-        // the TUI filter's default selection. Both services and tasks can
-        // opt in — the filter treats them identically.
-        let hidden_names: std::collections::HashSet<String> = config
-            .services
-            .iter()
-            .filter(|(name, svc)| is_active(name) && svc.hidden)
-            .map(|(name, _)| name.clone())
-            .chain(
-                config
-                    .tasks
-                    .iter()
-                    .filter(|(name, task)| is_active(name) && task.hidden)
-                    .map(|(name, _)| name.clone()),
-            )
-            .collect();
-
-        let auto_filter_on_failure_names: std::collections::HashSet<String> = config
-            .services
-            .iter()
-            .filter(|(name, svc)| {
-                is_active(name)
-                    && svc
-                        .resolve(platform)
-                        .auto_filter_on_failure
-                        .unwrap_or(config.auto_filter_on_failure)
-            })
-            .map(|(name, _)| name.clone())
-            .chain(
-                config
-                    .tasks
-                    .iter()
-                    .filter(|(name, task)| {
-                        is_active(name)
-                            && task
-                                .auto_filter_on_failure
-                                .unwrap_or(config.auto_filter_on_failure)
-                    })
-                    .map(|(name, _)| name.clone()),
-            )
-            .collect();
-
-        let runner = await_with_shutdown_supervision(
-            tokio::spawn({
-                let profile = profile.clone();
-                async move {
-                    don::runner::Runner::new(
-                        config,
-                        platform,
-                        output_manager,
-                        base,
-                        profile.as_deref(),
-                        shutdown_rx,
-                        terminal_coordinator,
-                    )
-                    .await
-                    .map_err(|e| format!("Error: {e}"))
-                }
-            }),
-            "starting runner",
-        )
-        .await?;
-
-        let events = runner.subscribe();
-        let commands = runner.command_sender();
-
-        // Wrap the TUI so that if it exits unexpectedly (e.g. a terminal IO
-        // error or panic), we signal the runner to shut down instead of
-        // leaving the daemon alive while the user's terminal is in cooked
-        // mode. Without this, raw mode gets disabled but logs keep streaming —
-        // the user sees a free-floating cursor and can type into the shell
-        // while the runner runs unattended. The log_rx closing (runner
-        // shutdown) returns Ok(()) so the normal exit path is unaffected.
-        let tui_log_filter = log_filter_set.clone();
-        let tui = tokio::spawn(async move {
-            let result = don::run_tui(
-                log_rx,
-                events,
-                commands,
-                verbosity,
-                lifecycle_emitter,
-                service_names,
-                task_names,
-                build_tool_names,
-                task_configs,
-                task_last_runs,
-                hidden_names,
-                auto_filter_on_failure_names,
-                tui_log_filter,
-                terminal_request_rx,
-            )
-            .await;
-            if result.is_err() {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::this(),
-                    nix::sys::signal::Signal::SIGINT,
-                );
-            }
-            result
-        });
-
-        let runner_task =
-            tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
-        let runner_result =
-            await_with_shutdown_supervision(runner_task, "waiting for runner shutdown").await;
-        if runner_result.is_err() {
-            tui.abort();
-        }
-
-        // Surface any TUI error so unexpected exits are visible instead of
-        // silently dropped. Runner errors take precedence.
-        match tui.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => errln(format!("TUI error: {e}")),
-            Err(join_err) if join_err.is_panic() => {
-                errln(format!("TUI task panicked: {join_err}"));
-            }
-            Err(_) => {} // cancelled — expected on shutdown
-        }
-
-        runner_result
-    } else {
         let output_manager = don::output::OutputManager::new_verbose_with_log_filters(
             &all_configs,
             &log_keep_filters,
@@ -1809,7 +1731,107 @@ async fn run_start(
         let runner_task =
             tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
         await_with_shutdown_supervision(runner_task, "waiting for runner shutdown").await
+}
+
+/// Attach the interactive TUI to an already-running daemon over the socket.
+/// The render loop is the same `run_tui` the in-process path uses; only the
+/// data source differs (a [`don::client::bridge::TuiBridge`] instead of direct
+/// in-process channels). Quitting prompts the user — the daemon outlives the
+/// TUI unless they choose to stop it.
+async fn run_tui_frontend(config_path: &Path, log_filter: Vec<String>) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+
+    let base = base_dir(config_path);
+
+    // Retry briefly: when launched by `don start`, the daemon may still be
+    // coming up (slow build) when we try to attach.
+    let bridge = {
+        let mut attempt = 0;
+        loop {
+            match don::client::bridge::TuiBridge::connect(&base).await {
+                Ok(bridge) => break bridge,
+                Err(ClientError::NotRunning { .. }) if attempt < 50 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(ClientError::NotRunning { .. }) => {
+                    return Err(
+                        "no don daemon running here — start one with `don start -d`, then `don tui`"
+                            .to_string(),
+                    );
+                }
+                Err(e) => return Err(format!("failed to connect to don daemon: {e}")),
+            }
+        }
+    };
+
+    let don::client::bridge::TuiBridge {
+        snapshot,
+        log_rx,
+        events_rx,
+        command_tx,
+        verbosity,
+        lifecycle_emitter,
+        terminal_request_rx,
+        guard,
+    } = bridge;
+
+    // Task param schemas come from the local config (kept off the wire). Filter
+    // to the daemon's active task set so the form/menu match what's running.
+    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+    let task_name_set: HashSet<&str> = snapshot.task_names.iter().map(String::as_str).collect();
+    let task_configs: HashMap<String, don::config::Task> = config
+        .tasks
+        .iter()
+        .filter(|(name, _)| task_name_set.contains(name.as_str()))
+        .map(|(name, task)| (name.clone(), task.clone()))
+        .collect();
+
+    let mut task_last_runs: HashMap<String, don::TaskRunInfo> = HashMap::new();
+    for status in &snapshot.statuses {
+        if let ItemStatus::Task {
+            name,
+            last_run: Some(last_run),
+            ..
+        } = status
+        {
+            task_last_runs.insert(name.clone(), last_run.clone());
+        }
     }
+
+    let hidden_names: HashSet<String> = snapshot.hidden_names.iter().cloned().collect();
+    let auto_filter_on_failure_names: HashSet<String> = snapshot
+        .auto_filter_on_failure_names
+        .iter()
+        .cloned()
+        .collect();
+    let cli_log_filter: Option<HashSet<String>> = if log_filter.is_empty() {
+        None
+    } else {
+        Some(log_filter.into_iter().collect())
+    };
+
+    let result = don::run_tui(
+        log_rx,
+        events_rx,
+        command_tx,
+        verbosity,
+        lifecycle_emitter,
+        snapshot.service_names.clone(),
+        snapshot.task_names.clone(),
+        snapshot.build_tool_names.clone(),
+        task_configs,
+        task_last_runs,
+        hidden_names,
+        auto_filter_on_failure_names,
+        cli_log_filter,
+        terminal_request_rx,
+    )
+    .await;
+
+    // Tear down bridge tasks now the TUI has returned (detach or daemon exit).
+    drop(guard);
+    result.map_err(|e| format!("TUI error: {e}"))
 }
 
 async fn await_with_shutdown_supervision<T>(
