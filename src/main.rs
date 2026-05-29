@@ -275,10 +275,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                 }
                 run_client(&config_path, |c| async move { c.run_pending().await }).await
             }
-            (None, false) => {
-                errln("don run: provide a task name or --all-pending");
-                1
-            }
+            (None, false) => list_runnable_tasks(&config_path),
         },
         Commands::Completions { shell } => {
             let mut out = std::io::stdout();
@@ -330,6 +327,54 @@ fn client_for(config_path: &Path) -> Client {
 
 /// Handle `don run <task> [flags]`. Parses `raw` against the task's declared
 /// params and dispatches via the client.
+/// Print the list of runnable tasks. Invoked for bare `don run` so the user
+/// can see what's available without needing to read the config. Pure config
+/// view (no daemon round-trip), so it works whether or not one is running.
+fn list_runnable_tasks(config_path: &Path) -> i32 {
+    let config = match don::config::Config::from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            errln(format!("failed to load config: {e}"));
+            return 1;
+        }
+    };
+    if config.tasks.is_empty() {
+        println!("No tasks defined in {}.", config_path.display());
+        println!("Add a [tasks.<name>] section to don.toml.");
+        return 0;
+    }
+
+    let mut names: Vec<&str> = config.tasks.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    let max_name = names.iter().map(|n| n.len()).max().unwrap_or(0);
+
+    println!("Tasks defined in {}:", config_path.display());
+    println!();
+    for name in &names {
+        let Some(task) = config.tasks.get(*name) else {
+            continue;
+        };
+        let auto = match task.auto_run {
+            don::TaskAutoRun::Always => "auto",
+            don::TaskAutoRun::Once => "once",
+            don::TaskAutoRun::Never => "manual",
+        };
+        let mut trailing = String::new();
+        if task.terminal.is_foreground() {
+            trailing.push_str("  [foreground]");
+        }
+        if !task.params.is_empty() {
+            let p: Vec<&str> = task.params.iter().map(|p| p.name.as_str()).collect();
+            trailing.push_str(&format!("  params: {}", p.join(", ")));
+        }
+        println!("  {name:<max_name$}  {auto:<6}{trailing}");
+    }
+    println!();
+    println!("Run one:           don run <name>");
+    println!("Run all pending:   don run --all-pending");
+    0
+}
+
 async fn run_run_task(
     config_path: &Path,
     name: String,
@@ -349,7 +394,18 @@ async fn run_run_task(
         }
     };
     let Some(task) = config.tasks.get(&name) else {
-        errln(format!("unknown task '{name}'"));
+        if config.services.contains_key(&name) {
+            errln(format!(
+                "'{name}' is a service, not a task — use `don start {name}` to start it (or `don stop`/`don restart`)"
+            ));
+        } else {
+            let candidates: std::collections::HashSet<&str> =
+                config.tasks.keys().map(String::as_str).collect();
+            let suggestion = suggest_log_filter_typo(&name, &candidates);
+            errln(format!(
+                "unknown task '{name}'{suggestion} — run `don run` to see the full list"
+            ));
+        }
         return 1;
     };
 
