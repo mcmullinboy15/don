@@ -67,17 +67,34 @@ pub(crate) async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
 }
 
 /// `GET /logstream` — binary-framed stream of every formatted log line.
+///
+/// Sends the daemon's recent-history snapshot first (so a frontend connecting
+/// to a long-running daemon sees what just happened, not an empty pane), then
+/// live frames. The snapshot and the live subscription are taken atomically
+/// inside [`crate::output::LogTaps`], so every line is delivered exactly once
+/// — no dups across the boundary, no gaps either.
 pub(crate) async fn get_logstream(State(state): State<Arc<ApiState>>) -> Response {
-    let mut logs = state.log_tap.subscribe();
+    let (snapshot, mut logs) = state.log_taps.snapshot_and_subscribe();
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(STREAM_BUFFER);
 
     tokio::spawn(async move {
+        // Backfill — recent ring first so the connecting frontend sees what
+        // just happened, not an empty pane.
+        for line in snapshot {
+            let frame = crate::wire::encode_log_frame(&line);
+            if tx.send(bytes::Bytes::from(frame)).await.is_err() {
+                return;
+            }
+        }
+        // Then live broadcast. Atomic snapshot+subscribe inside `log_taps`
+        // means every live line is delivered exactly once across the
+        // boundary — no dups, no gaps.
         loop {
             match logs.recv().await {
                 Ok(line) => {
                     let frame = crate::wire::encode_log_frame(&line);
                     if tx.send(bytes::Bytes::from(frame)).await.is_err() {
-                        break; // client gone
+                        break;
                     }
                 }
                 // A lagging viewer drops the oldest lines (broadcast semantics).

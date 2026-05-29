@@ -315,6 +315,67 @@ fn foreground_task_forwards_pty_both_ways() {
 }
 
 #[test]
+fn logstream_replays_history_to_a_late_connecting_client() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("frontend-backfill");
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "chatty",
+                "bash",
+                &["-c", "for i in 1 2 3 4 5; do echo BACKFILL-$i; sleep 0.05; done; sleep 60"],
+            )
+            .ready_exec("true", &[])
+            .done()
+            .build();
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        // Let the service emit all five lines BEFORE the client subscribes.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // Connect to /logstream after the fact — backfill should replay history.
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+        let socket_for_stream = socket.clone();
+        let stream = tokio::spawn(async move {
+            let c = Client::with_socket_path(socket_for_stream);
+            let _ = c
+                .stream_logs(move |line| {
+                    let _ = line_tx.send(String::from_utf8_lossy(&line.bytes).into_owned());
+                })
+                .await;
+        });
+
+        let mut seen: Vec<&str> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(300), line_rx.recv()).await {
+                Ok(Some(text)) => {
+                    for tag in ["BACKFILL-1", "BACKFILL-2", "BACKFILL-3", "BACKFILL-4", "BACKFILL-5"] {
+                        if text.contains(tag) && !seen.contains(&tag) {
+                            seen.push(tag);
+                        }
+                    }
+                    if seen.len() == 5 {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            5,
+            "late-connecting frontend should see all 5 backfilled lines; got {seen:?}"
+        );
+
+        stream.abort();
+        let _ = shutdown_tx.send(()).await;
+        let _ = handle.await;
+    });
+}
+
+#[test]
 fn bridge_connect_seeds_snapshot_and_state() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("frontend-bridge");

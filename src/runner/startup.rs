@@ -59,7 +59,7 @@ impl Runner {
         // Items still in `Building` (batch build in flight) stay in `pending`
         // — they get picked up after `BatchBuildComplete` transitions them
         // back to `Pending` and `start_ready_items` is re-run.
-        let mut ready: Vec<String> = order
+        let ready: Vec<String> = order
             .iter()
             .filter(|name| pending.contains(name.as_str()))
             .filter(|name| !self.is_item_building(name))
@@ -70,16 +70,11 @@ impl Runner {
             .cloned()
             .collect();
 
-        // Foreground terminal tasks are exclusive: once one is ready, it
-        // owns the terminal and no other newly-ready item should start in
-        // the same scheduler sweep. Already-running dependencies continue.
-        if let Some(foreground_name) = ready.iter().find(|name| {
-            self.tasks
-                .get(name.as_str())
-                .is_some_and(|rt| rt.config.terminal.is_foreground())
-        }) {
-            ready = vec![foreground_name.clone()];
-        }
+        // Foreground tasks used to be exclusive at startup because they all
+        // fought over the one real terminal don was running in. After the
+        // unify each foreground task runs on its own isolated PTY (parked
+        // for a client to claim), so they no longer conflict — the rest of
+        // the ready set should proceed in parallel.
 
         for name in ready {
             if shutdown_requested() {

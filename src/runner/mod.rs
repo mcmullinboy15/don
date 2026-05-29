@@ -1181,7 +1181,7 @@ impl Runner {
                 let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
                 let cmd_tx_for_server = self.cmd_tx.clone();
                 let event_tx_for_server = self.event_tx.clone();
-                let log_tap_for_server = self.output_manager.subscribe_logs_sender();
+                let log_taps_for_server = self.output_manager.log_taps();
                 let foreground_for_server = self.foreground_registry.clone();
                 let socket_path_for_server = socket_path.clone();
                 let server_emitter = self.output_manager.clone_lifecycle_emitter();
@@ -1191,7 +1191,7 @@ impl Runner {
                         socket_path_for_server,
                         cmd_tx_for_server,
                         event_tx_for_server,
-                        log_tap_for_server,
+                        log_taps_for_server,
                         foreground_for_server,
                         server_shutdown_rx,
                     )
