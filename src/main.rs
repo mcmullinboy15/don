@@ -125,8 +125,9 @@ enum Commands {
         /// Name of the service to attach to
         name: String,
     },
-    /// Attach the interactive TUI to a running daemon. The daemon keeps
-    /// running after you quit (you'll be asked whether to detach or stop it).
+    /// Attach the interactive TUI to a running daemon. Ctrl-C closes the
+    /// TUI; the daemon is independent and keeps running. Use `don stop` to
+    /// stop it.
     Tui {
         /// Restrict the initial log view to this comma-separated set of
         /// service/task names (seeds the filter, same as `start --log-filter`).
@@ -1829,8 +1830,29 @@ async fn run_tui_frontend(config_path: &Path, log_filter: Vec<String>) -> Result
     )
     .await;
 
-    // Tear down bridge tasks now the TUI has returned (detach or daemon exit).
+    // Tear down bridge tasks now the TUI has returned (Ctrl-C or daemon exit).
     drop(guard);
+
+    // One-line hint about what's left behind: the daemon is independent of
+    // the TUI, so it usually keeps running. Probe it briefly so we don't
+    // mistakenly tell the user it's up if it actually just died.
+    let probe = Client::new(&base);
+    match probe.status(false, None).await {
+        Ok(_) => {
+            println!(
+                "don tui closed. Daemon still running — reconnect with `don tui`, or stop with `don stop`."
+            );
+        }
+        Err(ClientError::NotRunning { .. }) => {
+            println!("don tui closed. Daemon has stopped.");
+        }
+        Err(_) => {
+            // Reached the socket but the daemon's already shutting down or
+            // unhealthy. Treat as still-around; `don stop` is the right hint.
+            println!("don tui closed. Daemon may still be shutting down — use `don stop` if needed.");
+        }
+    }
+
     result.map_err(|e| format!("TUI error: {e}"))
 }
 

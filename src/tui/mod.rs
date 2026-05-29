@@ -66,7 +66,7 @@ use backend::FixedBottomBackend;
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
 use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState, TerminalRequest};
-use app::{App, AppInit, QuitChoice, QuitPrompt, ViewMode, line_matches_log_popup};
+use app::{App, AppInit, ViewMode, line_matches_log_popup};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
 use status_table::StatusTableKeyOutcome;
@@ -738,23 +738,13 @@ fn handle_key(
     controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
-    // While the quit prompt is up it owns all input.
-    if app.quit_prompt.is_some() {
-        return handle_quit_prompt_key(key, app, terminal, store, command_tx, modal);
-    }
-
-    // Ctrl+C: belt-and-suspenders shutdown. We both send a `Shutdown` command
-    // directly down the runner channel AND raise SIGINT. The direct command
-    // works even if the signal handler task has died or isn't being polled
-    // (e.g., the runner is stuck pre-loop), and SIGINT preserves the
-    // two-press force-kill escalation via the runner's signal counter.
+    // Ctrl-C exits the TUI immediately. The daemon is an independent process
+    // — it keeps running unless you explicitly `don stop` it. The caller
+    // detects daemon state after `run_tui` returns and prints a one-line hint.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => {
-                // The TUI is a frontend; quitting must not kill the daemon
-                // implicitly. Open the detach/stop prompt and let the main
-                // loop act on the user's choice.
-                open_quit_prompt(app, terminal, store, modal)?;
+                app.should_quit = true;
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 let enabled = controls.verbosity.toggle();
@@ -783,99 +773,6 @@ fn handle_key(
             handle_services_key(key, app, terminal, store, command_tx, controls, modal)?;
         }
         ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
-    }
-    Ok(())
-}
-
-/// Open the Ctrl+C quit prompt for a remote frontend. If no modal surface is
-/// active (inline view), enter one just for the prompt and remember to tear it
-/// back down on cancel.
-fn open_quit_prompt(
-    app: &mut App,
-    _terminal: &mut TuiTerminal,
-    store: &LogStore,
-    modal: &mut Option<Modal>,
-) -> Result<(), TuiError> {
-    if app.quit_prompt.is_some() || app.shutdown_started {
-        return Ok(());
-    }
-    let opened_modal = modal.is_none();
-    app.quit_prompt = Some(QuitPrompt {
-        selected: QuitChoice::Detach,
-        opened_modal,
-    });
-    if opened_modal {
-        let mut m = Modal::enter(store.next_id())?;
-        m.draw(app)?;
-        *modal = Some(m);
-    } else if let Some(m) = modal.as_mut() {
-        m.draw(app)?;
-    }
-    Ok(())
-}
-
-/// Dismiss the quit prompt, restoring whatever was underneath it.
-fn close_quit_prompt(
-    app: &mut App,
-    terminal: &mut TuiTerminal,
-    store: &LogStore,
-    modal: &mut Option<Modal>,
-) -> Result<(), TuiError> {
-    let opened_modal = app
-        .quit_prompt
-        .as_ref()
-        .is_some_and(|p| p.opened_modal);
-    app.quit_prompt = None;
-    if opened_modal {
-        *modal = None;
-        clear_and_replay(terminal, store, app)?;
-    } else {
-        redraw_current_view(app, terminal, modal)?;
-    }
-    Ok(())
-}
-
-/// Handle a key while the quit prompt owns input. Esc / Ctrl+C cancel;
-/// arrows/tab switch the choice; Enter acts on it.
-fn handle_quit_prompt_key(
-    key: KeyEvent,
-    app: &mut App,
-    terminal: &mut TuiTerminal,
-    store: &mut LogStore,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
-    modal: &mut Option<Modal>,
-) -> Result<(), TuiError> {
-    let is_ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('c'));
-    if matches!(key.code, KeyCode::Esc) || is_ctrl_c {
-        return close_quit_prompt(app, terminal, store, modal);
-    }
-    match key.code {
-        KeyCode::Left
-        | KeyCode::Right
-        | KeyCode::Tab
-        | KeyCode::Char('h')
-        | KeyCode::Char('l') => {
-            if let Some(prompt) = app.quit_prompt.as_mut() {
-                prompt.toggle();
-            }
-            redraw_current_view(app, terminal, modal)?;
-        }
-        KeyCode::Enter => match app.quit_prompt.as_ref().map(|p| p.selected) {
-            Some(QuitChoice::Detach) => {
-                app.quit_prompt = None;
-                app.should_quit = true;
-            }
-            Some(QuitChoice::Stop) => {
-                app.quit_prompt = None;
-                let _ = command_tx.send(RunnerCommand::Shutdown);
-                // Show shutdown progress; the daemon closing the log stream
-                // is what ultimately returns us from the loop.
-                enter_shutdown_mode(app, terminal, modal)?;
-            }
-            None => {}
-        },
-        _ => {}
     }
     Ok(())
 }

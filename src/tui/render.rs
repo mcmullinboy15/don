@@ -26,7 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row};
 
-use super::app::{App, OverlayItem, QuitChoice, StatusCounts, TaskStatusItem, ViewMode};
+use super::app::{App, OverlayItem, StatusCounts, TaskStatusItem, ViewMode};
 use super::filter::{FilterFocus, FilterRow, FilterState};
 use super::status_table::{StatusTableView, draw_status_table};
 use crate::runner::{ServiceState, TaskItemState};
@@ -123,63 +123,6 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         ViewMode::Normal => {}
     }
     draw_log_popup(frame, app);
-    draw_quit_prompt(frame, app);
-}
-
-/// Render the Ctrl+C quit prompt for a remote frontend: a centered box
-/// offering Detach (leave the daemon running) vs Stop daemon.
-fn draw_quit_prompt(frame: &mut Frame<'_>, app: &App) {
-    let Some(prompt) = app.quit_prompt.as_ref() else {
-        return;
-    };
-    let area = centered_rect(frame.area(), 60, 30);
-    if area.height < 6 || area.width < 20 {
-        return;
-    }
-    frame.render_widget(Clear, area);
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(" Quit don tui ");
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
-        ])
-        .split(inner);
-
-    let detach_selected = matches!(prompt.selected, QuitChoice::Detach);
-    let option_style = |selected: bool| {
-        if selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        }
-    };
-
-    frame.render_widget(
-        Paragraph::new("The daemon keeps running unless you stop it.")
-            .style(Style::default().fg(Color::Gray)),
-        layout[0],
-    );
-    let choices = Line::from(vec![
-        Span::styled("  Detach  ", option_style(detach_selected)),
-        Span::raw("   "),
-        Span::styled("  Stop daemon  ", option_style(!detach_selected)),
-    ]);
-    frame.render_widget(Paragraph::new(choices), layout[1]);
-    frame.render_widget(
-        Paragraph::new("[←/→ or tab] choose   [enter] confirm   [esc] cancel")
-            .style(Style::default().fg(Color::DarkGray)),
-        layout[2],
-    );
 }
 
 fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
