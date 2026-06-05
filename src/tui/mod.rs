@@ -259,6 +259,9 @@ pub async fn run_tui(
         // park-then-draw helper) avoids moving the cursor away from where
         // FixedBottomBackend just placed it.
         act.terminal.draw(|f| render::draw_bar(f, &app))?;
+        // Seed the height the resize handler compares against, so the first
+        // resize knows whether the height actually changed.
+        app.last_screen_height = act.terminal.size()?.height;
     }
 
     // Drives the spinner and any other time-based UI. Skip-on-miss so the
@@ -521,6 +524,34 @@ fn draw_inline_bar(terminal: &mut TuiTerminal, app: &App) -> Result<(), TuiError
     Ok(())
 }
 
+/// Reposition and redraw the inline bar after a terminal resize.
+///
+/// Unlike [`clear_and_replay`], this does **not** re-emit the retained log
+/// history: a resize doesn't change which lines are visible, and the terminal
+/// emulator reflows its own scrollback. Replaying here is what produced the
+/// multi-second "scrollback takeover" on resize with a large history.
+///
+/// When `clear_for_ghost` is set, we first issue a `Clear(ClearType::All)`
+/// (`\x1b[2J`) — *not* `Purge` (`\x1b[3J`). `2J` wipes the visible screen,
+/// erasing any ghost of the bar that ratatui's autoresize left at its previous
+/// row (its internal `clear()` only repaints the *new* viewport region), while
+/// leaving the terminal's scrollback buffer intact so the user can still scroll
+/// back through the full history. The caller only sets this on a height change:
+/// a width-only resize keeps the bar on the same bottom row, so there is no
+/// ghost to erase and we preserve the on-screen logs. [`draw_inline_bar`] then
+/// re-anchors the viewport at the new bottom.
+fn resize_inline_bar(
+    terminal: &mut TuiTerminal,
+    app: &App,
+    clear_for_ghost: bool,
+) -> Result<(), TuiError> {
+    if clear_for_ghost {
+        execute!(std::io::stdout(), Clear(ClearType::All))?;
+    }
+    draw_inline_bar(terminal, app)?;
+    Ok(())
+}
+
 fn is_shutdown_start_line(line: &FormattedLogLine) -> bool {
     line.name == crate::output::LIFECYCLE_EVENT_NAME
         && String::from_utf8_lossy(&line.bytes).contains("shutting down gracefully")
@@ -652,14 +683,25 @@ fn handle_app_event(
 ) -> Result<(), TuiError> {
     match event {
         AppEvent::Resize => {
+            // `terminal.size()` already reflects the new geometry by the time
+            // this event is dispatched.
+            let new_height = terminal.size()?.height;
             if let Some(m) = modal.as_mut() {
                 m.draw(app)?;
             } else {
-                // Full clear + replay so border/bar ghosts from the previous
-                // viewport position don't linger on screen. `clear_and_replay`
-                // handles cursor-parking and autoresize internally.
-                clear_and_replay(terminal, store, app)?;
+                // A resize changes geometry, not content: the active filter and
+                // the set of visible lines are unchanged, and the terminal
+                // emulator already reflows its own scrollback for us. Running
+                // the full `clear_and_replay` here (purge scrollback + re-emit
+                // every retained line via `insert_before`) floods the screen
+                // for seconds on a large history and needlessly destroys the
+                // user's real, larger scrollback. Just re-place and redraw the
+                // inline bar. Only a height change moves the bar's bottom row
+                // (and can leave a ghost of it behind), so only then do we
+                // clear; a width-only resize keeps the reflowed logs on screen.
+                resize_inline_bar(terminal, app, new_height != app.last_screen_height)?;
             }
+            app.last_screen_height = new_height;
             // Caller-side state (cached_width in run_tui) is refreshed on the
             // next iteration via terminal.size() — handle_app_event doesn't
             // own that cache. The autoresize path inside ratatui has already

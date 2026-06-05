@@ -91,7 +91,7 @@ TUI-only — pipe mode fine, TUI hangs / loses lifecycle events / freezes the
 status bar under load. **If you touch `src/tui/`, `src/output/`, or the
 runner's shutdown path, you need to validate against a real PTY.**
 
-There are two complementary tools in `tools/`:
+There are three complementary tools in `tools/`:
 
 - **`tools/tui_drive.py`** — runs `don start` under a real PTY (`pty.fork`),
   intercepts and answers DSR cursor queries on the master side (so the TUI
@@ -107,6 +107,15 @@ There are two complementary tools in `tools/`:
   consumers with TERM-trap floods, dozens of lazy `app-NN` services with
   `listenfd` proxies. This is the load shape that exposes TUI render-rate
   bugs.
+- **`tools/tui_drive_resize.py`** — drives the *resize* path: waits for
+  steady state (a large log burst has filled the `LogStore`), then sends a
+  sequence of real `SIGWINCH` resizes (`ioctl(TIOCSWINSZ)`), accounts for
+  the bytes don writes per resize (a replay-on-resize regression shows up as
+  a multi-MB spike), and replays the captured stream into a `pyte` screen to
+  detect "ghost" bars left behind. Override the size sequence with
+  `DON_RESIZE_SIZES` (e.g. `"50x140,50x100"` for a width-only resize, which
+  must preserve on-screen logs and emit no `\x1b[2J`). Requires `pyte` for
+  the ghost check.
 
 The standard workflow:
 

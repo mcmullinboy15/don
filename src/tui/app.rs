@@ -225,6 +225,11 @@ pub(crate) struct App {
     pub(crate) form: Option<FormState>,
     /// Active service/task log popup shown over the services/tasks table.
     pub(crate) log_popup: Option<LogPopup>,
+    /// Terminal height the inline bar was last drawn at. The resize handler
+    /// compares against this to decide whether a resize changed the height
+    /// (and thus moved the bar, requiring a screen clear to erase the ghost)
+    /// or only the width (where the reflowed logs can stay on screen).
+    pub(crate) last_screen_height: u16,
 }
 
 pub(crate) struct AppInit {
@@ -296,6 +301,7 @@ impl App {
             auto_filter_on_failure_names,
             form: None,
             log_popup: None,
+            last_screen_height: 0,
         }
     }
 
