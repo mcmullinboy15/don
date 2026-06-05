@@ -196,7 +196,7 @@ impl Runner {
                 if should_auto_restart {
                     self.schedule_auto_restart(name, &message, true);
                 } else if let Some(rs) = self.services.get_mut(name) {
-                    rs.restart_attempts = 0;
+                    rs.reset_restart_tracking();
                 }
                 match intent {
                     ServiceStartIntent::Startup { done_tx } => {
@@ -678,7 +678,7 @@ impl Runner {
         // process so a recovery probe doesn't race with the stop.
         if let Some(rs) = self.services.get_mut(name) {
             rs.stop_health_tracking();
-            rs.restart_attempts = 0;
+            rs.reset_restart_tracking();
         }
         let handle = self
             .services
@@ -734,6 +734,10 @@ impl Runner {
             return;
         }
         if success {
+            // Backoff resets on Ready; the rapid-crash streak does not (it is
+            // cleared only by a sufficiently long-lived run, a clean exit, or
+            // manual intervention) so a service that flaps ready→crash→ready
+            // can still trip the crash-loop ceiling.
             if let Some(rs) = self.services.get_mut(name) {
                 if let Some(handle) = rs.pending_restart.take() {
                     handle.abort();
@@ -804,7 +808,7 @@ impl Runner {
 
         if let Some(rs) = self.services.get_mut(name) {
             rs.stop_health_tracking();
-            rs.restart_attempts = 0;
+            rs.reset_restart_tracking();
         }
         let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
             Some(h) => h,

@@ -2,9 +2,35 @@ use super::health::{format_unexpected_exit, unhealthy_restart_backoff_secs};
 use super::service::ServiceHandle;
 use super::service_worker::ServiceStartMode;
 use super::{Runner, RunnerInternalCommand, ServiceState};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 const MAX_STARTUP_FAILURES_BEFORE_GIVE_UP: u32 = 3;
+
+/// A process that exits within this window of being started is treated as a
+/// crash on launch (a likely crash loop) rather than a normal failure.
+const RAPID_CRASH_WINDOW: Duration = Duration::from_secs(5);
+
+/// Maximum number of back-to-back rapid crashes before don gives up
+/// auto-restarting a service, regardless of `on_failure`. Two strikes: the
+/// initial start plus one retry that also dies inside [`RAPID_CRASH_WINDOW`].
+const MAX_RAPID_CRASHES: u32 = 2;
+
+/// Update the rapid-crash streak after a non-clean process exit.
+///
+/// `lived` is how long the process ran since its last start (`None` when that
+/// is unknown, treated as an immediate crash). Returns the new streak count
+/// and whether don should give up instead of scheduling another auto-restart.
+/// A process that ran at least [`RAPID_CRASH_WINDOW`] clears the streak — it
+/// wasn't stuck in a tight crash loop.
+fn rapid_crash_outcome(lived: Option<Duration>, prior: u32) -> (u32, bool) {
+    let rapid = lived.map(|d| d < RAPID_CRASH_WINDOW).unwrap_or(true);
+    if !rapid {
+        return (0, false);
+    }
+    let count = prior.saturating_add(1);
+    (count, count >= MAX_RAPID_CRASHES)
+}
 
 impl Runner {
     /// Apply a health-monitor probe transition for a service.
@@ -31,6 +57,9 @@ impl Runner {
                 .get(name)
                 .map(|rs| rs.restart_attempts)
                 .unwrap_or(0);
+            // Health recovery resets the backoff counter only; the
+            // rapid-crash streak is cleared by the lifetime check on the next
+            // actual crash, not by a transient return to Ready.
             if let Some(rs) = self.services.get_mut(name) {
                 if let Some(handle) = rs.pending_restart.take() {
                     handle.abort();
@@ -160,7 +189,7 @@ impl Runner {
         let clean_exit = status.as_ref().is_some_and(|s| s.success());
         if clean_exit {
             if let Some(rs) = self.services.get_mut(name) {
-                rs.restart_attempts = 0;
+                rs.reset_restart_tracking();
                 rs.pgid = None;
             }
             self.set_service_state(name, ServiceState::Stopped);
@@ -184,9 +213,43 @@ impl Runner {
             .map(|rs| rs.resolved.on_failure)
             .unwrap_or_default();
         if matches!(policy, crate::config::OnFailure::Restart) {
-            self.schedule_auto_restart(name, &exit_msg, state == ServiceState::Running);
+            // Crash-loop guard: a process that dies within RAPID_CRASH_WINDOW
+            // of starting is failing on launch. After MAX_RAPID_CRASHES such
+            // back-to-back fast deaths, stop retrying and leave it Failed — a
+            // hard ceiling that no backoff or `on_failure` policy overrides.
+            let lived = self
+                .services
+                .get(name)
+                .and_then(|rs| rs.last_start)
+                .map(|started| started.elapsed());
+            let prior = self
+                .services
+                .get(name)
+                .map(|rs| rs.rapid_crashes)
+                .unwrap_or(0);
+            let (rapid_crashes, give_up) = rapid_crash_outcome(lived, prior);
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.rapid_crashes = rapid_crashes;
+            }
+            if give_up {
+                if let Some(rs) = self.services.get_mut(name)
+                    && let Some(prev) = rs.pending_restart.take()
+                {
+                    prev.abort();
+                }
+                self.output_manager.service_error_event(
+                    name,
+                    &format!(
+                        "crashed within {}s of starting {} times in a row — giving up (not auto-restarting)",
+                        RAPID_CRASH_WINDOW.as_secs(),
+                        rapid_crashes
+                    ),
+                );
+            } else {
+                self.schedule_auto_restart(name, &exit_msg, state == ServiceState::Running);
+            }
         } else if let Some(rs) = self.services.get_mut(name) {
-            rs.restart_attempts = 0;
+            rs.reset_restart_tracking();
         }
         if let Some(writer) = self.output_manager.service_writer(name) {
             writer.close_follow_sinks().await;
@@ -251,5 +314,82 @@ impl Runner {
             reply,
             super::ServiceStopAction::RestartFull,
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::{MAX_RAPID_CRASHES, RAPID_CRASH_WINDOW, rapid_crash_outcome};
+    use std::time::Duration;
+
+    #[test]
+    fn rapid_crash_outcome_streak_and_give_up() {
+        struct Case {
+            name: &'static str,
+            lived: Option<Duration>,
+            prior: u32,
+            expect_count: u32,
+            expect_give_up: bool,
+        }
+
+        let just_under = RAPID_CRASH_WINDOW - Duration::from_millis(1);
+        let cases = vec![
+            Case {
+                name: "first fast crash, unknown lifetime",
+                lived: None,
+                prior: 0,
+                expect_count: 1,
+                expect_give_up: false,
+            },
+            Case {
+                name: "first fast crash",
+                lived: Some(Duration::from_millis(200)),
+                prior: 0,
+                expect_count: 1,
+                expect_give_up: false,
+            },
+            Case {
+                name: "second fast crash hits the cap",
+                lived: Some(Duration::from_millis(200)),
+                prior: 1,
+                expect_count: MAX_RAPID_CRASHES,
+                expect_give_up: true,
+            },
+            Case {
+                name: "just inside the window still counts",
+                lived: Some(just_under),
+                prior: 1,
+                expect_count: 2,
+                expect_give_up: true,
+            },
+            Case {
+                name: "exactly at the window clears the streak",
+                lived: Some(RAPID_CRASH_WINDOW),
+                prior: 1,
+                expect_count: 0,
+                expect_give_up: false,
+            },
+            Case {
+                name: "long-lived crash clears a large streak",
+                lived: Some(Duration::from_secs(60)),
+                prior: 5,
+                expect_count: 0,
+                expect_give_up: false,
+            },
+            Case {
+                name: "unknown lifetime past the cap gives up",
+                lived: None,
+                prior: MAX_RAPID_CRASHES,
+                expect_count: MAX_RAPID_CRASHES + 1,
+                expect_give_up: true,
+            },
+        ];
+
+        for case in cases {
+            let (count, give_up) = rapid_crash_outcome(case.lived, case.prior);
+            assert_eq!(count, case.expect_count, "{}: count", case.name);
+            assert_eq!(give_up, case.expect_give_up, "{}: give_up", case.name);
+        }
     }
 }

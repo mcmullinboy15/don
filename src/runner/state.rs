@@ -20,6 +20,7 @@ use super::{
 };
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
+use std::time::Instant;
 use tokio::sync::oneshot;
 
 /// All per-service runtime state, consolidated into a single struct.
@@ -63,6 +64,16 @@ pub(crate) struct RuntimeService {
     /// triggered without the service recovering to Ready. Drives backoff
     /// for the next scheduled restart. Reset to 0 on Ready.
     pub restart_attempts: u32,
+    /// When the current process was last spawned. Used to detect a crash
+    /// loop: a process that exits within a few seconds of starting is
+    /// likely failing on launch rather than after doing useful work.
+    pub last_start: Option<Instant>,
+    /// Number of consecutive crashes where the process died within the
+    /// rapid-crash window of being started. A hard cap on this count makes
+    /// don give up auto-restarting regardless of `on_failure`. Reset
+    /// whenever the service recovers, is stopped, or runs long enough to
+    /// clear the streak.
+    pub rapid_crashes: u32,
     /// Handle to a scheduled `RestartUnhealthy` command. Aborted on stop,
     /// recovery, or manual restart so we don't fire a stale auto-restart.
     pub pending_restart: Option<tokio::task::JoinHandle<()>>,
@@ -110,6 +121,8 @@ impl RuntimeService {
             batch_built: false,
             monitor_cancel: None,
             restart_attempts: 0,
+            last_start: None,
+            rapid_crashes: 0,
             pending_restart: None,
             control_worker: None,
             control_generation: 0,
@@ -134,6 +147,15 @@ impl RuntimeService {
         if let Some(handle) = self.pending_restart.take() {
             handle.abort();
         }
+    }
+
+    /// Reset the auto-restart failure-streak counters. Called when the
+    /// service reaches a healthy state, exits cleanly, or is stopped /
+    /// restarted by the user — any of which means the prior run of failures
+    /// no longer counts toward the give-up thresholds.
+    pub(crate) fn reset_restart_tracking(&mut self) {
+        self.restart_attempts = 0;
+        self.rapid_crashes = 0;
     }
 
     pub(crate) fn state(&self) -> ServiceState {

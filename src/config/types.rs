@@ -260,6 +260,11 @@ pub enum OnFailure {
     /// Restart the service with escalating backoff (1, 2, 4, 8, 16, 32, 60s
     /// capped at 60s). Backoff attempts reset when the service recovers
     /// to `Ready` or a restart succeeds.
+    ///
+    /// A crash-loop ceiling overrides this: if the process exits within 5s of
+    /// being (re)started twice in a row, don stops auto-restarting and leaves
+    /// the service `Failed` rather than hammering a binary that dies on
+    /// launch. The streak is cleared once a run survives past that window.
     Restart,
 }
 
