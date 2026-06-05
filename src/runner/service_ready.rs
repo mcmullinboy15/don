@@ -25,6 +25,10 @@ impl Runner {
             }
             rs.pgid = spawned_pgid;
             rs.handle = Some(start_result.handle);
+            // Stamp the spawn time so a fast crash can be distinguished from a
+            // failure after the service did real work (see the crash-loop
+            // guard in `handle_service_exited`).
+            rs.last_start = Some(std::time::Instant::now());
 
             // Add OSC response sink if we have a PTY write handle.
             if let Some(ServiceHandle::Process(process)) = rs.handle.as_mut()
@@ -211,6 +215,10 @@ impl Runner {
                 .await;
         } else {
             // No ready check, rebuild path — mark ready immediately.
+            // Only the backoff counter resets here: reaching Ready (which is
+            // immediate without a ready check) is not proof the service will
+            // survive, so the rapid-crash streak is left for the lifetime
+            // check in `handle_service_exited` to clear.
             if let Some(rs) = self.services.get_mut(name) {
                 if let Some(handle) = rs.pending_restart.take() {
                     handle.abort();

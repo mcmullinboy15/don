@@ -1202,6 +1202,77 @@ retries = 1
 }
 
 #[test]
+fn integration_rapid_crash_loop_gives_up_after_two_starts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("rapid-crash-give-up");
+        let counter = dir.path().join("launches");
+        std::fs::write(&counter, "0").unwrap();
+
+        // Becomes "ready" instantly (no ready check), runs briefly so the
+        // Ready transition is processed, then crashes inside the 5s
+        // rapid-crash window. Two such fast crashes should trip the
+        // crash-loop ceiling regardless of the unlimited `restart` policy.
+        let script = dir.path().join("crash-fast.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 N=$(cat {ctr})\n\
+                 N=$((N + 1))\n\
+                 echo $N > {ctr}\n\
+                 sleep 0.3\n\
+                 exit 1\n",
+                ctr = counter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let toml = format!(
+            r#"
+[services.crasher]
+run.cmd = "{}"
+log = "ignore"
+on_failure = "restart"
+"#,
+            script.display()
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(
+            &buf,
+            "crashed within 5s of starting 2 times in a row — giving up",
+            Duration::from_secs(12),
+        )
+        .await;
+
+        // Give any stale backoff timer a chance to (wrongly) fire a 3rd start.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let launches: i32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            launches, 2,
+            "initial start plus one retry should produce exactly two fast crashes \
+             before giving up. output: {}",
+            read_buf(&buf)
+        );
+    });
+}
+
+#[test]
 fn integration_restart_crashed_service_without_ready_check() {
     run_with_timeout(Duration::from_secs(20), async {
         let dir = TempDir::new("restart-crashed-no-ready");

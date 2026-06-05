@@ -60,6 +60,9 @@ impl Runner {
             {
                 proxy.set_backend();
             }
+            // Reaching Ready resets the backoff counter, but not the
+            // rapid-crash streak — see `handle_service_exited`, which clears
+            // that only once the process has survived past the crash window.
             if let Some(rs) = self.services.get_mut(&item.name) {
                 if let Some(handle) = rs.pending_restart.take() {
                     handle.abort();
