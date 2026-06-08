@@ -90,6 +90,41 @@ async fn make_runner(
     (runner, shutdown_tx, buf)
 }
 
+/// Like [`make_runner`] but with verbose output enabled, so the `[don]`
+/// `watch:` diagnostics are emitted (and thus assertable).
+async fn make_runner_verbose(
+    toml: &str,
+    base_dir: &std::path::Path,
+) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
+    let config: Config = toml.parse().unwrap();
+    config.validate(PLATFORM).unwrap();
+
+    let all_configs: Vec<(&str, &LogConfig)> = config
+        .services
+        .iter()
+        .map(|(n, s)| (n.as_str(), &s.log))
+        .chain(config.tasks.iter().map(|(n, t)| (n.as_str(), &t.log)))
+        .collect();
+
+    let (writer, buf) = TestBuffer::new();
+    let output_manager = OutputManager::new_verbose(&all_configs, writer, true)
+        .await
+        .unwrap();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
+    let runner = Runner::new(
+        config,
+        PLATFORM,
+        output_manager,
+        base_dir.to_path_buf(),
+        None,
+        shutdown_rx,
+        TerminalCoordinator::detached(),
+    )
+    .await
+    .unwrap();
+    (runner, shutdown_tx, buf)
+}
+
 /// Wait until the output buffer contains the given string, with a timeout.
 async fn wait_for_output(buf: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> bool {
     let start = tokio::time::Instant::now();
@@ -149,6 +184,74 @@ fn integration_service_restarts_on_file_change() {
             wait_for_output(&buf, "rebuilding (file changed)", Duration::from_secs(5)).await,
             "timed out waiting for rebuild. output: {}",
             read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// A change to a file matched by the workspace-wide `watch_ignore` must produce
+/// no verbose `watch:` diagnostics at all — not even the raw event line — while
+/// a change to a genuinely watched file is still reported and triggers a
+/// rebuild.
+#[test]
+fn integration_global_watch_ignore_is_silent_in_verbose() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-global-ignore");
+        std::fs::create_dir_all(dir.path().join("ignored")).unwrap();
+        std::fs::create_dir_all(dir.path().join("watched")).unwrap();
+        std::fs::write(dir.path().join("ignored/a.txt"), "init").unwrap();
+        std::fs::write(dir.path().join("watched/a.txt"), "init").unwrap();
+
+        let toml = r#"
+watch_ignore = ["**/ignored/**"]
+
+[services.app]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+watch = ["**/*.txt"]
+debounce = "100ms"
+log = "ignore"
+ready.exec.cmd = "true"
+"#;
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+            "services did not start. output: {}",
+            read_buf(&buf)
+        );
+
+        // Touch the globally-ignored file first, give its event time to flow,
+        // then touch the watched file. When the watched rebuild fires we know
+        // the earlier ignored event has already been handled (and, with the
+        // fix, dropped silently).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(dir.path().join("ignored/a.txt"), "changed").unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::fs::write(dir.path().join("watched/a.txt"), "changed").unwrap();
+
+        assert!(
+            wait_for_output(&buf, "rebuilding (file changed)", Duration::from_secs(5)).await,
+            "watched file change did not trigger a rebuild. output: {}",
+            read_buf(&buf)
+        );
+
+        let output = read_buf(&buf);
+        // The watched file is reported; the globally-ignored file is not — no
+        // "watch:" line should ever mention it.
+        assert!(
+            output.contains("watched/a.txt"),
+            "expected the watched file to be reported. output: {output}"
+        );
+        assert!(
+            !output.contains("ignored/a.txt"),
+            "globally-ignored file produced a verbose log line. output: {output}"
         );
 
         let _ = shutdown_tx.send(()).await;

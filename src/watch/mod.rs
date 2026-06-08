@@ -167,6 +167,13 @@ pub(crate) struct WatchManager {
     runner_event_lag_count: u64,
     /// Most recent notify backend error.
     last_notify_error: Option<String>,
+    /// Workspace-wide `watch_ignore` patterns (resolved to absolute globs).
+    /// A path matching any of these is dropped up front in [`Self::handle_event`]
+    /// — it can't trigger anything and isn't worth a verbose log line, so we
+    /// skip it before the (noisy) per-item match/ignore diagnostics. These are
+    /// also merged into each item's `ignore_patterns` for the change-scan path;
+    /// `watch_ignore` is fixed for the runner's lifetime, so this stays in sync.
+    global_ignore: Vec<Pattern>,
 }
 
 enum NotifyBackend {
@@ -549,6 +556,11 @@ impl WatchManager {
             registered_dirs.len()
         ));
 
+        let global_ignore: Vec<Pattern> = global_ignore_patterns
+            .iter()
+            .filter_map(|pattern| Pattern::new(pattern).ok())
+            .collect();
+
         Ok((
             Self {
                 watcher,
@@ -564,6 +576,7 @@ impl WatchManager {
                 notify_error_count: 0,
                 runner_event_lag_count: 0,
                 last_notify_error: None,
+                global_ignore,
             },
             warnings,
         ))
@@ -780,16 +793,33 @@ impl WatchManager {
             return;
         }
 
+        // Workspace-wide `watch_ignore` is a top-level filter: a matching path
+        // can't trigger any item. Drop such paths up front and *before* any
+        // logging — emitting verbose diagnostics for files the user globally
+        // ignored (node_modules, build output, …) is pure noise. If every path
+        // in the event is ignored, there's nothing to report at all.
+        let paths: Vec<&PathBuf> = event
+            .paths
+            .iter()
+            .filter(|path| {
+                let path_str = path.to_string_lossy();
+                !self.global_ignore.iter().any(|p| p.matches(&path_str))
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+
         self.emitter.debug_event(&format!(
             "watch: event kind={:?} paths={:?}",
-            event.kind, event.paths
+            event.kind, paths
         ));
 
         // Find which items are affected by this event's paths.
         // Ignore patterns are checked first — if any ignore pattern matches,
         // the event is skipped for that item.
         let mut affected: Vec<String> = Vec::new();
-        for path in &event.paths {
+        for path in paths {
             let path_str = path.to_string_lossy();
             let mut matched_any = false;
             let mut ignored_by: Vec<String> = Vec::new();
