@@ -310,6 +310,16 @@ impl Runner {
             if let Some(prev) = rs.pending_restart.take() {
                 prev.abort();
             }
+            // Drop the failed launch's process handle and OSC sink. If a ready
+            // check failed while the process was still alive (e.g. it never
+            // bound its port), nothing else stops it — without this it lingers
+            // running and, via the OSC sink, holds the PTY master open. The
+            // handle's `kill_on_drop` reaps the process and the `OscSinkHandle`
+            // drop releases the PTY. On the crash path the handle is already
+            // gone, so these are no-ops. The output worker drains and drops the
+            // read half on EOF once the process is gone.
+            rs.handle = None;
+            rs.osc_sink = None;
         }
         if give_up {
             self.set_service_state(name, ServiceState::Failed);

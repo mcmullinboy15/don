@@ -65,26 +65,66 @@ const TURBO_COLOR: Color = Color::Grey;
 /// Handle to an active OSC response sink. Use [`take_pty_write`] to
 /// stop the sink and reclaim the PTY handle (e.g., for attach).
 pub struct OscSinkHandle {
-    /// Our copy of the sender — dropping it + removing the service's
-    /// copy from the sinks list closes the channel, stopping the task.
-    handle: SinkHandle,
-    join: JoinHandle<pty_process::OwnedWritePty>,
+    /// Our copy of the sender. Dropping it *and* removing the service's copy
+    /// from the sinks list closes the channel, stopping the task. `None` once
+    /// reclaimed by [`take_pty_write`].
+    handle: Option<SinkHandle>,
+    /// The OSC task, which owns the PTY write half and returns it on a clean
+    /// channel close. `None` once awaited by [`take_pty_write`].
+    join: Option<JoinHandle<pty_process::OwnedWritePty>>,
     service_state: Arc<Mutex<ServiceOutputState>>,
 }
 
 impl OscSinkHandle {
     /// Stop the OSC sink and reclaim the PTY write handle.
     /// Removes the sink from the service's sinks list, closes the channel,
-    /// and waits for the task to return the handle.
-    pub async fn take_pty_write(self) -> Option<pty_process::OwnedWritePty> {
-        // Remove our sender from the service's sinks list.
-        {
-            let mut state = self.service_state.lock().await;
-            state.sinks.retain(|s| !s.same_channel(&self.handle));
+    /// and waits for the task to return the handle. Clears both fields so the
+    /// [`Drop`] impl is a no-op afterwards.
+    pub async fn take_pty_write(mut self) -> Option<pty_process::OwnedWritePty> {
+        if let Some(handle) = self.handle.take() {
+            // Remove our sender from the service's sinks list, then drop it to
+            // close the channel.
+            {
+                let mut state = self.service_state.lock().await;
+                state.sinks.retain(|s| !s.same_channel(&handle));
+            }
+            drop(handle);
         }
-        // Drop our sender to close the channel.
-        drop(self.handle);
-        self.join.await.ok()
+        match self.join.take() {
+            Some(join) => join.await.ok(),
+            None => None,
+        }
+    }
+}
+
+impl Drop for OscSinkHandle {
+    /// Stop the OSC task when the handle is dropped — e.g. when a restart
+    /// replaces `osc_sink` or a service stops. Without this the task lives on
+    /// holding the PTY's write half (the service's copy of the channel sender
+    /// stays in the sinks list, so the channel never closes), leaking one PTY
+    /// master per restart until the system runs out of PTYs.
+    ///
+    /// [`take_pty_write`] clears both fields first, so this is a no-op after a
+    /// reclaim.
+    fn drop(&mut self) {
+        // Aborting the task drops its `OwnedWritePty`, closing the PTY master's
+        // write half. (The read half is dropped with the output worker.)
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
+        // Remove the service's lingering copy of our sender so the dead sink
+        // stops receiving lines. The sinks list is behind an async lock, so
+        // hand the removal to a task — there is always a runtime on the runner
+        // loop, where these handles are dropped.
+        if let Some(handle) = self.handle.take() {
+            let service_state = Arc::clone(&self.service_state);
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let mut state = service_state.lock().await;
+                    state.sinks.retain(|s| !s.same_channel(&handle));
+                });
+            }
+        }
     }
 }
 
@@ -986,8 +1026,8 @@ impl OutputManager {
         }
         let join = tokio::spawn(osc_sink_task(rx, pty_write));
         Some(OscSinkHandle {
-            handle,
-            join,
+            handle: Some(handle),
+            join: Some(join),
             service_state: state_arc,
         })
     }
@@ -2126,6 +2166,49 @@ mod tests {
         assert!(
             output.contains("api: ready"),
             "per-service lifecycle for allowlisted name should pass: {output:?}"
+        );
+    }
+
+    /// Dropping an `OscSinkHandle` (as a restart/stop does when it replaces or
+    /// clears `osc_sink`) must remove the sink and stop its task — otherwise
+    /// the task keeps the PTY master's write half open, leaking one PTY per
+    /// drop on any exit path that skips `close_follow_sinks` (e.g. lazy
+    /// ready-check failures).
+    #[tokio::test]
+    async fn dropping_osc_sink_handle_removes_sink() {
+        let config = crate::config::LogConfig::Stdout;
+        let (writer, _buf) = TestBuffer::new();
+        let mgr = OutputManager::new(&[("api", &config)], writer)
+            .await
+            .unwrap();
+
+        let state = mgr.services.get("api").unwrap().clone();
+        let before = state.lock().await.sinks.len();
+
+        // Hand a real PTY's write half to an OSC sink.
+        let (pty, _pts) = pty_process::open().unwrap();
+        let (_read, write) = pty.into_split();
+        let handle = mgr.add_osc_sink("api", write).await.unwrap();
+        assert_eq!(
+            state.lock().await.sinks.len(),
+            before + 1,
+            "osc sink should be registered"
+        );
+
+        drop(handle);
+
+        // Drop aborts the task and spawns the sink removal; let it run.
+        let mut removed = false;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if state.lock().await.sinks.len() == before {
+                removed = true;
+                break;
+            }
+        }
+        assert!(
+            removed,
+            "osc sink must be removed when its handle is dropped (PTY leak guard)"
         );
     }
 }
