@@ -648,3 +648,79 @@ fn integration_lazy_listenfd_triggers_on_connect() {
         handle.await.unwrap();
     });
 }
+
+/// A lazy service that dies the instant it launches must not be relaunched
+/// forever. The trigger connection the dying service never accepts stays queued
+/// and re-fires the launch the moment the proxy re-arms; without the crash-loop
+/// guard on the lazy path this is a tight, no-backoff restart loop. After the
+/// rapid-crash ceiling the service is left Failed with its trigger un-armed.
+#[test]
+fn integration_lazy_crash_loop_gives_up_and_stops_relaunching() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("lazy-crash-loop");
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let counter = dir.path().join("launches");
+
+        let cmd = format!(
+            "N=$(cat {ctr} 2>/dev/null || echo 0); N=$((N + 1)); echo $N > {ctr}; exit 1",
+            ctr = counter.display()
+        );
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "bash", &["-c", &cmd])
+            .proxy_listenfd(&[&addr])
+            .lazy(true)
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(
+                &buf,
+                &format!("proxy listening on {addr}"),
+                Duration::from_secs(5)
+            )
+            .await,
+            "expected proxy to bind. output: {}",
+            read_buf(&buf)
+        );
+
+        // A single connection triggers the lazy start. The service crashes,
+        // the queued connection re-fires the launch once more, then the guard
+        // must give up.
+        let _stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        assert!(
+            wait_for_output(&buf, "giving up", Duration::from_secs(10)).await,
+            "expected the lazy crash loop to give up. output: {}",
+            read_buf(&buf)
+        );
+
+        // Let any errant retrigger fire, then probe a few more times: with the
+        // trigger un-armed these connections must not relaunch the service.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..3 {
+            let _ = tokio::net::TcpStream::connect(&addr).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let launches: i32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            launches, 2,
+            "lazy service should launch exactly twice before giving up, got {launches}. output: {}",
+            read_buf(&buf)
+        );
+    });
+}

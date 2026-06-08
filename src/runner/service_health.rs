@@ -204,55 +204,136 @@ impl Runner {
         if let Some(rs) = self.services.get_mut(name) {
             rs.pgid = None;
         }
-        self.set_service_state(name, ServiceState::Failed);
         let exit_msg = format_unexpected_exit(status);
         self.output_manager.service_error_event(name, &exit_msg);
-        let policy = self
+        let is_lazy = self
             .services
             .get(name)
-            .map(|rs| rs.resolved.on_failure)
-            .unwrap_or_default();
-        if matches!(policy, crate::config::OnFailure::Restart) {
-            // Crash-loop guard: a process that dies within RAPID_CRASH_WINDOW
-            // of starting is failing on launch. After MAX_RAPID_CRASHES such
-            // back-to-back fast deaths, stop retrying and leave it Failed — a
-            // hard ceiling that no backoff or `on_failure` policy overrides.
-            let lived = self
+            .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
+        if is_lazy {
+            // A lazy service restarts on a proxy connection, not on the
+            // backoff timer, so route its crash through the connection-aware
+            // crash-loop guard rather than scheduling an auto-restart. This
+            // keeps a service that dies on launch from being relaunched in a
+            // tight loop by its still-queued trigger connection.
+            self.handle_lazy_launch_failure(name, Some(&exit_msg));
+        } else {
+            self.set_service_state(name, ServiceState::Failed);
+            let policy = self
                 .services
                 .get(name)
-                .and_then(|rs| rs.last_start)
-                .map(|started| started.elapsed());
-            let prior = self
-                .services
-                .get(name)
-                .map(|rs| rs.rapid_crashes)
-                .unwrap_or(0);
-            let (rapid_crashes, give_up) = rapid_crash_outcome(lived, prior);
-            if let Some(rs) = self.services.get_mut(name) {
-                rs.rapid_crashes = rapid_crashes;
-            }
-            if give_up {
-                if let Some(rs) = self.services.get_mut(name)
-                    && let Some(prev) = rs.pending_restart.take()
-                {
-                    prev.abort();
+                .map(|rs| rs.resolved.on_failure)
+                .unwrap_or_default();
+            if matches!(policy, crate::config::OnFailure::Restart) {
+                // Crash-loop guard: a process that dies within
+                // RAPID_CRASH_WINDOW of starting is failing on launch. After
+                // MAX_RAPID_CRASHES such back-to-back fast deaths, stop
+                // retrying and leave it Failed — a hard ceiling that no backoff
+                // or `on_failure` policy overrides.
+                let lived = self
+                    .services
+                    .get(name)
+                    .and_then(|rs| rs.last_start)
+                    .map(|started| started.elapsed());
+                let prior = self
+                    .services
+                    .get(name)
+                    .map(|rs| rs.rapid_crashes)
+                    .unwrap_or(0);
+                let (rapid_crashes, give_up) = rapid_crash_outcome(lived, prior);
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.rapid_crashes = rapid_crashes;
                 }
-                self.output_manager.service_error_event(
-                    name,
-                    &format!(
-                        "crashed within {}s of starting {} times in a row — giving up (not auto-restarting)",
-                        RAPID_CRASH_WINDOW.as_secs(),
-                        rapid_crashes
-                    ),
-                );
-            } else {
-                self.schedule_auto_restart(name, &exit_msg, state == ServiceState::Running);
+                if give_up {
+                    if let Some(rs) = self.services.get_mut(name)
+                        && let Some(prev) = rs.pending_restart.take()
+                    {
+                        prev.abort();
+                    }
+                    self.output_manager.service_error_event(
+                        name,
+                        &format!(
+                            "crashed within {}s of starting {} times in a row — giving up (not auto-restarting)",
+                            RAPID_CRASH_WINDOW.as_secs(),
+                            rapid_crashes
+                        ),
+                    );
+                } else {
+                    self.schedule_auto_restart(name, &exit_msg, state == ServiceState::Running);
+                }
+            } else if let Some(rs) = self.services.get_mut(name) {
+                rs.reset_restart_tracking();
             }
-        } else if let Some(rs) = self.services.get_mut(name) {
-            rs.reset_restart_tracking();
         }
         if let Some(writer) = self.output_manager.service_writer(name) {
             writer.close_follow_sinks().await;
+        }
+    }
+
+    /// Route a lazy service's failed launch through the crash-loop guard.
+    ///
+    /// Lazy services restart on proxy connections, not on the auto-restart
+    /// backoff timer, so [`Self::handle_service_exited`]'s guard doesn't bound
+    /// them: a connection the dying service never accepts stays queued and
+    /// re-fires the launch the instant the proxy re-arms — a tight, no-backoff
+    /// crash loop. This applies the same rapid-crash ceiling. Each failed
+    /// launch bumps the streak (cleared by a launch that survives
+    /// [`RAPID_CRASH_WINDOW`]); once it trips we leave the service `Failed` and
+    /// do **not** re-arm the proxy trigger, so the queued connection stops
+    /// relaunching it. Otherwise the service returns to `Lazy` and re-arms so a
+    /// later connection can retry.
+    ///
+    /// A failed launch can surface twice — via the ready-check/`ItemDone` path
+    /// and via the crash watcher. The state check makes this idempotent: the
+    /// first caller transitions the service out of a live state, and the second
+    /// sees `Lazy`/`Failed` and returns, so the streak counts one per launch.
+    pub(in crate::runner) fn handle_lazy_launch_failure(&mut self, name: &str, message: Option<&str>) {
+        if !matches!(
+            self.services.get(name).map(|rs| rs.state()),
+            Some(ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy)
+        ) {
+            return;
+        }
+        let lived = self
+            .services
+            .get(name)
+            .and_then(|rs| rs.last_start)
+            .map(|started| started.elapsed());
+        let prior = self
+            .services
+            .get(name)
+            .map(|rs| rs.rapid_crashes)
+            .unwrap_or(0);
+        let (rapid_crashes, give_up) = rapid_crash_outcome(lived, prior);
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.rapid_crashes = rapid_crashes;
+            if let Some(prev) = rs.pending_restart.take() {
+                prev.abort();
+            }
+        }
+        if give_up {
+            self.set_service_state(name, ServiceState::Failed);
+            self.output_manager.service_error_event(
+                name,
+                &format!(
+                    "crashed within {}s of starting {} times in a row — giving up; \
+                     not re-arming the lazy trigger (run `don restart {name}` to retry)",
+                    RAPID_CRASH_WINDOW.as_secs(),
+                    rapid_crashes
+                ),
+            );
+        } else {
+            self.set_service_state(name, ServiceState::Lazy);
+            self.unblock_dependency_failed_items();
+            if let Some(rs) = self.services.get_mut(name)
+                && let Some(ref mut proxy) = rs.proxy
+            {
+                proxy.rearm_lazy_watchers();
+            }
+            if let Some(msg) = message {
+                self.output_manager
+                    .service_error_event(name, &format!("{msg} (will retry on next connection)"));
+            }
         }
     }
 

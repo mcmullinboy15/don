@@ -82,21 +82,12 @@ impl Runner {
                 .get(&item.name)
                 .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
             if is_lazy {
-                self.set_service_state(&item.name, ServiceState::Lazy);
-                self.unblock_dependency_failed_items();
-                // Re-arm POLLIN watchers on any listenfd proxy entries so
-                // the next queued connection re-triggers lazy start.
-                if let Some(rs) = self.services.get_mut(&item.name)
-                    && let Some(ref mut proxy) = rs.proxy
-                {
-                    proxy.rearm_lazy_watchers();
-                }
-                if let Some(ref msg) = item.message {
-                    self.output_manager.service_error_event(
-                        &item.name,
-                        &format!("{msg} (will retry on next connection)"),
-                    );
-                }
+                // Route through the crash-loop guard: returns to `Lazy` and
+                // re-arms the proxy trigger normally, but gives up (leaving it
+                // `Failed`, trigger un-armed) once it has crashed on launch too
+                // many times in a row — otherwise a still-queued connection
+                // relaunches a dying service in a tight, no-backoff loop.
+                self.handle_lazy_launch_failure(&item.name, item.message.as_deref());
             } else {
                 self.set_service_state(&item.name, ServiceState::Failed);
                 if let Some(ref msg) = item.message {

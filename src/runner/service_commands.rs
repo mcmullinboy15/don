@@ -753,13 +753,11 @@ impl Runner {
             .get(name)
             .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
         if is_lazy {
-            self.set_service_state(name, ServiceState::Lazy);
-            self.unblock_dependency_failed_items();
-            if let Some(rs) = self.services.get_mut(name)
-                && let Some(ref mut proxy) = rs.proxy
-            {
-                proxy.rearm_lazy_watchers();
-            }
+            // Route through the crash-loop guard so a lazy service that keeps
+            // dying on launch is eventually left `Failed` with its proxy
+            // trigger un-armed, instead of being relaunched in a tight loop by
+            // a still-queued connection. See `handle_lazy_launch_failure`.
+            self.handle_lazy_launch_failure(name, message.as_deref());
         } else {
             self.set_service_state(name, ServiceState::Failed);
             let policy = self
