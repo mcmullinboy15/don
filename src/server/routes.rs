@@ -1,7 +1,7 @@
 //! HTTP endpoints for the unix socket API.
 
 use super::ApiState;
-use crate::runner::{CommandError, CompletionError, ItemStatus, RunnerCommand};
+use crate::runner::{CommandError, CompletionError, ItemStatus, RunnerCommand, WatchReport};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/status", get(get_status))
+        .route("/watch", get(get_watch))
         .route("/start/{name}", post(post_start))
         .route("/stop/{name}", post(post_stop))
         .route("/restart/{name}", post(post_restart))
@@ -37,6 +38,10 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
 struct StatusQuery {
     #[serde(default)]
     verbose: bool,
+    /// Restrict the response to a single service/task and include its full
+    /// resolved watch path list. Omit to list all items (path list elided).
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// `GET /status` — list all services/tasks and their current state.
@@ -49,6 +54,7 @@ async fn get_status(
         .cmd_tx
         .send(RunnerCommand::Status {
             verbose: query.verbose,
+            name: query.name,
             reply: tx,
         })
         .is_err()
@@ -64,6 +70,28 @@ async fn get_status(
 #[derive(Serialize)]
 struct StatusResponse {
     items: Vec<ItemStatus>,
+}
+
+/// `GET /watch` — global file-watch state (inotify dirs + per-item patterns).
+async fn get_watch(State(state): State<Arc<ApiState>>) -> Response {
+    let (tx, rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(RunnerCommand::WatchStatus { reply: tx })
+        .is_err()
+    {
+        return runner_unavailable();
+    }
+    match rx.await {
+        Ok(watch) => Json(WatchResponse { watch }).into_response(),
+        Err(_) => runner_unavailable(),
+    }
+}
+
+#[derive(Serialize)]
+struct WatchResponse {
+    /// `None` when no watches are active (serialized as JSON `null`).
+    watch: Option<WatchReport>,
 }
 
 /// `POST /start/:name` — start a stopped service.

@@ -114,11 +114,23 @@ pub(crate) struct WatchItemSnapshot {
     pub stale: bool,
     pub debounce_ms: u64,
     pub last_error: Option<String>,
+    /// Compiled (absolute) glob patterns this item matches file events against.
+    pub patterns: Vec<String>,
+    /// Item-specific ignore globs. Workspace-wide `watch_ignore` entries are
+    /// reported once on the snapshot (see [`WatchSnapshot::global_ignore`]) and
+    /// filtered out here so they aren't repeated under every item.
+    pub ignore_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct WatchSnapshot {
     pub items: HashMap<String, WatchItemSnapshot>,
+    /// The actual inotify registrations the watcher holds, as
+    /// `(directory, mode)` where mode is `"recursive"` / `"non-recursive"`.
+    /// This is the ground truth of what don is watching at the OS level.
+    pub registered_dirs: Vec<(PathBuf, &'static str)>,
+    /// Workspace-wide `watch_ignore` globs (apply to every item).
+    pub global_ignore: Vec<String>,
     pub notify_error_count: u64,
     pub runner_event_lag_count: u64,
     pub last_notify_error: Option<String>,
@@ -1055,6 +1067,12 @@ impl WatchManager {
     }
 
     fn snapshot(&self) -> WatchSnapshot {
+        // Global `watch_ignore` is merged into every item's `ignore_patterns` at
+        // setup. Filter it back out per item so the report shows item-specific
+        // ignores only and lists the workspace-wide set once.
+        let global_set: std::collections::HashSet<&str> =
+            self.global_ignore.iter().map(Pattern::as_str).collect();
+
         let items = self
             .items
             .iter()
@@ -1067,13 +1085,33 @@ impl WatchManager {
                         stale: item.stale,
                         debounce_ms: item.debounce_duration.as_millis() as u64,
                         last_error: item.last_error.clone(),
+                        patterns: item.patterns.iter().map(|p| p.as_str().to_string()).collect(),
+                        ignore_patterns: item
+                            .ignore_patterns
+                            .iter()
+                            .map(Pattern::as_str)
+                            .filter(|p| !global_set.contains(p))
+                            .map(str::to_string)
+                            .collect(),
                     },
                 )
             })
             .collect();
 
+        let registered_dirs = self
+            .registered_dirs
+            .iter()
+            .map(|(dir, mode)| (dir.clone(), recursive_mode_label(*mode)))
+            .collect();
+
         WatchSnapshot {
             items,
+            registered_dirs,
+            global_ignore: self
+                .global_ignore
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect(),
             notify_error_count: self.notify_error_count,
             runner_event_lag_count: self.runner_event_lag_count,
             last_notify_error: self.last_notify_error.clone(),
@@ -1154,6 +1192,13 @@ fn watch_state_label(state: WatchState) -> &'static str {
         WatchState::Idle => "idle",
         WatchState::Debouncing => "debouncing",
         WatchState::Rebuilding => "rebuilding",
+    }
+}
+
+fn recursive_mode_label(mode: RecursiveMode) -> &'static str {
+    match mode {
+        RecursiveMode::Recursive => "recursive",
+        RecursiveMode::NonRecursive => "non-recursive",
     }
 }
 

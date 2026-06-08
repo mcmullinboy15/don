@@ -259,7 +259,7 @@ fn cli_detached_start_and_stop_daemon() {
         let socket = dir.path().join(".don").join("don.sock");
         assert!(wait_for_socket(&socket, Duration::from_secs(5)).await);
         let client = Client::new(dir.path());
-        client.status(false).await.unwrap();
+        client.status(false, None).await.unwrap();
 
         let cp = config_path.clone();
         let (code, _stdout, stderr) = tokio::task::spawn_blocking(move || run_cli(&cp, &["stop"]))
@@ -292,7 +292,7 @@ fn cli_stop_and_restart_flow() {
         // status should show stopped
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = Client::new(dir.path());
-        let items = client.status(false).await.unwrap();
+        let items = client.status(false, None).await.unwrap();
         let joined = format!("{items:?}");
         assert!(joined.to_lowercase().contains("stopped"), "items: {joined}");
 

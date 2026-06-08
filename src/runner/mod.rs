@@ -360,10 +360,17 @@ pub enum RunnerCommand {
     RebuildStale { name: String },
     /// Re-run a task triggered by a file watch event.
     TaskRerun { name: String },
-    /// Query the status of all services and tasks.
+    /// Query the status of all services and tasks. When `name` is `Some`, only
+    /// that item is returned, with its full resolved watch path list included.
     Status {
         verbose: bool,
+        name: Option<String>,
         reply: oneshot::Sender<Vec<ItemStatus>>,
+    },
+    /// Query the global file-watch state — registered inotify directories and
+    /// per-item patterns. Replies `None` when no watches are active.
+    WatchStatus {
+        reply: oneshot::Sender<Option<WatchReport>>,
     },
     /// Read the last N lines from a service or task's ring buffer.
     /// Returns None if the name is unknown.
@@ -576,6 +583,63 @@ pub struct VerboseInfo {
 }
 
 fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// A global snapshot of everything the file watcher is monitoring right now,
+/// independent of any single service. Returned by `GET /watch` / `don watch`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WatchReport {
+    /// The actual inotify registrations — the ground truth of what don is
+    /// watching at the OS level. Sorted by path.
+    pub directories: Vec<WatchDir>,
+    /// Per-item (service/task/build-graph) watch state and patterns, sorted by
+    /// name.
+    pub items: Vec<WatchReportItem>,
+    /// Workspace-wide `watch_ignore` globs that apply to every item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub global_ignore: Vec<String>,
+    /// Count of notify backend errors observed since startup.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub notify_error_count: u64,
+    /// Count of runner-event broadcast-lag incidents (a non-zero value means an
+    /// item may be stuck mid-rebuild).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub runner_event_lag_count: u64,
+    /// Most recent notify backend error, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_notify_error: Option<String>,
+}
+
+/// One inotify registration: a directory and the mode it was registered under.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WatchDir {
+    pub path: String,
+    /// `"recursive"` or `"non-recursive"`.
+    pub mode: String,
+}
+
+/// Per-item entry in a [`WatchReport`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WatchReportItem {
+    pub name: String,
+    /// `"service"`, `"task"`, or `"build_graph"`.
+    pub kind: String,
+    /// Watch state machine: `"idle"`, `"debouncing"`, or `"rebuilding"`.
+    pub state: String,
+    pub stale: bool,
+    pub debounce_ms: u64,
+    /// Absolute glob patterns that trigger a rebuild/rerun for this item.
+    pub patterns: Vec<String>,
+    /// Item-specific ignore globs (workspace-wide ignores live on the report).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_patterns: Vec<String>,
+    /// Last watch-registration error for this item, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -1263,9 +1327,13 @@ impl Runner {
                                 self.initiate_shutdown().await;
                                 break;
                             }
-                            RunnerCommand::Status { verbose, reply } => {
-                                let statuses = self.collect_status(verbose).await;
+                            RunnerCommand::Status { verbose, name, reply } => {
+                                let statuses = self.collect_status(verbose, name.as_deref()).await;
                                 let _ = reply.send(statuses);
+                            }
+                            RunnerCommand::WatchStatus { reply } => {
+                                let report = self.collect_watch_report().await;
+                                let _ = reply.send(report);
                             }
                             RunnerCommand::Logs { name, last_n, reply } => {
                                 let logs = self.output_manager

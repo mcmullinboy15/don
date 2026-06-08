@@ -203,6 +203,102 @@ fn integration_verbose_status_summarizes_watch_paths() {
 }
 
 #[test]
+fn integration_verbose_status_single_item_lists_watch_paths() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-status-watch-single");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "sleep", &["60"])
+            .log("ignore")
+            .watch(&["src/one.ts", "src/two.ts"])
+            .ready_exec("true", &[])
+            .done()
+            .add_custom_service("web", "sleep", &["60"])
+            .log("ignore")
+            .watch(&["web/only.ts"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        // Drilling into a single item expands its full watch path list...
+        let (status, body) = request(&socket, "GET", "/status?verbose=true&name=api").await;
+        assert_eq!(status, 200, "body: {body}");
+        assert!(body.contains("src/one.ts"), "body: {body}");
+        assert!(body.contains("src/two.ts"), "body: {body}");
+        // ...and returns only that item — no sibling service.
+        assert!(!body.contains("\"name\":\"web\""), "body: {body}");
+        assert!(!body.contains("web/only.ts"), "body: {body}");
+
+        // A name that matches nothing is an empty list, not an error.
+        let (status, body) = request(&socket, "GET", "/status?verbose=true&name=nope").await;
+        assert_eq!(status, 200, "body: {body}");
+        assert!(body.contains("\"items\":[]"), "body: {body}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_watch_endpoint_reports_dirs_and_patterns() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-watch-report");
+        let toml = ConfigBuilder::new()
+            .watch_ignore(&["**/node_modules/**"])
+            .add_custom_service("api", "sleep", &["60"])
+            .log("ignore")
+            .watch(&["src/**/*.ts"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let (status, body) = request(&socket, "GET", "/watch").await;
+        assert_eq!(status, 200, "body: {body}");
+        // Registered inotify directory for the resolved `src` watch.
+        assert!(body.contains("\"directories\""), "body: {body}");
+        assert!(body.contains("\"mode\":\"recursive\""), "body: {body}");
+        // The item and its (absolute) glob pattern.
+        assert!(body.contains("\"name\":\"api\""), "body: {body}");
+        assert!(body.contains("\"kind\":\"service\""), "body: {body}");
+        assert!(body.contains("src/**/*.ts"), "body: {body}");
+        // Workspace-wide ignore is reported once at the top level.
+        assert!(body.contains("node_modules"), "body: {body}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_watch_endpoint_null_when_no_watches() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("server-watch-none");
+        // A service with no watch patterns registers no watches at all.
+        let toml = ConfigBuilder::new()
+            .add_custom_service("api", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let (status, body) = request(&socket, "GET", "/watch").await;
+        assert_eq!(status, 200, "body: {body}");
+        assert!(body.contains("\"watch\":null"), "body: {body}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
 fn integration_status_endpoint_includes_task_last_run() {
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("server-task-last-run");

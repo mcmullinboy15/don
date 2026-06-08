@@ -1,4 +1,4 @@
-use super::{ItemStatus, Runner, VerboseInfo};
+use super::{ItemStatus, Runner, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
 use tokio::sync::oneshot;
 
 impl Runner {
@@ -20,8 +20,60 @@ impl Runner {
             .and_then(Result::ok)
     }
 
+    /// Build a global [`WatchReport`] of every active inotify registration and
+    /// per-item watch pattern. Returns `None` when no watches are active (no
+    /// service/task declared watch patterns, or the watcher is unreachable).
+    pub(in crate::runner) async fn collect_watch_report(&self) -> Option<WatchReport> {
+        let snapshot = self.fetch_watch_snapshot().await?;
+
+        let mut directories: Vec<WatchDir> = snapshot
+            .registered_dirs
+            .iter()
+            .map(|(path, mode)| WatchDir {
+                path: path.to_string_lossy().into_owned(),
+                mode: (*mode).to_string(),
+            })
+            .collect();
+        directories.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let mut items: Vec<WatchReportItem> = snapshot
+            .items
+            .iter()
+            .map(|(name, item)| WatchReportItem {
+                name: name.clone(),
+                kind: item.kind.to_string(),
+                state: item.state.to_string(),
+                stale: item.stale,
+                debounce_ms: item.debounce_ms,
+                patterns: item.patterns.clone(),
+                ignore_patterns: item.ignore_patterns.clone(),
+                last_error: item.last_error.clone(),
+            })
+            .collect();
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Some(WatchReport {
+            directories,
+            items,
+            global_ignore: snapshot.global_ignore.clone(),
+            notify_error_count: snapshot.notify_error_count,
+            runner_event_lag_count: snapshot.runner_event_lag_count,
+            last_notify_error: snapshot.last_notify_error.clone(),
+        })
+    }
+
     /// Collect status of all items.
-    pub(in crate::runner) async fn collect_status(&self, verbose: bool) -> Vec<ItemStatus> {
+    ///
+    /// When `detail_name` is `Some`, only that single service/task is returned
+    /// and its fully-resolved `watch` path list is included. The all-items view
+    /// (`detail_name == None`) deliberately omits the path list — for a
+    /// build-tool stack it can be hundreds of resolved paths per service, so the
+    /// default verbose view reports only the count and callers drill in by name.
+    pub(in crate::runner) async fn collect_status(
+        &self,
+        verbose: bool,
+        detail_name: Option<&str>,
+    ) -> Vec<ItemStatus> {
         let mut statuses = Vec::new();
         let watch_snapshot = if verbose {
             self.fetch_watch_snapshot().await
@@ -30,6 +82,9 @@ impl Runner {
         };
         let watch_snapshot_available = watch_snapshot.is_some();
         for (name, rs) in &self.services {
+            if detail_name.is_some_and(|want| want != name) {
+                continue;
+            }
             let verbose_info = if verbose {
                 let resolved = &rs.resolved;
                 let ready = resolved.ready.as_ref().map(|r| {
@@ -88,7 +143,13 @@ impl Runner {
                 Some(VerboseInfo {
                     depends_on: resolved.depends_on.clone(),
                     watch_count: watch.len(),
-                    watch: Vec::new(),
+                    // Full path list only on a single-item drill-in; see
+                    // `collect_status` doc for why the all-items view omits it.
+                    watch: if detail_name.is_some() {
+                        watch
+                    } else {
+                        Vec::new()
+                    },
                     proxy: resolved
                         .proxy
                         .iter()
@@ -130,6 +191,9 @@ impl Runner {
             });
         }
         for (name, rt) in &self.tasks {
+            if detail_name.is_some_and(|want| want != name) {
+                continue;
+            }
             let verbose_info = if verbose {
                 let task = &rt.config;
                 let cmd_str = if task.args.is_empty() {
@@ -174,7 +238,13 @@ impl Runner {
                 Some(VerboseInfo {
                     depends_on: task.depends_on.clone(),
                     watch_count: watch.len(),
-                    watch: Vec::new(),
+                    // Full path list only on a single-item drill-in; see
+                    // `collect_status` doc for why the all-items view omits it.
+                    watch: if detail_name.is_some() {
+                        watch
+                    } else {
+                        Vec::new()
+                    },
                     proxy: Vec::new(),
                     proxy_active_connections: None,
                     bazel_target: task.bazel.as_ref().map(|b| b.target.clone()),

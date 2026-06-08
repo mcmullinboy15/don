@@ -61,6 +61,13 @@ pub struct StatusResponse {
     pub items: Vec<ItemStatus>,
 }
 
+/// Deserialised body of `GET /watch`.
+#[derive(Debug, Deserialize)]
+pub struct WatchResponse {
+    /// `None` when no watches are active.
+    pub watch: Option<crate::runner::WatchReport>,
+}
+
 /// Deserialised body of `GET /logs/:name`.
 #[derive(Debug, Deserialize)]
 pub struct LogsResponse {
@@ -100,16 +107,40 @@ impl Client {
     }
 
     /// `GET /status`
-    pub async fn status(&self, verbose: bool) -> Result<Vec<ItemStatus>, ClientError> {
-        let path = if verbose {
-            "/status?verbose=true"
-        } else {
-            "/status"
-        };
-        let (status, body) = self.request("GET", path, false).await?;
+    ///
+    /// When `name` is `Some`, the response is restricted to that single
+    /// service/task and includes its full resolved watch path list (the
+    /// all-items view omits the path list — see the server's `collect_status`).
+    /// A name that matches nothing yields an empty list, not an error.
+    pub async fn status(
+        &self,
+        verbose: bool,
+        name: Option<&str>,
+    ) -> Result<Vec<ItemStatus>, ClientError> {
+        let mut path = String::from("/status");
+        let mut sep = '?';
+        if verbose {
+            path.push_str("?verbose=true");
+            sep = '&';
+        }
+        if let Some(name) = name {
+            path.push(sep);
+            path.push_str("name=");
+            path.push_str(&urlencode(name));
+        }
+        let (status, body) = self.request("GET", &path, false).await?;
         ensure_ok(status, &body)?;
         let parsed: StatusResponse = serde_json::from_slice(&body)?;
         Ok(parsed.items)
+    }
+
+    /// `GET /watch` — global file-watch state (inotify dirs + per-item
+    /// patterns). `Ok(None)` means no watches are active.
+    pub async fn watch(&self) -> Result<Option<crate::runner::WatchReport>, ClientError> {
+        let (status, body) = self.request("GET", "/watch", false).await?;
+        ensure_ok(status, &body)?;
+        let parsed: WatchResponse = serde_json::from_slice(&body)?;
+        Ok(parsed.watch)
     }
 
     /// `POST /start/:name`

@@ -81,8 +81,12 @@ enum Commands {
         /// Name of the service to restart
         name: String,
     },
-    /// Show status of all services and tasks
+    /// Show status of all services and tasks, or a single one when NAME is given
     Status {
+        /// Name of a single service or task to inspect (omit to show all).
+        /// Combine with `--verbose` to list its fully-resolved watch paths —
+        /// useful for debugging why a build-tool service isn't reloading.
+        name: Option<String>,
         /// Show detailed info: watch paths, ports, build tool targets, commands
         #[arg(short, long)]
         verbose: bool,
@@ -90,6 +94,15 @@ enum Commands {
         /// top-level `ready` bool (true when every service is Ready or Lazy)
         /// and an `items` array. Useful for scripts and agents polling for
         /// stack readiness.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show everything don is currently watching: the inotify directories it has
+    /// registered plus the per-item glob patterns that trigger reloads. Useful
+    /// for confirming a file actually falls under a watch — especially for
+    /// build-tool services whose paths are resolved dynamically.
+    Watch {
+        /// Emit machine-readable JSON instead of the human-readable report.
         #[arg(long)]
         json: bool,
     },
@@ -237,7 +250,12 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Restart { name } => {
             run_client(&config_path, |c| async move { c.restart(&name).await }).await
         }
-        Commands::Status { verbose, json } => run_status(&config_path, verbose, json).await,
+        Commands::Status {
+            name,
+            verbose,
+            json,
+        } => run_status(&config_path, name.as_deref(), verbose, json).await,
+        Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
@@ -556,7 +574,7 @@ async fn wait_for_daemon_socket_gone(
     let client = Client::with_socket_path(socket_path.to_path_buf());
     let start = tokio::time::Instant::now();
     loop {
-        if let Err(ClientError::NotRunning { .. }) = client.status(false).await {
+        if let Err(ClientError::NotRunning { .. }) = client.status(false, None).await {
             return Ok(());
         }
         if start.elapsed() >= timeout {
@@ -569,10 +587,27 @@ async fn wait_for_daemon_socket_gone(
     }
 }
 
-async fn run_status(config_path: &Path, verbose: bool, json: bool) -> i32 {
+async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json: bool) -> i32 {
     let client = client_for(config_path);
-    match client.status(verbose).await {
+    match client.status(verbose, name).await {
         Ok(mut items) => {
+            // A named query is filtered server-side; an empty result means the
+            // name didn't match anything. Fetch the full list to offer a
+            // did-you-mean before failing.
+            if let Some(name) = name
+                && items.is_empty()
+            {
+                let suggestion = match client.status(false, None).await {
+                    Ok(all) => {
+                        let available: std::collections::HashSet<&str> =
+                            all.iter().map(item_name).collect();
+                        suggest_name_typo(name, &available)
+                    }
+                    Err(_) => String::new(),
+                };
+                errln(format!("no service or task named '{name}'{suggestion}"));
+                return 1;
+            }
             items.sort_by(|a, b| {
                 status_sort_bucket(a)
                     .cmp(&status_sort_bucket(b))
@@ -599,12 +634,132 @@ async fn run_status(config_path: &Path, verbose: bool, json: bool) -> i32 {
                     }
                 };
             }
-            print_status_table(&items, verbose);
+            print_status_table(&items, verbose, name.is_some());
             0
         }
         Err(e) => {
             errln(e);
             1
+        }
+    }
+}
+
+async fn run_watch(config_path: &Path, json: bool) -> i32 {
+    let client = client_for(config_path);
+    match client.watch().await {
+        Ok(report) => {
+            if json {
+                #[derive(serde::Serialize)]
+                struct WatchJson<'a> {
+                    watch: Option<&'a don::WatchReport>,
+                }
+                return match serde_json::to_string_pretty(&WatchJson {
+                    watch: report.as_ref(),
+                }) {
+                    Ok(s) => {
+                        println!("{s}");
+                        0
+                    }
+                    Err(e) => {
+                        errln(format!("failed to serialize watch report as JSON: {e}"));
+                        1
+                    }
+                };
+            }
+            match report {
+                Some(report) => print_watch_report(&report),
+                None => println!(
+                    "don is not watching any files (no service or task has watch patterns enabled)"
+                ),
+            }
+            0
+        }
+        Err(e) => {
+            errln(e);
+            1
+        }
+    }
+}
+
+fn print_watch_report(report: &don::WatchReport) {
+    let dim = SetAttribute(Attribute::Dim);
+    let reset = SetAttribute(Attribute::Reset);
+
+    // Headline: the actual inotify registrations — what don is truly watching.
+    if report.directories.is_empty() {
+        println!("watching 0 directories");
+    } else {
+        let mode_w = report
+            .directories
+            .iter()
+            .map(|d| d.mode.len())
+            .max()
+            .unwrap_or(0);
+        println!(
+            "watching {} {} (inotify):",
+            report.directories.len(),
+            if report.directories.len() == 1 {
+                "directory"
+            } else {
+                "directories"
+            }
+        );
+        for dir in &report.directories {
+            println!("  {:<mode_w$}  {}", dir.mode, dir.path);
+        }
+    }
+
+    if !report.global_ignore.is_empty() {
+        println!();
+        println!("{dim}global ignore:{reset}");
+        for pattern in &report.global_ignore {
+            println!("  {pattern}");
+        }
+    }
+
+    println!();
+    println!(
+        "{} watched {}:",
+        report.items.len(),
+        if report.items.len() == 1 {
+            "item"
+        } else {
+            "items"
+        }
+    );
+    for item in &report.items {
+        let stale = if item.stale { " stale" } else { "" };
+        println!(
+            "  {}  {dim}{} · {} · debounce {}ms{}{reset}",
+            item.name, item.kind, item.state, item.debounce_ms, stale
+        );
+        for pattern in &item.patterns {
+            println!("      {pattern}");
+        }
+        for pattern in &item.ignore_patterns {
+            println!("      {dim}! {pattern}{reset}");
+        }
+        if let Some(ref err) = item.last_error {
+            println!("      {dim}error: {err}{reset}");
+        }
+    }
+
+    // Diagnostics worth surfacing: a non-zero count here usually explains a
+    // "didn't reload" report (dropped events or an item stuck mid-rebuild).
+    if report.notify_error_count > 0 || report.runner_event_lag_count > 0 {
+        println!();
+        if report.notify_error_count > 0 {
+            let last = report.last_notify_error.as_deref().unwrap_or("");
+            println!(
+                "{dim}notify errors:{reset} {} (last: {last})",
+                report.notify_error_count
+            );
+        }
+        if report.runner_event_lag_count > 0 {
+            println!(
+                "{dim}runner-event lag:{reset} {} — an item may be stuck mid-rebuild",
+                report.runner_event_lag_count
+            );
         }
     }
 }
@@ -700,7 +855,7 @@ async fn run_attach(config_path: &Path, name: &str) -> i32 {
     }
 }
 
-fn print_status_table(items: &[ItemStatus], verbose: bool) {
+fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: bool) {
     if items.is_empty() {
         println!("(no services or tasks)");
         return;
@@ -786,7 +941,7 @@ fn print_status_table(items: &[ItemStatus], verbose: bool) {
         );
 
         if verbose && let Some(info) = verbose_info {
-            print_verbose_info(info);
+            print_verbose_info(info, show_watch_paths);
         }
     }
 }
@@ -846,7 +1001,7 @@ fn format_duration_ms(duration_ms: u64) -> String {
 
 /// Print verbose details for a single item, indented under the status line.
 #[allow(clippy::print_stdout)]
-fn print_verbose_info(info: &don::runner::VerboseInfo) {
+fn print_verbose_info(info: &don::runner::VerboseInfo, show_watch_paths: bool) {
     let dim = SetAttribute(Attribute::Dim);
     let reset = SetAttribute(Attribute::Reset);
 
@@ -871,17 +1026,20 @@ fn print_verbose_info(info: &don::runner::VerboseInfo) {
     if let Some(ref task) = info.turbo_task {
         println!("  {dim}turbo:{reset}  {task}");
     }
-    if info.watch_count > 0 {
-        println!("  {dim}watch:{reset}  {} paths", info.watch_count);
-    }
-    if !info.watch.is_empty() {
+    // When inspecting a single item, expand the full resolved watch path list
+    // (these are dynamically resolved for build-tool services, so the count
+    // alone hides what's actually being watched). In the all-items view keep it
+    // to a count so a large stack stays scannable.
+    if show_watch_paths && !info.watch.is_empty() {
         println!(
             "  {dim}watch:{reset}  {}",
-            info.watch.first().unwrap_or(&String::new())
+            info.watch.first().map(String::as_str).unwrap_or("")
         );
         for pattern in info.watch.iter().skip(1) {
             println!("         {pattern}");
         }
+    } else if info.watch_count > 0 {
+        println!("  {dim}watch:{reset}  {} paths", info.watch_count);
     }
     if let Some(ref watch_state) = info.watch_state {
         println!("  {dim}watch state:{reset}  {watch_state}");
@@ -1088,12 +1246,13 @@ fn validate(config_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Lightweight Levenshtein-style typo suggestion for `--log-filter` names.
-/// Returns ` — did you mean '<best>'?` or empty if nothing close is found.
-/// Mirrors the shape used by `config::suggest_typo` so error messages read
-/// the same on both surfaces; kept local to avoid widening the config
-/// module's public API for a single CLI-side caller.
-fn suggest_log_filter_typo(input: &str, candidates: &std::collections::HashSet<&str>) -> String {
+/// Lightweight Levenshtein-style typo suggestion for CLI-supplied names
+/// (`--log-filter` entries, `status <name>`, …). Returns
+/// ` — did you mean '<best>'?` or empty if nothing close is found. Mirrors the
+/// shape used by `config::suggest_typo` so error messages read the same on both
+/// surfaces; kept local to avoid widening the config module's public API for a
+/// CLI-side caller.
+fn suggest_name_typo(input: &str, candidates: &std::collections::HashSet<&str>) -> String {
     fn distance(a: &str, b: &str) -> usize {
         let a: Vec<char> = a.chars().collect();
         let b: Vec<char> = b.chars().collect();
@@ -1133,7 +1292,7 @@ async fn run_start_detached(
 ) -> Result<(), String> {
     let base = base_dir(config_path);
     let client = Client::new(&base);
-    match client.status(false).await {
+    match client.status(false, None).await {
         Ok(_) => return Err("don daemon is already running".to_string()),
         Err(ClientError::NotRunning { .. }) => {}
         Err(e) => return Err(format!("failed to check daemon status: {e}")),
@@ -1217,7 +1376,7 @@ async fn wait_for_detached_start(
     let timeout = std::time::Duration::from_secs(5);
 
     loop {
-        match client.status(false).await {
+        match client.status(false, None).await {
             Ok(_) => {
                 println!(
                     "don started in background (pid {pid}, log: {})",
@@ -1414,7 +1573,7 @@ async fn run_start(
         let mut invalid: Vec<(String, String)> = Vec::new();
         for name in &log_filter {
             if !valid.contains(name.as_str()) {
-                invalid.push((name.clone(), suggest_log_filter_typo(name, &valid)));
+                invalid.push((name.clone(), suggest_name_typo(name, &valid)));
             }
         }
         if !invalid.is_empty() {

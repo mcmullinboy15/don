@@ -1073,6 +1073,7 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
             cmd_tx
                 .send(RunnerCommand::Status {
                     verbose: false,
+                    name: None,
                     reply: status_tx,
                 })
                 .unwrap();
@@ -1344,6 +1345,7 @@ fn integration_restart_crashed_service_without_ready_check() {
             cmd_tx
                 .send(RunnerCommand::Status {
                     verbose: false,
+                    name: None,
                     reply: status_tx,
                 })
                 .unwrap();
