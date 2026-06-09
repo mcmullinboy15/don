@@ -99,6 +99,13 @@ pub(crate) struct RuntimeService {
     /// A watched file changed during the current rebuild cycle, so any
     /// pending restart for that cycle should be skipped.
     pub rebuild_stale: bool,
+    /// A build completed successfully but its restart was skipped because the
+    /// item went stale (a watched file changed mid-build), so the running
+    /// process is now *behind* the latest built artifact. The follow-up
+    /// rebuild cycle must restart even if the build tool reports "up to date" —
+    /// up-to-date is measured against the last *build*, not against the
+    /// *running process*. Cleared once the process is (re)started.
+    pub artifact_ahead_of_process: bool,
 }
 
 impl RuntimeService {
@@ -133,6 +140,7 @@ impl RuntimeService {
             rebuild_worker: None,
             rebuild_generation: 0,
             rebuild_stale: false,
+            artifact_ahead_of_process: false,
         }
     }
 

@@ -122,6 +122,16 @@ impl Runner {
         })
     }
 
+    /// Read and clear the "running process is behind the latest build" flag.
+    /// See [`crate::runner::state::RuntimeService::artifact_ahead_of_process`].
+    pub(in crate::runner) fn take_artifact_ahead_of_process(&mut self, name: &str) -> bool {
+        self.services.get_mut(name).is_some_and(|rs| {
+            let ahead = rs.artifact_ahead_of_process;
+            rs.artifact_ahead_of_process = false;
+            ahead
+        })
+    }
+
     pub(in crate::runner) async fn handle_rebuild_batch_complete(
         &mut self,
         outcome: RebuildBatchOutcome,
@@ -130,6 +140,20 @@ impl Runner {
             self.fail_rebuild(name, message);
         }
         for name in &outcome.up_to_date {
+            // Normally up-to-date means the running process already has the
+            // current artifact, so there's nothing to do. But if an earlier
+            // stale build deferred this service's restart, the process is still
+            // behind the last successful build — restart into it now rather
+            // than no-op (up-to-date is measured against the last build, not
+            // the running process).
+            if self.take_artifact_ahead_of_process(name) {
+                self.output_manager.service_debug_event(
+                    name,
+                    "up to date, but process is behind last build — restarting",
+                );
+                self.do_rebuild(name).await;
+                continue;
+            }
             self.output_manager
                 .service_debug_event(name, "skipped (no changes)");
             let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
@@ -142,6 +166,14 @@ impl Runner {
                 rs.batch_built = true;
             }
             if self.take_rebuild_stale(name) {
+                // A watched file changed mid-build. Skip restarting into the
+                // artifact we just built and let the follow-up cycle pick up
+                // the newer change — but record that the running process is now
+                // behind a successful build, so the follow-up restarts even if
+                // the build tool then reports up-to-date.
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.artifact_ahead_of_process = true;
+                }
                 let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
                     name: name.clone(),
                     success: true,
@@ -516,6 +548,11 @@ impl Runner {
     /// This is the core rebuild logic, called either directly (non-build-tool
     /// services) or after a batch build completes (build-tool services).
     async fn do_rebuild(&mut self, name: &str) {
+        // We're committing to a restart, so the process will be brought up to
+        // the current artifact — clear the "behind the latest build" flag.
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.artifact_ahead_of_process = false;
+        }
         let resolved = match self.services.get(name) {
             Some(rs) => rs.resolved.clone(),
             None => {

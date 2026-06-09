@@ -2005,6 +2005,129 @@ mod tests {
         }
     }
 
+    /// Build a runner with a single watch-enabled bazel service "api", for
+    /// exercising the rebuild-batch completion paths directly. Returns the
+    /// shutdown sender too so the runner's `shutdown_rx` stays open.
+    async fn single_bazel_runner(
+        temp: &std::path::Path,
+    ) -> (Runner, mpsc::Sender<()>) {
+        use crate::config::service::{Service, ServiceKind};
+        use crate::config::types::{BazelConfig, LogConfig, LogFilterConfig};
+
+        let config = Config {
+            services: [(
+                "api".to_string(),
+                Service {
+                    dir: None,
+                    env: HashMap::new(),
+                    env_file: Vec::new(),
+                    watch: Vec::new(),
+                    ignore: Vec::new(),
+                    debounce: None,
+                    depends_on: Vec::new(),
+                    proxy: Vec::new(),
+                    lazy: false,
+                    download: None,
+                    ready: None,
+                    shutdown: None,
+                    log: LogConfig::Stdout,
+                    log_filter: LogFilterConfig::default(),
+                    reload: true,
+                    tty: true,
+                    on_failure: crate::config::OnFailure::Notify,
+                    platform: HashMap::new(),
+                    hidden: false,
+                    auto_filter_on_failure: None,
+                    kind: Some(ServiceKind::Bazel(BazelConfig {
+                        target: "//api:api".to_string(),
+                        watch: true,
+                    })),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            service_groups: HashMap::new(),
+            tasks: HashMap::new(),
+            profiles: HashMap::new(),
+            default_profile: None,
+            watch_ignore: Vec::new(),
+            shutdown: crate::config::ShutdownConfig::default(),
+            log_filter: LogFilterConfig::default(),
+            auto_filter_on_failure: true,
+        };
+        let output_manager = crate::output::OutputManager::new_verbose(
+            &[("api", &LogConfig::Stdout)],
+            tokio::io::sink(),
+            false,
+        )
+        .await
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let runner = Runner::new(
+            config,
+            Platform::LinuxX86_64,
+            output_manager,
+            temp.to_path_buf(),
+            None,
+            shutdown_rx,
+            TerminalCoordinator::detached(),
+        )
+        .await
+        .unwrap();
+        (runner, shutdown_tx)
+    }
+
+    /// Regression: a watched file changes *during* a bazel build. The build
+    /// that completes is correct, but its restart is deferred because the item
+    /// went stale. The follow-up cycle then finds bazel "up to date" — and must
+    /// still restart, because up-to-date is measured against the last *build*,
+    /// not against the *running process*. Without the fix the service keeps
+    /// running the old binary forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_build_then_up_to_date_followup_still_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+
+        // The service is up, running the pre-edit binary.
+        runner.set_service_state("api", ServiceState::Running);
+
+        // A watched file changed mid-build → the watcher marked it stale.
+        runner.mark_rebuild_stale("api");
+
+        // The in-flight build completes successfully. Because it's stale, the
+        // restart is deferred to the follow-up cycle (process stays Running).
+        runner
+            .handle_rebuild_batch_complete(RebuildBatchOutcome {
+                build_succeeded: vec!["api".to_string()],
+                up_to_date: Vec::new(),
+                failed: Vec::new(),
+                plain_rebuilds: Vec::new(),
+            })
+            .await;
+        assert_eq!(
+            runner.services.get("api").map(|rs| rs.state()),
+            Some(ServiceState::Running),
+            "a stale build should defer the restart, not restart immediately",
+        );
+
+        // Follow-up cycle: the artifact is already built, so bazel reports up
+        // to date. The running process still predates that build, so don must
+        // restart it rather than no-op.
+        runner
+            .handle_rebuild_batch_complete(RebuildBatchOutcome {
+                build_succeeded: Vec::new(),
+                up_to_date: vec!["api".to_string()],
+                failed: Vec::new(),
+                plain_rebuilds: Vec::new(),
+            })
+            .await;
+        assert_eq!(
+            runner.services.get("api").map(|rs| rs.state()),
+            Some(ServiceState::Starting),
+            "up-to-date follow-up after a deferred build must still restart the process",
+        );
+    }
+
     #[test]
     fn test_topological_sort() {
         struct Case {
