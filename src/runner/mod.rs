@@ -2128,6 +2128,64 @@ mod tests {
         );
     }
 
+    /// The deferred-restart flag set by a stale build must survive the
+    /// watcher's re-trigger. In production a fresh `handle_rebuild` runs between
+    /// the two batch completions (cycle 1 -> watch re-trigger -> cycle 2); it
+    /// clears `rebuild_stale` but must NOT clear `artifact_ahead_of_process`, or
+    /// the up-to-date follow-up would no-op and strand the old binary. This is
+    /// the same scenario as `stale_build_then_up_to_date_followup_still_restarts`
+    /// but exercises the intermediate re-trigger the outcome-only test skips.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_restart_survives_watch_retrigger() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        runner.set_service_state("api", ServiceState::Running);
+
+        // Cycle 1: a change lands mid-build; the successful build defers restart.
+        runner.mark_rebuild_stale("api");
+        runner
+            .handle_rebuild_batch_complete(RebuildBatchOutcome {
+                build_succeeded: vec!["api".to_string()],
+                up_to_date: Vec::new(),
+                failed: Vec::new(),
+                plain_rebuilds: Vec::new(),
+            })
+            .await;
+        assert!(
+            runner
+                .services
+                .get("api")
+                .is_some_and(|rs| rs.artifact_ahead_of_process),
+            "a stale build should mark the process as behind the latest build",
+        );
+
+        // The watcher re-triggers a rebuild. handle_rebuild clears rebuild_stale
+        // but must leave the deferred-restart flag intact.
+        runner.handle_rebuild("api").await;
+        assert!(
+            runner
+                .services
+                .get("api")
+                .is_some_and(|rs| rs.artifact_ahead_of_process),
+            "the watch re-trigger must not drop the deferred-restart flag",
+        );
+
+        // Cycle 2: bazel now reports up to date — must still restart.
+        runner
+            .handle_rebuild_batch_complete(RebuildBatchOutcome {
+                build_succeeded: Vec::new(),
+                up_to_date: vec!["api".to_string()],
+                failed: Vec::new(),
+                plain_rebuilds: Vec::new(),
+            })
+            .await;
+        assert_eq!(
+            runner.services.get("api").map(|rs| rs.state()),
+            Some(ServiceState::Starting),
+            "up-to-date follow-up after the re-trigger must still restart",
+        );
+    }
+
     /// Regression: a watched file changes while a build-tool service is still in
     /// its initial/JIT build (`Building`). That rebuild request must not be
     /// dropped — it has to be queued and held until the service finishes coming
