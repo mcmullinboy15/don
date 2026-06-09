@@ -987,6 +987,11 @@ impl OutputManager {
         // Preload last N ring buffer lines. Channel has `capacity` slots and
         // is empty, so try_send is safe here.
         for line in state.ring_buffer.last_n(last_n) {
+            // Ring-buffer entries keep their trailing `\n`, but `SinkLine.line`
+            // is contractually newline-free (the follow route embeds it in a
+            // JSON "line" value and the client adds its own newline). Strip it
+            // so the replayed snapshot doesn't render a blank line per entry.
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
             let sink_line = SinkLine {
                 prefix: prefix.clone(),
                 line: Bytes::copy_from_slice(line),
@@ -1856,6 +1861,40 @@ mod tests {
 
         let logs = mgr.read_logs("svc", 10).await.unwrap();
         assert_eq!(logs.as_ref(), b"line one\npartial");
+
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn follow_preload_lines_have_no_trailing_newline() {
+        // Regression: `don logs -f` replays the last N ring-buffer lines as the
+        // initial snapshot. Ring-buffer entries carry a trailing `\n`, but
+        // `SinkLine.line` must be newline-free — the follow route embeds it in a
+        // JSON "line" value and the client prints it with its own newline. If
+        // the `\n` leaks through, every replayed line renders a blank line after
+        // it.
+        let (writer, _buf) = TestBuffer::new();
+        let config = crate::config::LogConfig::Stdout;
+        let mgr = OutputManager::new(&[("api", &config)], writer)
+            .await
+            .unwrap();
+        let svc = mgr.service_writer("api").unwrap();
+
+        svc.process_stream(std::io::Cursor::new(b"alpha\nbeta\ngamma\n".to_vec()))
+            .await
+            .unwrap();
+
+        let mut rx = mgr.add_follow_sink("api", 10, 8).await.unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        while let Ok(sink_line) = rx.try_recv() {
+            let text = String::from_utf8_lossy(&sink_line.line).into_owned();
+            assert!(
+                !text.ends_with('\n'),
+                "preloaded follow line must not carry a trailing newline: {text:?}",
+            );
+            lines.push(text);
+        }
+        assert_eq!(lines, vec!["alpha", "beta", "gamma"]);
 
         mgr.shutdown().await;
     }
