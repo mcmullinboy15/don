@@ -2128,6 +2128,51 @@ mod tests {
         );
     }
 
+    /// Regression: a watched file changes while a build-tool service is still in
+    /// its initial/JIT build (`Building`). That rebuild request must not be
+    /// dropped — it has to be queued and held until the service finishes coming
+    /// up, then run. Previously it was swallowed (RebuildComplete with no
+    /// rebuild), leaving the service on pre-edit code with no recovery.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebuild_during_build_is_queued_not_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+
+        // Service is mid-build (initial bazel build in progress).
+        runner.set_service_state("api", ServiceState::Building);
+
+        // A watched file changes during the build. The request must be queued.
+        runner.handle_rebuild("api").await;
+        assert!(
+            runner.pending_bt_rebuilds.contains(&"api".to_string()),
+            "a rebuild requested during the build must be queued, not dropped",
+        );
+
+        // Flushing while still building defers — don't race the in-flight build
+        // or double-start the service before startup attaches a handle.
+        runner.flush_pending_rebuilds().await;
+        assert!(
+            runner.pending_bt_rebuilds.contains(&"api".to_string()),
+            "rebuild should stay deferred while the service is still building",
+        );
+        assert!(
+            runner.rebuild_batch_handle.is_none(),
+            "no rebuild build should start while the service is still building",
+        );
+
+        // Once the service is up, the deferred rebuild proceeds.
+        runner.set_service_state("api", ServiceState::Ready);
+        runner.flush_pending_rebuilds().await;
+        assert!(
+            !runner.pending_bt_rebuilds.contains(&"api".to_string()),
+            "deferred rebuild should fire once the service is running",
+        );
+        assert!(
+            runner.rebuild_batch_handle.is_some(),
+            "a rebuild build should start once the service is running",
+        );
+    }
+
     #[test]
     fn test_topological_sort() {
         struct Case {

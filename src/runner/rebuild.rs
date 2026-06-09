@@ -14,7 +14,7 @@ impl Runner {
     /// Collects Bazel targets and Turbo filters from the queued services,
     /// runs one build per tool, then restarts each affected service.
     pub(in crate::runner) async fn flush_pending_rebuilds(&mut self) {
-        let names = std::mem::take(&mut self.pending_bt_rebuilds);
+        let mut names = std::mem::take(&mut self.pending_bt_rebuilds);
         self.bt_rebuild_deadline = None;
 
         if names.is_empty() {
@@ -28,6 +28,40 @@ impl Runner {
             }
             self.bt_rebuild_deadline =
                 Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+            return;
+        }
+
+        // Defer services that haven't finished coming up. Rebuilding a service
+        // that is still building or starting would race its in-flight build or
+        // double-start it before the startup path attaches a process handle.
+        // Re-queue them; they're retried once they reach a running state. (This
+        // is what keeps a file edited mid-build from being lost: the rebuild
+        // waits here instead of running against a half-started service.)
+        let mut deferred: Vec<String> = Vec::new();
+        names.retain(|name| {
+            let coming_up = self.services.get(name).is_some_and(|rs| {
+                matches!(
+                    rs.state(),
+                    ServiceState::Building | ServiceState::Pending | ServiceState::Starting
+                )
+            });
+            if coming_up {
+                deferred.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !deferred.is_empty() {
+            for name in deferred {
+                if !self.pending_bt_rebuilds.contains(&name) {
+                    self.pending_bt_rebuilds.push(name);
+                }
+            }
+            self.bt_rebuild_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+        }
+        if names.is_empty() {
             return;
         }
 
@@ -517,17 +551,15 @@ impl Runner {
             }
         };
 
-        if rs.state() == ServiceState::Building {
-            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
-                name: name.to_string(),
-                success: true,
-            });
-            return;
-        }
-
         // For build-tool-managed services, queue the rebuild into a batch.
         // Multiple services sharing the same source files will be batched into
         // one `bazel build //a //b //c` invocation instead of separate builds.
+        //
+        // A service that is still mid-build (`Building`, e.g. the initial or
+        // first-connection bazel build) is queued too rather than dropped —
+        // `flush_pending_rebuilds` holds it until the service has come up, so a
+        // file edited during the build still triggers a rebuild instead of
+        // being silently lost.
         if rs.resolved.is_build_tool_managed() {
             if !self.pending_bt_rebuilds.contains(&name.to_string()) {
                 self.pending_bt_rebuilds.push(name.to_string());
