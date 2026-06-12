@@ -191,6 +191,12 @@ when you want the task's output to remain in normal scrollback:
 terminal = { mode = "foreground", screen = "main" }
 ```
 
+When Don itself has no terminal — a detached daemon (`don start -d`) — foreground
+tasks run on their own PTY instead: output is captured like any other task, and
+`don run <task>` from an interactive terminal bridges your stdin/stdout to the
+task's PTY for the life of the run (Ctrl+C passes through to the task). `don
+attach <task>` connects to an already-running one.
+
 Tasks can also declare parameters. Parametrized tasks are interactive: values are supplied at run time via `don run <task> --<name>=<value>` or the TUI form, then substituted into `cmd`, `args`, `env`, and `dir` via `{{name}}` placeholders.
 
 ```toml
