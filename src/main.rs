@@ -9,6 +9,7 @@ use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForeground
 use don::TaskRunInfo;
 use don::client::{Client, ClientError, RunTaskOptions};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -275,7 +276,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                 }
                 run_client(&config_path, |c| async move { c.run_pending().await }).await
             }
-            (None, false) => list_runnable_tasks(&config_path),
+            (None, false) => list_runnable_tasks(&config_path).await,
         },
         Commands::Completions { shell } => {
             let mut out = std::io::stdout();
@@ -330,7 +331,7 @@ fn client_for(config_path: &Path) -> Client {
 /// Print the list of runnable tasks. Invoked for bare `don run` so the user
 /// can see what's available without needing to read the config. Pure config
 /// view (no daemon round-trip), so it works whether or not one is running.
-fn list_runnable_tasks(config_path: &Path) -> i32 {
+async fn list_runnable_tasks(config_path: &Path) -> i32 {
     let config = match don::config::Config::from_file(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -344,12 +345,37 @@ fn list_runnable_tasks(config_path: &Path) -> i32 {
         return 0;
     }
 
+    // Task state comes from the daemon when one is running; the listing
+    // degrades to a config-only view otherwise.
+    let mut task_status: HashMap<String, (TaskItemState, Option<TaskRunInfo>)> = HashMap::new();
+    let mut daemon_up = false;
+    if let Ok(items) = client_for(config_path).status(false, None).await {
+        daemon_up = true;
+        for item in items {
+            if let ItemStatus::Task {
+                name,
+                state,
+                last_run,
+                ..
+            } = item
+            {
+                task_status.insert(name, (state, last_run));
+            }
+        }
+    }
+
     let mut names: Vec<&str> = config.tasks.keys().map(String::as_str).collect();
     names.sort_unstable();
-    let max_name = names.iter().map(|n| n.len()).max().unwrap_or(0);
+    let max_name = names.iter().map(|n| n.len()).max().unwrap_or(0).max(4);
 
     println!("Tasks defined in {}:", config_path.display());
     println!();
+    if daemon_up {
+        println!(
+            "  {:<max_name$}  {:<6}  {:<11}  {:<8}  {:<6}  {:<8}",
+            "NAME", "AUTO", "STATE", "LAST RUN", "RESULT", "DURATION",
+        );
+    }
     for name in &names {
         let Some(task) = config.tasks.get(*name) else {
             continue;
@@ -367,9 +393,36 @@ fn list_runnable_tasks(config_path: &Path) -> i32 {
             let p: Vec<&str> = task.params.iter().map(|p| p.name.as_str()).collect();
             trailing.push_str(&format!("  params: {}", p.join(", ")));
         }
-        println!("  {name:<max_name$}  {auto:<6}{trailing}");
+        match task_status.get(*name) {
+            Some((state, last_run)) => {
+                let label = task_state_label(*state);
+                let color = task_state_color(*state);
+                println!(
+                    "  {name:<max_name$}  {auto:<6}  {}{label:<11}{}  {:<8}  {:<6}  {:<8}{trailing}",
+                    SetForegroundColor(color),
+                    ResetColor,
+                    format_last_run_time(last_run.as_ref()),
+                    format_last_run_result(last_run.as_ref()),
+                    format_last_run_duration(last_run.as_ref()),
+                );
+            }
+            None => println!("  {name:<max_name$}  {auto:<6}{trailing}"),
+        }
     }
     println!();
+    let needs_run: Vec<&str> = names
+        .iter()
+        .filter(|n| {
+            matches!(
+                task_status.get(**n),
+                Some((TaskItemState::PendingRun | TaskItemState::Failed, _))
+            )
+        })
+        .copied()
+        .collect();
+    if !needs_run.is_empty() {
+        println!("Needs a run:       {}", needs_run.join(", "));
+    }
     println!("Run one:           don run <name>");
     println!("Run all pending:   don run --all-pending");
     0
@@ -401,7 +454,7 @@ async fn run_run_task(
         } else {
             let candidates: std::collections::HashSet<&str> =
                 config.tasks.keys().map(String::as_str).collect();
-            let suggestion = suggest_log_filter_typo(&name, &candidates);
+            let suggestion = suggest_name_typo(&name, &candidates);
             errln(format!(
                 "unknown task '{name}'{suggestion} — run `don run` to see the full list"
             ));
