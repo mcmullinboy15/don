@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 /// Build the axum router for the API.
 pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
     Router::new()
+        .route("/info", get(get_info))
         .route("/status", get(get_status))
         .route("/watch", get(get_watch))
         .route("/start/{name}", post(post_start))
@@ -31,6 +32,17 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
             post(post_resolve_completions),
         )
         .with_state(state)
+}
+
+/// `GET /info` — daemon identity: version and whether it owns an interactive
+/// terminal. `headless: true` means foreground tasks run on parked PTYs and
+/// clients must bridge in via attach.
+async fn get_info() -> Response {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "headless": !crate::runner::has_interactive_terminal(),
+    }))
+    .into_response()
 }
 
 /// Query params for the status endpoint.

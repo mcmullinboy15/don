@@ -36,6 +36,7 @@ pub(crate) mod task;
 pub(crate) use params::resolve_task_params;
 pub use profile::resolve_profile_items;
 pub use signals::{install_signal_handlers, signal_count};
+pub(crate) use terminal::has_interactive_terminal;
 pub use terminal::{TerminalCoordinator, TerminalRequest};
 
 use crate::config::{Config, Platform, ShutdownConfig};
@@ -1460,7 +1461,7 @@ impl Runner {
                                     .await;
                             }
                             RunnerInternalCommand::TaskExited(exit) => {
-                                self.handle_task_exit(exit);
+                                self.handle_task_exit(exit).await;
                             }
                             RunnerInternalCommand::TaskRunWaitTimedOut {
                                 name,

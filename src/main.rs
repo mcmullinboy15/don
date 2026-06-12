@@ -9,7 +9,7 @@ use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForeground
 use don::TaskRunInfo;
 use don::client::{Client, ClientError, RunTaskOptions};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -393,6 +393,14 @@ async fn run_run_task(
     }
 
     let client = client_for(config_path);
+
+    if task.terminal.is_foreground()
+        && std::io::stdin().is_terminal()
+        && client.info().await.map(|i| i.headless).unwrap_or(false)
+    {
+        return run_foreground_bridged(config_path, &client, &name, parsed).await;
+    }
+
     let options = RunTaskOptions { wait, wait_timeout };
     match client.run_task_with_options(&name, parsed, options).await {
         Ok(()) => 0,
@@ -404,6 +412,54 @@ async fn run_run_task(
             errln(e);
             1
         }
+    }
+}
+
+/// Run a foreground task against a headless daemon: the task runs on a PTY
+/// in the daemon, and this terminal bridges to it via attach. The attach is
+/// registered *before* the run is triggered so a fast task can't exit before
+/// the bridge connects; the session ends when the task does.
+async fn run_foreground_bridged(
+    config_path: &Path,
+    client: &Client,
+    name: &str,
+    params: std::collections::HashMap<String, String>,
+) -> i32 {
+    let socket_path = base_dir(config_path).join(".don").join("don.sock");
+    let attach_name = name.to_string();
+    let attach = tokio::spawn(async move {
+        don::client::attach::run_attach_session(&socket_path, &attach_name).await
+    });
+
+    let options = RunTaskOptions {
+        wait: false,
+        wait_timeout: None,
+    };
+    if let Err(e) = client.run_task_with_options(name, params, options).await {
+        attach.abort();
+        errln(e);
+        return 1;
+    }
+
+    match attach.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            errln(e);
+            return 1;
+        }
+        Err(_) => return 1,
+    }
+
+    // The bridge streamed the task's output; report only the final verdict.
+    match client.status(false, Some(name)).await.as_deref() {
+        Ok([don::runner::ItemStatus::Task {
+            state: don::runner::TaskItemState::Failed,
+            ..
+        }]) => {
+            errln(format!("{name}: failed"));
+            1
+        }
+        _ => 0,
     }
 }
 
@@ -1438,8 +1494,6 @@ async fn run_start(
     no_tui: bool,
     log_filter: Vec<String>,
 ) -> Result<(), String> {
-    use std::io::IsTerminal;
-
     let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
     let platform = don::config::Platform::current().ok_or_else(|| {
@@ -1796,7 +1850,11 @@ async fn run_start(
                         base,
                         profile.as_deref(),
                         shutdown_rx,
-                        don::runner::TerminalCoordinator::detached(),
+                        if std::io::stdin().is_terminal() {
+                            don::runner::TerminalCoordinator::detached_with_terminal()
+                        } else {
+                            don::runner::TerminalCoordinator::detached()
+                        },
                     )
                     .await
                     .map_err(|e| format!("Error: {e}"))

@@ -61,6 +61,14 @@ pub struct StatusResponse {
     pub items: Vec<ItemStatus>,
 }
 
+/// Deserialised body of `GET /info`.
+#[derive(serde::Deserialize)]
+pub struct DaemonInfo {
+    pub version: String,
+    #[serde(default)]
+    pub headless: bool,
+}
+
 /// Deserialised body of `GET /watch`.
 #[derive(Debug, Deserialize)]
 pub struct WatchResponse {
@@ -104,6 +112,14 @@ impl Client {
     /// Directly wrap an existing socket path (tests, non-standard layouts).
     pub fn with_socket_path(socket_path: PathBuf) -> Self {
         Self { socket_path }
+    }
+
+    /// `GET /info` — daemon version + headless flag. Errors against daemons
+    /// older than the endpoint; callers should treat that as "not headless".
+    pub async fn info(&self) -> Result<DaemonInfo, ClientError> {
+        let (status, body) = self.request("GET", "/info", false).await?;
+        ensure_ok(status, &body)?;
+        Ok(serde_json::from_slice(&body)?)
     }
 
     /// `GET /status`
