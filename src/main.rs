@@ -122,6 +122,15 @@ enum Commands {
         /// Name of the service to attach to
         name: String,
     },
+    /// Attach an interactive TUI to a running daemon (e.g. one started with
+    /// `don start -d`). Renders the same dashboard as `don start`; Ctrl+C
+    /// detaches and leaves the daemon running.
+    Tui {
+        /// Restrict displayed log lines to the given comma-separated set of
+        /// service/task names (seeds the TUI filter, same as `don start`).
+        #[arg(long, value_delimiter = ',')]
+        log_filter: Vec<String>,
+    },
     /// Clean up stale state from a previous run
     Cleanup {
         /// Kill a running daemon first, then clean up
@@ -258,6 +267,13 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
+        Commands::Tui { log_filter } => match run_tui_frontend(&config_path, log_filter).await {
+            Ok(()) => 0,
+            Err(e) => {
+                errln(e);
+                1
+            }
+        },
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
         Commands::Run {
             name,
@@ -909,6 +925,122 @@ async fn run_attach(config_path: &Path, name: &str) -> i32 {
             1
         }
     }
+}
+
+/// Attach an interactive TUI to a running daemon as a pure frontend. The
+/// runner stays in the daemon; this renders the same `run_tui` loop, fed by a
+/// `TuiBridge` over the unix socket instead of in-process channels. Ctrl+C
+/// detaches (the daemon keeps running).
+async fn run_tui_frontend(config_path: &Path, log_filter: Vec<String>) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+
+    let base = base_dir(config_path);
+
+    // Retry briefly: `don start -d` already waits for the socket before
+    // returning, so this only covers the narrow race where the daemon is
+    // mid-bind. A daemon that genuinely isn't here fails in ~1s, not 10.
+    let bridge = {
+        let mut attempt = 0;
+        loop {
+            match don::client::bridge::TuiBridge::connect(&base).await {
+                Ok(bridge) => break bridge,
+                Err(ClientError::NotRunning { .. }) if attempt < 5 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(ClientError::NotRunning { .. }) => {
+                    return Err(
+                        "no don daemon running here — start one with `don start -d`, then `don tui`"
+                            .to_string(),
+                    );
+                }
+                Err(e) => return Err(format!("failed to connect to don daemon: {e}")),
+            }
+        }
+    };
+
+    let don::client::bridge::TuiBridge {
+        snapshot,
+        log_rx,
+        events_rx,
+        command_tx,
+        verbosity,
+        lifecycle_emitter,
+        terminal_request_rx,
+        guard,
+    } = bridge;
+
+    // Task param schemas come from the local config (kept off the wire).
+    // Filter to the daemon's active task set so the form/menu match.
+    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+    let task_name_set: HashSet<&str> = snapshot.task_names.iter().map(String::as_str).collect();
+    let task_configs: HashMap<String, don::config::Task> = config
+        .tasks
+        .iter()
+        .filter(|(name, _)| task_name_set.contains(name.as_str()))
+        .map(|(name, task)| (name.clone(), task.clone()))
+        .collect();
+
+    let mut task_last_runs: HashMap<String, don::TaskRunInfo> = HashMap::new();
+    for status in &snapshot.statuses {
+        if let ItemStatus::Task {
+            name,
+            last_run: Some(last_run),
+            ..
+        } = status
+        {
+            task_last_runs.insert(name.clone(), last_run.clone());
+        }
+    }
+
+    let hidden_names: HashSet<String> = snapshot.hidden_names.iter().cloned().collect();
+    let auto_filter_on_failure_names: HashSet<String> = snapshot
+        .auto_filter_on_failure_names
+        .iter()
+        .cloned()
+        .collect();
+    let cli_log_filter: Option<HashSet<String>> = if log_filter.is_empty() {
+        None
+    } else {
+        Some(log_filter.into_iter().collect())
+    };
+
+    let result = don::run_tui(
+        log_rx,
+        events_rx,
+        command_tx,
+        verbosity,
+        lifecycle_emitter,
+        snapshot.service_names.clone(),
+        snapshot.task_names.clone(),
+        snapshot.build_tool_names.clone(),
+        task_configs,
+        task_last_runs,
+        hidden_names,
+        auto_filter_on_failure_names,
+        cli_log_filter,
+        terminal_request_rx,
+        don::QuitMode::DetachFrontend,
+    )
+    .await;
+
+    // Tear down bridge tasks now the TUI has returned (Ctrl-C or daemon exit).
+    drop(guard);
+
+    // Tell the user what was left behind: the daemon is independent of the
+    // viewer, so it usually keeps running.
+    let probe = Client::new(&base);
+    match probe.status(false, None).await {
+        Ok(_) => println!(
+            "don tui closed. Daemon still running — reconnect with `don tui`, or stop with `don stop`."
+        ),
+        Err(ClientError::NotRunning { .. }) => println!("don tui closed. Daemon has stopped."),
+        Err(_) => println!(
+            "don tui closed. Daemon may still be shutting down — use `don stop` if needed."
+        ),
+    }
+
+    result.map_err(|e| format!("TUI error: {e}"))
 }
 
 fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: bool) {
@@ -1794,6 +1926,7 @@ async fn run_start(
                 auto_filter_on_failure_names,
                 tui_log_filter,
                 terminal_request_rx,
+                don::QuitMode::ShutdownDaemon,
             )
             .await;
             if result.is_err() {

@@ -192,6 +192,17 @@ impl ActiveTerm {
     }
 }
 
+/// What Ctrl+C does in the TUI, set by the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QuitMode {
+    /// In-process `don start`: Ctrl+C shuts the whole stack down (SIGINT +
+    /// a direct `Shutdown` command, preserving the two-press force escalation).
+    ShutdownDaemon,
+    /// `don tui` frontend: Ctrl+C detaches the viewer and leaves the daemon
+    /// running. No shutdown is sent.
+    DetachFrontend,
+}
+
 /// Run the interactive TUI until the runner shuts down or the user quits.
 ///
 /// Ctrl+C raises SIGINT to our own process so the installed signal handler
@@ -213,6 +224,7 @@ pub async fn run_tui(
     auto_filter_on_failure_names: std::collections::HashSet<String>,
     cli_log_filter: Option<std::collections::HashSet<String>>,
     mut terminal_request_rx: mpsc::Receiver<TerminalRequest>,
+    quit_mode: QuitMode,
 ) -> Result<(), TuiError> {
     let controls = TuiControls {
         verbosity,
@@ -392,7 +404,11 @@ pub async fn run_tui(
                                 &command_tx,
                                 &controls,
                                 &mut act.modal,
+                                quit_mode,
                             )?;
+                        }
+                        if app.should_detach {
+                            break;
                         }
                     }
                     None => {
@@ -672,6 +688,7 @@ fn close_modal_and_replay_new_logs(
 }
 
 /// Dispatch an input or resize event.
+#[allow(clippy::too_many_arguments)]
 fn handle_app_event(
     event: AppEvent,
     app: &mut App,
@@ -680,6 +697,7 @@ fn handle_app_event(
     command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
+    quit_mode: QuitMode,
 ) -> Result<(), TuiError> {
     match event {
         AppEvent::Resize => {
@@ -707,7 +725,9 @@ fn handle_app_event(
             // own that cache. The autoresize path inside ratatui has already
             // adopted the new size by this point.
         }
-        AppEvent::Key(key) => handle_key(key, app, terminal, store, command_tx, controls, modal)?,
+        AppEvent::Key(key) => {
+            handle_key(key, app, terminal, store, command_tx, controls, modal, quit_mode)?
+        }
         AppEvent::CompletionsReady {
             param,
             request_id,
@@ -722,6 +742,7 @@ fn handle_app_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
@@ -730,6 +751,7 @@ fn handle_key(
     command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
+    quit_mode: QuitMode,
 ) -> Result<(), TuiError> {
     // Ctrl+C: belt-and-suspenders shutdown. We both send a `Shutdown` command
     // directly down the runner channel AND raise SIGINT. The direct command
@@ -738,14 +760,20 @@ fn handle_key(
     // two-press force-kill escalation via the runner's signal counter.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') => {
-                let _ = command_tx.send(RunnerCommand::Shutdown);
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::this(),
-                    nix::sys::signal::Signal::SIGINT,
-                );
-                enter_shutdown_mode(app, terminal, modal)?;
-            }
+            KeyCode::Char('c') => match quit_mode {
+                QuitMode::DetachFrontend => {
+                    // Remote frontend: leave the daemon running, just return.
+                    app.should_detach = true;
+                }
+                QuitMode::ShutdownDaemon => {
+                    let _ = command_tx.send(RunnerCommand::Shutdown);
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::this(),
+                        nix::sys::signal::Signal::SIGINT,
+                    );
+                    enter_shutdown_mode(app, terminal, modal)?;
+                }
+            },
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 let enabled = controls.verbosity.toggle();
                 app.set_verbose_enabled(enabled);

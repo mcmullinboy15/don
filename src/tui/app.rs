@@ -195,6 +195,10 @@ pub(crate) struct App {
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
     pub(crate) verbose_enabled: bool,
+    /// Set when the user presses Ctrl+C in detach mode (`don tui` frontend).
+    /// The event loop checks it after each key and breaks, returning from
+    /// `run_tui` without shutting the daemon down.
+    pub(crate) should_detach: bool,
     /// Graceful shutdown is in progress: the inline bar becomes
     /// non-interactive and `[don]`-prefixed lifecycle events bypass the
     /// committed filter (raw service stdout still respects it).
@@ -287,6 +291,7 @@ impl App {
             counts,
             view_mode: ViewMode::Normal,
             verbose_enabled,
+            should_detach: false,
             shutdown_started: false,
             filter: FilterState::new(all_filter_names, &hidden_names, cli_log_filter.as_ref()),
             spinner_frame: 0,
