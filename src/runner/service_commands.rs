@@ -674,6 +674,25 @@ impl Runner {
             let _ = reply.send(Ok(()));
             return;
         }
+        // A failed service has no live process — drop any exited handle and
+        // mark it Stopped so the user can clear it without a restart.
+        if self.services.get(name).is_some_and(|rs| {
+            matches!(
+                rs.state(),
+                ServiceState::Failed | ServiceState::DependencyFailed
+            )
+        }) {
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.stop_health_tracking();
+                rs.reset_restart_tracking();
+                rs.handle = None;
+            }
+            self.set_service_state(name, ServiceState::Stopped);
+            self.output_manager
+                .service_event(name, "stopped (was failed)");
+            let _ = reply.send(Ok(()));
+            return;
+        }
         // Cancel monitor + any pending auto-restart before tearing down the
         // process so a recovery probe doesn't race with the stop.
         if let Some(rs) = self.services.get_mut(name) {

@@ -1097,7 +1097,7 @@ fn overlay_toggle_command(app: &App) -> Option<OverlayCommand> {
             Some(overlay_start_command(item.name.clone()))
         }
         ServiceState::Failed | ServiceState::DependencyFailed => {
-            Some(overlay_restart_command(item.name.clone()))
+            Some(overlay_stop_command(item.name.clone()))
         }
         ServiceState::Pending
         | ServiceState::Building
@@ -1644,7 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_enter_restarts_failed_service_rows() {
+    fn overlay_enter_stops_failed_service_rows() {
         struct Case {
             name: &'static str,
             state: ServiceState,
@@ -1667,10 +1667,10 @@ mod tests {
                 panic!("{}: expected command", case.name);
             };
             match command.command {
-                RunnerCommand::Restart { name, .. } => {
+                RunnerCommand::Stop { name, .. } => {
                     assert_eq!(name, "api", "{}: wrong service", case.name);
                 }
-                _ => panic!("{}: expected restart command", case.name),
+                _ => panic!("{}: expected stop command", case.name),
             }
         }
     }

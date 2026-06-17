@@ -219,7 +219,7 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
         area,
         StatusTableView {
             title:
-                " don services — [j/k ↑↓] move  [enter] start/stop/retry  [r] restart  [R] hard restart  [l] logs  [/] filter  [esc] clear/dismiss "
+                " don services — [j/k ↑↓] move  [enter] start/stop  [r] restart  [R] hard restart  [l] logs  [/] filter  [esc] clear/dismiss "
                     .to_string(),
             header,
             rows,
@@ -443,7 +443,7 @@ fn service_selected_hint(app: &App) -> Option<String> {
         }
         ServiceState::Stopped | ServiceState::Lazy => Some(format!("enter start {}", item.name)),
         ServiceState::Failed | ServiceState::DependencyFailed => {
-            Some(format!("enter retry {}", item.name))
+            Some(format!("enter stop {}", item.name))
         }
         ServiceState::Pending
         | ServiceState::Building
