@@ -1021,6 +1021,7 @@ async fn run_tui_frontend(config_path: &Path, log_filter: Vec<String>) -> Result
         cli_log_filter,
         terminal_request_rx,
         don::QuitMode::DetachFrontend,
+        Some(base.join(".don").join("don.sock")),
     )
     .await;
 
@@ -1927,6 +1928,7 @@ async fn run_start(
                 tui_log_filter,
                 terminal_request_rx,
                 don::QuitMode::ShutdownDaemon,
+                None,
             )
             .await;
             if result.is_err() {
