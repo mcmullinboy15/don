@@ -261,7 +261,7 @@ fn integration_watch_endpoint_reports_dirs_and_patterns() {
         assert_eq!(status, 200, "body: {body}");
         // Registered inotify directory for the resolved `src` watch.
         assert!(body.contains("\"directories\""), "body: {body}");
-        assert!(body.contains("\"mode\":\"recursive\""), "body: {body}");
+        assert!(body.contains("\"mode\":\"non-recursive\""), "body: {body}");
         // The item and its (absolute) glob pattern.
         assert!(body.contains("\"name\":\"api\""), "body: {body}");
         assert!(body.contains("\"kind\":\"service\""), "body: {body}");

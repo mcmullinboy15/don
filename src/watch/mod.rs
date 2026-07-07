@@ -21,6 +21,8 @@ use crate::duration::parse_duration;
 use crate::output::LifecycleEmitter;
 use crate::runner::{RunnerCommand, RunnerEvent};
 use glob::Pattern;
+use ignore::WalkBuilder;
+use ignore::overrides::{Override, OverrideBuilder};
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -332,11 +334,13 @@ impl WatchManager {
                 std::fs::create_dir_all(&watch_dir)
                     .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
 
-                if !is_covered(&watch_dir, RecursiveMode::Recursive, &registered_dirs) {
-                    ensure_notify_watcher(&mut watcher, &notify_tx)?
-                        .watch(&watch_dir, RecursiveMode::Recursive)?;
-                    registered_dirs.insert(watch_dir, RecursiveMode::Recursive);
-                }
+                register_recursive_ignoring(
+                    &mut watcher,
+                    &notify_tx,
+                    &watch_dir,
+                    &config.watch_ignore,
+                    &mut registered_dirs,
+                )?;
             }
 
             let mut compiled_ignore = Vec::new();
@@ -404,11 +408,13 @@ impl WatchManager {
                 std::fs::create_dir_all(&watch_dir)
                     .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
 
-                if !is_covered(&watch_dir, RecursiveMode::Recursive, &registered_dirs) {
-                    ensure_notify_watcher(&mut watcher, &notify_tx)?
-                        .watch(&watch_dir, RecursiveMode::Recursive)?;
-                    registered_dirs.insert(watch_dir, RecursiveMode::Recursive);
-                }
+                register_recursive_ignoring(
+                    &mut watcher,
+                    &notify_tx,
+                    &watch_dir,
+                    &config.watch_ignore,
+                    &mut registered_dirs,
+                )?;
             }
 
             let mut compiled_ignore = Vec::new();
@@ -1158,6 +1164,46 @@ fn is_covered(
         return true;
     }
     false
+}
+
+fn register_recursive_ignoring(
+    watcher: &mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    root: &Path,
+    watch_ignore: &[String],
+    registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
+) -> Result<(), WatchError> {
+    let overrides = {
+        let mut builder = OverrideBuilder::new(root);
+        for glob in watch_ignore {
+            let _ = builder.add(&format!("!{glob}"));
+        }
+        builder.build().unwrap_or_else(|_| Override::empty())
+    };
+
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .overrides(overrides)
+        .build();
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let dir = entry.into_path();
+        if is_covered(&dir, RecursiveMode::NonRecursive, registered_dirs) {
+            continue;
+        }
+        ensure_notify_watcher(watcher, notify_tx)?
+            .watch(&dir, RecursiveMode::NonRecursive)?;
+        registered_dirs.insert(dir, RecursiveMode::NonRecursive);
+    }
+    Ok(())
 }
 
 fn refresh_item_definition(
