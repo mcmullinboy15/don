@@ -21,6 +21,7 @@ use crate::duration::parse_duration;
 use crate::output::LifecycleEmitter;
 use crate::runner::{RunnerCommand, RunnerEvent};
 use glob::Pattern;
+use ignore::overrides::{Override, OverrideBuilder};
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -186,6 +187,12 @@ pub(crate) struct WatchManager {
     /// also merged into each item's `ignore_patterns` for the change-scan path;
     /// `watch_ignore` is fixed for the runner's lifetime, so this stays in sync.
     global_ignore: Vec<Pattern>,
+    /// Workspace-wide `watch_ignore` compiled as an `ignore` override matcher,
+    /// rooted at the (canonical) base dir. Used to prune ignored subtrees when
+    /// deciding which directories to register with the notify backend — both at
+    /// startup and when a new directory appears at runtime (see
+    /// [`Self::register_new_directory`]). Fixed for the runner's lifetime.
+    overrides: Override,
 }
 
 enum NotifyBackend {
@@ -246,15 +253,25 @@ impl WatchManager {
         let base_dir = std::fs::canonicalize(base_dir)
             .map_err(|e| WatchError::Io(base_dir.to_path_buf(), e))?;
         let base_dir = base_dir.as_path();
-        let global_ignore_patterns: Vec<String> = config
-            .watch_ignore
-            .iter()
-            .map(|pattern| {
-                resolve_pattern(base_dir, pattern)
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
+        let mut global_ignore_patterns: Vec<String> = Vec::new();
+        for pattern in &config.watch_ignore {
+            global_ignore_patterns
+                .push(resolve_pattern(base_dir, pattern).to_string_lossy().into_owned());
+            // A contents glob (`node_modules/**`) matches files *inside* the dir
+            // but not the bare directory itself, so the directory's own creation
+            // event would slip past the ignore filter and be logged as noise.
+            // Also ignore the directory node, mirroring the walk-pruning in
+            // `build_watch_ignore_overrides` so the two dialects stay in sync.
+            if let Some(dir) = pattern.strip_suffix("/**") {
+                global_ignore_patterns
+                    .push(resolve_pattern(base_dir, dir).to_string_lossy().into_owned());
+            }
+        }
+
+        // Compile `watch_ignore` into an `ignore` override matcher rooted at the
+        // canonical base dir. This is what prunes ignored subtrees when we walk
+        // to decide which directories to register with the notify backend.
+        let overrides = build_watch_ignore_overrides(base_dir, &config.watch_ignore, &mut warnings);
 
         let mut items: HashMap<String, WatchedItem> = HashMap::new();
         // Track which directories we've already registered, with the mode we
@@ -332,11 +349,13 @@ impl WatchManager {
                 std::fs::create_dir_all(&watch_dir)
                     .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
 
-                if !is_covered(&watch_dir, RecursiveMode::Recursive, &registered_dirs) {
-                    ensure_notify_watcher(&mut watcher, &notify_tx)?
-                        .watch(&watch_dir, RecursiveMode::Recursive)?;
-                    registered_dirs.insert(watch_dir, RecursiveMode::Recursive);
-                }
+                register_dirs_ignoring(
+                    &mut watcher,
+                    &notify_tx,
+                    &watch_dir,
+                    &overrides,
+                    &mut registered_dirs,
+                )?;
             }
 
             let mut compiled_ignore = Vec::new();
@@ -404,11 +423,13 @@ impl WatchManager {
                 std::fs::create_dir_all(&watch_dir)
                     .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
 
-                if !is_covered(&watch_dir, RecursiveMode::Recursive, &registered_dirs) {
-                    ensure_notify_watcher(&mut watcher, &notify_tx)?
-                        .watch(&watch_dir, RecursiveMode::Recursive)?;
-                    registered_dirs.insert(watch_dir, RecursiveMode::Recursive);
-                }
+                register_dirs_ignoring(
+                    &mut watcher,
+                    &notify_tx,
+                    &watch_dir,
+                    &overrides,
+                    &mut registered_dirs,
+                )?;
             }
 
             let mut compiled_ignore = Vec::new();
@@ -589,6 +610,7 @@ impl WatchManager {
                 runner_event_lag_count: 0,
                 last_notify_error: None,
                 global_ignore,
+                overrides,
             },
             warnings,
         ))
@@ -648,16 +670,6 @@ impl WatchManager {
     /// Replaces the watch patterns for the named item and registers any
     /// new watch directories with the notify watcher.
     fn apply_watch_update(&mut self, mut update: WatchUpdate) {
-        // Tier-1 BuildGraph updates land on specific filename patterns
-        // (`<pkg>/BUILD`, `<pkg>/package.json`) — a non-recursive watch on
-        // the package directory is exactly right. Tier-2 Service/Task
-        // updates are directory-level globs (`<pkg>/**`), which need
-        // recursive watching.
-        let mode = match update.kind {
-            WatchItemKind::BuildGraph => RecursiveMode::NonRecursive,
-            WatchItemKind::Service | WatchItemKind::Task => RecursiveMode::Recursive,
-        };
-
         // Canonicalize the base so the compiled globs are absolute and match
         // the cwd-prefixed absolute paths that notify reports in events.
         // Without this, a runner base_dir of `.` produces patterns like
@@ -678,54 +690,41 @@ impl WatchManager {
                 // all subdirectories (e.g. when bazel symlinks cause inotify
                 // to miss directories during the initial recursive walk).
                 let watch_dir = glob_base_dir(&full_pattern);
-                if watch_dir.exists() && !is_covered(&watch_dir, mode, &self.registered_dirs) {
-                    // Upgrade case: an existing NonRecursive watch at this
-                    // exact path doesn't cover a Recursive request. Unwatch
-                    // the old one first so the new Recursive watch replaces
-                    // it cleanly (notify-rs's inotify backend treats the
-                    // same path + different mode as a distinct registration,
-                    // so leaving the old one leaks a watch descriptor).
-                    if mode == RecursiveMode::Recursive
-                        && self.registered_dirs.get(&watch_dir)
-                            == Some(&RecursiveMode::NonRecursive)
-                    {
-                        match ensure_notify_watcher(&mut self.watcher, &self.notify_tx) {
-                            Ok(watcher) => {
-                                if let Err(e) = watcher.unwatch(&watch_dir) {
-                                    self.record_item_error(
-                                        &update.name,
-                                        format!(
-                                            "watch: failed to replace non-recursive watch for {}: {e}",
-                                            watch_dir.display()
-                                        ),
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                self.record_item_error(
-                                    &update.name,
-                                    format!("watch: failed to initialize notify backend: {e}"),
-                                );
-                                continue;
-                            }
+                if watch_dir.exists() {
+                    let result = match update.kind {
+                        // Tier-1 BuildGraph updates land on specific filename
+                        // patterns (`<pkg>/BUILD`, `<pkg>/package.json`) — a
+                        // non-recursive watch on the package directory is
+                        // exactly right, no subtree walk.
+                        WatchItemKind::BuildGraph => register_single_dir(
+                            &mut self.watcher,
+                            &self.notify_tx,
+                            &watch_dir,
+                            RecursiveMode::NonRecursive,
+                            &mut self.registered_dirs,
+                        ),
+                        // Tier-2 Service/Task updates are directory-level globs
+                        // (`<pkg>/**`) that need recursive coverage — routed
+                        // through the same `watch_ignore`-aware registration as
+                        // startup so ignored subtrees stay pruned on reload.
+                        WatchItemKind::Service | WatchItemKind::Task => {
+                            register_dirs_ignoring(
+                                &mut self.watcher,
+                                &self.notify_tx,
+                                &watch_dir,
+                                &self.overrides,
+                                &mut self.registered_dirs,
+                            )
                         }
-                    }
-                    match ensure_notify_watcher(&mut self.watcher, &self.notify_tx).and_then(
-                        |watcher| watcher.watch(&watch_dir, mode).map_err(WatchError::from),
-                    ) {
-                        Ok(()) => {
-                            self.registered_dirs.insert(watch_dir, mode);
-                        }
-                        Err(e) => {
-                            self.record_item_error(
-                                &update.name,
-                                format!(
-                                    "watch: failed to register {:?} watch for {}: {e}",
-                                    mode,
-                                    watch_dir.display()
-                                ),
-                            );
-                        }
+                    };
+                    if let Err(e) = result {
+                        self.record_item_error(
+                            &update.name,
+                            format!(
+                                "watch: failed to register watch for {}: {e}",
+                                watch_dir.display()
+                            ),
+                        );
                     }
                 }
             }
@@ -810,13 +809,14 @@ impl WatchManager {
         // logging — emitting verbose diagnostics for files the user globally
         // ignored (node_modules, build output, …) is pure noise. If every path
         // in the event is ignored, there's nothing to report at all.
-        let paths: Vec<&PathBuf> = event
+        let paths: Vec<PathBuf> = event
             .paths
             .iter()
             .filter(|path| {
                 let path_str = path.to_string_lossy();
                 !self.global_ignore.iter().any(|p| p.matches(&path_str))
             })
+            .cloned()
             .collect();
         if paths.is_empty() {
             return;
@@ -827,6 +827,26 @@ impl WatchManager {
             event.kind, paths
         ));
 
+        // Backstop for the recursion we deliberately gave up by using only
+        // non-recursive watches: when a new directory appears, notify won't
+        // auto-watch it, so register it here (skipping ignored dirs) and replay
+        // any files that already landed inside before the watch took effect
+        // (e.g. `git checkout` of a branch that adds a whole tree). An ignored
+        // directory created at runtime — a fresh `node_modules` — is skipped
+        // here and never watched.
+        if matches!(event.kind, EventKind::Create(_)) {
+            for path in &paths {
+                self.register_new_directory(path);
+            }
+        }
+
+        self.process_changed_paths(&paths);
+    }
+
+    /// Match changed paths against watched items and advance their debounce
+    /// state machines. Shared by live notify events and the new-directory
+    /// backstop (which replays pre-existing files under a freshly-watched dir).
+    fn process_changed_paths(&mut self, paths: &[PathBuf]) {
         // Find which items are affected by this event's paths.
         // Ignore patterns are checked first — if any ignore pattern matches,
         // the event is skipped for that item.
@@ -942,6 +962,57 @@ impl WatchManager {
 
         for name in stale_services {
             let _ = self.cmd_tx.send(RunnerCommand::RebuildStale { name });
+        }
+    }
+
+    /// Register a directory that appeared at runtime, then replay files already
+    /// inside it.
+    ///
+    /// Because all watches are non-recursive (see [`register_dirs_ignoring`]),
+    /// notify does not auto-watch new subdirectories — a directory created at
+    /// runtime would otherwise go unwatched. This registers the new subtree
+    /// (skipping ignored directories) and, because files may have been written
+    /// between the directory's creation and our watch taking effect, feeds any
+    /// pre-existing files through the normal matching path. A no-op when the
+    /// path isn't a directory, is already covered by an existing watch, or is
+    /// itself ignored — so a fresh `node_modules` is never watched.
+    fn register_new_directory(&mut self, path: &Path) {
+        let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+        if !is_dir {
+            return;
+        }
+        // Already covered by an exact watch (or a recursive ancestor, e.g. a
+        // build-tool-registered dir) — nothing to do.
+        if is_covered(path, RecursiveMode::NonRecursive, &self.registered_dirs) {
+            return;
+        }
+        // Never watch a directory the user asked to ignore.
+        if self.overrides.matched(path, true).is_ignore() {
+            return;
+        }
+
+        if let Err(e) = register_dirs_ignoring(
+            &mut self.watcher,
+            &self.notify_tx,
+            path,
+            &self.overrides,
+            &mut self.registered_dirs,
+        ) {
+            self.emitter.debug_event(&format!(
+                "watch: failed to register new directory {:?}: {e}",
+                path
+            ));
+            return;
+        }
+        self.emitter
+            .debug_event(&format!("watch: registered new directory {:?}", path));
+
+        // Replay files that already exist under the new subtree so a burst that
+        // populated it before the watch landed still triggers the right rebuild.
+        let mut files = Vec::new();
+        collect_files_recursive(path, &self.overrides, &mut files);
+        if !files.is_empty() {
+            self.process_changed_paths(&files);
         }
     }
 
@@ -1158,6 +1229,215 @@ fn is_covered(
         return true;
     }
     false
+}
+
+/// Build an `ignore` override matcher from the workspace `watch_ignore` globs,
+/// rooted at `base_dir` so patterns anchor consistently no matter which subtree
+/// is later walked. Invalid globs are reported into `warnings` rather than
+/// silently dropped, so a typo'd ignore surfaces to the user.
+fn build_watch_ignore_overrides(
+    base_dir: &Path,
+    watch_ignore: &[String],
+    warnings: &mut Vec<String>,
+) -> Override {
+    let mut builder = OverrideBuilder::new(base_dir);
+    for glob in watch_ignore {
+        // `ignore` overrides invert gitignore semantics: a leading `!` marks an
+        // *ignore* (blacklist) pattern, which is exactly what `watch_ignore` is.
+        // With no whitelist patterns present, anything not matching an ignore
+        // glob is simply `Match::None` (kept).
+        if let Err(e) = builder.add(&format!("!{glob}")) {
+            warnings.push(format!("invalid watch_ignore pattern '{glob}': {e}"));
+        }
+        // A contents glob like `node_modules/**` or `target/**` matches only the
+        // *contents* of the directory, not the directory itself — which would
+        // leave a shallow watch on it. Users who ignore `foo/**` mean "don't
+        // watch foo at all", so also prune the directory node itself. Any error
+        // here is already surfaced by the primary `add` above (same glob body).
+        if let Some(dir) = glob.strip_suffix("/**") {
+            let _ = builder.add(&format!("!{dir}"));
+        }
+    }
+    match builder.build() {
+        Ok(overrides) => overrides,
+        Err(e) => {
+            // Falling back to an empty matcher means nothing is pruned and heavy
+            // ignored dirs get watched — surface it rather than degrade silently.
+            warnings.push(format!("failed to compile watch_ignore globs: {e}"));
+            Override::empty()
+        }
+    }
+}
+
+/// A directory to register with the notify backend, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchAction {
+    dir: PathBuf,
+    mode: RecursiveMode,
+    /// When true, an existing NonRecursive watch at `dir` must be unwatched
+    /// before the (Recursive) re-watch. notify's inotify backend treats the
+    /// same path under a different mode as a distinct registration, so leaving
+    /// the old one leaks a watch descriptor.
+    replace: bool,
+}
+
+/// Register the notify watches needed to cover `root`, honoring `watch_ignore`.
+///
+/// Every non-ignored directory under `root` gets its own `NonRecursive` watch;
+/// ignored directories (`node_modules`, `target`, …) are pruned from the walk
+/// and never watched.
+///
+/// We deliberately do **not** use recursive watches. A recursive watch makes
+/// notify auto-descend into every directory created beneath it at runtime —
+/// including a fresh ignored directory (a new `node_modules`, `target`, …),
+/// re-registering the whole heavy subtree we set out to prune. There is no way
+/// to stop that descent (notify has no ignore hook), only to unwatch it *after*
+/// the spike — by which point thousands of watch descriptors may already have
+/// been allocated. Non-recursive watches never auto-descend, so a runtime
+/// ignored dir is simply skipped by the create backstop
+/// ([`WatchManager::register_new_directory`]); the cost is that new directories
+/// must be registered by that backstop rather than by notify. The kernel watch
+/// count is identical either way (notify allocates one descriptor per directory
+/// even for a recursive watch).
+fn register_dirs_ignoring(
+    watcher: &mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    root: &Path,
+    overrides: &Override,
+    registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
+) -> Result<(), WatchError> {
+    let desired = desired_watches(root, overrides);
+    let actions = reconcile_watches(&desired, registered_dirs);
+    apply_watch_actions(watcher, notify_tx, actions, registered_dirs)
+}
+
+/// Register a single directory under `mode`, reconciling against existing
+/// watches (skip if already covered). Used for tier-1 build-graph patterns,
+/// which are exact filenames in a package dir and need no subtree walk.
+fn register_single_dir(
+    watcher: &mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    dir: &Path,
+    mode: RecursiveMode,
+    registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
+) -> Result<(), WatchError> {
+    let actions = reconcile_watches(&[(dir.to_path_buf(), mode)], registered_dirs);
+    apply_watch_actions(watcher, notify_tx, actions, registered_dirs)
+}
+
+/// Compute the desired `(directory, NonRecursive)` watch set for `root`'s
+/// subtree, pruning ignored directories. See [`register_dirs_ignoring`] for why
+/// every entry is non-recursive.
+fn desired_watches(root: &Path, overrides: &Override) -> Vec<(PathBuf, RecursiveMode)> {
+    let mut out = Vec::new();
+    collect_watch_dirs(root, overrides, &mut out);
+    out
+}
+
+/// Recursively emit a `NonRecursive` watch for `dir` and every non-ignored
+/// directory beneath it. Ignored directories are pruned (not descended into);
+/// symlinked directories are skipped, mirroring the notify backend's
+/// `follow_symlinks(false)`.
+fn collect_watch_dirs(dir: &Path, overrides: &Override, out: &mut Vec<(PathBuf, RecursiveMode)>) {
+    out.push((dir.to_path_buf(), RecursiveMode::NonRecursive));
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut child_dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        // `file_type()` on a `DirEntry` does not traverse symlinks, so a
+        // symlinked directory reports `is_symlink()` and is skipped here.
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if overrides.matched(&path, true).is_ignore() {
+            continue;
+        }
+        child_dirs.push(path);
+    }
+    // Deterministic order for stable debug output and tests.
+    child_dirs.sort();
+    for child in &child_dirs {
+        collect_watch_dirs(child, overrides, out);
+    }
+}
+
+/// Reconcile a desired watch set against what is already registered, producing
+/// the minimal set of watch/unwatch actions. Pure (no I/O) so it is
+/// table-testable; the actual `watch()`/`unwatch()` calls happen in
+/// [`apply_watch_actions`].
+fn reconcile_watches(
+    desired: &[(PathBuf, RecursiveMode)],
+    registered: &HashMap<PathBuf, RecursiveMode>,
+) -> Vec<WatchAction> {
+    // Simulate the registration as we go so a recursive watch planned early in
+    // the batch covers its descendants later in the batch.
+    let mut sim = registered.clone();
+    // Ancestors first: a recursive ancestor added early covers descendants.
+    let mut ordered: Vec<&(PathBuf, RecursiveMode)> = desired.iter().collect();
+    ordered.sort_by_key(|(dir, _)| dir.components().count());
+
+    let mut actions = Vec::new();
+    for (dir, mode) in ordered {
+        if is_covered(dir, *mode, &sim) {
+            continue;
+        }
+        let replace = *mode == RecursiveMode::Recursive
+            && sim.get(dir) == Some(&RecursiveMode::NonRecursive);
+        actions.push(WatchAction {
+            dir: dir.clone(),
+            mode: *mode,
+            replace,
+        });
+        sim.insert(dir.clone(), *mode);
+    }
+    actions
+}
+
+/// Apply reconciled watch actions to the notify backend and record them in
+/// `registered_dirs`. Stops at the first hard error and returns it; the caller
+/// decides whether that is fatal (startup) or per-item (runtime reload).
+fn apply_watch_actions(
+    watcher: &mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    actions: Vec<WatchAction>,
+    registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
+) -> Result<(), WatchError> {
+    for action in actions {
+        let backend = ensure_notify_watcher(watcher, notify_tx)?;
+        if action.replace {
+            // Best-effort: an unwatch failure shouldn't block the re-watch.
+            let _ = backend.unwatch(&action.dir);
+        }
+        backend.watch(&action.dir, action.mode)?;
+        registered_dirs.insert(action.dir, action.mode);
+    }
+    Ok(())
+}
+
+/// Recursively collect non-ignored file paths under `dir` (skipping ignored
+/// subtrees and symlinks). Used to replay files that already exist inside a
+/// directory that appeared before its watch took effect.
+fn collect_files_recursive(dir: &Path, overrides: &Override, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            if overrides.matched(&path, true).is_ignore() {
+                continue;
+            }
+            collect_files_recursive(&path, overrides, out);
+        } else if ft.is_file() && !overrides.matched(&path, false).is_ignore() {
+            out.push(path);
+        }
+        // Symlinks are skipped, mirroring `follow_symlinks(false)`.
+    }
 }
 
 fn refresh_item_definition(
@@ -1448,6 +1728,178 @@ mod tests {
                 case.name,
             );
         }
+    }
+
+    #[test]
+    fn test_reconcile_watches() {
+        use RecursiveMode::{NonRecursive, Recursive};
+
+        struct Case {
+            name: &'static str,
+            desired: Vec<(&'static str, RecursiveMode)>,
+            registered: Vec<(&'static str, RecursiveMode)>,
+            expected: Vec<(&'static str, RecursiveMode, bool)>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "fresh recursive root",
+                desired: vec![("/a", Recursive)],
+                registered: vec![],
+                expected: vec![("/a", Recursive, false)],
+            },
+            Case {
+                name: "recursive ancestor covers later descendants in batch",
+                desired: vec![("/a/b", Recursive), ("/a", Recursive)],
+                registered: vec![],
+                // Sorted ancestors-first: /a registers and covers /a/b.
+                expected: vec![("/a", Recursive, false)],
+            },
+            Case {
+                name: "spine non-recursive plus recursive clean child",
+                desired: vec![("/a", NonRecursive), ("/a/clean", Recursive)],
+                registered: vec![],
+                expected: vec![("/a", NonRecursive, false), ("/a/clean", Recursive, false)],
+            },
+            Case {
+                name: "already covered by recursive ancestor is skipped",
+                desired: vec![("/a/b", Recursive)],
+                registered: vec![("/a", Recursive)],
+                expected: vec![],
+            },
+            Case {
+                name: "upgrade existing non-recursive to recursive replaces it",
+                desired: vec![("/a", Recursive)],
+                registered: vec![("/a", NonRecursive)],
+                expected: vec![("/a", Recursive, true)],
+            },
+            Case {
+                name: "exact non-recursive already registered is skipped",
+                desired: vec![("/a", NonRecursive)],
+                registered: vec![("/a", NonRecursive)],
+                expected: vec![],
+            },
+            Case {
+                name: "non-recursive request under recursive ancestor is skipped",
+                desired: vec![("/a/b", NonRecursive)],
+                registered: vec![("/a", Recursive)],
+                expected: vec![],
+            },
+        ];
+
+        for case in cases {
+            let desired: Vec<(PathBuf, RecursiveMode)> = case
+                .desired
+                .iter()
+                .map(|(p, m)| (PathBuf::from(p), *m))
+                .collect();
+            let registered: HashMap<PathBuf, RecursiveMode> = case
+                .registered
+                .iter()
+                .map(|(p, m)| (PathBuf::from(p), *m))
+                .collect();
+            let expected: Vec<WatchAction> = case
+                .expected
+                .iter()
+                .map(|(p, m, replace)| WatchAction {
+                    dir: PathBuf::from(p),
+                    mode: *m,
+                    replace: *replace,
+                })
+                .collect();
+
+            let got = reconcile_watches(&desired, &registered);
+            assert_eq!(got, expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_desired_watches() {
+        use RecursiveMode::NonRecursive;
+
+        // Build a tree:
+        //   root/
+        //     clean/
+        //       sub/
+        //     pkg/
+        //       node_modules/   (ignored -> never watched)
+        //         dep/
+        //       src/
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for rel in [
+            "clean/sub",
+            "pkg/node_modules/dep",
+            "pkg/src",
+        ] {
+            std::fs::create_dir_all(root.join(rel)).unwrap();
+        }
+
+        let mut warnings = Vec::new();
+        let overrides =
+            build_watch_ignore_overrides(root, &["**/node_modules/**".to_string()], &mut warnings);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+        let mut got: Vec<(PathBuf, RecursiveMode)> = desired_watches(root, &overrides);
+        got.sort();
+
+        // Every non-ignored directory is watched non-recursively; the ignored
+        // `node_modules` subtree is pruned entirely.
+        let mut expected: Vec<(PathBuf, RecursiveMode)> = vec![
+            (root.to_path_buf(), NonRecursive),
+            (root.join("clean"), NonRecursive),
+            (root.join("clean/sub"), NonRecursive),
+            (root.join("pkg"), NonRecursive),
+            (root.join("pkg/src"), NonRecursive),
+        ];
+        expected.sort();
+
+        assert_eq!(got, expected);
+        // node_modules must never appear in the watch set.
+        assert!(
+            !got.iter().any(|(p, _)| p.to_string_lossy().contains("node_modules")),
+            "node_modules should be pruned: {got:?}"
+        );
+    }
+
+    #[test]
+    fn test_desired_watches_prunes_nested_ignored_dir_created_anywhere() {
+        // A `**/node_modules/**` pattern must prune node_modules at any depth,
+        // not just directly under root.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("a/b/node_modules/dep")).unwrap();
+        std::fs::create_dir_all(root.join("a/b/keep")).unwrap();
+
+        let mut warnings = Vec::new();
+        let overrides =
+            build_watch_ignore_overrides(root, &["**/node_modules/**".to_string()], &mut warnings);
+
+        let mut got = desired_watches(root, &overrides);
+        got.sort();
+
+        let mut expected: Vec<(PathBuf, RecursiveMode)> = vec![
+            (root.to_path_buf(), RecursiveMode::NonRecursive),
+            (root.join("a"), RecursiveMode::NonRecursive),
+            (root.join("a/b"), RecursiveMode::NonRecursive),
+            (root.join("a/b/keep"), RecursiveMode::NonRecursive),
+        ];
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_build_watch_ignore_overrides_reports_invalid_glob() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut warnings = Vec::new();
+        // An unclosed character class is an invalid glob.
+        let _ = build_watch_ignore_overrides(
+            temp.path(),
+            &["good/**".to_string(), "bad[".to_string()],
+            &mut warnings,
+        );
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("bad["), "warnings: {warnings:?}");
     }
 
     #[tokio::test]

@@ -254,14 +254,29 @@ fn integration_watch_endpoint_reports_dirs_and_patterns() {
             .done()
             .build();
 
+        // Pre-create `src` with an ignored `node_modules` and a real
+        // `components` dir. Every non-ignored directory is watched
+        // non-recursively; the ignored `node_modules` is never watched.
+        std::fs::create_dir_all(dir.path().join("src/node_modules/left-pad")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/components")).unwrap();
+
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
 
         let (status, body) = request(&socket, "GET", "/watch").await;
         assert_eq!(status, 200, "body: {body}");
-        // Registered inotify directory for the resolved `src` watch.
+        // Registered inotify directories for the resolved `src` watch.
         assert!(body.contains("\"directories\""), "body: {body}");
-        assert!(body.contains("\"mode\":\"recursive\""), "body: {body}");
+        // All watches are non-recursive so notify never auto-descends into a
+        // runtime-created ignored dir.
+        assert!(body.contains("\"mode\":\"non-recursive\""), "body: {body}");
+        // The real `components` dir is watched...
+        assert!(body.contains("components"), "body: {body}");
+        // ...but the ignored node_modules must not appear as a registered dir.
+        assert!(
+            !body.contains("node_modules/left-pad"),
+            "ignored dir should not be watched, body: {body}"
+        );
         // The item and its (absolute) glob pattern.
         assert!(body.contains("\"name\":\"api\""), "body: {body}");
         assert!(body.contains("\"kind\":\"service\""), "body: {body}");

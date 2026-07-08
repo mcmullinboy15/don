@@ -259,6 +259,184 @@ ready.exec.cmd = "true"
     });
 }
 
+/// A directory created at runtime under a watched directory must be picked up,
+/// so files created inside it trigger a rebuild. Because all watches are
+/// non-recursive, notify won't auto-watch the new dir — the create backstop has
+/// to register it and replay any files that already landed inside it.
+#[test]
+fn integration_new_dir_at_runtime_triggers_rebuild() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-new-dir-runtime");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "v1").unwrap();
+
+        let toml = r#"
+watch_ignore = ["**/node_modules/**"]
+
+[services.api]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+watch = ["src/**/*.rs"]
+debounce = "100ms"
+log = "ignore"
+ready.exec.cmd = "true"
+"#;
+
+        let (runner, shutdown_tx, buf) = make_runner(toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+            "services did not start. output: {}",
+            read_buf(&buf)
+        );
+
+        // Create a brand-new directory under `src` and drop a matching file into
+        // it. The backstop must register `src/feature` and replay `new.rs`.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::create_dir_all(dir.path().join("src/feature")).unwrap();
+        std::fs::write(dir.path().join("src/feature/new.rs"), "v1").unwrap();
+
+        assert!(
+            wait_for_output(&buf, "rebuilding (file changed)", Duration::from_secs(6)).await,
+            "new file under a runtime-created directory did not trigger a rebuild. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// A whole *nested* directory tree created at once (e.g. `mkdir -p a/b/c` then a
+/// file) must be picked up, even though only the top of the tree fires a create
+/// event under a non-recursive watch. The backstop's subtree walk has to
+/// register every level and replay files it finds.
+#[test]
+fn integration_deep_new_dir_tree_at_runtime_triggers_rebuild() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-deep-new-dir");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "v1").unwrap();
+
+        let toml = r#"
+watch_ignore = ["**/node_modules/**"]
+
+[services.api]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+watch = ["src/**/*.rs"]
+debounce = "100ms"
+log = "ignore"
+ready.exec.cmd = "true"
+"#;
+
+        let (runner, shutdown_tx, buf) = make_runner(toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+            "services did not start. output: {}",
+            read_buf(&buf)
+        );
+
+        // Create several levels at once, with the matching file at the bottom.
+        // Only `src` is watched at this point, so this exercises the backstop's
+        // recursive registration + replay-scan, not per-level create events.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::create_dir_all(dir.path().join("src/a/b/c")).unwrap();
+        std::fs::write(dir.path().join("src/a/b/c/deep.rs"), "v1").unwrap();
+
+        assert!(
+            wait_for_output(&buf, "rebuilding (file changed)", Duration::from_secs(6)).await,
+            "file deep in a runtime-created tree did not trigger a rebuild. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// A `watch_ignore`d directory that is created *at runtime* under a watched
+/// directory must not be registered with the watcher (and must not trigger a
+/// rebuild). This is why every watch is non-recursive: a recursive watch would
+/// let notify auto-descend into the fresh `node_modules` and re-register the
+/// whole heavy subtree we asked to ignore.
+#[test]
+fn integration_runtime_node_modules_is_not_watched() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-runtime-node-modules");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "v1").unwrap();
+
+        let toml = r#"
+watch_ignore = ["**/node_modules/**"]
+
+[services.api]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+watch = ["src/**/*.rs"]
+debounce = "100ms"
+log = "ignore"
+ready.exec.cmd = "true"
+"#;
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+            "services did not start. output: {}",
+            read_buf(&buf)
+        );
+
+        // Simulate `npm install`: a node_modules tree appears at runtime under
+        // the watched `src` dir, then a real source edit lands.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::create_dir_all(dir.path().join("src/node_modules/left-pad")).unwrap();
+        std::fs::write(
+            dir.path().join("src/node_modules/left-pad/index.js"),
+            "module.exports = 1",
+        )
+        .unwrap();
+        // Give the create event time to be processed by the backstop.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::fs::write(dir.path().join("src/main.rs"), "v2").unwrap();
+
+        // The real edit still rebuilds — the watcher is alive and working.
+        assert!(
+            wait_for_output(&buf, "rebuilding (file changed)", Duration::from_secs(5)).await,
+            "watched edit did not rebuild. output: {}",
+            read_buf(&buf)
+        );
+
+        let output = read_buf(&buf);
+        // The runtime-created ignored dir must stay invisible to the watcher: no
+        // event, match, or registration diagnostic. The only legitimate mention
+        // is the startup summary echoing the configured ignore patterns
+        // (`... ignore=[...]`), which we skip.
+        for line in output.lines() {
+            if line.contains("ignore=[") {
+                continue;
+            }
+            assert!(
+                !line.contains("node_modules"),
+                "node_modules leaked into watch handling: {line}"
+            );
+        }
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- Integration test: build then restart on file change ---
 
 #[test]
