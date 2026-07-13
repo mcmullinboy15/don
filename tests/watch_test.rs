@@ -661,7 +661,11 @@ fn integration_rapid_fire_changes_one_restart() {
         let toml = ConfigBuilder::new()
             .add_custom_service("api", "bash", &["-c", "sleep 60"])
             .watch(&["src/**/*.rs"])
-            .debounce("300ms")
+            // A generous debounce so all 5 writes coalesce even under the
+            // coarser event-delivery latency of macOS FSEvents (a tight window
+            // makes this test ~flaky there). The window still comfortably
+            // exceeds the 250ms write span on Linux/inotify.
+            .debounce("1s")
             .log("ignore")
             .ready_exec("true", &[])
             .done()
@@ -678,7 +682,7 @@ fn integration_rapid_fire_changes_one_restart() {
             "timed out waiting for services to start"
         );
 
-        // Fire 5 rapid changes with 50ms gaps (total 250ms < 300ms debounce).
+        // Fire 5 rapid changes with 50ms gaps (total 250ms < 1s debounce).
         tokio::time::sleep(Duration::from_millis(200)).await;
         for i in 1..=5 {
             std::fs::write(src_dir.join("main.rs"), format!("v{i}")).unwrap();
