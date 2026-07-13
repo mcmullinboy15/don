@@ -1,133 +1,88 @@
-//! Just-in-time start orchestration for lazy services: a first proxy
-//! connection triggers a start, but only once `depends_on` is satisfied.
+//! Just-in-time activation helpers for lazy services.
+//!
+//! `Lazy` means no connection has requested the service yet. The first
+//! connection transitions it to `Pending`, after which the normal dependency
+//! scheduler owns it just like any other service.
 
-use super::events::ItemDone;
-use super::service_worker::ServiceStartMode;
+use super::build_tools::BatchBuildOutcome;
 use super::{NodeKind, Runner, ServiceState};
-use std::collections::HashSet;
-use tokio::sync::mpsc;
-
-/// Why a lazy service is being started — drives lifecycle event wording.
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runner) enum LazyStartReason {
-    /// A first connection arrived with dependencies already satisfied.
-    FirstConnection,
-    /// An earlier connection was deferred; dependencies are now satisfied.
-    DependenciesReady,
-}
-
-impl LazyStartReason {
-    fn prefix(self) -> &'static str {
-        match self {
-            LazyStartReason::FirstConnection => "first connection",
-            LazyStartReason::DependenciesReady => "dependencies ready",
-        }
-    }
-}
 
 impl Runner {
-    /// React to a lazy service's first proxy connection (caller confirmed
-    /// `Lazy`): start now, defer, or surface `DependencyFailed`.
-    pub(in crate::runner) fn handle_lazy_connection(
-        &mut self,
-        name: &str,
-        pending: &mut HashSet<String>,
-        done_tx: &mpsc::Sender<ItemDone>,
-    ) {
+    /// Record the first proxy connection for a lazy service.
+    ///
+    /// Moving to `Pending` is the request: no parallel name set is needed, and
+    /// the normal pending-item scheduler can wait, cascade dependency failure,
+    /// and start the service when its dependencies become ready.
+    pub(in crate::runner) fn handle_lazy_connection(&mut self, name: &str) {
         let deps = match self.services.get(name) {
-            Some(rs) => rs.resolved.depends_on.clone(),
-            None => return,
+            Some(rs) if rs.state() == ServiceState::Lazy => rs.resolved.depends_on.clone(),
+            _ => return,
         };
 
-        // Don't build/start against a broken prerequisite; surface it instead.
         if let Some(failed) = deps.iter().find(|dep| self.is_dep_failed(dep)) {
-            let failed = failed.clone();
-            self.lazy_start_requested.remove(name);
-            pending.remove(name);
-            self.set_service_state(name, ServiceState::DependencyFailed);
             self.output_manager.service_error_event(
                 name,
-                &format!("cannot start — dependency '{failed}' failed"),
+                &format!("first connection — dependency '{failed}' has failed"),
             );
-            return;
-        }
-
-        let unsatisfied: Vec<String> = deps
-            .iter()
-            .filter(|dep| !self.is_dep_satisfied(dep))
-            .cloned()
-            .collect();
-
-        if unsatisfied.is_empty() {
-            self.lazy_start_requested.remove(name);
-            self.start_lazy_service(name, done_tx.clone(), LazyStartReason::FirstConnection);
-            return;
-        }
-
-        // Defer: stay `Lazy` and keep in `pending` so `start_ready_items`
-        // re-fires the recorded request once every dependency is satisfied.
-        pending.insert(name.to_string());
-        if self.lazy_start_requested.insert(name.to_string()) {
-            self.output_manager.service_event(
-                name,
-                &format!(
-                    "waiting for dependencies before start: {}",
-                    unsatisfied.join(", ")
-                ),
-            );
-        }
-    }
-
-    /// Kick a lazy service's JIT build (build-tool-managed, not yet built) or
-    /// its direct start. Caller must have confirmed deps are satisfied.
-    pub(in crate::runner) fn start_lazy_service(
-        &mut self,
-        name: &str,
-        done_tx: mpsc::Sender<ItemDone>,
-        reason: LazyStartReason,
-    ) {
-        if !self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.state() == ServiceState::Lazy)
-        {
-            return;
-        }
-
-        let prefix = reason.prefix();
-        let needs_jit = self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.resolved.is_build_tool_managed() && !rs.batch_built);
-
-        if needs_jit {
-            let item = match self.services.get(name) {
-                Some(rs) => self.build_batch_item(name, NodeKind::Service, rs),
-                None => return,
-            };
-            self.output_manager
-                .service_event(name, &format!("{prefix} — building before start"));
-            self.set_service_state(name, ServiceState::Building);
-            self.spawn_lazy_build(name, item);
         } else {
-            self.output_manager
-                .service_event(name, &format!("{prefix} — starting service"));
-            if let Err(e) = self.queue_startup_service_start(name, done_tx, ServiceStartMode::Full) {
+            let unsatisfied: Vec<&str> = deps
+                .iter()
+                .filter(|dep| !self.is_dep_satisfied(dep))
+                .map(String::as_str)
+                .collect();
+            if unsatisfied.is_empty() {
                 self.output_manager
-                    .service_error_event(name, &e.to_string());
+                    .service_event(name, "first connection — dependencies satisfied");
+            } else {
+                self.output_manager.service_event(
+                    name,
+                    &format!(
+                        "waiting for dependencies before start: {}",
+                        unsatisfied.join(", ")
+                    ),
+                );
             }
         }
+
+        self.set_service_state(name, ServiceState::Pending);
     }
 
-    /// First failed `depends_on` entry of `name`, if any. Re-checked after a
-    /// JIT build since a dependency can fail while the build runs.
-    pub(in crate::runner) fn first_failed_dep(&self, name: &str) -> Option<String> {
-        self.services
-            .get(name)?
-            .resolved
-            .depends_on
-            .iter()
-            .find(|dep| self.is_dep_failed(dep))
-            .cloned()
+    /// Start the detached build-tool chain for a triggered lazy service when
+    /// it has not been batch-built yet. Returns whether a build was started.
+    pub(in crate::runner) fn start_lazy_build_if_needed(&mut self, name: &str) -> bool {
+        let needs_jit = self.services.get(name).is_some_and(|rs| {
+            rs.state() == ServiceState::Pending
+                && rs.resolved.lazy
+                && rs.resolved.is_build_tool_managed()
+                && !rs.batch_built
+        });
+        if !needs_jit {
+            return false;
+        }
+
+        let item = match self.services.get(name) {
+            Some(rs) => self.build_batch_item(name, NodeKind::Service, rs),
+            None => return false,
+        };
+        self.output_manager
+            .service_event(name, "dependencies ready — building before start");
+        self.set_service_state(name, ServiceState::Building);
+        self.spawn_lazy_build(name, item);
+        true
+    }
+
+    /// Apply a lazy JIT build result and return successful builds to Pending.
+    /// The normal scheduler then re-checks every dependency before starting.
+    pub(in crate::runner) fn handle_lazy_build_complete(
+        &mut self,
+        name: &str,
+        outcome: BatchBuildOutcome,
+    ) {
+        self.lazy_build_handles.remove(name);
+        let replay_items = outcome.replay_items.clone();
+        self.apply_batch_build_outcome(outcome);
+        if let Some(item) = replay_items.iter().find(|item| item.name == name) {
+            self.schedule_lazy_build_replay(item);
+        }
     }
 }

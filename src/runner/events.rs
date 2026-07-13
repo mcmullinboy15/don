@@ -255,25 +255,6 @@ impl Runner {
                 };
                 self.output_manager.service_error_event(name, &msg);
             }
-            // Mirror the success branch's re-notify so a lazy dependent that
-            // deferred on this in-flight rerun cascades to DependencyFailed.
-            let run_generation = self.tasks.get(name).map(|rt| rt.run_generation);
-            if let Some(done_tx) = self.done_tx.clone() {
-                let name = name.to_string();
-                tokio::spawn(async move {
-                    let _ = done_tx
-                        .send(ItemDone {
-                            name,
-                            kind: NodeKind::Task,
-                            success: false,
-                            message: None,
-                            elapsed: None,
-                            last_run: None,
-                            task_run_generation: run_generation,
-                        })
-                        .await;
-                });
-            }
         }
 
         if rerun {

@@ -157,7 +157,7 @@ impl Runner {
 
         match result {
             Ok(start_result) => match intent {
-                ServiceStartIntent::Startup { done_tx } => {
+                ServiceStartIntent::Scheduled { done_tx } => {
                     self.wire_service_output_and_ready_check(
                         name,
                         *start_result,
@@ -199,7 +199,7 @@ impl Runner {
                     rs.reset_restart_tracking();
                 }
                 match intent {
-                    ServiceStartIntent::Startup { done_tx } => {
+                    ServiceStartIntent::Scheduled { done_tx } => {
                         let _ = done_tx
                             .send(ItemDone {
                                 name: name.to_string(),
@@ -397,7 +397,7 @@ impl Runner {
         )
     }
 
-    pub(in crate::runner) fn queue_startup_service_start(
+    pub(in crate::runner) fn queue_scheduled_service_start(
         &mut self,
         name: &str,
         done_tx: mpsc::Sender<ItemDone>,
@@ -416,7 +416,7 @@ impl Runner {
             name,
             context,
             mode,
-            ServiceStartIntent::Startup { done_tx },
+            ServiceStartIntent::Scheduled { done_tx },
         )
     }
 
@@ -447,8 +447,6 @@ impl Runner {
                 return;
             }
         };
-        // An explicit start fulfills (and thus clears) any deferred lazy start.
-        self.lazy_start_requested.remove(name);
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager
             .service_event(name, "starting... (requested)");
@@ -505,9 +503,6 @@ impl Runner {
             return;
         }
 
-        // A hard restart takes the service out of the Lazy lifecycle — clear
-        // any deferred lazy start so a later sweep can't double-fire it.
-        self.lazy_start_requested.remove(name);
         self.clear_rebuild_stale(name);
         self.output_manager
             .service_event(name, "rebuilding (requested hard restart)");
@@ -667,18 +662,15 @@ impl Runner {
             let _ = reply.send(Err(e));
             return;
         }
-        // A lazy service in Lazy state has no process — just mark it Stopped.
-        if self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.state() == ServiceState::Lazy)
-        {
-            // Clear any deferred start so a later unrelated sweep doesn't
-            // resurrect a service the user explicitly stopped.
-            self.lazy_start_requested.remove(name);
+        // An untriggered or dependency-blocked lazy service has no process —
+        // just mark it Stopped. Pending means its proxy received a connection,
+        // but the dependency scheduler has not started it yet.
+        if self.services.get(name).is_some_and(|rs| {
+            rs.resolved.lazy && matches!(rs.state(), ServiceState::Lazy | ServiceState::Pending)
+        }) {
             self.set_service_state(name, ServiceState::Stopped);
             self.output_manager
-                .service_event(name, "stopped (was lazy)");
+                .service_event(name, "stopped before lazy start");
             let _ = reply.send(Ok(()));
             return;
         }
@@ -827,8 +819,6 @@ impl Runner {
             return;
         }
         if matches!(state, ServiceState::Lazy | ServiceState::Stopped) {
-            // An explicit restart fulfills (and thus clears) any deferred lazy start.
-            self.lazy_start_requested.remove(name);
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
         }
