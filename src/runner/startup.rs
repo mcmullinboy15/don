@@ -478,7 +478,10 @@ impl Runner {
     /// Recover any descendants stranded in `DependencyFailed` and then kick
     /// the normal pending-item sweep so newly-unblocked items can start.
     pub(in crate::runner) fn unblock_dependency_failed_items(&mut self) {
-        if self.restore_dependency_failed_items() {
+        let restored = self.restore_dependency_failed_items();
+        // A deferred lazy start stays in `Lazy` (not `DependencyFailed`), so
+        // `restored` misses it — sweep whenever one is waiting.
+        if restored || !self.lazy_start_requested.is_empty() {
             self.schedule_start_pending();
         }
     }
@@ -566,6 +569,29 @@ impl Runner {
 
         let mut started_any = false;
         for name in &order {
+            // A deferred lazy start (still `Lazy`) fires here once its deps are
+            // satisfied — the re-fire path for a dep going Ready off startup.
+            if self.lazy_start_requested.contains(name)
+                && self
+                    .services
+                    .get(name)
+                    .is_some_and(|rs| rs.state() == ServiceState::Lazy)
+            {
+                let deps = dep_map.get(name).cloned().unwrap_or_default();
+                if deps.iter().all(|dep| self.is_dep_satisfied(dep))
+                    && let Some(done_tx) = self.done_tx.clone()
+                {
+                    self.lazy_start_requested.remove(name);
+                    self.start_lazy_service(
+                        name,
+                        done_tx,
+                        super::lazy::LazyStartReason::DependenciesReady,
+                    );
+                    started_any = true;
+                }
+                continue;
+            }
+
             let is_pending_svc = self
                 .services
                 .get(name)

@@ -447,6 +447,8 @@ impl Runner {
                 return;
             }
         };
+        // An explicit start fulfills (and thus clears) any deferred lazy start.
+        self.lazy_start_requested.remove(name);
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager
             .service_event(name, "starting... (requested)");
@@ -503,6 +505,9 @@ impl Runner {
             return;
         }
 
+        // A hard restart takes the service out of the Lazy lifecycle — clear
+        // any deferred lazy start so a later sweep can't double-fire it.
+        self.lazy_start_requested.remove(name);
         self.clear_rebuild_stale(name);
         self.output_manager
             .service_event(name, "rebuilding (requested hard restart)");
@@ -668,6 +673,9 @@ impl Runner {
             .get(name)
             .is_some_and(|rs| rs.state() == ServiceState::Lazy)
         {
+            // Clear any deferred start so a later unrelated sweep doesn't
+            // resurrect a service the user explicitly stopped.
+            self.lazy_start_requested.remove(name);
             self.set_service_state(name, ServiceState::Stopped);
             self.output_manager
                 .service_event(name, "stopped (was lazy)");
@@ -819,6 +827,8 @@ impl Runner {
             return;
         }
         if matches!(state, ServiceState::Lazy | ServiceState::Stopped) {
+            // An explicit restart fulfills (and thus clears) any deferred lazy start.
+            self.lazy_start_requested.remove(name);
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
         }
