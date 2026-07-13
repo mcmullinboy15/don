@@ -34,6 +34,14 @@ jobs:
           rustc --version
           cargo --version
 
+      # The Go preset integration tests spawn a real `go` toolchain. The Ubuntu
+      # runner image ships one, but the macOS image does not — install it
+      # explicitly so both platforms exercise the same tests.
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
       - name: Build
         run: cargo build --locked
 
