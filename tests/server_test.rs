@@ -265,14 +265,32 @@ fn integration_watch_endpoint_reports_dirs_and_patterns() {
 
         let (status, body) = request(&socket, "GET", "/watch").await;
         assert_eq!(status, 200, "body: {body}");
-        // Registered inotify directories for the resolved `src` watch.
+        // Registered watch directories for the resolved `src` watch.
         assert!(body.contains("\"directories\""), "body: {body}");
-        // All watches are non-recursive so notify never auto-descends into a
-        // runtime-created ignored dir.
-        assert!(body.contains("\"mode\":\"non-recursive\""), "body: {body}");
-        // The real `components` dir is watched...
-        assert!(body.contains("components"), "body: {body}");
-        // ...but the ignored node_modules must not appear as a registered dir.
+
+        // The registration strategy is platform-dependent (see
+        // `watch::desired_watches`): Linux/inotify registers one non-recursive
+        // watch per directory (so `src/components` shows up individually), while
+        // macOS/FSEvents registers a single recursive watch at the glob base
+        // `src` that covers the whole subtree.
+        #[cfg(not(target_os = "macos"))]
+        {
+            // All watches are non-recursive so notify never auto-descends into a
+            // runtime-created ignored dir.
+            assert!(body.contains("\"mode\":\"non-recursive\""), "body: {body}");
+            // The real `components` dir is watched directly.
+            assert!(body.contains("components"), "body: {body}");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // One recursive watch at `src` covers `components` (and everything
+            // else) without a per-directory registration.
+            assert!(body.contains("\"mode\":\"recursive\""), "body: {body}");
+        }
+
+        // The ignored node_modules must not appear as a registered dir on either
+        // platform: Linux prunes it from the walk; macOS never registers per-dir
+        // entries under the recursive `src` watch at all.
         assert!(
             !body.contains("node_modules/left-pad"),
             "ignored dir should not be watched, body: {body}"
