@@ -1283,13 +1283,14 @@ struct WatchAction {
 
 /// Register the notify watches needed to cover `root`, honoring `watch_ignore`.
 ///
-/// Every non-ignored directory under `root` gets its own `NonRecursive` watch;
-/// ignored directories (`node_modules`, `target`, …) are pruned from the walk
-/// and never watched.
+/// The strategy is platform-dependent (see [`desired_watches`]): on Linux
+/// (inotify) every non-ignored directory under `root` gets its own
+/// `NonRecursive` watch and ignored subtrees are pruned from the walk; on macOS
+/// (FSEvents) a single `Recursive` watch is registered at `root`.
 ///
-/// We deliberately do **not** use recursive watches. A recursive watch makes
-/// notify auto-descend into every directory created beneath it at runtime —
-/// including a fresh ignored directory (a new `node_modules`, `target`, …),
+/// On Linux we deliberately do **not** use recursive watches. A recursive watch
+/// makes notify auto-descend into every directory created beneath it at runtime
+/// — including a fresh ignored directory (a new `node_modules`, `target`, …),
 /// re-registering the whole heavy subtree we set out to prune. There is no way
 /// to stop that descent (notify has no ignore hook), only to unwatch it *after*
 /// the spike — by which point thousands of watch descriptors may already have
@@ -1297,8 +1298,11 @@ struct WatchAction {
 /// ignored dir is simply skipped by the create backstop
 /// ([`WatchManager::register_new_directory`]); the cost is that new directories
 /// must be registered by that backstop rather than by notify. The kernel watch
-/// count is identical either way (notify allocates one descriptor per directory
+/// count is identical either way (inotify allocates one descriptor per directory
 /// even for a recursive watch).
+///
+/// That reasoning does **not** transfer to macOS, where a per-directory scheme
+/// is pathologically slow — see [`desired_watches`].
 fn register_dirs_ignoring(
     watcher: &mut Option<NotifyBackend>,
     notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
@@ -1325,10 +1329,32 @@ fn register_single_dir(
     apply_watch_actions(watcher, notify_tx, actions, registered_dirs)
 }
 
-/// Compute the desired `(directory, NonRecursive)` watch set for `root`'s
-/// subtree, pruning ignored directories. See [`register_dirs_ignoring`] for why
-/// every entry is non-recursive.
+/// Compute the desired watch set for `root`'s subtree.
+///
+/// **Linux (inotify):** every non-ignored directory under `root` gets its own
+/// `NonRecursive` watch; ignored subtrees are pruned. inotify allocates one
+/// descriptor per directory regardless of mode, so this costs the same as a
+/// recursive watch while honoring `watch_ignore` at registration and never
+/// auto-descending into a runtime `node_modules`.
+///
+/// **macOS (FSEvents):** a single `Recursive` watch at `root`. FSEvents is
+/// natively recursive and keeps *one* stream for all watched paths — every
+/// `watcher.watch()` call tears that stream down and rebuilds it over the full
+/// accumulated path set (see notify's `fsevent.rs`: `watch_inner` = `stop()` +
+/// `append_path` + `run()`). Registering one watch per directory therefore makes
+/// startup O(N²) in stream rebuilds plus N runloop-thread spawn/join cycles —
+/// minutes on a large monorepo (this was the 0.5.8 Mac startup regression). One
+/// recursive watch is one cheap stream, matching pre-0.5.8 behavior. `watch_ignore`
+/// is instead enforced at the event layer (`global_ignore` in
+/// [`WatchManager::handle_notify_event`]); FSEvents allocates no per-directory
+/// descriptors, so there is nothing to leak by not pruning here.
 fn desired_watches(root: &Path, overrides: &Override) -> Vec<(PathBuf, RecursiveMode)> {
+    // `cfg!` (not `#[cfg]`) so `collect_watch_dirs` stays compiled and
+    // referenced on every platform — no dead-code warnings, and the walk logic
+    // remains testable on Linux CI.
+    if cfg!(target_os = "macos") {
+        return vec![(root.to_path_buf(), RecursiveMode::Recursive)];
+    }
     let mut out = Vec::new();
     collect_watch_dirs(root, overrides, &mut out);
     out
@@ -1813,6 +1839,9 @@ mod tests {
         }
     }
 
+    // On macOS `desired_watches` short-circuits to a single recursive watch, so
+    // the per-directory walk asserted below only runs on other platforms.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_desired_watches() {
         use RecursiveMode::NonRecursive;
@@ -1862,6 +1891,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_desired_watches_prunes_nested_ignored_dir_created_anywhere() {
         // A `**/node_modules/**` pattern must prune node_modules at any depth,
@@ -1886,6 +1916,27 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(got, expected);
+    }
+
+    // On macOS the notify backend is FSEvents, where each `watcher.watch()` call
+    // rebuilds a single shared stream over all accumulated paths — a per-dir walk
+    // is O(N²). `desired_watches` must therefore collapse to one recursive watch
+    // at the root regardless of the subtree shape, ignored dirs included (they're
+    // filtered at the event layer instead).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_desired_watches_macos_single_recursive() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("pkg/src")).unwrap();
+        std::fs::create_dir_all(root.join("pkg/node_modules/dep")).unwrap();
+
+        let mut warnings = Vec::new();
+        let overrides =
+            build_watch_ignore_overrides(root, &["**/node_modules/**".to_string()], &mut warnings);
+
+        let got = desired_watches(root, &overrides);
+        assert_eq!(got, vec![(root.to_path_buf(), RecursiveMode::Recursive)]);
     }
 
     #[test]

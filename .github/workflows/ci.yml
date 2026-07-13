@@ -6,7 +6,14 @@ on:
 
 jobs:
   build-test-lint:
-    runs-on: ubuntu-24.04
+    # Test on every OS we ship a binary for. macOS matters especially: the file
+    # watcher uses a different notify backend there (FSEvents vs inotify), and
+    # the worst watch regressions have been macOS-only.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
         with:
