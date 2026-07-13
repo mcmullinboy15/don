@@ -367,7 +367,7 @@ impl TaskState {
             if has_glob_metacharacters(&resolved) {
                 roots.push(glob_pattern_base_dir(&resolved));
             } else {
-                consider_literal(&resolved, &compiled_ignore, &mut paths);
+                consider_literal(&resolved, &compiled_ignore, &mut paths)?;
             }
         }
 
@@ -395,7 +395,7 @@ impl TaskState {
                 &compiled_ignore,
                 &prune_prefixes,
                 &mut paths,
-            );
+            )?;
             let files_matched = paths.len().saturating_sub(paths_before);
             progress(TaskHashProgress::GlobFinished {
                 pattern: root_display,
@@ -545,31 +545,30 @@ fn collect_matching_files(
     ignore: &[glob::Pattern],
     prune_prefixes: &[glob::Pattern],
     out: &mut Vec<PathBuf>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+) -> Result<(), TaskStateError> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
         let path = entry.path();
         if file_type.is_dir() {
             if is_pruned(&path, prune_prefixes) {
                 continue;
             }
-            collect_matching_files(&path, watch, ignore, prune_prefixes, out);
+            collect_matching_files(&path, watch, ignore, prune_prefixes, out)?;
         } else if file_type.is_file() {
             consider_file(&path, watch, ignore, out);
         } else if file_type.is_symlink() {
-            // A symlink to a file is a candidate; a symlink to a directory (or a
-            // broken link) is skipped so a cycle can't drive an unbounded walk.
+            // A symlinked file is a candidate; a symlinked dir is skipped to bound cycles.
+            // A broken link (NotFound) is a no-match; other metadata errors propagate.
             match std::fs::metadata(&path) {
                 Ok(meta) if meta.is_file() => consider_file(&path, watch, ignore, out),
-                _ => {}
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(TaskStateError::Io(e)),
             }
         }
     }
+    Ok(())
 }
 
 /// Push `path` onto `out` if it matches a watch pattern and no ignore pattern.
@@ -593,18 +592,28 @@ fn consider_file(
 
 /// Push a literal watch target directly if it resolves to a file and isn't
 /// ignored — the metacharacter-free fast path that skips the directory walk.
-fn consider_literal(path: &Path, ignore: &[glob::Pattern], out: &mut Vec<PathBuf>) {
-    if !matches!(std::fs::metadata(path), Ok(meta) if meta.is_file()) {
-        return;
+fn consider_literal(
+    path: &Path,
+    ignore: &[glob::Pattern],
+    out: &mut Vec<PathBuf>,
+) -> Result<(), TaskStateError> {
+    // A missing literal (NotFound, incl. a broken symlink) is a no-match;
+    // other metadata errors propagate so an unreadable path surfaces.
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(TaskStateError::Io(e)),
     }
     let path_str = path.to_string_lossy();
     if ignore
         .iter()
         .any(|pattern| matches_glob(pattern, &path_str))
     {
-        return;
+        return Ok(());
     }
     out.push(path.to_path_buf());
+    Ok(())
 }
 
 /// Whether `dir` is fully covered by a `dir/**` ignore and can be skipped.
@@ -1035,7 +1044,7 @@ mod tests {
             })
             .collect();
         let mut out = Vec::new();
-        collect_matching_files(root, &watch, &ignore_pats, &prune, &mut out);
+        collect_matching_files(root, &watch, &ignore_pats, &prune, &mut out).unwrap();
         out.sort();
         out
     }
@@ -1263,5 +1272,57 @@ mod tests {
 
         fs::write(base.join("real.json"), "{\"v\":2}").unwrap();
         assert!(state.needs_run("t", &watch, &[], None).await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_broken_symlink_is_no_match_without_error() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("broken-symlink");
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("real.txt"), "x").unwrap();
+        symlink(base.join("does-not-exist"), base.join("dangling.txt")).unwrap();
+
+        // The dangling link must not match and must not error the walk (collect_paths
+        // unwraps, so an unexpected Err here would panic the test).
+        let watch = format!("{}/*.txt", base.display());
+        assert_eq!(
+            collect_paths(&base, &[&watch], &[]),
+            vec![base.join("real.txt")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unreadable_dir_surfaces_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("unreadable-dir");
+        let base = dir.path().to_path_buf();
+        let locked = base.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("a.txt"), "x").unwrap();
+
+        struct RestorePerms(PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = RestorePerms(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root bypasses permission bits; only assert when the dir is truly unreadable.
+        if fs::read_dir(&locked).is_ok() {
+            return;
+        }
+
+        let state = TaskState::new(base.join(".don-state"));
+        let watch = vec![format!("{}/**/*.txt", base.display())];
+        let result = state.compute_hash(&watch, &[], None);
+        assert!(
+            matches!(result, Err(TaskStateError::Io(_))),
+            "unreadable dir must surface as an Io error, got {result:?}"
+        );
     }
 }
