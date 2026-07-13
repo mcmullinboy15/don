@@ -2782,4 +2782,37 @@ mod tests {
             SystemTime::now() + std::time::Duration::from_secs(60),
         ));
     }
+
+    #[test]
+    fn test_any_glob_path_changed_since_star_does_not_cross_separator() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        fs::create_dir_all(repo.join("src/a")).unwrap();
+        fs::write(repo.join("src/a/b.ts"), "nested").unwrap();
+
+        // `src/*.ts` matches a direct child of src, not a nested file — mirroring
+        // glob::glob's component-wise walk (not Pattern::matches's default).
+        assert!(!any_glob_path_changed_since(
+            repo,
+            &["src/*.ts".to_string()],
+            &[],
+            SystemTime::UNIX_EPOCH,
+        ));
+
+        fs::write(repo.join("src/top.ts"), "top").unwrap();
+        assert!(any_glob_path_changed_since(
+            repo,
+            &["src/*.ts".to_string()],
+            &[],
+            SystemTime::UNIX_EPOCH,
+        ));
+
+        // `**` still crosses separators to reach the nested file.
+        assert!(any_glob_path_changed_since(
+            repo,
+            &["src/**/*.ts".to_string()],
+            &[],
+            SystemTime::UNIX_EPOCH,
+        ));
+    }
 }

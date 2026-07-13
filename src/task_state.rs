@@ -7,6 +7,7 @@
 //!
 //! Success state is only written after a task exits successfully (exit code 0).
 
+use crate::globwalk::{glob_pattern_base_dir, has_glob_metacharacters, matches_glob};
 use hex::encode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -356,11 +357,21 @@ impl TaskState {
             })
             .collect();
 
+        let mut paths = Vec::new();
+
+        // A literal (no-metacharacter) watch resolves to one path; stat it directly
+        // instead of walking its parent (a repo-root literal would walk the whole tree).
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for pattern in watch_patterns {
+            let resolved = resolve_pattern(base_dir, pattern);
+            if has_glob_metacharacters(&resolved) {
+                roots.push(glob_pattern_base_dir(&resolved));
+            } else {
+                consider_literal(&resolved, &compiled_ignore, &mut paths);
+            }
+        }
+
         // Drop roots nested under another root to avoid walking a subtree twice.
-        let mut roots: Vec<PathBuf> = watch_patterns
-            .iter()
-            .map(|pattern| glob_pattern_base_dir(&resolve_pattern(base_dir, pattern)))
-            .collect();
         roots.sort();
         roots.dedup();
         let mut walk_roots: Vec<PathBuf> = Vec::new();
@@ -371,7 +382,6 @@ impl TaskState {
             walk_roots.push(root);
         }
 
-        let mut paths = Vec::new();
         for root in &walk_roots {
             let root_display = root.to_string_lossy().into_owned();
             progress(TaskHashProgress::GlobStarted {
@@ -527,29 +537,6 @@ fn compile_pattern(
     glob::Pattern::new(&full.to_string_lossy()).map_err(|e| TaskStateError::Glob(e.to_string()))
 }
 
-/// Longest literal directory prefix of a glob pattern — the root to walk from.
-/// A metacharacter-free pattern is a literal file, so its parent is returned.
-fn glob_pattern_base_dir(pattern: &Path) -> PathBuf {
-    let mut base = PathBuf::new();
-    let mut hit_glob = false;
-    for component in pattern.components() {
-        let s = component.as_os_str().to_string_lossy();
-        if s.contains('*') || s.contains('?') || s.contains('[') {
-            hit_glob = true;
-            break;
-        }
-        base.push(component);
-    }
-    if !hit_glob {
-        base = base.parent().map(Path::to_path_buf).unwrap_or_default();
-    }
-    if base.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        base
-    }
-}
-
 /// Recursively collect files under `dir` matching a watch pattern and no ignore
 /// pattern. Symlinked directories are never descended, bounding cycle walks.
 fn collect_matching_files(
@@ -593,12 +580,31 @@ fn consider_file(
     out: &mut Vec<PathBuf>,
 ) {
     let path_str = path.to_string_lossy();
-    if ignore.iter().any(|pattern| pattern.matches(&path_str)) {
+    if ignore
+        .iter()
+        .any(|pattern| matches_glob(pattern, &path_str))
+    {
         return;
     }
-    if watch.iter().any(|pattern| pattern.matches(&path_str)) {
+    if watch.iter().any(|pattern| matches_glob(pattern, &path_str)) {
         out.push(path.to_path_buf());
     }
+}
+
+/// Push a literal watch target directly if it resolves to a file and isn't
+/// ignored — the metacharacter-free fast path that skips the directory walk.
+fn consider_literal(path: &Path, ignore: &[glob::Pattern], out: &mut Vec<PathBuf>) {
+    if !matches!(std::fs::metadata(path), Ok(meta) if meta.is_file()) {
+        return;
+    }
+    let path_str = path.to_string_lossy();
+    if ignore
+        .iter()
+        .any(|pattern| matches_glob(pattern, &path_str))
+    {
+        return;
+    }
+    out.push(path.to_path_buf());
 }
 
 /// Whether `dir` is fully covered by a `dir/**` ignore and can be skipped.
@@ -606,7 +612,7 @@ fn is_pruned(dir: &Path, prune_prefixes: &[glob::Pattern]) -> bool {
     let dir_str = dir.to_string_lossy();
     prune_prefixes
         .iter()
-        .any(|pattern| pattern.matches(&dir_str))
+        .any(|pattern| matches_glob(pattern, &dir_str))
 }
 
 async fn remove_file_if_exists(path: PathBuf) -> Result<(), TaskStateError> {
@@ -1132,5 +1138,130 @@ mod tests {
             collect_paths(&base, &[&watch], &[&ignore]),
             vec![base.join("keep.sql"), base.join("skipper/keep2.sql")]
         );
+    }
+
+    #[test]
+    fn test_separator_semantics_match_glob_glob() {
+        struct Case {
+            name: &'static str,
+            setup: fn(&Path),
+            watch: &'static str,
+            ignore: &'static [&'static str],
+            want: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                name: "star does not cross separator",
+                setup: |base| {
+                    fs::create_dir_all(base.join("src/a")).unwrap();
+                    fs::write(base.join("src/x.ts"), "1").unwrap();
+                    fs::write(base.join("src/a/b.ts"), "2").unwrap();
+                },
+                watch: "src/*.ts",
+                ignore: &[],
+                want: &["src/x.ts"],
+            },
+            Case {
+                name: "globstar crosses separators",
+                setup: |base| {
+                    fs::create_dir_all(base.join("a/x/y")).unwrap();
+                    fs::write(base.join("a/x.ts"), "1").unwrap();
+                    fs::write(base.join("a/x/y/z.ts"), "2").unwrap();
+                },
+                watch: "a/**/*.ts",
+                ignore: &[],
+                want: &["a/x/y/z.ts", "a/x.ts"],
+            },
+            Case {
+                name: "globstar prune matches zero components",
+                setup: |base| {
+                    fs::create_dir_all(base.join("a/node_modules")).unwrap();
+                    fs::write(base.join("a/keep.ts"), "1").unwrap();
+                    fs::write(base.join("a/node_modules/dep.ts"), "2").unwrap();
+                },
+                watch: "a/**/*.ts",
+                ignore: &["a/**/node_modules/**"],
+                want: &["a/keep.ts"],
+            },
+            Case {
+                name: "sibling with shared prefix not pruned",
+                setup: |base| {
+                    fs::write(base.join("keep.sql"), "1").unwrap();
+                    fs::create_dir_all(base.join("skip")).unwrap();
+                    fs::write(base.join("skip/x.sql"), "2").unwrap();
+                    fs::create_dir_all(base.join("skipper")).unwrap();
+                    fs::write(base.join("skipper/y.sql"), "3").unwrap();
+                },
+                watch: "**/*.sql",
+                ignore: &["**/skip/**"],
+                want: &["keep.sql", "skipper/y.sql"],
+            },
+        ];
+
+        for case in cases {
+            let dir = TempDir::new(case.name);
+            let base = dir.path().to_path_buf();
+            (case.setup)(&base);
+
+            let watch = format!("{}/{}", base.display(), case.watch);
+            let ignore: Vec<String> = case
+                .ignore
+                .iter()
+                .map(|pattern| format!("{}/{}", base.display(), pattern))
+                .collect();
+            let ignore_refs: Vec<&str> = ignore.iter().map(String::as_str).collect();
+
+            let got = collect_paths(&base, &[&watch], &ignore_refs);
+            let want: Vec<PathBuf> = case.want.iter().map(|rel| base.join(rel)).collect();
+            assert_eq!(got, want, "case '{}'", case.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_literal_watch_tracks_only_target_file() {
+        let dir = TempDir::new("literal-fast-path");
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("package.json"), "{\"v\":1}").unwrap();
+        // A large-ish sibling subtree the literal watch must not track.
+        fs::create_dir_all(base.join("node_modules/dep/sub")).unwrap();
+        for i in 0..50 {
+            fs::write(base.join(format!("node_modules/dep/sub/f{i}.js")), "x").unwrap();
+        }
+
+        let state = TaskState::new(base.join(".don-state"));
+        let watch = vec![format!("{}/package.json", base.display())];
+
+        assert!(state.needs_run("t", &watch, &[], None).await.unwrap());
+        state.record_success("t", &watch, &[], None).await.unwrap();
+        assert!(!state.needs_run("t", &watch, &[], None).await.unwrap());
+
+        // A change to an unrelated sibling must not re-trigger the task.
+        fs::write(base.join("node_modules/dep/sub/f0.js"), "changed").unwrap();
+        assert!(!state.needs_run("t", &watch, &[], None).await.unwrap());
+
+        // A change to the literal target itself must re-trigger it.
+        fs::write(base.join("package.json"), "{\"v\":2}").unwrap();
+        assert!(state.needs_run("t", &watch, &[], None).await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_literal_symlink_watch_tracked() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("literal-symlink");
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("real.json"), "{\"v\":1}").unwrap();
+        symlink(base.join("real.json"), base.join("link.json")).unwrap();
+
+        let state = TaskState::new(base.join(".don-state"));
+        // A literal watch on a symlink-to-file is tracked and its content hashed.
+        let watch = vec![format!("{}/link.json", base.display())];
+
+        state.record_success("t", &watch, &[], None).await.unwrap();
+        assert!(!state.needs_run("t", &watch, &[], None).await.unwrap());
+
+        fs::write(base.join("real.json"), "{\"v\":2}").unwrap();
+        assert!(state.needs_run("t", &watch, &[], None).await.unwrap());
     }
 }

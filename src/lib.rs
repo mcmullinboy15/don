@@ -6,6 +6,7 @@ pub(crate) mod docker;
 pub mod download;
 pub mod duration;
 pub mod exec;
+pub(crate) mod globwalk;
 pub mod init;
 pub mod output;
 pub mod process;
