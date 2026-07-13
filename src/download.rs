@@ -21,10 +21,12 @@ const SETUP_MARKER: &str = ".setup-marker";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Maximum time allowed for an artifact setup command.
-#[cfg(not(test))]
+///
+/// Passed explicitly to [`run_setup_if_needed`] rather than read from inside it,
+/// so tests can supply their own bound: the timeout-bounding test needs a tiny
+/// value while the run-once test needs one generous enough for a real shell to
+/// finish (a single shared `#[cfg(test)]` override made the latter CI-flaky).
 const SETUP_TIMEOUT: Duration = Duration::from_secs(300);
-#[cfg(test)]
-const SETUP_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Log a progress line after this many bytes received.
 const PROGRESS_INTERVAL_BYTES: u64 = 10 * 1024 * 1024;
@@ -216,7 +218,7 @@ pub async fn ensure_artifact(
                 .await;
         }
         // Still run setup if marker is missing (e.g., previous setup failed).
-        run_setup_if_needed(artifact, &cache_dir, service_writer).await?;
+        run_setup_if_needed(artifact, &cache_dir, service_writer, SETUP_TIMEOUT).await?;
         return Ok(());
     }
 
@@ -242,7 +244,7 @@ pub async fn ensure_artifact(
                 .write_line("artifact cached, skipping download")
                 .await;
         }
-        run_setup_if_needed(artifact, &cache_dir, service_writer).await?;
+        run_setup_if_needed(artifact, &cache_dir, service_writer, SETUP_TIMEOUT).await?;
         return Ok(());
     }
 
@@ -305,7 +307,7 @@ pub async fn ensure_artifact(
     result?;
 
     // Run setup command if configured.
-    run_setup_if_needed(artifact, &cache_dir, service_writer).await?;
+    run_setup_if_needed(artifact, &cache_dir, service_writer, SETUP_TIMEOUT).await?;
 
     Ok(())
 }
@@ -720,6 +722,7 @@ async fn run_setup_if_needed(
     artifact: &PlatformDownload,
     cache_dir: &Path,
     service_writer: Option<&crate::output::ServiceWriter>,
+    timeout: Duration,
 ) -> Result<(), DownloadError> {
     let setup = match &artifact.setup {
         Some(cmd) => cmd,
@@ -752,7 +755,7 @@ async fn run_setup_if_needed(
         cmd: setup.cmd.clone(),
         message: e.to_string(),
     })?;
-    let output = match tokio::time::timeout(SETUP_TIMEOUT, child.wait_with_output()).await {
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result.map_err(|e| DownloadError::Setup {
             cmd: setup.cmd.clone(),
             message: e.to_string(),
@@ -760,7 +763,7 @@ async fn run_setup_if_needed(
         Err(_) => {
             return Err(DownloadError::Setup {
                 cmd: setup.cmd.clone(),
-                message: format!("timed out after {SETUP_TIMEOUT:?}"),
+                message: format!("timed out after {timeout:?}"),
             });
         }
     };
@@ -1351,13 +1354,16 @@ mod tests {
         };
 
         // First run: setup should execute.
-        run_setup_if_needed(&artifact, &cache_dir, None)
+        // Generous timeout: this test only cares that setup runs (and is skipped
+        // the second time), not about the bound — a tight window flaked in CI
+        // when a loaded runner took >200ms just to spawn the shell.
+        run_setup_if_needed(&artifact, &cache_dir, None, Duration::from_secs(30))
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&counter_file).unwrap().trim(), "1");
 
         // Second run: setup should be skipped (marker file exists).
-        run_setup_if_needed(&artifact, &cache_dir, None)
+        run_setup_if_needed(&artifact, &cache_dir, None, Duration::from_secs(30))
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&counter_file).unwrap().trim(), "1");
@@ -1380,7 +1386,9 @@ mod tests {
             headers: std::collections::HashMap::new(),
         };
 
-        let result = run_setup_if_needed(&artifact, &cache_dir, None).await;
+        // Generous timeout — this exercises the command *failing*, not timing out.
+        let result =
+            run_setup_if_needed(&artifact, &cache_dir, None, Duration::from_secs(30)).await;
         assert!(result.is_err());
 
         // Marker file should NOT exist after failure.
@@ -1404,8 +1412,11 @@ mod tests {
             headers: std::collections::HashMap::new(),
         };
 
+        // A deliberately tiny timeout: the `sleep 5` must be killed well before it
+        // finishes so the elapsed-time assertion below proves the bound is enforced.
         let start = std::time::Instant::now();
-        let result = run_setup_if_needed(&artifact, &cache_dir, None).await;
+        let result =
+            run_setup_if_needed(&artifact, &cache_dir, None, Duration::from_millis(200)).await;
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("timed out"),
