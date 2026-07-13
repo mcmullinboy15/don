@@ -22,7 +22,7 @@ use crate::output::LifecycleEmitter;
 use crate::runner::{RunnerCommand, RunnerEvent};
 use glob::Pattern;
 use ignore::overrides::{Override, OverrideBuilder};
-use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, PathsMut, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -201,6 +201,13 @@ enum NotifyBackend {
 }
 
 impl NotifyBackend {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Native(_) => "native",
+            Self::Poll(_) => "poll",
+        }
+    }
+
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
         match self {
             Self::Native(watcher) => watcher.watch(path, mode),
@@ -212,6 +219,13 @@ impl NotifyBackend {
         match self {
             Self::Native(watcher) => watcher.unwatch(path),
             Self::Poll(watcher) => watcher.unwatch(path),
+        }
+    }
+
+    fn paths_mut(&mut self) -> Box<dyn PathsMut + '_> {
+        match self {
+            Self::Native(watcher) => watcher.paths_mut(),
+            Self::Poll(watcher) => watcher.paths_mut(),
         }
     }
 }
@@ -235,6 +249,15 @@ impl WatchManager {
         query_rx: mpsc::Receiver<WatchQuery>,
         emitter: LifecycleEmitter,
     ) -> Result<(Self, Vec<String>), WatchError> {
+        let setup_started = Instant::now();
+        emitter.debug_event(&format!(
+            "watch: initial setup started base={} services={} tasks={} watch_ignore={} backend_preference={}",
+            base_dir.display(),
+            config.services.len(),
+            config.tasks.len(),
+            config.watch_ignore.len(),
+            preferred_watcher_label()
+        ));
         let mut warnings: Vec<String> = Vec::new();
         let (notify_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -250,9 +273,15 @@ impl WatchManager {
         // absolute paths that notify reports in events. Without this, a base_dir
         // of `.` produces patterns like `./definitions/**/*.sql` that don't match
         // the absolute paths notify returns.
+        let canonicalize_started = Instant::now();
         let base_dir = std::fs::canonicalize(base_dir)
             .map_err(|e| WatchError::Io(base_dir.to_path_buf(), e))?;
         let base_dir = base_dir.as_path();
+        emitter.debug_event(&format!(
+            "watch: canonicalized base={} elapsed={:?}",
+            base_dir.display(),
+            canonicalize_started.elapsed()
+        ));
         let mut global_ignore_patterns: Vec<String> = Vec::new();
         for pattern in &config.watch_ignore {
             global_ignore_patterns
@@ -271,13 +300,24 @@ impl WatchManager {
         // Compile `watch_ignore` into an `ignore` override matcher rooted at the
         // canonical base dir. This is what prunes ignored subtrees when we walk
         // to decide which directories to register with the notify backend.
+        let ignore_setup_started = Instant::now();
         let overrides = build_watch_ignore_overrides(base_dir, &config.watch_ignore, &mut warnings);
+        emitter.debug_event(&format!(
+            "watch: ignore setup complete resolved_patterns={} warnings={} elapsed={:?}",
+            global_ignore_patterns.len(),
+            warnings.len(),
+            ignore_setup_started.elapsed()
+        ));
 
         let mut items: HashMap<String, WatchedItem> = HashMap::new();
         // Track which directories we've already registered, with the mode we
         // registered each under. See `WatchManager::registered_dirs` for why
         // the mode matters.
         let mut registered_dirs: HashMap<PathBuf, RecursiveMode> = HashMap::new();
+        // Collect every service/task request before touching the backend. On
+        // macOS this lets us discard descendant roots covered by a recursive
+        // ancestor and add the minimal set to FSEvents in one stream rebuild.
+        let mut initial_desired_watches: Vec<(PathBuf, RecursiveMode)> = Vec::new();
 
         // Process services.
         for (name, svc) in &config.services {
@@ -311,6 +351,16 @@ impl WatchManager {
                 continue;
             }
 
+            let item_setup_started = Instant::now();
+            let desired_before = initial_desired_watches.len();
+            emitter.service_debug_event(
+                name,
+                &format!(
+                    "watch: initial service setup started patterns={watch_patterns:?} dir={:?}",
+                    resolved.dir
+                ),
+            );
+
             // Resolve svc_dir relative to the (canonical) base_dir so patterns
             // are absolute and can match notify's absolute event paths.
             // Canonicalize to eliminate `./` components (e.g. dir = "./app"
@@ -342,19 +392,16 @@ impl WatchManager {
                     }
                 }
 
-                // Determine which directory to watch. Create it if it
-                // doesn't exist so we get precise inotify coverage
-                // instead of watching a broad ancestor.
                 let watch_dir = glob_base_dir(&full_pattern);
-                std::fs::create_dir_all(&watch_dir)
-                    .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
-
-                register_dirs_ignoring(
-                    &mut watcher,
-                    &notify_tx,
+                collect_initial_dirs_ignoring(
                     &watch_dir,
                     &overrides,
-                    &mut registered_dirs,
+                    &mut initial_desired_watches,
+                    InitialWatchRegistrationLog {
+                        emitter: &emitter,
+                        item: name,
+                        pattern: pattern_str,
+                    },
                 )?;
             }
 
@@ -390,6 +437,15 @@ impl WatchManager {
                     last_error: None,
                 },
             );
+            emitter.service_debug_event(
+                name,
+                &format!(
+                    "watch: initial service setup complete requested_directories={} total_requests={} elapsed={:?}",
+                    initial_desired_watches.len().saturating_sub(desired_before),
+                    initial_desired_watches.len(),
+                    item_setup_started.elapsed()
+                ),
+            );
         }
 
         // Process tasks.
@@ -397,6 +453,16 @@ impl WatchManager {
             if task.watch.is_empty() {
                 continue;
             }
+
+            let item_setup_started = Instant::now();
+            let desired_before = initial_desired_watches.len();
+            emitter.service_debug_event(
+                name,
+                &format!(
+                    "watch: initial task setup started patterns={:?} dir={:?}",
+                    task.watch, task.dir
+                ),
+            );
 
             let task_dir = match task.dir.as_deref() {
                 Some(d) => {
@@ -420,15 +486,15 @@ impl WatchManager {
                 }
 
                 let watch_dir = glob_base_dir(&full_pattern);
-                std::fs::create_dir_all(&watch_dir)
-                    .map_err(|e| WatchError::Io(watch_dir.clone(), e))?;
-
-                register_dirs_ignoring(
-                    &mut watcher,
-                    &notify_tx,
+                collect_initial_dirs_ignoring(
                     &watch_dir,
                     &overrides,
-                    &mut registered_dirs,
+                    &mut initial_desired_watches,
+                    InitialWatchRegistrationLog {
+                        emitter: &emitter,
+                        item: name,
+                        pattern: pattern_str,
+                    },
                 )?;
             }
 
@@ -464,7 +530,24 @@ impl WatchManager {
                     last_error: None,
                 },
             );
+            emitter.service_debug_event(
+                name,
+                &format!(
+                    "watch: initial task setup complete requested_directories={} total_requests={} elapsed={:?}",
+                    initial_desired_watches.len().saturating_sub(desired_before),
+                    initial_desired_watches.len(),
+                    item_setup_started.elapsed()
+                ),
+            );
         }
+
+        apply_initial_watch_batch(
+            &mut watcher,
+            &notify_tx,
+            initial_desired_watches,
+            &mut registered_dirs,
+            &emitter,
+        )?;
 
         // Register tier-1 build graph watches for workspace-level files.
         //
@@ -502,6 +585,11 @@ impl WatchManager {
                 .any(|t| t.turbo.as_ref().is_some_and(|turbo| turbo.watch));
 
             if has_bazel || has_turbo {
+                let graph_setup_started = Instant::now();
+                emitter.debug_event(&format!(
+                    "watch: workspace graph setup started bazel={has_bazel} turbo={has_turbo} root={}",
+                    base_dir.display()
+                ));
                 let mut root_file_names: Vec<&str> = Vec::new();
                 if has_bazel {
                     root_file_names.extend(["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"]);
@@ -525,14 +613,26 @@ impl WatchManager {
                 // Non-recursive watch on the workspace root is enough for
                 // these specific filenames. No symlink spelunking.
                 if !is_covered(base_dir, RecursiveMode::NonRecursive, &registered_dirs) {
-                    match ensure_notify_watcher(&mut watcher, &notify_tx).and_then(|watcher| {
-                        watcher
-                            .watch(base_dir, RecursiveMode::NonRecursive)
-                            .map_err(WatchError::from)
-                    }) {
+                    let registration_started = Instant::now();
+                    emitter.debug_event(&format!(
+                        "watch: workspace graph backend registration started root={} mode=non-recursive backend={}",
+                        base_dir.display(),
+                        watcher_label(watcher.as_ref())
+                    ));
+                    match register_single_dir(
+                        &mut watcher,
+                        &notify_tx,
+                        base_dir,
+                        RecursiveMode::NonRecursive,
+                        &mut registered_dirs,
+                    ) {
                         Ok(()) => {
-                            registered_dirs
-                                .insert(base_dir.to_path_buf(), RecursiveMode::NonRecursive);
+                            emitter.debug_event(&format!(
+                                "watch: workspace graph backend registration complete root={} backend={} elapsed={:?}",
+                                base_dir.display(),
+                                watcher_label(watcher.as_ref()),
+                                registration_started.elapsed()
+                            ));
                         }
                         Err(e) => warnings.push(format!(
                             "workspace watch registration failed for {}: {e}",
@@ -541,6 +641,7 @@ impl WatchManager {
                     }
                 }
 
+                let compiled_pattern_count = compiled_patterns.len();
                 if !compiled_patterns.is_empty() {
                     items.insert(
                         WORKSPACE_GRAPH_ITEM_NAME.to_string(),
@@ -556,6 +657,12 @@ impl WatchManager {
                         },
                     );
                 }
+                emitter.debug_event(&format!(
+                    "watch: workspace graph setup complete patterns={} total_directories={} elapsed={:?}",
+                    compiled_pattern_count,
+                    registered_dirs.len(),
+                    graph_setup_started.elapsed()
+                ));
             }
         }
 
@@ -581,12 +688,14 @@ impl WatchManager {
         let mut dirs: Vec<(&PathBuf, &RecursiveMode)> = registered_dirs.iter().collect();
         dirs.sort_by(|a, b| a.0.cmp(b.0));
         for (dir, mode) in &dirs {
-            emitter.debug_event(&format!("watch: inotify dir {:?} mode={:?}", dir, mode));
+            emitter.debug_event(&format!("watch: backend dir {:?} mode={:?}", dir, mode));
         }
         emitter.debug_event(&format!(
-            "watch: setup complete — {} items, {} directories registered",
+            "watch: setup complete — {} items, {} directories registered, backend={}, elapsed={:?}",
             items.len(),
-            registered_dirs.len()
+            registered_dirs.len(),
+            watcher_label(watcher.as_ref()),
+            setup_started.elapsed()
         ));
 
         let global_ignore: Vec<Pattern> = global_ignore_patterns
@@ -1281,15 +1390,129 @@ struct WatchAction {
     replace: bool,
 }
 
+struct InitialWatchRegistrationLog<'a> {
+    emitter: &'a LifecycleEmitter,
+    item: &'a str,
+    pattern: &'a str,
+}
+
+/// Collect an initial service/task watch with verbose phase timings.
+///
+/// Keeping these boundaries visible is important because directory creation,
+/// subtree discovery, and backend registration can each block independently on
+/// a large or remote workspace. Backend registration is deliberately deferred
+/// until every initial request has been collected so recursive ancestors can
+/// eliminate redundant descendant roots.
+fn collect_initial_dirs_ignoring(
+    root: &Path,
+    overrides: &Override,
+    initial_desired_watches: &mut Vec<(PathBuf, RecursiveMode)>,
+    log: InitialWatchRegistrationLog<'_>,
+) -> Result<(), WatchError> {
+    let pattern_started = Instant::now();
+    let filesystem_started = Instant::now();
+    log.emitter.service_debug_event(
+        log.item,
+        &format!(
+            "watch: initial pattern filesystem setup started pattern={:?} root={}",
+            log.pattern,
+            root.display()
+        ),
+    );
+    std::fs::create_dir_all(root).map_err(|e| WatchError::Io(root.to_path_buf(), e))?;
+    log.emitter.service_debug_event(
+        log.item,
+        &format!(
+            "watch: initial pattern filesystem setup complete pattern={:?} root={} elapsed={:?}",
+            log.pattern,
+            root.display(),
+            filesystem_started.elapsed()
+        ),
+    );
+
+    let discovery_started = Instant::now();
+    log.emitter.service_debug_event(
+        log.item,
+        &format!(
+            "watch: initial directory discovery started pattern={:?} root={} strategy={}",
+            log.pattern,
+            root.display(),
+            initial_watch_strategy_label()
+        ),
+    );
+    let desired = desired_watches(root, overrides);
+    log.emitter.service_debug_event(
+        log.item,
+        &format!(
+            "watch: initial directory discovery complete pattern={:?} root={} desired_directories={} elapsed={:?}",
+            log.pattern,
+            root.display(),
+            desired.len(),
+            discovery_started.elapsed()
+        ),
+    );
+
+    let recursive_requests = desired
+        .iter()
+        .filter(|(_, mode)| *mode == RecursiveMode::Recursive)
+        .count();
+    initial_desired_watches.extend(desired);
+    log.emitter.service_debug_event(
+        log.item,
+        &format!(
+            "watch: initial watch request queued pattern={:?} root={} recursive_requests={} total_requests={} pattern_elapsed={:?}",
+            log.pattern,
+            root.display(),
+            recursive_requests,
+            initial_desired_watches.len(),
+            pattern_started.elapsed()
+        ),
+    );
+    Ok(())
+}
+
+/// Reconcile all initial requests together, then register only the minimal set.
+///
+/// On macOS, `notify`'s FSEvents backend restarts its single stream whenever
+/// paths are mutated. Applying the reconciled actions as one batch avoids both
+/// redundant descendant roots and one stream restart per configured pattern.
+fn apply_initial_watch_batch(
+    watcher: &mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    desired: Vec<(PathBuf, RecursiveMode)>,
+    registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
+    emitter: &LifecycleEmitter,
+) -> Result<(), WatchError> {
+    let requested = desired.len();
+    let actions = reconcile_watches(&desired, registered_dirs);
+    let retained = actions.len();
+    let pruned = requested.saturating_sub(retained);
+    let registration_started = Instant::now();
+    emitter.debug_event(&format!(
+        "watch: initial backend batch started requests={requested} retained={retained} pruned={pruned} backend={} preference={}",
+        watcher_label(watcher.as_ref()),
+        preferred_watcher_label()
+    ));
+    apply_watch_actions(watcher, notify_tx, actions, registered_dirs)?;
+    emitter.debug_event(&format!(
+        "watch: initial backend batch complete registered={} backend={} elapsed={:?}",
+        registered_dirs.len(),
+        watcher_label(watcher.as_ref()),
+        registration_started.elapsed()
+    ));
+    Ok(())
+}
+
 /// Register the notify watches needed to cover `root`, honoring `watch_ignore`.
 ///
-/// Every non-ignored directory under `root` gets its own `NonRecursive` watch;
-/// ignored directories (`node_modules`, `target`, …) are pruned from the walk
-/// and never watched.
+/// The strategy is platform-dependent (see [`desired_watches`]): on Linux
+/// (inotify) every non-ignored directory under `root` gets its own
+/// `NonRecursive` watch and ignored subtrees are pruned from the walk; on macOS
+/// (FSEvents) a single `Recursive` watch is registered at `root`.
 ///
-/// We deliberately do **not** use recursive watches. A recursive watch makes
-/// notify auto-descend into every directory created beneath it at runtime —
-/// including a fresh ignored directory (a new `node_modules`, `target`, …),
+/// On Linux we deliberately do **not** use recursive watches. A recursive watch
+/// makes notify auto-descend into every directory created beneath it at runtime
+/// — including a fresh ignored directory (a new `node_modules`, `target`, …),
 /// re-registering the whole heavy subtree we set out to prune. There is no way
 /// to stop that descent (notify has no ignore hook), only to unwatch it *after*
 /// the spike — by which point thousands of watch descriptors may already have
@@ -1297,8 +1520,11 @@ struct WatchAction {
 /// ignored dir is simply skipped by the create backstop
 /// ([`WatchManager::register_new_directory`]); the cost is that new directories
 /// must be registered by that backstop rather than by notify. The kernel watch
-/// count is identical either way (notify allocates one descriptor per directory
+/// count is identical either way (inotify allocates one descriptor per directory
 /// even for a recursive watch).
+///
+/// That reasoning does **not** transfer to macOS, where a per-directory scheme
+/// is pathologically slow — see [`desired_watches`].
 fn register_dirs_ignoring(
     watcher: &mut Option<NotifyBackend>,
     notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
@@ -1325,10 +1551,32 @@ fn register_single_dir(
     apply_watch_actions(watcher, notify_tx, actions, registered_dirs)
 }
 
-/// Compute the desired `(directory, NonRecursive)` watch set for `root`'s
-/// subtree, pruning ignored directories. See [`register_dirs_ignoring`] for why
-/// every entry is non-recursive.
+/// Compute the desired watch set for `root`'s subtree.
+///
+/// **Linux (inotify):** every non-ignored directory under `root` gets its own
+/// `NonRecursive` watch; ignored subtrees are pruned. inotify allocates one
+/// descriptor per directory regardless of mode, so this costs the same as a
+/// recursive watch while honoring `watch_ignore` at registration and never
+/// auto-descending into a runtime `node_modules`.
+///
+/// **macOS (FSEvents):** a single `Recursive` watch at `root`. FSEvents is
+/// natively recursive and keeps *one* stream for all watched paths — every
+/// `watcher.watch()` call tears that stream down and rebuilds it over the full
+/// accumulated path set (see notify's `fsevent.rs`: `watch_inner` = `stop()` +
+/// `append_path` + `run()`). Registering one watch per directory therefore makes
+/// startup O(N²) in stream rebuilds plus N runloop-thread spawn/join cycles —
+/// minutes on a large monorepo (this was the 0.5.8 Mac startup regression). One
+/// recursive watch is one cheap stream, matching pre-0.5.8 behavior. `watch_ignore`
+/// is instead enforced at the event layer (`global_ignore` in
+/// [`WatchManager::handle_notify_event`]); FSEvents allocates no per-directory
+/// descriptors, so there is nothing to leak by not pruning here.
 fn desired_watches(root: &Path, overrides: &Override) -> Vec<(PathBuf, RecursiveMode)> {
+    // `cfg!` (not `#[cfg]`) so `collect_watch_dirs` stays compiled and
+    // referenced on every platform — no dead-code warnings, and the walk logic
+    // remains testable on Linux CI.
+    if cfg!(target_os = "macos") {
+        return vec![(root.to_path_buf(), RecursiveMode::Recursive)];
+    }
     let mut out = Vec::new();
     collect_watch_dirs(root, overrides, &mut out);
     out
@@ -1406,15 +1654,50 @@ fn apply_watch_actions(
     actions: Vec<WatchAction>,
     registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
 ) -> Result<(), WatchError> {
-    for action in actions {
-        let backend = ensure_notify_watcher(watcher, notify_tx)?;
-        if action.replace {
-            // Best-effort: an unwatch failure shouldn't block the re-watch.
-            let _ = backend.unwatch(&action.dir);
-        }
-        backend.watch(&action.dir, action.mode)?;
-        registered_dirs.insert(action.dir, action.mode);
+    if actions.is_empty() {
+        return Ok(());
     }
+
+    // Replacements are uncommon runtime upgrades and need ordered best-effort
+    // unwatch + watch handling. Fresh registrations can use `paths_mut`, which
+    // lets FSEvents stop and restart its shared stream once for the whole set.
+    if actions.iter().any(|action| action.replace) {
+        for action in actions {
+            let backend = ensure_notify_watcher(watcher, notify_tx)?;
+            if action.replace {
+                // Best-effort: an unwatch failure shouldn't block the re-watch.
+                let _ = backend.unwatch(&action.dir);
+            }
+            backend.watch(&action.dir, action.mode)?;
+            registered_dirs.insert(action.dir, action.mode);
+        }
+        return Ok(());
+    }
+
+    let backend = ensure_notify_watcher(watcher, notify_tx)?;
+    let mut paths = backend.paths_mut();
+    let mut added = Vec::new();
+    let mut add_error = None;
+    for action in &actions {
+        match paths.add(&action.dir, action.mode) {
+            Ok(()) => added.push(action),
+            Err(e) => {
+                add_error = Some(e);
+                break;
+            }
+        }
+    }
+    let commit_result = paths.commit();
+    if commit_result.is_ok() {
+        for action in added {
+            registered_dirs.insert(action.dir.clone(), action.mode);
+        }
+    }
+    if let Some(e) = add_error {
+        return Err(e.into());
+    }
+    commit_result?;
+
     Ok(())
 }
 
@@ -1553,6 +1836,26 @@ fn ensure_notify_watcher<'a>(
 
 fn prefer_poll_watcher() -> bool {
     cfg!(debug_assertions) && std::env::var_os("DON_NATIVE_WATCH").is_none()
+}
+
+fn preferred_watcher_label() -> &'static str {
+    if prefer_poll_watcher() {
+        "poll"
+    } else {
+        "native-with-poll-fallback"
+    }
+}
+
+fn watcher_label(watcher: Option<&NotifyBackend>) -> &'static str {
+    watcher.map_or("not-initialized", NotifyBackend::label)
+}
+
+fn initial_watch_strategy_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "recursive-root"
+    } else {
+        "non-recursive-directory-walk"
+    }
 }
 
 fn create_native_watcher(
@@ -1756,6 +2059,16 @@ mod tests {
                 expected: vec![("/a", Recursive, false)],
             },
             Case {
+                name: "recursive ancestor prunes multiple earlier sibling requests",
+                desired: vec![
+                    ("/a/prisma/models", Recursive),
+                    ("/a/redo/kafka/topics/src", Recursive),
+                    ("/a", Recursive),
+                ],
+                registered: vec![],
+                expected: vec![("/a", Recursive, false)],
+            },
+            Case {
                 name: "spine non-recursive plus recursive clean child",
                 desired: vec![("/a", NonRecursive), ("/a/clean", Recursive)],
                 registered: vec![],
@@ -1813,6 +2126,9 @@ mod tests {
         }
     }
 
+    // On macOS `desired_watches` short-circuits to a single recursive watch, so
+    // the per-directory walk asserted below only runs on other platforms.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_desired_watches() {
         use RecursiveMode::NonRecursive;
@@ -1862,6 +2178,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_desired_watches_prunes_nested_ignored_dir_created_anywhere() {
         // A `**/node_modules/**` pattern must prune node_modules at any depth,
@@ -1886,6 +2203,63 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(got, expected);
+    }
+
+    // On macOS the notify backend is FSEvents, where each `watcher.watch()` call
+    // rebuilds a single shared stream over all accumulated paths — a per-dir walk
+    // is O(N²). `desired_watches` must therefore collapse to one recursive watch
+    // at the root regardless of the subtree shape, ignored dirs included (they're
+    // filtered at the event layer instead).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_desired_watches_macos_single_recursive() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("pkg/src")).unwrap();
+        std::fs::create_dir_all(root.join("pkg/node_modules/dep")).unwrap();
+
+        let mut warnings = Vec::new();
+        let overrides =
+            build_watch_ignore_overrides(root, &["**/node_modules/**".to_string()], &mut warnings);
+
+        let got = desired_watches(root, &overrides);
+        assert_eq!(got, vec![(root.to_path_buf(), RecursiveMode::Recursive)]);
+    }
+
+    #[tokio::test]
+    async fn test_initial_watch_batch_prunes_recursive_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let prisma = root.join("prisma/models");
+        let kafka = root.join("redo/kafka/topics/src");
+        std::fs::create_dir_all(&prisma).unwrap();
+        std::fs::create_dir_all(&kafka).unwrap();
+
+        let output = crate::output::OutputManager::new(&[], tokio::io::sink())
+            .await
+            .unwrap();
+        let emitter = output.clone_lifecycle_emitter();
+        let (notify_tx, _notify_rx) = mpsc::unbounded_channel();
+        let mut watcher = None;
+        let mut registered = HashMap::new();
+
+        apply_initial_watch_batch(
+            &mut watcher,
+            &notify_tx,
+            vec![
+                (prisma, RecursiveMode::Recursive),
+                (kafka, RecursiveMode::Recursive),
+                (root.clone(), RecursiveMode::Recursive),
+            ],
+            &mut registered,
+            &emitter,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registered,
+            HashMap::from([(root, RecursiveMode::Recursive)])
+        );
     }
 
     #[test]

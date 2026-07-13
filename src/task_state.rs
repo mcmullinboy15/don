@@ -11,7 +11,9 @@ use hex::encode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const HASH_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Metadata for the most recent task process that actually ran.
 ///
@@ -62,6 +64,41 @@ pub struct TaskState {
     state_dir: PathBuf,
 }
 
+/// Progress emitted while collecting and hashing a task's watched inputs.
+pub(crate) enum TaskHashProgress {
+    GlobStarted {
+        pattern: String,
+    },
+    GlobProgress {
+        pattern: String,
+        entries_seen: usize,
+        files_matched: usize,
+        files_ignored: usize,
+        elapsed: Duration,
+    },
+    GlobFinished {
+        pattern: String,
+        entries_seen: usize,
+        files_matched: usize,
+        files_ignored: usize,
+        elapsed: Duration,
+    },
+    HashStarted {
+        total_files: usize,
+    },
+    HashProgress {
+        files_hashed: usize,
+        total_files: usize,
+        bytes_hashed: u64,
+        elapsed: Duration,
+    },
+    HashFinished {
+        files_hashed: usize,
+        bytes_hashed: u64,
+        elapsed: Duration,
+    },
+}
+
 impl Default for TaskState {
     fn default() -> Self {
         Self::new(PathBuf::from(".don").join("task-state"))
@@ -92,17 +129,33 @@ impl TaskState {
         ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<bool, TaskStateError> {
+        self.needs_run_with_progress(task_name, watch_patterns, ignore_patterns, base_dir, |_| {})
+            .await
+    }
+
+    pub(crate) async fn needs_run_with_progress<F>(
+        &self,
+        task_name: &str,
+        watch_patterns: &[String],
+        ignore_patterns: &[String],
+        base_dir: Option<&Path>,
+        mut progress: F,
+    ) -> Result<bool, TaskStateError>
+    where
+        F: FnMut(TaskHashProgress) + Send + 'static,
+    {
         let this = self.clone();
         let task_name = task_name.to_string();
         let watch_patterns = watch_patterns.to_vec();
         let ignore_patterns = ignore_patterns.to_vec();
         let base_dir = base_dir.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
-            this.needs_run_sync(
+            this.needs_run_sync_with_progress(
                 &task_name,
                 &watch_patterns,
                 &ignore_patterns,
                 base_dir.as_deref(),
+                &mut progress,
             )
         })
         .await
@@ -216,18 +269,23 @@ impl TaskState {
         remove_file_if_exists(self.last_run_file_path(&task_name)).await
     }
 
-    fn needs_run_sync(
+    fn needs_run_sync_with_progress<F>(
         &self,
         task_name: &str,
         watch_patterns: &[String],
         ignore_patterns: &[String],
         base_dir: Option<&Path>,
-    ) -> Result<bool, TaskStateError> {
+        progress: &mut F,
+    ) -> Result<bool, TaskStateError>
+    where
+        F: FnMut(TaskHashProgress),
+    {
         if watch_patterns.is_empty() {
             return Ok(true);
         }
 
-        let current_hash = self.compute_hash(watch_patterns, ignore_patterns, base_dir)?;
+        let current_hash =
+            self.compute_hash_with_progress(watch_patterns, ignore_patterns, base_dir, progress)?;
         let stored_hash = self.read_stored_hash(task_name)?;
 
         Ok(stored_hash.as_ref() != Some(&current_hash))
@@ -265,6 +323,19 @@ impl TaskState {
         ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<String, TaskStateError> {
+        self.compute_hash_with_progress(watch_patterns, ignore_patterns, base_dir, &mut |_| {})
+    }
+
+    fn compute_hash_with_progress<F>(
+        &self,
+        watch_patterns: &[String],
+        ignore_patterns: &[String],
+        base_dir: Option<&Path>,
+        progress: &mut F,
+    ) -> Result<String, TaskStateError>
+    where
+        F: FnMut(TaskHashProgress),
+    {
         let compiled_ignore: Vec<glob::Pattern> = ignore_patterns
             .iter()
             .map(|pattern| {
@@ -278,18 +349,49 @@ impl TaskState {
             let full_pattern = resolve_pattern(base_dir, pattern)
                 .to_string_lossy()
                 .into_owned();
+            progress(TaskHashProgress::GlobStarted {
+                pattern: full_pattern.clone(),
+            });
+            let glob_started = Instant::now();
+            let mut last_progress = glob_started;
+            let mut entries_seen = 0usize;
+            let mut files_matched = 0usize;
+            let mut files_ignored = 0usize;
             for entry in
                 glob::glob(&full_pattern).map_err(|e| TaskStateError::Glob(e.to_string()))?
             {
                 let path = entry.map_err(|e| TaskStateError::Io(e.into_error()))?;
+                entries_seen = entries_seen.saturating_add(1);
                 let path_str = path.to_string_lossy();
                 let ignored = compiled_ignore
                     .iter()
                     .any(|ignore| ignore.matches(&path_str));
-                if path.is_file() && !ignored {
-                    paths.push(path);
+                if path.is_file() {
+                    if ignored {
+                        files_ignored = files_ignored.saturating_add(1);
+                    } else {
+                        files_matched = files_matched.saturating_add(1);
+                        paths.push(path);
+                    }
+                }
+                if last_progress.elapsed() >= HASH_PROGRESS_INTERVAL {
+                    progress(TaskHashProgress::GlobProgress {
+                        pattern: full_pattern.clone(),
+                        entries_seen,
+                        files_matched,
+                        files_ignored,
+                        elapsed: glob_started.elapsed(),
+                    });
+                    last_progress = Instant::now();
                 }
             }
+            progress(TaskHashProgress::GlobFinished {
+                pattern: full_pattern,
+                entries_seen,
+                files_matched,
+                files_ignored,
+                elapsed: glob_started.elapsed(),
+            });
         }
         paths.sort();
         paths.dedup();
@@ -302,12 +404,37 @@ impl TaskState {
             hasher.update(b"\0");
         }
 
-        // Hash each file's contents
+        let total_files = paths.len();
+        progress(TaskHashProgress::HashStarted { total_files });
+        let hash_started = Instant::now();
+        let mut last_progress = hash_started;
+        let mut files_hashed = 0usize;
+        let mut bytes_hashed = 0u64;
+
+        // Hash each file's contents.
         for path in &paths {
             let contents = std::fs::read(path)?;
             hasher.update(&contents);
             hasher.update(b"\0");
+            files_hashed = files_hashed.saturating_add(1);
+            bytes_hashed =
+                bytes_hashed.saturating_add(u64::try_from(contents.len()).unwrap_or(u64::MAX));
+            if last_progress.elapsed() >= HASH_PROGRESS_INTERVAL {
+                progress(TaskHashProgress::HashProgress {
+                    files_hashed,
+                    total_files,
+                    bytes_hashed,
+                    elapsed: hash_started.elapsed(),
+                });
+                last_progress = Instant::now();
+            }
         }
+
+        progress(TaskHashProgress::HashFinished {
+            files_hashed,
+            bytes_hashed,
+            elapsed: hash_started.elapsed(),
+        });
 
         Ok(encode(hasher.finalize()))
     }
@@ -620,6 +747,63 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_needs_run_reports_hash_progress() {
+        let dir = TempDir::new("hash-progress");
+        let generated = dir.path().join("generated");
+        fs::create_dir_all(&generated).unwrap();
+        fs::write(dir.path().join("schema.sql"), "CREATE TABLE schema;").unwrap();
+        fs::write(generated.join("ignored.sql"), "CREATE TABLE ignored;").unwrap();
+
+        let state = TaskState::new(dir.path().join(".don-state"));
+        let patterns = vec!["**/*.sql".to_string()];
+        let ignore_patterns = vec!["generated/**".to_string()];
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+
+        let needs_run = state
+            .needs_run_with_progress(
+                "schema",
+                &patterns,
+                &ignore_patterns,
+                Some(dir.path()),
+                move |progress| {
+                    progress_tx.send(progress).unwrap();
+                },
+            )
+            .await
+            .unwrap();
+        assert!(needs_run);
+
+        let events: Vec<TaskHashProgress> = progress_rx.into_iter().collect();
+        assert!(matches!(
+            events.first(),
+            Some(TaskHashProgress::GlobStarted { pattern })
+                if pattern.ends_with("/**/*.sql")
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TaskHashProgress::GlobFinished {
+                entries_seen: 2,
+                files_matched: 1,
+                files_ignored: 1,
+                ..
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TaskHashProgress::HashStarted { total_files: 1 }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TaskHashProgress::HashFinished {
+                files_hashed: 1,
+                bytes_hashed: 20,
+                ..
+            }
+        )));
     }
 
     #[tokio::test]

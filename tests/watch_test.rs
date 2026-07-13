@@ -661,7 +661,11 @@ fn integration_rapid_fire_changes_one_restart() {
         let toml = ConfigBuilder::new()
             .add_custom_service("api", "bash", &["-c", "sleep 60"])
             .watch(&["src/**/*.rs"])
-            .debounce("300ms")
+            // A generous debounce so all 5 writes coalesce even under the
+            // coarser event-delivery latency of macOS FSEvents (a tight window
+            // makes this test ~flaky there). The window still comfortably
+            // exceeds the 250ms write span on Linux/inotify.
+            .debounce("1s")
             .log("ignore")
             .ready_exec("true", &[])
             .done()
@@ -678,7 +682,7 @@ fn integration_rapid_fire_changes_one_restart() {
             "timed out waiting for services to start"
         );
 
-        // Fire 5 rapid changes with 50ms gaps (total 250ms < 300ms debounce).
+        // Fire 5 rapid changes with 50ms gaps (total 250ms < 1s debounce).
         tokio::time::sleep(Duration::from_millis(200)).await;
         for i in 1..=5 {
             std::fs::write(src_dir.join("main.rs"), format!("v{i}")).unwrap();
@@ -902,7 +906,7 @@ fn integration_task_auto_run_false_skips_initial_and_goes_pending() {
             .done()
             .build();
 
-        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
 
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
@@ -920,6 +924,22 @@ fn integration_task_auto_run_false_skips_initial_and_goes_pending() {
             "migrate should be pending at startup. output: {}",
             read_buf(&buf)
         );
+
+        let startup_output = read_buf(&buf);
+        for expected in [
+            "task state: watched input check started",
+            "task state: expanding watch glob",
+            "task state: glob complete",
+            "matched_files=1",
+            "task state: hashing watched file contents files=1",
+            "task state: hash complete files=1",
+            "task state: watched input check complete changed=true",
+        ] {
+            assert!(
+                startup_output.contains(expected),
+                "missing verbose task-state diagnostic {expected:?}. output: {startup_output}"
+            );
+        }
 
         // Modify the watched file.
         tokio::time::sleep(Duration::from_millis(200)).await;
