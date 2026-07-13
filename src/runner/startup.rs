@@ -23,20 +23,17 @@ impl Runner {
         in_flight: &mut HashSet<String>,
         done_tx: &mpsc::Sender<ItemDone>,
     ) -> Result<bool, RunnerError> {
-        // First pass: mark pending items as DependencyFailed when an upstream
-        // dep failed (including another DependencyFailed — the cascade is
-        // transitive). Lazy services are left alone: the failure of one of
-        // their deps doesn't mean the lazy service can never start; it'll
-        // re-evaluate when an incoming proxy connection fires.
+        // Cascade DependencyFailed onto pending items with a failed dep. Skip
+        // lazy services unless one has a waiting first connection.
         let failed_items: Vec<String> = order
             .iter()
             .filter(|name| pending.contains(name.as_str()))
             .filter(|name| {
-                // Skip services marked lazy in their resolved config.
-                !self
+                let is_lazy = self
                     .services
                     .get(name.as_str())
-                    .is_some_and(|rs| rs.resolved.lazy)
+                    .is_some_and(|rs| rs.resolved.lazy);
+                !is_lazy || self.lazy_start_requested.contains(name.as_str())
             })
             .filter(|name| {
                 let node_deps = dep_map.get(name.as_str()).cloned().unwrap_or_default();
@@ -47,6 +44,7 @@ impl Runner {
 
         for name in failed_items {
             pending.remove(&name);
+            self.lazy_start_requested.remove(&name);
             // `name` is either a service or a task — the helpers are no-ops
             // for unknown names, so we can call both unconditionally.
             self.set_service_state(&name, ServiceState::DependencyFailed);
@@ -86,17 +84,19 @@ impl Runner {
                 return Ok(true);
             }
 
-            // Skip lazy services — they're managed exclusively by the
-            // `lazy_start_rx` flow (proxy connection triggers JIT build +
-            // start). We gate on the CONFIG `resolved.lazy`, not the runtime
-            // state: once the first connection fires, state walks
-            // Lazy → Building → Pending → Starting → Running → Ready. If
-            // this function re-fires while the service is past `Lazy` (e.g.
-            // because a dep became Ready after the lazy-triggered start),
-            // a state-based check would miss it and we'd queue a second
-            // start worker — double-spawn.
+            // Lazy services are managed by the `lazy_start_rx` flow; gating on
+            // CONFIG `resolved.lazy` avoids a double-spawn past `Lazy`.
             if self.services.get(&name).is_some_and(|rs| rs.resolved.lazy) {
                 pending.remove(&name);
+                // Deferred first connection: deps are now satisfied (ready
+                // set), so honor the recorded request and start.
+                if self.lazy_start_requested.remove(&name) {
+                    self.start_lazy_service(
+                        &name,
+                        done_tx.clone(),
+                        super::lazy::LazyStartReason::DependenciesReady,
+                    );
+                }
                 continue;
             }
 
@@ -396,7 +396,7 @@ impl Runner {
     /// Check if a dependency has failed (including the transitive
     /// `DependencyFailed` cascade — if A fails, B depends on A, C depends
     /// on B, then C also needs to be marked).
-    fn is_dep_failed(&self, dep: &str) -> bool {
+    pub(in crate::runner) fn is_dep_failed(&self, dep: &str) -> bool {
         if let Some(rs) = self.services.get(dep) {
             return matches!(
                 rs.state(),
@@ -446,7 +446,18 @@ impl Runner {
             }
 
             if service_dep_failed {
-                self.set_service_state(&name, ServiceState::Pending);
+                // A lazy service re-arms rather than starting: back to `Lazy`
+                // so the next connection re-evaluates its now-satisfied deps.
+                if self.services.get(&name).is_some_and(|rs| rs.resolved.lazy) {
+                    self.set_service_state(&name, ServiceState::Lazy);
+                    if let Some(rs) = self.services.get_mut(&name)
+                        && let Some(ref mut proxy) = rs.proxy
+                    {
+                        proxy.rearm_lazy_watchers();
+                    }
+                } else {
+                    self.set_service_state(&name, ServiceState::Pending);
+                }
             } else if task_dep_failed {
                 self.set_task_state(&name, TaskItemState::Pending);
             }

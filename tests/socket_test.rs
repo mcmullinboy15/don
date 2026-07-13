@@ -724,3 +724,209 @@ fn integration_lazy_crash_loop_gives_up_and_stops_relaunching() {
         );
     });
 }
+
+/// A lazy service whose `depends_on` is still running at first-connection must
+/// wait, then start. The marker proves `setup` finished before `api` launched.
+#[test]
+fn integration_lazy_defers_start_until_dependency_satisfied() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("lazy-dep-defer");
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let marker = dir.path().join("setup-done");
+
+        let setup_cmd = format!("sleep 1; touch {}; echo SETUP_DONE", marker.display());
+        // The sentinel value is computed at runtime, so the printed
+        // "API_MARKER=yes/no" never appears in don's echoed spawn command.
+        let api_cmd = format!(
+            "echo API_MARKER=$(test -f {m} && echo yes || echo no); exec sleep 60",
+            m = marker.display()
+        );
+        let toml = ConfigBuilder::new()
+            .add_task("setup", "bash", &["-c", &setup_cmd])
+            .done()
+            .add_custom_service("api", "bash", &["-c", &api_cmd])
+            .proxy_listenfd(&[&addr])
+            .lazy(true)
+            .depends_on(&["setup"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(
+                &buf,
+                &format!("proxy listening on {addr}"),
+                Duration::from_secs(5)
+            )
+            .await,
+            "expected proxy to bind. output: {}",
+            read_buf(&buf)
+        );
+
+        // Connect while `setup` is still running.
+        let _stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        assert!(
+            wait_for_output(
+                &buf,
+                "waiting for dependencies before start: setup",
+                Duration::from_secs(5)
+            )
+            .await,
+            "expected the lazy start to defer for its dependency. output: {}",
+            read_buf(&buf)
+        );
+        assert!(
+            wait_for_output(&buf, "api: ready", Duration::from_secs(8)).await,
+            "expected api to start after setup completed. output: {}",
+            read_buf(&buf)
+        );
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("API_MARKER=yes"),
+            "api must have started after setup created its marker. output: {output}"
+        );
+        assert!(
+            !output.contains("API_MARKER=no"),
+            "api started before its dependency ran. output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// With the dependency already satisfied at connect time, the lazy start is
+/// immediate — the just-in-time path is unchanged.
+#[test]
+fn integration_lazy_starts_immediately_when_dependency_satisfied() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("lazy-dep-satisfied");
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let toml = ConfigBuilder::new()
+            .add_task("setup", "echo", &["setup done"])
+            .done()
+            .add_custom_service("api", "bash", &["-c", "echo API_UP; exec sleep 60"])
+            .proxy_listenfd(&[&addr])
+            .lazy(true)
+            .depends_on(&["setup"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(
+                &buf,
+                &format!("proxy listening on {addr}"),
+                Duration::from_secs(5)
+            )
+            .await,
+            "expected proxy to bind. output: {}",
+            read_buf(&buf)
+        );
+        assert!(
+            wait_for_output(&buf, "setup: complete", Duration::from_secs(5)).await,
+            "expected setup task to complete first. output: {}",
+            read_buf(&buf)
+        );
+
+        let _stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        assert!(
+            wait_for_output(&buf, "api: ready", Duration::from_secs(5)).await,
+            "expected api to reach ready. output: {}",
+            read_buf(&buf)
+        );
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("first connection"),
+            "satisfied deps should take the immediate first-connection path. output: {output}"
+        );
+        assert!(
+            !output.contains("waiting for dependencies"),
+            "should not defer when the dependency is already satisfied. output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// A lazy service with a pending first connection whose dependency then fails
+/// must surface DependencyFailed and never launch its process.
+#[test]
+fn integration_lazy_dependency_failure_blocks_start() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("lazy-dep-failure");
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let toml = ConfigBuilder::new()
+            .add_task("setup", "bash", &["-c", "sleep 1; echo SETUP_FAILING; exit 1"])
+            .done()
+            .add_custom_service("api", "bash", &["-c", "echo API_STARTED; exec sleep 60"])
+            .proxy_listenfd(&[&addr])
+            .lazy(true)
+            .depends_on(&["setup"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(
+                &buf,
+                &format!("proxy listening on {addr}"),
+                Duration::from_secs(5)
+            )
+            .await,
+            "expected proxy to bind. output: {}",
+            read_buf(&buf)
+        );
+
+        // Connect while `setup` is still running, so the start defers.
+        let _stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        assert!(
+            wait_for_output(
+                &buf,
+                "waiting for dependencies before start: setup",
+                Duration::from_secs(5)
+            )
+            .await,
+            "expected the lazy start to defer for its dependency. output: {}",
+            read_buf(&buf)
+        );
+        assert!(
+            wait_for_output(&buf, "api: skipped (dependency failed)", Duration::from_secs(8)).await,
+            "expected api to surface DependencyFailed. output: {}",
+            read_buf(&buf)
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let output = read_buf(&buf);
+        assert!(
+            !output.contains("API_STARTED"),
+            "api must not launch when its dependency failed. output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}

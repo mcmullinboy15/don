@@ -11,6 +11,7 @@ mod completions;
 mod events;
 mod graph;
 mod health;
+mod lazy;
 mod params;
 mod paths;
 mod profile;
@@ -185,6 +186,10 @@ impl ServiceState {
                 | (Self::Building, Self::Failed)
                 | (Self::Lazy, Self::Building)
                 | (Self::Lazy, Self::Starting)
+                // A lazy service with a pending first connection surfaces
+                // DependencyFailed when a dep fails, and re-arms on recovery.
+                | (Self::Lazy, Self::DependencyFailed)
+                | (Self::DependencyFailed, Self::Lazy)
                 | (Self::Starting, Self::Running)
                 | (Self::Starting, Self::Failed)
                 | (Self::Running, Self::Ready)
@@ -728,6 +733,9 @@ pub struct Runner {
     lazy_start_rx: mpsc::Receiver<String>,
     /// Sender half kept for passing to ServiceProxy::bind.
     lazy_start_tx: mpsc::Sender<String>,
+    /// Lazy services whose first connection arrived before `depends_on` was
+    /// satisfied; the deferred start fires from `start_ready_items`.
+    lazy_start_requested: HashSet<String>,
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -880,6 +888,7 @@ impl Runner {
             tasks,
             lazy_start_rx,
             lazy_start_tx,
+            lazy_start_requested: HashSet::new(),
             server_shutdown_tx: None,
             docker_client,
             cmd_tx,
@@ -1545,17 +1554,31 @@ impl Runner {
                                         .get(&name)
                                         .is_some_and(|rs| rs.state() == ServiceState::Pending)
                                 {
-                                    self.output_manager.service_event(
-                                        &name,
-                                        "lazy build complete, starting",
-                                    );
-                                    if let Err(e) = self.queue_startup_service_start(
-                                        &name,
-                                        done_tx.clone(),
-                                        ServiceStartMode::SpawnOnly,
-                                    ) {
+                                    // A dependency can fail while the JIT build
+                                    // runs — don't start against a broken one.
+                                    if let Some(failed) = self.first_failed_dep(&name) {
+                                        self.lazy_start_requested.remove(&name);
+                                        self.set_service_state(
+                                            &name,
+                                            ServiceState::DependencyFailed,
+                                        );
+                                        self.output_manager.service_error_event(
+                                            &name,
+                                            &format!(
+                                                "cannot start — dependency '{failed}' failed"
+                                            ),
+                                        );
+                                    } else {
                                         self.output_manager
-                                            .service_error_event(&name, &e.to_string());
+                                            .service_event(&name, "lazy build complete, starting");
+                                        if let Err(e) = self.queue_startup_service_start(
+                                            &name,
+                                            done_tx.clone(),
+                                            ServiceStartMode::SpawnOnly,
+                                        ) {
+                                            self.output_manager
+                                                .service_error_event(&name, &e.to_string());
+                                        }
                                     }
                                 }
                             }
@@ -1569,10 +1592,8 @@ impl Runner {
                         }
                     }
                     Some(name) = self.lazy_start_rx.recv() => {
-                        // Only act on the first connection — subsequent connections
-                        // (during JIT build or start) find the service in a non-Lazy
-                        // state and are ignored. Connections still queue at the
-                        // proxy; they get forwarded once the backend is Ready.
+                        // Only the first connection acts; later ones find a
+                        // non-Lazy state and queue at the proxy until Ready.
                         if !self
                             .services
                             .get(&name)
@@ -1580,33 +1601,7 @@ impl Runner {
                         {
                             continue;
                         }
-                        let needs_jit = self
-                            .services
-                            .get(&name)
-                            .is_some_and(|rs| rs.resolved.is_build_tool_managed() && !rs.batch_built);
-                        if needs_jit {
-                            let item = match self.services.get(&name) {
-                                Some(rs) => self.build_batch_item(&name, NodeKind::Service, rs),
-                                None => continue,
-                            };
-                            self.output_manager.service_event(
-                                &name,
-                                "first connection — building before start",
-                            );
-                            self.set_service_state(&name, ServiceState::Building);
-                            self.spawn_lazy_build(&name, item);
-                        } else {
-                            self.output_manager
-                                .service_event(&name, "first connection — starting service");
-                            if let Err(e) = self.queue_startup_service_start(
-                                &name,
-                                done_tx.clone(),
-                                ServiceStartMode::Full,
-                            ) {
-                                self.output_manager
-                                    .service_error_event(&name, &e.to_string());
-                            }
-                        }
+                        self.handle_lazy_connection(&name, &mut pending, &done_tx);
                     }
                     // Flush batched build-tool rebuilds when the batch window expires.
                     _ = async {
