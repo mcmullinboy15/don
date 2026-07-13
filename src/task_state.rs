@@ -336,60 +336,62 @@ impl TaskState {
     where
         F: FnMut(TaskHashProgress),
     {
+        let compiled_watch: Vec<glob::Pattern> = watch_patterns
+            .iter()
+            .map(|pattern| compile_pattern(base_dir, pattern))
+            .collect::<Result<_, _>>()?;
         let compiled_ignore: Vec<glob::Pattern> = ignore_patterns
             .iter()
-            .map(|pattern| {
-                let full_pattern = resolve_pattern(base_dir, pattern);
-                glob::Pattern::new(&full_pattern.to_string_lossy())
-                    .map_err(|e| TaskStateError::Glob(e.to_string()))
-            })
+            .map(|pattern| compile_pattern(base_dir, pattern))
             .collect::<Result<_, _>>()?;
+        // A `dir/**` ignore covers every descendant of `dir`, so its prefix
+        // (matching `dir` itself) can prune the whole subtree from the walk.
+        let prune_prefixes: Vec<glob::Pattern> = ignore_patterns
+            .iter()
+            .filter_map(|pattern| {
+                let full = resolve_pattern(base_dir, pattern)
+                    .to_string_lossy()
+                    .into_owned();
+                glob::Pattern::new(full.strip_suffix("/**")?).ok()
+            })
+            .collect();
+
+        // Drop roots nested under another root to avoid walking a subtree twice.
+        let mut roots: Vec<PathBuf> = watch_patterns
+            .iter()
+            .map(|pattern| glob_pattern_base_dir(&resolve_pattern(base_dir, pattern)))
+            .collect();
+        roots.sort();
+        roots.dedup();
+        let mut walk_roots: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            if walk_roots.iter().any(|kept| root.starts_with(kept)) {
+                continue;
+            }
+            walk_roots.push(root);
+        }
+
         let mut paths = Vec::new();
-        for pattern in watch_patterns {
-            let full_pattern = resolve_pattern(base_dir, pattern)
-                .to_string_lossy()
-                .into_owned();
+        for root in &walk_roots {
+            let root_display = root.to_string_lossy().into_owned();
             progress(TaskHashProgress::GlobStarted {
-                pattern: full_pattern.clone(),
+                pattern: root_display.clone(),
             });
             let glob_started = Instant::now();
-            let mut last_progress = glob_started;
-            let mut entries_seen = 0usize;
-            let mut files_matched = 0usize;
-            let mut files_ignored = 0usize;
-            for entry in
-                glob::glob(&full_pattern).map_err(|e| TaskStateError::Glob(e.to_string()))?
-            {
-                let path = entry.map_err(|e| TaskStateError::Io(e.into_error()))?;
-                entries_seen = entries_seen.saturating_add(1);
-                let path_str = path.to_string_lossy();
-                let ignored = compiled_ignore
-                    .iter()
-                    .any(|ignore| ignore.matches(&path_str));
-                if path.is_file() {
-                    if ignored {
-                        files_ignored = files_ignored.saturating_add(1);
-                    } else {
-                        files_matched = files_matched.saturating_add(1);
-                        paths.push(path);
-                    }
-                }
-                if last_progress.elapsed() >= HASH_PROGRESS_INTERVAL {
-                    progress(TaskHashProgress::GlobProgress {
-                        pattern: full_pattern.clone(),
-                        entries_seen,
-                        files_matched,
-                        files_ignored,
-                        elapsed: glob_started.elapsed(),
-                    });
-                    last_progress = Instant::now();
-                }
-            }
+            let paths_before = paths.len();
+            collect_matching_files(
+                root,
+                &compiled_watch,
+                &compiled_ignore,
+                &prune_prefixes,
+                &mut paths,
+            );
+            let files_matched = paths.len().saturating_sub(paths_before);
             progress(TaskHashProgress::GlobFinished {
-                pattern: full_pattern,
-                entries_seen,
+                pattern: root_display,
+                entries_seen: files_matched,
                 files_matched,
-                files_ignored,
+                files_ignored: 0,
                 elapsed: glob_started.elapsed(),
             });
         }
@@ -514,6 +516,97 @@ fn resolve_pattern(base_dir: Option<&Path>, pattern: &str) -> PathBuf {
             None => pattern_path.to_path_buf(),
         }
     }
+}
+
+/// Compile a watch/ignore pattern into an absolute `glob::Pattern`.
+fn compile_pattern(
+    base_dir: Option<&Path>,
+    pattern: &str,
+) -> Result<glob::Pattern, TaskStateError> {
+    let full = resolve_pattern(base_dir, pattern);
+    glob::Pattern::new(&full.to_string_lossy()).map_err(|e| TaskStateError::Glob(e.to_string()))
+}
+
+/// Longest literal directory prefix of a glob pattern — the root to walk from.
+/// A metacharacter-free pattern is a literal file, so its parent is returned.
+fn glob_pattern_base_dir(pattern: &Path) -> PathBuf {
+    let mut base = PathBuf::new();
+    let mut hit_glob = false;
+    for component in pattern.components() {
+        let s = component.as_os_str().to_string_lossy();
+        if s.contains('*') || s.contains('?') || s.contains('[') {
+            hit_glob = true;
+            break;
+        }
+        base.push(component);
+    }
+    if !hit_glob {
+        base = base.parent().map(Path::to_path_buf).unwrap_or_default();
+    }
+    if base.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        base
+    }
+}
+
+/// Recursively collect files under `dir` matching a watch pattern and no ignore
+/// pattern. Symlinked directories are never descended, bounding cycle walks.
+fn collect_matching_files(
+    dir: &Path,
+    watch: &[glob::Pattern],
+    ignore: &[glob::Pattern],
+    prune_prefixes: &[glob::Pattern],
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            if is_pruned(&path, prune_prefixes) {
+                continue;
+            }
+            collect_matching_files(&path, watch, ignore, prune_prefixes, out);
+        } else if file_type.is_file() {
+            consider_file(&path, watch, ignore, out);
+        } else if file_type.is_symlink() {
+            // A symlink to a file is a candidate; a symlink to a directory (or a
+            // broken link) is skipped so a cycle can't drive an unbounded walk.
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => consider_file(&path, watch, ignore, out),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Push `path` onto `out` if it matches a watch pattern and no ignore pattern.
+fn consider_file(
+    path: &Path,
+    watch: &[glob::Pattern],
+    ignore: &[glob::Pattern],
+    out: &mut Vec<PathBuf>,
+) {
+    let path_str = path.to_string_lossy();
+    if ignore.iter().any(|pattern| pattern.matches(&path_str)) {
+        return;
+    }
+    if watch.iter().any(|pattern| pattern.matches(&path_str)) {
+        out.push(path.to_path_buf());
+    }
+}
+
+/// Whether `dir` is fully covered by a `dir/**` ignore and can be skipped.
+fn is_pruned(dir: &Path, prune_prefixes: &[glob::Pattern]) -> bool {
+    let dir_str = dir.to_string_lossy();
+    prune_prefixes
+        .iter()
+        .any(|pattern| pattern.matches(&dir_str))
 }
 
 async fn remove_file_if_exists(path: PathBuf) -> Result<(), TaskStateError> {
@@ -917,5 +1010,127 @@ mod tests {
             .unwrap();
         assert!(state.has_success("build").await.unwrap());
         assert_eq!(state.last_run("build").await.unwrap(), Some(succeeded));
+    }
+
+    fn collect_paths(root: &Path, watch: &[&str], ignore: &[&str]) -> Vec<PathBuf> {
+        let watch: Vec<glob::Pattern> = watch
+            .iter()
+            .map(|p| glob::Pattern::new(p).unwrap())
+            .collect();
+        let ignore_pats: Vec<glob::Pattern> = ignore
+            .iter()
+            .map(|p| glob::Pattern::new(p).unwrap())
+            .collect();
+        let prune: Vec<glob::Pattern> = ignore
+            .iter()
+            .filter_map(|p| {
+                p.strip_suffix("/**")
+                    .and_then(|pre| glob::Pattern::new(pre).ok())
+            })
+            .collect();
+        let mut out = Vec::new();
+        collect_matching_files(root, &watch, &ignore_pats, &prune, &mut out);
+        out.sort();
+        out
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlink_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("symlink-cycle");
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("a")).unwrap();
+        fs::write(base.join("watched.txt"), "hi").unwrap();
+        // base/a/loop -> base makes base/a/loop/a/loop/... an infinite path.
+        symlink(&base, base.join("a").join("loop")).unwrap();
+
+        let state = TaskState::new(base.join(".don-state"));
+        let watch = format!("{}/**/*.txt", base.display());
+        let patterns = vec![watch.clone()];
+
+        // The old glob walk spins forever here; the timeout catches a regression.
+        let needs = tokio::time::timeout(
+            Duration::from_secs(20),
+            state.needs_run("t", &patterns, &[], None),
+        )
+        .await
+        .expect("needs_run must terminate on a symlink cycle")
+        .unwrap();
+        assert!(needs, "first run with no stored hash must run");
+
+        assert_eq!(
+            collect_paths(&base, &[&watch], &[]),
+            vec![base.join("watched.txt")]
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            state.record_success("t", &patterns, &[], None),
+        )
+        .await
+        .expect("record_success must terminate on a symlink cycle")
+        .unwrap();
+        assert!(
+            !state.needs_run("t", &patterns, &[], None).await.unwrap(),
+            "unchanged tree must skip"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_directory_not_descended() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("symlink-dir");
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("real")).unwrap();
+        fs::write(base.join("real/inside.txt"), "x").unwrap();
+        symlink(base.join("real"), base.join("link")).unwrap();
+
+        let watch = format!("{}/**/*.txt", base.display());
+        // base/link/inside.txt is reachable only through the symlinked dir.
+        assert_eq!(
+            collect_paths(&base, &[&watch], &[]),
+            vec![base.join("real/inside.txt")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_to_file_included() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("symlink-to-file");
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("hidden_target"), "payload").unwrap();
+        symlink(base.join("hidden_target"), base.join("a.txt")).unwrap();
+
+        // a.txt is a symlink to a file; hidden_target does not match by name.
+        let watch = format!("{}/*.txt", base.display());
+        assert_eq!(
+            collect_paths(&base, &[&watch], &[]),
+            vec![base.join("a.txt")]
+        );
+    }
+
+    #[test]
+    fn test_ignored_subtree_pruned() {
+        let dir = TempDir::new("prune-subtree");
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("keep.sql"), "1").unwrap();
+        fs::create_dir_all(base.join("skip/nested")).unwrap();
+        for f in ["a.sql", "b.sql", "c.sql"] {
+            fs::write(base.join("skip").join(f), "x").unwrap();
+        }
+        fs::write(base.join("skip/nested/d.sql"), "x").unwrap();
+        // A sibling whose name merely starts with "skip" must NOT be pruned.
+        fs::create_dir_all(base.join("skipper")).unwrap();
+        fs::write(base.join("skipper/keep2.sql"), "2").unwrap();
+
+        let watch = format!("{}/**/*.sql", base.display());
+        let ignore = format!("{}/**/skip/**", base.display());
+        assert_eq!(
+            collect_paths(&base, &[&watch], &[&ignore]),
+            vec![base.join("keep.sql"), base.join("skipper/keep2.sql")]
+        );
     }
 }
