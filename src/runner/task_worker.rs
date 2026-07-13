@@ -3,9 +3,10 @@ use super::service_worker::ensure_download_for_config_worker;
 use super::task;
 use super::terminal::TerminalCoordinator;
 use crate::config::{Platform, TaskAutoRun};
-use crate::task_state::TaskState;
+use crate::task_state::{TaskHashProgress, TaskState};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Clone, Copy)]
 pub(in crate::runner) enum TaskRunMode {
@@ -26,6 +27,50 @@ pub(in crate::runner) struct TaskWorkerContext {
     pub(in crate::runner) emitter: crate::output::LifecycleEmitter,
     pub(in crate::runner) global_watch_ignore: Vec<String>,
     pub(in crate::runner) terminal_coordinator: TerminalCoordinator,
+}
+
+fn format_hash_progress(progress: TaskHashProgress) -> String {
+    match progress {
+        TaskHashProgress::GlobStarted { pattern } => {
+            format!("task state: expanding watch glob pattern={pattern:?}")
+        }
+        TaskHashProgress::GlobProgress {
+            pattern,
+            entries_seen,
+            files_matched,
+            files_ignored,
+            elapsed,
+        } => format!(
+            "task state: glob progress pattern={pattern:?} entries={entries_seen} matched_files={files_matched} ignored_files={files_ignored} elapsed={elapsed:?}"
+        ),
+        TaskHashProgress::GlobFinished {
+            pattern,
+            entries_seen,
+            files_matched,
+            files_ignored,
+            elapsed,
+        } => format!(
+            "task state: glob complete pattern={pattern:?} entries={entries_seen} matched_files={files_matched} ignored_files={files_ignored} elapsed={elapsed:?}"
+        ),
+        TaskHashProgress::HashStarted { total_files } => {
+            format!("task state: hashing watched file contents files={total_files}")
+        }
+        TaskHashProgress::HashProgress {
+            files_hashed,
+            total_files,
+            bytes_hashed,
+            elapsed,
+        } => format!(
+            "task state: hash progress files={files_hashed}/{total_files} bytes={bytes_hashed} elapsed={elapsed:?}"
+        ),
+        TaskHashProgress::HashFinished {
+            files_hashed,
+            bytes_hashed,
+            elapsed,
+        } => format!(
+            "task state: hash complete files={files_hashed} bytes={bytes_hashed} elapsed={elapsed:?}"
+        ),
+    }
 }
 
 /// Inputs to the startup run/skip/pending decision for a single task.
@@ -153,14 +198,67 @@ pub(in crate::runner) async fn run_task_worker(
         );
         let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
         let needs_watch_run = if has_watch {
-            task_state
-                .needs_run(name, &task_cfg.watch, &ignore_patterns, Some(&watch_base))
+            let check_started = Instant::now();
+            emitter.service_debug_event(
+                name,
+                &format!(
+                    "task state: watched input check started base={} patterns={:?} ignore_patterns={}",
+                    watch_base.display(),
+                    task_cfg.watch,
+                    ignore_patterns.len()
+                ),
+            );
+            let progress_emitter = emitter.clone();
+            let progress_name = name.to_string();
+            match task_state
+                .needs_run_with_progress(
+                    name,
+                    &task_cfg.watch,
+                    &ignore_patterns,
+                    Some(&watch_base),
+                    move |progress| {
+                        progress_emitter
+                            .service_debug_event(&progress_name, &format_hash_progress(progress));
+                    },
+                )
                 .await
-                .unwrap_or(true)
+            {
+                Ok(needs_run) => {
+                    emitter.service_debug_event(
+                        name,
+                        &format!(
+                            "task state: watched input check complete changed={needs_run} elapsed={:?}",
+                            check_started.elapsed()
+                        ),
+                    );
+                    needs_run
+                }
+                Err(e) => {
+                    emitter.service_debug_event(
+                        name,
+                        &format!(
+                            "task state: watched input check failed after {:?}: {e}; treating inputs as changed",
+                            check_started.elapsed()
+                        ),
+                    );
+                    true
+                }
+            }
         } else {
             false
         };
-        let has_success = task_state.has_success(name).await.unwrap_or(false);
+        let has_success = match task_state.has_success(name).await {
+            Ok(has_success) => has_success,
+            Err(e) => {
+                emitter.service_debug_event(
+                    name,
+                    &format!(
+                        "task state: failed to read prior success marker: {e}; treating task as never successful"
+                    ),
+                );
+                false
+            }
+        };
 
         match decide_startup_task(StartupTaskInputs {
             auto_run: task_cfg.auto_run,

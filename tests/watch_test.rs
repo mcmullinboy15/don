@@ -906,7 +906,7 @@ fn integration_task_auto_run_false_skips_initial_and_goes_pending() {
             .done()
             .build();
 
-        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
 
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
@@ -924,6 +924,22 @@ fn integration_task_auto_run_false_skips_initial_and_goes_pending() {
             "migrate should be pending at startup. output: {}",
             read_buf(&buf)
         );
+
+        let startup_output = read_buf(&buf);
+        for expected in [
+            "task state: watched input check started",
+            "task state: expanding watch glob",
+            "task state: glob complete",
+            "matched_files=1",
+            "task state: hashing watched file contents files=1",
+            "task state: hash complete files=1",
+            "task state: watched input check complete changed=true",
+        ] {
+            assert!(
+                startup_output.contains(expected),
+                "missing verbose task-state diagnostic {expected:?}. output: {startup_output}"
+            );
+        }
 
         // Modify the watched file.
         tokio::time::sleep(Duration::from_millis(200)).await;
