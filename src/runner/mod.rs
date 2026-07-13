@@ -44,9 +44,9 @@ use crate::process::pid_file::PidFile;
 use crate::watch::WatchManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Duration;
 #[cfg(test)]
 use std::time::SystemTime;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[cfg(test)]
@@ -1172,6 +1172,11 @@ impl Runner {
         let cmd_tx_for_watch = self.cmd_tx.clone();
         let runner_events_for_watch = self.event_tx.subscribe();
         let emitter_for_watch = self.output_manager.clone_lifecycle_emitter();
+        let watch_setup_started = Instant::now();
+        self.output_manager.debug_event(&format!(
+            "watch: scheduling initial setup on blocking worker base={}",
+            self.base_dir.display()
+        ));
         let mut watch_setup_handle = tokio::task::spawn_blocking(move || {
             WatchManager::new(
                 &config_for_watch,
@@ -1194,6 +1199,10 @@ impl Runner {
             }
             r = &mut watch_setup_handle => r,
         };
+        self.output_manager.debug_event(&format!(
+            "watch: initial setup worker finished elapsed={:?}",
+            watch_setup_started.elapsed()
+        ));
         match watch_result {
             Ok(Ok((watch_mgr, warnings))) => {
                 for warning in &warnings {
