@@ -308,17 +308,6 @@ impl ServiceProxy {
             .collect()
     }
 
-    /// Create a handle that can be sent to a spawned task to set env-mode
-    /// backends once a ready check passes. The handle is `Send + Sync`.
-    pub(crate) fn backend_handle(&self) -> ProxyBackendHandle {
-        let pairs: Vec<_> = self
-            .forward
-            .iter()
-            .map(|fwd| (fwd.backend_tx.clone(), fwd.backend.addr()))
-            .collect();
-        ProxyBackendHandle { pairs }
-    }
-
     /// Addresses Don is listening on (for display / logging). Includes both
     /// modes in declaration order across each kind.
     pub(crate) fn listen_addrs(&self) -> Vec<SocketAddr> {
@@ -429,21 +418,6 @@ fn has_pending_connection(fd: RawFd) -> bool {
     // reads one entry as specified by the count argument (1).
     let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
     ret > 0 && (pollfd.revents & libc::POLLIN) != 0
-}
-
-/// A lightweight, `Send + Sync` handle for activating proxy backends from
-/// a spawned task (e.g. after a ready check passes on the rebuild path).
-pub(crate) struct ProxyBackendHandle {
-    pairs: Vec<(watch::Sender<Option<SocketAddr>>, SocketAddr)>,
-}
-
-impl ProxyBackendHandle {
-    /// Set all backends to their ephemeral addresses.
-    pub(crate) fn activate(&self) {
-        for (tx, addr) in &self.pairs {
-            let _ = tx.send(Some(*addr));
-        }
-    }
 }
 
 impl Drop for ServiceProxy {

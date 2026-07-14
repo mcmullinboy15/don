@@ -168,6 +168,7 @@ impl Runner {
                             message: None,
                             elapsed: None,
                             last_run: None,
+                            service_start_generation: None,
                             task_run_generation: None,
                         })
                         .await;
@@ -191,6 +192,7 @@ impl Runner {
                             message: None,
                             elapsed: None,
                             last_run: None,
+                            service_start_generation: None,
                             task_run_generation: None,
                         })
                         .await;
@@ -256,6 +258,7 @@ impl Runner {
                                 message: Some(message),
                                 elapsed: None,
                                 last_run: None,
+                                service_start_generation: None,
                                 task_run_generation: None,
                             })
                             .await;
@@ -387,6 +390,7 @@ impl Runner {
                         message,
                         elapsed: Some(elapsed),
                         last_run: Some(last_run),
+                        service_start_generation: None,
                         task_run_generation: None,
                     })
                     .await;
@@ -491,6 +495,7 @@ impl Runner {
                         message,
                         elapsed: Some(elapsed),
                         last_run: Some(last_run),
+                        service_start_generation: None,
                         task_run_generation: None,
                     })
                     .await;
@@ -896,11 +901,11 @@ impl Runner {
 
         // Reject while already in flight — otherwise we'd race two spawns of
         // the same task and the output would interleave unpredictably.
-        let current = self.tasks.get(name).map(|rt| rt.state());
-        if matches!(
-            current,
-            Some(TaskItemState::Running) | Some(TaskItemState::Building)
-        ) {
+        let already_in_flight = self.tasks.get(name).is_some_and(|rt| {
+            matches!(rt.state(), TaskItemState::Running | TaskItemState::Building)
+                || rt.run_worker.is_some()
+        });
+        if already_in_flight {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "task is already running".to_string(),

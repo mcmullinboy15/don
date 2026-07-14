@@ -13,6 +13,9 @@ pub(in crate::runner) struct ItemDone {
     pub(in crate::runner) elapsed: Option<std::time::Duration>,
     /// Metadata for a task process that actually ran.
     pub(in crate::runner) last_run: Option<crate::task_state::TaskRunInfo>,
+    /// Start generation for service completions. A completion from an older
+    /// spawn must not mutate the state of a newer or already-stopped service.
+    pub(in crate::runner) service_start_generation: Option<u64>,
     /// Run generation for manually-triggered task completions that need to
     /// re-notify startup dependency resolution. `None` for normal startup
     /// item completions.
@@ -39,6 +42,16 @@ impl Runner {
     }
 
     fn handle_service_done(&mut self, item: &ItemDone) {
+        let is_current_running_generation =
+            item.service_start_generation.is_some_and(|generation| {
+                self.services.get(&item.name).is_some_and(|rs| {
+                    rs.start_generation == generation && rs.state() == ServiceState::Running
+                })
+            });
+        if !is_current_running_generation {
+            return;
+        }
+
         if item.success {
             let message = self
                 .services
@@ -236,6 +249,7 @@ impl Runner {
                             message: None,
                             elapsed: None,
                             last_run: None,
+                            service_start_generation: None,
                             task_run_generation: run_generation,
                         })
                         .await;

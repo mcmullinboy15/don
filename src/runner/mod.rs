@@ -468,6 +468,7 @@ enum RunnerInternalCommand {
     /// Result of a just-in-time build for a single lazy service.
     LazyBuildComplete {
         name: String,
+        generation: u64,
         outcome: BatchBuildOutcome,
     },
     /// Health-check monitor reported a state transition for a service.
@@ -479,6 +480,7 @@ enum RunnerInternalCommand {
     /// Ready-check completed for a manual-start or rebuild spawn.
     ReadyCheckComplete {
         name: String,
+        generation: u64,
         success: bool,
         message: Option<String>,
     },
@@ -769,7 +771,7 @@ pub struct Runner {
     /// [`Self::batch_build_handle`]: on shutdown we abort any in-flight
     /// JIT builds so bazel/turbo output stops streaming before
     /// "shutdown complete" is emitted.
-    lazy_build_handles: HashMap<String, crate::build_tool::AbortOnDrop<()>>,
+    lazy_build_handles: HashMap<String, (u64, crate::build_tool::AbortOnDrop<()>)>,
 
     /// Detached file-watch build-tool rebuild batch, if one is in flight.
     rebuild_batch_handle: Option<crate::build_tool::AbortOnDrop<()>>,
@@ -1476,10 +1478,16 @@ impl Runner {
                             }
                             RunnerInternalCommand::ReadyCheckComplete {
                                 name,
+                                generation,
                                 success,
                                 message,
                             } => {
-                                self.handle_ready_check_complete(&name, success, message);
+                                self.handle_ready_check_complete(
+                                    &name,
+                                    generation,
+                                    success,
+                                    message,
+                                );
                             }
                             RunnerInternalCommand::BatchBuildComplete(outcome) => {
                                 // Drop the abort-on-drop handle: the task is done,
@@ -1494,8 +1502,12 @@ impl Runner {
                                 self.rebuild_batch_handle = None;
                                 self.handle_rebuild_batch_complete(outcome).await;
                             }
-                            RunnerInternalCommand::LazyBuildComplete { name, outcome } => {
-                                self.handle_lazy_build_complete(&name, outcome);
+                            RunnerInternalCommand::LazyBuildComplete {
+                                name,
+                                generation,
+                                outcome,
+                            } => {
+                                self.handle_lazy_build_complete(&name, generation, outcome);
                             }
                             RunnerInternalCommand::GraphRequeryComplete(outcomes) => {
                                 self.graph_requery_handle = None;
@@ -1991,6 +2003,7 @@ mod tests {
 
         runner.handle_lazy_build_complete(
             "api",
+            0,
             build_tools::BatchBuildOutcome {
                 resolved_watches: Vec::new(),
                 warnings: Vec::new(),
@@ -2005,6 +2018,195 @@ mod tests {
         let service = runner.services.get("api").unwrap();
         assert_eq!(service.state(), ServiceState::Pending);
         assert!(service.start_worker.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_lazy_jit_completion_does_not_overwrite_newer_service_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        if let Some(service) = runner.services.get_mut("api") {
+            service.resolved.lazy = true;
+            service.start_generation = 2;
+        }
+        runner.set_service_state("api", ServiceState::Building);
+
+        runner.handle_lazy_build_complete(
+            "api",
+            1,
+            build_tools::BatchBuildOutcome {
+                resolved_watches: Vec::new(),
+                warnings: Vec::new(),
+                succeeded: std::collections::HashSet::new(),
+                failed: vec![("api".to_string(), "stale build failure".to_string())],
+                binary_paths: HashMap::new(),
+                replay_items: Vec::new(),
+            },
+        );
+
+        let service = runner.services.get("api").unwrap();
+        assert_eq!(service.state(), ServiceState::Building);
+        assert!(!service.batch_built);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_commands_reject_during_lazy_build() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Start,
+            Restart,
+        }
+
+        struct Case {
+            name: &'static str,
+            operation: Operation,
+            expected_message: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "start",
+                operation: Operation::Start,
+                expected_message: "cannot start while Building",
+            },
+            Case {
+                name: "restart",
+                operation: Operation::Restart,
+                expected_message: "cannot restart while Building",
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+            runner.set_service_state("api", ServiceState::Building);
+            let (reply_tx, reply_rx) = oneshot::channel();
+
+            match case.operation {
+                Operation::Start => runner.handle_start_service_cmd("api", reply_tx).await,
+                Operation::Restart => runner.handle_restart_service_cmd("api", reply_tx).await,
+            }
+
+            let result = reply_rx.await.unwrap();
+            assert!(
+                matches!(
+                    &result,
+                    Err(CommandError::InvalidState { message, .. })
+                        if message == case.expected_message
+                ),
+                "case '{}' returned {result:?}",
+                case.name,
+            );
+            assert_eq!(
+                runner.services.get("api").map(|service| service.state()),
+                Some(ServiceState::Building),
+                "case '{}'",
+                case.name,
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_check_completion_requires_current_running_generation() {
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+            current_generation: u64,
+            completion_generation: u64,
+            success: bool,
+            expected: ServiceState,
+        }
+
+        let cases = vec![
+            Case {
+                name: "stopped service ignores same-generation completion",
+                state: ServiceState::Stopped,
+                current_generation: 2,
+                completion_generation: 2,
+                success: true,
+                expected: ServiceState::Stopped,
+            },
+            Case {
+                name: "newer running service ignores stale success",
+                state: ServiceState::Running,
+                current_generation: 2,
+                completion_generation: 1,
+                success: true,
+                expected: ServiceState::Running,
+            },
+            Case {
+                name: "newer running service ignores stale failure",
+                state: ServiceState::Running,
+                current_generation: 2,
+                completion_generation: 1,
+                success: false,
+                expected: ServiceState::Running,
+            },
+            Case {
+                name: "current running service accepts success",
+                state: ServiceState::Running,
+                current_generation: 2,
+                completion_generation: 2,
+                success: true,
+                expected: ServiceState::Ready,
+            },
+            Case {
+                name: "current running service accepts failure",
+                state: ServiceState::Running,
+                current_generation: 2,
+                completion_generation: 2,
+                success: false,
+                expected: ServiceState::Failed,
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+            if let Some(service) = runner.services.get_mut("api") {
+                service.start_generation = case.current_generation;
+            }
+            runner.set_service_state("api", case.state);
+
+            runner.handle_ready_check_complete(
+                "api",
+                case.completion_generation,
+                case.success,
+                None,
+            );
+
+            assert_eq!(
+                runner.services.get("api").map(|service| service.state()),
+                Some(case.expected),
+                "case '{}'",
+                case.name,
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_service_completion_ignores_stale_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        if let Some(service) = runner.services.get_mut("api") {
+            service.start_generation = 2;
+        }
+        runner.set_service_state("api", ServiceState::Running);
+
+        runner.handle_item_done(&ItemDone {
+            name: "api".to_string(),
+            kind: NodeKind::Service,
+            success: true,
+            message: None,
+            elapsed: None,
+            last_run: None,
+            service_start_generation: Some(1),
+            task_run_generation: None,
+        });
+
+        assert_eq!(
+            runner.services.get("api").map(|service| service.state()),
+            Some(ServiceState::Running),
+        );
     }
 
     /// Regression: a watched file changes *during* a bazel build. The build

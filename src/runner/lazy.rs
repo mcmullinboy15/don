@@ -76,9 +76,22 @@ impl Runner {
     pub(in crate::runner) fn handle_lazy_build_complete(
         &mut self,
         name: &str,
+        generation: u64,
         outcome: BatchBuildOutcome,
     ) {
-        self.lazy_build_handles.remove(name);
+        let matching_handle = self
+            .lazy_build_handles
+            .get(name)
+            .is_some_and(|(active_generation, _)| *active_generation == generation);
+        if matching_handle {
+            self.lazy_build_handles.remove(name);
+        }
+        let is_current_build = self.services.get(name).is_some_and(|rs| {
+            rs.start_generation == generation && rs.state() == ServiceState::Building
+        });
+        if !is_current_build {
+            return;
+        }
         let replay_items = outcome.replay_items.clone();
         self.apply_batch_build_outcome(outcome);
         if let Some(item) = replay_items.iter().find(|item| item.name == name) {

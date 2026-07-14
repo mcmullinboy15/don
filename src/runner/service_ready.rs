@@ -14,6 +14,7 @@ impl Runner {
     pub(in crate::runner) async fn wire_service_output_and_ready_check(
         &mut self,
         name: &str,
+        start_generation: u64,
         start_result: service::StartResult,
         resolved: &crate::config::ResolvedService,
         done_tx: Option<mpsc::Sender<ItemDone>>,
@@ -98,17 +99,10 @@ impl Runner {
             r
         });
         let event_tx = self.event_tx.clone();
-        let proxy_handle = self
-            .services
-            .get(name)
-            .and_then(|rs| rs.proxy.as_ref())
-            .map(|p| p.backend_handle());
-
         // For proxy services, activate the backend immediately so the proxy
         // can start forwarding. The proxy has connection-level retry with
         // backoff, so it handles the case where the service isn't listening yet.
-        if proxy_handle.is_some()
-            && let Some(rs) = self.services.get(name)
+        if let Some(rs) = self.services.get(name)
             && let Some(ref proxy) = rs.proxy
         {
             proxy.set_backend();
@@ -143,11 +137,6 @@ impl Runner {
 
                 let success = ready_result.is_ok();
 
-                // Activate proxy backend once the service is ready.
-                if success && let Some(ref handle) = proxy_handle {
-                    handle.activate();
-                }
-
                 // State update:
                 //   done_tx path -> runner's handle_service_done flips state
                 //     via set_service_state (which broadcasts). Don't
@@ -161,6 +150,7 @@ impl Runner {
                     let _ = cmd_tx_for_state
                         .send(RunnerInternalCommand::ReadyCheckComplete {
                             name: name_owned.clone(),
+                            generation: start_generation,
                             success,
                             message: ready_result.as_ref().err().map(ToString::to_string),
                         })
@@ -187,6 +177,7 @@ impl Runner {
                             message: ready_result.err().map(|e| e.to_string()),
                             elapsed: None,
                             last_run: None,
+                            service_start_generation: Some(start_generation),
                             task_run_generation: None,
                         })
                         .await;
@@ -210,6 +201,7 @@ impl Runner {
                     message: None,
                     elapsed: None,
                     last_run: None,
+                    service_start_generation: Some(start_generation),
                     task_run_generation: None,
                 })
                 .await;

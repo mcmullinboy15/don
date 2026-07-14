@@ -107,7 +107,7 @@ impl Runner {
         let lazy_handles: Vec<tokio::task::JoinHandle<()>> = self
             .lazy_build_handles
             .drain()
-            .filter_map(|(_, guard)| guard.into_inner())
+            .filter_map(|(_, (_, guard))| guard.into_inner())
             .collect();
         for h in &lazy_handles {
             h.abort();

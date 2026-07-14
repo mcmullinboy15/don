@@ -152,6 +152,13 @@ impl Runner {
     }
 
     pub(in crate::runner) fn spawn_lazy_build(&mut self, name: &str, item: BatchBuildItem) {
+        let generation = match self.services.get_mut(name) {
+            Some(rs) => {
+                rs.start_generation = rs.start_generation.saturating_add(1);
+                rs.start_generation
+            }
+            None => return,
+        };
         let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
@@ -175,13 +182,14 @@ impl Runner {
             let _ = cmd_tx
                 .send(RunnerInternalCommand::LazyBuildComplete {
                     name: svc_name,
+                    generation,
                     outcome,
                 })
                 .await;
         });
         self.lazy_build_handles.insert(
             name.to_string(),
-            crate::build_tool::AbortOnDrop::new(handle),
+            (generation, crate::build_tool::AbortOnDrop::new(handle)),
         );
     }
 
@@ -508,11 +516,6 @@ impl Runner {
                 continue;
             };
 
-            // Claim the task before spawning its asynchronous preparation
-            // worker. A queued second sweep will now see Running, preventing
-            // duplicate launches without a parallel in-flight name set.
-            self.set_task_state(&name, TaskItemState::Running);
-
             if needs_startup_evaluation {
                 let has_dependents = dep_map
                     .values()
@@ -543,7 +546,7 @@ impl Runner {
             || self
                 .tasks
                 .get(name)
-                .is_some_and(|rt| rt.state() == TaskItemState::Pending)
+                .is_some_and(|rt| rt.state() == TaskItemState::Pending && rt.run_worker.is_none())
     }
 
     /// Whether every item participating in initial startup has settled.
