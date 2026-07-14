@@ -1,4 +1,4 @@
-use crate::globwalk::{glob_pattern_base_dir, matches_glob};
+use crate::globwalk::{glob_pattern_base_dir, matches_glob, matches_ignore};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -74,11 +74,13 @@ fn scan_tree_for_changes(
     let path_str = path.to_string_lossy();
     let ignored = ignore_patterns
         .iter()
-        .any(|ignore| matches_glob(ignore, &path_str));
-    if !ignored
-        && patterns
-            .iter()
-            .any(|pattern| matches_glob(pattern, &path_str))
+        .any(|ignore| matches_ignore(ignore, &path_str));
+    if ignored {
+        return false;
+    }
+    if patterns
+        .iter()
+        .any(|pattern| matches_glob(pattern, &path_str))
     {
         let Ok(modified) = metadata.modified() else {
             return false;

@@ -7,7 +7,9 @@
 //!
 //! Success state is only written after a task exits successfully (exit code 0).
 
-use crate::globwalk::{glob_pattern_base_dir, has_glob_metacharacters, matches_glob};
+use crate::globwalk::{
+    glob_pattern_base_dir, has_glob_metacharacters, matches_glob, matches_ignore,
+};
 use hex::encode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -361,17 +363,24 @@ impl TaskState {
 
         // A literal (no-metacharacter) watch resolves to one path; stat it directly
         // instead of walking its parent (a repo-root literal would walk the whole tree).
-        let mut roots: Vec<PathBuf> = Vec::new();
+        let mut glob_roots_and_patterns: Vec<(PathBuf, String)> = Vec::new();
         for pattern in watch_patterns {
             let resolved = resolve_pattern(base_dir, pattern);
             if has_glob_metacharacters(&resolved) {
-                roots.push(glob_pattern_base_dir(&resolved));
+                glob_roots_and_patterns.push((
+                    glob_pattern_base_dir(&resolved),
+                    resolved.to_string_lossy().into_owned(),
+                ));
             } else {
                 consider_literal(&resolved, &compiled_ignore, &mut paths)?;
             }
         }
 
         // Drop roots nested under another root to avoid walking a subtree twice.
+        let mut roots: Vec<PathBuf> = glob_roots_and_patterns
+            .iter()
+            .map(|(root, _)| root.clone())
+            .collect();
         roots.sort();
         roots.dedup();
         let mut walk_roots: Vec<PathBuf> = Vec::new();
@@ -383,25 +392,46 @@ impl TaskState {
         }
 
         for root in &walk_roots {
-            let root_display = root.to_string_lossy().into_owned();
+            let root_display = glob_roots_and_patterns
+                .iter()
+                .filter(|(pattern_root, _)| pattern_root.starts_with(root))
+                .map(|(_, pattern)| pattern.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             progress(TaskHashProgress::GlobStarted {
                 pattern: root_display.clone(),
             });
             let glob_started = Instant::now();
-            let paths_before = paths.len();
-            collect_matching_files(
-                root,
-                &compiled_watch,
-                &compiled_ignore,
-                &prune_prefixes,
-                &mut paths,
-            )?;
-            let files_matched = paths.len().saturating_sub(paths_before);
+            let mut last_progress = glob_started;
+            let mut stats = GlobWalkStats::default();
+            {
+                let mut report_progress = |stats: GlobWalkStats| {
+                    if last_progress.elapsed() >= HASH_PROGRESS_INTERVAL {
+                        progress(TaskHashProgress::GlobProgress {
+                            pattern: root_display.clone(),
+                            entries_seen: stats.entries_seen,
+                            files_matched: stats.files_matched,
+                            files_ignored: stats.files_ignored,
+                            elapsed: glob_started.elapsed(),
+                        });
+                        last_progress = Instant::now();
+                    }
+                };
+                collect_matching_files(
+                    root,
+                    &compiled_watch,
+                    &compiled_ignore,
+                    &prune_prefixes,
+                    &mut paths,
+                    &mut stats,
+                    &mut report_progress,
+                )?;
+            }
             progress(TaskHashProgress::GlobFinished {
                 pattern: root_display,
-                entries_seen: files_matched,
-                files_matched,
-                files_ignored: 0,
+                entries_seen: stats.entries_seen,
+                files_matched: stats.files_matched,
+                files_ignored: stats.files_ignored,
                 elapsed: glob_started.elapsed(),
             });
         }
@@ -539,36 +569,84 @@ fn compile_pattern(
 
 /// Recursively collect files under `dir` matching a watch pattern and no ignore
 /// pattern. Symlinked directories are never descended, bounding cycle walks.
+#[derive(Clone, Copy, Default)]
+struct GlobWalkStats {
+    entries_seen: usize,
+    files_matched: usize,
+    files_ignored: usize,
+}
+
 fn collect_matching_files(
     dir: &Path,
     watch: &[glob::Pattern],
     ignore: &[glob::Pattern],
     prune_prefixes: &[glob::Pattern],
     out: &mut Vec<PathBuf>,
+    stats: &mut GlobWalkStats,
+    report_progress: &mut dyn FnMut(GlobWalkStats),
 ) -> Result<(), TaskStateError> {
+    if is_pruned(dir, prune_prefixes) || is_ignored(dir, ignore) {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(TaskStateError::Io(e)),
+    }
+
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        stats.entries_seen = stats.entries_seen.saturating_add(1);
         let file_type = entry.file_type()?;
         let path = entry.path();
         if file_type.is_dir() {
             if is_pruned(&path, prune_prefixes) {
+                report_progress(*stats);
                 continue;
             }
-            collect_matching_files(&path, watch, ignore, prune_prefixes, out)?;
+            collect_matching_files(
+                &path,
+                watch,
+                ignore,
+                prune_prefixes,
+                out,
+                stats,
+                report_progress,
+            )?;
         } else if file_type.is_file() {
-            consider_file(&path, watch, ignore, out);
+            stats.record(consider_file(&path, watch, ignore, out));
         } else if file_type.is_symlink() {
             // A symlinked file is a candidate; a symlinked dir is skipped to bound cycles.
             // A broken link (NotFound) is a no-match; other metadata errors propagate.
             match std::fs::metadata(&path) {
-                Ok(meta) if meta.is_file() => consider_file(&path, watch, ignore, out),
+                Ok(meta) if meta.is_file() => {
+                    stats.record(consider_file(&path, watch, ignore, out));
+                }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(TaskStateError::Io(e)),
             }
         }
+        report_progress(*stats);
     }
     Ok(())
+}
+
+impl GlobWalkStats {
+    fn record(&mut self, outcome: FileMatch) {
+        match outcome {
+            FileMatch::Matched => self.files_matched = self.files_matched.saturating_add(1),
+            FileMatch::Ignored => self.files_ignored = self.files_ignored.saturating_add(1),
+            FileMatch::Unmatched => {}
+        }
+    }
+}
+
+enum FileMatch {
+    Matched,
+    Ignored,
+    Unmatched,
 }
 
 /// Push `path` onto `out` if it matches a watch pattern and no ignore pattern.
@@ -577,17 +655,20 @@ fn consider_file(
     watch: &[glob::Pattern],
     ignore: &[glob::Pattern],
     out: &mut Vec<PathBuf>,
-) {
-    let path_str = path.to_string_lossy();
+) -> FileMatch {
+    let normalized = strip_current_dir_prefix(path);
+    let path_str = normalized.to_string_lossy();
+    if !watch.iter().any(|pattern| matches_glob(pattern, &path_str)) {
+        return FileMatch::Unmatched;
+    }
     if ignore
         .iter()
-        .any(|pattern| matches_glob(pattern, &path_str))
+        .any(|pattern| matches_ignore(pattern, &path_str))
     {
-        return;
+        return FileMatch::Ignored;
     }
-    if watch.iter().any(|pattern| matches_glob(pattern, &path_str)) {
-        out.push(path.to_path_buf());
-    }
+    out.push(normalized.to_path_buf());
+    FileMatch::Matched
 }
 
 /// Push a literal watch target directly if it resolves to a file and isn't
@@ -605,23 +686,41 @@ fn consider_literal(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(TaskStateError::Io(e)),
     }
-    let path_str = path.to_string_lossy();
+    let normalized = strip_current_dir_prefix(path);
+    let path_str = normalized.to_string_lossy();
     if ignore
         .iter()
-        .any(|pattern| matches_glob(pattern, &path_str))
+        .any(|pattern| matches_ignore(pattern, &path_str))
     {
         return Ok(());
     }
-    out.push(path.to_path_buf());
+    out.push(normalized.to_path_buf());
     Ok(())
 }
 
 /// Whether `dir` is fully covered by a `dir/**` ignore and can be skipped.
 fn is_pruned(dir: &Path, prune_prefixes: &[glob::Pattern]) -> bool {
-    let dir_str = dir.to_string_lossy();
+    let dir_str = strip_current_dir_prefix(dir).to_string_lossy();
     prune_prefixes
         .iter()
         .any(|pattern| matches_glob(pattern, &dir_str))
+}
+
+fn is_ignored(path: &Path, ignore: &[glob::Pattern]) -> bool {
+    let path_str = strip_current_dir_prefix(path).to_string_lossy();
+    ignore
+        .iter()
+        .any(|pattern| matches_ignore(pattern, &path_str))
+}
+
+fn strip_current_dir_prefix(path: &Path) -> &Path {
+    path.strip_prefix(Path::new(".")).map_or(path, |stripped| {
+        if stripped.as_os_str().is_empty() {
+            path
+        } else {
+            stripped
+        }
+    })
 }
 
 async fn remove_file_if_exists(path: PathBuf) -> Result<(), TaskStateError> {
@@ -632,7 +731,6 @@ async fn remove_file_if_exists(path: PathBuf) -> Result<(), TaskStateError> {
     }
 }
 
-/// Errors from task state operations.
 /// Errors from task state operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TaskStateError {
@@ -895,7 +993,7 @@ mod tests {
             TaskHashProgress::GlobFinished {
                 entries_seen: 2,
                 files_matched: 1,
-                files_ignored: 1,
+                files_ignored: 0,
                 ..
             }
         )));
@@ -1044,7 +1142,17 @@ mod tests {
             })
             .collect();
         let mut out = Vec::new();
-        collect_matching_files(root, &watch, &ignore_pats, &prune, &mut out).unwrap();
+        let mut stats = GlobWalkStats::default();
+        collect_matching_files(
+            root,
+            &watch,
+            &ignore_pats,
+            &prune,
+            &mut out,
+            &mut stats,
+            &mut |_| {},
+        )
+        .unwrap();
         out.sort();
         out
     }
@@ -1108,6 +1216,20 @@ mod tests {
             collect_paths(&base, &[&watch], &[]),
             vec![base.join("real/inside.txt")]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_walk_root_not_descended() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("symlink-root");
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("real/nested")).unwrap();
+        fs::write(base.join("real/nested/inside.txt"), "x").unwrap();
+        symlink(base.join("real"), base.join("link")).unwrap();
+
+        let watch = format!("{}/link/**/*.txt", base.display());
+        assert!(collect_paths(&base.join("link"), &[&watch], &[]).is_empty());
     }
 
     #[cfg(unix)]
@@ -1206,6 +1328,39 @@ mod tests {
                 ignore: &["**/skip/**"],
                 want: &["keep.sql", "skipper/y.sql"],
             },
+            Case {
+                name: "matching is case sensitive",
+                setup: |base| {
+                    fs::create_dir_all(base.join("src")).unwrap();
+                    fs::write(base.join("src/lower.ts"), "1").unwrap();
+                    fs::write(base.join("src/UPPER.TS"), "2").unwrap();
+                },
+                watch: "src/*.ts",
+                ignore: &[],
+                want: &["src/lower.ts"],
+            },
+            Case {
+                name: "ignore matching is case sensitive",
+                setup: |base| {
+                    fs::create_dir_all(base.join("src")).unwrap();
+                    fs::write(base.join("src/lower.ts"), "1").unwrap();
+                    fs::write(base.join("src/UPPER.TS"), "2").unwrap();
+                },
+                watch: "src/*.*",
+                ignore: &["src/*.ts"],
+                want: &["src/UPPER.TS"],
+            },
+            Case {
+                name: "ignore star covers a matched directory subtree",
+                setup: |base| {
+                    fs::create_dir_all(base.join("generated/nested")).unwrap();
+                    fs::write(base.join("generated/direct.ts"), "1").unwrap();
+                    fs::write(base.join("generated/nested/deep.ts"), "2").unwrap();
+                },
+                watch: "generated/**/*.ts",
+                ignore: &["generated/*"],
+                want: &[],
+            },
         ];
 
         for case in cases {
@@ -1225,6 +1380,27 @@ mod tests {
             let want: Vec<PathBuf> = case.want.iter().map(|rel| base.join(rel)).collect();
             assert_eq!(got, want, "case '{}'", case.name);
         }
+    }
+
+    #[tokio::test]
+    async fn test_missing_glob_root_is_an_empty_match_set() {
+        let dir = TempDir::new("missing-glob-root");
+        let base = dir.path().to_path_buf();
+        let state = TaskState::new(base.join(".don-state"));
+        let watch = vec![format!("{}/generated/**/*.sql", base.display())];
+
+        state.record_success("t", &watch, &[], None).await.unwrap();
+        assert!(!state.needs_run("t", &watch, &[], None).await.unwrap());
+
+        fs::create_dir_all(base.join("generated")).unwrap();
+        fs::write(base.join("generated/schema.sql"), "create table t;").unwrap();
+        assert!(state.needs_run("t", &watch, &[], None).await.unwrap());
+    }
+
+    #[test]
+    fn test_current_dir_prefix_does_not_break_top_level_glob() {
+        let paths = collect_paths(Path::new("."), &["*.toml"], &[]);
+        assert!(paths.contains(&PathBuf::from("Cargo.toml")));
     }
 
     #[tokio::test]

@@ -10,13 +10,18 @@ Match `path` against `pattern` component-wise like `glob::glob` — `*`/`?` neve
 cross `/`. `Pattern::matches` defaults the other way, so the walk must opt in.
 */
 pub(crate) fn matches_glob(pattern: &glob::Pattern, path: &str) -> bool {
-    pattern.matches_with(
-        path,
-        glob::MatchOptions {
-            require_literal_separator: true,
-            ..glob::MatchOptions::default()
-        },
-    )
+    let mut options = glob::MatchOptions::new();
+    options.require_literal_separator = true;
+    pattern.matches_with(path, options)
+}
+
+/**
+Match an ignore pattern against a full path. Ignore globs intentionally allow
+`*` to cross separators: ignoring a matched directory also ignores its subtree,
+matching the live watch registration behavior.
+*/
+pub(crate) fn matches_ignore(pattern: &glob::Pattern, path: &str) -> bool {
+    pattern.matches_with(path, glob::MatchOptions::new())
 }
 
 /**
@@ -93,6 +98,73 @@ mod tests {
             let pattern = glob::Pattern::new(case.pattern).unwrap();
             assert_eq!(
                 matches_glob(&pattern, case.path),
+                case.want,
+                "pattern {:?} vs path {:?}",
+                case.pattern,
+                case.path
+            );
+        }
+    }
+
+    #[test]
+    fn test_matches_glob_is_case_sensitive() {
+        struct Case {
+            pattern: &'static str,
+            path: &'static str,
+            want: bool,
+        }
+        let cases = [
+            Case {
+                pattern: "src/*.ts",
+                path: "src/app.ts",
+                want: true,
+            },
+            Case {
+                pattern: "src/*.ts",
+                path: "src/APP.TS",
+                want: false,
+            },
+            Case {
+                pattern: "target/**",
+                path: "TARGET/debug/app",
+                want: false,
+            },
+        ];
+        for case in cases {
+            let pattern = glob::Pattern::new(case.pattern).unwrap();
+            assert_eq!(
+                matches_glob(&pattern, case.path),
+                case.want,
+                "pattern {:?} vs path {:?}",
+                case.pattern,
+                case.path
+            );
+        }
+    }
+
+    #[test]
+    fn test_matches_ignore_covers_descendants_and_is_case_sensitive() {
+        struct Case {
+            pattern: &'static str,
+            path: &'static str,
+            want: bool,
+        }
+        let cases = [
+            Case {
+                pattern: "generated/*",
+                path: "generated/nested/schema.rs",
+                want: true,
+            },
+            Case {
+                pattern: "generated/*",
+                path: "Generated/nested/schema.rs",
+                want: false,
+            },
+        ];
+        for case in cases {
+            let pattern = glob::Pattern::new(case.pattern).unwrap();
+            assert_eq!(
+                matches_ignore(&pattern, case.path),
                 case.want,
                 "pattern {:?} vs path {:?}",
                 case.pattern,

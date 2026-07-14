@@ -2017,9 +2017,7 @@ mod tests {
     /// Build a runner with a single watch-enabled bazel service "api", for
     /// exercising the rebuild-batch completion paths directly. Returns the
     /// shutdown sender too so the runner's `shutdown_rx` stays open.
-    async fn single_bazel_runner(
-        temp: &std::path::Path,
-    ) -> (Runner, mpsc::Sender<()>) {
+    async fn single_bazel_runner(temp: &std::path::Path) -> (Runner, mpsc::Sender<()>) {
         use crate::config::service::{Service, ServiceKind};
         use crate::config::types::{BazelConfig, LogConfig, LogFilterConfig};
 
@@ -2756,12 +2754,20 @@ mod tests {
         let repo = temp.path();
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::create_dir_all(repo.join("generated")).unwrap();
+        fs::create_dir_all(repo.join("generated/nested")).unwrap();
+        fs::create_dir_all(repo.join("TARGET")).unwrap();
         fs::write(repo.join("src/app.ts"), "console.log('src');").unwrap();
         fs::write(
             repo.join("generated/schema.ts"),
             "console.log('generated');",
         )
         .unwrap();
+        fs::write(
+            repo.join("generated/nested/deep.ts"),
+            "console.log('deep');",
+        )
+        .unwrap();
+        fs::write(repo.join("TARGET/app.ts"), "console.log('case');").unwrap();
 
         assert!(any_glob_path_changed_since(
             repo,
@@ -2773,6 +2779,18 @@ mod tests {
             repo,
             &["generated/**".to_string()],
             &["generated/**".to_string()],
+            SystemTime::UNIX_EPOCH,
+        ));
+        assert!(!any_glob_path_changed_since(
+            repo,
+            &["generated/**/*.ts".to_string()],
+            &["generated/*".to_string()],
+            SystemTime::UNIX_EPOCH,
+        ));
+        assert!(any_glob_path_changed_since(
+            repo,
+            &["TARGET/**".to_string()],
+            &["target/**".to_string()],
             SystemTime::UNIX_EPOCH,
         ));
         assert!(!any_glob_path_changed_since(

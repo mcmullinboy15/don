@@ -18,6 +18,7 @@
 
 use crate::config::{Config, Platform};
 use crate::duration::parse_duration;
+use crate::globwalk::{matches_glob, matches_ignore};
 use crate::output::LifecycleEmitter;
 use crate::runner::{RunnerCommand, RunnerEvent};
 use glob::Pattern;
@@ -284,16 +285,22 @@ impl WatchManager {
         ));
         let mut global_ignore_patterns: Vec<String> = Vec::new();
         for pattern in &config.watch_ignore {
-            global_ignore_patterns
-                .push(resolve_pattern(base_dir, pattern).to_string_lossy().into_owned());
+            global_ignore_patterns.push(
+                resolve_pattern(base_dir, pattern)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
             // A contents glob (`node_modules/**`) matches files *inside* the dir
             // but not the bare directory itself, so the directory's own creation
             // event would slip past the ignore filter and be logged as noise.
             // Also ignore the directory node, mirroring the walk-pruning in
             // `build_watch_ignore_overrides` so the two dialects stay in sync.
             if let Some(dir) = pattern.strip_suffix("/**") {
-                global_ignore_patterns
-                    .push(resolve_pattern(base_dir, dir).to_string_lossy().into_owned());
+                global_ignore_patterns.push(
+                    resolve_pattern(base_dir, dir)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
 
@@ -816,15 +823,13 @@ impl WatchManager {
                         // (`<pkg>/**`) that need recursive coverage — routed
                         // through the same `watch_ignore`-aware registration as
                         // startup so ignored subtrees stay pruned on reload.
-                        WatchItemKind::Service | WatchItemKind::Task => {
-                            register_dirs_ignoring(
-                                &mut self.watcher,
-                                &self.notify_tx,
-                                &watch_dir,
-                                &self.overrides,
-                                &mut self.registered_dirs,
-                            )
-                        }
+                        WatchItemKind::Service | WatchItemKind::Task => register_dirs_ignoring(
+                            &mut self.watcher,
+                            &self.notify_tx,
+                            &watch_dir,
+                            &self.overrides,
+                            &mut self.registered_dirs,
+                        ),
                     };
                     if let Err(e) = result {
                         self.record_item_error(
@@ -923,7 +928,10 @@ impl WatchManager {
             .iter()
             .filter(|path| {
                 let path_str = path.to_string_lossy();
-                !self.global_ignore.iter().any(|p| p.matches(&path_str))
+                !self
+                    .global_ignore
+                    .iter()
+                    .any(|pattern| matches_ignore(pattern, &path_str))
             })
             .cloned()
             .collect();
@@ -967,7 +975,11 @@ impl WatchManager {
             let mut unmatched: Vec<String> = Vec::new();
             for (name, item) in &self.items {
                 let state = watch_state_label(item.state);
-                if let Some(ig) = item.ignore_patterns.iter().find(|p| p.matches(&path_str)) {
+                if let Some(ig) = item
+                    .ignore_patterns
+                    .iter()
+                    .find(|pattern| matches_ignore(pattern, &path_str))
+                {
                     self.emitter.service_debug_event(
                         name,
                         &format!(
@@ -980,7 +992,11 @@ impl WatchManager {
                     ignored_by.push(name.clone());
                     continue;
                 }
-                if let Some(pat) = item.patterns.iter().find(|p| p.matches(&path_str)) {
+                if let Some(pat) = item
+                    .patterns
+                    .iter()
+                    .find(|pattern| matches_glob(pattern, &path_str))
+                {
                     self.emitter.service_debug_event(
                         name,
                         &format!(
@@ -1265,7 +1281,11 @@ impl WatchManager {
                         stale: item.stale,
                         debounce_ms: item.debounce_duration.as_millis() as u64,
                         last_error: item.last_error.clone(),
-                        patterns: item.patterns.iter().map(|p| p.as_str().to_string()).collect(),
+                        patterns: item
+                            .patterns
+                            .iter()
+                            .map(|p| p.as_str().to_string())
+                            .collect(),
                         ignore_patterns: item
                             .ignore_patterns
                             .iter()
@@ -1633,8 +1653,8 @@ fn reconcile_watches(
         if is_covered(dir, *mode, &sim) {
             continue;
         }
-        let replace = *mode == RecursiveMode::Recursive
-            && sim.get(dir) == Some(&RecursiveMode::NonRecursive);
+        let replace =
+            *mode == RecursiveMode::Recursive && sim.get(dir) == Some(&RecursiveMode::NonRecursive);
         actions.push(WatchAction {
             dir: dir.clone(),
             mode: *mode,
@@ -2143,11 +2163,7 @@ mod tests {
         //       src/
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        for rel in [
-            "clean/sub",
-            "pkg/node_modules/dep",
-            "pkg/src",
-        ] {
+        for rel in ["clean/sub", "pkg/node_modules/dep", "pkg/src"] {
             std::fs::create_dir_all(root.join(rel)).unwrap();
         }
 
@@ -2173,7 +2189,8 @@ mod tests {
         assert_eq!(got, expected);
         // node_modules must never appear in the watch set.
         assert!(
-            !got.iter().any(|(p, _)| p.to_string_lossy().contains("node_modules")),
+            !got.iter()
+                .any(|(p, _)| p.to_string_lossy().contains("node_modules")),
             "node_modules should be pruned: {got:?}"
         );
     }
@@ -2406,6 +2423,24 @@ bazel.target = "//services/api:api"
                 expected: false,
             },
             Case {
+                name: "single star matches one path component",
+                pattern: "/app/src/*.rs",
+                path: "/app/src/main.rs",
+                expected: true,
+            },
+            Case {
+                name: "single star does not cross path components",
+                pattern: "/app/src/*.rs",
+                path: "/app/src/nested/main.rs",
+                expected: false,
+            },
+            Case {
+                name: "matching is case sensitive",
+                pattern: "/app/src/*.rs",
+                path: "/app/src/main.RS",
+                expected: false,
+            },
+            Case {
                 name: "does not match outside dir",
                 pattern: "/app/src/**/*.rs",
                 path: "/other/src/main.rs",
@@ -2435,7 +2470,7 @@ bazel.target = "//services/api:api"
         for case in cases {
             let pat = Pattern::new(case.pattern).unwrap();
             assert_eq!(
-                pat.matches(case.path),
+                matches_glob(&pat, case.path),
                 case.expected,
                 "case: {} — pattern {:?} vs path {:?}",
                 case.name,
@@ -2786,10 +2821,19 @@ bazel.target = "//services/api:api"
         for path in &event.paths {
             let path_str = path.to_string_lossy();
             for (name, item) in items.iter() {
-                if item.ignore_patterns.iter().any(|p| p.matches(&path_str)) {
+                if item
+                    .ignore_patterns
+                    .iter()
+                    .any(|pattern| matches_ignore(pattern, &path_str))
+                {
                     continue;
                 }
-                if item.patterns.iter().any(|p| p.matches(&path_str)) && !affected.contains(name) {
+                if item
+                    .patterns
+                    .iter()
+                    .any(|pattern| matches_glob(pattern, &path_str))
+                    && !affected.contains(name)
+                {
                     affected.push(name.clone());
                 }
             }
