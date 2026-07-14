@@ -6,13 +6,26 @@ on:
       plan:
         required: true
         type: string
+  # cargo-dist skips every publish job for prereleases by default. Run this
+  # publisher after a successful prerelease-tag build so crates.io users can
+  # opt in without advancing package managers such as Homebrew.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
 
 jobs:
   publish-crates-io:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v') &&
+       contains(github.event.workflow_run.head_branch, '-'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo publish
