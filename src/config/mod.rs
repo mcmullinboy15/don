@@ -21,7 +21,9 @@ pub use self::profile::Profile;
 pub use self::service::{
     DockerBuildConfig, DockerConfig, ResolvedService, RustConfig, Service, ServiceKind,
 };
-pub use self::task::{Task, TaskAutoRun, TaskTerminal, TaskTerminalMode, TaskTerminalScreen};
+pub use self::task::{
+    Task, TaskAutoRun, TaskHeadless, TaskTerminal, TaskTerminalMode, TaskTerminalScreen,
+};
 pub use self::types::{
     BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
     ShutdownConfig, TurboConfig,
@@ -1030,6 +1032,16 @@ fn validate_task_params(task_name: &str, task: &Task, errors: &mut Vec<String>) 
     scan("cmd", &task.cmd);
     for (idx, arg) in task.args.iter().enumerate() {
         scan(&format!("args[{idx}]"), arg);
+    }
+    if let Some(headless) = &task.headless {
+        if let Some(cmd) = &headless.cmd {
+            scan("headless.cmd", cmd);
+        }
+        if let Some(args) = &headless.args {
+            for (idx, arg) in args.iter().enumerate() {
+                scan(&format!("headless.args[{idx}]"), arg);
+            }
+        }
     }
     for (k, v) in &task.env {
         scan(&format!("env['{k}']"), v);
@@ -3007,6 +3019,28 @@ turbo.build_task = ""
                     name = "name"
                 "#,
                 want: None,
+            },
+            Case {
+                name: "headless placeholder referencing declared param is fine",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    headless = { args = ["{{name}}"] }
+                    [[tasks.t.params]]
+                    name = "name"
+                "#,
+                want: None,
+            },
+            Case {
+                name: "headless placeholder referencing unknown param errors",
+                toml: r#"
+                    [tasks.t]
+                    cmd = "echo"
+                    headless = { cmd = "{{nme}}" }
+                    [[tasks.t.params]]
+                    name = "name"
+                "#,
+                want: Some("headless.cmd references undeclared param"),
             },
             Case {
                 name: "placeholder referencing unknown param errors with suggestion",

@@ -382,6 +382,7 @@ fn integration_task_download_resolves_cmd() {
             timeout: None,
             log: don::config::LogConfig::Stdout,
             terminal: don::config::TaskTerminal::default(),
+            headless: None,
             auto_run: don::config::TaskAutoRun::Always,
             download: Some(download),
             bazel: None,

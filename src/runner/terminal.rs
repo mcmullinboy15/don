@@ -44,6 +44,10 @@ impl TerminalCoordinator {
         Self { tx: Some(tx) }
     }
 
+    pub(crate) fn is_detached(&self) -> bool {
+        self.tx.is_none()
+    }
+
     /// Pause the TUI and wait for it to confirm it has released the
     /// terminal. No-op when detached.
     pub async fn acquire(&self) {

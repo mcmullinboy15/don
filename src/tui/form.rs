@@ -409,6 +409,7 @@ mod tests {
             timeout: None,
             log: LogConfig::Stdout,
             terminal: crate::config::TaskTerminal::default(),
+            headless: None,
             auto_run: crate::config::TaskAutoRun::Always,
             download: None,
             bazel: None,
