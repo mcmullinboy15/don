@@ -1,3 +1,4 @@
+use crate::globwalk::{glob_pattern_base_dir, matches_glob, matches_ignore};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -73,8 +74,14 @@ fn scan_tree_for_changes(
     let path_str = path.to_string_lossy();
     let ignored = ignore_patterns
         .iter()
-        .any(|ignore| ignore.matches(&path_str));
-    if !ignored && patterns.iter().any(|pattern| pattern.matches(&path_str)) {
+        .any(|ignore| matches_ignore(ignore, &path_str));
+    if ignored {
+        return false;
+    }
+    if patterns
+        .iter()
+        .any(|pattern| matches_glob(pattern, &path_str))
+    {
         let Ok(modified) = metadata.modified() else {
             return false;
         };
@@ -97,25 +104,4 @@ fn scan_tree_for_changes(
     }
 
     false
-}
-
-fn glob_pattern_base_dir(pattern: &Path) -> PathBuf {
-    let mut base = PathBuf::new();
-    let mut hit_glob = false;
-    for component in pattern.components() {
-        let s = component.as_os_str().to_string_lossy();
-        if s.contains('*') || s.contains('?') || s.contains('[') {
-            hit_glob = true;
-            break;
-        }
-        base.push(component);
-    }
-    if !hit_glob {
-        base = base.parent().map(Path::to_path_buf).unwrap_or_default();
-    }
-    if base.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        base
-    }
 }
