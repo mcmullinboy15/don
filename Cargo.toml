@@ -1,6 +1,6 @@
 [package]
 name = "don"
-version = "0.5.8"
+version = "0.6.0-preview"
 edition = "2024"
 description = "Boss of your dev environment"
 license = "MIT"
