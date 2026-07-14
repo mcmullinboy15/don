@@ -156,6 +156,7 @@ pub(in crate::runner) async fn build_runtime_maps(
     base_dir: &Path,
     active_services: &HashSet<String>,
     active_tasks: &HashSet<String>,
+    headless: bool,
 ) -> (
     HashMap<String, RuntimeService>,
     HashMap<String, RuntimeTask>,
@@ -178,6 +179,9 @@ pub(in crate::runner) async fn build_runtime_maps(
         if active_tasks.contains(name) {
             let mut task = task.clone();
             task.depends_on = config.effective_depends_on(name, &task.depends_on);
+            if headless {
+                task.apply_headless_override();
+            }
             let has_success = task_state.has_success(name).await.unwrap_or(false);
             let last_run = task_state.last_run(name).await.unwrap_or(None);
             tasks.insert(

@@ -146,6 +146,18 @@ pub enum TaskTerminalScreen {
     Alternate,
 }
 
+/// Command overrides used when a task runs without the interactive TUI.
+///
+/// Omitted fields inherit from the task's top-level `cmd` and `args`. An
+/// explicitly empty `args` list clears the task's normal arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct TaskHeadless {
+    /// Command to use instead of the task's normal command.
+    pub cmd: Option<String>,
+    /// Arguments to use instead of the task's normal arguments.
+    pub args: Option<Vec<String>>,
+}
+
 /// A one-shot task that runs to completion.
 ///
 /// Tasks can depend on services (waits for ready) and other tasks.
@@ -184,6 +196,12 @@ pub struct Task {
     /// while it runs.
     #[serde(default)]
     pub terminal: TaskTerminal,
+    /// Command overrides to use in non-TUI runs.
+    ///
+    /// When present, the task uses muxed output instead of taking foreground
+    /// terminal ownership. Omitted `cmd` or `args` fields inherit their
+    /// top-level values.
+    pub headless: Option<TaskHeadless>,
     /// Whether the task runs automatically.
     ///
     /// Supported values:
@@ -230,6 +248,19 @@ impl Task {
     pub(crate) fn build_tool_watch_enabled(&self) -> bool {
         self.bazel.as_ref().is_some_and(|bazel| bazel.watch)
             || self.turbo.as_ref().is_some_and(|turbo| turbo.watch)
+    }
+
+    pub(crate) fn apply_headless_override(&mut self) {
+        let Some(headless) = &self.headless else {
+            return;
+        };
+        if let Some(cmd) = &headless.cmd {
+            self.cmd.clone_from(cmd);
+        }
+        if let Some(args) = &headless.args {
+            self.args.clone_from(args);
+        }
+        self.terminal = TaskTerminal::default();
     }
 
     /// Resolve the task's command path, using the cached download binary
@@ -293,5 +324,43 @@ mod tests {
         .unwrap();
         assert_eq!(task.terminal.mode, TaskTerminalMode::Foreground);
         assert_eq!(task.terminal.screen, TaskTerminalScreen::Main);
+    }
+
+    #[test]
+    fn headless_override_inherits_omitted_command_and_replaces_args() {
+        let mut task: Task = toml::from_str(
+            r#"
+            cmd = "scurry"
+            args = ["push"]
+            terminal = "foreground"
+            headless = { args = ["push", "--force"] }
+            "#,
+        )
+        .unwrap();
+
+        task.apply_headless_override();
+
+        assert_eq!(task.cmd, "scurry");
+        assert_eq!(task.args, vec!["push", "--force"]);
+        assert_eq!(task.terminal, TaskTerminal::default());
+    }
+
+    #[test]
+    fn headless_override_can_replace_command_and_clear_args() {
+        let mut task: Task = toml::from_str(
+            r#"
+            cmd = "interactive"
+            args = ["one"]
+            terminal = "foreground"
+            headless = { cmd = "batch", args = [] }
+            "#,
+        )
+        .unwrap();
+
+        task.apply_headless_override();
+
+        assert_eq!(task.cmd, "batch");
+        assert!(task.args.is_empty());
+        assert_eq!(task.terminal, TaskTerminal::default());
     }
 }

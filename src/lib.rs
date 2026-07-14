@@ -17,7 +17,7 @@ pub(crate) mod tui;
 pub(crate) mod update;
 pub(crate) mod watch;
 
-pub use config::{Config, ConfigError, Platform, TaskAutoRun};
+pub use config::{Config, ConfigError, Platform, TaskAutoRun, TaskHeadless};
 pub use docker::stream::DockerLogReader;
 pub use duration::{DurationError, parse_duration};
 pub use output::{OutputError, OutputManager, ServiceWriter};

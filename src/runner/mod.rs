@@ -859,6 +859,7 @@ impl Runner {
         let active_items = setup::resolve_active_items(&config, platform, profile)?;
         let active_services = setup::filter_active_services(&config, active_items.as_ref());
         let active_tasks = setup::filter_active_tasks(&config, active_items.as_ref());
+        let headless = terminal_coordinator.is_detached();
 
         setup::prune_download_cache(&config, platform, &don_dir, &output_manager);
 
@@ -868,6 +869,7 @@ impl Runner {
             &base_dir,
             &active_services,
             &active_tasks,
+            headless,
         )
         .await;
 
@@ -2606,6 +2608,7 @@ mod tests {
                 timeout: None,
                 log: LogConfig::Stdout,
                 terminal: crate::config::TaskTerminal::default(),
+                headless: None,
                 auto_run: crate::config::TaskAutoRun::Always,
                 download: None,
                 bazel: None,

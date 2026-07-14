@@ -177,6 +177,7 @@ log = "ignore"
 | `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
 | `terminal` | string or table | `"muxed"` (default) routes through Don output; `"foreground"` gives the task exclusive terminal ownership |
+| `headless` | table | Optional `cmd` and/or `args` overrides for non-TUI runs |
 
 Foreground terminal tasks are for interactive commands that need stdin and an
 unprefixed terminal, such as REPLs, editors, interactive migrations, or test
@@ -201,6 +202,19 @@ does not start other newly-ready services/tasks until that task exits. Already
 running dependencies continue to run, and their output is still captured in
 ring buffers and log files while visible Don output is paused. Watch-triggered
 foreground tasks may also steal the terminal during development.
+
+Foreground tasks can provide a non-interactive command variant for
+`--no-tui`, redirected-output, and detached runs. Fields omitted from
+`headless` inherit their normal values, and headless execution uses muxed
+output instead of foreground terminal ownership:
+
+```toml
+[tasks.push]
+cmd = "scurry"
+args = ["push"]
+terminal = "foreground"
+headless = { args = ["push", "--force"] }
+```
 
 #### Task State Tracking
 

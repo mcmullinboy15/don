@@ -260,6 +260,38 @@ fn integration_task_depends_on_service() {
 }
 
 #[test]
+fn integration_headless_task_uses_command_override_without_foreground_terminal() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("headless-task-override");
+        let output_path = dir.path().join("task-output.txt");
+        let toml = format!(
+            r#"
+[tasks.push]
+cmd = "sh"
+args = ["-c", "printf interactive > {}"]
+terminal = "foreground"
+headless = {{ args = ["-c", "printf headless > {}"] }}
+log = "ignore"
+"#,
+            output_path.display(),
+            output_path.display()
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(&buf, "push: complete", Duration::from_secs(5)).await;
+        let task_output = std::fs::read_to_string(&output_path).unwrap();
+        assert_eq!(task_output, "headless");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
 fn integration_manual_task_dependency_unblocks_service_after_run() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("manual-task-dep");
