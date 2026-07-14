@@ -11,6 +11,7 @@ mod completions;
 mod events;
 mod graph;
 mod health;
+mod lazy;
 mod params;
 mod paths;
 mod profile;
@@ -42,7 +43,7 @@ use crate::config::{Config, Platform, ShutdownConfig};
 use crate::output::OutputManager;
 use crate::process::pid_file::PidFile;
 use crate::watch::WatchManager;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::time::SystemTime;
@@ -62,7 +63,7 @@ use self::health::run_health_monitor;
 use self::health::unhealthy_restart_backoff_secs;
 #[cfg(test)]
 use self::paths::any_glob_path_changed_since;
-use self::service_worker::{ServiceStartContext, ServiceStartMode};
+use self::service_worker::ServiceStartContext;
 use self::signals::shutdown_requested;
 use self::support::check_gitignore;
 use self::task_worker::TaskRunPrepared;
@@ -71,7 +72,7 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 enum ServiceStartIntent {
-    Startup {
+    Scheduled {
         done_tx: mpsc::Sender<ItemDone>,
     },
     Reply {
@@ -81,7 +82,7 @@ enum ServiceStartIntent {
 }
 
 enum TaskRunIntent {
-    Startup { done_tx: mpsc::Sender<ItemDone> },
+    Scheduled { done_tx: mpsc::Sender<ItemDone> },
     Background,
 }
 
@@ -139,13 +140,12 @@ pub(crate) enum ServiceStopAction {
 #[serde(rename_all = "lowercase")]
 pub enum ServiceState {
     Pending,
-    /// A batch build (bazel/turbo) is in flight. Transitions to Pending on
-    /// success (then the service starts like any other) or Failed on build
-    /// error. Only set during the startup-phase batch build; file-watch
-    /// rebuilds keep the service in Running/Ready.
+    /// A batch or lazy JIT build (bazel/turbo) is in flight. Transitions to
+    /// Pending on success (then the service starts like any other) or Failed
+    /// on build error. File-watch rebuilds keep the service in Running/Ready.
     Building,
     /// Proxy is bound and accepting connections, but the service process is not
-    /// started yet. Will transition to Starting on first incoming connection.
+    /// requested yet. Transitions to Pending on the first incoming connection.
     Lazy,
     Starting,
     Running,
@@ -183,6 +183,7 @@ impl ServiceState {
                 | (Self::Pending, Self::Lazy)
                 | (Self::Building, Self::Pending)
                 | (Self::Building, Self::Failed)
+                | (Self::Lazy, Self::Pending)
                 | (Self::Lazy, Self::Building)
                 | (Self::Lazy, Self::Starting)
                 | (Self::Starting, Self::Running)
@@ -467,6 +468,7 @@ enum RunnerInternalCommand {
     /// Result of a just-in-time build for a single lazy service.
     LazyBuildComplete {
         name: String,
+        generation: u64,
         outcome: BatchBuildOutcome,
     },
     /// Health-check monitor reported a state transition for a service.
@@ -478,6 +480,7 @@ enum RunnerInternalCommand {
     /// Ready-check completed for a manual-start or rebuild spawn.
     ReadyCheckComplete {
         name: String,
+        generation: u64,
         success: bool,
         message: Option<String>,
     },
@@ -742,7 +745,7 @@ pub struct Runner {
     internal_rx: mpsc::Receiver<RunnerInternalCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
 
-    /// Item-completion sender shared between the initial startup and config
+    /// Item-completion sender shared by dependency-scheduled starts and config
     /// reload paths. Ready-check and task-completion callbacks send here.
     /// The main loop's `done_rx` receives these.
     done_tx: Option<mpsc::Sender<ItemDone>>,
@@ -768,7 +771,7 @@ pub struct Runner {
     /// [`Self::batch_build_handle`]: on shutdown we abort any in-flight
     /// JIT builds so bazel/turbo output stops streaming before
     /// "shutdown complete" is emitted.
-    lazy_build_handles: HashMap<String, crate::build_tool::AbortOnDrop<()>>,
+    lazy_build_handles: HashMap<String, (u64, crate::build_tool::AbortOnDrop<()>)>,
 
     /// Detached file-watch build-tool rebuild batch, if one is in flight.
     rebuild_batch_handle: Option<crate::build_tool::AbortOnDrop<()>>,
@@ -931,6 +934,17 @@ impl Runner {
                 state,
                 pid,
             });
+            if self.done_tx.is_some()
+                && matches!(
+                    state,
+                    ServiceState::Pending
+                        | ServiceState::Ready
+                        | ServiceState::Failed
+                        | ServiceState::DependencyFailed
+                )
+            {
+                self.schedule_start_pending();
+            }
         }
     }
 
@@ -947,6 +961,19 @@ impl Runner {
                 state,
                 last_run,
             });
+            if self.done_tx.is_some()
+                && matches!(
+                    state,
+                    TaskItemState::Pending
+                        | TaskItemState::PendingRun
+                        | TaskItemState::Completed
+                        | TaskItemState::Skipped
+                        | TaskItemState::Failed
+                        | TaskItemState::DependencyFailed
+                )
+            {
+                self.schedule_start_pending();
+            }
         }
     }
 
@@ -1247,40 +1274,25 @@ impl Runner {
             self.spawn_startup_batch_build(batch_items);
         }
 
-        // Build dependency map and topological order.
+        // Validate the active dependency graph before starting anything.
         let dep_map = self.build_dep_map();
-        let order = topological_sort(&dep_map).map_err(|cycle| RunnerError::Cycle { cycle })?;
+        topological_sort(&dep_map).map_err(|cycle| RunnerError::Cycle { cycle })?;
 
-        // Channel for item completion notifications. Store the sender on `self`
-        // so later-started services (lazy starts, pending-sweep) can reuse it.
+        // Channel for dependency-scheduled completion notifications. Store the
+        // sender on `self` so services requested later use the same path.
         let (done_tx, mut done_rx) = mpsc::channel::<ItemDone>(64);
-        self.done_tx = Some(done_tx.clone());
+        self.done_tx = Some(done_tx);
 
-        // Track which items are in flight. Only include items that are in the
-        // active set (all items, or profile subset). Items not in service_states
-        // or task_states are excluded (e.g. services not in the selected profile).
-        let mut pending: HashSet<String> = order
-            .iter()
-            .filter(|name| self.services.contains_key(*name) || self.tasks.contains_key(*name))
-            .cloned()
-            .collect();
-        let mut in_flight: HashSet<String> = HashSet::new();
-
-        // Start items whose dependencies are already satisfied.
-        let startup_shutdown_requested = if self
-            .start_ready_items(&order, &dep_map, &mut pending, &mut in_flight, &done_tx)
-            .await?
-        {
-            self.initiate_shutdown().await;
-            true
-        } else {
-            false
-        };
-
-        let mut all_started = false;
+        // Initial non-lazy items already occupy Pending. A lazy connection
+        // performs the same state transition and can join this scheduler at
+        // any point, including while this first sweep is running.
+        self.start_pending_items().await;
+        let mut startup_complete = false;
 
         // Main loop: wait for completions, commands, and signals.
-        if !startup_shutdown_requested {
+        if shutdown_requested() {
+            self.initiate_shutdown().await;
+        } else {
             loop {
                 if self.shutting_down {
                     break;
@@ -1291,12 +1303,14 @@ impl Runner {
                 }
 
                 // Emit "all services running" once when startup is complete.
-                if !all_started && pending.is_empty() && in_flight.is_empty() {
-                    all_started = true;
+                if !startup_complete && self.initial_startup_settled() {
+                    startup_complete = true;
                     let has_running_services = self.services.values().any(|rs| {
                         matches!(
                             rs.state(),
-                            ServiceState::Running
+                            ServiceState::Pending
+                                | ServiceState::Building
+                                | ServiceState::Running
                                 | ServiceState::Ready
                                 | ServiceState::Starting
                                 | ServiceState::Lazy
@@ -1314,23 +1328,7 @@ impl Runner {
 
                 tokio::select! {
                     Some(item_done) = done_rx.recv() => {
-                        in_flight.remove(&item_done.name);
                         self.handle_item_done(&item_done);
-
-                        // Start newly-unblocked items.
-                        if self
-                            .start_ready_items(
-                                &order,
-                                &dep_map,
-                                &mut pending,
-                                &mut in_flight,
-                                &done_tx,
-                            )
-                            .await?
-                        {
-                            self.initiate_shutdown().await;
-                            break;
-                        }
                     }
                     Some(cmd) = self.cmd_rx.recv() => {
                         match cmd {
@@ -1491,10 +1489,16 @@ impl Runner {
                             }
                             RunnerInternalCommand::ReadyCheckComplete {
                                 name,
+                                generation,
                                 success,
                                 message,
                             } => {
-                                self.handle_ready_check_complete(&name, success, message);
+                                self.handle_ready_check_complete(
+                                    &name,
+                                    generation,
+                                    success,
+                                    message,
+                                );
                             }
                             RunnerInternalCommand::BatchBuildComplete(outcome) => {
                                 // Drop the abort-on-drop handle: the task is done,
@@ -1502,73 +1506,19 @@ impl Runner {
                                 // task has already returned (harmless but noisy).
                                 self.batch_build_handle = None;
                                 let replay_items = outcome.replay_items.clone();
-                                // Pull failed names out of the pending set before
-                                // applying the outcome. `apply_batch_build_outcome`
-                                // transitions them to `Failed`, but leaving them in
-                                // `pending` would let `start_ready_items` try to
-                                // spawn a failed service.
-                                for (name, _) in &outcome.failed {
-                                    pending.remove(name);
-                                }
                                 self.apply_batch_build_outcome(outcome);
                                 self.schedule_startup_batch_replays(&replay_items);
-                                if self
-                                    .start_ready_items(
-                                        &order,
-                                        &dep_map,
-                                        &mut pending,
-                                        &mut in_flight,
-                                        &done_tx,
-                                    )
-                                    .await?
-                                {
-                                    self.initiate_shutdown().await;
-                                    break;
-                                }
                             }
                             RunnerInternalCommand::RebuildBatchComplete(outcome) => {
                                 self.rebuild_batch_handle = None;
                                 self.handle_rebuild_batch_complete(outcome).await;
                             }
-                            RunnerInternalCommand::LazyBuildComplete { name, outcome } => {
-                                // Drop the abort-on-drop handle: the task is done,
-                                // and leaving it live would abort after the task
-                                // has already returned (harmless but noisy).
-                                self.lazy_build_handles.remove(&name);
-                                // Single-service JIT build triggered by a first
-                                // proxy connection. `apply_batch_build_outcome`
-                                // flips Building → Pending on success or →
-                                // Failed on build error; on success we then
-                                // queue the detached service-start worker to
-                                // take it through Pending → Starting → Ready
-                                // like any cold start.
-                                let replay_items = outcome.replay_items.clone();
-                                let succeeded = outcome.succeeded.contains(&name);
-                                self.apply_batch_build_outcome(outcome);
-                                let replayed = replay_items
-                                    .iter()
-                                    .find(|item| item.name == name)
-                                    .is_some_and(|item| self.schedule_lazy_build_replay(item));
-                                if succeeded
-                                    && !replayed
-                                    && self
-                                        .services
-                                        .get(&name)
-                                        .is_some_and(|rs| rs.state() == ServiceState::Pending)
-                                {
-                                    self.output_manager.service_event(
-                                        &name,
-                                        "lazy build complete, starting",
-                                    );
-                                    if let Err(e) = self.queue_startup_service_start(
-                                        &name,
-                                        done_tx.clone(),
-                                        ServiceStartMode::SpawnOnly,
-                                    ) {
-                                        self.output_manager
-                                            .service_error_event(&name, &e.to_string());
-                                    }
-                                }
+                            RunnerInternalCommand::LazyBuildComplete {
+                                name,
+                                generation,
+                                outcome,
+                            } => {
+                                self.handle_lazy_build_complete(&name, generation, outcome);
                             }
                             RunnerInternalCommand::GraphRequeryComplete(outcomes) => {
                                 self.graph_requery_handle = None;
@@ -1580,44 +1530,10 @@ impl Runner {
                         }
                     }
                     Some(name) = self.lazy_start_rx.recv() => {
-                        // Only act on the first connection — subsequent connections
-                        // (during JIT build or start) find the service in a non-Lazy
-                        // state and are ignored. Connections still queue at the
-                        // proxy; they get forwarded once the backend is Ready.
-                        if !self
-                            .services
-                            .get(&name)
-                            .is_some_and(|rs| rs.state() == ServiceState::Lazy)
-                        {
-                            continue;
-                        }
-                        let needs_jit = self
-                            .services
-                            .get(&name)
-                            .is_some_and(|rs| rs.resolved.is_build_tool_managed() && !rs.batch_built);
-                        if needs_jit {
-                            let item = match self.services.get(&name) {
-                                Some(rs) => self.build_batch_item(&name, NodeKind::Service, rs),
-                                None => continue,
-                            };
-                            self.output_manager.service_event(
-                                &name,
-                                "first connection — building before start",
-                            );
-                            self.set_service_state(&name, ServiceState::Building);
-                            self.spawn_lazy_build(&name, item);
-                        } else {
-                            self.output_manager
-                                .service_event(&name, "first connection — starting service");
-                            if let Err(e) = self.queue_startup_service_start(
-                                &name,
-                                done_tx.clone(),
-                                ServiceStartMode::Full,
-                            ) {
-                                self.output_manager
-                                    .service_error_event(&name, &e.to_string());
-                            }
-                        }
+                        // Only the first connection acts: it moves Lazy →
+                        // Pending, and the normal dependency scheduler owns
+                        // the service from there.
+                        self.handle_lazy_connection(&name);
                     }
                     // Flush batched build-tool rebuilds when the batch window expires.
                     _ = async {
@@ -2086,6 +2002,224 @@ mod tests {
         (runner, shutdown_tx)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn lazy_jit_completion_rechecks_dependencies_before_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        if let Some(service) = runner.services.get_mut("api") {
+            service.resolved.lazy = true;
+            service.resolved.depends_on = vec!["setup".to_string()];
+        }
+        runner.set_service_state("api", ServiceState::Building);
+
+        runner.handle_lazy_build_complete(
+            "api",
+            0,
+            build_tools::BatchBuildOutcome {
+                resolved_watches: Vec::new(),
+                warnings: Vec::new(),
+                succeeded: ["api".to_string()].into_iter().collect(),
+                failed: Vec::new(),
+                binary_paths: HashMap::new(),
+                replay_items: Vec::new(),
+            },
+        );
+        runner.start_pending_items().await;
+
+        let service = runner.services.get("api").unwrap();
+        assert_eq!(service.state(), ServiceState::Pending);
+        assert!(service.start_worker.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_lazy_jit_completion_does_not_overwrite_newer_service_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        if let Some(service) = runner.services.get_mut("api") {
+            service.resolved.lazy = true;
+            service.start_generation = 2;
+        }
+        runner.set_service_state("api", ServiceState::Building);
+
+        runner.handle_lazy_build_complete(
+            "api",
+            1,
+            build_tools::BatchBuildOutcome {
+                resolved_watches: Vec::new(),
+                warnings: Vec::new(),
+                succeeded: std::collections::HashSet::new(),
+                failed: vec![("api".to_string(), "stale build failure".to_string())],
+                binary_paths: HashMap::new(),
+                replay_items: Vec::new(),
+            },
+        );
+
+        let service = runner.services.get("api").unwrap();
+        assert_eq!(service.state(), ServiceState::Building);
+        assert!(!service.batch_built);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_commands_reject_during_lazy_build() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Start,
+            Restart,
+        }
+
+        struct Case {
+            name: &'static str,
+            operation: Operation,
+            expected_message: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "start",
+                operation: Operation::Start,
+                expected_message: "cannot start while Building",
+            },
+            Case {
+                name: "restart",
+                operation: Operation::Restart,
+                expected_message: "cannot restart while Building",
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+            runner.set_service_state("api", ServiceState::Building);
+            let (reply_tx, reply_rx) = oneshot::channel();
+
+            match case.operation {
+                Operation::Start => runner.handle_start_service_cmd("api", reply_tx).await,
+                Operation::Restart => runner.handle_restart_service_cmd("api", reply_tx).await,
+            }
+
+            let result = reply_rx.await.unwrap();
+            assert!(
+                matches!(
+                    &result,
+                    Err(CommandError::InvalidState { message, .. })
+                        if message == case.expected_message
+                ),
+                "case '{}' returned {result:?}",
+                case.name,
+            );
+            assert_eq!(
+                runner.services.get("api").map(|service| service.state()),
+                Some(ServiceState::Building),
+                "case '{}'",
+                case.name,
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_check_completion_requires_current_running_generation() {
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+            current_generation: u64,
+            completion_generation: u64,
+            success: bool,
+            expected: ServiceState,
+        }
+
+        let cases = vec![
+            Case {
+                name: "stopped service ignores same-generation completion",
+                state: ServiceState::Stopped,
+                current_generation: 2,
+                completion_generation: 2,
+                success: true,
+                expected: ServiceState::Stopped,
+            },
+            Case {
+                name: "newer running service ignores stale success",
+                state: ServiceState::Running,
+                current_generation: 2,
+                completion_generation: 1,
+                success: true,
+                expected: ServiceState::Running,
+            },
+            Case {
+                name: "newer running service ignores stale failure",
+                state: ServiceState::Running,
+                current_generation: 2,
+                completion_generation: 1,
+                success: false,
+                expected: ServiceState::Running,
+            },
+            Case {
+                name: "current running service accepts success",
+                state: ServiceState::Running,
+                current_generation: 2,
+                completion_generation: 2,
+                success: true,
+                expected: ServiceState::Ready,
+            },
+            Case {
+                name: "current running service accepts failure",
+                state: ServiceState::Running,
+                current_generation: 2,
+                completion_generation: 2,
+                success: false,
+                expected: ServiceState::Failed,
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+            if let Some(service) = runner.services.get_mut("api") {
+                service.start_generation = case.current_generation;
+            }
+            runner.set_service_state("api", case.state);
+
+            runner.handle_ready_check_complete(
+                "api",
+                case.completion_generation,
+                case.success,
+                None,
+            );
+
+            assert_eq!(
+                runner.services.get("api").map(|service| service.state()),
+                Some(case.expected),
+                "case '{}'",
+                case.name,
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_service_completion_ignores_stale_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        if let Some(service) = runner.services.get_mut("api") {
+            service.start_generation = 2;
+        }
+        runner.set_service_state("api", ServiceState::Running);
+
+        runner.handle_item_done(&ItemDone {
+            name: "api".to_string(),
+            kind: NodeKind::Service,
+            success: true,
+            message: None,
+            elapsed: None,
+            last_run: None,
+            service_start_generation: Some(1),
+            task_run_generation: None,
+        });
+
+        assert_eq!(
+            runner.services.get("api").map(|service| service.state()),
+            Some(ServiceState::Running),
+        );
+    }
+
     /// Regression: a watched file changes *during* a bazel build. The build
     /// that completes is correct, but its restart is deferred because the item
     /// went stale. The follow-up cycle then finds bazel "up to date" — and must
@@ -2377,6 +2511,12 @@ mod tests {
         }
 
         let cases = vec![
+            Case {
+                name: "lazy -> pending (first connection)",
+                from: ServiceState::Lazy,
+                to: ServiceState::Pending,
+                valid: true,
+            },
             Case {
                 name: "pending -> starting",
                 from: ServiceState::Pending,

@@ -157,9 +157,10 @@ impl Runner {
 
         match result {
             Ok(start_result) => match intent {
-                ServiceStartIntent::Startup { done_tx } => {
+                ServiceStartIntent::Scheduled { done_tx } => {
                     self.wire_service_output_and_ready_check(
                         name,
+                        op_id,
                         *start_result,
                         &context.resolved,
                         Some(done_tx),
@@ -169,6 +170,7 @@ impl Runner {
                 ServiceStartIntent::Reply { reply } => {
                     self.wire_service_output_and_ready_check(
                         name,
+                        op_id,
                         *start_result,
                         &context.resolved,
                         None,
@@ -179,6 +181,7 @@ impl Runner {
                 ServiceStartIntent::Background => {
                     self.wire_service_output_and_ready_check(
                         name,
+                        op_id,
                         *start_result,
                         &context.resolved,
                         None,
@@ -199,7 +202,7 @@ impl Runner {
                     rs.reset_restart_tracking();
                 }
                 match intent {
-                    ServiceStartIntent::Startup { done_tx } => {
+                    ServiceStartIntent::Scheduled { done_tx } => {
                         let _ = done_tx
                             .send(ItemDone {
                                 name: name.to_string(),
@@ -208,6 +211,7 @@ impl Runner {
                                 message: Some(message),
                                 elapsed: None,
                                 last_run: None,
+                                service_start_generation: Some(op_id),
                                 task_run_generation: None,
                             })
                             .await;
@@ -397,7 +401,7 @@ impl Runner {
         )
     }
 
-    pub(in crate::runner) fn queue_startup_service_start(
+    pub(in crate::runner) fn queue_scheduled_service_start(
         &mut self,
         name: &str,
         done_tx: mpsc::Sender<ItemDone>,
@@ -416,7 +420,7 @@ impl Runner {
             name,
             context,
             mode,
-            ServiceStartIntent::Startup { done_tx },
+            ServiceStartIntent::Scheduled { done_tx },
         )
     }
 
@@ -427,6 +431,25 @@ impl Runner {
     ) {
         if let Err(e) = self.lookup_service(name) {
             let _ = reply.send(Err(e));
+            return;
+        }
+        let state = self.services.get(name).map(|rs| rs.state());
+        let operation_in_progress = self.services.get(name).is_some_and(|rs| {
+            rs.start_worker.is_some()
+                || matches!(
+                    rs.state(),
+                    ServiceState::Pending
+                        | ServiceState::Building
+                        | ServiceState::Starting
+                        | ServiceState::Stopping
+                )
+        });
+        if operation_in_progress {
+            let state = state.unwrap_or(ServiceState::Stopped);
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: format!("cannot start while {state:?}"),
+            }));
             return;
         }
         if self
@@ -662,15 +685,15 @@ impl Runner {
             let _ = reply.send(Err(e));
             return;
         }
-        // A lazy service in Lazy state has no process — just mark it Stopped.
-        if self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.state() == ServiceState::Lazy)
-        {
+        // An untriggered or dependency-blocked lazy service has no process —
+        // just mark it Stopped. Pending means its proxy received a connection,
+        // but the dependency scheduler has not started it yet.
+        if self.services.get(name).is_some_and(|rs| {
+            rs.resolved.lazy && matches!(rs.state(), ServiceState::Lazy | ServiceState::Pending)
+        }) {
             self.set_service_state(name, ServiceState::Stopped);
             self.output_manager
-                .service_event(name, "stopped (was lazy)");
+                .service_event(name, "stopped before lazy start");
             let _ = reply.send(Ok(()));
             return;
         }
@@ -746,10 +769,14 @@ impl Runner {
     pub(in crate::runner) fn handle_ready_check_complete(
         &mut self,
         name: &str,
+        generation: u64,
         success: bool,
         message: Option<String>,
     ) {
-        if !self.services.contains_key(name) {
+        let is_current_running_generation = self.services.get(name).is_some_and(|rs| {
+            rs.start_generation == generation && rs.state() == ServiceState::Running
+        });
+        if !is_current_running_generation {
             return;
         }
         if success {
@@ -814,6 +841,23 @@ impl Runner {
                 return;
             }
         };
+        if matches!(
+            state,
+            ServiceState::Pending
+                | ServiceState::Building
+                | ServiceState::Starting
+                | ServiceState::Stopping
+        ) || self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.start_worker.is_some())
+        {
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: format!("cannot restart while {state:?}"),
+            }));
+            return;
+        }
         if state == ServiceState::Failed && self.reap_exited_process_handle(name).await {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;

@@ -159,7 +159,7 @@ impl Runner {
                 }
                 self.set_task_state(name, TaskItemState::PendingRun);
                 self.output_manager.service_event(name, &message);
-                if let TaskRunIntent::Startup { done_tx } = intent {
+                if let TaskRunIntent::Scheduled { done_tx } = intent {
                     let _ = done_tx
                         .send(ItemDone {
                             name: name.to_string(),
@@ -168,6 +168,7 @@ impl Runner {
                             message: None,
                             elapsed: None,
                             last_run: None,
+                            service_start_generation: None,
                             task_run_generation: None,
                         })
                         .await;
@@ -182,7 +183,7 @@ impl Runner {
                 }
                 self.set_task_state(name, TaskItemState::Skipped);
                 self.output_manager.service_debug_event(name, &message);
-                if let TaskRunIntent::Startup { done_tx } = intent {
+                if let TaskRunIntent::Scheduled { done_tx } = intent {
                     let _ = done_tx
                         .send(ItemDone {
                             name: name.to_string(),
@@ -191,13 +192,14 @@ impl Runner {
                             message: None,
                             elapsed: None,
                             last_run: None,
+                            service_start_generation: None,
                             task_run_generation: None,
                         })
                         .await;
                 }
             }
             Ok(TaskRunPrepared::Spawned(spawn)) => {
-                if matches!(intent, TaskRunIntent::Startup { .. })
+                if matches!(intent, TaskRunIntent::Scheduled { .. })
                     && let Some(rt) = self.tasks.get_mut(name)
                 {
                     rt.set_needs_run_now(true);
@@ -209,7 +211,7 @@ impl Runner {
                 self.output_manager
                     .service_event(name, &format!("spawn {}", spawn.rendered_cmdline));
                 let done_tx = match intent {
-                    TaskRunIntent::Startup { done_tx } => {
+                    TaskRunIntent::Scheduled { done_tx } => {
                         self.output_manager.service_event(name, "running...");
                         self.set_task_state(name, TaskItemState::Running);
                         Some(done_tx)
@@ -220,13 +222,13 @@ impl Runner {
                     .await;
             }
             Ok(TaskRunPrepared::ForegroundSpawned(spawn)) => {
-                if matches!(intent, TaskRunIntent::Startup { .. })
+                if matches!(intent, TaskRunIntent::Scheduled { .. })
                     && let Some(rt) = self.tasks.get_mut(name)
                 {
                     rt.set_needs_run_now(true);
                 }
                 let done_tx = match intent {
-                    TaskRunIntent::Startup { done_tx } => {
+                    TaskRunIntent::Scheduled { done_tx } => {
                         self.set_task_state(name, TaskItemState::Running);
                         Some(done_tx)
                     }
@@ -239,7 +241,7 @@ impl Runner {
                 if task_cfg.terminal.is_foreground() {
                     self.output_manager.resume_visible_output();
                 }
-                if matches!(intent, TaskRunIntent::Startup { .. })
+                if matches!(intent, TaskRunIntent::Scheduled { .. })
                     && let Some(rt) = self.tasks.get_mut(name)
                 {
                     rt.set_needs_run_now(true);
@@ -247,7 +249,7 @@ impl Runner {
                 self.set_task_state(name, TaskItemState::Failed);
                 self.output_manager.service_error_event(name, &message);
                 match intent {
-                    TaskRunIntent::Startup { done_tx } => {
+                    TaskRunIntent::Scheduled { done_tx } => {
                         let _ = done_tx
                             .send(ItemDone {
                                 name: name.to_string(),
@@ -256,6 +258,7 @@ impl Runner {
                                 message: Some(message),
                                 elapsed: None,
                                 last_run: None,
+                                service_start_generation: None,
                                 task_run_generation: None,
                             })
                             .await;
@@ -387,6 +390,7 @@ impl Runner {
                         message,
                         elapsed: Some(elapsed),
                         last_run: Some(last_run),
+                        service_start_generation: None,
                         task_run_generation: None,
                     })
                     .await;
@@ -491,6 +495,7 @@ impl Runner {
                         message,
                         elapsed: Some(elapsed),
                         last_run: Some(last_run),
+                        service_start_generation: None,
                         task_run_generation: None,
                     })
                     .await;
@@ -896,11 +901,11 @@ impl Runner {
 
         // Reject while already in flight — otherwise we'd race two spawns of
         // the same task and the output would interleave unpredictably.
-        let current = self.tasks.get(name).map(|rt| rt.state());
-        if matches!(
-            current,
-            Some(TaskItemState::Running) | Some(TaskItemState::Building)
-        ) {
+        let already_in_flight = self.tasks.get(name).is_some_and(|rt| {
+            matches!(rt.state(), TaskItemState::Running | TaskItemState::Building)
+                || rt.run_worker.is_some()
+        });
+        if already_in_flight {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "task is already running".to_string(),

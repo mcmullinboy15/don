@@ -7,154 +7,18 @@ use super::service_worker::ServiceStartMode;
 use super::signals::shutdown_requested;
 use super::task_worker::TaskRunMode;
 use super::{
-    ItemDone, NodeKind, Runner, RunnerCommand, RunnerError, RunnerInternalCommand, RuntimeService,
-    ServiceState, TaskItemState, TaskRunIntent,
+    NodeKind, Runner, RunnerCommand, RunnerInternalCommand, RuntimeService, ServiceState,
+    TaskItemState, TaskRunIntent,
 };
-use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc;
+use std::collections::HashMap;
 
 impl Runner {
-    /// Start items whose dependencies are all satisfied.
-    pub(in crate::runner) async fn start_ready_items(
-        &mut self,
-        order: &[String],
-        dep_map: &HashMap<String, Vec<String>>,
-        pending: &mut HashSet<String>,
-        in_flight: &mut HashSet<String>,
-        done_tx: &mpsc::Sender<ItemDone>,
-    ) -> Result<bool, RunnerError> {
-        // First pass: mark pending items as DependencyFailed when an upstream
-        // dep failed (including another DependencyFailed — the cascade is
-        // transitive). Lazy services are left alone: the failure of one of
-        // their deps doesn't mean the lazy service can never start; it'll
-        // re-evaluate when an incoming proxy connection fires.
-        let failed_items: Vec<String> = order
-            .iter()
-            .filter(|name| pending.contains(name.as_str()))
-            .filter(|name| {
-                // Skip services marked lazy in their resolved config.
-                !self
-                    .services
-                    .get(name.as_str())
-                    .is_some_and(|rs| rs.resolved.lazy)
-            })
-            .filter(|name| {
-                let node_deps = dep_map.get(name.as_str()).cloned().unwrap_or_default();
-                node_deps.iter().any(|dep| self.is_dep_failed(dep))
-            })
-            .cloned()
-            .collect();
-
-        for name in failed_items {
-            pending.remove(&name);
-            // `name` is either a service or a task — the helpers are no-ops
-            // for unknown names, so we can call both unconditionally.
-            self.set_service_state(&name, ServiceState::DependencyFailed);
-            self.set_task_state(&name, TaskItemState::DependencyFailed);
-            self.output_manager
-                .service_error_event(&name, "skipped (dependency failed)");
-        }
-
-        // Second pass: start items whose dependencies are all satisfied.
-        // Items still in `Building` (batch build in flight) stay in `pending`
-        // — they get picked up after `BatchBuildComplete` transitions them
-        // back to `Pending` and `start_ready_items` is re-run.
-        let mut ready: Vec<String> = order
-            .iter()
-            .filter(|name| pending.contains(name.as_str()))
-            .filter(|name| !self.is_item_building(name))
-            .filter(|name| {
-                let node_deps = dep_map.get(name.as_str()).cloned().unwrap_or_default();
-                node_deps.iter().all(|dep| self.is_dep_satisfied(dep))
-            })
-            .cloned()
-            .collect();
-
-        // Foreground terminal tasks are exclusive: once one is ready, it
-        // owns the terminal and no other newly-ready item should start in
-        // the same scheduler sweep. Already-running dependencies continue.
-        if let Some(foreground_name) = ready.iter().find(|name| {
-            self.tasks
-                .get(name.as_str())
-                .is_some_and(|rt| rt.config.terminal.is_foreground())
-        }) {
-            ready = vec![foreground_name.clone()];
-        }
-
-        for name in ready {
-            if shutdown_requested() {
-                return Ok(true);
-            }
-
-            // Skip lazy services — they're managed exclusively by the
-            // `lazy_start_rx` flow (proxy connection triggers JIT build +
-            // start). We gate on the CONFIG `resolved.lazy`, not the runtime
-            // state: once the first connection fires, state walks
-            // Lazy → Building → Pending → Starting → Running → Ready. If
-            // this function re-fires while the service is past `Lazy` (e.g.
-            // because a dep became Ready after the lazy-triggered start),
-            // a state-based check would miss it and we'd queue a second
-            // start worker — double-spawn.
-            if self.services.get(&name).is_some_and(|rs| rs.resolved.lazy) {
-                pending.remove(&name);
-                continue;
-            }
-
-            pending.remove(&name);
-            in_flight.insert(name.clone());
-
-            if self.services.contains_key(&name) {
-                self.output_manager
-                    .service_debug_event(&name, "start triggered (deps satisfied)");
-                if let Err(e) =
-                    self.queue_startup_service_start(&name, done_tx.clone(), ServiceStartMode::Full)
-                {
-                    self.output_manager
-                        .service_error_event(&name, &e.to_string());
-                }
-            } else if self.tasks.contains_key(&name)
-                && let Some(task_cfg) = self.tasks.get(&name).map(|rt| rt.config.clone())
-            {
-                let has_dependents = dep_map
-                    .values()
-                    .any(|deps| deps.iter().any(|dep| dep == &name));
-                if let Err(e) = self.spawn_task_worker(
-                    &name,
-                    task_cfg,
-                    HashMap::new(),
-                    TaskRunMode::Startup { has_dependents },
-                    TaskRunIntent::Startup {
-                        done_tx: done_tx.clone(),
-                    },
-                ) {
-                    self.output_manager
-                        .service_error_event(&name, &e.to_string());
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
-    /// True when the service or task is currently blocked on the startup-
-    /// phase batch build. Used by [`Runner::start_ready_items`] to keep
-    /// `Building` entries parked in `pending` until the batch completes.
-    fn is_item_building(&self, name: &str) -> bool {
-        if let Some(rs) = self.services.get(name) {
-            return rs.state() == ServiceState::Building;
-        }
-        if let Some(rt) = self.tasks.get(name) {
-            return rt.state() == TaskItemState::Building;
-        }
-        false
-    }
-
     /// Apply the outcome of the detached batch-build chain: mutate the
     /// runtime state (watch paths, binary paths, `batch_built` flag) and
     /// transition `Building` items to `Pending` (on success) or `Failed`
     /// (on build failure). The caller is responsible for dropping its
-    /// cached batch-build handle and re-running [`Self::start_ready_items`]
-    /// so newly-unblocked items start.
+    /// cached batch-build handle. State transitions schedule the normal
+    /// pending-item sweep so newly-unblocked items start.
     pub(in crate::runner) fn apply_batch_build_outcome(&mut self, outcome: BatchBuildOutcome) {
         for warning in &outcome.warnings {
             self.output_manager.error_event(warning);
@@ -288,6 +152,13 @@ impl Runner {
     }
 
     pub(in crate::runner) fn spawn_lazy_build(&mut self, name: &str, item: BatchBuildItem) {
+        let generation = match self.services.get_mut(name) {
+            Some(rs) => {
+                rs.start_generation = rs.start_generation.saturating_add(1);
+                rs.start_generation
+            }
+            None => return,
+        };
         let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
@@ -311,13 +182,14 @@ impl Runner {
             let _ = cmd_tx
                 .send(RunnerInternalCommand::LazyBuildComplete {
                     name: svc_name,
+                    generation,
                     outcome,
                 })
                 .await;
         });
         self.lazy_build_handles.insert(
             name.to_string(),
-            crate::build_tool::AbortOnDrop::new(handle),
+            (generation, crate::build_tool::AbortOnDrop::new(handle)),
         );
     }
 
@@ -396,7 +268,7 @@ impl Runner {
     /// Check if a dependency has failed (including the transitive
     /// `DependencyFailed` cascade — if A fails, B depends on A, C depends
     /// on B, then C also needs to be marked).
-    fn is_dep_failed(&self, dep: &str) -> bool {
+    pub(in crate::runner) fn is_dep_failed(&self, dep: &str) -> bool {
         if let Some(rs) = self.services.get(dep) {
             return matches!(
                 rs.state(),
@@ -416,14 +288,13 @@ impl Runner {
     /// dependency is satisfied. A dependency that is merely retrying is not
     /// enough; starting descendants before it reaches Ready violates the
     /// same dependency contract that stranded them in the first place.
-    fn restore_dependency_failed_items(&mut self) -> bool {
+    fn restore_dependency_failed_items(&mut self) {
         let dep_map = self.build_dep_map();
         let order = match topological_sort(&dep_map) {
             Ok(order) => order,
-            Err(_) => return false,
+            Err(_) => return,
         };
 
-        let mut restored_any = false;
         for name in order {
             let service_dep_failed = self
                 .services
@@ -446,6 +317,10 @@ impl Runner {
             }
 
             if service_dep_failed {
+                // A lazy service can only reach DependencyFailed after a
+                // connection moved it out of Lazy. Returning it to Pending
+                // preserves that queued request and lets the normal scheduler
+                // resume it without a separate lazy-request flag.
                 self.set_service_state(&name, ServiceState::Pending);
             } else if task_dep_failed {
                 self.set_task_state(&name, TaskItemState::Pending);
@@ -453,23 +328,18 @@ impl Runner {
 
             self.output_manager
                 .service_debug_event(&name, "dependency recovered; re-queued");
-            restored_any = true;
         }
-
-        restored_any
     }
 
     /// Ask the runner loop to re-check `Pending` items on its own task.
-    fn schedule_start_pending(&self) {
+    pub(in crate::runner) fn schedule_start_pending(&self) {
         let _ = self.cmd_tx.send(RunnerCommand::StartPending);
     }
 
-    /// Recover any descendants stranded in `DependencyFailed` and then kick
-    /// the normal pending-item sweep so newly-unblocked items can start.
+    /// Recover descendants stranded in `DependencyFailed`. Transitioning them
+    /// to `Pending` schedules the normal pending-item sweep.
     pub(in crate::runner) fn unblock_dependency_failed_items(&mut self) {
-        if self.restore_dependency_failed_items() {
-            self.schedule_start_pending();
-        }
+        self.restore_dependency_failed_items();
     }
 
     /// Snapshot of a batch-buildable service or task — everything the
@@ -544,8 +414,11 @@ impl Runner {
         }
     }
 
-    /// Try to start any Pending services/tasks whose dependencies are now satisfied.
-    /// Driven by the `StartPending` command; re-schedules itself if items remain pending.
+    /// Start every Pending service or task whose dependencies are satisfied.
+    ///
+    /// This is the only dependency scheduler. Initial services begin in
+    /// `Pending`, while lazy services enter `Pending` on their first proxy
+    /// connection; both are claimed and launched by this same sweep.
     pub(in crate::runner) async fn start_pending_items(&mut self) {
         let dep_map = self.build_dep_map();
         let order = match topological_sort(&dep_map) {
@@ -553,73 +426,150 @@ impl Runner {
             Err(_) => return,
         };
 
-        let mut started_any = false;
-        for name in &order {
+        let failed_items: Vec<String> = order
+            .iter()
+            .filter(|name| self.is_item_pending(name))
+            .filter(|name| {
+                dep_map
+                    .get(name.as_str())
+                    .is_some_and(|deps| deps.iter().any(|dep| self.is_dep_failed(dep)))
+            })
+            .cloned()
+            .collect();
+
+        for name in failed_items {
+            self.set_service_state(&name, ServiceState::DependencyFailed);
+            self.set_task_state(&name, TaskItemState::DependencyFailed);
+            self.output_manager
+                .service_error_event(&name, "skipped (dependency failed)");
+        }
+
+        let mut ready: Vec<String> = order
+            .iter()
+            .filter(|name| self.is_item_pending(name))
+            .filter(|name| {
+                dep_map
+                    .get(name.as_str())
+                    .is_none_or(|deps| deps.iter().all(|dep| self.is_dep_satisfied(dep)))
+            })
+            .cloned()
+            .collect();
+
+        // Foreground tasks own the terminal exclusively. If one is ready,
+        // claim only it in this sweep; its completion schedules the next one.
+        if let Some(foreground_name) = ready.iter().find(|name| {
+            self.tasks
+                .get(name.as_str())
+                .is_some_and(|rt| rt.config.terminal.is_foreground())
+        }) {
+            ready = vec![foreground_name.clone()];
+        }
+
+        let Some(done_tx) = self.done_tx.clone() else {
+            return;
+        };
+
+        for name in ready {
+            if shutdown_requested() {
+                return;
+            }
+
             let is_pending_svc = self
                 .services
-                .get(name)
+                .get(&name)
                 .is_some_and(|rs| rs.state() == ServiceState::Pending);
             let is_pending_task = self
                 .tasks
-                .get(name)
+                .get(&name)
                 .is_some_and(|rt| rt.state() == TaskItemState::Pending);
-            if !is_pending_svc && !is_pending_task {
-                continue;
-            }
-
-            let deps = dep_map.get(name).cloned().unwrap_or_default();
-            let deps_ok = deps.iter().all(|dep| self.is_dep_satisfied(dep));
-            if !deps_ok {
-                continue;
-            }
 
             if is_pending_svc {
-                // Skip lazy services for the same reason as `start_ready_items`:
-                // the `lazy_start_rx` flow owns them. A lazy service briefly
-                // in `Pending` state during `LazyBuildComplete`'s
-                // Building→Pending→Starting transition must not be double-started
-                // by a concurrently-scheduled `StartPending`.
-                if self.services.get(name).is_some_and(|rs| rs.resolved.lazy) {
+                // A build-tool-managed lazy service takes a JIT build detour.
+                // Successful completion returns it to Pending, where this
+                // scheduler checks dependencies again before starting it.
+                if self.start_lazy_build_if_needed(&name) {
                     continue;
                 }
-                if self.services.contains_key(name)
-                    && let Some(done_tx) = self.done_tx.clone()
-                {
+                self.output_manager
+                    .service_debug_event(&name, "start triggered (deps satisfied)");
+                if let Err(e) = self.queue_scheduled_service_start(
+                    &name,
+                    done_tx.clone(),
+                    ServiceStartMode::Full,
+                ) {
+                    self.set_service_state(&name, ServiceState::Failed);
                     self.output_manager
-                        .service_event(name, "start triggered (pending sweep)");
-                    if let Err(e) =
-                        self.queue_startup_service_start(name, done_tx, ServiceStartMode::Full)
-                    {
-                        self.output_manager
-                            .service_error_event(name, &e.to_string());
-                    }
-                    started_any = true;
+                        .service_error_event(&name, &e.to_string());
                 }
-            } else if is_pending_task {
-                self.set_task_state(name, TaskItemState::Running);
-                self.handle_task_rerun(name).await;
-                started_any = true;
+                continue;
             }
-        }
 
-        // If we started something, schedule another check — the newly-started
-        // items might unblock further pending items.
-        if started_any {
-            let still_pending = self
-                .services
-                .values()
-                .any(|rs| rs.state() == ServiceState::Pending)
-                || self
-                    .tasks
+            if !is_pending_task {
+                continue;
+            }
+
+            let Some((task_cfg, needs_startup_evaluation)) = self
+                .tasks
+                .get(&name)
+                .map(|rt| (rt.config.clone(), !rt.dependency_evaluated))
+            else {
+                continue;
+            };
+
+            if needs_startup_evaluation {
+                let has_dependents = dep_map
                     .values()
-                    .any(|rt| rt.state() == TaskItemState::Pending);
-            if still_pending {
-                let cmd_tx = self.cmd_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let _ = cmd_tx.send(RunnerCommand::StartPending);
-                });
+                    .any(|deps| deps.iter().any(|dep| dep == &name));
+                if let Err(e) = self.spawn_task_worker(
+                    &name,
+                    task_cfg,
+                    HashMap::new(),
+                    TaskRunMode::Startup { has_dependents },
+                    TaskRunIntent::Scheduled {
+                        done_tx: done_tx.clone(),
+                    },
+                ) {
+                    self.set_task_state(&name, TaskItemState::Failed);
+                    self.output_manager
+                        .service_error_event(&name, &e.to_string());
+                }
+            } else {
+                self.handle_task_rerun(&name).await;
             }
         }
+    }
+
+    fn is_item_pending(&self, name: &str) -> bool {
+        self.services
+            .get(name)
+            .is_some_and(|rs| rs.state() == ServiceState::Pending)
+            || self
+                .tasks
+                .get(name)
+                .is_some_and(|rt| rt.state() == TaskItemState::Pending && rt.run_worker.is_none())
+    }
+
+    /// Whether every item participating in initial startup has settled.
+    /// Lazy services are listeners, not startup work, even if a connection
+    /// happens to request one while the initial graph is still progressing.
+    pub(in crate::runner) fn initial_startup_settled(&self) -> bool {
+        let service_work = self.services.values().any(|rs| {
+            !rs.resolved.lazy
+                && matches!(
+                    rs.state(),
+                    ServiceState::Pending
+                        | ServiceState::Building
+                        | ServiceState::Starting
+                        | ServiceState::Running
+                )
+        });
+        let task_work = self.tasks.values().any(|rt| {
+            matches!(
+                rt.state(),
+                TaskItemState::Pending | TaskItemState::Building | TaskItemState::Running
+            )
+        });
+
+        !service_work && !task_work
     }
 }

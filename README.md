@@ -456,6 +456,8 @@ proxy = { listen = "127.0.0.1:3000", env = "PORT" }
 lazy = true
 ```
 
+A lazy service with `depends_on` moves from `lazy` to `pending` on its first connection and won't start until those dependencies are ready. While it waits (or if a dependency has failed), the browser tab shows nothing — the connection just sits queued. Don logs `waiting for dependencies before start` while deferred, and `don status` reports `pending` or `dep failed` as appropriate.
+
 ### Socket Passing
 
 Zero-downtime restarts via the systemd `LISTEN_FDS` protocol. Don binds the port and passes the socket fd to the child:
