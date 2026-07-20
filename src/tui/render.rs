@@ -571,14 +571,17 @@ fn normal_bar_line(
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
         spans.push(dim("  [R] reset"));
     }
-    spans.push(dim("  [t] tasks"));
+    // Parked tasks are easy to miss as a lone `*`, so tint the whole hotkey.
     if counts.tasks_pending_run > 0 {
+        spans.push(Span::styled("  [t] tasks", Style::default().fg(Color::Yellow)));
         spans.push(Span::styled(
             "*",
             Style::default()
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         ));
+    } else {
+        spans.push(dim("  [t] tasks"));
     }
     spans.push(dim("  [s] services"));
     if verbose_enabled {
@@ -1077,6 +1080,14 @@ mod tests {
 
         assert_eq!(star.style.fg, Some(Color::LightYellow));
         assert!(star.style.add_modifier.contains(Modifier::BOLD));
+
+        let hotkey = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "  [t] tasks")
+            .expect("tasks hotkey missing");
+        assert_eq!(hotkey.style.fg, Some(Color::Yellow));
+
         let text = line_text(line);
         assert!(text.contains("[t] tasks*"));
         assert!(!text.contains("tasks pending"));
@@ -1084,15 +1095,23 @@ mod tests {
 
     #[test]
     fn normal_bar_leaves_tasks_shortcut_unmarked_without_pending_tasks() {
-        let text = line_text(normal_bar_line(
+        let line = normal_bar_line(
             &StatusCounts::default(),
             &FilterState::new(Vec::new(), &std::collections::HashSet::new(), None),
             0,
             0,
             0,
             false,
-        ));
+        );
 
+        let hotkey = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "  [t] tasks")
+            .expect("tasks hotkey missing");
+        assert_eq!(hotkey.style.fg, Some(Color::DarkGray));
+
+        let text = line_text(line);
         assert!(text.contains("[t] tasks"));
         assert!(!text.contains("[t] tasks*"));
     }
