@@ -224,6 +224,61 @@ docker.command = ["sh", "-c", "echo value=$DON_ENVFILE_TEST"]
     });
 }
 
+// --- Docker service built from a Dockerfile with no explicit image ---
+
+#[test]
+fn docker_service_builds_from_dockerfile_without_image() {
+    skip_unless_docker!();
+
+    run_with_timeout(Duration::from_secs(60), async {
+        let dir = TempDir::new("docker-build");
+        let container_name = "don-test-build";
+
+        cleanup_container(container_name).await;
+        // Remove any image left over from a previous run so we prove the build ran.
+        if let Ok(docker) = bollard::Docker::connect_with_socket_defaults() {
+            use bollard::query_parameters::RemoveImageOptionsBuilder;
+            let _ = docker
+                .remove_image("don-buildsvc", Some(RemoveImageOptionsBuilder::new().force(true).build()), None)
+                .await;
+        }
+
+        // A Dockerfile with no corresponding public image — don must build it.
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM alpine:latest\nCMD [\"echo\", \"built-and-running\"]\n",
+        )
+        .unwrap();
+
+        // No `docker.image`: the image is built from the Dockerfile and tagged
+        // don-<service> automatically.
+        let toml = format!(
+            r#"
+[services.buildsvc]
+docker.container = "{container_name}"
+docker.build.context = "."
+"#
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        let found = wait_for_output(&buf, "built-and-running", Duration::from_secs(45)).await;
+        assert!(
+            found,
+            "expected output from the built image. got: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+        cleanup_container(container_name).await;
+    });
+}
+
 // --- Docker service with port mapping ---
 
 #[test]

@@ -396,8 +396,12 @@ pub struct ResolvedService {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DockerConfig {
     /// Docker image to run (e.g. "postgres:16").
-    /// For built images, this is also used as the tag for `docker build -t`.
-    pub image: String,
+    ///
+    /// Optional when `build` is set: a built image is tagged `don-<service>` by
+    /// default (see [`DockerConfig::image_tag`]). Set both `image` and `build`
+    /// to give a built image an explicit tag. A service must have `image` or
+    /// `build`.
+    pub image: Option<String>,
     /// Container name — used to check if it's already running.
     pub container: Option<String>,
     /// Port mappings (e.g. ["5432:5432"]).
@@ -430,6 +434,20 @@ pub struct DockerBuildConfig {
     /// Build arguments passed via --build-arg.
     #[serde(default)]
     pub args: HashMap<String, String>,
+}
+
+impl DockerConfig {
+    /// The image tag to run — and to tag a build as.
+    ///
+    /// Uses the explicit `image` if set, otherwise derives `don-<service>` from
+    /// the service name (matching the `don-<service>` container-naming
+    /// convention). Only meaningful when the service has `image` or `build`,
+    /// which config validation enforces.
+    pub fn image_tag(&self, service_name: &str) -> String {
+        self.image
+            .clone()
+            .unwrap_or_else(|| format!("don-{service_name}"))
+    }
 }
 
 /// Rust/Cargo service configuration.

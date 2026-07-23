@@ -73,11 +73,30 @@ pub(crate) async fn build_image(
 }
 
 /// Create a tar archive of a directory for Docker build context.
+///
+/// Skips don's own runtime directory (`.don`): when the build context is the
+/// project root, it holds a live control socket that cannot be archived (and has
+/// no business in an image). Everything else is archived as-is.
 fn create_tar_context(context_path: &Path) -> Result<Vec<u8>, DockerError> {
     let mut tar_builder = tar::Builder::new(Vec::new());
-    tar_builder
-        .append_dir_all(".", context_path)
-        .map_err(DockerError::Tar)?;
+    for entry in std::fs::read_dir(context_path).map_err(DockerError::Tar)? {
+        let entry = entry.map_err(DockerError::Tar)?;
+        let name = entry.file_name();
+        if name == ".don" {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(DockerError::Tar)?;
+        if file_type.is_dir() {
+            tar_builder
+                .append_dir_all(&name, &path)
+                .map_err(DockerError::Tar)?;
+        } else {
+            tar_builder
+                .append_path_with_name(&path, &name)
+                .map_err(DockerError::Tar)?;
+        }
+    }
     tar_builder.into_inner().map_err(DockerError::Tar)
 }
 
@@ -112,6 +131,34 @@ mod tests {
         assert!(
             entries.iter().any(|e| e.contains("src/main.rs")),
             "expected src/main.rs in tar: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn test_tar_context_excludes_don_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        // don's runtime dir — in a real run this also holds a socket that can't
+        // be archived. It must not appear in the build context.
+        std::fs::create_dir_all(dir.path().join(".don")).unwrap();
+        std::fs::write(dir.path().join(".don/state.json"), "{}").unwrap();
+
+        let tar_bytes = create_tar_context(dir.path()).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            entries.iter().any(|e| e.contains("Dockerfile")),
+            "expected Dockerfile in tar: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.contains(".don")),
+            "expected .don to be excluded from tar: {entries:?}"
         );
     }
 }
