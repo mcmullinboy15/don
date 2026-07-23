@@ -107,19 +107,23 @@ pub(crate) async fn start_docker_service(
     // Clean up any stale container with the same name.
     cleanup_stale_container(client, &container_name).await?;
 
+    // The tag to run — and to tag a build as. Explicit `image`, else derived
+    // from the service name.
+    let image_tag = config.image_tag(name);
+
     // Build the image if a build config is present.
     if let Some(ref build_config) = config.build
         && let Some(w) = writer
     {
-        build::build_image(client, build_config, &config.image, base_dir, w).await?;
+        build::build_image(client, build_config, &image_tag, base_dir, w).await?;
     }
 
     // Build container configuration.
     let (port_bindings, exposed_ports) = parse::parse_port_mappings(&config.ports)?;
-    let env_vars = parse::build_env_vars(service_env, env_files)?;
+    let env_vars = parse::build_container_env(service_env, env_files, &config.env_file)?;
 
     let container_config = ContainerCreateBody {
-        image: Some(config.image.clone()),
+        image: Some(image_tag.clone()),
         env: Some(env_vars),
         exposed_ports: if exposed_ports.is_empty() {
             None

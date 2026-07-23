@@ -31,6 +31,14 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # docker.env_file = [".env"]
 # ready.tcp = "127.0.0.1:5432"
 
+# Docker build — build an image from a Dockerfile on demand instead of pulling
+# one. No `docker.image` needed: the build is tagged `don-<service>`. (Set
+# `docker.image` too if you want an explicit tag.)
+# [services.app]
+# docker.build.context = "."           # build context dir
+# docker.build.dockerfile = "Dockerfile"  # optional, relative to context
+# docker.ports = ["8080:8080"]
+
 # Rust preset — runs `cargo build --bin <name>`, watches src/**/*.rs.
 # [services.api]
 # rust.binary = "api"

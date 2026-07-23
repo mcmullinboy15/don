@@ -140,7 +140,7 @@ pub(in crate::runner) async fn run_service_build_worker(
                     crate::docker::build::build_image(
                         client,
                         build_config,
-                        &docker_config.image,
+                        &docker_config.image_tag(name),
                         base_dir,
                         writer,
                     )

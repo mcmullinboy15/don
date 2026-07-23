@@ -442,6 +442,17 @@ impl Config {
                 &resolved.log_filter,
                 &mut errors,
             );
+            // A docker service must have something to run: an explicit image,
+            // or a build config (whose image is tagged `don-<service>`).
+            if let Some(ServiceKind::Docker(docker)) = &resolved.kind
+                && docker.image.is_none()
+                && docker.build.is_none()
+            {
+                errors.push(format!(
+                    "service '{name}': docker service must set `docker.image` or `docker.build`"
+                ));
+            }
+
             // Validate download config.
             if let Some(ref download) = resolved.download {
                 // Downloads only apply to custom services (with run.cmd).
@@ -1240,7 +1251,7 @@ mod tests {
                     let Some(ServiceKind::Docker(docker)) = &resolved.kind else {
                         panic!("expected docker preset");
                     };
-                    assert_eq!(docker.image, "postgres:16");
+                    assert_eq!(docker.image.as_deref(), Some("postgres:16"));
                     assert_eq!(docker.container.as_deref(), Some("my-postgres"));
                     assert_eq!(docker.ports, vec!["5432:5432"]);
                     assert_eq!(docker.volumes, vec!["pgdata:/var/lib/postgresql/data"]);
@@ -1283,7 +1294,7 @@ mod tests {
                     let Some(ServiceKind::Docker(docker)) = &resolved.kind else {
                         panic!("expected docker preset");
                     };
-                    assert_eq!(docker.image, "myapp:dev");
+                    assert_eq!(docker.image.as_deref(), Some("myapp:dev"));
                     let build = docker.build.as_ref().unwrap();
                     assert_eq!(build.context, "./services/api");
                     assert_eq!(build.dockerfile.as_deref(), Some("Dockerfile.dev"));
@@ -1292,6 +1303,46 @@ mod tests {
                     assert_eq!(
                         resolved.watch,
                         vec!["services/api/src/**/*.rs", "services/api/Dockerfile.dev",]
+                    );
+                },
+            },
+            ConfigTestCase {
+                name: "docker service builds without an explicit image",
+                input: r#"
+                    [services.db]
+                    docker.build.context = "."
+                    docker.ports = ["5432:5432"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    // A build config alone is enough — no `image` required.
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    let resolved = config.services["db"].resolve(TEST_PLATFORM);
+                    let Some(ServiceKind::Docker(docker)) = &resolved.kind else {
+                        panic!("expected docker preset");
+                    };
+                    assert!(docker.image.is_none());
+                    // The built image is tagged from the service name.
+                    assert_eq!(docker.image_tag("db"), "don-db");
+                },
+            },
+            ConfigTestCase {
+                name: "docker service without image or build is a validation error",
+                input: r#"
+                    [services.db]
+                    docker.ports = ["5432:5432"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(
+                        errors
+                            .iter()
+                            .any(|e| e.contains("must set `docker.image` or `docker.build`")),
+                        "got: {errors:?}"
                     );
                 },
             },
@@ -1465,7 +1516,7 @@ mod tests {
                     let Some(ServiceKind::Docker(docker)) = &macos.kind else {
                         panic!("expected docker preset on macos");
                     };
-                    assert_eq!(docker.image, "cockroachdb/cockroach:v24.1.0");
+                    assert_eq!(docker.image.as_deref(), Some("cockroachdb/cockroach:v24.1.0"));
                     assert_eq!(macos.env["COCKROACH_PORT"], "26257");
                     assert!(macos.download.is_some());
                 },
@@ -1532,7 +1583,7 @@ mod tests {
                     let Some(ServiceKind::Docker(docker)) = &macos.kind else {
                         panic!("expected docker on macos");
                     };
-                    assert_eq!(docker.image, "cockroachdb/cockroach:v24.1.0");
+                    assert_eq!(docker.image.as_deref(), Some("cockroachdb/cockroach:v24.1.0"));
 
                     // Platform without an override and no base preset should fail
                     let other = config.services["crdb"].resolve(Platform::LinuxAarch64);
