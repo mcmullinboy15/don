@@ -116,7 +116,7 @@ pub(crate) async fn start_docker_service(
 
     // Build container configuration.
     let (port_bindings, exposed_ports) = parse::parse_port_mappings(&config.ports)?;
-    let env_vars = parse::build_env_vars(service_env, env_files)?;
+    let env_vars = parse::build_container_env(service_env, env_files, &config.env_file)?;
 
     let container_config = ContainerCreateBody {
         image: Some(config.image.clone()),

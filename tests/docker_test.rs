@@ -176,6 +176,54 @@ docker.command = ["echo", "hello from docker"]
     });
 }
 
+// --- Docker service receives docker.env_file vars ---
+
+#[test]
+fn docker_service_env_file_reaches_container() {
+    skip_unless_docker!();
+
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("docker-envfile");
+        let container_name = "don-test-envfile";
+
+        cleanup_container(container_name).await;
+
+        // A docker-scoped env_file. Regression: this used to be parsed and then
+        // silently dropped, never reaching the container.
+        let env_file = dir.path().join("container.env");
+        std::fs::write(&env_file, "DON_ENVFILE_TEST=envfile_works\n").unwrap();
+
+        let toml = format!(
+            r#"
+[services.envcheck]
+docker.image = "alpine:latest"
+docker.container = "{container_name}"
+docker.env_file = ["{env_file}"]
+docker.command = ["sh", "-c", "echo value=$DON_ENVFILE_TEST"]
+"#,
+            env_file = env_file.display()
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        let found = wait_for_output(&buf, "value=envfile_works", Duration::from_secs(15)).await;
+        assert!(
+            found,
+            "expected env var from docker.env_file in output. got: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        cleanup_container(container_name).await;
+    });
+}
+
 // --- Docker service with port mapping ---
 
 #[test]

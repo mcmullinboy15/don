@@ -114,6 +114,27 @@ pub(crate) fn build_env_vars(
     Ok(vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect())
 }
 
+/// Build the full container environment from every source.
+///
+/// A docker service draws env from two distinct config fields — the service's
+/// own `env_file` and the docker-scoped `docker.env_file` — plus inline `env`.
+/// Precedence, lowest to highest: service env files, then docker env files
+/// (more specific, so they override), then inline env vars.
+///
+/// This exists because `docker.env_file` must actually reach the container:
+/// previously only the service-level env/env_file was forwarded and
+/// `docker.env_file` was silently dropped.
+pub(crate) fn build_container_env(
+    env: &HashMap<String, String>,
+    service_env_files: &[PathBuf],
+    docker_env_files: &[PathBuf],
+) -> Result<Vec<String>, DockerError> {
+    let mut env_files = Vec::with_capacity(service_env_files.len() + docker_env_files.len());
+    env_files.extend_from_slice(service_env_files);
+    env_files.extend_from_slice(docker_env_files);
+    build_env_vars(env, &env_files)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -267,5 +288,33 @@ mod tests {
         assert!(result.contains(&"FILE_VAR=from_file".to_string()));
         assert!(result.contains(&"INLINE=only".to_string()));
         assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_build_container_env_merges_docker_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let service_file = dir.path().join("service.env");
+        std::fs::write(&service_file, "SERVICE_VAR=svc\nOVERRIDE=from_service\n").unwrap();
+        let docker_file = dir.path().join("docker.env");
+        std::fs::write(&docker_file, "DOCKER_VAR=dock\nOVERRIDE=from_docker\n").unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("INLINE_VAR".to_string(), "inline".to_string());
+
+        let result = build_container_env(
+            &env,
+            std::slice::from_ref(&service_file),
+            std::slice::from_ref(&docker_file),
+        )
+        .unwrap();
+
+        // Regression: the docker-scoped env_file used to be dropped entirely.
+        // All three sources must reach the container.
+        assert!(result.contains(&"SERVICE_VAR=svc".to_string()));
+        assert!(result.contains(&"DOCKER_VAR=dock".to_string()));
+        assert!(result.contains(&"INLINE_VAR=inline".to_string()));
+        // Docker env_file overrides the service env_file on conflict.
+        assert!(result.contains(&"OVERRIDE=from_docker".to_string()));
     }
 }
