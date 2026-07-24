@@ -12,6 +12,19 @@ use super::{
 };
 use std::collections::HashMap;
 
+fn push_unique_name(names: &mut Vec<String>, name: &str) {
+    if !names.iter().any(|existing| existing == name) {
+        names.push(name.to_string());
+    }
+}
+
+fn format_dependency_failure(dependencies: &[String]) -> String {
+    match dependencies {
+        [dependency] => format!("dependency '{dependency}' failed"),
+        dependencies => format!("dependencies '{}' failed", dependencies.join("', '")),
+    }
+}
+
 impl Runner {
     /// Apply the outcome of the detached batch-build chain: mutate the
     /// runtime state (watch paths, binary paths, `batch_built` flag) and
@@ -284,62 +297,105 @@ impl Runner {
         false
     }
 
-    /// Re-queue items stranded in `DependencyFailed` once every upstream
-    /// dependency is satisfied. A dependency that is merely retrying is not
-    /// enough; starting descendants before it reaches Ready violates the
-    /// same dependency contract that stranded them in the first place.
-    fn restore_dependency_failed_items(&mut self) {
-        let dep_map = self.build_dep_map();
-        let order = match topological_sort(&dep_map) {
-            Ok(order) => order,
-            Err(_) => return,
-        };
-
-        for name in order {
-            let service_dep_failed = self
-                .services
-                .get(&name)
-                .is_some_and(|rs| rs.state() == ServiceState::DependencyFailed);
-            let task_dep_failed = self
-                .tasks
-                .get(&name)
-                .is_some_and(|rt| rt.state() == TaskItemState::DependencyFailed);
-            if !service_dep_failed && !task_dep_failed {
-                continue;
-            }
-
-            let deps = dep_map.get(&name).cloned().unwrap_or_default();
-            if deps.iter().any(|dep| self.is_dep_failed(dep)) {
-                continue;
-            }
-            if deps.iter().any(|dep| !self.is_dep_satisfied(dep)) {
-                continue;
-            }
-
-            if service_dep_failed {
-                // A lazy service can only reach DependencyFailed after a
-                // connection moved it out of Lazy. Returning it to Pending
-                // preserves that queued request and lets the normal scheduler
-                // resume it without a separate lazy-request flag.
-                self.set_service_state(&name, ServiceState::Pending);
-            } else if task_dep_failed {
-                self.set_task_state(&name, TaskItemState::Pending);
-            }
-
-            self.output_manager
-                .service_debug_event(&name, "dependency recovered; re-queued");
-        }
-    }
-
     /// Ask the runner loop to re-check `Pending` items on its own task.
     pub(in crate::runner) fn schedule_start_pending(&self) {
         let _ = self.cmd_tx.send(RunnerCommand::StartPending);
     }
 
-    /// Recover descendants stranded in `DependencyFailed`. Transitioning them
-    /// to `Pending` schedules the normal pending-item sweep.
-    pub(in crate::runner) fn unblock_dependency_failed_items(&mut self) {
-        self.restore_dependency_failed_items();
+    /// Resolve failed direct dependencies to their root failures. An
+    /// intermediate `DependencyFailed` item contributes the roots it already
+    /// recorded, so a chain such as api -> worker -> db reports `db`.
+    fn failed_dependency_roots(&self, dependencies: &[String]) -> Vec<String> {
+        let mut roots = Vec::new();
+        for dependency in dependencies {
+            let inherited = if let Some(rs) = self.services.get(dependency) {
+                match rs.state() {
+                    ServiceState::Failed => Some(std::slice::from_ref(dependency)),
+                    ServiceState::DependencyFailed => Some(rs.failed_dependencies()),
+                    _ => None,
+                }
+            } else if let Some(rt) = self.tasks.get(dependency) {
+                match rt.state() {
+                    TaskItemState::Failed => Some(std::slice::from_ref(dependency)),
+                    TaskItemState::DependencyFailed => Some(rt.failed_dependencies()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let Some(inherited) = inherited else {
+                continue;
+            };
+            if inherited.is_empty() {
+                push_unique_name(&mut roots, dependency);
+                continue;
+            }
+            for root in inherited {
+                push_unique_name(&mut roots, root);
+            }
+        }
+        roots
+    }
+
+    /// Refresh dependency-failure causes and recover items whose complete
+    /// dependency set is satisfied. Iterating in topological order lets a
+    /// root-cause update flow through every descendant in one sweep.
+    fn reconcile_dependency_failures(
+        &mut self,
+        dep_map: &HashMap<String, Vec<String>>,
+        order: &[String],
+    ) {
+        for name in order {
+            let service_state = self.services.get(name).map(RuntimeService::state);
+            let task_state = self.tasks.get(name).map(|rt| rt.state());
+            let is_pending = service_state == Some(ServiceState::Pending)
+                || task_state == Some(TaskItemState::Pending);
+            let is_dependency_failed = service_state == Some(ServiceState::DependencyFailed)
+                || task_state == Some(TaskItemState::DependencyFailed);
+            if !is_pending && !is_dependency_failed {
+                continue;
+            }
+
+            let dependencies = dep_map.get(name).map(Vec::as_slice).unwrap_or_default();
+            let failed_dependencies = self.failed_dependency_roots(dependencies);
+            if !failed_dependencies.is_empty() {
+                let state_changed = if service_state.is_some() {
+                    self.mark_service_dependency_failed(name, failed_dependencies.clone())
+                } else {
+                    self.mark_task_dependency_failed(name, failed_dependencies.clone())
+                };
+                if state_changed {
+                    self.output_manager.service_error_event(
+                        name,
+                        &format!(
+                            "skipped ({})",
+                            format_dependency_failure(&failed_dependencies)
+                        ),
+                    );
+                }
+                continue;
+            }
+
+            // A dependency that is merely retrying is not enough: descendants
+            // remain blocked until every dependency reaches a satisfied state.
+            if is_dependency_failed
+                && dependencies
+                    .iter()
+                    .all(|dependency| self.is_dep_satisfied(dependency))
+            {
+                if service_state.is_some() {
+                    // A lazy service reaches DependencyFailed only after a
+                    // connection moved it out of Lazy. Pending preserves that
+                    // queued request for the normal scheduler.
+                    self.set_service_state(name, ServiceState::Pending);
+                } else {
+                    self.set_task_state(name, TaskItemState::Pending);
+                }
+                self.output_manager
+                    .service_debug_event(name, "dependency recovered; re-queued");
+            }
+        }
     }
 
     /// Snapshot of a batch-buildable service or task — everything the
@@ -426,23 +482,7 @@ impl Runner {
             Err(_) => return,
         };
 
-        let failed_items: Vec<String> = order
-            .iter()
-            .filter(|name| self.is_item_pending(name))
-            .filter(|name| {
-                dep_map
-                    .get(name.as_str())
-                    .is_some_and(|deps| deps.iter().any(|dep| self.is_dep_failed(dep)))
-            })
-            .cloned()
-            .collect();
-
-        for name in failed_items {
-            self.set_service_state(&name, ServiceState::DependencyFailed);
-            self.set_task_state(&name, TaskItemState::DependencyFailed);
-            self.output_manager
-                .service_error_event(&name, "skipped (dependency failed)");
-        }
+        self.reconcile_dependency_failures(&dep_map, &order);
 
         let mut ready: Vec<String> = order
             .iter()

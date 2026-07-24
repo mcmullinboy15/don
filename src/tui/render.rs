@@ -25,6 +25,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row};
+use std::borrow::Cow;
 
 use super::app::{App, OverlayItem, StatusCounts, TaskStatusItem, ViewMode};
 use super::filter::{FilterFocus, FilterRow, FilterState};
@@ -320,7 +321,7 @@ fn service_table_row(item: &OverlayItem, name_colors: &HashMap<String, Color>) -
         .pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "-".to_string());
-    let state_cell = Cell::from(service_state_label(item.state))
+    let state_cell = Cell::from(service_state_label(item.state, &item.failed_dependencies))
         .style(Style::default().fg(service_state_color(item.state)));
     let name_style = name_colors
         .get(&name)
@@ -342,7 +343,7 @@ fn task_table_row(item: &TaskStatusItem, name_colors: &HashMap<String, Color>) -
         .unwrap_or_default();
     Row::new(vec![
         Cell::from(item.name.clone()).style(name_style),
-        Cell::from(task_state_label(item.state))
+        Cell::from(task_state_label(item.state, &item.failed_dependencies))
             .style(Style::default().fg(task_state_color(item.state))),
         Cell::from(format_task_last_run_time(item.last_run.as_ref()))
             .style(Style::default().fg(Color::Gray)),
@@ -768,32 +769,40 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
     spans
 }
 
-fn service_state_label(state: ServiceState) -> &'static str {
+fn service_state_label(state: ServiceState, failed_dependencies: &[String]) -> Cow<'static, str> {
     match state {
-        ServiceState::Pending => "pending",
-        ServiceState::Building => "building",
-        ServiceState::Lazy => "lazy",
-        ServiceState::Starting => "starting",
-        ServiceState::Running => "running",
-        ServiceState::Ready => "ready",
-        ServiceState::Unhealthy => "unhealthy",
-        ServiceState::Stopping => "stopping",
-        ServiceState::Stopped => "stopped",
-        ServiceState::Failed => "failed",
-        ServiceState::DependencyFailed => "dep failed",
+        ServiceState::Pending => Cow::Borrowed("pending"),
+        ServiceState::Building => Cow::Borrowed("building"),
+        ServiceState::Lazy => Cow::Borrowed("lazy"),
+        ServiceState::Starting => Cow::Borrowed("starting"),
+        ServiceState::Running => Cow::Borrowed("running"),
+        ServiceState::Ready => Cow::Borrowed("ready"),
+        ServiceState::Unhealthy => Cow::Borrowed("unhealthy"),
+        ServiceState::Stopping => Cow::Borrowed("stopping"),
+        ServiceState::Stopped => Cow::Borrowed("stopped"),
+        ServiceState::Failed => Cow::Borrowed("failed"),
+        ServiceState::DependencyFailed => dependency_failed_label(failed_dependencies),
     }
 }
 
-fn task_state_label(state: TaskItemState) -> &'static str {
+fn task_state_label(state: TaskItemState, failed_dependencies: &[String]) -> Cow<'static, str> {
     match state {
-        TaskItemState::Pending => "pending",
-        TaskItemState::Building => "building",
-        TaskItemState::Running => "running",
-        TaskItemState::Completed => "completed",
-        TaskItemState::Skipped => "skipped",
-        TaskItemState::Failed => "failed",
-        TaskItemState::DependencyFailed => "dep failed",
-        TaskItemState::PendingRun => "pending run",
+        TaskItemState::Pending => Cow::Borrowed("pending"),
+        TaskItemState::Building => Cow::Borrowed("building"),
+        TaskItemState::Running => Cow::Borrowed("running"),
+        TaskItemState::Completed => Cow::Borrowed("completed"),
+        TaskItemState::Skipped => Cow::Borrowed("skipped"),
+        TaskItemState::Failed => Cow::Borrowed("failed"),
+        TaskItemState::DependencyFailed => dependency_failed_label(failed_dependencies),
+        TaskItemState::PendingRun => Cow::Borrowed("pending run"),
+    }
+}
+
+fn dependency_failed_label(failed_dependencies: &[String]) -> Cow<'static, str> {
+    if failed_dependencies.is_empty() {
+        Cow::Borrowed("dep failed")
+    } else {
+        Cow::Owned(format!("dep failed: {}", failed_dependencies.join(", ")))
     }
 }
 
@@ -1048,6 +1057,42 @@ mod tests {
     }
 
     #[test]
+    fn dependency_failed_label_names_blocking_dependencies() {
+        struct Case {
+            name: &'static str,
+            dependencies: Vec<String>,
+            want: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "unknown dependency remains backward compatible",
+                dependencies: Vec::new(),
+                want: "dep failed",
+            },
+            Case {
+                name: "one dependency",
+                dependencies: vec!["db".to_string()],
+                want: "dep failed: db",
+            },
+            Case {
+                name: "multiple dependencies",
+                dependencies: vec!["db".to_string(), "cache".to_string()],
+                want: "dep failed: db, cache",
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                dependency_failed_label(&case.dependencies),
+                case.want,
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
     fn shutdown_bar_hides_interactive_controls() {
         let text = line_text(shutdown_bar_line(&StatusCounts::default(), 0));
         assert!(text.contains("shutting down"));
@@ -1177,6 +1222,7 @@ mod tests {
         let item = TaskStatusItem {
             name: "lint".to_string(),
             state: TaskItemState::Completed,
+            failed_dependencies: Vec::new(),
             last_run: Some(TaskRunInfo {
                 finished_at_unix_secs: 0,
                 duration_ms: Some(1_250),

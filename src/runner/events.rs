@@ -83,7 +83,6 @@ impl Runner {
                 rs.restart_attempts = 0;
             }
             self.set_service_state(&item.name, ServiceState::Ready);
-            self.unblock_dependency_failed_items();
             if let Some(message) = message {
                 self.output_manager.service_event(&item.name, &message);
             }
@@ -169,7 +168,6 @@ impl Runner {
                 };
                 self.output_manager.service_event(&item.name, &msg);
             }
-            self.unblock_dependency_failed_items();
         } else {
             if let Some(rt) = self.tasks.get_mut(&item.name) {
                 rt.set_needs_run_now(true);
@@ -230,7 +228,6 @@ impl Runner {
                 rt.last_run = last_run;
             }
             self.set_task_state(name, TaskItemState::Completed);
-            self.unblock_dependency_failed_items();
             let msg = if timing.is_empty() {
                 "complete".to_string()
             } else {

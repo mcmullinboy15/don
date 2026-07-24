@@ -218,7 +218,6 @@ impl Runner {
                 rs.restart_attempts = 0;
             }
             self.set_service_state(name, ServiceState::Ready);
-            self.unblock_dependency_failed_items();
             self.output_manager.service_event(name, "restarted");
             let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
                 name: name.to_string(),

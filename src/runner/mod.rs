@@ -532,12 +532,18 @@ pub enum ItemStatus {
     Service {
         name: String,
         state: ServiceState,
+        /// Root service/task failures blocking this item.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failed_dependencies: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         verbose: Option<VerboseInfo>,
     },
     Task {
         name: String,
         state: TaskItemState,
+        /// Root service/task failures blocking this item.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failed_dependencies: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         last_run: Option<crate::task_state::TaskRunInfo>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -672,12 +678,16 @@ pub enum RunnerEvent {
         name: String,
         state: ServiceState,
         pid: Option<i32>,
+        /// Root service/task failures when `state` is `DependencyFailed`.
+        failed_dependencies: Vec<String>,
     },
     /// A task changed state.
     TaskStateChanged {
         name: String,
         state: TaskItemState,
         last_run: Option<crate::task_state::TaskRunInfo>,
+        /// Root service/task failures when `state` is `DependencyFailed`.
+        failed_dependencies: Vec<String>,
     },
     /// A rebuild cycle completed (file watch triggered).
     RebuildComplete { name: String, success: bool },
@@ -928,16 +938,12 @@ impl Runner {
             .get_mut(name)
             .and_then(|rs| rs.set_state(new_state));
         if let Some(state) = changed {
-            let pid = self.services.get(name).and_then(|rs| rs.pgid);
-            let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
-                name: name.to_string(),
-                state,
-                pid,
-            });
+            self.broadcast_service_state(name, state);
             if self.done_tx.is_some()
                 && matches!(
                     state,
                     ServiceState::Pending
+                        | ServiceState::Lazy
                         | ServiceState::Ready
                         | ServiceState::Failed
                         | ServiceState::DependencyFailed
@@ -948,6 +954,39 @@ impl Runner {
         }
     }
 
+    /// Atomically mark a service as dependency-failed and broadcast changes
+    /// to either its lifecycle state or its root-cause detail.
+    pub(crate) fn mark_service_dependency_failed(
+        &mut self,
+        name: &str,
+        dependencies: Vec<String>,
+    ) -> bool {
+        let Some(rs) = self.services.get_mut(name) else {
+            return false;
+        };
+        let state_changed = rs.state() != ServiceState::DependencyFailed;
+        if !rs.mark_dependency_failed(dependencies) {
+            return false;
+        }
+        self.broadcast_service_state(name, ServiceState::DependencyFailed);
+        if state_changed && self.done_tx.is_some() {
+            self.schedule_start_pending();
+        }
+        state_changed
+    }
+
+    fn broadcast_service_state(&self, name: &str, state: ServiceState) {
+        let Some(rs) = self.services.get(name) else {
+            return;
+        };
+        let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
+            name: name.to_string(),
+            state,
+            pid: rs.pgid,
+            failed_dependencies: rs.failed_dependencies().to_vec(),
+        });
+    }
+
     /// Transition a task to a new state and broadcast the change.
     pub(crate) fn set_task_state(&mut self, name: &str, new_state: TaskItemState) {
         let changed = self
@@ -955,12 +994,7 @@ impl Runner {
             .get_mut(name)
             .and_then(|rt| rt.set_state(new_state));
         if let Some(state) = changed {
-            let last_run = self.tasks.get(name).and_then(|rt| rt.last_run.clone());
-            let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
-                name: name.to_string(),
-                state,
-                last_run,
-            });
+            self.broadcast_task_state(name, state);
             if self.done_tx.is_some()
                 && matches!(
                     state,
@@ -975,6 +1009,39 @@ impl Runner {
                 self.schedule_start_pending();
             }
         }
+    }
+
+    /// Atomically mark a task as dependency-failed and broadcast changes to
+    /// either its lifecycle state or its root-cause detail.
+    pub(crate) fn mark_task_dependency_failed(
+        &mut self,
+        name: &str,
+        dependencies: Vec<String>,
+    ) -> bool {
+        let Some(rt) = self.tasks.get_mut(name) else {
+            return false;
+        };
+        let state_changed = rt.state() != TaskItemState::DependencyFailed;
+        if !rt.mark_dependency_failed(dependencies) {
+            return false;
+        }
+        self.broadcast_task_state(name, TaskItemState::DependencyFailed);
+        if state_changed && self.done_tx.is_some() {
+            self.schedule_start_pending();
+        }
+        state_changed
+    }
+
+    fn broadcast_task_state(&self, name: &str, state: TaskItemState) {
+        let Some(rt) = self.tasks.get(name) else {
+            return;
+        };
+        let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
+            name: name.to_string(),
+            state,
+            last_run: rt.last_run.clone(),
+            failed_dependencies: rt.failed_dependencies().to_vec(),
+        });
     }
 
     pub fn command_sender(&self) -> mpsc::UnboundedSender<RunnerCommand> {
@@ -1605,6 +1672,7 @@ mod tests {
             ItemStatus::Service {
                 name: "s".to_string(),
                 state,
+                failed_dependencies: Vec::new(),
                 verbose: None,
             }
         }
@@ -1612,6 +1680,7 @@ mod tests {
             ItemStatus::Task {
                 name: "t".to_string(),
                 state,
+                failed_dependencies: Vec::new(),
                 last_run: None,
                 verbose: None,
             }
@@ -1666,6 +1735,29 @@ mod tests {
         ];
         for c in cases {
             assert_eq!(all_services_ready(&c.items), c.want, "case: {}", c.name);
+        }
+    }
+
+    #[test]
+    fn item_status_deserializes_without_dependency_failure_detail() {
+        let cases = vec![
+            r#"{"kind":"service","name":"api","state":"dependencyfailed","verbose":null}"#,
+            r#"{"kind":"task","name":"setup","state":"dependency_failed","last_run":null,"verbose":null}"#,
+        ];
+
+        for json in cases {
+            let status: ItemStatus = serde_json::from_str(json).unwrap();
+            let failed_dependencies = match status {
+                ItemStatus::Service {
+                    failed_dependencies,
+                    ..
+                }
+                | ItemStatus::Task {
+                    failed_dependencies,
+                    ..
+                } => failed_dependencies,
+            };
+            assert!(failed_dependencies.is_empty(), "json: {json}");
         }
     }
 
@@ -2691,7 +2783,7 @@ mod tests {
         use crate::config::types::{LogConfig, LogFilterConfig};
         use std::collections::HashMap;
 
-        let rs = RuntimeService::new(
+        let mut rs = RuntimeService::new(
             ResolvedService {
                 dir: None,
                 env: HashMap::new(),
@@ -2727,6 +2819,43 @@ mod tests {
         assert!(rs.bazel_binary_path.is_none());
         assert!(!rs.batch_built);
         assert!(rs.resolved.kind.is_none());
+
+        struct Case {
+            name: &'static str,
+            dependencies: Vec<String>,
+            want_changed: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "enter dependency failure",
+                dependencies: vec!["db".to_string()],
+                want_changed: true,
+            },
+            Case {
+                name: "refresh root cause without a state change",
+                dependencies: vec!["cache".to_string()],
+                want_changed: true,
+            },
+            Case {
+                name: "identical failure is a no-op",
+                dependencies: vec!["cache".to_string()],
+                want_changed: false,
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                rs.mark_dependency_failed(case.dependencies),
+                case.want_changed,
+                "case: {}",
+                case.name
+            );
+        }
+        assert_eq!(rs.failed_dependencies(), ["cache"]);
+        assert_eq!(
+            rs.set_state(ServiceState::Pending),
+            Some(ServiceState::Pending)
+        );
+        assert!(rs.failed_dependencies().is_empty());
     }
 
     #[test]
@@ -2734,7 +2863,7 @@ mod tests {
         use crate::config::types::LogConfig;
         use std::collections::HashMap;
 
-        let rt = RuntimeTask::new(
+        let mut rt = RuntimeTask::new(
             crate::config::task::Task {
                 cmd: "echo".to_string(),
                 args: vec!["hello".to_string()],
@@ -2767,6 +2896,14 @@ mod tests {
         assert!(rt.attach_waiter.is_none());
         assert!(rt.resolved_watch_paths.is_empty());
         assert_eq!(rt.config.cmd, "echo");
+
+        assert!(rt.mark_dependency_failed(vec!["setup".to_string()]));
+        assert_eq!(rt.failed_dependencies(), ["setup"]);
+        assert_eq!(
+            rt.set_state(TaskItemState::Pending),
+            Some(TaskItemState::Pending)
+        );
+        assert!(rt.failed_dependencies().is_empty());
     }
 
     #[test]

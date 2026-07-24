@@ -574,14 +574,18 @@ fn enter_shutdown_mode(
 /// Apply one [`RunnerEvent`] to the cached state on [`App`].
 fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
     match event {
-        RunnerEvent::ServiceStateChanged { name, state, pid } => {
-            app.apply_service_runtime(name, state, pid)
-        }
+        RunnerEvent::ServiceStateChanged {
+            name,
+            state,
+            pid,
+            failed_dependencies,
+        } => app.apply_service_runtime(name, state, pid, failed_dependencies),
         RunnerEvent::TaskStateChanged {
             name,
             state,
             last_run,
-        } => app.apply_task_state(name, state, last_run),
+            failed_dependencies,
+        } => app.apply_task_state(name, state, last_run, failed_dependencies),
         RunnerEvent::UpdateCheckComplete {
             current_version,
             latest_version,
@@ -1639,7 +1643,7 @@ mod tests {
             cli_log_filter: None,
             verbose_enabled: false,
         });
-        app.apply_service_runtime("api".to_string(), state, None);
+        app.apply_service_runtime("api".to_string(), state, None, Vec::new());
         app
     }
 
@@ -1672,6 +1676,55 @@ mod tests {
                 }
                 _ => panic!("{}: expected stop command", case.name),
             }
+        }
+    }
+
+    #[test]
+    fn dependency_failure_events_refresh_tui_detail() {
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+            dependencies: Vec<String>,
+            want: Vec<String>,
+        }
+        let cases = vec![
+            Case {
+                name: "initial root cause",
+                state: ServiceState::DependencyFailed,
+                dependencies: vec!["db".to_string()],
+                want: vec!["db".to_string()],
+            },
+            Case {
+                name: "changed root cause without state change",
+                state: ServiceState::DependencyFailed,
+                dependencies: vec!["cache".to_string()],
+                want: vec!["cache".to_string()],
+            },
+            Case {
+                name: "recovery clears detail",
+                state: ServiceState::Pending,
+                dependencies: Vec::new(),
+                want: Vec::new(),
+            },
+        ];
+
+        let mut app = app_with_service_state(ServiceState::Pending);
+        for case in cases {
+            apply_runner_event(
+                RunnerEvent::ServiceStateChanged {
+                    name: "api".to_string(),
+                    state: case.state,
+                    pid: None,
+                    failed_dependencies: case.dependencies,
+                },
+                &mut app,
+            );
+            let item = app
+                .service_items()
+                .into_iter()
+                .find(|item| item.name() == "api")
+                .unwrap();
+            assert_eq!(item.failed_dependencies, case.want, "case: {}", case.name);
         }
     }
 

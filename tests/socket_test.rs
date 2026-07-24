@@ -921,7 +921,7 @@ fn integration_lazy_dependency_failure_blocks_start() {
         assert!(
             wait_for_output(
                 &buf,
-                "api: skipped (dependency failed)",
+                "api: skipped (dependency 'setup' failed)",
                 Duration::from_secs(8)
             )
             .await,
@@ -1014,7 +1014,7 @@ fn integration_lazy_dep_rerun_failure_after_startup_blocks_start() {
         assert!(
             wait_for_output(
                 &buf,
-                "api: skipped (dependency failed)",
+                "api: skipped (dependency 'setup' failed)",
                 Duration::from_secs(8)
             )
             .await,
@@ -1205,7 +1205,7 @@ fn integration_lazy_service_dep_failure_after_startup_blocks_start() {
         assert!(
             wait_for_output(
                 &buf,
-                "api: skipped (dependency failed)",
+                "api: skipped (dependency 'dep' failed)",
                 Duration::from_secs(8)
             )
             .await,
