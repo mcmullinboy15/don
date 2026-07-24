@@ -187,6 +187,7 @@ impl Runner {
             statuses.push(ItemStatus::Service {
                 name: name.clone(),
                 state: rs.state(),
+                failed_dependencies: rs.failed_dependencies().to_vec(),
                 verbose: verbose_info,
             });
         }
@@ -265,6 +266,7 @@ impl Runner {
             statuses.push(ItemStatus::Task {
                 name: name.clone(),
                 state: rt.state(),
+                failed_dependencies: rt.failed_dependencies().to_vec(),
                 last_run: rt.last_run.clone(),
                 verbose: verbose_info,
             });

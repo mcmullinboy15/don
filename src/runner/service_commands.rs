@@ -791,7 +791,6 @@ impl Runner {
                 rs.restart_attempts = 0;
             }
             self.set_service_state(name, ServiceState::Ready);
-            self.unblock_dependency_failed_items();
             return;
         }
         let is_lazy = self

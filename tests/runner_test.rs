@@ -1048,7 +1048,7 @@ fn integration_ready_check_exhausted() {
             "badsvc should show retry exhaustion: {output}"
         );
         assert!(
-            output.contains("dependent") && output.contains("dependency failed"),
+            output.contains("dependent") && output.contains("dependency 'badsvc' failed"),
             "dependent should be skipped: {output}"
         );
     });
@@ -1455,6 +1455,10 @@ while True: time.sleep(60)\n\
             .depends_on(&["db"])
             .log("ignore")
             .done()
+            .add_custom_service("web", "sleep", &["300"])
+            .depends_on(&["api"])
+            .log("ignore")
+            .done()
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
@@ -1465,7 +1469,35 @@ while True: time.sleep(60)\n\
 
         wait_for_substr(
             &buf,
-            "api: skipped (dependency failed)",
+            "api: skipped (dependency 'db' failed)",
+            Duration::from_secs(8),
+        )
+        .await;
+
+        let (status_tx, status_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Status {
+                verbose: false,
+                name: Some("api".to_string()),
+                reply: status_tx,
+            })
+            .unwrap();
+        let statuses = status_rx.await.unwrap();
+        assert!(
+            statuses.iter().any(|item| matches!(
+                item,
+                ItemStatus::Service {
+                    state: ServiceState::DependencyFailed,
+                    failed_dependencies,
+                    ..
+                } if failed_dependencies == &["db".to_string()]
+            )),
+            "api status should name db as its failed dependency: {statuses:?}"
+        );
+
+        wait_for_substr(
+            &buf,
+            "web: skipped (dependency 'db' failed)",
             Duration::from_secs(8),
         )
         .await;
@@ -1487,6 +1519,137 @@ while True: time.sleep(60)\n\
 
         wait_for_substr(&buf, "api: starting", Duration::from_secs(15)).await;
         wait_for_substr(&buf, "api: started", Duration::from_secs(15)).await;
+        wait_for_substr(&buf, "web: started", Duration::from_secs(15)).await;
+
+        let (status_tx, status_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Status {
+                verbose: false,
+                name: Some("api".to_string()),
+                reply: status_tx,
+            })
+            .unwrap();
+        let statuses = status_rx.await.unwrap();
+        assert!(
+            statuses.iter().any(|item| matches!(
+                item,
+                ItemStatus::Service {
+                    state: ServiceState::Ready,
+                    failed_dependencies,
+                    ..
+                } if failed_dependencies.is_empty()
+            )),
+            "api should clear its failed dependency after recovery: {statuses:?}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("dep-failed-refresh");
+        let db_gate = dir.path().join("db-ready");
+        let cache_gate = dir.path().join("cache-ready");
+        let cache_runs = dir.path().join("cache-runs");
+
+        let db_cmd = format!(
+            "if [ ! -f {gate} ]; then echo DB_FAIL; exit 1; fi; \
+             echo DB_RECOVERING; sleep 2; echo DB_OK",
+            gate = db_gate.display()
+        );
+        let cache_cmd = format!(
+            "N=$(cat {runs} 2>/dev/null || echo 0); N=$((N + 1)); echo $N > {runs}; \
+             if [ $N -gt 1 ] && [ ! -f {gate} ]; then echo CACHE_FAIL; exit 1; fi; \
+             echo CACHE_OK",
+            runs = cache_runs.display(),
+            gate = cache_gate.display()
+        );
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["300"])
+            .log("ignore")
+            .done()
+            .add_task("db", "bash", &["-c", &db_cmd])
+            .auto_run_mode("always")
+            .done()
+            .add_task("cache", "bash", &["-c", &cache_cmd])
+            .auto_run_mode("always")
+            .done()
+            .add_custom_service("api", "sleep", &["300"])
+            .depends_on(&["db", "cache"])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(
+            &buf,
+            "api: skipped (dependency 'db' failed)",
+            Duration::from_secs(8),
+        )
+        .await;
+
+        std::fs::write(&db_gate, "ok").unwrap();
+        cmd_tx
+            .send(RunnerCommand::TaskRerun {
+                name: "db".to_string(),
+            })
+            .unwrap();
+        wait_for_substr(&buf, "DB_RECOVERING", Duration::from_secs(5)).await;
+
+        cmd_tx
+            .send(RunnerCommand::TaskRerun {
+                name: "cache".to_string(),
+            })
+            .unwrap();
+        wait_for_substr(&buf, "CACHE_FAIL", Duration::from_secs(5)).await;
+
+        let mut refreshed = false;
+        for _ in 0..50 {
+            let (status_tx, status_rx) = oneshot::channel();
+            cmd_tx
+                .send(RunnerCommand::Status {
+                    verbose: false,
+                    name: Some("api".to_string()),
+                    reply: status_tx,
+                })
+                .unwrap();
+            let statuses = status_rx.await.unwrap();
+            refreshed = statuses.iter().any(|item| {
+                matches!(
+                    item,
+                    ItemStatus::Service {
+                        state: ServiceState::DependencyFailed,
+                        failed_dependencies,
+                        ..
+                    } if failed_dependencies == &["cache".to_string()]
+                )
+            });
+            if refreshed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            refreshed,
+            "api should replace recovered db with newly failed cache: {}",
+            read_buf(&buf)
+        );
+
+        std::fs::write(&cache_gate, "ok").unwrap();
+        cmd_tx
+            .send(RunnerCommand::TaskRerun {
+                name: "cache".to_string(),
+            })
+            .unwrap();
+        wait_for_substr(&buf, "api: started", Duration::from_secs(10)).await;
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

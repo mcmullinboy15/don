@@ -30,6 +30,9 @@ pub(crate) struct RuntimeService {
     /// Lifecycle state. Private so every mutation routes through
     /// [`set_state`](Self::set_state) and gets broadcast.
     state: ServiceState,
+    /// Direct dependencies that caused the current `DependencyFailed` state.
+    /// Cleared on every transition out of that state.
+    failed_dependencies: Vec<String>,
     /// The fully resolved service config (platform overrides applied once).
     pub resolved: crate::config::service::ResolvedService,
     /// Handle to the running process (if spawned).
@@ -115,6 +118,7 @@ impl RuntimeService {
     ) -> Self {
         Self {
             state: initial_state,
+            failed_dependencies: Vec::new(),
             resolved,
             handle: None,
             pgid: None,
@@ -170,6 +174,21 @@ impl RuntimeService {
         self.state
     }
 
+    pub(crate) fn failed_dependencies(&self) -> &[String] {
+        &self.failed_dependencies
+    }
+
+    /// Atomically enter `DependencyFailed` with the supplied root causes.
+    pub(crate) fn mark_dependency_failed(&mut self, dependencies: Vec<String>) -> bool {
+        if self.state == ServiceState::DependencyFailed && self.failed_dependencies == dependencies
+        {
+            return false;
+        }
+        self.state = ServiceState::DependencyFailed;
+        self.failed_dependencies = dependencies;
+        true
+    }
+
     /// Transition to `new_state`. Returns `Some(new_state)` when the state
     /// actually changed — the caller **must** broadcast a
     /// `RunnerEvent::ServiceStateChanged` for that value. Returns `None`
@@ -180,6 +199,9 @@ impl RuntimeService {
             return None;
         }
         self.state = new_state;
+        if new_state != ServiceState::DependencyFailed {
+            self.failed_dependencies.clear();
+        }
         Some(new_state)
     }
 }
@@ -191,6 +213,9 @@ pub(crate) struct RuntimeTask {
     /// Lifecycle state. Private so every mutation routes through
     /// [`set_state`](Self::set_state) and gets broadcast.
     state: TaskItemState,
+    /// Direct dependencies that caused the current `DependencyFailed` state.
+    /// Cleared on every transition out of that state.
+    failed_dependencies: Vec<String>,
     /// The task config (stored once, no repeated lookups).
     pub config: crate::config::task::Task,
     /// Params used for the most recent spawned run. Empty for param-less
@@ -237,6 +262,7 @@ impl RuntimeTask {
     ) -> Self {
         Self {
             state: initial_state,
+            failed_dependencies: Vec::new(),
             config,
             last_params: HashMap::new(),
             pgid: None,
@@ -259,6 +285,21 @@ impl RuntimeTask {
         self.state
     }
 
+    pub(crate) fn failed_dependencies(&self) -> &[String] {
+        &self.failed_dependencies
+    }
+
+    /// Atomically enter `DependencyFailed` with the supplied root causes.
+    pub(crate) fn mark_dependency_failed(&mut self, dependencies: Vec<String>) -> bool {
+        if self.state == TaskItemState::DependencyFailed && self.failed_dependencies == dependencies
+        {
+            return false;
+        }
+        self.state = TaskItemState::DependencyFailed;
+        self.failed_dependencies = dependencies;
+        true
+    }
+
     /// Transition to `new_state`. Returns `Some(new_state)` when the state
     /// actually changed — the caller **must** broadcast a
     /// `RunnerEvent::TaskStateChanged` for that value.
@@ -268,6 +309,9 @@ impl RuntimeTask {
             return None;
         }
         self.state = new_state;
+        if new_state != TaskItemState::DependencyFailed {
+            self.failed_dependencies.clear();
+        }
         Some(new_state)
     }
 

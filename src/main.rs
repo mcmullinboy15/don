@@ -9,6 +9,7 @@ use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForeground
 use don::TaskRunInfo;
 use don::client::{Client, ClientError, RunTaskOptions};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -904,10 +905,8 @@ fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: boo
     let state_w = "STATE".len().max(
         items
             .iter()
-            .map(|i| match i {
-                ItemStatus::Service { state, .. } => service_state_label(*state).len(),
-                ItemStatus::Task { state, .. } => task_state_label(*state).len(),
-            })
+            .map(item_state_label)
+            .map(|label| label.len())
             .max()
             .unwrap_or(0),
     );
@@ -921,11 +920,12 @@ fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: boo
             ItemStatus::Service {
                 name,
                 state,
+                failed_dependencies,
                 verbose,
             } => (
                 "service",
                 name.as_str(),
-                service_state_label(*state),
+                state_label(service_state_label(*state), failed_dependencies),
                 service_state_color(*state),
                 "-".to_string(),
                 "-".to_string(),
@@ -935,12 +935,13 @@ fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: boo
             ItemStatus::Task {
                 name,
                 state,
+                failed_dependencies,
                 last_run,
                 verbose,
             } => (
                 "task",
                 name.as_str(),
-                task_state_label(*state),
+                state_label(task_state_label(*state), failed_dependencies),
                 task_state_color(*state),
                 format_last_run_time(last_run.as_ref()),
                 format_last_run_result(last_run.as_ref()),
@@ -1125,6 +1126,29 @@ fn task_state_color(s: TaskItemState) -> Color {
         TaskItemState::PendingRun => Color::Cyan,
         TaskItemState::Failed => Color::Red,
         TaskItemState::DependencyFailed => Color::DarkRed,
+    }
+}
+
+fn item_state_label(item: &ItemStatus) -> Cow<'static, str> {
+    match item {
+        ItemStatus::Service {
+            state,
+            failed_dependencies,
+            ..
+        } => state_label(service_state_label(*state), failed_dependencies),
+        ItemStatus::Task {
+            state,
+            failed_dependencies,
+            ..
+        } => state_label(task_state_label(*state), failed_dependencies),
+    }
+}
+
+fn state_label(base: &'static str, failed_dependencies: &[String]) -> Cow<'static, str> {
+    if failed_dependencies.is_empty() {
+        Cow::Borrowed(base)
+    } else {
+        Cow::Owned(format!("{base}: {}", failed_dependencies.join(", ")))
     }
 }
 
@@ -1895,6 +1919,7 @@ mod tests {
         ItemStatus::Service {
             name: name.to_string(),
             state,
+            failed_dependencies: Vec::new(),
             verbose: None,
         }
     }
@@ -1903,6 +1928,7 @@ mod tests {
         ItemStatus::Task {
             name: name.to_string(),
             state,
+            failed_dependencies: Vec::new(),
             last_run: None,
             verbose: None,
         }

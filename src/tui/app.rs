@@ -51,6 +51,7 @@ pub(crate) struct OverlayItem {
     pub(crate) name: String,
     pub(crate) state: ServiceState,
     pub(crate) pid: Option<i32>,
+    pub(crate) failed_dependencies: Vec<String>,
 }
 
 /// A row in the tasks status table.
@@ -58,6 +59,7 @@ pub(crate) struct OverlayItem {
 pub(crate) struct TaskStatusItem {
     pub(crate) name: String,
     pub(crate) state: TaskItemState,
+    pub(crate) failed_dependencies: Vec<String>,
     pub(crate) last_run: Option<TaskRunInfo>,
     pub(crate) has_params: bool,
 }
@@ -209,6 +211,7 @@ pub(crate) struct App {
     pub(crate) services_state: HashMap<String, ServiceState>,
     pub(crate) service_pids: HashMap<String, Option<i32>>,
     pub(crate) tasks_state: HashMap<String, TaskItemState>,
+    failed_dependencies: HashMap<String, Vec<String>>,
     pub(crate) tasks_last_run: HashMap<String, TaskRunInfo>,
     pub(crate) update_badge: Option<UpdateBadge>,
     pub(crate) services_table: StatusTableState,
@@ -293,6 +296,7 @@ impl App {
             services_state,
             service_pids,
             tasks_state,
+            failed_dependencies: HashMap::new(),
             tasks_last_run: task_last_runs,
             update_badge: None,
             services_table: StatusTableState::default(),
@@ -353,6 +357,11 @@ impl App {
                 name: name.clone(),
                 state: *state,
                 pid: self.service_pids.get(name).copied().flatten(),
+                failed_dependencies: self
+                    .failed_dependencies
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default(),
             })
             .collect();
         retain_fuzzy_matches(&self.services_table.query, &mut items, OverlayItem::name);
@@ -371,6 +380,11 @@ impl App {
             .map(|(name, state)| TaskStatusItem {
                 name: name.clone(),
                 state: *state,
+                failed_dependencies: self
+                    .failed_dependencies
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default(),
                 last_run: self.tasks_last_run.get(name).cloned(),
                 has_params: self
                     .task_configs
@@ -394,12 +408,14 @@ impl App {
         name: String,
         state: ServiceState,
         pid: Option<i32>,
+        failed_dependencies: Vec<String>,
     ) -> bool {
         let filter_changed = state == ServiceState::Failed
             && self.auto_filter_on_failure_names.contains(&name)
             && self.filter.select_name(&name);
         self.services_state.insert(name.clone(), state);
-        self.service_pids.insert(name, pid);
+        self.service_pids.insert(name.clone(), pid);
+        self.apply_failed_dependencies(name, failed_dependencies);
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
         filter_changed
     }
@@ -409,16 +425,26 @@ impl App {
         name: String,
         state: TaskItemState,
         last_run: Option<TaskRunInfo>,
+        failed_dependencies: Vec<String>,
     ) -> bool {
         let filter_changed = state == TaskItemState::Failed
             && self.auto_filter_on_failure_names.contains(&name)
             && self.filter.select_name(&name);
         self.tasks_state.insert(name.clone(), state);
+        self.apply_failed_dependencies(name.clone(), failed_dependencies);
         if let Some(last_run) = last_run {
             self.tasks_last_run.insert(name, last_run);
         }
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
         filter_changed
+    }
+
+    fn apply_failed_dependencies(&mut self, name: String, dependencies: Vec<String>) {
+        if dependencies.is_empty() {
+            self.failed_dependencies.remove(&name);
+        } else {
+            self.failed_dependencies.insert(name, dependencies);
+        }
     }
 
     pub(crate) fn open_log_popup(&mut self, name: String, mut lines: Vec<Vec<u8>>) {
@@ -565,6 +591,14 @@ mod tests {
         })
     }
 
+    fn apply_service(app: &mut App, name: &str, state: ServiceState, pid: Option<i32>) -> bool {
+        app.apply_service_runtime(name.to_string(), state, pid, Vec::new())
+    }
+
+    fn apply_task(app: &mut App, name: &str, state: TaskItemState) -> bool {
+        app.apply_task_state(name.to_string(), state, None, Vec::new())
+    }
+
     #[test]
     fn from_state_counts_ready_failed_and_pending_run() {
         struct Case {
@@ -700,14 +734,14 @@ mod tests {
     fn apply_state_refreshes_counts() {
         let mut app = app_with_names(vec!["api".into(), "db".into()], vec![]);
         assert_eq!(app.counts.services_ready, 0);
-        app.apply_service_runtime("api".into(), ServiceState::Ready, None);
+        apply_service(&mut app, "api", ServiceState::Ready, None);
         assert_eq!(app.counts.services_ready, 1);
-        app.apply_service_runtime("db".into(), ServiceState::Ready, None);
+        apply_service(&mut app, "db", ServiceState::Ready, None);
         assert_eq!(app.counts.services_ready, 2);
-        app.apply_service_runtime("db".into(), ServiceState::Stopping, None);
+        apply_service(&mut app, "db", ServiceState::Stopping, None);
         assert_eq!(app.counts.services_ready, 1);
         assert_eq!(app.counts.services_active, 1);
-        app.apply_service_runtime("api".into(), ServiceState::Failed, None);
+        apply_service(&mut app, "api", ServiceState::Failed, None);
         assert_eq!(app.counts.services_ready, 0);
         assert_eq!(app.counts.services_failed, 1);
     }
@@ -725,7 +759,7 @@ mod tests {
         app.filter.commit();
 
         assert!(!app.should_render_log("db", false));
-        let changed = app.apply_service_runtime("db".into(), ServiceState::Failed, None);
+        let changed = apply_service(&mut app, "db", ServiceState::Failed, None);
 
         assert!(changed);
         assert!(app.should_render_log("db", false));
@@ -743,7 +777,7 @@ mod tests {
         app.filter.toggle_highlighted(); // clear all
         app.filter.commit();
 
-        let changed = app.apply_service_runtime("api".into(), ServiceState::DependencyFailed, None);
+        let changed = apply_service(&mut app, "api", ServiceState::DependencyFailed, None);
 
         assert!(!changed);
         assert!(!app.should_render_log("api", false));
@@ -760,7 +794,7 @@ mod tests {
         app.filter.toggle_highlighted(); // clear all
         app.filter.commit();
 
-        let changed = app.apply_task_state("lint".into(), TaskItemState::Failed, None);
+        let changed = apply_task(&mut app, "lint", TaskItemState::Failed);
 
         assert!(changed);
         assert!(app.should_render_log("lint", false));
@@ -919,10 +953,10 @@ mod tests {
                 .collect();
             let mut app = app_with_names(service_names, task_names);
             for (name, state) in case.services {
-                app.apply_service_runtime(name.to_string(), state, None);
+                apply_service(&mut app, name, state, None);
             }
             for (name, state) in case.tasks {
-                app.apply_task_state(name.to_string(), state, None);
+                apply_task(&mut app, name, state);
             }
 
             let items = app.service_items();
@@ -935,7 +969,7 @@ mod tests {
     fn service_items_include_service_pid() {
         let mut app = app_with_names(vec!["api".into()], vec![]);
 
-        app.apply_service_runtime("api".into(), ServiceState::Running, Some(12_345));
+        apply_service(&mut app, "api", ServiceState::Running, Some(12_345));
 
         let items = app.service_items();
         assert_eq!(items.len(), 1);
@@ -995,10 +1029,10 @@ mod tests {
                 "running".into(),
             ],
         );
-        app.apply_task_state("completed".into(), TaskItemState::Completed, None);
-        app.apply_task_state("failed".into(), TaskItemState::Failed, None);
-        app.apply_task_state("pending-run".into(), TaskItemState::PendingRun, None);
-        app.apply_task_state("running".into(), TaskItemState::Running, None);
+        apply_task(&mut app, "completed", TaskItemState::Completed);
+        apply_task(&mut app, "failed", TaskItemState::Failed);
+        apply_task(&mut app, "pending-run", TaskItemState::PendingRun);
+        apply_task(&mut app, "running", TaskItemState::Running);
         app.tasks_last_run.insert(
             "completed".into(),
             TaskRunInfo {

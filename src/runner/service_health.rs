@@ -334,7 +334,6 @@ impl Runner {
             );
         } else {
             self.set_service_state(name, ServiceState::Lazy);
-            self.unblock_dependency_failed_items();
             if let Some(rs) = self.services.get_mut(name)
                 && let Some(ref mut proxy) = rs.proxy
             {
