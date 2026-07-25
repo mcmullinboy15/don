@@ -91,6 +91,68 @@ impl DockerPortBinding {
     }
 }
 
+/// Standard `DON_PUBLIC_*` variables for a service's Docker mappings. Generic
+/// names refer to the first mapping; every mapping also gets an indexed name.
+///
+/// Free function so it can be unit-tested without a live Docker client.
+fn public_env_vars(bindings: &[DockerPortBinding]) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        let addr = binding.connect_addr().to_string();
+        let port = binding.host_port.to_string();
+        vars.insert(format!("DON_PUBLIC_ADDR_{index}"), addr.clone());
+        vars.insert(format!("DON_PUBLIC_PORT_{index}"), port.clone());
+        if index == 0 {
+            vars.insert("DON_PUBLIC_ADDR".to_string(), addr);
+            vars.insert("DON_PUBLIC_PORT".to_string(), port);
+        }
+    }
+    vars
+}
+
+/// Runtime-reference values for dependent service env fields. Alongside generic
+/// and indexed aliases, a container-port-qualified alias is included only when
+/// that container port is unambiguous.
+///
+/// Free function so it can be unit-tested without a live Docker client.
+fn env_reference_values(bindings: &[DockerPortBinding]) -> HashMap<String, String> {
+    let mut refs = HashMap::new();
+    let mut container_port_counts: HashMap<u16, usize> = HashMap::new();
+    for binding in bindings {
+        let count = container_port_counts
+            .entry(binding.container_port)
+            .or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    for (index, binding) in bindings.iter().enumerate() {
+        let addr = binding.connect_addr().to_string();
+        let port = binding.host_port.to_string();
+        refs.insert(format!("addr_{index}"), addr.clone());
+        refs.insert(format!("ADDR_{index}"), addr.clone());
+        refs.insert(format!("port_{index}"), port.clone());
+        refs.insert(format!("PORT_{index}"), port.clone());
+        if index == 0 {
+            refs.insert("addr".to_string(), addr.clone());
+            refs.insert("ADDR".to_string(), addr.clone());
+            refs.insert("port".to_string(), port.clone());
+            refs.insert("PORT".to_string(), port.clone());
+        }
+    }
+
+    for binding in bindings {
+        if container_port_counts.get(&binding.container_port) == Some(&1) {
+            let addr_key = format!("ADDR_{}", binding.container_port);
+            let port_key = format!("PORT_{}", binding.container_port);
+            refs.entry(addr_key)
+                .or_insert_with(|| binding.connect_addr().to_string());
+            refs.entry(port_key)
+                .or_insert_with(|| binding.host_port.to_string());
+        }
+    }
+    refs
+}
+
 /// Handle to a running Docker container.
 ///
 /// Provides stop/remove operations analogous to [`crate::process::ProcessHandle`].
@@ -122,18 +184,7 @@ impl DockerHandle {
     /// Generic names refer to the first configured mapping; every mapping also
     /// receives a stable zero-based indexed name.
     pub(crate) fn public_env_vars(&self) -> HashMap<String, String> {
-        let mut vars = HashMap::new();
-        for (index, binding) in self.port_bindings.iter().enumerate() {
-            let addr = binding.connect_addr().to_string();
-            let port = binding.host_port.to_string();
-            vars.insert(format!("DON_PUBLIC_ADDR_{index}"), addr.clone());
-            vars.insert(format!("DON_PUBLIC_PORT_{index}"), port.clone());
-            if index == 0 {
-                vars.insert("DON_PUBLIC_ADDR".to_string(), addr);
-                vars.insert("DON_PUBLIC_PORT".to_string(), port);
-            }
-        }
-        vars
+        public_env_vars(&self.port_bindings)
     }
 
     /// Runtime-reference values used by dependent service environment fields.
@@ -141,41 +192,7 @@ impl DockerHandle {
     /// Alongside generic and indexed aliases, a container-port-qualified alias
     /// is included only when that container port is unambiguous.
     pub(crate) fn env_reference_values(&self) -> HashMap<String, String> {
-        let mut refs = HashMap::new();
-        let mut container_port_counts: HashMap<u16, usize> = HashMap::new();
-        for binding in &self.port_bindings {
-            let count = container_port_counts
-                .entry(binding.container_port)
-                .or_insert(0);
-            *count = count.saturating_add(1);
-        }
-
-        for (index, binding) in self.port_bindings.iter().enumerate() {
-            let addr = binding.connect_addr().to_string();
-            let port = binding.host_port.to_string();
-            refs.insert(format!("addr_{index}"), addr.clone());
-            refs.insert(format!("ADDR_{index}"), addr.clone());
-            refs.insert(format!("port_{index}"), port.clone());
-            refs.insert(format!("PORT_{index}"), port.clone());
-            if index == 0 {
-                refs.insert("addr".to_string(), addr.clone());
-                refs.insert("ADDR".to_string(), addr.clone());
-                refs.insert("port".to_string(), port.clone());
-                refs.insert("PORT".to_string(), port.clone());
-            }
-        }
-
-        for binding in &self.port_bindings {
-            if container_port_counts.get(&binding.container_port) == Some(&1) {
-                let addr_key = format!("ADDR_{}", binding.container_port);
-                let port_key = format!("PORT_{}", binding.container_port);
-                refs.entry(addr_key)
-                    .or_insert_with(|| binding.connect_addr().to_string());
-                refs.entry(port_key)
-                    .or_insert_with(|| binding.host_port.to_string());
-            }
-        }
-        refs
+        env_reference_values(&self.port_bindings)
     }
 
     /// Stop the container with the given signal and timeout, then remove it.
@@ -643,17 +660,14 @@ mod tests {
 
     #[test]
     fn test_handle_discovery_values() {
-        let handle = DockerHandle {
-            client: Docker::connect_with_socket_defaults().unwrap(),
-            container_id: "test-id".to_string(),
-            container_name: "test-name".to_string(),
-            port_bindings: vec![
-                binding("0:5432", 0, "0.0.0.0", 49152, 5432, "tcp"),
-                binding("127.0.0.1:8443:443", 8443, "127.0.0.1", 8443, 443, "tcp"),
-            ],
-        };
+        // Operate on the free functions directly so this needs no live Docker
+        // client (the daemon is absent on some CI runners, e.g. macOS).
+        let bindings = vec![
+            binding("0:5432", 0, "0.0.0.0", 49152, 5432, "tcp"),
+            binding("127.0.0.1:8443:443", 8443, "127.0.0.1", 8443, 443, "tcp"),
+        ];
 
-        let public = handle.public_env_vars();
+        let public = public_env_vars(&bindings);
         assert_eq!(
             public.get("DON_PUBLIC_ADDR").map(String::as_str),
             Some("127.0.0.1:49152")
@@ -663,7 +677,7 @@ mod tests {
             Some("8443")
         );
 
-        let refs = handle.env_reference_values();
+        let refs = env_reference_values(&bindings);
         assert_eq!(refs.get("port").map(String::as_str), Some("49152"));
         assert_eq!(
             refs.get("addr_1").map(String::as_str),
@@ -678,17 +692,12 @@ mod tests {
 
     #[test]
     fn test_container_port_aliases_require_unambiguous_port() {
-        let handle = DockerHandle {
-            client: Docker::connect_with_socket_defaults().unwrap(),
-            container_id: "test-id".to_string(),
-            container_name: "test-name".to_string(),
-            port_bindings: vec![
-                binding("8053:53/tcp", 8053, "127.0.0.1", 8053, 53, "tcp"),
-                binding("8053:53/udp", 8053, "127.0.0.1", 8053, 53, "udp"),
-            ],
-        };
+        let bindings = vec![
+            binding("8053:53/tcp", 8053, "127.0.0.1", 8053, 53, "tcp"),
+            binding("8053:53/udp", 8053, "127.0.0.1", 8053, 53, "udp"),
+        ];
 
-        let refs = handle.env_reference_values();
+        let refs = env_reference_values(&bindings);
         assert!(!refs.contains_key("PORT_53"));
         assert!(!refs.contains_key("ADDR_53"));
         assert_eq!(refs.get("PORT_0").map(String::as_str), Some("8053"));
