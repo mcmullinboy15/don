@@ -1,8 +1,17 @@
 name: CI
 
+# Run once per change. `pull_request` covers branches with an open PR; scoping
+# `push` to main avoids a duplicate run on every PR-branch push while still
+# testing direct pushes/merges to the default branch.
 on:
   pull_request:
   push:
+    branches: [main]
+
+# Cancel superseded runs when new commits land on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-test-lint:
