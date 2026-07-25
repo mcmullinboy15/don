@@ -185,6 +185,8 @@ fn cleanup_cli_no_stale_state() {
             .build();
         let config_path = dir.path().join("don.toml");
         std::fs::write(&config_path, &toml).unwrap();
+        don::ports::write_manifest(dir.path(), don::ports::PortManifest::default()).unwrap();
+        let ports_path = don::ports::manifest_path(dir.path());
 
         let output = tokio::task::spawn_blocking(move || {
             std::process::Command::new(env!("CARGO_BIN_EXE_don"))
@@ -202,6 +204,7 @@ fn cleanup_cli_no_stale_state() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("no stale state"), "stdout: {stdout}");
+        assert!(!ports_path.exists(), "cleanup should remove ports.json");
     });
 }
 

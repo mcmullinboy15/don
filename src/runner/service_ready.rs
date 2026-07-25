@@ -19,12 +19,42 @@ impl Runner {
         resolved: &crate::config::ResolvedService,
         done_tx: Option<mpsc::Sender<ItemDone>>,
     ) {
+        let docker_port_bindings = match &start_result.handle {
+            ServiceHandle::Docker(handle) => handle.port_bindings().to_vec(),
+            ServiceHandle::Process(_) => Vec::new(),
+        };
+        for binding in docker_port_bindings
+            .iter()
+            .filter(|binding| binding.used_fallback())
+        {
+            if binding.configured_host_port == 0 {
+                self.output_manager.service_event(
+                    name,
+                    &format!(
+                        "allocated Docker port {} at {}",
+                        binding.configured,
+                        binding.connect_addr()
+                    ),
+                );
+            } else {
+                self.output_manager.service_event(
+                    name,
+                    &format!(
+                        "Docker port {} is unavailable; using {}",
+                        binding.configured,
+                        binding.connect_addr()
+                    ),
+                );
+            }
+        }
+
         let mut spawned_pgid: Option<i32> = None;
         if let Some(rs) = self.services.get_mut(name) {
             if let ServiceHandle::Process(ref proc) = start_result.handle {
                 spawned_pgid = Some(proc.pgid());
             }
             rs.pgid = spawned_pgid;
+            rs.docker_port_bindings = docker_port_bindings;
             rs.handle = Some(start_result.handle);
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop
@@ -45,6 +75,7 @@ impl Runner {
         }
         self.fulfill_pending_waiter(name).await;
         self.set_service_state(name, ServiceState::Running);
+        self.refresh_runtime_port_manifest();
 
         // Wire up output processing. We need to fan the EOF (= process died)
         // out to two independent waiters: the ready check (cancels its
@@ -87,17 +118,9 @@ impl Runner {
         }
 
         let name_owned = name.to_string();
-        // Expand ${VAR} in ready check fields (tcp, http) so proxy-injected
-        // vars like CRDB_PORT resolve to the actual ephemeral port.
-        let ready_config = resolved.ready.clone().map(|mut r| {
-            if let Some(ref tcp) = r.tcp {
-                r.tcp = Some(service::expand_env_vars(tcp, &resolved.env));
-            }
-            if let Some(ref http) = r.http {
-                r.http = Some(service::expand_env_vars(http, &resolved.env));
-            }
-            r
-        });
+        // Resolve ready checks only after the handle is stored: Docker's
+        // actual host ports are authoritative only after container start.
+        let ready_config = self.effective_ready_check(name, resolved);
         let event_tx = self.event_tx.clone();
         // For proxy services, activate the backend immediately so the proxy
         // can start forwarding. The proxy has connection-level retry with

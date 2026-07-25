@@ -40,8 +40,8 @@ This is not an implementation detail. "Can the user still exit right here?" is p
 ## Config File (`don.toml`)
 
 The config has `[services]`, `[tasks]`, `[service_groups]`, and `[profiles]`
-sections, plus a few optional top-level keys such as `default_profile` and
-`watch_ignore`.
+sections, plus a few optional top-level keys such as `default_profile`,
+`watch_ignore`, and `fallback_ports`.
 
 Don also loads a sibling local override file when it exists. For the default
 config path, that file is `don.local.toml`; for `--config workspace.toml`, it is
@@ -105,6 +105,11 @@ docker.command = ["postgres", "-c", "max_connections=200"]
 docker.env_file = [".env.postgres.docker"]
 ```
 
+When the top-level `fallback_ports = true`, generated container names include a
+hash of the canonical project directory so separate worktrees do not remove
+each other's containers. Explicit `docker.container` names remain unchanged and
+can still collide.
+
 Docker build support for custom images:
 
 ```toml
@@ -142,7 +147,7 @@ These fields are available on all service presets:
 | `watch` | list of globs | File patterns to watch for rebuilding/restarting |
 | `debounce` | duration string | Debounce window for watch events (default "200ms") |
 | `depends_on` | list of names | Services or tasks that must be ready/complete first |
-| `listen` | list of addresses | Addresses for don to bind and pass to the service via `LISTEN_FDS` |
+| `proxy` | address or list | Public listeners using env forwarding, fixed forwarding, or `LISTEN_FDS` handoff |
 | `ready` | table | Ready check configuration (see below) |
 | `shutdown` | table | Shutdown behavior (see below) |
 | `log` | string or table | Logging output destination (see below) |
@@ -377,15 +382,16 @@ docker.ports = ["26257:26257"]
 
 Override merge rules:
 - **`env`**: merged — override entries win on conflict, base entries are preserved
-- **`watch`, `depends_on`, `listen`, `env_file`**: replaced entirely if set in the override
+- **`watch`, `depends_on`, `proxy`, `env_file`**: replaced entirely if set in the override
 - **Preset fields** (`docker`, `rust`, `run`): if the override sets any preset field, all base preset fields are cleared and replaced
 - **`build`, `dir`, `ready`, `shutdown`, `log`, `log_filter`, `download`**: override wins if set, otherwise base is kept
 
 A service can have no base preset and define it entirely via platform overrides. Platforms without an override and no base preset will fail validation.
 
-## Socket Passing (`listen`)
+## Socket Passing (`proxy.listenfd`)
 
-Don can own TCP sockets on behalf of services. When `listen` addresses are configured, don:
+Don can own TCP sockets on behalf of services. When listenfd-mode `proxy`
+entries are configured, don:
 
 1. Binds the TCP sockets itself
 2. Passes them to the child process as inherited file descriptors
@@ -395,7 +401,10 @@ Don can own TCP sockets on behalf of services. When `listen` addresses are confi
 ```toml
 [services.api]
 rust.binary = "api-server"
-listen = ["0.0.0.0:3000", "0.0.0.0:3001"]
+proxy = [
+    { listen = "0.0.0.0:3000", listenfd = true },
+    { listen = "0.0.0.0:3001", listenfd = true },
+]
 ```
 
 ## Dependency Graph
@@ -463,6 +472,7 @@ Don stores all mutable state under `.don/` in the project directory:
 | `.don/don.pid` | Don's own PID (for detecting stale instances) |
 | `.don/don.sock` | Unix socket for CLI-to-daemon communication |
 | `.don/pids/<service-name>` | PGID for each running service (for stale cleanup) |
+| `.don/ports.json` | Versioned manifest of configured and actual proxy/Docker ports |
 
 This directory should be added to `.gitignore`.
 
@@ -473,7 +483,23 @@ Environment variables are resolved in this order (later wins):
 1. `.env.<service-name>` — auto-loaded if the file exists (convention)
 2. `env_file` — explicitly listed env files, loaded in order
 3. `env` — inline variables from the config
-4. Don-injected variables (`LISTEN_FDS`, `LISTEN_FDNAMES`, `DON_DOWNLOAD_DIR`, etc.)
+4. Don-injected variables (`LISTEN_FDS`, `LISTEN_FDNAMES`, `DON_PUBLIC_*`, `DON_DOWNLOAD_DIR`, etc.)
+
+An env-mode proxy keeps its configured env variable (for example `PORT`) for
+the private backend port the service binds. Its actual public listener is
+available through `DON_PUBLIC_PORT` / `DON_PUBLIC_ADDR`, indexed
+`DON_PUBLIC_PORT_0` / `DON_PUBLIC_ADDR_0` forms, and aliases derived from the
+proxy env name. Ready TCP/HTTP checks can expand `${DON_PUBLIC_PORT}`.
+Docker ready checks receive equivalent runner-side values after the container
+starts and Don has inspected its assigned host bindings; these values cannot be
+injected into that already-running container.
+
+Inline env values on dependent services and tasks may reference another
+service's runtime public binding with `$(service.port)` /
+`$(service.addr)`. Indexed keys (`port_0`, `addr_0`), env-mode proxy names
+(`$(api.PORT)`), and unambiguous Docker container-port keys
+(`$(database.PORT_5432)`) are also supported. `depends_on` establishes the
+startup ordering needed for Docker bindings to exist before expansion.
 
 ## Terminal UI
 
@@ -715,14 +741,26 @@ If don crashes or gets killed, it can leave behind orphaned state. On startup (a
 - **Stale socket** — if `.don/don.sock` exists, don tries to connect. If it can't, the socket is stale and gets removed.
 - **Don PID file** — `flock` on `.don/don.pid`. If the lock succeeds, no other don is running and stale resources can be cleaned up.
 - **Orphaned process groups** — for each file in `.don/pids/`, attempt to acquire the flock. If it succeeds, the owning process is dead: read the PGID, `killpg` it, delete the file.
-- **Docker containers** — for services with `docker.container` set, don checks if the container already exists and is orphaned from a previous run, and stops/removes it.
+- **Docker containers** — don checks the effective container name for an orphaned container and stops/removes it. With `fallback_ports = true`, generated names include a project-directory hash; explicit names are preserved and can still collide across worktrees.
 
 ### Port Conflict Detection
 
 Before starting services, don pre-checks for port conflicts:
 
-- **`listen` addresses**: don binds these itself, so conflicts are caught immediately with a clear error.
-- **Docker `ports` and other declared ports**: don does a quick TCP connect to check if the port is already in use and warns early instead of letting the service fail with a cryptic error.
+- **Proxy listeners**: Don binds `proxy.listen` itself, so conflicts are caught immediately with a clear error.
+- **Fallback ports**: when `fallback_ports = true`, Don first tries each configured proxy or Docker host address. If it is already in use, Don requests an OS-assigned port on the same host/IP. Permission errors, invalid addresses, and other failures do not fall back.
+- **Scope**: fallback applies only to explicit `proxy.listen` addresses and the host side of `docker.ports`. Don does not choose ports by inferring them from arbitrary env values, command arguments, or fixed proxy backend targets. TCP/HTTP ready checks that target an explicitly configured public port are rewritten to its actual binding.
+- **Docker authority**: Docker's inspected post-start port bindings are authoritative. This avoids reporting a probe port that Docker did not actually acquire and gives ready checks the real host port.
+- **Runtime references**: immediately before a dependent service or task starts, Don renders `$(service.key)` references in its inline env after proxy pre-bind and after Docker dependencies have started.
+
+The configured choice remains the stable preferred address. A fallback is held
+for the lifetime of a Don proxy; Docker restarts try to retain their resolved
+mapping. Don records both configured and actual values in `.don/ports.json`,
+shows them with `don ports`, and uses actual addresses for `LISTEN_FDNAMES` and
+verbose status.
+
+A configured proxy or Docker host port of `0` skips the preferred-port attempt
+and always requests an OS-assigned port, independently of `fallback_ports`.
 
 ### Config Auto-Reload
 
@@ -790,6 +828,7 @@ Commands:
   restart <name>            Restart a specific service
   stop <name>               Stop a specific service
   status                    Show the status of all services and tasks
+  ports                     Show configured and actual runtime ports
   logs <name>               Tail the logs for a specific service
   run <name>                Run a specific task (bypasses auto_run)
   run --all-pending         Run every task currently in pending_run
@@ -804,7 +843,11 @@ When no subcommand is given, `don` prints the help text. Use `don start` to brin
 
 ### Interacting with a Running Instance
 
-Don exposes an HTTP API over a Unix socket at `.don/don.sock`. The CLI commands (`restart`, `stop`, `status`, `logs`) communicate with a running don process through this socket. If no don process is running, these commands exit with an error.
+Don exposes an HTTP API over a Unix socket at `.don/don.sock`. The CLI commands
+(`restart`, `stop`, `status`, `logs`) communicate with a running don process
+through this socket. If no don process is running, these commands exit with an
+error. `GET /status?verbose=true` reports actual proxy and Docker addresses;
+`.don/ports.json` is the structured source for both proxy and Docker mappings.
 
 This means you can have don running in one terminal and use `don restart api` from another terminal to restart a specific service without disrupting the rest of the environment.
 
@@ -817,7 +860,9 @@ When a service has `watch` patterns configured and a watched file changes:
 3. **For docker services with `docker.build`**: don rebuilds the image, then recreates the container
 4. **For rust services**: don runs `cargo build`, then restarts the binary
 
-If the service has `listen` addresses, don keeps the sockets open during the restart so traffic is never dropped. The new process gets the sockets via `LISTEN_FDS` once it's ready.
+If the service has proxy listeners, Don keeps them open during the restart so
+traffic is never dropped. A listenfd-mode process receives the sockets via
+`LISTEN_FDS`, with actual bound addresses in `LISTEN_FDNAMES`.
 
 #### Debouncing
 

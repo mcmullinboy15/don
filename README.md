@@ -352,6 +352,11 @@ docker.volumes = ["pgdata:/var/lib/postgresql/data"]
 docker.env_file = [".env"]
 ```
 
+When `fallback_ports = true`, generated container names include a hash of the
+project checkout so the same config can run from multiple worktrees. An
+explicit `docker.container` value is preserved exactly and can still collide
+across worktrees.
+
 Build from a Dockerfile:
 
 ```toml
@@ -458,6 +463,112 @@ lazy = true
 
 A lazy service with `depends_on` moves from `lazy` to `pending` on its first connection and won't start until those dependencies are ready. While it waits (or if a dependency has failed), the browser tab shows nothing — the connection just sits queued. Don logs `waiting for dependencies before start` while deferred, and `don status` reports `pending` or `dep failed` as appropriate.
 
+#### Fallback Ports
+
+Port fallback is opt-in. Keep the preferred ports in `don.toml` and set the
+top-level `fallback_ports = true`. Don uses each configured proxy listener or
+Docker host port when it is available; if another process already owns it, Don
+asks the OS for an available port on the same host/IP.
+
+```toml
+fallback_ports = true
+
+[services.api]
+run.cmd = "./api-server"
+proxy = { listen = "127.0.0.1:3000", env = "PORT" }
+
+[services.database]
+docker.image = "postgres:16"
+docker.ports = ["127.0.0.1:5432:5432"]
+```
+
+This applies only to ports Don can see explicitly: `proxy.listen` and the host
+side of `docker.ports`. Don does not choose ports by inferring them from
+`env.PORT`, command arguments, or a fixed proxy `forward` target. TCP/HTTP
+ready checks that target one of those explicitly configured public ports are
+updated to the actual binding. A bind failure other than “address already in
+use” remains an error. Without `fallback_ports = true`, conflicts retain the
+fail-fast behavior.
+
+Use host port `0` to request an OS-assigned port unconditionally, for example
+`proxy = "127.0.0.1:0"` or `docker.ports = ["127.0.0.1:0:80"]`. Explicit port
+`0` works whether or not fallback mode is enabled.
+
+For an env-mode proxy, the configured env variable still names the private
+backend port that the service must bind. Don separately injects the public
+listener selected at runtime:
+
+| Variable | Value |
+|----------|-------|
+| `DON_PUBLIC_PORT`, `DON_PUBLIC_ADDR` | First public listener |
+| `DON_PUBLIC_PORT_0`, `DON_PUBLIC_ADDR_0` | Public listener by declaration index |
+| `DON_PUBLIC_<NAME>` | Public port for proxy `env = "NAME"` |
+| `DON_PUBLIC_<NAME>_PORT`, `DON_PUBLIC_<NAME>_ADDR` | Named public port/address |
+
+`<NAME>` is uppercased and non-alphanumeric characters other than `_` are
+removed. For example, `env = "CRDB_PORT"` exposes
+`DON_PUBLIC_CRDB_PORT`, `DON_PUBLIC_CRDB_PORT_PORT`, and
+`DON_PUBLIC_CRDB_PORT_ADDR`. Ready HTTP/TCP checks may use
+`${DON_PUBLIC_PORT}`. The same runner-side `DON_PUBLIC_*` values are available
+when evaluating Docker ready checks, but cannot be injected into a container
+whose host port is assigned only after that container starts.
+
+Dependent services and tasks can copy another service's public runtime port
+into their own inline `env` values:
+
+```toml
+[services.web]
+depends_on = ["database"]
+env = {
+  DATABASE_PORT = "$(database.port)",
+  DATABASE_ADDR = "$(database.addr)",
+  DATABASE_PORT_BY_CONTAINER = "$(database.PORT_5432)",
+}
+
+[tasks.migrate]
+cmd = "dbmate"
+depends_on = ["database"]
+env = { DATABASE_PORT = "$(database.port)" }
+```
+
+`port` / `addr` select the first public binding. Indexed forms such as
+`port_0` / `addr_0` select by declaration order; uppercase forms are aliases.
+For env-mode proxies, the configured env name (for example
+`$(api.PORT)`) selects that proxy's public port. Docker mappings can also be
+selected by container port with `PORT_<container-port>` and
+`ADDR_<container-port>` when that container port is unambiguous. Use `$$(...)`
+for a literal `$(`. A referenced runtime service should be in `depends_on` so
+its mapping exists before the consumer starts.
+
+Run `don ports` to see configured and actual addresses, or `don ports --json`
+to print the versioned `.don/ports.json` manifest. `don status -v` also shows
+the actual proxy and Docker listener addresses.
+
+```json
+{
+  "version": 1,
+  "generated_at_unix_secs": 1770000000,
+  "services": {
+    "api": {
+      "proxy": [{
+        "configured_addr": "127.0.0.1:3000",
+        "bound_addr": "127.0.0.1:49152",
+        "mode": "env",
+        "env": "PORT"
+      }]
+    },
+    "database": {
+      "docker": [{
+        "configured": "127.0.0.1:5432:5432",
+        "host_addr": "127.0.0.1:49153",
+        "container_port": "5432",
+        "protocol": "tcp"
+      }]
+    }
+  }
+}
+```
+
 ### Socket Passing
 
 Zero-downtime restarts via the systemd `LISTEN_FDS` protocol. Don binds the port and passes the socket fd to the child:
@@ -465,11 +576,13 @@ Zero-downtime restarts via the systemd `LISTEN_FDS` protocol. Don binds the port
 ```toml
 [services.api]
 run.cmd = "./api-server"
-listen = ["127.0.0.1:3000"]
+proxy = { listen = "127.0.0.1:3000", listenfd = true }
 watch = ["src/**/*.rs"]
 ```
 
-During a file-watch restart, the port stays bound (connections queue in the kernel backlog).
+During a file-watch restart, the port stays bound (connections queue in the
+kernel backlog). `LISTEN_FDNAMES` contains the actual bound addresses, including
+any fallback selected at startup.
 
 ### Profiles
 
@@ -513,6 +626,8 @@ don stop <name>              # stop a running service
 don restart <name>           # restart a service
 don status                   # show all services and their states
 don status -v                # verbose: watch paths, ports, commands, build targets
+don ports                    # show configured and actual runtime ports
+don ports --json             # print the .don/ports.json manifest
 don logs <name>              # view recent output
 don logs <name> --follow     # stream output
 don logs <name> --last 50    # last N lines
@@ -537,6 +652,7 @@ Don exposes a unix socket API at `.don/don.sock` for programmatic control:
 
 ```
 GET  /status                 → service/task states
+GET  /status?verbose=true    → states plus actual proxy/Docker addresses
 POST /start/:name            → start a stopped service
 POST /stop/:name             → stop a service
 POST /restart/:name          → restart a service
@@ -582,7 +698,6 @@ See [`examples/`](examples/) for complete working configs.
 | `watch` | [string] | Glob patterns to watch for changes; not a boolean |
 | `ignore` | [string] | Glob patterns to exclude from watch |
 | `debounce` | string | Debounce duration ("200ms", "1s") |
-| `listen` | [string] | TCP addresses for socket passing |
 | `ready.tcp` | string | TCP ready check address |
 | `ready.http` | string | HTTP ready check URL |
 | `ready.exec` | {cmd, args} | Exec ready check command |
@@ -621,7 +736,7 @@ See [`examples/`](examples/) for complete working configs.
 | `docker.build` | table | Dockerfile build config |
 | `rust.binary` | string | Rust binary target name |
 | `go.package` | string | Go package path |
-| `proxy` | string or table | TCP proxy: `"addr"` or `{ listen, env }` |
+| `proxy` | string or table | TCP listener: `"addr"` (listenfd) or `{ listen, env/listenfd/forward }` |
 | `lazy` | bool | Delay start until first proxy connection |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
 | `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
@@ -631,6 +746,7 @@ See [`examples/`](examples/) for complete working configs.
 | `turbo.watch` | bool | Auto-resolve Turbo watch paths from the task graph (default: true); does not disable explicit service `watch` |
 | `download.platform.<platform>` | table | Per-platform download config |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
+| `fallback_ports` | bool | Top-level: use an OS-assigned proxy/Docker host port when the preferred port is in use |
 
 ## Platform Support
 

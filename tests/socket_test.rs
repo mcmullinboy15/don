@@ -3,6 +3,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
+use don::ports::{manifest_path, read_manifest};
 use don::runner::{Runner, RunnerCommand, TerminalCoordinator};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
@@ -189,6 +190,127 @@ fn integration_service_receives_listen_env_vars() {
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
+    });
+}
+
+// --- Integration test: occupied proxy ports fall back and publish the result ---
+
+#[test]
+fn integration_proxy_fallback_ports_table() {
+    struct Case {
+        name: &'static str,
+        occupy_preferred_port: bool,
+    }
+
+    let cases = vec![
+        Case {
+            name: "occupied",
+            occupy_preferred_port: true,
+        },
+        Case {
+            name: "available",
+            occupy_preferred_port: false,
+        },
+    ];
+
+    run_with_timeout(Duration::from_secs(30), async {
+        for case in cases {
+            let dir = TempDir::new(&format!("proxy-fallback-{}", case.name));
+            let preferred_port = free_port();
+            let preferred_addr = format!("127.0.0.1:{preferred_port}");
+            let blocker = case
+                .occupy_preferred_port
+                .then(|| std::net::TcpListener::bind(&preferred_addr).unwrap());
+
+            let toml = ConfigBuilder::new()
+                .raw("fallback_ports = true")
+                .add_custom_service(
+                    "api",
+                    "bash",
+                    &["-c", "echo API_PUBLIC=$DON_PUBLIC_PORT; exec sleep 60"],
+                )
+                .listen(&[&preferred_addr])
+                .ready_tcp_with(&preferred_addr, "100ms", 30)
+                .done()
+                .add_custom_service(
+                    "consumer",
+                    "bash",
+                    &["-c", "echo CONSUMER_API_PORT=$API_PORT; exec sleep 60"],
+                )
+                .depends_on(&["api"])
+                .env("API_PORT", "$(api.port)")
+                .ready_exec("true", &[])
+                .done()
+                .build();
+
+            let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+            let handle = tokio::spawn(async move {
+                runner.run().await.unwrap();
+            });
+
+            assert!(
+                wait_for_output(&buf, "all services running", Duration::from_secs(8)).await,
+                "{}: timed out waiting for startup. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            let manifest = read_manifest(dir.path()).unwrap();
+            let binding = manifest
+                .services
+                .get("api")
+                .and_then(|ports| ports.proxy.first())
+                .unwrap();
+            let actual_addr: std::net::SocketAddr = binding.bound_addr.parse().unwrap();
+
+            assert_eq!(binding.configured_addr, preferred_addr, "{}", case.name);
+            if case.occupy_preferred_port {
+                assert_ne!(
+                    actual_addr.port(),
+                    preferred_port,
+                    "{}: occupied preferred port should fall back",
+                    case.name
+                );
+                assert!(
+                    read_buf(&buf).contains(&format!(
+                        "{preferred_addr} is in use; using {}",
+                        binding.bound_addr
+                    )),
+                    "{}: expected a visible fallback event. output: {}",
+                    case.name,
+                    read_buf(&buf)
+                );
+            } else {
+                assert_eq!(
+                    actual_addr.port(),
+                    preferred_port,
+                    "{}: an available preferred port should remain exact",
+                    case.name
+                );
+            }
+
+            assert!(
+                wait_for_output(
+                    &buf,
+                    &format!("CONSUMER_API_PORT={}", actual_addr.port()),
+                    Duration::from_secs(2)
+                )
+                .await,
+                "{}: dependent runtime env did not receive the actual public port. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+            assert!(
+                !manifest_path(dir.path()).exists(),
+                "{}: runtime port manifest should be removed after shutdown",
+                case.name
+            );
+
+            drop(blocker);
+        }
     });
 }
 

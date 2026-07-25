@@ -9,6 +9,7 @@ pub mod exec;
 pub(crate) mod globwalk;
 pub mod init;
 pub mod output;
+pub mod ports;
 pub mod process;
 pub(crate) mod proxy;
 pub mod runner;

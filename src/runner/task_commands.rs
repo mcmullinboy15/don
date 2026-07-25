@@ -15,11 +15,12 @@ impl Runner {
     pub(in crate::runner) fn spawn_task_worker(
         &mut self,
         name: &str,
-        task_cfg: crate::config::Task,
+        mut task_cfg: crate::config::Task,
         params: HashMap<String, String>,
         mode: TaskRunMode,
         intent: TaskRunIntent,
     ) -> Result<u64, CommandError> {
+        self.render_runtime_env(name, &mut task_cfg.env)?;
         let Some(rt) = self.tasks.get_mut(name) else {
             return Err(CommandError::UnknownTask {
                 name: name.to_string(),

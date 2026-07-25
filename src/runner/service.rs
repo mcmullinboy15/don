@@ -105,6 +105,8 @@ pub(crate) async fn start_service(
     service_writer: Option<&crate::output::ServiceWriter>,
     platform: Platform,
     emitter: Option<&crate::output::LifecycleEmitter>,
+    fallback_ports: bool,
+    prior_docker_port_bindings: &[crate::docker::DockerPortBinding],
 ) -> Result<StartResult, ServiceError> {
     // Dispatch based on the service kind.
     if let Some(ServiceKind::Docker(docker_config)) = &resolved.kind {
@@ -115,6 +117,8 @@ pub(crate) async fn start_service(
             client,
             name,
             docker_config,
+            fallback_ports,
+            prior_docker_port_bindings,
             &resolved.env,
             &resolved.env_file,
             base_dir,

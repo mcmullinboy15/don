@@ -7,6 +7,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
+use don::ports::{manifest_path, read_manifest};
 use don::runner::{Runner, TerminalCoordinator};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -239,7 +240,11 @@ fn docker_service_builds_from_dockerfile_without_image() {
         if let Ok(docker) = bollard::Docker::connect_with_socket_defaults() {
             use bollard::query_parameters::RemoveImageOptionsBuilder;
             let _ = docker
-                .remove_image("don-buildsvc", Some(RemoveImageOptionsBuilder::new().force(true).build()), None)
+                .remove_image(
+                    "don-buildsvc",
+                    Some(RemoveImageOptionsBuilder::new().force(true).build()),
+                    None,
+                )
                 .await;
         }
 
@@ -326,6 +331,83 @@ ready.retries = 20
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
         cleanup_container(container_name).await;
+    });
+}
+
+// --- Occupied Docker host port falls back and publishes the actual mapping ---
+
+#[test]
+fn docker_service_falls_back_from_occupied_host_port() {
+    skip_unless_docker!();
+
+    run_with_timeout(Duration::from_secs(40), async {
+        let dir = TempDir::new("docker-port-fallback");
+        let container_name = "don-test-port-fallback";
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let preferred_port = blocker.local_addr().unwrap().port();
+
+        cleanup_container(container_name).await;
+
+        let toml = format!(
+            r#"
+fallback_ports = true
+
+[services.web]
+docker.image = "nginx:alpine"
+docker.container = "{container_name}"
+docker.ports = ["127.0.0.1:{preferred_port}:80"]
+ready.http = "http://127.0.0.1:{preferred_port}/"
+ready.interval = "200ms"
+ready.retries = 50
+
+[services.consumer]
+run.cmd = "bash"
+run.args = ["-c", "echo WEB_PORT=$WEB_PORT; exec sleep 60"]
+depends_on = ["web"]
+env = {{ WEB_PORT = "$(web.PORT_80)" }}
+ready.exec.cmd = "true"
+"#
+        );
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(25)).await,
+            "expected Docker fallback service to become ready. output: {}",
+            read_buf(&buf)
+        );
+
+        let manifest = read_manifest(dir.path()).unwrap();
+        let binding = manifest
+            .services
+            .get("web")
+            .and_then(|ports| ports.docker.first())
+            .expect("missing Docker runtime port binding");
+        let actual_addr: std::net::SocketAddr = binding.host_addr.parse().unwrap();
+        assert_ne!(actual_addr.port(), preferred_port);
+        assert_eq!(binding.container_port, "80");
+        assert!(
+            wait_for_output(
+                &buf,
+                &format!("WEB_PORT={}", actual_addr.port()),
+                Duration::from_secs(3)
+            )
+            .await,
+            "dependent service did not receive the actual Docker port. output: {}",
+            read_buf(&buf)
+        );
+
+        let response = reqwest::get(format!("http://127.0.0.1:{}/", actual_addr.port())).await;
+        assert!(response.is_ok(), "expected fallback HTTP port to respond");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+        assert!(!manifest_path(dir.path()).exists());
+        cleanup_container(container_name).await;
+        drop(blocker);
     });
 }
 
