@@ -33,20 +33,29 @@ impl Runner {
                 });
             }
         };
+        self.render_runtime_env(name, &mut resolved.env)?;
         let (listen_fds, listen_fds_env) = if let Some(rs) = self.services.get(name)
             && let Some(ref proxy) = rs.proxy
         {
             resolved.env.extend(proxy.env_vars());
+            resolved.env.extend(proxy.public_env_vars());
             (proxy.listenfd_raw_fds(), proxy.listenfd_env())
         } else {
             (Vec::new(), HashMap::new())
         };
         let batch_built = self.services.get(name).is_some_and(|rs| rs.batch_built);
+        let prior_docker_port_bindings = self
+            .services
+            .get(name)
+            .map(|rs| rs.docker_port_bindings.clone())
+            .unwrap_or_default();
         Ok(ServiceStartContext {
             resolved,
             batch_built,
             listen_fds,
             listen_fds_env,
+            fallback_ports: self.config.fallback_ports,
+            prior_docker_port_bindings,
         })
     }
 
@@ -226,6 +235,7 @@ impl Runner {
                 }
             }
         }
+        self.refresh_runtime_port_manifest();
     }
 
     pub(in crate::runner) fn spawn_service_rebuild_worker(
@@ -673,6 +683,7 @@ impl Runner {
                 }
             }
         }
+        self.refresh_runtime_port_manifest();
     }
 
     /// Handle an API-initiated Stop command.
@@ -711,6 +722,7 @@ impl Runner {
                 rs.handle = None;
             }
             self.set_service_state(name, ServiceState::Stopped);
+            self.refresh_runtime_port_manifest();
             self.output_manager
                 .service_event(name, "stopped (was failed)");
             let _ = reply.send(Ok(()));

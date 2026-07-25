@@ -8,6 +8,7 @@
 mod attach;
 mod build_tools;
 mod completions;
+mod env_refs;
 mod events;
 mod graph;
 mod health;
@@ -16,6 +17,7 @@ mod params;
 mod paths;
 mod profile;
 mod rebuild;
+mod runtime_ports;
 mod service_commands;
 mod service_health;
 mod service_ready;
@@ -561,6 +563,9 @@ pub struct VerboseInfo {
     /// `"addr (listenfd)"` for display.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy: Vec<String>,
+    /// Active Docker mappings, formatted with actual host addresses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docker_ports: Vec<String>,
     /// Active Don-managed proxy connections. Present only for env/forward
     /// proxy entries; listenfd connections are owned by the child process.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -824,6 +829,13 @@ pub struct Runner {
     /// Coordinates terminal handoff with the TUI for foreground tasks.
     /// Detached in non-TUI runs.
     pub(crate) terminal_coordinator: TerminalCoordinator,
+
+    /// Sends manifest snapshots / removals to the serialized writer task that
+    /// owns `.don/ports.json` filesystem I/O. `None` after shutdown flush.
+    manifest_writer_tx: Option<mpsc::UnboundedSender<runtime_ports::ManifestWrite>>,
+    /// Join handle for the manifest-writer task, awaited on shutdown so the
+    /// final removal is observable once the runner stops.
+    manifest_writer_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Runner {
@@ -856,8 +868,11 @@ impl Runner {
         let don_dir = setup::ensure_don_dir(&base_dir)?;
         let don_pid_file = setup::acquire_don_pid_file(&don_dir).await?;
 
-        setup::cleanup_stale_state(&config, &base_dir, &output_manager).await;
-        let docker_client = setup::connect_docker_if_needed(&config)?;
+        setup::cleanup_stale_state(&config, platform, &base_dir, &output_manager).await;
+        if let Err(error) = crate::ports::remove_manifest(&base_dir) {
+            output_manager.error_event(&format!("failed to remove stale runtime ports: {error}"));
+        }
+        let docker_client = setup::connect_docker_if_needed(&config, platform)?;
 
         let active_items = setup::resolve_active_items(&config, platform, profile)?;
         let active_services = setup::filter_active_services(&config, active_items.as_ref());
@@ -875,6 +890,11 @@ impl Runner {
             headless,
         )
         .await;
+
+        let (manifest_writer_tx, manifest_writer_handle) = runtime_ports::spawn_manifest_writer(
+            base_dir.clone(),
+            output_manager.clone_lifecycle_emitter(),
+        );
 
         Ok(Self {
             config,
@@ -913,6 +933,8 @@ impl Runner {
             shutdown_flag_tx,
             shutting_down: false,
             terminal_coordinator,
+            manifest_writer_tx: Some(manifest_writer_tx),
+            manifest_writer_handle: Some(manifest_writer_handle),
         })
     }
 
@@ -1124,6 +1146,7 @@ impl Runner {
             };
             match crate::proxy::ServiceProxy::bind(
                 &proxy_config,
+                self.config.fallback_ports,
                 lazy_tx,
                 name,
                 self.output_manager.clone_lifecycle_emitter(),
@@ -1131,6 +1154,9 @@ impl Runner {
             .await
             {
                 Ok(proxy) => {
+                    for message in proxy.fallback_descriptions() {
+                        self.output_manager.service_event(name, &message);
+                    }
                     let addrs: Vec<String> =
                         proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
                     self.output_manager.service_debug_event(
@@ -1151,6 +1177,7 @@ impl Runner {
                 }
             }
         }
+        self.refresh_runtime_port_manifest();
 
         // Bind the unix socket API synchronously so bind errors surface
         // visibly at startup. Only spawn the accept loop if bind succeeds.
@@ -1223,6 +1250,7 @@ impl Runner {
             _ = shutdown_rx.recv() => {
                 watch_setup_handle.abort();
                 let _ = watch_setup_handle.await;
+                self.finish_runtime_port_manifest().await;
                 self.output_manager.shutdown().await;
                 return Ok(());
             }
@@ -1582,6 +1610,7 @@ impl Runner {
             let _ = handle.await;
         }
 
+        self.finish_runtime_port_manifest().await;
         if self.shutting_down {
             self.output_manager.lifecycle_event("shutdown complete");
         }
@@ -1888,6 +1917,7 @@ mod tests {
             shutdown: crate::config::ShutdownConfig::default(),
             log_filter: LogFilterConfig::default(),
             auto_filter_on_failure: true,
+            fallback_ports: false,
         };
         let output_manager = crate::output::OutputManager::new_verbose(
             &[("api", &LogConfig::Stdout)],
@@ -1979,6 +2009,7 @@ mod tests {
             shutdown: crate::config::ShutdownConfig::default(),
             log_filter: LogFilterConfig::default(),
             auto_filter_on_failure: true,
+            fallback_ports: false,
         };
         let output_manager = crate::output::OutputManager::new_verbose(
             &[("api", &LogConfig::Stdout)],

@@ -98,6 +98,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show the proxy and Docker addresses Don actually bound
+    Ports {
+        /// Emit the runtime port manifest as machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show everything don is currently watching: the inotify directories it has
     /// registered plus the per-item glob patterns that trigger reloads. Useful
     /// for confirming a file actually falls under a watch — especially for
@@ -256,6 +262,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             verbose,
             json,
         } => run_status(&config_path, name.as_deref(), verbose, json).await,
+        Commands::Ports { json } => run_ports(&config_path, json),
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
@@ -323,6 +330,103 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             }
         }
     }
+}
+
+fn run_ports(config_path: &Path, json: bool) -> i32 {
+    let base = base_dir(config_path);
+    let manifest = match don::ports::read_manifest(&base) {
+        Ok(manifest) => manifest,
+        Err(don::ports::PortManifestError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            errln(format!(
+                "no runtime port manifest found at {} — start don first",
+                don::ports::manifest_path(&base).display()
+            ));
+            return 1;
+        }
+        Err(error) => {
+            errln(error);
+            return 1;
+        }
+    };
+
+    if json {
+        return match serde_json::to_string_pretty(&manifest) {
+            Ok(output) => {
+                println!("{output}");
+                0
+            }
+            Err(error) => {
+                errln(format!("failed to serialize runtime ports: {error}"));
+                1
+            }
+        };
+    }
+
+    let mut rows = Vec::new();
+    for (service, ports) in manifest.services {
+        for proxy in ports.proxy {
+            rows.push((
+                service.clone(),
+                "proxy".to_string(),
+                proxy.configured_addr,
+                proxy.bound_addr,
+                proxy.mode,
+            ));
+        }
+        for docker in ports.docker {
+            rows.push((
+                service.clone(),
+                "docker".to_string(),
+                docker.configured,
+                docker.host_addr,
+                format!("{}/{}", docker.container_port, docker.protocol),
+            ));
+        }
+    }
+
+    if rows.is_empty() {
+        println!("No runtime ports.");
+        return 0;
+    }
+
+    let service_width = rows
+        .iter()
+        .map(|(service, _, _, _, _)| service.len())
+        .max()
+        .unwrap_or("SERVICE".len())
+        .max("SERVICE".len());
+    let kind_width = rows
+        .iter()
+        .map(|(_, kind, _, _, _)| kind.len())
+        .max()
+        .unwrap_or("KIND".len())
+        .max("KIND".len());
+    let configured_width = rows
+        .iter()
+        .map(|(_, _, configured, _, _)| configured.len())
+        .max()
+        .unwrap_or("CONFIGURED".len())
+        .max("CONFIGURED".len());
+    let bound_width = rows
+        .iter()
+        .map(|(_, _, _, bound, _)| bound.len())
+        .max()
+        .unwrap_or("BOUND".len())
+        .max("BOUND".len());
+
+    println!(
+        "{:<service_width$}  {:<kind_width$}  {:<configured_width$}  {:<bound_width$}  DETAIL",
+        "SERVICE", "KIND", "CONFIGURED", "BOUND"
+    );
+    for (service, kind, configured, bound, detail) in rows {
+        println!(
+            "{service:<service_width$}  {kind:<kind_width$}  \
+             {configured:<configured_width$}  {bound:<bound_width$}  {detail}"
+        );
+    }
+    0
 }
 
 fn client_for(config_path: &Path) -> Client {
@@ -1034,6 +1138,9 @@ fn print_verbose_info(info: &don::runner::VerboseInfo, show_watch_paths: bool) {
     if !info.proxy.is_empty() {
         println!("  {dim}proxy:{reset}  {}", info.proxy.join(", "));
     }
+    if !info.docker_ports.is_empty() {
+        println!("  {dim}docker:{reset} {}", info.docker_ports.join(", "));
+    }
     if let Some(active) = info.proxy_active_connections {
         println!("  {dim}proxy connections:{reset}  {active} active");
     }
@@ -1173,17 +1280,29 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
     // Load config to discover docker container names. If config doesn't
     // exist or is invalid, still clean up what we can (pid files and socket).
     let docker_names: Vec<String> = match don::config::Config::from_file(config_path) {
-        Ok(config) => config
-            .services
-            .iter()
-            .filter_map(|(name, svc)| {
-                if let Some(don::config::ServiceKind::Docker(d)) = &svc.kind {
-                    Some(d.container.clone().unwrap_or_else(|| format!("don-{name}")))
-                } else {
-                    None
-                }
-            })
-            .collect(),
+        Ok(config) => match don::config::Platform::current() {
+            Some(platform) => config
+                .services
+                .iter()
+                .filter_map(|(name, svc)| {
+                    let resolved = svc.resolve(platform);
+                    if let Some(don::config::ServiceKind::Docker(d)) = &resolved.kind {
+                        Some(don::ports::managed_docker_container_name(
+                            &base,
+                            name,
+                            d,
+                            config.fallback_ports,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            None => {
+                errln("Warning: unsupported platform; Docker cleanup names may be incomplete");
+                Vec::new()
+            }
+        },
         Err(e) => {
             errln(format!(
                 "Warning: could not load config for docker cleanup: {e}"
@@ -1196,6 +1315,9 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
     println!("{report}");
     for warning in &report.warnings {
         errln(format!("Warning: {warning}"));
+    }
+    if let Err(error) = don::ports::remove_manifest(&base) {
+        errln(format!("Warning: failed to remove runtime ports: {error}"));
     }
 
     // Hold lock until cleanup finishes, then release.
@@ -1874,7 +1996,8 @@ fn map_join_result<T>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{item_name, parse_task_args, split_run_flags, status_sort_bucket};
+    use super::{Cli, Commands, item_name, parse_task_args, split_run_flags, status_sort_bucket};
+    use clap::Parser;
     use don::config::{ParamKind, TaskParam};
     use don::runner::{ItemStatus, ServiceState, TaskItemState};
 
@@ -1905,6 +2028,36 @@ mod tests {
             state,
             last_run: None,
             verbose: None,
+        }
+    }
+
+    #[test]
+    fn ports_command_parses_json_flag() {
+        struct Case {
+            name: &'static str,
+            args: &'static [&'static str],
+            expected_json: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "table output",
+                args: &["don", "ports"],
+                expected_json: false,
+            },
+            Case {
+                name: "json output",
+                args: &["don", "ports", "--json"],
+                expected_json: true,
+            },
+        ];
+
+        for case in cases {
+            let cli = Cli::try_parse_from(case.args).unwrap();
+            let Commands::Ports { json } = cli.command else {
+                panic!("case '{}': expected ports command", case.name);
+            };
+            assert_eq!(json, case.expected_json, "case '{}'", case.name);
         }
     }
 

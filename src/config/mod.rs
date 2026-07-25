@@ -66,6 +66,11 @@ pub struct Config {
     /// file-watch and watch-derived change detection.
     #[serde(default)]
     pub watch_ignore: Vec<String>,
+    /// If true, Don first tries each configured proxy listener or Docker host
+    /// port, then falls back to an OS-assigned port on the same host/IP when
+    /// the preferred port is already in use.
+    #[serde(default)]
+    pub fallback_ports: bool,
     /// Default shutdown behavior for services that do not define their own
     /// `[services.<name>.shutdown]` table.
     #[serde(default)]
@@ -442,15 +447,25 @@ impl Config {
                 &resolved.log_filter,
                 &mut errors,
             );
-            // A docker service must have something to run: an explicit image,
-            // or a build config (whose image is tagged `don-<service>`).
-            if let Some(ServiceKind::Docker(docker)) = &resolved.kind
-                && docker.image.is_none()
-                && docker.build.is_none()
-            {
-                errors.push(format!(
-                    "service '{name}': docker service must set `docker.image` or `docker.build`"
-                ));
+            if let Some(ServiceKind::Docker(docker)) = &resolved.kind {
+                // A docker service must have something to run: an explicit
+                // image, or a build config (whose image is tagged
+                // `don-<service>`).
+                if docker.image.is_none() && docker.build.is_none() {
+                    errors.push(format!(
+                        "service '{name}': docker service must set `docker.image` or `docker.build`"
+                    ));
+                }
+                if let Err(error) = crate::docker::parse::parse_port_mappings(&docker.ports) {
+                    errors.push(format!("service '{name}': {error}"));
+                }
+                if self.fallback_ports && docker.container.is_some() {
+                    warnings.push(format!(
+                        "service '{name}': explicit docker.container names can collide across \
+                         worktrees even when fallback_ports is enabled — omit docker.container \
+                         to use Don's generated worktree-specific name"
+                    ));
+                }
             }
 
             // Validate download config.
@@ -523,7 +538,14 @@ impl Config {
             .iter()
             .map(|(name, svc)| {
                 let resolved = svc.resolve(platform);
-                let addrs: Vec<String> = resolved.proxy.iter().map(|e| e.listen.clone()).collect();
+                let addrs: Vec<String> = resolved
+                    .proxy
+                    .iter()
+                    .filter_map(|entry| {
+                        let addr = entry.listen.parse::<std::net::SocketAddr>().ok()?;
+                        (addr.port() != 0).then(|| entry.listen.clone())
+                    })
+                    .collect();
                 (name.clone(), addrs)
             })
             .collect();
@@ -1206,6 +1228,30 @@ mod tests {
     #[test]
     fn test_config_parsing() {
         let cases = vec![
+            ConfigTestCase {
+                name: "fallback ports defaults off",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(!config.fallback_ports);
+                },
+            },
+            ConfigTestCase {
+                name: "fallback ports parses",
+                input: r#"
+                    fallback_ports = true
+
+                    [services.api]
+                    run.cmd = "api"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.fallback_ports);
+                },
+            },
             ConfigTestCase {
                 name: "global watch ignore parses",
                 input: r#"
@@ -2706,6 +2752,115 @@ mod tests {
             let config =
                 result.unwrap_or_else(|e| panic!("case '{}': unexpected error: {e}", case.name));
             (case.check)(&config);
+        }
+    }
+
+    #[test]
+    fn test_fallback_port_validation() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected_error: Option<&'static str>,
+            expected_warning: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "duplicate random proxy addresses are allowed",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    proxy = "127.0.0.1:0"
+
+                    [services.web]
+                    run.cmd = "web"
+                    proxy = "127.0.0.1:0"
+                "#,
+                expected_error: None,
+                expected_warning: None,
+            },
+            Case {
+                name: "duplicate preferred proxy addresses remain invalid",
+                input: r#"
+                    fallback_ports = true
+
+                    [services.api]
+                    run.cmd = "api"
+                    proxy = "127.0.0.1:3000"
+
+                    [services.web]
+                    run.cmd = "web"
+                    proxy = "127.0.0.1:3000"
+                "#,
+                expected_error: Some("proxy listen address '127.0.0.1:3000'"),
+                expected_warning: None,
+            },
+            Case {
+                name: "docker port mappings validate with the config",
+                input: r#"
+                    [services.database]
+                    docker.image = "postgres:16"
+                    docker.ports = ["not-a-port-mapping"]
+                "#,
+                expected_error: Some("invalid port mapping 'not-a-port-mapping'"),
+                expected_warning: None,
+            },
+            Case {
+                name: "explicit docker container warns with fallback ports",
+                input: r#"
+                    fallback_ports = true
+
+                    [services.database]
+                    docker.image = "postgres:16"
+                    docker.container = "shared-postgres"
+                "#,
+                expected_error: None,
+                expected_warning: Some("explicit docker.container names can collide"),
+            },
+            Case {
+                name: "explicit docker container does not warn by default",
+                input: r#"
+                    [services.database]
+                    docker.image = "postgres:16"
+                    docker.container = "shared-postgres"
+                "#,
+                expected_error: None,
+                expected_warning: None,
+            },
+        ];
+
+        for case in cases {
+            let config: Config = case.input.parse().unwrap();
+            match (config.validate(TEST_PLATFORM), case.expected_error) {
+                (Err(ConfigError::Validation { errors }), Some(needle)) => assert!(
+                    errors.iter().any(|error| error.contains(needle)),
+                    "case '{}': expected error containing '{needle}', got {errors:?}",
+                    case.name
+                ),
+                (Ok(warnings), None) => match case.expected_warning {
+                    Some(needle) => assert!(
+                        warnings.iter().any(|warning| warning.contains(needle)),
+                        "case '{}': expected warning containing '{needle}', got {warnings:?}",
+                        case.name
+                    ),
+                    None => assert!(
+                        warnings.is_empty(),
+                        "case '{}': expected no warnings, got {warnings:?}",
+                        case.name
+                    ),
+                },
+                (Err(error), None) => {
+                    panic!("case '{}': expected valid config, got {error}", case.name)
+                }
+                (Err(error), Some(needle)) => panic!(
+                    "case '{}': expected validation error containing '{needle}', got {error}",
+                    case.name
+                ),
+                (Ok(_), Some(needle)) => panic!(
+                    "case '{}': expected validation error containing '{needle}'",
+                    case.name
+                ),
+            }
         }
     }
 

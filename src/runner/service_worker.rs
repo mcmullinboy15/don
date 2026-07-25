@@ -15,6 +15,8 @@ pub(in crate::runner) struct ServiceStartContext {
     pub(in crate::runner) batch_built: bool,
     pub(in crate::runner) listen_fds: Vec<RawFd>,
     pub(in crate::runner) listen_fds_env: HashMap<String, String>,
+    pub(in crate::runner) fallback_ports: bool,
+    pub(in crate::runner) prior_docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
 }
 
 pub(in crate::runner) async fn ensure_download_for_config_worker(
@@ -229,6 +231,8 @@ pub(in crate::runner) async fn start_service_worker(
         service_writer,
         platform,
         Some(emitter),
+        context.fallback_ports,
+        &context.prior_docker_port_bindings,
     )
     .await
     .map_err(|e| e.to_string())

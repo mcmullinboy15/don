@@ -1,3 +1,4 @@
+use super::service::ServiceHandle;
 use super::{ItemStatus, Runner, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
 use tokio::sync::oneshot;
 
@@ -87,17 +88,20 @@ impl Runner {
             }
             let verbose_info = if verbose {
                 let resolved = &rs.resolved;
-                let ready = resolved.ready.as_ref().map(|r| {
-                    if let Some(ref tcp) = r.tcp {
-                        format!("tcp {tcp}")
-                    } else if let Some(ref http) = r.http {
-                        format!("http {http}")
-                    } else if let Some(ref exec) = r.exec {
-                        format!("{} {}", exec.cmd, exec.args.join(" "))
-                    } else {
-                        "none".to_string()
-                    }
-                });
+                let ready = self
+                    .effective_ready_check(name, resolved)
+                    .as_ref()
+                    .map(|r| {
+                        if let Some(ref tcp) = r.tcp {
+                            format!("tcp {tcp}")
+                        } else if let Some(ref http) = r.http {
+                            format!("http {http}")
+                        } else if let Some(ref exec) = r.exec {
+                            format!("{} {}", exec.cmd, exec.args.join(" "))
+                        } else {
+                            "none".to_string()
+                        }
+                    });
                 let cmd = resolved.run_cmd().map(|r| {
                     if r.args.is_empty() {
                         r.cmd.clone()
@@ -150,21 +154,42 @@ impl Runner {
                     } else {
                         Vec::new()
                     },
-                    proxy: resolved
-                        .proxy
-                        .iter()
-                        .map(|p| match &p.mode {
-                            crate::config::ProxyMode::Env(name) => {
-                                format!("{} (env={name})", p.listen)
-                            }
-                            crate::config::ProxyMode::Listenfd => {
-                                format!("{} (listenfd)", p.listen)
-                            }
-                            crate::config::ProxyMode::Forward(target) => {
-                                format!("{} → {target}", p.listen)
-                            }
-                        })
-                        .collect(),
+                    proxy: rs.proxy.as_ref().map_or_else(
+                        || {
+                            resolved
+                                .proxy
+                                .iter()
+                                .map(|p| match &p.mode {
+                                    crate::config::ProxyMode::Env(name) => {
+                                        format!("{} (env={name})", p.listen)
+                                    }
+                                    crate::config::ProxyMode::Listenfd => {
+                                        format!("{} (listenfd)", p.listen)
+                                    }
+                                    crate::config::ProxyMode::Forward(target) => {
+                                        format!("{} → {target}", p.listen)
+                                    }
+                                })
+                                .collect()
+                        },
+                        crate::proxy::ServiceProxy::descriptions,
+                    ),
+                    docker_ports: match rs.handle.as_ref() {
+                        Some(ServiceHandle::Docker(handle)) => handle
+                            .port_bindings()
+                            .iter()
+                            .map(|binding| {
+                                format!(
+                                    "{} → {} ({}/{})",
+                                    binding.configured,
+                                    binding.connect_addr(),
+                                    binding.container_port,
+                                    binding.protocol
+                                )
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    },
                     proxy_active_connections: rs
                         .proxy
                         .as_ref()
@@ -246,6 +271,7 @@ impl Runner {
                         Vec::new()
                     },
                     proxy: Vec::new(),
+                    docker_ports: Vec::new(),
                     proxy_active_connections: None,
                     bazel_target: task.bazel.as_ref().map(|b| b.target.clone()),
                     turbo_task: task.turbo.as_ref().map(|t| t.task.clone()),

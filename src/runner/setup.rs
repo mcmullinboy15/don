@@ -33,6 +33,7 @@ pub(in crate::runner) async fn acquire_don_pid_file(
 
 pub(in crate::runner) async fn cleanup_stale_state(
     config: &Config,
+    platform: Platform,
     base_dir: &Path,
     output_manager: &OutputManager,
 ) {
@@ -40,8 +41,14 @@ pub(in crate::runner) async fn cleanup_stale_state(
         .services
         .iter()
         .filter_map(|(name, svc)| {
-            if let Some(ServiceKind::Docker(d)) = &svc.kind {
-                Some(d.container.clone().unwrap_or_else(|| format!("don-{name}")))
+            let resolved = svc.resolve(platform);
+            if let Some(ServiceKind::Docker(d)) = &resolved.kind {
+                Some(crate::ports::managed_docker_container_name(
+                    base_dir,
+                    name,
+                    d,
+                    config.fallback_ports,
+                ))
             } else {
                 None
             }
@@ -61,11 +68,12 @@ pub(in crate::runner) async fn cleanup_stale_state(
 
 pub(in crate::runner) fn connect_docker_if_needed(
     config: &Config,
+    platform: Platform,
 ) -> Result<Option<bollard::Docker>, RunnerError> {
     let has_docker = config
         .services
         .values()
-        .any(|s| matches!(&s.kind, Some(ServiceKind::Docker(_))));
+        .any(|service| matches!(service.resolve(platform).kind, Some(ServiceKind::Docker(_))));
     if !has_docker {
         return Ok(None);
     }

@@ -13,6 +13,9 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # default_profile = "dev"
 # Ignore generated files across every watch rule in the workspace.
 # watch_ignore = ["target/**", ".don/**"]
+# Prefer the configured proxy/Docker host ports, but use OS-assigned ports when
+# those ports are already occupied. Discover actual values with `don ports`.
+# fallback_ports = true
 
 # ── Services ────────────────────────────────────────────────────────────────
 # Long-running processes. Don keeps them alive and restarts on file changes.
@@ -20,16 +23,16 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # [services.api]
 # run.cmd = "node"
 # run.args = ["server.js"]
-# env = { PORT = "3000" }
+# proxy = { listen = "127.0.0.1:3000", env = "PORT" }
 # watch = ["src/**/*.js"]
-# ready.http = "http://localhost:3000/health"
+# ready.http = "http://127.0.0.1:${PORT}/health"
 
 # Docker preset — run a container via the local Docker daemon.
 # [services.postgres]
 # docker.image = "postgres:16"
 # docker.ports = ["5432:5432"]
 # docker.env_file = [".env"]
-# ready.tcp = "127.0.0.1:5432"
+# ready.tcp = "127.0.0.1:${DON_PUBLIC_PORT}"
 
 # Docker build — build an image from a Dockerfile on demand instead of pulling
 # one. No `docker.image` needed: the build is tagged `don-<service>`. (Set
@@ -64,6 +67,7 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # [tasks.migrate]
 # cmd = "dbmate"
 # args = ["up"]
+# env = { DATABASE_PORT = "$(postgres.port)" }
 # depends_on = ["postgres"]
 # watch = ["db/migrations/**/*.sql"]
 

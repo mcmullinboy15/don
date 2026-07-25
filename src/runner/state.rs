@@ -34,6 +34,9 @@ pub(crate) struct RuntimeService {
     pub resolved: crate::config::service::ResolvedService,
     /// Handle to the running process (if spawned).
     pub handle: Option<ServiceHandle>,
+    /// Last authoritative Docker host-port bindings. Retained while the
+    /// container is stopped so a restart can request the same fallback ports.
+    pub docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
     /// Process group ID for the current local process. This is equal to the
     /// child PID for services spawned by don. Docker services do not expose a
     /// local PID here.
@@ -117,6 +120,7 @@ impl RuntimeService {
             state: initial_state,
             resolved,
             handle: None,
+            docker_port_bindings: Vec::new(),
             pgid: None,
             output_worker: None,
             osc_sink: None,
