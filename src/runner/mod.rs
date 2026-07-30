@@ -955,6 +955,7 @@ impl Runner {
     /// `#[must_use]` precisely so the event can't be forgotten. No-op if
     /// the service is unknown or already at `new_state`.
     pub(crate) fn set_service_state(&mut self, name: &str, new_state: ServiceState) {
+        let previous_state = self.services.get(name).map(RuntimeService::state);
         let changed = self
             .services
             .get_mut(name)
@@ -962,14 +963,17 @@ impl Runner {
         if let Some(state) = changed {
             self.broadcast_service_state(name, state);
             if self.done_tx.is_some()
-                && matches!(
+                && (matches!(
                     state,
                     ServiceState::Pending
                         | ServiceState::Lazy
                         | ServiceState::Ready
                         | ServiceState::Failed
                         | ServiceState::DependencyFailed
-                )
+                ) || matches!(
+                    previous_state,
+                    Some(ServiceState::Failed | ServiceState::DependencyFailed)
+                ))
             {
                 self.schedule_start_pending();
             }
@@ -1011,6 +1015,7 @@ impl Runner {
 
     /// Transition a task to a new state and broadcast the change.
     pub(crate) fn set_task_state(&mut self, name: &str, new_state: TaskItemState) {
+        let previous_state = self.tasks.get(name).map(RuntimeTask::state);
         let changed = self
             .tasks
             .get_mut(name)
@@ -1018,7 +1023,7 @@ impl Runner {
         if let Some(state) = changed {
             self.broadcast_task_state(name, state);
             if self.done_tx.is_some()
-                && matches!(
+                && (matches!(
                     state,
                     TaskItemState::Pending
                         | TaskItemState::PendingRun
@@ -1026,7 +1031,10 @@ impl Runner {
                         | TaskItemState::Skipped
                         | TaskItemState::Failed
                         | TaskItemState::DependencyFailed
-                )
+                ) || matches!(
+                    previous_state,
+                    Some(TaskItemState::Failed | TaskItemState::DependencyFailed)
+                ))
             {
                 self.schedule_start_pending();
             }

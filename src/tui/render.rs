@@ -24,10 +24,13 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Wrap,
+};
 use std::borrow::Cow;
 
 use super::app::{App, OverlayItem, StatusCounts, TaskStatusItem, ViewMode};
+use super::failure_summary;
 use super::filter::{FilterFocus, FilterRow, FilterState};
 use super::status_table::{StatusTableView, draw_status_table};
 use crate::runner::{ServiceState, TaskItemState};
@@ -85,6 +88,7 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
             visible_services,
             total_services,
             app.verbose_enabled,
+            app.has_failure_summary(),
         )
     };
     let update_badge = (!app.shutdown_started)
@@ -120,6 +124,7 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         ViewMode::Filter => draw_filter_modal(frame, app),
         ViewMode::Tasks => draw_tasks_table(frame, app),
         ViewMode::Services => draw_services_table(frame, app),
+        ViewMode::Failures => draw_failure_summary(frame, app),
         ViewMode::Form => draw_form_modal(frame, app),
         ViewMode::Normal => {}
     }
@@ -168,14 +173,15 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let name_colors = log_name_colors(app);
     let items = app.task_items();
-    let header = Row::new(vec!["NAME", "STATE", "LAST RUN", "RESULT", "DURATION"]).style(
+    let layout = task_table_layout(area.width);
+    let header = Row::new(layout.columns.iter().map(|column| column.label())).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(Color::Cyan),
     );
     let rows = items
         .iter()
-        .map(|item| task_table_row(item, &name_colors))
+        .map(|item| task_table_row(item, &name_colors, &layout.columns))
         .collect();
     draw_status_table(
         frame,
@@ -185,18 +191,120 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
                 .to_string(),
             header,
             rows,
-            widths: vec![
-                Constraint::Percentage(32),
-                Constraint::Length(14),
-                Constraint::Length(14),
-                Constraint::Length(10),
-                Constraint::Length(10),
-            ],
+            widths: layout.widths,
             state: &app.tasks_table,
             empty_label: "(no tasks)",
             selected_hint: task_selected_hint(app),
         },
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskTableColumn {
+    Name,
+    State,
+    LastRun,
+    Result,
+    Duration,
+}
+
+impl TaskTableColumn {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "NAME",
+            Self::State => "STATE",
+            Self::LastRun => "LAST RUN",
+            Self::Result => "RESULT",
+            Self::Duration => "DURATION",
+        }
+    }
+}
+
+struct TaskTableLayout {
+    columns: Vec<TaskTableColumn>,
+    widths: Vec<Constraint>,
+}
+
+fn task_table_layout(width: u16) -> TaskTableLayout {
+    if width >= 110 {
+        return TaskTableLayout {
+            columns: vec![
+                TaskTableColumn::Name,
+                TaskTableColumn::State,
+                TaskTableColumn::LastRun,
+                TaskTableColumn::Result,
+                TaskTableColumn::Duration,
+            ],
+            widths: vec![
+                Constraint::Percentage(32),
+                Constraint::Min(24),
+                Constraint::Length(14),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        };
+    }
+    if width >= 70 {
+        return TaskTableLayout {
+            columns: vec![
+                TaskTableColumn::Name,
+                TaskTableColumn::State,
+                TaskTableColumn::Result,
+            ],
+            widths: vec![
+                Constraint::Percentage(32),
+                Constraint::Min(24),
+                Constraint::Length(10),
+            ],
+        };
+    }
+    TaskTableLayout {
+        columns: vec![TaskTableColumn::Name, TaskTableColumn::State],
+        widths: vec![Constraint::Percentage(40), Constraint::Min(20)],
+    }
+}
+
+fn draw_failure_summary(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let outer = failure_summary_block();
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let max_scroll = failure_summary_max_scroll(area, app);
+    let scroll = app.failure_summary_scroll.min(max_scroll);
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+    let text = failure_summary::text(&app.failure_summary_items());
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        inner,
+    );
+}
+
+fn failure_summary_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(" don failures — [j/k ↑↓] scroll  [home/end] top/bottom  [esc] dismiss ")
+}
+
+pub(crate) fn failure_summary_max_scroll(area: Rect, app: &App) -> usize {
+    let inner = failure_summary_block().inner(area);
+    if inner.height == 0 || inner.width == 0 {
+        return 0;
+    }
+    let text = failure_summary::text(&app.failure_summary_items());
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize)
 }
 
 /// Render the full-screen services table — a table of every known service
@@ -335,32 +443,39 @@ fn service_table_row(item: &OverlayItem, name_colors: &HashMap<String, Color>) -
     ])
 }
 
-fn task_table_row(item: &TaskStatusItem, name_colors: &HashMap<String, Color>) -> Row<'static> {
+fn task_table_row(
+    item: &TaskStatusItem,
+    name_colors: &HashMap<String, Color>,
+    columns: &[TaskTableColumn],
+) -> Row<'static> {
     let name_style = name_colors
         .get(&item.name)
         .copied()
         .map(|color| Style::default().fg(color))
         .unwrap_or_default();
-    Row::new(vec![
-        Cell::from(item.name.clone()).style(name_style),
-        Cell::from(task_state_label(item.state, &item.failed_dependencies))
-            .style(Style::default().fg(task_state_color(item.state))),
-        Cell::from(format_task_last_run_time(item.last_run.as_ref()))
+    let cells = columns.iter().map(|column| match column {
+        TaskTableColumn::Name => Cell::from(item.name.clone()).style(name_style),
+        TaskTableColumn::State => {
+            Cell::from(task_state_label(item.state, &item.failed_dependencies))
+                .style(Style::default().fg(task_state_color(item.state)))
+        }
+        TaskTableColumn::LastRun => Cell::from(format_task_last_run_time(item.last_run.as_ref()))
             .style(Style::default().fg(Color::Gray)),
-        Cell::from(format_task_result(item.last_run.as_ref())).style(
+        TaskTableColumn::Result => Cell::from(format_task_result(item.last_run.as_ref())).style(
             Style::default().fg(item
                 .last_run
                 .as_ref()
                 .map(task_result_color)
                 .unwrap_or(Color::DarkGray)),
         ),
-        Cell::from(format_task_duration(
+        TaskTableColumn::Duration => Cell::from(format_task_duration(
             item.last_run
                 .as_ref()
                 .and_then(|last_run| last_run.duration_ms),
         ))
         .style(Style::default().fg(Color::Gray)),
-    ])
+    });
+    Row::new(cells)
 }
 
 fn draw_filter_list(
@@ -532,6 +647,7 @@ fn normal_bar_line(
     visible_services: usize,
     total_services: usize,
     verbose_enabled: bool,
+    has_failure_summary: bool,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -549,7 +665,7 @@ fn normal_bar_line(
             .add_modifier(Modifier::BOLD),
     ));
 
-    spans.extend(base_count_spans(counts));
+    spans.extend(base_count_spans(counts, has_failure_summary));
 
     if counts.tasks_running > 0 {
         spans.push(separator());
@@ -593,7 +709,7 @@ fn normal_bar_line(
 }
 
 fn filter_bar_line(counts: &StatusCounts, filter: &FilterState) -> Line<'static> {
-    let mut spans = base_count_spans(counts);
+    let mut spans = base_count_spans(counts, false);
     spans.push(separator());
     let hint = match filter.focus() {
         FilterFocus::List => {
@@ -691,7 +807,7 @@ fn shutdown_bar_line(counts: &StatusCounts, spinner_frame: usize) -> Line<'stati
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(separator());
-    spans.extend(base_count_spans(counts));
+    spans.extend(base_count_spans(counts, false));
     if counts.tasks_running > 0 {
         spans.push(separator());
         let label = if counts.tasks_running == 1 {
@@ -731,7 +847,7 @@ fn line_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
-fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
+fn base_count_spans(counts: &StatusCounts, show_failure_info: bool) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
     let ready_color = if counts.services_failed > 0 {
@@ -753,8 +869,21 @@ fn base_count_spans(counts: &StatusCounts) -> Vec<Span<'static>> {
 
     if counts.services_failed > 0 {
         spans.push(separator());
+        let info_hint = if show_failure_info { " [i]" } else { "" };
         spans.push(Span::styled(
-            format!("{} failed", counts.services_failed),
+            format!("{} failed{info_hint}", counts.services_failed),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    } else if counts.tasks_failed > 0 {
+        spans.push(separator());
+        let noun = if counts.tasks_failed == 1 {
+            "task"
+        } else {
+            "tasks"
+        };
+        let info_hint = if show_failure_info { " [i]" } else { "" };
+        spans.push(Span::styled(
+            format!("{} {noun} failed{info_hint}", counts.tasks_failed),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
@@ -1049,6 +1178,7 @@ fn field_render_rows(
 mod tests {
     use super::*;
     use crate::config::ParamKind;
+    use crate::tui::app::AppInit;
     use crate::tui::form::{CandidateState, Field};
 
     fn line_text(line: Line<'static>) -> String {
@@ -1116,6 +1246,7 @@ mod tests {
             0,
             0,
             false,
+            false,
         );
         let star = line
             .spans
@@ -1146,6 +1277,7 @@ mod tests {
             0,
             0,
             0,
+            false,
             false,
         );
 
@@ -1180,9 +1312,182 @@ mod tests {
             1,
             2,
             false,
+            false,
         ));
 
         assert!(text.contains("[l] logs (1/2)  [R] reset"));
+    }
+
+    #[test]
+    fn normal_bar_marks_failed_count_with_info_shortcut() {
+        struct Case {
+            name: &'static str,
+            counts: StatusCounts,
+            want: &'static str,
+            reject: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "service failure details available",
+                counts: StatusCounts {
+                    services_total: 2,
+                    services_failed: 2,
+                    ..Default::default()
+                },
+                want: "2 failed [i]",
+                reject: "2 failed  [i]",
+            },
+            Case {
+                name: "task-only failure details available",
+                counts: StatusCounts {
+                    tasks_failed: 1,
+                    ..Default::default()
+                },
+                want: "1 task failed [i]",
+                reject: "1 tasks failed",
+            },
+        ];
+
+        for case in cases {
+            let text = line_text(normal_bar_line(
+                &case.counts,
+                &FilterState::new(Vec::new(), &std::collections::HashSet::new(), None),
+                0,
+                0,
+                2,
+                false,
+                true,
+            ));
+
+            assert!(text.contains(case.want), "case: {}", case.name);
+            assert!(!text.contains(case.reject), "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn task_state_column_stays_visible_across_terminal_widths() {
+        struct Case {
+            width: u16,
+            want_headers: &'static [&'static str],
+            reject_headers: &'static [&'static str],
+            want_state: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                width: 50,
+                want_headers: &["NAME", "STATE"],
+                reject_headers: &["LAST RUN", "RESULT", "DURATION"],
+                want_state: "dep failed:",
+            },
+            Case {
+                width: 60,
+                want_headers: &["NAME", "STATE"],
+                reject_headers: &["LAST RUN", "RESULT", "DURATION"],
+                want_state: "configure-kafka-topics",
+            },
+            Case {
+                width: 80,
+                want_headers: &["NAME", "STATE", "RESULT"],
+                reject_headers: &["LAST RUN", "DURATION"],
+                want_state: "configure-kafka-topics",
+            },
+        ];
+
+        for case in cases {
+            let rendered = rendered_task_table(case.width);
+            for header in case.want_headers {
+                assert!(
+                    rendered.contains(header),
+                    "width {} should show {header}: {rendered}",
+                    case.width
+                );
+            }
+            for header in case.reject_headers {
+                assert!(
+                    !rendered.contains(header),
+                    "width {} should hide {header}: {rendered}",
+                    case.width
+                );
+            }
+            assert!(
+                rendered.contains(case.want_state),
+                "width {} should preserve task state detail: {rendered}",
+                case.width
+            );
+        }
+    }
+
+    fn rendered_task_table(width: u16) -> String {
+        let mut app = App::new(AppInit {
+            service_names: Vec::new(),
+            task_names: vec!["configure-everything".to_string()],
+            build_tool_names: Vec::new(),
+            task_configs: HashMap::new(),
+            task_last_runs: HashMap::new(),
+            hidden_names: std::collections::HashSet::new(),
+            auto_filter_on_failure_names: std::collections::HashSet::new(),
+            cli_log_filter: None,
+            verbose_enabled: false,
+        });
+        app.apply_task_state(
+            "configure-everything".to_string(),
+            TaskItemState::DependencyFailed,
+            None,
+            vec!["configure-kafka-topics".to_string()],
+        );
+        app.view_mode = ViewMode::Tasks;
+
+        let backend = ratatui::backend::TestBackend::new(width, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn failure_summary_wraps_instead_of_truncating_root_causes() {
+        let mut app = App::new(AppInit {
+            service_names: vec!["api".to_string()],
+            task_names: Vec::new(),
+            build_tool_names: Vec::new(),
+            task_configs: HashMap::new(),
+            task_last_runs: HashMap::new(),
+            hidden_names: std::collections::HashSet::new(),
+            auto_filter_on_failure_names: std::collections::HashSet::new(),
+            cli_log_filter: None,
+            verbose_enabled: false,
+        });
+        app.apply_service_runtime(
+            "api".to_string(),
+            ServiceState::DependencyFailed,
+            None,
+            vec![
+                "configure-kafka-topics".to_string(),
+                "configure-mongo-collections".to_string(),
+            ],
+        );
+        app.open_failure_summary();
+
+        let backend = ratatui::backend::TestBackend::new(45, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("configure-kafka-topics"));
+        assert!(rendered.contains("configure-mongo-collections"));
     }
 
     #[test]
@@ -1252,7 +1557,8 @@ mod tests {
             has_params: false,
         };
 
-        let _row = task_table_row(&item, &HashMap::new());
+        let layout = task_table_layout(120);
+        let _row = task_table_row(&item, &HashMap::new(), &layout.columns);
 
         assert_eq!(format_task_result(item.last_run.as_ref()), "ok");
         assert_eq!(

@@ -338,9 +338,9 @@ impl Runner {
         roots
     }
 
-    /// Refresh dependency-failure causes and recover items whose complete
-    /// dependency set is satisfied. Iterating in topological order lets a
-    /// root-cause update flow through every descendant in one sweep.
+    /// Refresh dependency-failure causes and return recovered items to the
+    /// pending scheduler. Iterating in topological order lets a root-cause
+    /// update flow through every descendant in one sweep.
     fn reconcile_dependency_failures(
         &mut self,
         dep_map: &HashMap<String, Vec<String>>,
@@ -377,17 +377,12 @@ impl Runner {
                 continue;
             }
 
-            // A dependency that is merely retrying is not enough: descendants
-            // remain blocked until every dependency reaches a satisfied state.
-            if is_dependency_failed
-                && dependencies
-                    .iter()
-                    .all(|dependency| self.is_dep_satisfied(dependency))
-            {
+            if is_dependency_failed {
                 if service_state.is_some() {
                     // A lazy service reaches DependencyFailed only after a
                     // connection moved it out of Lazy. Pending preserves that
-                    // queued request for the normal scheduler.
+                    // queued request for the normal scheduler. That scheduler
+                    // still waits for every dependency to become satisfied.
                     self.set_service_state(name, ServiceState::Pending);
                 } else {
                     self.set_task_state(name, TaskItemState::Pending);

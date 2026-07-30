@@ -40,6 +40,7 @@
 mod app;
 mod backend;
 mod events;
+mod failure_summary;
 mod filter;
 mod form;
 mod fuzzy;
@@ -134,7 +135,12 @@ impl Modal {
 
     fn draw(&mut self, app: &mut App) -> Result<(), TuiError> {
         let size = self.terminal.size()?;
-        app.sync_log_popup_scroll(render::log_popup_visible_rows(size.into()));
+        let area: Rect = size.into();
+        app.sync_log_popup_scroll(render::log_popup_visible_rows(area));
+        if app.view_mode == ViewMode::Failures {
+            let max_scroll = render::failure_summary_max_scroll(area, app);
+            app.sync_failure_summary_scroll(max_scroll);
+        }
         self.terminal.draw(|f| render::draw_modal(f, app))?;
         Ok(())
     }
@@ -776,6 +782,7 @@ fn handle_key(
         ViewMode::Services => {
             handle_services_key(key, app, terminal, store, command_tx, controls, modal)?;
         }
+        ViewMode::Failures => handle_failure_summary_key(key, app, terminal, store, modal)?,
         ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
     }
     Ok(())
@@ -832,11 +839,43 @@ fn handle_normal_key(
             m.draw(app)?;
             *modal = Some(m);
         }
+        KeyCode::Char('i') if app.has_failure_summary() => {
+            app.open_failure_summary();
+            let mut m = Modal::enter(store.next_id())?;
+            m.draw(app)?;
+            *modal = Some(m);
+        }
         KeyCode::Char('R') if app.filter.reset_to_defaults() => {
             clear_and_replay(terminal, store, app)?;
         }
         _ => {}
     }
+    Ok(())
+}
+
+fn handle_failure_summary_key(
+    key: KeyEvent,
+    app: &mut App,
+    terminal: &mut TuiTerminal,
+    store: &mut LogStore,
+    modal: &mut Option<Modal>,
+) -> Result<(), TuiError> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => {
+            app.view_mode = ViewMode::Normal;
+            app.failure_summary_scroll = 0;
+            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
+            return Ok(());
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.scroll_failure_summary_by(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.scroll_failure_summary_by(1),
+        KeyCode::PageUp => app.scroll_failure_summary_by(-10),
+        KeyCode::PageDown => app.scroll_failure_summary_by(10),
+        KeyCode::Home | KeyCode::Char('g') => app.scroll_failure_summary_to_top(),
+        KeyCode::End | KeyCode::Char('G') => app.scroll_failure_summary_to_bottom(),
+        _ => return Ok(()),
+    }
+    redraw_current_view(app, terminal, modal)?;
     Ok(())
 }
 
