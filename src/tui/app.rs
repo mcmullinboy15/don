@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::failure_summary::{self, FailureSummaryItem};
 use super::filter::FilterState;
 use super::form::FormState;
 use super::status_table::{StatusTableState, retain_fuzzy_matches};
@@ -37,6 +38,8 @@ pub(crate) enum ViewMode {
     /// highlight; Enter toggles start/stop on the selected service, `r`
     /// restarts it, `R` hard-restarts it, `Esc` dismisses.
     Services,
+    /// Full-screen summary of root failures and dependency-blocked items.
+    Failures,
     /// Param-entry form for a task. Opened from the task table when the user
     /// selects a task with declared `params`. Collects values and, on
     /// submit, dispatches `RunnerCommand::RunTask { name, params, reply }`.
@@ -138,6 +141,7 @@ pub(crate) struct StatusCounts {
     pub(crate) services_active: usize,
     pub(crate) tasks_running: usize,
     pub(crate) tasks_pending_run: usize,
+    pub(crate) tasks_failed: usize,
 }
 
 impl StatusCounts {
@@ -178,6 +182,7 @@ impl StatusCounts {
             match state {
                 TaskItemState::PendingRun => counts.tasks_pending_run += 1,
                 TaskItemState::Running => counts.tasks_running += 1,
+                TaskItemState::Failed | TaskItemState::DependencyFailed => counts.tasks_failed += 1,
                 _ => {}
             }
         }
@@ -216,6 +221,8 @@ pub(crate) struct App {
     pub(crate) update_badge: Option<UpdateBadge>,
     pub(crate) services_table: StatusTableState,
     pub(crate) tasks_table: StatusTableState,
+    /// Vertical scroll offset for the wrapped failure-summary view.
+    pub(crate) failure_summary_scroll: usize,
     /// Static task-config snapshot — populated at TUI startup so the
     /// table/form can inspect declared params without reaching back into
     /// the runner. Immutable for the session; the runner re-validates on
@@ -301,6 +308,7 @@ impl App {
             update_badge: None,
             services_table: StatusTableState::default(),
             tasks_table: StatusTableState::default(),
+            failure_summary_scroll: 0,
             task_configs,
             auto_filter_on_failure_names,
             form: None,
@@ -314,6 +322,7 @@ impl App {
         self.view_mode = ViewMode::Normal;
         self.services_table.reset();
         self.tasks_table.reset();
+        self.failure_summary_scroll = 0;
         self.form = None;
         self.log_popup = None;
     }
@@ -399,6 +408,47 @@ impl App {
                 .then_with(|| a.name().cmp(b.name()))
         });
         items
+    }
+
+    pub(crate) fn has_failure_summary(&self) -> bool {
+        failure_summary::has_failures(&self.services_state, &self.tasks_state)
+    }
+
+    pub(crate) fn failure_summary_items(&self) -> Vec<FailureSummaryItem> {
+        failure_summary::collect(
+            &self.services_state,
+            &self.tasks_state,
+            &self.failed_dependencies,
+        )
+    }
+
+    pub(crate) fn open_failure_summary(&mut self) {
+        self.failure_summary_scroll = 0;
+        self.view_mode = ViewMode::Failures;
+    }
+
+    pub(crate) fn scroll_failure_summary_by(&mut self, delta: isize) {
+        if delta < 0 {
+            self.failure_summary_scroll = self
+                .failure_summary_scroll
+                .saturating_sub(delta.unsigned_abs());
+        } else {
+            self.failure_summary_scroll = self
+                .failure_summary_scroll
+                .saturating_add(delta.unsigned_abs());
+        }
+    }
+
+    pub(crate) fn scroll_failure_summary_to_top(&mut self) {
+        self.failure_summary_scroll = 0;
+    }
+
+    pub(crate) fn scroll_failure_summary_to_bottom(&mut self) {
+        self.failure_summary_scroll = usize::MAX;
+    }
+
+    pub(crate) fn sync_failure_summary_scroll(&mut self, max_scroll: usize) {
+        self.failure_summary_scroll = self.failure_summary_scroll.min(max_scroll);
     }
 
     /// Apply a runner-emitted state change. Returns `true` when counts
@@ -630,6 +680,7 @@ mod tests {
                     services_active: 0,
                     tasks_running: 0,
                     tasks_pending_run: 0,
+                    tasks_failed: 0,
                 },
             },
             Case {
@@ -645,6 +696,7 @@ mod tests {
                     ("seed", TaskItemState::Completed),
                     ("backup", TaskItemState::PendingRun),
                     ("build", TaskItemState::Running),
+                    ("lint", TaskItemState::Failed),
                 ],
                 want: StatusCounts {
                     services_total: 3, // cache (Lazy) doesn't count
@@ -654,6 +706,7 @@ mod tests {
                     services_active: 1, // queue (Starting)
                     tasks_running: 1,   // build
                     tasks_pending_run: 2,
+                    tasks_failed: 1,
                 },
             },
             Case {
@@ -668,6 +721,7 @@ mod tests {
                     services_active: 1,
                     tasks_running: 0,
                     tasks_pending_run: 0,
+                    tasks_failed: 0,
                 },
             },
         ];
@@ -1065,6 +1119,10 @@ mod tests {
             },
             Case {
                 mode: ViewMode::Services,
+                want: false,
+            },
+            Case {
+                mode: ViewMode::Failures,
                 want: false,
             },
             Case {

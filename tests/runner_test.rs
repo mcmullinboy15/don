@@ -1604,6 +1604,38 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
             .unwrap();
         wait_for_substr(&buf, "DB_RECOVERING", Duration::from_secs(5)).await;
 
+        let mut cleared_recovered_root = false;
+        for _ in 0..20 {
+            let (status_tx, status_rx) = oneshot::channel();
+            cmd_tx
+                .send(RunnerCommand::Status {
+                    verbose: false,
+                    name: Some("api".to_string()),
+                    reply: status_tx,
+                })
+                .unwrap();
+            let statuses = status_rx.await.unwrap();
+            cleared_recovered_root = statuses.iter().any(|item| {
+                matches!(
+                    item,
+                    ItemStatus::Service {
+                        state: ServiceState::Pending,
+                        failed_dependencies,
+                        ..
+                    } if failed_dependencies.is_empty()
+                )
+            });
+            if cleared_recovered_root {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            cleared_recovered_root,
+            "api should stop naming recovered db while db is still running: {}",
+            read_buf(&buf)
+        );
+
         cmd_tx
             .send(RunnerCommand::TaskRerun {
                 name: "cache".to_string(),
