@@ -3,6 +3,7 @@
 //! The config is loaded from a `don.toml` file and defines services, tasks,
 //! and profiles for a dev environment.
 
+pub(crate) mod dependency;
 mod download;
 mod group;
 pub(crate) mod param;
@@ -13,6 +14,7 @@ pub(crate) mod task;
 pub(crate) mod template;
 pub(crate) mod types;
 
+pub use self::dependency::Dependency;
 pub use self::download::{DownloadConfig, PlatformDownload};
 pub use self::group::ServiceGroup;
 pub use self::param::{CompletionParse, Completions, ParamKind, ParamValidate, TaskParam};
@@ -205,13 +207,15 @@ impl Config {
         names
     }
 
-    pub(crate) fn expand_dependency_refs(&self, refs: &[String]) -> Vec<String> {
+    /// Expand `depends_on` entries: every service-group reference becomes its
+    /// transitive members, each inheriting the requiredness declared on the
+    /// group reference. Duplicates collapse to the strictest edge.
+    pub(crate) fn expand_dependency_refs(&self, refs: &[Dependency]) -> Vec<Dependency> {
         let mut expanded = Vec::new();
-        let mut seen = HashSet::new();
         let mut group_stack = Vec::new();
 
-        for name in refs {
-            self.expand_dependency_ref(name, &mut expanded, &mut seen, &mut group_stack);
+        for dep in refs {
+            self.expand_dependency_ref(dep, &mut expanded, &mut group_stack);
         }
 
         expanded
@@ -219,53 +223,62 @@ impl Config {
 
     fn expand_dependency_ref(
         &self,
-        name: &str,
-        expanded: &mut Vec<String>,
-        seen: &mut HashSet<String>,
+        dep: &Dependency,
+        expanded: &mut Vec<Dependency>,
         group_stack: &mut Vec<String>,
     ) {
-        if self.service_groups.contains_key(name) {
-            self.expand_service_group(name, expanded, seen, group_stack);
-        } else if seen.insert(name.to_string()) {
-            expanded.push(name.to_string());
+        if self.service_groups.contains_key(&dep.name) {
+            self.expand_service_group(dep, expanded, group_stack);
+        } else {
+            dependency::push_dependency(expanded, dep.clone());
         }
     }
 
     fn expand_service_group(
         &self,
-        name: &str,
-        expanded: &mut Vec<String>,
-        seen: &mut HashSet<String>,
+        dep: &Dependency,
+        expanded: &mut Vec<Dependency>,
         group_stack: &mut Vec<String>,
     ) {
-        if group_stack.iter().any(|group| group == name) {
+        if group_stack.contains(&dep.name) {
             return;
         }
 
-        group_stack.push(name.to_string());
-        if let Some(group) = self.service_groups.get(name) {
+        group_stack.push(dep.name.clone());
+        if let Some(group) = self.service_groups.get(&dep.name) {
             for member in &group.members {
-                self.expand_dependency_ref(member, expanded, seen, group_stack);
+                self.expand_dependency_ref(&dep.with_name(member), expanded, group_stack);
             }
         }
         group_stack.pop();
     }
 
+    /// Expand plain service/group name references (profiles) to leaf service
+    /// and task names.
+    pub(crate) fn expand_service_refs(&self, refs: &[String]) -> Vec<String> {
+        let deps: Vec<Dependency> = refs.iter().cloned().map(Dependency::from).collect();
+        dependency::dependency_names(&self.expand_dependency_refs(&deps))
+    }
+
     pub(crate) fn expand_profile_services(&self, refs: &[String]) -> Vec<String> {
-        self.expand_dependency_refs(refs)
+        self.expand_service_refs(refs)
     }
 
     /// Effective `depends_on` for a service or task — its own declared deps
     /// plus the `depends_on` from every group whose transitive member set
     /// contains `name`. The result is fully expanded (group refs resolved to
     /// leaf names) and deduplicated.
-    pub(crate) fn effective_depends_on(&self, name: &str, own_deps: &[String]) -> Vec<String> {
-        let mut all: Vec<String> = own_deps.to_vec();
+    pub(crate) fn effective_depends_on(
+        &self,
+        name: &str,
+        own_deps: &[Dependency],
+    ) -> Vec<Dependency> {
+        let mut all: Vec<Dependency> = own_deps.to_vec();
         for (group_name, group) in &self.service_groups {
             if group.depends_on.is_empty() {
                 continue;
             }
-            let members = self.expand_dependency_refs(std::slice::from_ref(group_name));
+            let members = self.expand_service_refs(std::slice::from_ref(group_name));
             if members.iter().any(|m| m == name) {
                 all.extend(group.depends_on.iter().cloned());
             }
@@ -332,10 +345,11 @@ impl Config {
                 }
             }
             for dep in &group.depends_on {
-                if !dependency_reference_names.contains(dep.as_str()) {
-                    let suggestion = suggest_typo(dep, &dependency_reference_names);
+                if !dependency_reference_names.contains(dep.name.as_str()) {
+                    let suggestion = suggest_typo(&dep.name, &dependency_reference_names);
                     errors.push(format!(
-                        "service group '{name}': depends on unknown service, task, or service group '{dep}'{suggestion}"
+                        "service group '{name}': depends on unknown service, task, or service group '{}'{suggestion}",
+                        dep.name
                     ));
                 }
             }
@@ -379,10 +393,11 @@ impl Config {
                 ));
             }
             for dep in &resolved.depends_on {
-                if !dependency_reference_names.contains(dep.as_str()) {
-                    let suggestion = suggest_typo(dep, &dependency_reference_names);
+                if !dependency_reference_names.contains(dep.name.as_str()) {
+                    let suggestion = suggest_typo(&dep.name, &dependency_reference_names);
                     errors.push(format!(
-                        "service '{name}': depends on unknown service, task, or service group '{dep}'{suggestion}"
+                        "service '{name}': depends on unknown service, task, or service group '{}'{suggestion}",
+                        dep.name
                     ));
                 }
             }
@@ -570,10 +585,11 @@ impl Config {
                 ));
             }
             for dep in &task.depends_on {
-                if !dependency_reference_names.contains(dep.as_str()) {
-                    let suggestion = suggest_typo(dep, &dependency_reference_names);
+                if !dependency_reference_names.contains(dep.name.as_str()) {
+                    let suggestion = suggest_typo(&dep.name, &dependency_reference_names);
                     errors.push(format!(
-                        "task '{name}': depends on unknown service, task, or service group '{dep}'{suggestion}"
+                        "task '{name}': depends on unknown service, task, or service group '{}'{suggestion}",
+                        dep.name
                     ));
                 }
             }
@@ -770,13 +786,15 @@ impl Config {
             let resolved = svc.resolve(platform);
             deps.insert(
                 name.clone(),
-                self.effective_depends_on(name, &resolved.depends_on),
+                dependency::dependency_names(
+                    &self.effective_depends_on(name, &resolved.depends_on),
+                ),
             );
         }
         for (name, task) in &self.tasks {
             deps.insert(
                 name.clone(),
-                self.effective_depends_on(name, &task.depends_on),
+                dependency::dependency_names(&self.effective_depends_on(name, &task.depends_on)),
             );
         }
 
@@ -1426,7 +1444,7 @@ mod tests {
                         rust.target_dir.as_deref(),
                         Some(std::path::Path::new("./target-api"))
                     );
-                    assert_eq!(resolved.depends_on, vec!["postgres"]);
+                    assert_eq!(resolved.depends_on, vec![Dependency::required("postgres")]);
                     assert_eq!(resolved.proxy.len(), 1);
                     assert_eq!(resolved.proxy[0].listen, "0.0.0.0:3000");
                     assert_eq!(resolved.proxy[0].mode, crate::config::ProxyMode::Listenfd);
@@ -1749,13 +1767,13 @@ mod tests {
                     let migrate = &config.tasks["migrate"];
                     assert_eq!(migrate.cmd, "dbmate");
                     assert_eq!(migrate.args, vec!["up"]);
-                    assert_eq!(migrate.depends_on, vec!["postgres"]);
+                    assert_eq!(migrate.depends_on, vec![Dependency::required("postgres")]);
                     assert_eq!(migrate.watch, vec!["db/migrations/**/*.sql"]);
                     assert_eq!(migrate.dir.as_deref(), Some(std::path::Path::new("./db")));
                     assert_eq!(migrate.env["DATABASE_URL"], "postgres://localhost:5432/dev");
 
                     let seed = &config.tasks["seed"];
-                    assert_eq!(seed.depends_on, vec!["migrate"]);
+                    assert_eq!(seed.depends_on, vec![Dependency::required("migrate")]);
                     assert!(matches!(seed.log, LogConfig::Ignore));
 
                     assert!(config.validate(TEST_PLATFORM).is_ok());
@@ -1904,7 +1922,7 @@ mod tests {
                 check: |config| {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     assert_eq!(
-                        config.expand_dependency_refs(&["backend".to_string()]),
+                        config.expand_service_refs(&["backend".to_string()]),
                         vec![
                             "postgres".to_string(),
                             "redis".to_string(),
@@ -2015,7 +2033,7 @@ mod tests {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     let group = config.service_groups.get("frontend").unwrap();
                     assert_eq!(group.members, vec!["web"]);
-                    assert_eq!(group.depends_on, vec!["api"]);
+                    assert_eq!(group.depends_on, vec![Dependency::required("api")]);
                 },
             },
             ConfigTestCase {
@@ -2032,7 +2050,7 @@ mod tests {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     let group = config.service_groups.get("frontend").unwrap();
                     assert!(group.members.is_empty());
-                    assert_eq!(group.depends_on, vec!["api"]);
+                    assert_eq!(group.depends_on, vec![Dependency::required("api")]);
                 },
             },
             ConfigTestCase {
@@ -2055,9 +2073,16 @@ mod tests {
                 expect_err: false,
                 check: |config| {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
-                    let mut deps = config.effective_depends_on("web", &["self-only".to_string()]);
+                    let mut deps =
+                        config.effective_depends_on("web", &[Dependency::required("self-only")]);
                     deps.sort();
-                    assert_eq!(deps, vec!["api".to_string(), "self-only".to_string()]);
+                    assert_eq!(
+                        deps,
+                        vec![
+                            Dependency::required("api"),
+                            Dependency::required("self-only"),
+                        ]
+                    );
                 },
             },
             ConfigTestCase {
@@ -2084,11 +2109,11 @@ mod tests {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     assert_eq!(
                         config.effective_depends_on("web", &[]),
-                        vec!["api".to_string()],
+                        vec![Dependency::required("api")],
                     );
                     assert_eq!(
                         config.effective_depends_on("admin", &[]),
-                        vec!["api".to_string()],
+                        vec![Dependency::required("api")],
                     );
                 },
             },
@@ -2116,7 +2141,66 @@ mod tests {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     let mut deps = config.effective_depends_on("web", &[]);
                     deps.sort();
-                    assert_eq!(deps, vec!["api".to_string(), "worker".to_string()]);
+                    assert_eq!(
+                        deps,
+                        vec![Dependency::required("api"), Dependency::required("worker")]
+                    );
+                },
+            },
+            ConfigTestCase {
+                name: "an optional group reference makes every member optional",
+                input: r#"
+                    [services.web]
+                    run.cmd = "web"
+                    depends_on = [{ name = "backend", required = false }]
+
+                    [services.api]
+                    run.cmd = "api"
+
+                    [services.worker]
+                    run.cmd = "worker"
+
+                    [service_groups.backend]
+                    members = ["api", "worker"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    let web = config.services["web"].resolve(TEST_PLATFORM);
+                    let mut deps = config.effective_depends_on("web", &web.depends_on);
+                    deps.sort();
+                    assert_eq!(
+                        deps,
+                        vec![Dependency::optional("api"), Dependency::optional("worker")]
+                    );
+                },
+            },
+            ConfigTestCase {
+                name: "a name reached both ways keeps the required edge",
+                input: r#"
+                    [services.web]
+                    run.cmd = "web"
+                    depends_on = [{ name = "backend", required = false }, "api"]
+
+                    [services.api]
+                    run.cmd = "api"
+
+                    [services.worker]
+                    run.cmd = "worker"
+
+                    [service_groups.backend]
+                    members = ["api", "worker"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    let web = config.services["web"].resolve(TEST_PLATFORM);
+                    let mut deps = config.effective_depends_on("web", &web.depends_on);
+                    deps.sort();
+                    assert_eq!(
+                        deps,
+                        vec![Dependency::required("api"), Dependency::optional("worker")]
+                    );
                 },
             },
             ConfigTestCase {

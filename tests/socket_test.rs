@@ -1344,3 +1344,244 @@ fn integration_lazy_service_dep_failure_after_startup_blocks_start() {
         handle.await.unwrap();
     });
 }
+
+/// A service that has landed in a failed state must refuse proxy connections
+/// rather than leave clients parked on a socket that nothing will ever read.
+/// Both proxy modes are covered: don's own forwarding accept loop (env mode)
+/// and the listenfd socket the child would otherwise be accepting on.
+#[test]
+fn integration_failed_service_proxy_refuses_connections() {
+    use tokio::io::AsyncReadExt;
+
+    struct Case {
+        name: &'static str,
+        listenfd: bool,
+    }
+
+    let cases = vec![
+        Case {
+            name: "listenfd proxy",
+            listenfd: true,
+        },
+        Case {
+            name: "env proxy",
+            listenfd: false,
+        },
+    ];
+
+    for case in cases {
+        run_with_timeout(Duration::from_secs(20), async move {
+            let dir = TempDir::new("proxy-refuse");
+            let port = free_port();
+            let addr = format!("127.0.0.1:{port}");
+
+            let service = ConfigBuilder::new()
+                .add_task(
+                    "setup",
+                    "bash",
+                    &["-c", "sleep 1; echo SETUP_FAILING; exit 1"],
+                )
+                .done()
+                .add_custom_service("api", "bash", &["-c", "echo API_STARTED; exec sleep 60"])
+                .depends_on(&["setup"]);
+            let toml = if case.listenfd {
+                service.proxy_listenfd(&[&addr])
+            } else {
+                service.proxy_env(&addr, "PORT")
+            }
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+            let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+            let handle = tokio::spawn(async move {
+                runner.run().await.unwrap();
+            });
+
+            assert!(
+                wait_for_output(
+                    &buf,
+                    &format!("proxy listening on {addr}"),
+                    Duration::from_secs(5)
+                )
+                .await,
+                "{}: expected proxy to bind. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            // Connect while `setup` is still running: the service isn't up
+            // yet, so the connection is held rather than closed.
+            let mut early = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            let mut byte = [0u8; 1];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), early.read(&mut byte))
+                    .await
+                    .is_err(),
+                "{}: connections should queue while the service is still starting. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            assert!(
+                wait_for_output(
+                    &buf,
+                    "api: skipped (dependency 'setup' failed)",
+                    Duration::from_secs(8)
+                )
+                .await,
+                "{}: expected api to reach DependencyFailed. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            // Now that api is failed, the queued connection is closed and new
+            // ones are refused immediately.
+            let closed = tokio::time::timeout(Duration::from_secs(5), early.read(&mut byte))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{}: a parked connection should close once the service failed. output: {}",
+                        case.name,
+                        read_buf(&buf)
+                    )
+                })
+                .unwrap_or(0);
+            assert_eq!(closed, 0, "{}: expected a clean close", case.name);
+
+            let mut fresh = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            let refused = tokio::time::timeout(Duration::from_secs(5), fresh.read(&mut byte))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{}: new connections should be refused while failed. output: {}",
+                        case.name,
+                        read_buf(&buf)
+                    )
+                })
+                .unwrap_or(0);
+            assert_eq!(refused, 0, "{}: expected a clean close", case.name);
+
+            assert!(
+                !read_buf(&buf).contains("API_STARTED"),
+                "{}: api must not launch when its dependency failed. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+        });
+    }
+}
+
+/// `Failed` does not mean "the process is gone": under the default
+/// `on_failure = "notify"` a service whose ready check fails keeps running and
+/// may well be serving traffic. Don must keep proxying it — and in listenfd
+/// mode must not accept on the socket the live child is accepting on.
+#[test]
+fn integration_failed_but_live_service_keeps_serving_its_proxy() {
+    use tokio::io::AsyncReadExt;
+
+    struct Case {
+        name: &'static str,
+        listenfd: bool,
+    }
+
+    let cases = vec![
+        Case {
+            name: "listenfd proxy",
+            listenfd: true,
+        },
+        Case {
+            name: "env proxy",
+            listenfd: false,
+        },
+    ];
+
+    for case in cases {
+        run_with_timeout(Duration::from_secs(25), async move {
+            let dir = TempDir::new("failed-but-live");
+            let port = free_port();
+            let addr = format!("127.0.0.1:{port}");
+
+            // A server that keeps serving no matter what don thinks of it.
+            let script_path = dir.path().join("serve.py");
+            let source = if case.listenfd {
+                "import socket, os\ns = socket.fromfd(3, socket.AF_INET, socket.SOCK_STREAM)\nos.close(3)\n"
+            } else {
+                "import socket, os\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', int(os.environ['PORT'])))\ns.listen(16)\n"
+            };
+            std::fs::write(
+                &script_path,
+                format!("{source}print('SERVING', flush=True)\nwhile True:\n    conn, _ = s.accept()\n    conn.sendall(b'HELLO')\n    conn.close()\n"),
+            )
+            .unwrap();
+
+            let script = script_path.to_str().unwrap().to_string();
+            let service = ConfigBuilder::new().add_custom_service("api", "python3", &[&script]);
+            let toml = if case.listenfd {
+                service.proxy_listenfd(&[&addr])
+            } else {
+                service.proxy_env(&addr, "PORT")
+            }
+            // Never passes, so the service is declared failed while its
+            // process happily keeps accepting connections.
+            .ready_exec_with("false", &[], "100ms", 3)
+            .done()
+            .build();
+
+            let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+            let handle = tokio::spawn(async move {
+                runner.run().await.unwrap();
+            });
+
+            assert!(
+                wait_for_output(&buf, "SERVING", Duration::from_secs(10)).await,
+                "{}: server should be up. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+            assert!(
+                wait_for_output(&buf, "ready check failed", Duration::from_secs(10)).await,
+                "{}: ready check should have failed. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            // The service is `failed` but alive — every connection must still
+            // be served, not stolen and closed by don.
+            for attempt in 0..5 {
+                let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                let mut got = vec![0u8; 16];
+                let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut got))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{}: attempt {attempt} hung. output: {}",
+                            case.name,
+                            read_buf(&buf)
+                        )
+                    })
+                    .unwrap_or(0);
+                assert_eq!(
+                    String::from_utf8_lossy(&got[..n]),
+                    "HELLO",
+                    "{}: attempt {attempt} was not served by the live process. output: {}",
+                    case.name,
+                    read_buf(&buf)
+                );
+            }
+
+            assert!(
+                !read_buf(&buf).contains("refusing connections"),
+                "{}: don must not refuse while the process is alive. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+        });
+    }
+}

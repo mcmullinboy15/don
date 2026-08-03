@@ -1,4 +1,6 @@
 use super::Runner;
+use crate::config::Dependency;
+use crate::config::dependency::dependency_names;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Topologically sort a dependency graph.
@@ -186,8 +188,18 @@ pub(crate) fn compute_depths(
     depths
 }
 
+/// Drop the edge kinds from a dependency map, keeping only names.
+pub(in crate::runner) fn dep_name_map(
+    deps: &HashMap<String, Vec<Dependency>>,
+) -> HashMap<String, Vec<String>> {
+    deps.iter()
+        .map(|(name, deps)| (name.clone(), dependency_names(deps)))
+        .collect()
+}
+
 impl Runner {
-    pub(in crate::runner) fn build_dep_map(&self) -> HashMap<String, Vec<String>> {
+    /// Full dependency edges (names *and* kinds) for every active item.
+    pub(in crate::runner) fn build_dep_map(&self) -> HashMap<String, Vec<Dependency>> {
         let mut deps = HashMap::new();
         for (name, rs) in &self.services {
             deps.insert(name.clone(), rs.resolved.depends_on.clone());
@@ -196,5 +208,12 @@ impl Runner {
             deps.insert(name.clone(), rt.config.depends_on.clone());
         }
         deps
+    }
+
+    /// Dependency edges reduced to names, for ordering-only consumers
+    /// (topological sort, shutdown depth). Optional edges still order the
+    /// graph — they just don't gate on success.
+    pub(in crate::runner) fn build_dep_name_map(&self) -> HashMap<String, Vec<String>> {
+        dep_name_map(&self.build_dep_map())
     }
 }

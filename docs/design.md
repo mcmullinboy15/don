@@ -146,7 +146,7 @@ These fields are available on all service presets:
 | `env_file` | list of paths | Env files to load. Don also auto-loads `.env.<service-name>` if it exists |
 | `watch` | list of globs | File patterns to watch for rebuilding/restarting |
 | `debounce` | duration string | Debounce window for watch events (default "200ms") |
-| `depends_on` | list of names | Services or tasks that must be ready/complete first |
+| `depends_on` | list of names or `{name, required}` tables | Services or tasks that must be ready/complete first. `required = false` makes an entry ordering-only |
 | `proxy` | address or list | Public listeners using env forwarding, fixed forwarding, or `LISTEN_FDS` handoff |
 | `ready` | table | Ready check configuration (see below) |
 | `shutdown` | table | Shutdown behavior (see below) |
@@ -177,7 +177,7 @@ log = "ignore"
 | `args` | list | Arguments to pass |
 | `dir` | path | Working directory |
 | `env` | map | Environment variables |
-| `depends_on` | list of names | Services or tasks that must be ready/complete first |
+| `depends_on` | list of names or `{name, required}` tables | Services or tasks that must be ready/complete first. `required = false` makes an entry ordering-only |
 | `watch` | list of globs | File patterns — task only re-runs if these changed since last success. Empty = always runs |
 | `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
@@ -407,6 +407,36 @@ proxy = [
 ]
 ```
 
+### Connection policy while a service is down
+
+Don's listeners outlive the process, so what happens to a connection depends
+on *why* the service isn't answering:
+
+| Service state | Behavior |
+|---------------|----------|
+| starting, restarting, not yet ready | connections are held — env/forward entries park until the backend appears, listenfd entries sit in the kernel accept queue |
+| failed, **process still alive** | connections are served normally |
+| failed, **no process left** | connections are **refused**: already-queued and new connections are closed immediately |
+
+Refusal exists because queuing is only kind when someone is coming back. A
+service that failed and has no process leaves clients blocked on a socket
+nothing will ever read.
+
+The liveness half of that rule matters. `failed` does not imply the process
+is gone: under the default `on_failure = "notify"`, a service whose ready
+check fails keeps running and is often still serving traffic — a misconfigured
+health probe must not take the app down. Don only refuses once the service has
+both failed and lost its process (a crash, or a dependency failure where
+nothing was ever spawned).
+
+For env/forward entries the accept loop closes the client. For listenfd
+entries Don drains and closes the accept queue itself; that is only safe
+because the liveness rule guarantees no child is accepting on that socket at
+the same time. Each listenfd socket has exactly one supervisor task — a
+second `AsyncFd` registration on the same descriptor fails with `EEXIST`, so
+the lazy start trigger and the refusal drain are two modes of one task rather
+than two tasks. `don status --verbose` marks a refusing listener.
+
 ## Dependency Graph
 
 Services and tasks share a single dependency namespace. The `depends_on` field accepts names of both services and tasks:
@@ -417,6 +447,36 @@ Services and tasks share a single dependency namespace. The `depends_on` field a
 - A task depending on a **task**: waits for the dependency to complete successfully
 
 Names must be unique across services and tasks (validated).
+
+### Required and optional dependencies
+
+Each `depends_on` entry is either a bare name or a table carrying the edge
+kind:
+
+```toml
+[services.api]
+rust.binary = "api-server"
+depends_on = [
+  "postgres",                                    # required (default)
+  { name = "otel-collector", required = false }, # ordering only
+]
+```
+
+| Kind | Gate | On dependency failure |
+|------|------|-----------------------|
+| required (default) | waits for ready/complete | dependent is skipped, `DependencyFailed`, with the root cause named |
+| optional (`required = false`) | waits for the dependency to *settle* | dependent starts anyway and logs `starting without optional dependency '<name>'` |
+
+"Settled" means the dependency is done deciding: a service that is ready,
+failed, or stopped; a task that completed, failed, or is parked waiting for a
+manual trigger (`auto_run = false`). An optional edge also does not make a
+manual task "required by dependents" — only a required edge does.
+
+Optional is not the same as "ignored": the edge still orders startup, reverse
+shutdown order, and profile resolution — it only stops a failure from
+cascading. Group references carry their kind to every member, and when the
+same name is reachable through both a required and an optional edge, the
+required edge wins.
 
 You can also define named groups of services and reference those group names
 from `depends_on`:

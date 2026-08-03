@@ -8,6 +8,8 @@
 
 use serde::Deserialize;
 
+use super::dependency::Dependency;
+
 /// A named bundle of services (and/or nested groups) that can be referenced
 /// as a single name from `depends_on` and `profiles.*.services`.
 ///
@@ -20,7 +22,7 @@ pub struct ServiceGroup {
     pub members: Vec<String>,
     /// Dependencies applied to every (transitive) member of this group.
     /// May reference services, tasks, or other groups.
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<Dependency>,
 }
 
 #[derive(Deserialize)]
@@ -33,7 +35,7 @@ enum RawServiceGroup {
         #[serde(default)]
         members: Vec<String>,
         #[serde(default)]
-        depends_on: Vec<String>,
+        depends_on: Vec<Dependency>,
     },
 }
 

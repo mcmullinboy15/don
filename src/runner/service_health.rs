@@ -160,17 +160,43 @@ impl Runner {
             Some(rs) => rs.state(),
             None => return,
         };
-        if !matches!(
-            state,
-            ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
-        ) {
-            return;
-        }
         let current_pgid = self.services.get(name).and_then(|rs| match &rs.handle {
             Some(ServiceHandle::Process(p)) => Some(p.pgid()),
             _ => None,
         });
         if current_pgid != Some(pgid) {
+            return;
+        }
+        // A service can sit in `Failed` with its process still alive: a failed
+        // ready check under the default `on_failure = "notify"` reports the
+        // failure and leaves the process running. When that process later
+        // exits, the live-state path below doesn't run, so nothing reaps it —
+        // the zombie and its PTY stay held, and the proxy keeps parking
+        // clients on a socket that now has nobody behind it. Reap it and let
+        // the proxy switch to refusing.
+        if state == ServiceState::Failed {
+            if let Some(ServiceHandle::Process(mut proc)) =
+                self.services.get_mut(name).and_then(|rs| rs.handle.take())
+            {
+                // The crash watcher only fires after the child's output
+                // EOF'd, so this wait doesn't block the runner.
+                let _ = proc.wait().await;
+            }
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.pgid = None;
+                rs.osc_sink = None;
+                rs.stop_health_tracking();
+            }
+            self.sync_proxy_policy(name);
+            if let Some(writer) = self.output_manager.service_writer(name) {
+                writer.close_follow_sinks().await;
+            }
+            return;
+        }
+        if !matches!(
+            state,
+            ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
+        ) {
             return;
         }
         let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
@@ -287,7 +313,11 @@ impl Runner {
     /// and via the crash watcher. The state check makes this idempotent: the
     /// first caller transitions the service out of a live state, and the second
     /// sees `Lazy`/`Failed` and returns, so the streak counts one per launch.
-    pub(in crate::runner) fn handle_lazy_launch_failure(&mut self, name: &str, message: Option<&str>) {
+    pub(in crate::runner) fn handle_lazy_launch_failure(
+        &mut self,
+        name: &str,
+        message: Option<&str>,
+    ) {
         if !matches!(
             self.services.get(name).map(|rs| rs.state()),
             Some(ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy)

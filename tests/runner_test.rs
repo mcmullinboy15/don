@@ -1409,6 +1409,205 @@ fn integration_restart_crashed_service_without_ready_check() {
     });
 }
 
+/// An optional (`required = false`) dependency orders startup without gating
+/// on success: when it fails, the dependent starts anyway while a sibling that
+/// depends on it the normal way is skipped.
+#[test]
+fn integration_optional_dependency_failure_does_not_block_dependent() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("optional-dep-failure");
+
+        let toml = ConfigBuilder::new()
+            .add_task("seed", "bash", &["-c", "echo SEED_FAILING; exit 1"])
+            .auto_run_mode("always")
+            .done()
+            .add_custom_service("api", "sleep", &["300"])
+            .depends_on_kinds(&[("seed", false)])
+            .log("ignore")
+            .done()
+            .add_custom_service("worker", "sleep", &["300"])
+            .depends_on(&["seed"])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(
+            &buf,
+            "worker: skipped (dependency 'seed' failed)",
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_substr(
+            &buf,
+            "api: starting without optional dependency 'seed'",
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_substr(&buf, "api: started", Duration::from_secs(10)).await;
+
+        let (status_tx, status_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Status {
+                verbose: false,
+                name: Some("api".to_string()),
+                reply: status_tx,
+            })
+            .unwrap();
+        let statuses = status_rx.await.unwrap();
+        assert!(
+            statuses.iter().any(|item| matches!(
+                item,
+                ItemStatus::Service {
+                    state: ServiceState::Ready | ServiceState::Running,
+                    ..
+                }
+            )),
+            "api should be running despite its optional dependency failing: {statuses:?}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// A task that only ever runs on a manual trigger has settled as far as an
+/// optional dependent is concerned — waiting for it would mean waiting
+/// forever. It must also not be parked as "required by dependents" when the
+/// only thing pointing at it is an optional edge.
+#[test]
+fn integration_optional_dependency_on_manual_task_does_not_block() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("optional-dep-manual-task");
+
+        let toml = ConfigBuilder::new()
+            .add_task("seed", "bash", &["-c", "echo SEED_RAN"])
+            .auto_run(false)
+            .done()
+            .add_custom_service("api", "sleep", &["300"])
+            .depends_on_kinds(&[("seed", false)])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(&buf, "api: started", Duration::from_secs(10)).await;
+        assert!(
+            !read_buf(&buf).contains("SEED_RAN"),
+            "a manual task must not be auto-run for an optional dependent. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// Stopping a service settles an optional edge, and the dependent has to be
+/// swept promptly — not left pending until something unrelated happens.
+#[test]
+fn integration_optional_dependency_unblocks_when_dependency_is_stopped() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("optional-dep-stopped");
+        // Nothing ever listens here, so `dep` stays Running and un-ready for
+        // the whole test: the optional gate is genuinely closed until we stop it.
+        let unused_port = free_port();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("dep", "sleep", &["300"])
+            .ready_tcp_with(&format!("127.0.0.1:{unused_port}"), "1s", 60)
+            .log("ignore")
+            .done()
+            .add_custom_service("api", "sleep", &["300"])
+            .depends_on_kinds(&[("dep", false)])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // `dep` is up but not ready, so `api` waits.
+        wait_for_substr(&buf, "dep: starting", Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !read_buf(&buf).contains("api: starting"),
+            "api should wait while its optional dependency is still coming up. output: {}",
+            read_buf(&buf)
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Stop {
+                name: "dep".to_string(),
+                reply: reply_tx,
+            })
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_ok(),
+            "stopping dep should succeed"
+        );
+
+        wait_for_substr(&buf, "api: started", Duration::from_secs(10)).await;
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// Optional is not the same as ignored: the dependent still starts *after*
+/// the dependency settles.
+#[test]
+fn integration_optional_dependency_still_orders_startup() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("optional-dep-ordering");
+
+        let toml = ConfigBuilder::new()
+            .add_task("seed", "bash", &["-c", "sleep 1; echo SEED_DONE"])
+            .auto_run_mode("always")
+            .done()
+            .add_custom_service("api", "sleep", &["300"])
+            .depends_on_kinds(&[("seed", false)])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(&buf, "api: started", Duration::from_secs(15)).await;
+
+        let output = read_buf(&buf);
+        let seed_done = output
+            .find("SEED_DONE")
+            .unwrap_or_else(|| panic!("seed should have run. output: {output}"));
+        let api_started = output
+            .find("api: starting")
+            .unwrap_or_else(|| panic!("api should have started. output: {output}"));
+        assert!(
+            seed_done < api_started,
+            "api should start only after its optional dependency finished. output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 #[test]
 fn integration_dependency_failed_service_recovers_downstream_start() {
     run_with_timeout(Duration::from_secs(30), async {

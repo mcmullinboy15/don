@@ -144,6 +144,13 @@ impl ServiceBuilder {
         self
     }
 
+    /// Add depends_on entries with explicit kinds: `(name, required)`.
+    pub fn depends_on_kinds(mut self, deps: &[(&str, bool)]) -> Self {
+        self.lines
+            .push(format!("depends_on = [{}]", format_dependencies(deps)));
+        self
+    }
+
     /// Set the working directory.
     pub fn dir(mut self, dir: &str) -> Self {
         self.lines.push(format!("dir = \"{dir}\""));
@@ -336,6 +343,13 @@ impl TaskBuilder {
         self
     }
 
+    /// Add depends_on entries with explicit kinds: `(name, required)`.
+    pub fn depends_on_kinds(mut self, deps: &[(&str, bool)]) -> Self {
+        self.lines
+            .push(format!("depends_on = [{}]", format_dependencies(deps)));
+        self
+    }
+
     /// Set the working directory.
     pub fn dir(mut self, dir: &str) -> Self {
         self.lines.push(format!("dir = \"{dir}\""));
@@ -400,4 +414,18 @@ impl TaskBuilder {
     pub fn write_to(self, dir: &Path) -> PathBuf {
         self.done().write_to(dir)
     }
+}
+
+/// Render `depends_on` entries, using the table form for optional edges.
+fn format_dependencies(deps: &[(&str, bool)]) -> String {
+    deps.iter()
+        .map(|(name, required)| {
+            if *required {
+                format!("\"{name}\"")
+            } else {
+                format!("{{ name = \"{name}\", required = false }}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }

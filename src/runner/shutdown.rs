@@ -132,7 +132,7 @@ impl Runner {
 
         // Build reverse dependency order for shutdown.
         // Services at the same depth (no dependency relationship) stop concurrently.
-        let dep_map = self.build_dep_map();
+        let dep_map = self.build_dep_name_map();
         let order = match topological_sort(&dep_map) {
             Ok(o) => o,
             Err(cycle) => {
