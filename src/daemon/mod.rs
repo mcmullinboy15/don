@@ -14,6 +14,7 @@
 //! window into the browser.
 
 pub mod client;
+pub mod install;
 pub mod paths;
 pub mod registry;
 pub(crate) mod routes;

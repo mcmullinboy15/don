@@ -243,6 +243,18 @@ enum DaemonCommands {
     },
     /// Stop the running daemon. Registered projects keep running.
     Stop,
+    /// Install the daemon as a per-user service so it starts on login
+    Install {
+        /// Port the installed service should serve the web UI on
+        #[arg(long, default_value_t = don::web::DEFAULT_PORT)]
+        port: u16,
+        /// Print the service file that would be written, without touching
+        /// anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Stop the installed service and remove it
+    Uninstall,
 }
 
 #[tokio::main]
@@ -738,6 +750,72 @@ async fn run_daemon_command(port: u16, no_web: bool, command: Option<DaemonComma
         None => run_daemon_foreground(paths, port, no_web).await,
         Some(DaemonCommands::Status { json }) => run_daemon_status(paths, json).await,
         Some(DaemonCommands::Stop) => run_daemon_stop(paths).await,
+        Some(DaemonCommands::Install {
+            port: install_port,
+            dry_run,
+        }) => run_daemon_install(&paths, install_port, dry_run),
+        Some(DaemonCommands::Uninstall) => run_daemon_uninstall(&paths),
+    }
+}
+
+fn run_daemon_install(paths: &don::daemon::DaemonPaths, port: u16, dry_run: bool) -> i32 {
+    let plan = match don::daemon::install::plan(paths, port) {
+        Ok(plan) => plan,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    if dry_run {
+        println!("would write {}:\n", plan.unit_path.display());
+        println!("{}", plan.contents);
+        return 0;
+    }
+
+    match don::daemon::install::install(&plan) {
+        Ok(messages) => {
+            for message in messages {
+                println!("{message}");
+            }
+            println!("open the ui with `don ui`");
+            0
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            // The unit is on disk even when the supervisor call failed, so
+            // point at the manual path rather than leaving a dead end.
+            if plan.unit_path.exists() {
+                errln(format!(
+                    "the service file was written to {} — you can start it by hand",
+                    plan.unit_path.display()
+                ));
+            }
+            1
+        }
+    }
+}
+
+fn run_daemon_uninstall(paths: &don::daemon::DaemonPaths) -> i32 {
+    // Port doesn't matter for removal; only the unit path is used.
+    let plan = match don::daemon::install::plan(paths, don::web::DEFAULT_PORT) {
+        Ok(plan) => plan,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+    match don::daemon::install::uninstall(&plan) {
+        Ok(messages) => {
+            for message in messages {
+                println!("{message}");
+            }
+            0
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            1
+        }
     }
 }
 
