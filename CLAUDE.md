@@ -7,18 +7,26 @@ Don is a dev environment orchestrator. See `docs/design.md` for the full design 
 ## Build & Test
 
 ```sh
+npm --prefix web ci && npm --prefix web run build   # once after cloning
 cargo build          # build
 cargo test           # run all tests
 cargo clippy         # lint
 ```
+
+The web UI bundle is a build artifact and is **not** committed — it's
+gitignored, built by CI, and shipped inside the published crate via the
+`include` list in `Cargo.toml`. Build it once after cloning or the binary has
+no UI (it will say so rather than serving a broken page), and the couple of
+tests that assert on real assets skip themselves.
 
 ### Running don on don
 
 There's a `don.toml` in this repo, so `don start` here brings up the dev loop:
 a dev daemon rebuilt whenever `src/` changes, the Vite dev server proxying to
 it, and a throwaway stack (`dev/demo/`) registered with the dev daemon so the
-web UI has something to render. Clippy runs on every Rust save and `web/dist`
-is rebuilt on every frontend save, which keeps the CI drift check happy.
+web UI has something to render. Clippy runs on every Rust save and the web
+bundle is rebuilt on every frontend save, so the binary you build always has
+a current UI.
 
 ```sh
 don start                  # everything

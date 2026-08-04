@@ -127,6 +127,12 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Set up Node for the web UI bundle"
+        uses: "actions/setup-node@v4"
+        with:
+          "node-version": "22"
+      - name: "Build the web UI bundle"
+        run: "npm --prefix web ci && npm --prefix web run build"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

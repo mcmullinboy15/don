@@ -51,6 +51,19 @@ jobs:
         with:
           go-version: stable
 
+      # The web UI bundle is embedded into the binary but isn't committed —
+      # it's a build artifact. Build it before cargo so the embedded assets
+      # are real; a couple of the web tests assert the app shell is served.
+      # `npm ci` also typechecks the frontend via the build script.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the web UI bundle
+        run: npm --prefix web ci && npm --prefix web run build
+
       - name: Build
         run: cargo build --locked
 
@@ -62,33 +75,3 @@ jobs:
 
       - name: Lint
         run: cargo clippy --locked -- -D warnings
-
-  # `web/dist` is committed because it gets embedded into the binary and
-  # neither crates.io nor cargo-dist can run npm. That only works if the
-  # committed bundle actually matches the sources, so rebuild it and fail on
-  # any drift. Linux-only: the bundle is platform-independent.
-  web-bundle:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: Install
-        run: npm --prefix web ci
-
-      - name: Build
-        run: npm --prefix web run build
-
-      - name: Check the committed bundle is up to date
-        run: |
-          if ! git diff --exit-code --stat web/dist; then
-            echo "::error::web/dist is stale — run 'npm --prefix web run build' and commit the result"
-            exit 1
-          fi

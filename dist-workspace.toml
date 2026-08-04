@@ -21,3 +21,6 @@ install-updater = false
 tap = "pjtatlow/homebrew-tap"
 # Publish jobs
 publish-jobs = ["homebrew", "./publish-crates-io"]
+# Steps injected before `dist build`. The web UI bundle is embedded in the
+# binary but isn't committed, so release builds have to produce it first.
+github-build-setup = "build-setup.yml"

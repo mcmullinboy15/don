@@ -6,9 +6,17 @@ description = "Boss of your dev environment"
 license = "MIT"
 repository = "https://github.com/pjtatlow/don"
 homepage = "https://github.com/pjtatlow/don"
-# The published crate needs `web/dist` (it's embedded into the binary) but not
-# the frontend sources or its toolchain — those only matter to contributors.
-exclude = ["web/src", "web/node_modules", "web/package*.json", "web/*.ts", "web/*.json", "web/index.html", "tools/", "dev/", "don.toml"]
+# An allowlist rather than `exclude`, because `include` is also what gets
+# `web/dist` into the tarball: the built bundle is gitignored (it's a build
+# artifact) but has to ship, since it's embedded in the binary and neither
+# crates.io nor `cargo install` will run npm. CI builds it before publishing.
+# Frontend sources and the dev tooling only matter to contributors.
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "web/dist/**",
+    "README.md",
+]
 
 
 [dependencies]

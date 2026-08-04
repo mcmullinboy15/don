@@ -254,7 +254,16 @@ fn integration_web_serves_the_app_shell_for_unknown_routes() {
         let harness = Harness::start(&dir.child("proj")).await;
 
         // Client-side routes must return the shell so a deep link works.
+        // The bundle isn't committed, so a fresh clone won't have one until
+        // npm has run; CI builds it first, which is where this bites.
         let (status, body) = harness.get("/projects/whatever").await;
+        if status == 500 && body.contains("without its web ui bundle") {
+            eprintln!(
+                "skipping: no web ui bundle — run `npm --prefix web run build` to exercise this"
+            );
+            harness.stop().await;
+            return;
+        }
         assert_eq!(status, 200);
         assert!(body.contains("<html"), "expected the app shell; got: {body}");
 

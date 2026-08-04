@@ -1,0 +1,13 @@
+# Injected into cargo-dist's build job via `github-build-setup` in
+# dist-workspace.toml, and run before `dist build`.
+#
+# The web UI bundle is embedded into the binary but is a build artifact, so
+# it isn't in git. Every machine that compiles a shipping binary has to build
+# it first — this is that step for release builds. CI and `cargo publish`
+# have their own equivalents.
+- name: Set up Node for the web UI bundle
+  uses: actions/setup-node@v4
+  with:
+    node-version: "22"
+- name: Build the web UI bundle
+  run: npm --prefix web ci && npm --prefix web run build

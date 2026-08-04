@@ -9,8 +9,12 @@
 //! the bundle, reload the page — no `cargo build`) while a shipped binary
 //! stays self-contained.
 //!
-//! Because `web/dist` must exist at compile time and crates.io will never run
-//! npm, the built bundle is committed. See `web/README.md`.
+//! The bundle is a build artifact, so it isn't in git; it's built by CI and
+//! shipped inside the published crate (see `include` in Cargo.toml). Binaries
+//! from crates.io, Homebrew, or the install script therefore have it. Building
+//! from a git clone or the source tarball means running npm first — until
+//! then [`missing_bundle`] says so rather than serving a broken page. See
+//! `web/README.md`.
 
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -27,6 +31,13 @@ struct Assets;
 /// real 404 instead, so a missing script fails loudly rather than being
 /// handed a page of HTML.
 pub(crate) async fn serve(uri: Uri) -> Response {
+    // No bundle compiled in at all. Answer every route the same way, because
+    // the alternative is a bare 404 on `/` — `index.html` has an extension,
+    // so it would take the missing-asset path and never explain itself.
+    if !bundle_present() {
+        return missing_bundle();
+    }
+
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
@@ -78,15 +89,31 @@ fn mime_for(path: &str) -> &'static str {
 
 /// The bundle is missing entirely — a build problem, not a user problem, so
 /// say which build step didn't run.
-fn missing_bundle() -> Response {
+///
+/// Reachable only when don was built from a git clone or the source tarball,
+/// neither of which carries the bundle. Released binaries and the crates.io
+/// package have it built in.
+pub(crate) fn missing_bundle() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        "don was built without its web ui bundle.\n\
-         Build it with `npm --prefix web ci && npm --prefix web run build`, \
-         then rebuild don.\n",
+        "don was built from source without its web ui bundle.\n\
+         \n\
+         Build it and rebuild don:\n\
+         \n    npm --prefix web ci && npm --prefix web run build\n\
+         \n\
+         Binaries from crates.io, Homebrew, or the install script include it \
+         already.\n",
     )
         .into_response()
+}
+
+/// Whether a bundle is available at all.
+///
+/// False only when don was built from source without running the frontend
+/// build — released binaries always have one.
+pub(crate) fn bundle_present() -> bool {
+    Assets::get("index.html").is_some()
 }
 
 #[cfg(test)]
@@ -181,7 +208,17 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_routes_fall_back_to_the_app_shell() {
-        // The bundle always contains index.html, so an app route resolves.
+        // The bundle isn't in git, so a fresh clone hasn't got one yet. CI
+        // builds it before running tests, which is where this assertion
+        // actually bites.
+        if !bundle_present() {
+            eprintln!(
+                "skipping: no web ui bundle — run `npm --prefix web run build` to exercise this"
+            );
+            return;
+        }
+
+        // An app route resolves to the shell so deep links work.
         let response = serve("/projects/abc".parse().unwrap()).await;
         assert_eq!(response.status(), StatusCode::OK);
 

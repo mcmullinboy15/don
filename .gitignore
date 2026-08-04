@@ -2,5 +2,9 @@
 .don
 *.local.toml
 web/node_modules
-# NOTE: web/dist is deliberately NOT ignored — it's embedded into the binary
-# and crates.io can't run npm. See web/README.md.
+# The built bundle is a build artifact, not source. It's embedded into the
+# binary and shipped in the published crate (Cargo.toml `include` puts it in
+# the tarball regardless of this file), but it never belongs in git history.
+# The directory itself is kept so a fresh clone compiles before npm has run.
+web/dist/*
+!web/dist/.gitkeep

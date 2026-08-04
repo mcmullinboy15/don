@@ -3,18 +3,29 @@
 React + TypeScript, built with Vite, embedded into the `don` binary from
 `web/dist` (see `src/web/assets.rs`).
 
-## Why `dist/` is committed
+## How the bundle ships
 
-`don` is published to crates.io and built by cargo-dist. Neither will run
-`npm`, and neither can be asked to — so the built bundle has to be in the
-source tree, not produced at build time.
+`web/dist` is a build artifact: **gitignored, never committed.** It still has
+to reach users, because it's embedded into the binary and `cargo install`
+won't run npm. So it's built by CI and travels inside the published artifacts:
 
-That means **`web/dist` is checked in, and it must be rebuilt and committed
-whenever anything under `web/src` changes.** CI enforces this: it runs the
-build and fails if `git diff --exit-code web/dist` shows drift.
+| Install path | Bundle? | How |
+|---|---|---|
+| `cargo install don` | yes | `include` in `Cargo.toml` puts `web/dist/**` in the `.crate` tarball; the publish workflow builds it first |
+| Homebrew / install script | yes | the release workflow builds it before `dist build` (see `github-build-setup`) |
+| `cargo install --git …` | no | build from a clone — run npm yourself |
+| `source.tar.gz` | no | `git archive`, so gitignored files are absent |
+
+For the last two, don serves a page telling you to run the build rather than
+a broken UI.
+
+**After cloning, run `npm --prefix web run build` once** or the binary you
+build has no UI. `don start` in this repo does it for you (and re-does it on
+every frontend save).
 
 Output file names are deterministic (`assets/app.js`, `assets/app.css`) rather
-than content-hashed, so the committed bundle only changes when the code does.
+than content-hashed — nothing depends on that any more, but it keeps rebuilds
+byte-identical when the source hasn't changed.
 
 ## Working on it
 
@@ -57,5 +68,7 @@ npm run build && don ui
 
 ```sh
 npm run build               # typechecks, then bundles into dist/
-git add web/dist
 ```
+
+Nothing to add — `dist/` is ignored. The build is worth running anyway,
+because it typechecks.
