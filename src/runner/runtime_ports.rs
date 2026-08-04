@@ -87,6 +87,17 @@ impl Runner {
     ) -> Option<ReadyCheck> {
         let mut ready = resolved.ready.clone()?;
         let mut env = resolved.env.clone();
+        // Backend vars first, then public ones. A `proxy = { env = "PORT" }`
+        // service is told its ephemeral backend port through `PORT`, and a
+        // ready check pointed at `${PORT}` means "is the service itself up?" —
+        // checking the public listener instead would pass the moment Don bound
+        // the proxy, before the service had started at all.
+        //
+        // The spawn path adds these to its own copy of `resolved` before
+        // launching (see `service_commands`), which is why checks resolved
+        // correctly while `don status -v` and the ready lifecycle event, both
+        // reading the stored `resolved`, printed the raw `${PORT}`.
+        env.extend(self.runtime_backend_env(name));
         env.extend(self.runtime_public_env(name));
 
         if let Some(tcp) = ready.tcp.take() {
@@ -152,6 +163,17 @@ impl Runner {
             }
         }
         references
+    }
+
+    /// Env-mode proxy backend vars, e.g. `{"PORT": "49152"}` — the ephemeral
+    /// port the service itself was told to bind, as distinct from Don's public
+    /// listener.
+    fn runtime_backend_env(&self, name: &str) -> HashMap<String, String> {
+        self.services
+            .get(name)
+            .and_then(|runtime| runtime.proxy.as_ref())
+            .map(|proxy| proxy.env_vars())
+            .unwrap_or_default()
     }
 
     fn runtime_public_env(&self, name: &str) -> HashMap<String, String> {

@@ -1585,3 +1585,66 @@ fn integration_failed_but_live_service_keeps_serving_its_proxy() {
         });
     }
 }
+
+#[test]
+fn integration_ready_event_reports_the_probed_address_not_the_template() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("socket-ready-template");
+        let public = free_port();
+
+        // `${PORT}` is the ephemeral backend port Don hands the service, so
+        // the ready check probes the service itself rather than Don's proxy
+        // (which would answer the instant it bound, before the service ran).
+        // The lifecycle line has to name the port actually probed — reporting
+        // the literal `${PORT}` tells the reader nothing, and reporting the
+        // public port would be an outright lie about what was checked.
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "api",
+                "bash",
+                &["-c", "python3 -m http.server $PORT --bind 127.0.0.1"],
+            )
+            .proxy_env(&format!("127.0.0.1:{public}"), "PORT")
+            .ready_tcp_with("127.0.0.1:${PORT}", "200ms", 40)
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "ready (tcp ", Duration::from_secs(12)).await,
+            "service never reported ready. output: {}",
+            String::from_utf8_lossy(&buf.lock().unwrap())
+        );
+
+        let output = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let line = output
+            .lines()
+            .find(|line| line.contains("ready (tcp "))
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(
+            !line.contains("${"),
+            "ready event should name the probed address, not the template: {line}"
+        );
+        // The backend is ephemeral and chosen by the kernel, so assert the
+        // relationship that matters rather than a literal: it is a real port,
+        // and it is not the public listener.
+        assert!(
+            !line.contains(&format!("127.0.0.1:{public}")),
+            "ready event should report the backend port, not the public one ({public}): {line}"
+        );
+        let probed: u16 = line
+            .rsplit_once("127.0.0.1:")
+            .and_then(|(_, rest)| rest.trim_end_matches(')').parse().ok())
+            .unwrap_or_else(|| panic!("no numeric port in ready event: {line}"));
+        assert!(probed > 0, "probed port should be real: {line}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}

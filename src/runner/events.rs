@@ -53,10 +53,13 @@ impl Runner {
         }
 
         if item.success {
-            let message = self
-                .services
-                .get(&item.name)
-                .map(|rs| match &rs.resolved.ready {
+            // Report the address actually probed, not the configured template.
+            // `effective_ready_check` is what the probe itself ran against, so
+            // going through it keeps this line, `don status -v`, and reality in
+            // agreement — printing `${PORT}` here told the user nothing about
+            // which port was checked.
+            let message = self.services.get(&item.name).map(|rs| {
+                match self.effective_ready_check(&item.name, &rs.resolved) {
                     Some(r) if r.tcp.is_some() => {
                         format!("ready (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
                     }
@@ -65,7 +68,8 @@ impl Runner {
                     }
                     Some(r) if r.exec.is_some() => "ready (exec)".to_string(),
                     _ => "started".to_string(),
-                });
+                }
+            });
             // Activate proxy backend before state flip so the proxy is ready
             // to forward the moment observers see `Ready`.
             if let Some(rs) = self.services.get(&item.name)
