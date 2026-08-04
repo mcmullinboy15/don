@@ -38,7 +38,7 @@ jobs:
 
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup component add clippy
+          rustup component add clippy rustfmt
 
           rustc --version
           cargo --version
@@ -75,3 +75,8 @@ jobs:
 
       - name: Lint
         run: cargo clippy --locked -- -D warnings
+
+      # Runs after the build so a formatting nit never masks a compile error —
+      # the useful failure should be the one you see first.
+      - name: Check formatting
+        run: cargo fmt --check

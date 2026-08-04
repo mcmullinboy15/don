@@ -1,0 +1,10 @@
+# Commits that changed formatting only. `git blame` skips these so a
+# mechanical reformat doesn't sit on top of every line.
+#
+# Enable locally with:
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub picks this file up automatically.
+
+# Apply rustfmt
+491a3bbd76b09d4a4d2637802d3e6128ffc6473e

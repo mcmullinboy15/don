@@ -302,8 +302,15 @@ Current dependency choices and rationale are documented in `docs/design.md`.
 
 All code must pass `cargo clippy` with no warnings and compile with no warnings. Treat warnings as errors — don't leave `#[allow(unused)]` or dead code lying around. If something is temporarily unused during development, remove it or gate it behind a feature.
 
+Formatting is `cargo fmt` with default settings — there is no `rustfmt.toml`
+and no house deviation. CI runs `cargo fmt --check`, so run `cargo fmt` before
+committing. The one-off reformat that established this is listed in
+`.git-blame-ignore-revs`; enable it locally with
+`git config blame.ignoreRevsFile .git-blame-ignore-revs`.
+
 Specifically:
 - `cargo clippy -- -D warnings` must pass
+- `cargo fmt --check` must pass
 - `cargo build 2>&1 | grep warning` must be empty
 - No `#[allow(dead_code)]` or `#[allow(unused)]` in committed code
 - Prefer explicit imports over glob imports (`use std::path::PathBuf`, not `use std::path::*`)
