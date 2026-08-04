@@ -632,9 +632,47 @@ pub(crate) fn rust_build_args(config: &RustConfig) -> Vec<String> {
 
 /// Resolve the path to the built Rust binary.
 pub(crate) fn rust_binary_path(config: &RustConfig, base_dir: &Path) -> PathBuf {
+    rust_binary_path_with(config, base_dir, std::env::var_os("CARGO_TARGET_DIR"))
+}
+
+/// Resolve the built binary's path from explicit inputs.
+///
+/// `CARGO_TARGET_DIR` has to be honoured because the build subprocess already
+/// does: it inherits the ambient environment, so cargo writes wherever the
+/// variable says. Ignoring it here meant the build reported success and Don
+/// then failed to spawn a binary that had just been built somewhere else —
+/// which is a baffling thing to be told.
+///
+/// Precedence is `rust.target_dir` (an explicit choice in `don.toml`), then
+/// the environment, then cargo's default of `<dir>/target`. A relative
+/// `CARGO_TARGET_DIR` resolves against the directory cargo runs in, matching
+/// cargo's own behaviour.
+///
+/// Not covered: `build.target-dir` in `.cargo/config.toml`. Reading it
+/// properly means asking cargo (`cargo metadata`, or parsing
+/// `--message-format=json` build output), and doing that on every start and
+/// watch-triggered restart would put a subprocess on the hot path to fix a
+/// rarer case than the env var. `rust.target_dir` is the escape hatch.
+pub(crate) fn rust_binary_path_with(
+    config: &RustConfig,
+    base_dir: &Path,
+    cargo_target_dir: Option<std::ffi::OsString>,
+) -> PathBuf {
+    let from_env = cargo_target_dir
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| {
+            if dir.is_absolute() {
+                dir
+            } else {
+                base_dir.join(dir)
+            }
+        });
+
     let target_dir = config
         .target_dir
         .clone()
+        .or(from_env)
         .unwrap_or_else(|| base_dir.join("target"));
     let profile = if config.release { "release" } else { "debug" };
     target_dir.join(profile).join(&config.binary)
@@ -775,50 +813,88 @@ mod tests {
             name: &'static str,
             config: RustConfig,
             base_dir: &'static str,
+            /// Stands in for `$CARGO_TARGET_DIR`. Passed explicitly rather
+            /// than read from the process so the test says the same thing on
+            /// a machine that has the variable exported.
+            cargo_target_dir: Option<&'static str>,
             expected: &'static str,
+        }
+
+        fn config(binary: &str, release: bool, target_dir: Option<&str>) -> RustConfig {
+            RustConfig {
+                binary: binary.to_string(),
+                features: vec![],
+                release,
+                extra_args: vec![],
+                target_dir: target_dir.map(PathBuf::from),
+            }
         }
 
         let cases = vec![
             Case {
                 name: "debug default target",
-                config: RustConfig {
-                    binary: "myapp".to_string(),
-                    features: vec![],
-                    release: false,
-                    extra_args: vec![],
-                    target_dir: None,
-                },
+                config: config("myapp", false, None),
                 base_dir: "/project",
+                cargo_target_dir: None,
                 expected: "/project/target/debug/myapp",
             },
             Case {
                 name: "release default target",
-                config: RustConfig {
-                    binary: "myapp".to_string(),
-                    features: vec![],
-                    release: true,
-                    extra_args: vec![],
-                    target_dir: None,
-                },
+                config: config("myapp", true, None),
                 base_dir: "/project",
+                cargo_target_dir: None,
                 expected: "/project/target/release/myapp",
             },
             Case {
                 name: "custom target dir",
-                config: RustConfig {
-                    binary: "api".to_string(),
-                    features: vec![],
-                    release: false,
-                    extra_args: vec![],
-                    target_dir: Some(PathBuf::from("/tmp/build")),
-                },
+                config: config("api", false, Some("/tmp/build")),
                 base_dir: "/project",
+                cargo_target_dir: None,
                 expected: "/tmp/build/debug/api",
+            },
+            Case {
+                name: "CARGO_TARGET_DIR is honoured, as the build subprocess already does",
+                config: config("api", false, None),
+                base_dir: "/project",
+                cargo_target_dir: Some("/shared/target"),
+                expected: "/shared/target/debug/api",
+            },
+            Case {
+                name: "release profile under CARGO_TARGET_DIR",
+                config: config("api", true, None),
+                base_dir: "/project",
+                cargo_target_dir: Some("/shared/target"),
+                expected: "/shared/target/release/api",
+            },
+            Case {
+                name: "an explicit rust.target_dir outranks the environment",
+                config: config("api", false, Some("/tmp/build")),
+                base_dir: "/project",
+                cargo_target_dir: Some("/shared/target"),
+                expected: "/tmp/build/debug/api",
+            },
+            Case {
+                name: "a relative CARGO_TARGET_DIR resolves against cargo's working directory",
+                config: config("api", false, None),
+                base_dir: "/project",
+                cargo_target_dir: Some("build/out"),
+                expected: "/project/build/out/debug/api",
+            },
+            Case {
+                name: "an empty CARGO_TARGET_DIR is ignored, not treated as the root",
+                config: config("api", false, None),
+                base_dir: "/project",
+                cargo_target_dir: Some(""),
+                expected: "/project/target/debug/api",
             },
         ];
 
         for case in cases {
-            let result = rust_binary_path(&case.config, Path::new(case.base_dir));
+            let result = rust_binary_path_with(
+                &case.config,
+                Path::new(case.base_dir),
+                case.cargo_target_dir.map(std::ffi::OsString::from),
+            );
             assert_eq!(result, PathBuf::from(case.expected), "{}", case.name);
         }
     }

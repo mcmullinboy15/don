@@ -401,6 +401,9 @@ Built-in support for Rust and Go with automatic build commands and default watch
 [services.api]
 rust.binary = "api"
 rust.features = ["dev"]
+# `$CARGO_TARGET_DIR` is honoured. Set `rust.target_dir` to override it, or if
+# your target directory comes from `build.target-dir` in .cargo/config.toml,
+# which Don doesn't read.
 
 # Go — runs `go build -o .don/bin/api ./cmd/api`, watches **/*.go
 [services.api]
