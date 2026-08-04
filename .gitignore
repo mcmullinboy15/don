@@ -5,6 +5,5 @@ web/node_modules
 # The built bundle is a build artifact, not source. It's embedded into the
 # binary and shipped in the published crate (Cargo.toml `include` puts it in
 # the tarball regardless of this file), but it never belongs in git history.
-# The directory itself is kept so a fresh clone compiles before npm has run.
-web/dist/*
-!web/dist/.gitkeep
+# build.rs creates the directory when it's missing, so a fresh clone compiles.
+web/dist/
