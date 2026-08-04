@@ -89,6 +89,89 @@ pub struct InstallPlan {
     pub contents: String,
 }
 
+impl InstallPlan {
+    /// Whether this service is installed — i.e. its unit file is on disk.
+    ///
+    /// What it means for `stop`/`restart`: a daemon under a supervisor has to
+    /// be stopped *through* it. Asking the daemon to exit on its own leaves
+    /// systemd or launchd believing it stopped for reasons of its own, and on
+    /// systemd a clean exit isn't covered by `Restart=on-failure`, so it stays
+    /// down until something starts it again.
+    pub fn installed(&self) -> bool {
+        self.unit_path.exists()
+    }
+}
+
+/// The supervisor command that stops the service, as `(program, args)`.
+///
+/// Split out from running it so the platform argument lists are testable —
+/// getting `launchctl`'s domain-target syntax subtly wrong is easy and would
+/// otherwise only show up on a Mac.
+fn stop_command(plan: &InstallPlan) -> (&'static str, Vec<String>) {
+    match plan.manager {
+        ServiceManager::Systemd => (
+            "systemctl",
+            vec![
+                "--user".to_string(),
+                "stop".to_string(),
+                SYSTEMD_UNIT_NAME.to_string(),
+            ],
+        ),
+        // launchd has no "stop but stay loaded" for an agent; unloading is the
+        // stop. The plist stays, so it returns at next login or `install`.
+        ServiceManager::Launchd => (
+            "launchctl",
+            vec![
+                "bootout".to_string(),
+                format!("gui/{}", current_uid()),
+                path_str(&plan.unit_path),
+            ],
+        ),
+    }
+}
+
+/// The supervisor command that restarts the service, as `(program, args)`.
+fn restart_command(plan: &InstallPlan) -> (&'static str, Vec<String>) {
+    match plan.manager {
+        ServiceManager::Systemd => (
+            "systemctl",
+            vec![
+                "--user".to_string(),
+                "restart".to_string(),
+                SYSTEMD_UNIT_NAME.to_string(),
+            ],
+        ),
+        // `kickstart -k` kills the running instance and starts a fresh one in
+        // a single step, which is what picks up an upgraded binary.
+        ServiceManager::Launchd => (
+            "launchctl",
+            vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                format!("gui/{}/{LAUNCHD_LABEL}", current_uid()),
+            ],
+        ),
+    }
+}
+
+/// Stop the installed service through its supervisor.
+pub fn supervisor_stop(plan: &InstallPlan) -> Result<(), InstallError> {
+    let (program, args) = stop_command(plan);
+    run(
+        program,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+}
+
+/// Restart the installed service through its supervisor.
+pub fn supervisor_restart(plan: &InstallPlan) -> Result<(), InstallError> {
+    let (program, args) = restart_command(plan);
+    run(
+        program,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+}
+
 /// Build an install plan for the current platform.
 pub fn plan(paths: &DaemonPaths, port: u16) -> Result<InstallPlan, InstallError> {
     let manager = ServiceManager::for_platform()?;
@@ -409,6 +492,95 @@ mod tests {
             );
             assert!(!plan.contents.is_empty(), "case: {}", case.name);
         }
+    }
+
+    #[test]
+    fn supervisor_commands_are_right_for_each_platform() {
+        struct Case {
+            name: &'static str,
+            manager: ServiceManager,
+            home: &'static str,
+            expect_stop: Vec<String>,
+            expect_restart: Vec<String>,
+        }
+
+        let uid = current_uid();
+        let plist = format!("/Users/u/Library/LaunchAgents/{LAUNCHD_LABEL}.plist");
+
+        let cases = vec![
+            Case {
+                name: "systemd stops and restarts the unit by name",
+                manager: ServiceManager::Systemd,
+                home: "/home/u",
+                expect_stop: vec![
+                    "systemctl".into(),
+                    "--user".into(),
+                    "stop".into(),
+                    SYSTEMD_UNIT_NAME.into(),
+                ],
+                expect_restart: vec![
+                    "systemctl".into(),
+                    "--user".into(),
+                    "restart".into(),
+                    SYSTEMD_UNIT_NAME.into(),
+                ],
+            },
+            Case {
+                name: "launchd boots out by plist path but kickstarts by service target",
+                manager: ServiceManager::Launchd,
+                home: "/Users/u",
+                expect_stop: vec![
+                    "launchctl".into(),
+                    "bootout".into(),
+                    format!("gui/{uid}"),
+                    plist.clone(),
+                ],
+                expect_restart: vec![
+                    "launchctl".into(),
+                    "kickstart".into(),
+                    "-k".into(),
+                    format!("gui/{uid}/{LAUNCHD_LABEL}"),
+                ],
+            },
+        ];
+
+        for case in cases {
+            let plan = plan_with(
+                case.manager,
+                Path::new("/usr/local/bin/don"),
+                &paths(),
+                3666,
+                Path::new(case.home),
+            );
+
+            for (built, expected, which) in [
+                (stop_command(&plan), &case.expect_stop, "stop"),
+                (restart_command(&plan), &case.expect_restart, "restart"),
+            ] {
+                let (program, args) = built;
+                let actual: Vec<String> =
+                    std::iter::once(program.to_string()).chain(args).collect();
+                assert_eq!(&actual, expected, "case: {} ({which})", case.name);
+            }
+        }
+    }
+
+    #[test]
+    fn installed_follows_the_unit_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = InstallPlan {
+            manager: ServiceManager::Systemd,
+            unit_path: tmp.path().join("don.service"),
+            contents: "[Unit]\n".to_string(),
+        };
+
+        // Drives which branch `don daemon stop` takes, so it has to track the
+        // file rather than be decided once at startup.
+        assert!(!plan.installed(), "absent unit means not installed");
+        std::fs::write(&plan.unit_path, &plan.contents).unwrap();
+        assert!(plan.installed(), "present unit means installed");
+        std::fs::remove_file(&plan.unit_path).unwrap();
+        assert!(!plan.installed(), "removed unit means not installed again");
     }
 
     #[test]

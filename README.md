@@ -674,6 +674,7 @@ don ui                       # open the web UI in your browser
 don daemon                   # run the system-wide daemon in the foreground
 don daemon install           # install it as a user service (systemd/launchd)
 don daemon status            # what's running, and which projects it can see
+don daemon restart           # restart it, e.g. after upgrading don
 don daemon stop              # stop it (your projects keep running)
 don daemon uninstall         # remove the user service
 ```

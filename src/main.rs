@@ -245,7 +245,16 @@ enum DaemonCommands {
         json: bool,
     },
     /// Stop the running daemon. Registered projects keep running.
+    ///
+    /// When the daemon is installed as a service this goes through the
+    /// supervisor, so it stays stopped instead of being restarted underneath
+    /// you.
     Stop,
+    /// Restart the daemon, e.g. to pick up an upgraded `don` binary
+    ///
+    /// Requires the daemon to be installed as a service — there's nothing to
+    /// restart a bare foreground `don daemon` with.
+    Restart,
     /// Install the daemon as a per-user service so it starts on login
     Install {
         /// Port the installed service should serve the web UI on
@@ -753,6 +762,7 @@ async fn run_daemon_command(port: u16, no_web: bool, command: Option<DaemonComma
         None => run_daemon_foreground(paths, port, no_web).await,
         Some(DaemonCommands::Status { json }) => run_daemon_status(paths, json).await,
         Some(DaemonCommands::Stop) => run_daemon_stop(paths).await,
+        Some(DaemonCommands::Restart) => run_daemon_restart(&paths),
         Some(DaemonCommands::Install {
             port: install_port,
             dry_run,
@@ -990,7 +1000,30 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
+/// `don daemon stop`.
+///
+/// An installed daemon is stopped through its supervisor. Asking it to exit on
+/// its own would leave systemd or launchd thinking it stopped for reasons of
+/// its own — and since a clean exit isn't covered by `Restart=on-failure`, the
+/// service would sit inactive until something started it again, which is a
+/// confusing state to leave someone in.
 async fn run_daemon_stop(paths: don::daemon::DaemonPaths) -> i32 {
+    if let Ok(plan) = don::daemon::install::plan(&paths, don::web::DEFAULT_PORT)
+        && plan.installed()
+    {
+        return match don::daemon::install::supervisor_stop(&plan) {
+            Ok(()) => {
+                println!("don daemon stopped (running projects were left alone)");
+                println!("  it will start again on login — `don daemon uninstall` to prevent that");
+                0
+            }
+            Err(e) => {
+                errln(format!("Error: {e}"));
+                1
+            }
+        };
+    }
+
     let socket = paths.socket();
     let client = don::daemon::DaemonClient::new(socket.clone());
     match client.shutdown().await {
@@ -1012,6 +1045,42 @@ async fn run_daemon_stop(paths: don::daemon::DaemonPaths) -> i32 {
         }
         Err(e) => {
             errln(e);
+            1
+        }
+    }
+}
+
+/// `don daemon restart` — mainly for picking up an upgraded `don` binary.
+///
+/// Supervisor-only by design. Restarting a bare foreground `don daemon` would
+/// mean spawning a detached replacement, which is process management this
+/// command has no business inventing — better to say so.
+fn run_daemon_restart(paths: &don::daemon::DaemonPaths) -> i32 {
+    let plan = match don::daemon::install::plan(paths, don::web::DEFAULT_PORT) {
+        Ok(plan) => plan,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    if !plan.installed() {
+        errln(format!(
+            "the don daemon isn't installed as a service, so there's nothing to restart it with.\n  \
+             Expected a unit at {}.\n  \
+             Install it with `don daemon install`, or stop and start your `don daemon` by hand.",
+            plan.unit_path.display()
+        ));
+        return 1;
+    }
+
+    match don::daemon::install::supervisor_restart(&plan) {
+        Ok(()) => {
+            println!("don daemon restarted (running projects were left alone)");
+            0
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
             1
         }
     }
