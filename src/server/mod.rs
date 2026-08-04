@@ -14,7 +14,7 @@ use hyper_util::server::conn::auto;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// Server errors.
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +46,10 @@ pub(crate) struct ApiState {
     /// Subscribing per-request keeps the API decoupled from the runner loop —
     /// a slow HTTP client lags its own receiver and nobody else's.
     pub event_tx: broadcast::Sender<RunnerEvent>,
+    /// Whether the runner's initial startup sweep has decided every item.
+    /// Handlers wait on this from their own task, which is safe precisely
+    /// because they are not the runner's command loop.
+    pub startup_settled: watch::Receiver<bool>,
     /// Resize channels for active attach sessions. The attach bridge task
     /// registers its receiver here; the resize HTTP handler sends through it.
     pub attach_resize_txs: std::sync::Arc<tokio::sync::Mutex<ResizeMap>>,
@@ -95,12 +99,14 @@ pub async fn serve_api(
     socket_path: PathBuf,
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
+    startup_settled: watch::Receiver<bool>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);
     let state = Arc::new(ApiState {
         cmd_tx,
         event_tx,
+        startup_settled,
         attach_resize_txs: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

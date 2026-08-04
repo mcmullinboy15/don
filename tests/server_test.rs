@@ -971,3 +971,95 @@ fn integration_logs_endpoint_returns_ring_buffer() {
         handle.await.unwrap();
     });
 }
+
+#[test]
+fn integration_run_waits_for_startup_instead_of_reporting_already_running() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("server-run-during-startup");
+        let out_path = dir.path().join("ran.txt");
+
+        // A watch set large enough that hashing it takes measurably longer
+        // than binding the API socket. That window is the bug: every task
+        // carries a worker deciding skip/pending/run, and the runner used to
+        // read that as "already running" — for a task that is not running and,
+        // with auto_run = false, never would on its own.
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for i in 0..3000 {
+            std::fs::write(data.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task(
+                "slow",
+                "sh",
+                &["-c", &format!("echo done > {}", out_path.display())],
+            )
+            .log("ignore")
+            .auto_run(false)
+            .watch(&["data/**"])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(5)).await);
+
+        // Deliberately no settling sleep — issuing the request into the
+        // window is the whole point of the test.
+        let (status, body) = request_with_body(&socket, "POST", "/run/slow", Some("{}")).await;
+        assert_eq!(
+            status, 204,
+            "run should wait for the runner to settle, not be refused; body: {body}"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !out_path.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(out_path.exists(), "the deferred run should actually happen");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_ready_endpoint_reports_startup_progress() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("server-ready");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(5)).await);
+
+        // Must answer immediately whether or not startup has settled — it's a
+        // status read, not a wait, and a client asking "can I act yet?" during
+        // startup is exactly when it needs an answer.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (status, body) = request(&socket, "GET", "/ready").await;
+            assert_eq!(status, 200, "body: {body}");
+            assert!(body.contains("startup_complete"), "body: {body}");
+            if body.contains("\"startup_complete\":true") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup never settled; last body: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}

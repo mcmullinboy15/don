@@ -730,6 +730,7 @@ checked, so the UI works behind a reverse proxy.
 Don exposes a unix socket API at `.don/don.sock` for programmatic control:
 
 ```
+GET  /ready                  → whether the initial startup sweep has settled
 GET  /status                 → service/task states
 GET  /status?verbose=true    → states plus actual proxy/Docker addresses, and task params
 GET  /events                 → streaming NDJSON of state changes

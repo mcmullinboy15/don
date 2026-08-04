@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/status", get(get_status))
+        .route("/ready", get(get_ready))
         .route("/events", get(get_events))
         .route("/watch", get(get_watch))
         .route("/start/{name}", post(post_start))
@@ -71,6 +72,55 @@ async fn get_status(
 #[derive(Serialize)]
 struct StatusResponse {
     items: Vec<ItemStatus>,
+}
+
+/// How long a command will wait for the runner to finish deciding.
+///
+/// Bounded so a wedged startup reports something honest instead of hanging a
+/// client forever. Generous because the wait is real work — hashing a large
+/// watch set takes seconds — and timing out early would just resurrect the
+/// spurious failure this exists to prevent.
+const STARTUP_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Block until the runner has decided every item, or the deadline passes.
+///
+/// Safe to await here: this runs in the per-request axum task, not the
+/// runner's command loop, so waiting costs this one client and nothing else.
+async fn await_startup_settled(state: &ApiState) -> bool {
+    let mut settled = state.startup_settled.clone();
+    if *settled.borrow() {
+        return true;
+    }
+    let wait = async {
+        while settled.changed().await.is_ok() {
+            if *settled.borrow() {
+                return true;
+            }
+        }
+        // Sender dropped — the runner is going away; stop waiting.
+        false
+    };
+    tokio::time::timeout(STARTUP_SETTLE_WAIT, wait)
+        .await
+        .unwrap_or(false)
+}
+
+#[derive(Serialize)]
+struct ReadyResponse {
+    /// Whether the initial startup sweep has decided every item.
+    startup_complete: bool,
+}
+
+/// `GET /ready` — whether the runner has finished its initial sweep.
+///
+/// Answers immediately either way; it's a status read, not a wait. Clients
+/// that would rather not offer a "run" button during startup can poll this or
+/// watch for `startup_settled` on `GET /events`.
+async fn get_ready(State(state): State<Arc<ApiState>>) -> Response {
+    Json(ReadyResponse {
+        startup_complete: *state.startup_settled.borrow(),
+    })
+    .into_response()
 }
 
 /// `GET /events` — stream runner state changes as newline-delimited JSON.
@@ -287,6 +337,23 @@ async fn post_run_task(
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let wait = body.wait || body.wait_timeout.is_some();
+
+    // Wait for the runner to finish deciding before asking it to run anything.
+    // During the initial sweep every task has a worker attached that is
+    // working out skip/pending/run, and the runner cannot tell that apart from
+    // a real run — so a request landing here would be refused as "already
+    // running" for a task that is not running and may never run on its own.
+    if !await_startup_settled(&state).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(error_body(
+                "runner is still starting up — it hasn't finished working out \
+                 which tasks need to run yet",
+            )),
+        )
+            .into_response();
+    }
+
     let (tx, rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -399,6 +466,18 @@ fn completion_error_body(e: &CompletionError) -> serde_json::Value {
 
 /// `POST /run-pending` — run all tasks in PendingRun state.
 async fn post_run_pending(State(state): State<Arc<ApiState>>) -> Response {
+    // Same reasoning as `post_run_task`: "which tasks are pending" isn't
+    // knowable until the sweep has decided.
+    if !await_startup_settled(&state).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(error_body(
+                "runner is still starting up — it hasn't finished working out \
+                 which tasks need to run yet",
+            )),
+        )
+            .into_response();
+    }
     let (tx, rx) = oneshot::channel();
     if state
         .cmd_tx

@@ -599,8 +599,12 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
             app.set_update_check(current_version, latest_version);
             false
         }
+        // The TUI already shows per-item states, so it learns nothing extra
+        // from the sweep finishing — that signal is for API clients deciding
+        // whether it's meaningful to ask the runner to run something.
         RunnerEvent::RebuildComplete { .. }
         | RunnerEvent::TaskRerunComplete { .. }
+        | RunnerEvent::StartupSettled
         | RunnerEvent::ShutdownStarted
         | RunnerEvent::ShutdownComplete => false,
     }

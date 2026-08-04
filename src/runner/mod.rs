@@ -52,7 +52,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 #[cfg(test)]
 use self::build_tools::bazel_graph_requery_group_dir;
@@ -770,6 +770,9 @@ pub enum RunnerEvent {
     RebuildComplete { name: String, success: bool },
     /// A task re-run completed (file watch triggered).
     TaskRerunComplete { name: String, success: bool },
+    /// The initial startup sweep has decided every item — nothing is left
+    /// merely being *considered*. Fires once per run.
+    StartupSettled,
     /// Graceful shutdown has started.
     ShutdownStarted,
     /// Shutdown complete.
@@ -848,6 +851,16 @@ pub struct Runner {
     internal_tx: mpsc::Sender<RunnerInternalCommand>,
     internal_rx: mpsc::Receiver<RunnerInternalCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
+
+    /// Published once the initial startup sweep has decided every item.
+    ///
+    /// A `watch` rather than a flag because the point is for *other tasks* to
+    /// await it. API handlers run in their own axum tasks, not on this
+    /// runner's command loop, so they can block on this without stalling the
+    /// runner — which is what lets `don run <task>` wait for the answer
+    /// instead of being told "already running" about a task that is merely
+    /// being decided about.
+    startup_settled_tx: watch::Sender<bool>,
 
     /// Item-completion sender shared by dependency-scheduled starts and config
     /// reload paths. Ready-check and task-completion callbacks send here.
@@ -954,6 +967,7 @@ impl Runner {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (internal_tx, internal_rx) = mpsc::channel(64);
         let (event_tx, _) = broadcast::channel(256);
+        let (startup_settled_tx, _) = watch::channel(false);
         let (lazy_start_tx, lazy_start_rx) = mpsc::channel(16);
         let (shutdown_flag_tx, _shutdown_flag_rx) = tokio::sync::watch::channel(false);
 
@@ -1012,6 +1026,7 @@ impl Runner {
             internal_tx,
             internal_rx,
             event_tx,
+            startup_settled_tx,
             done_tx: None,
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
@@ -1237,6 +1252,16 @@ impl Runner {
         self.event_tx.subscribe()
     }
 
+    /// Watch whether the initial startup sweep has decided every item.
+    ///
+    /// `false` until then. Callers that need the runner's answer about an item
+    /// — rather than its answer about what it is currently doing — should wait
+    /// for `true` first. Await it from your own task, never from the runner's
+    /// command loop.
+    pub fn startup_settled(&self) -> watch::Receiver<bool> {
+        self.startup_settled_tx.subscribe()
+    }
+
     fn start_update_checker(&mut self) {
         if std::env::var_os("DON_NO_UPDATE_CHECK").is_some() {
             return;
@@ -1409,6 +1434,7 @@ impl Runner {
                 let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
                 let cmd_tx_for_server = self.cmd_tx.clone();
                 let event_tx_for_server = self.event_tx.clone();
+                let startup_settled_for_server = self.startup_settled_tx.subscribe();
                 let socket_path_for_server = socket_path.clone();
                 let server_emitter = self.output_manager.clone_lifecycle_emitter();
                 tokio::spawn(async move {
@@ -1417,6 +1443,7 @@ impl Runner {
                         socket_path_for_server,
                         cmd_tx_for_server,
                         event_tx_for_server,
+                        startup_settled_for_server,
                         server_shutdown_rx,
                     )
                     .await
@@ -1559,6 +1586,10 @@ impl Runner {
                 // Emit "all services running" once when startup is complete.
                 if !startup_complete && self.initial_startup_settled() {
                     startup_complete = true;
+                    // Release anything waiting for the runner to settle before
+                    // issuing a command — see `startup_settled`.
+                    let _ = self.startup_settled_tx.send(true);
+                    let _ = self.event_tx.send(RunnerEvent::StartupSettled);
                     let has_running_services = self.services.values().any(|rs| {
                         matches!(
                             rs.state(),
