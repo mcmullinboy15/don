@@ -555,6 +555,65 @@ pub enum ItemStatus {
     },
 }
 
+/// One task param, as a client needs to see it to build a run form.
+///
+/// Deliberately not [`crate::config::TaskParam`] itself: that carries the
+/// `completions` shell command, which is an implementation detail of the
+/// daemon and has no business crossing to a browser. Clients learn only
+/// *that* a param has dynamic completions, and ask for the values.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ParamInfo {
+    /// Param identifier, as passed to `POST /run/:task`.
+    pub name: String,
+    /// Human-readable label; falls back to `name` when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Whether the task refuses to run without a value.
+    pub required: bool,
+    /// Value used when the client doesn't supply one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// One of `string`, `int`, `bool`, `choice`.
+    pub kind: String,
+    /// Fixed candidate values, when the config lists them inline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// Whether candidates come from a completion command — fetch them from
+    /// the completions endpoint rather than expecting `choices`.
+    #[serde(default)]
+    pub has_completions: bool,
+    /// Lower bound for `int` params.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    /// Upper bound for `int` params.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+}
+
+impl ParamInfo {
+    /// Project a configured param into its client-visible shape.
+    pub(crate) fn from_config(param: &crate::config::TaskParam) -> Self {
+        use crate::config::ParamKind;
+        Self {
+            name: param.name.clone(),
+            prompt: param.prompt.clone(),
+            required: param.required,
+            default: param.default.clone(),
+            kind: match param.kind {
+                ParamKind::String => "string",
+                ParamKind::Int => "int",
+                ParamKind::Bool => "bool",
+                ParamKind::Choice => "choice",
+            }
+            .to_string(),
+            choices: param.choices.clone(),
+            has_completions: param.completions.is_some(),
+            min: param.validate.as_ref().and_then(|v| v.min),
+            max: param.validate.as_ref().and_then(|v| v.max),
+        }
+    }
+}
+
 /// Extended information for verbose status display.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VerboseInfo {
@@ -586,6 +645,10 @@ pub struct VerboseInfo {
     /// Turbo task (if configured).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turbo_task: Option<String>,
+    /// Params a task declares, so a client can render a run form without
+    /// reading `don.toml` itself. Empty for services.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<ParamInfo>,
     /// Ready check description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready: Option<String>,

@@ -146,6 +146,8 @@ impl Runner {
                 }
                 Some(VerboseInfo {
                     depends_on: resolved.depends_on.clone(),
+                    // Services have no params; only tasks are run with values.
+                    params: Vec::new(),
                     watch_count: watch.len(),
                     // Full path list only on a single-item drill-in; see
                     // `collect_status` doc for why the all-items view omits it.
@@ -287,6 +289,11 @@ impl Runner {
                     proxy_active_connections: None,
                     bazel_target: task.bazel.as_ref().map(|b| b.target.clone()),
                     turbo_task: task.turbo.as_ref().map(|t| t.task.clone()),
+                    params: task
+                        .params
+                        .iter()
+                        .map(super::ParamInfo::from_config)
+                        .collect(),
                     ready: None,
                     cmd: Some(cmd_str),
                     watch_state: watch_item.map(|item| {

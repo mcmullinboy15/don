@@ -6,6 +6,9 @@ description = "Boss of your dev environment"
 license = "MIT"
 repository = "https://github.com/pjtatlow/don"
 homepage = "https://github.com/pjtatlow/don"
+# The published crate needs `web/dist` (it's embedded into the binary) but not
+# the frontend sources or its toolchain — those only matter to contributors.
+exclude = ["web/src", "web/node_modules", "web/package*.json", "web/*.ts", "web/*.json", "web/index.html", "tools/"]
 
 
 [dependencies]

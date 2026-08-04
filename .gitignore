@@ -1,3 +1,6 @@
 /target
 .don
 *.local.toml
+web/node_modules
+# NOTE: web/dist is deliberately NOT ignored — it's embedded into the binary
+# and crates.io can't run npm. See web/README.md.
