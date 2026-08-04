@@ -208,7 +208,7 @@ impl Config {
     }
 
     /// Expand `depends_on` entries: every service-group reference becomes its
-    /// transitive members, each inheriting the requiredness declared on the
+    /// transitive members, each inheriting the blocking-ness declared on the
     /// group reference. Duplicates collapse to the strictest edge.
     pub(crate) fn expand_dependency_refs(&self, refs: &[Dependency]) -> Vec<Dependency> {
         let mut expanded = Vec::new();
@@ -1444,7 +1444,7 @@ mod tests {
                         rust.target_dir.as_deref(),
                         Some(std::path::Path::new("./target-api"))
                     );
-                    assert_eq!(resolved.depends_on, vec![Dependency::required("postgres")]);
+                    assert_eq!(resolved.depends_on, vec![Dependency::blocking("postgres")]);
                     assert_eq!(resolved.proxy.len(), 1);
                     assert_eq!(resolved.proxy[0].listen, "0.0.0.0:3000");
                     assert_eq!(resolved.proxy[0].mode, crate::config::ProxyMode::Listenfd);
@@ -1767,13 +1767,13 @@ mod tests {
                     let migrate = &config.tasks["migrate"];
                     assert_eq!(migrate.cmd, "dbmate");
                     assert_eq!(migrate.args, vec!["up"]);
-                    assert_eq!(migrate.depends_on, vec![Dependency::required("postgres")]);
+                    assert_eq!(migrate.depends_on, vec![Dependency::blocking("postgres")]);
                     assert_eq!(migrate.watch, vec!["db/migrations/**/*.sql"]);
                     assert_eq!(migrate.dir.as_deref(), Some(std::path::Path::new("./db")));
                     assert_eq!(migrate.env["DATABASE_URL"], "postgres://localhost:5432/dev");
 
                     let seed = &config.tasks["seed"];
-                    assert_eq!(seed.depends_on, vec![Dependency::required("migrate")]);
+                    assert_eq!(seed.depends_on, vec![Dependency::blocking("migrate")]);
                     assert!(matches!(seed.log, LogConfig::Ignore));
 
                     assert!(config.validate(TEST_PLATFORM).is_ok());
@@ -2033,7 +2033,7 @@ mod tests {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     let group = config.service_groups.get("frontend").unwrap();
                     assert_eq!(group.members, vec!["web"]);
-                    assert_eq!(group.depends_on, vec![Dependency::required("api")]);
+                    assert_eq!(group.depends_on, vec![Dependency::blocking("api")]);
                 },
             },
             ConfigTestCase {
@@ -2050,7 +2050,7 @@ mod tests {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     let group = config.service_groups.get("frontend").unwrap();
                     assert!(group.members.is_empty());
-                    assert_eq!(group.depends_on, vec![Dependency::required("api")]);
+                    assert_eq!(group.depends_on, vec![Dependency::blocking("api")]);
                 },
             },
             ConfigTestCase {
@@ -2074,13 +2074,13 @@ mod tests {
                 check: |config| {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     let mut deps =
-                        config.effective_depends_on("web", &[Dependency::required("self-only")]);
+                        config.effective_depends_on("web", &[Dependency::blocking("self-only")]);
                     deps.sort();
                     assert_eq!(
                         deps,
                         vec![
-                            Dependency::required("api"),
-                            Dependency::required("self-only"),
+                            Dependency::blocking("api"),
+                            Dependency::blocking("self-only"),
                         ]
                     );
                 },
@@ -2109,11 +2109,11 @@ mod tests {
                     assert!(config.validate(TEST_PLATFORM).is_ok());
                     assert_eq!(
                         config.effective_depends_on("web", &[]),
-                        vec![Dependency::required("api")],
+                        vec![Dependency::blocking("api")],
                     );
                     assert_eq!(
                         config.effective_depends_on("admin", &[]),
-                        vec![Dependency::required("api")],
+                        vec![Dependency::blocking("api")],
                     );
                 },
             },
@@ -2143,16 +2143,16 @@ mod tests {
                     deps.sort();
                     assert_eq!(
                         deps,
-                        vec![Dependency::required("api"), Dependency::required("worker")]
+                        vec![Dependency::blocking("api"), Dependency::blocking("worker")]
                     );
                 },
             },
             ConfigTestCase {
-                name: "an optional group reference makes every member optional",
+                name: "a non-blocking group reference makes every member non-blocking",
                 input: r#"
                     [services.web]
                     run.cmd = "web"
-                    depends_on = [{ name = "backend", required = false }]
+                    depends_on = [{ name = "backend", blocking = false }]
 
                     [services.api]
                     run.cmd = "api"
@@ -2171,16 +2171,19 @@ mod tests {
                     deps.sort();
                     assert_eq!(
                         deps,
-                        vec![Dependency::optional("api"), Dependency::optional("worker")]
+                        vec![
+                            Dependency::non_blocking("api"),
+                            Dependency::non_blocking("worker")
+                        ]
                     );
                 },
             },
             ConfigTestCase {
-                name: "a name reached both ways keeps the required edge",
+                name: "a name reached both ways keeps the blocking edge",
                 input: r#"
                     [services.web]
                     run.cmd = "web"
-                    depends_on = [{ name = "backend", required = false }, "api"]
+                    depends_on = [{ name = "backend", blocking = false }, "api"]
 
                     [services.api]
                     run.cmd = "api"
@@ -2199,7 +2202,10 @@ mod tests {
                     deps.sort();
                     assert_eq!(
                         deps,
-                        vec![Dependency::required("api"), Dependency::optional("worker")]
+                        vec![
+                            Dependency::blocking("api"),
+                            Dependency::non_blocking("worker")
+                        ]
                     );
                 },
             },

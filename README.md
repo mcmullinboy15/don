@@ -257,30 +257,30 @@ depends_on = ["db"]
 depends_on = ["migrate"]
 ```
 
-#### Required vs. optional dependencies
+#### Blocking vs. non-blocking dependencies
 
-A plain string is a **required** dependency: it must become ready (services)
+A plain string is a **blocking** dependency: it must become ready (services)
 or complete (tasks) first, and if it fails the dependent is skipped with
 `dep failed`.
 
-Write an entry in table form with `required = false` to make it **ordering
+Write an entry in table form with `blocking = false` to make it **ordering
 only**. The dependent still waits for that dependency to settle — it never
 starts before it — but a failure doesn't hold it back:
 
 ```toml
 [services.api]
 depends_on = [
-  "postgres",                                    # required: api won't start without it
-  { name = "otel-collector", required = false }, # nice to have: start anyway if it fails
+  "postgres",                                    # blocking: api won't start without it
+  { name = "otel-collector", blocking = false }, # nice to have: start anyway if it fails
 ]
 ```
 
-Don logs `starting without optional dependency 'otel-collector'` when it makes
-that call, so a start that follows a visible failure is never a mystery.
+Don logs `starting without non-blocking dependency 'otel-collector'` when it
+makes that call, so a start that follows a visible failure is never a mystery.
 
-Optional edges still count for ordering, shutdown order, and profile
-resolution. A group reference marked optional makes every member of that group
-optional; if a name is reachable both ways, the required edge wins.
+Non-blocking edges still count for ordering, shutdown order, and profile
+resolution. A group reference marked non-blocking makes every member of that
+group non-blocking; if a name is reachable both ways, the blocking edge wins.
 
 ### Service Groups
 
@@ -478,7 +478,7 @@ run.cmd = "./api-server"
 proxy = { listen = "127.0.0.1:3000", env = "PORT" }
 ```
 
-Don injects `PORT=<ephemeral>` into the service's environment. On restart, the proxy queues new connections while the service restarts. If the service has failed *and* its process is gone — a crash, or a required dependency that failed — queuing would just leave clients hanging, so Don refuses connections instead: queued and new connections are closed immediately until the service recovers. A service that failed but is **still running** (a failing ready check under the default `on_failure = "notify"`) keeps being served — a misconfigured health probe shouldn't take your app down. Both proxy modes behave the same way; `don status --verbose` marks a refusing listener `refusing (service failed)`.
+Don injects `PORT=<ephemeral>` into the service's environment. On restart, the proxy queues new connections while the service restarts. If the service has failed *and* its process is gone — a crash, or a blocking dependency that failed — queuing would just leave clients hanging, so Don refuses connections instead: queued and new connections are closed immediately until the service recovers. A service that failed but is **still running** (a failing ready check under the default `on_failure = "notify"`) keeps being served — a misconfigured health probe shouldn't take your app down. Both proxy modes behave the same way; `don status --verbose` marks a refusing listener `refusing (service failed)`.
 
 Supports multiple proxy entries and lazy start (delay service startup until first connection):
 
@@ -488,7 +488,7 @@ proxy = { listen = "127.0.0.1:3000", env = "PORT" }
 lazy = true
 ```
 
-A lazy service with `depends_on` moves from `lazy` to `pending` on its first connection and won't start until those dependencies are ready. While it waits, the browser tab shows nothing — the connection just sits queued. Don logs `waiting for dependencies before start` while deferred, and `don status` reports `pending`. If a required dependency has failed, the service goes to `dep failed` and the proxy closes the connection rather than holding it.
+A lazy service with `depends_on` moves from `lazy` to `pending` on its first connection and won't start until those dependencies are ready. While it waits, the browser tab shows nothing — the connection just sits queued. Don logs `waiting for dependencies before start` while deferred, and `don status` reports `pending`. If a blocking dependency has failed, the service goes to `dep failed` and the proxy closes the connection rather than holding it.
 
 #### Fallback Ports
 
@@ -721,7 +721,7 @@ See [`examples/`](examples/) for complete working configs.
 | `dir` | string | Working directory |
 | `env` | {key: value} | Environment variables |
 | `env_file` | [string] | Env files to load |
-| `depends_on` | [string \| {name, required}] | Services/tasks to wait for. A string (or `required = true`) also gates on success; `required = false` orders startup only |
+| `depends_on` | [string \| {name, blocking}] | Services/tasks to wait for. A string (or `blocking = true`) also gates on success; `blocking = false` orders startup only |
 | `watch` | [string] | Glob patterns to watch for changes; not a boolean |
 | `ignore` | [string] | Glob patterns to exclude from watch |
 | `debounce` | string | Debounce duration ("200ms", "1s") |

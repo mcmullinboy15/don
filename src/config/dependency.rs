@@ -1,8 +1,8 @@
 //! Dependency edges in `depends_on`.
 //!
-//! Every edge carries a *kind*. A **required** dependency (the default) gates
+//! Every edge carries a *kind*. A **blocking** dependency (the default) gates
 //! the dependent on the dependency reaching a satisfied state, and a failure
-//! propagates: the dependent is skipped with `dep failed`. An **optional**
+//! propagates: the dependent is skipped with `dep failed`. A **non-blocking**
 //! dependency is ordering only — the dependent still waits for it to settle,
 //! but starts whether it succeeded or failed.
 //!
@@ -10,8 +10,8 @@
 //!
 //! ```toml
 //! depends_on = [
-//!   "postgres",                                # required (default)
-//!   { name = "otel-collector", required = false },  # ordering only
+//!   "postgres",                                     # blocking (default)
+//!   { name = "otel-collector", blocking = false },  # ordering only
 //! ]
 //! ```
 
@@ -22,67 +22,68 @@ use std::fmt;
 /// One `depends_on` edge: the name of a service, task, or service group,
 /// plus whether the dependent may start when that dependency fails.
 ///
-/// Deserializes from either a bare string (`"postgres"`, required) or a table
-/// (`{ name = "otel", required = false }`). Serializes back to the same
-/// shorthand: a required dependency is written as a plain string.
+/// Deserializes from either a bare string (`"postgres"`, blocking) or a table
+/// (`{ name = "otel", blocking = false }`). Serializes back to the same
+/// shorthand: a blocking dependency is written as a plain string.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Dependency {
     /// The referenced service, task, or service group.
     pub name: String,
     /// When `true` (the default), the dependency must become ready/complete
-    /// before the dependent starts, and its failure skips the dependent.
-    /// When `false`, the edge only orders startup: the dependent waits for
-    /// the dependency to settle and then starts regardless of the outcome.
-    pub required: bool,
+    /// before the dependent starts, and its failure blocks the dependent —
+    /// which is skipped. When `false`, the edge only orders startup: the
+    /// dependent waits for the dependency to settle and then starts
+    /// regardless of the outcome.
+    pub blocking: bool,
 }
 
 impl Dependency {
-    /// A required dependency — the default kind.
-    pub fn required(name: impl Into<String>) -> Self {
+    /// A blocking dependency — the default kind.
+    pub fn blocking(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            required: true,
+            blocking: true,
         }
     }
 
     /// An ordering-only dependency whose failure does not block the dependent.
-    pub fn optional(name: impl Into<String>) -> Self {
+    pub fn non_blocking(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            required: false,
+            blocking: false,
         }
     }
 
     /// The same edge kind pointed at a different name. Used when a service
     /// group reference expands to its members: each member inherits the
-    /// requiredness declared on the group reference.
+    /// blocking-ness declared on the group reference.
     pub(crate) fn with_name(&self, name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            required: self.required,
+            blocking: self.blocking,
         }
     }
 }
 
 impl fmt::Display for Dependency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.required {
+        if self.blocking {
             write!(f, "{}", self.name)
         } else {
-            write!(f, "{} (optional)", self.name)
+            write!(f, "{} (non-blocking)", self.name)
         }
     }
 }
 
 impl From<&str> for Dependency {
     fn from(name: &str) -> Self {
-        Self::required(name)
+        Self::blocking(name)
     }
 }
 
 impl From<String> for Dependency {
     fn from(name: String) -> Self {
-        Self::required(name)
+        Self::blocking(name)
     }
 }
 
@@ -91,13 +92,13 @@ impl Serialize for Dependency {
     where
         S: Serializer,
     {
-        if self.required {
+        if self.blocking {
             return serializer.serialize_str(&self.name);
         }
         use serde::ser::SerializeStruct;
         let mut entry = serializer.serialize_struct("Dependency", 2)?;
         entry.serialize_field("name", &self.name)?;
-        entry.serialize_field("required", &self.required)?;
+        entry.serialize_field("blocking", &self.blocking)?;
         entry.end()
     }
 }
@@ -117,14 +118,14 @@ impl<'de> Visitor<'de> for DependencyVisitor {
     type Value = Dependency;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a dependency name, or a table like { name = \"api\", required = false }")
+        f.write_str("a dependency name, or a table like { name = \"api\", blocking = false }")
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Dependency, E>
     where
         E: serde::de::Error,
     {
-        Ok(Dependency::required(value))
+        Ok(Dependency::blocking(value))
     }
 
     fn visit_map<M>(self, mut map: M) -> Result<Dependency, M::Error>
@@ -132,15 +133,15 @@ impl<'de> Visitor<'de> for DependencyVisitor {
         M: MapAccess<'de>,
     {
         let mut name: Option<String> = None;
-        let mut required: Option<bool> = None;
+        let mut blocking: Option<bool> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "name" => name = Some(map.next_value()?),
-                "required" => required = Some(map.next_value()?),
+                "blocking" => blocking = Some(map.next_value()?),
                 other => {
                     return Err(serde::de::Error::custom(format!(
-                        "unknown key '{other}' in depends_on entry — expected 'name' or 'required'"
+                        "unknown key '{other}' in depends_on entry — expected 'name' or 'blocking'"
                     )));
                 }
             }
@@ -152,17 +153,17 @@ impl<'de> Visitor<'de> for DependencyVisitor {
 
         Ok(Dependency {
             name,
-            required: required.unwrap_or(true),
+            blocking: blocking.unwrap_or(true),
         })
     }
 }
 
 /// Append `dependency` to `list`, keeping the first position but the strictest
-/// kind: if the same name is reachable both as a required and an optional
-/// edge, the required edge wins.
+/// kind: if the same name is reachable both as a blocking and a non-blocking
+/// edge, the blocking edge wins.
 pub(crate) fn push_dependency(list: &mut Vec<Dependency>, dependency: Dependency) {
     if let Some(existing) = list.iter_mut().find(|d| d.name == dependency.name) {
-        existing.required |= dependency.required;
+        existing.blocking |= dependency.blocking;
         return;
     }
     list.push(dependency);
@@ -195,41 +196,41 @@ mod tests {
 
         let cases = vec![
             Case {
-                name: "bare strings are required",
+                name: "bare strings are blocking",
                 toml: r#"depends_on = ["postgres", "migrate"]"#,
                 want: Ok(vec![
-                    Dependency::required("postgres"),
-                    Dependency::required("migrate"),
+                    Dependency::blocking("postgres"),
+                    Dependency::blocking("migrate"),
                 ]),
             },
             Case {
-                name: "table with required = false is optional",
-                toml: r#"depends_on = [{ name = "otel", required = false }]"#,
-                want: Ok(vec![Dependency::optional("otel")]),
+                name: "table with blocking = false is non-blocking",
+                toml: r#"depends_on = [{ name = "otel", blocking = false }]"#,
+                want: Ok(vec![Dependency::non_blocking("otel")]),
             },
             Case {
-                name: "table without required defaults to required",
+                name: "table without blocking defaults to blocking",
                 toml: r#"depends_on = [{ name = "otel" }]"#,
-                want: Ok(vec![Dependency::required("otel")]),
+                want: Ok(vec![Dependency::blocking("otel")]),
             },
             Case {
                 name: "mixed forms keep declaration order",
-                toml: r#"depends_on = ["db", { name = "otel", required = false }, "cache"]"#,
+                toml: r#"depends_on = ["db", { name = "otel", blocking = false }, "cache"]"#,
                 want: Ok(vec![
-                    Dependency::required("db"),
-                    Dependency::optional("otel"),
-                    Dependency::required("cache"),
+                    Dependency::blocking("db"),
+                    Dependency::non_blocking("otel"),
+                    Dependency::blocking("cache"),
                 ]),
             },
             Case {
                 name: "missing name is rejected",
-                toml: r#"depends_on = [{ required = false }]"#,
+                toml: r#"depends_on = [{ blocking = false }]"#,
                 want: Err("missing 'name'"),
             },
             Case {
                 name: "unknown key is rejected",
-                toml: r#"depends_on = [{ name = "otel", requird = false }]"#,
-                want: Err("unknown key 'requird'"),
+                toml: r#"depends_on = [{ name = "otel", blockng = false }]"#,
+                want: Err("unknown key 'blockng'"),
             },
         ];
 
@@ -263,7 +264,7 @@ mod tests {
         }
 
         let out = Out {
-            depends_on: vec![Dependency::required("db"), Dependency::optional("otel")],
+            depends_on: vec![Dependency::blocking("db"), Dependency::non_blocking("otel")],
         };
         let text = toml::to_string(&out).unwrap();
         let back: Holder = toml::from_str(&text).unwrap();
@@ -282,21 +283,21 @@ mod tests {
         let cases = vec![
             Case {
                 name: "new name is appended",
-                existing: vec![Dependency::required("db")],
-                incoming: Dependency::optional("otel"),
-                want: vec![Dependency::required("db"), Dependency::optional("otel")],
+                existing: vec![Dependency::blocking("db")],
+                incoming: Dependency::non_blocking("otel"),
+                want: vec![Dependency::blocking("db"), Dependency::non_blocking("otel")],
             },
             Case {
-                name: "required upgrades an existing optional edge",
-                existing: vec![Dependency::optional("db")],
-                incoming: Dependency::required("db"),
-                want: vec![Dependency::required("db")],
+                name: "blocking upgrades an existing non-blocking edge",
+                existing: vec![Dependency::non_blocking("db")],
+                incoming: Dependency::blocking("db"),
+                want: vec![Dependency::blocking("db")],
             },
             Case {
-                name: "optional does not downgrade an existing required edge",
-                existing: vec![Dependency::required("db")],
-                incoming: Dependency::optional("db"),
-                want: vec![Dependency::required("db")],
+                name: "non-blocking does not downgrade an existing blocking edge",
+                existing: vec![Dependency::blocking("db")],
+                incoming: Dependency::non_blocking("db"),
+                want: vec![Dependency::blocking("db")],
             },
         ];
 
@@ -308,8 +309,11 @@ mod tests {
     }
 
     #[test]
-    fn display_marks_optional_edges() {
-        assert_eq!(Dependency::required("db").to_string(), "db");
-        assert_eq!(Dependency::optional("db").to_string(), "db (optional)");
+    fn display_marks_non_blocking_edges() {
+        assert_eq!(Dependency::blocking("db").to_string(), "db");
+        assert_eq!(
+            Dependency::non_blocking("db").to_string(),
+            "db (non-blocking)"
+        );
     }
 }

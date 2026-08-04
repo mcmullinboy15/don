@@ -176,8 +176,8 @@ pub struct Task {
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// Services or tasks that must be ready/complete before this task runs.
-    /// A `required` entry also gates on success; an optional entry only
-    /// orders startup.
+    /// A blocking entry also gates on success; a non-blocking one only orders
+    /// startup.
     #[serde(default)]
     pub depends_on: Vec<Dependency>,
     /// File glob patterns — task only re-runs if these files changed since last success.

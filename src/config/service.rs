@@ -52,8 +52,8 @@ pub struct Service {
     pub ignore: Vec<String>,
     /// Debounce window for file watch events (e.g. "500ms" or "1s"). Defaults to "200ms".
     pub debounce: Option<String>,
-    /// Services or tasks that must start before this one. A `required`
-    /// entry also gates on success; an optional entry only orders startup.
+    /// Services or tasks that must start before this one. A blocking entry
+    /// also gates on success; a non-blocking one only orders startup.
     pub depends_on: Vec<Dependency>,
     /// Proxy entries: Don binds each entry's `listen` address and either
     /// forwards to an ephemeral backend port (env mode) or hands the bound

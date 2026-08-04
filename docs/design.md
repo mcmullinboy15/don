@@ -146,7 +146,7 @@ These fields are available on all service presets:
 | `env_file` | list of paths | Env files to load. Don also auto-loads `.env.<service-name>` if it exists |
 | `watch` | list of globs | File patterns to watch for rebuilding/restarting |
 | `debounce` | duration string | Debounce window for watch events (default "200ms") |
-| `depends_on` | list of names or `{name, required}` tables | Services or tasks that must be ready/complete first. `required = false` makes an entry ordering-only |
+| `depends_on` | list of names or `{name, blocking}` tables | Services or tasks that must be ready/complete first. `blocking = false` makes an entry ordering-only |
 | `proxy` | address or list | Public listeners using env forwarding, fixed forwarding, or `LISTEN_FDS` handoff |
 | `ready` | table | Ready check configuration (see below) |
 | `shutdown` | table | Shutdown behavior (see below) |
@@ -177,7 +177,7 @@ log = "ignore"
 | `args` | list | Arguments to pass |
 | `dir` | path | Working directory |
 | `env` | map | Environment variables |
-| `depends_on` | list of names or `{name, required}` tables | Services or tasks that must be ready/complete first. `required = false` makes an entry ordering-only |
+| `depends_on` | list of names or `{name, blocking}` tables | Services or tasks that must be ready/complete first. `blocking = false` makes an entry ordering-only |
 | `watch` | list of globs | File patterns — task only re-runs if these changed since last success. Empty = always runs |
 | `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
@@ -448,7 +448,7 @@ Services and tasks share a single dependency namespace. The `depends_on` field a
 
 Names must be unique across services and tasks (validated).
 
-### Required and optional dependencies
+### Blocking and non-blocking dependencies
 
 Each `depends_on` entry is either a bare name or a table carrying the edge
 kind:
@@ -457,26 +457,26 @@ kind:
 [services.api]
 rust.binary = "api-server"
 depends_on = [
-  "postgres",                                    # required (default)
-  { name = "otel-collector", required = false }, # ordering only
+  "postgres",                                    # blocking (default)
+  { name = "otel-collector", blocking = false }, # ordering only
 ]
 ```
 
 | Kind | Gate | On dependency failure |
 |------|------|-----------------------|
-| required (default) | waits for ready/complete | dependent is skipped, `DependencyFailed`, with the root cause named |
-| optional (`required = false`) | waits for the dependency to *settle* | dependent starts anyway and logs `starting without optional dependency '<name>'` |
+| blocking (default) | waits for ready/complete | dependent is skipped, `DependencyFailed`, with the root cause named |
+| non-blocking (`blocking = false`) | waits for the dependency to *settle* | dependent starts anyway and logs `starting without non-blocking dependency '<name>'` |
 
 "Settled" means the dependency is done deciding: a service that is ready,
 failed, or stopped; a task that completed, failed, or is parked waiting for a
-manual trigger (`auto_run = false`). An optional edge also does not make a
-manual task "required by dependents" — only a required edge does.
+manual trigger (`auto_run = false`). A non-blocking edge also does not make a
+manual task "required by dependents" — only a blocking edge does.
 
-Optional is not the same as "ignored": the edge still orders startup, reverse
-shutdown order, and profile resolution — it only stops a failure from
+Non-blocking is not the same as "ignored": the edge still orders startup,
+reverse shutdown order, and profile resolution — it only stops a failure from
 cascading. Group references carry their kind to every member, and when the
-same name is reachable through both a required and an optional edge, the
-required edge wins.
+same name is reachable through both a blocking and a non-blocking edge, the
+blocking edge wins.
 
 You can also define named groups of services and reference those group names
 from `depends_on`:
