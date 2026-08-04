@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/status", get(get_status))
+        .route("/events", get(get_events))
         .route("/watch", get(get_watch))
         .route("/start/{name}", post(post_start))
         .route("/stop/{name}", post(post_stop))
@@ -70,6 +71,44 @@ async fn get_status(
 #[derive(Serialize)]
 struct StatusResponse {
     items: Vec<ItemStatus>,
+}
+
+/// `GET /events` — stream runner state changes as newline-delimited JSON.
+///
+/// Each line is a serialized [`RunnerEvent`] (`{"type": "...", ...}`). The
+/// stream stays open until the client disconnects or the runner shuts down;
+/// consumers should treat `shutdown_complete` as the terminator.
+///
+/// A consumer too slow to keep up with the broadcast gets
+/// `{"type":"lagged","skipped":N}` instead of silently missing transitions —
+/// the correct response is to refetch `GET /status` and resync.
+async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+    let stream = BroadcastStream::new(state.event_tx.subscribe()).map(|item| {
+        let value = match item {
+            Ok(event) => serde_json::to_value(&event).unwrap_or_else(|_| {
+                serde_json::json!({ "type": "error", "message": "event serialization failed" })
+            }),
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                serde_json::json!({ "type": "lagged", "skipped": skipped })
+            }
+        };
+        let mut chunk = serde_json::to_vec(&value).unwrap_or_default();
+        chunk.push(b'\n');
+        Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk))
+    });
+
+    match axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .body(axum::body::Body::from_stream(stream))
+    {
+        Ok(resp) => resp,
+        Err(_) => runner_unavailable(),
+    }
 }
 
 /// `GET /watch` — global file-watch state (inotify dirs + per-item patterns).

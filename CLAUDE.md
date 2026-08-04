@@ -285,6 +285,8 @@ Don targets Unix systems (Linux and macOS). Windows is not supported due to reli
 
 ## State Directory
 
-All mutable state goes under `.don/` in the project root. This directory must be in `.gitignore`. See `docs/design.md` for the full layout.
+All mutable *project* state goes under `.don/` in the project root. This directory must be in `.gitignore`. See `docs/design.md` for the full layout.
 
-Never store state outside `.don/` — don should be fully self-contained and leave no footprint beyond this directory.
+Never store project state outside `.don/` — a don-managed project should be fully self-contained and leave no footprint beyond this directory.
+
+**The system-wide daemon is the one documented exception.** `don daemon` is not scoped to a project, so it has nowhere project-local to put its socket, project registry, and web-UI auth token. Those live in a single directory resolved by `src/daemon/paths.rs`: `$DON_STATE_DIR`, else `$XDG_STATE_HOME/don`, else `~/.local/state/don` (`~/Library/Application Support/don` on macOS). Nothing else may write outside `.don/`, and the daemon writes nothing into any project's directory.

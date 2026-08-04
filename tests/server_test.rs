@@ -403,6 +403,55 @@ fn integration_stop_endpoint_stops_service() {
 }
 
 #[test]
+fn integration_events_endpoint_streams_state_changes() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("server-events");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+        // Let startup settle so the events we assert on are the ones this
+        // test triggers, not leftovers from the initial start sequence.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Trigger a stop *after* the subscriber is attached — the endpoint
+        // streams live events only, so the request has to land second.
+        let socket_for_stop = socket.clone();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            request(&socket_for_stop, "POST", "/stop/keeper").await
+        });
+
+        // A stop produces two transitions: Stopping, then Stopped.
+        let lines = follow_lines(&socket, "/events", 2, Duration::from_secs(8)).await;
+        let (stop_status, _) = stopper.await.unwrap();
+        assert_eq!(stop_status, 204);
+
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("\"type\":\"service_state_changed\""),
+            "events should be internally tagged; got: {joined}"
+        );
+        assert!(
+            joined.contains("\"name\":\"keeper\""),
+            "events should name the service; got: {joined}"
+        );
+        assert!(
+            joined.contains("\"state\":\"stopped\""),
+            "stop should reach the event stream; got: {joined}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
 fn integration_restart_endpoint_restarts_service() {
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("server-restart");

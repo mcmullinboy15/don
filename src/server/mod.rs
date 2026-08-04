@@ -8,13 +8,13 @@
 pub(crate) mod attach;
 pub(crate) mod routes;
 
-use crate::runner::RunnerCommand;
+use crate::runner::{RunnerCommand, RunnerEvent};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// Server errors.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +42,10 @@ type ResizeMap = std::collections::HashMap<String, mpsc::Sender<(u16, u16)>>;
 #[derive(Clone)]
 pub(crate) struct ApiState {
     pub cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
+    /// Runner event broadcast, used by `GET /events` to stream state changes.
+    /// Subscribing per-request keeps the API decoupled from the runner loop —
+    /// a slow HTTP client lags its own receiver and nobody else's.
+    pub event_tx: broadcast::Sender<RunnerEvent>,
     /// Resize channels for active attach sessions. The attach bridge task
     /// registers its receiver here; the resize HTTP handler sends through it.
     pub attach_resize_txs: std::sync::Arc<tokio::sync::Mutex<ResizeMap>>,
@@ -90,11 +94,13 @@ pub async fn serve_api(
     listener: UnixListener,
     socket_path: PathBuf,
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
+    event_tx: broadcast::Sender<RunnerEvent>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);
     let state = Arc::new(ApiState {
         cmd_tx,
+        event_tx,
         attach_resize_txs: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

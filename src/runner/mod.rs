@@ -679,7 +679,12 @@ pub fn all_services_ready(items: &[ItemStatus]) -> bool {
 }
 
 /// An event broadcast from the runner for external consumers.
-#[derive(Debug, Clone)]
+///
+/// Serialized as an internally-tagged JSON object (`{"type": "...", ...}`) so
+/// the unix-socket API can stream state changes to the web UI and any other
+/// consumer over `GET /events`. Variant names are snake_cased on the wire.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunnerEvent {
     /// A service changed state.
     ServiceStateChanged {
@@ -1321,6 +1326,7 @@ impl Runner {
             Ok(listener) => {
                 let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
                 let cmd_tx_for_server = self.cmd_tx.clone();
+                let event_tx_for_server = self.event_tx.clone();
                 let socket_path_for_server = socket_path.clone();
                 let server_emitter = self.output_manager.clone_lifecycle_emitter();
                 tokio::spawn(async move {
@@ -1328,6 +1334,7 @@ impl Runner {
                         listener,
                         socket_path_for_server,
                         cmd_tx_for_server,
+                        event_tx_for_server,
                         server_shutdown_rx,
                     )
                     .await
