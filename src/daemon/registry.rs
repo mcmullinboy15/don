@@ -191,9 +191,9 @@ impl ProjectRegistry {
     /// because pruning happens inline on the daemon's command loop.
     pub async fn prune(&mut self) -> Vec<ProjectEntry> {
         let candidates = self.list();
-        let probes = candidates.into_iter().map(|entry| async move {
-            is_reachable(&entry.socket).await.then_some(entry.id)
-        });
+        let probes = candidates
+            .into_iter()
+            .map(|entry| async move { is_reachable(&entry.socket).await.then_some(entry.id) });
         let alive: HashSet<String> = futures_util::future::join_all(probes)
             .await
             .into_iter()
@@ -320,7 +320,10 @@ mod tests {
         assert_eq!(outcome, LoadOutcome::Fresh);
 
         assert!(!reg.register(entry("/p/one", 1)), "first insert is new");
-        assert!(!reg.register(entry("/p/two", 2)), "different project is new");
+        assert!(
+            !reg.register(entry("/p/two", 2)),
+            "different project is new"
+        );
         assert_eq!(reg.len(), 2);
 
         // Same directory, new process — replaces rather than duplicates.
@@ -338,7 +341,10 @@ mod tests {
         reg.register(entry("/p/two", 2));
 
         assert!(reg.deregister(&project_id(Path::new("/p/one"))));
-        assert!(!reg.deregister(&project_id(Path::new("/p/one"))), "idempotent");
+        assert!(
+            !reg.deregister(&project_id(Path::new("/p/one"))),
+            "idempotent"
+        );
         assert!(!reg.deregister("nonexistent"));
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.list()[0].name, "two");

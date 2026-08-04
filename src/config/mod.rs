@@ -1580,7 +1580,10 @@ mod tests {
                     let Some(ServiceKind::Docker(docker)) = &macos.kind else {
                         panic!("expected docker preset on macos");
                     };
-                    assert_eq!(docker.image.as_deref(), Some("cockroachdb/cockroach:v24.1.0"));
+                    assert_eq!(
+                        docker.image.as_deref(),
+                        Some("cockroachdb/cockroach:v24.1.0")
+                    );
                     assert_eq!(macos.env["COCKROACH_PORT"], "26257");
                     assert!(macos.download.is_some());
                 },
@@ -1647,7 +1650,10 @@ mod tests {
                     let Some(ServiceKind::Docker(docker)) = &macos.kind else {
                         panic!("expected docker on macos");
                     };
-                    assert_eq!(docker.image.as_deref(), Some("cockroachdb/cockroach:v24.1.0"));
+                    assert_eq!(
+                        docker.image.as_deref(),
+                        Some("cockroachdb/cockroach:v24.1.0")
+                    );
 
                     // Platform without an override and no base preset should fail
                     let other = config.services["crdb"].resolve(Platform::LinuxAarch64);

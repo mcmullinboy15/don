@@ -79,11 +79,7 @@ impl Harness {
 
         let (listener, addr) = don::web::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
         let (web_shutdown, web_shutdown_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(don::web::serve_single(
-            listener,
-            entry,
-            web_shutdown_rx,
-        ));
+        tokio::spawn(don::web::serve_single(listener, entry, web_shutdown_rx));
 
         Self {
             port: addr.port(),
@@ -265,7 +261,10 @@ fn integration_web_serves_the_app_shell_for_unknown_routes() {
             return;
         }
         assert_eq!(status, 200);
-        assert!(body.contains("<html"), "expected the app shell; got: {body}");
+        assert!(
+            body.contains("<html"),
+            "expected the app shell; got: {body}"
+        );
 
         // A missing asset must fail loudly rather than being handed HTML.
         let (status, _) = harness.get("/assets/missing.js").await;

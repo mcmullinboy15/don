@@ -158,10 +158,8 @@ impl DaemonPaths {
     /// Create the state directory (and the log directory) if missing.
     pub fn ensure(&self) -> Result<(), PathError> {
         for dir in [self.root.clone(), self.log_dir()] {
-            std::fs::create_dir_all(&dir).map_err(|source| PathError::CreateDir {
-                path: dir,
-                source,
-            })?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|source| PathError::CreateDir { path: dir, source })?;
         }
         Ok(())
     }
@@ -302,7 +300,10 @@ mod tests {
         assert_eq!(paths.pid_file(), PathBuf::from("/state/don/daemon.pid"));
         assert_eq!(paths.registry(), PathBuf::from("/state/don/registry.json"));
         assert_eq!(paths.log_dir(), PathBuf::from("/state/don/logs"));
-        assert_eq!(paths.log_file(), PathBuf::from("/state/don/logs/daemon.log"));
+        assert_eq!(
+            paths.log_file(),
+            PathBuf::from("/state/don/logs/daemon.log")
+        );
     }
 
     #[test]
@@ -315,7 +316,10 @@ mod tests {
         );
 
         // A root just short enough that appending "/daemon.sock" still fits.
-        let ok = format!("/{}", "d".repeat(SOCKET_PATH_MAX - "/daemon.sock".len() - 1));
+        let ok = format!(
+            "/{}",
+            "d".repeat(SOCKET_PATH_MAX - "/daemon.sock".len() - 1)
+        );
         assert!(DaemonPaths::resolve(&env(Some(&ok), None, None, false)).is_ok());
     }
 

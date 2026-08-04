@@ -24,9 +24,7 @@ pub enum InstallError {
          Run `don daemon` yourself, or wire it into whatever supervisor you use."
     )]
     UnsupportedPlatform { os: &'static str },
-    #[error(
-        "cannot work out where to install the service: $HOME is not set to an absolute path"
-    )]
+    #[error("cannot work out where to install the service: $HOME is not set to an absolute path")]
     NoHome,
     #[error("failed to locate the don binary: {0}")]
     NoExecutable(#[source] std::io::Error),
@@ -155,7 +153,10 @@ pub fn install(plan: &InstallPlan) -> Result<Vec<String>, InstallError> {
     match plan.manager {
         ServiceManager::Systemd => {
             run("systemctl", &["--user", "daemon-reload"])?;
-            run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT_NAME])?;
+            run(
+                "systemctl",
+                &["--user", "enable", "--now", SYSTEMD_UNIT_NAME],
+            )?;
             messages.push("enabled and started the service".to_string());
             messages.push(
                 "note: run `loginctl enable-linger $USER` if you want the daemon \
@@ -167,7 +168,10 @@ pub fn install(plan: &InstallPlan) -> Result<Vec<String>, InstallError> {
             let target = format!("gui/{}", current_uid());
             // `bootout` first so re-installing picks up a changed unit
             // instead of failing with "service already loaded".
-            let _ = run("launchctl", &["bootout", &target, &path_str(&plan.unit_path)]);
+            let _ = run(
+                "launchctl",
+                &["bootout", &target, &path_str(&plan.unit_path)],
+            );
             run(
                 "launchctl",
                 &["bootstrap", &target, &path_str(&plan.unit_path)],
@@ -188,12 +192,18 @@ pub fn uninstall(plan: &InstallPlan) -> Result<Vec<String>, InstallError> {
 
     match plan.manager {
         ServiceManager::Systemd => {
-            let _ = run("systemctl", &["--user", "disable", "--now", SYSTEMD_UNIT_NAME]);
+            let _ = run(
+                "systemctl",
+                &["--user", "disable", "--now", SYSTEMD_UNIT_NAME],
+            );
             messages.push("stopped and disabled the service".to_string());
         }
         ServiceManager::Launchd => {
             let target = format!("gui/{}", current_uid());
-            let _ = run("launchctl", &["bootout", &target, &path_str(&plan.unit_path)]);
+            let _ = run(
+                "launchctl",
+                &["bootout", &target, &path_str(&plan.unit_path)],
+            );
             messages.push("unloaded the agent".to_string());
         }
     }

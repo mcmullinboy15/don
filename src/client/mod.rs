@@ -267,7 +267,12 @@ impl Client {
     /// `GET /logs/:name?last=N&follow=true` — opens a streaming connection
     /// and invokes `on_line` for each NDJSON line the server sends. Returns
     /// when the server closes the stream or the callback returns `Err`.
-    pub async fn logs_follow<F>(&self, name: &str, last: usize, on_line: F) -> Result<(), ClientError>
+    pub async fn logs_follow<F>(
+        &self,
+        name: &str,
+        last: usize,
+        on_line: F,
+    ) -> Result<(), ClientError>
     where
         F: FnMut(&str) -> Result<(), ClientError>,
     {

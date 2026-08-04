@@ -125,9 +125,7 @@ async fn stream_events(State(state): State<Arc<ApiState>>, Path(id): Path<String
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(STREAM_BUFFER);
     tokio::spawn(async move {
-        let _ = client
-            .events_follow(|line| forward(&tx, line))
-            .await;
+        let _ = client.events_follow(|line| forward(&tx, line)).await;
     });
     sse(rx)
 }
@@ -180,7 +178,12 @@ async fn post_start(
     State(state): State<Arc<ApiState>>,
     Path((id, name)): Path<(String, String)>,
 ) -> Response {
-    control(&state, &id, |client| async move { client.start(&name).await }).await
+    control(
+        &state,
+        &id,
+        |client| async move { client.start(&name).await },
+    )
+    .await
 }
 
 /// `POST /api/projects/:id/stop/:name`
@@ -188,7 +191,12 @@ async fn post_stop(
     State(state): State<Arc<ApiState>>,
     Path((id, name)): Path<(String, String)>,
 ) -> Response {
-    control(&state, &id, |client| async move { client.stop(&name).await }).await
+    control(
+        &state,
+        &id,
+        |client| async move { client.stop(&name).await },
+    )
+    .await
 }
 
 /// `POST /api/projects/:id/restart/:name`
@@ -196,9 +204,11 @@ async fn post_restart(
     State(state): State<Arc<ApiState>>,
     Path((id, name)): Path<(String, String)>,
 ) -> Response {
-    control(&state, &id, |client| async move {
-        client.restart(&name).await
-    })
+    control(
+        &state,
+        &id,
+        |client| async move { client.restart(&name).await },
+    )
     .await
 }
 
@@ -241,9 +251,11 @@ async fn post_run(
 
 /// `POST /api/projects/:id/run-pending` — run every task awaiting a trigger.
 async fn post_run_pending(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
-    control(&state, &id, |client| async move {
-        client.run_pending().await
-    })
+    control(
+        &state,
+        &id,
+        |client| async move { client.run_pending().await },
+    )
     .await
 }
 

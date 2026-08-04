@@ -690,7 +690,10 @@ fn normal_bar_line(
     }
     // Parked tasks are easy to miss as a lone `*`, so tint the whole hotkey.
     if counts.tasks_pending_run > 0 {
-        spans.push(Span::styled("  [t] tasks", Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            "  [t] tasks",
+            Style::default().fg(Color::Yellow),
+        ));
         spans.push(Span::styled(
             "*",
             Style::default()

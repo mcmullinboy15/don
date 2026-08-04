@@ -961,7 +961,9 @@ async fn run_ui(print_only: bool) -> i32 {
             0
         }
         Err(e) => {
-            errln(format!("could not open a browser ({e}) — open this instead:"));
+            errln(format!(
+                "could not open a browser ({e}) — open this instead:"
+            ));
             println!("{url}");
             0
         }
@@ -2406,11 +2408,8 @@ async fn start_with_ui(
     profile: Option<&str>,
 ) -> Result<WithUiGuard, String> {
     let root = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-    let entry = don::daemon::ProjectEntry::new(
-        root,
-        std::process::id(),
-        profile.map(str::to_string),
-    );
+    let entry =
+        don::daemon::ProjectEntry::new(root, std::process::id(), profile.map(str::to_string));
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let (listener, addr) = don::web::bind(addr).await.map_err(|e| {
@@ -2421,11 +2420,7 @@ async fn start_with_ui(
     })?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(don::web::serve_single(
-        listener,
-        entry,
-        shutdown_rx,
-    ));
+    tokio::spawn(don::web::serve_single(listener, entry, shutdown_rx));
 
     println!("don web ui: http://{addr}/");
     Ok(WithUiGuard {

@@ -134,12 +134,8 @@ fn integration_project_registers_and_deregisters() {
 
         let project_dir = dir.child("proj");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let (shutdown_tx, handle) = spawn_runner(
-            &keeper_config(),
-            &project_dir,
-            Some(daemon.paths.socket()),
-        )
-        .await;
+        let (shutdown_tx, handle) =
+            spawn_runner(&keeper_config(), &project_dir, Some(daemon.paths.socket())).await;
 
         assert_eq!(
             wait_for_project_count(&client, 1, Duration::from_secs(5)).await,
@@ -183,12 +179,8 @@ fn integration_registering_twice_replaces_rather_than_duplicates() {
         std::fs::create_dir_all(&project_dir).unwrap();
 
         for _ in 0..2 {
-            let (shutdown_tx, handle) = spawn_runner(
-                &keeper_config(),
-                &project_dir,
-                Some(daemon.paths.socket()),
-            )
-            .await;
+            let (shutdown_tx, handle) =
+                spawn_runner(&keeper_config(), &project_dir, Some(daemon.paths.socket())).await;
             assert_eq!(
                 wait_for_project_count(&client, 1, Duration::from_secs(5)).await,
                 1,
@@ -272,12 +264,8 @@ fn integration_daemon_survives_restart_with_registry_intact() {
 
         let project_dir = dir.child("proj");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let (shutdown_tx, handle) = spawn_runner(
-            &keeper_config(),
-            &project_dir,
-            Some(daemon.paths.socket()),
-        )
-        .await;
+        let (shutdown_tx, handle) =
+            spawn_runner(&keeper_config(), &project_dir, Some(daemon.paths.socket())).await;
         assert_eq!(
             wait_for_project_count(&daemon.client(), 1, Duration::from_secs(5)).await,
             1

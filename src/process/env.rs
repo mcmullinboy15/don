@@ -368,8 +368,7 @@ mod tests {
     #[test]
     fn merge_env_expands_config_values() {
         let dir = TempDir::new("env-expand");
-        let injected: HashMap<String, String> =
-            [("PORT".to_string(), "45678".to_string())].into();
+        let injected: HashMap<String, String> = [("PORT".to_string(), "45678".to_string())].into();
 
         struct Case {
             name: &'static str,
@@ -407,8 +406,7 @@ mod tests {
         for case in cases {
             let config: HashMap<String, String> =
                 [("TARGET".to_string(), case.value.to_string())].into();
-            let (merged, _) =
-                merge_env("svc", Some(dir.path()), &[], &config, &injected).unwrap();
+            let (merged, _) = merge_env("svc", Some(dir.path()), &[], &config, &injected).unwrap();
             let expect = case
                 .expect
                 .replace("DIR", &dir.path().to_string_lossy())
@@ -438,8 +436,14 @@ mod tests {
     #[test]
     fn merge_env_points_pwd_at_the_child_directory() {
         let dir = TempDir::new("env-pwd");
-        let (merged, _) =
-            merge_env("svc", Some(dir.path()), &[], &HashMap::new(), &HashMap::new()).unwrap();
+        let (merged, _) = merge_env(
+            "svc",
+            Some(dir.path()),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             merged.get("PWD").map(String::as_str),

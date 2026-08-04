@@ -48,8 +48,7 @@ pub(in crate::runner) fn spawn_manifest_writer(
                     emitter.lifecycle_event(&format!("failed to update runtime ports: {error}"));
                 }
                 Err(join_error) => {
-                    emitter
-                        .lifecycle_event(&format!("runtime ports writer failed: {join_error}"));
+                    emitter.lifecycle_event(&format!("runtime ports writer failed: {join_error}"));
                 }
             }
         }

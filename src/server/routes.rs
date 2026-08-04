@@ -89,9 +89,9 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
 
     let stream = BroadcastStream::new(state.event_tx.subscribe()).map(|item| {
         let value = match item {
-            Ok(event) => serde_json::to_value(&event).unwrap_or_else(|_| {
-                serde_json::json!({ "type": "error", "message": "event serialization failed" })
-            }),
+            Ok(event) => serde_json::to_value(&event).unwrap_or_else(
+                |_| serde_json::json!({ "type": "error", "message": "event serialization failed" }),
+            ),
             Err(BroadcastStreamRecvError::Lagged(skipped)) => {
                 serde_json::json!({ "type": "lagged", "skipped": skipped })
             }
