@@ -771,7 +771,7 @@ See [`examples/`](examples/) for complete working configs.
 | `run.cmd` | string | Command to execute |
 | `run.args` | [string] | Arguments |
 | `dir` | string | Working directory |
-| `env` | {key: value} | Environment variables |
+| `env` | {key: value} | Environment variables. Values expand `${VAR}` against the inherited environment, env files, and Don-injected vars like `PORT` and `PWD` — but not against each other |
 | `env_file` | [string] | Env files to load |
 | `depends_on` | [string \| {name, blocking}] | Services/tasks to wait for. A string (or `blocking = true`) also gates on success; `blocking = false` orders startup only |
 | `watch` | [string] | Glob patterns to watch for changes; not a boolean |

@@ -91,14 +91,14 @@ impl Runner {
         env.extend(self.runtime_public_env(name));
 
         if let Some(tcp) = ready.tcp.take() {
-            let expanded = super::service::expand_env_vars(&tcp, &env);
+            let expanded = crate::process::env::expand_env_vars(&tcp, &env);
             ready.tcp = Some(rewrite_tcp_port(
                 &expanded,
                 &self.ready_port_replacements(name),
             ));
         }
         if let Some(http) = ready.http.take() {
-            let expanded = super::service::expand_env_vars(&http, &env);
+            let expanded = crate::process::env::expand_env_vars(&http, &env);
             ready.http = Some(rewrite_http_port(
                 &expanded,
                 &self.ready_port_replacements(name),

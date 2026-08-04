@@ -232,8 +232,11 @@ pub(crate) async fn start_service(
 
     // Expand ${VAR} references in the command and args against the env map.
     // This lets proxy-injected vars like PORT be used in run args.
-    let cmd = expand_env_vars(&cmd, &env);
-    let args: Vec<String> = args.iter().map(|a| expand_env_vars(a, &env)).collect();
+    let cmd = crate::process::env::expand_env_vars(&cmd, &env);
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| crate::process::env::expand_env_vars(a, &env))
+        .collect();
 
     // Build PGID file path.
     std::fs::create_dir_all(pid_dir).map_err(crate::process::ProcessError::Io)?;
@@ -669,45 +672,6 @@ pub(crate) fn go_binary_path(config: &GoConfig, service_name: &str, base_dir: &P
     bin_dir.join(binary_name)
 }
 
-/// Expand `${VAR}` references in a string using values from the env map.
-/// Unknown variables are left as-is.
-pub(crate) fn expand_env_vars(input: &str, env: &HashMap<String, String>) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // consume '{'
-            let mut var_name = String::new();
-            let mut found_close = false;
-            for c in chars.by_ref() {
-                if c == '}' {
-                    found_close = true;
-                    break;
-                }
-                var_name.push(c);
-            }
-            if found_close {
-                if let Some(val) = env.get(&var_name) {
-                    result.push_str(val);
-                } else {
-                    // Leave unresolved vars as-is.
-                    result.push_str("${");
-                    result.push_str(&var_name);
-                    result.push('}');
-                }
-            } else {
-                // Unclosed ${, emit literally.
-                result.push_str("${");
-                result.push_str(&var_name);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -905,71 +869,6 @@ mod tests {
             let result = go_build_args(&case.config, Path::new(case.output));
             let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(result, expected, "{}", case.name);
-        }
-    }
-
-    #[test]
-    fn test_expand_env_vars() {
-        struct Case {
-            name: &'static str,
-            input: &'static str,
-            env: Vec<(&'static str, &'static str)>,
-            expected: &'static str,
-        }
-
-        let cases = vec![
-            Case {
-                name: "no vars",
-                input: "hello world",
-                env: vec![],
-                expected: "hello world",
-            },
-            Case {
-                name: "single var",
-                input: "--port ${PORT}",
-                env: vec![("PORT", "8080")],
-                expected: "--port 8080",
-            },
-            Case {
-                name: "multiple vars",
-                input: "${HOST}:${PORT}",
-                env: vec![("HOST", "localhost"), ("PORT", "3000")],
-                expected: "localhost:3000",
-            },
-            Case {
-                name: "unknown var left as-is",
-                input: "--port ${UNKNOWN}",
-                env: vec![],
-                expected: "--port ${UNKNOWN}",
-            },
-            Case {
-                name: "var at start",
-                input: "${PORT}",
-                env: vec![("PORT", "9090")],
-                expected: "9090",
-            },
-            Case {
-                name: "bare dollar sign",
-                input: "cost is $5",
-                env: vec![],
-                expected: "cost is $5",
-            },
-            Case {
-                name: "unclosed brace",
-                input: "broken ${VAR",
-                env: vec![("VAR", "val")],
-                expected: "broken ${VAR",
-            },
-        ];
-
-        for case in cases {
-            let env: HashMap<String, String> = case
-                .env
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            let result = expand_env_vars(case.input, &env);
-            assert_eq!(result, case.expected, "{}", case.name);
         }
     }
 

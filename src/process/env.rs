@@ -194,6 +194,28 @@ pub fn merge_env(
         !(lk.contains("runfiles") || lk.contains("rlocation") || bazel_state)
     });
 
+    // Point PWD at the directory the child will actually run in.
+    //
+    // Don sets the child's cwd but, without this, leaves it inheriting Don's
+    // own PWD — so anything reading `$PWD` (shell scripts especially) sees
+    // the directory Don was launched from rather than its own. Shells
+    // recompute PWD when it disagrees with `getcwd()`, which hides the bug;
+    // a Python or Node child reading the variable directly does not.
+    //
+    // It also makes `${PWD}` usable in config, which is the only way to
+    // write an absolute path relative to the project without hard-coding
+    // one machine's layout.
+    if let Some(dir) = service_dir {
+        let absolute = if dir.is_absolute() {
+            Some(dir.to_path_buf())
+        } else {
+            std::fs::canonicalize(dir).ok()
+        };
+        if let Some(absolute) = absolute {
+            merged.insert("PWD".to_string(), absolute.to_string_lossy().into_owned());
+        }
+    }
+
     // 1. Auto-load .env.<service_name> if it exists
     let dir = service_dir.unwrap_or_else(|| Path::new("."));
     let auto_path = dir.join(format!(".env.{service_name}"));
@@ -210,13 +232,65 @@ pub fn merge_env(
         all_warnings.extend(warnings);
     }
 
-    // 3. Inline env from config
-    merged.extend(config_env.clone());
+    // 3. Inline env from config, with `${VAR}` expanded.
+    //
+    //    The base for expansion is everything *except* the config block
+    //    itself — the inherited environment, any env files, and Don's own
+    //    injected variables. Config values deliberately can't see each
+    //    other: `HashMap` iteration order is arbitrary, so `A = "${B}"`
+    //    alongside `B = "x"` would resolve differently run to run, and a
+    //    config that works by luck is worse than one that doesn't work.
+    let mut expansion_base = merged.clone();
+    expansion_base.extend(injected.clone());
+    for (key, value) in config_env {
+        merged.insert(key.clone(), expand_env_vars(value, &expansion_base));
+    }
 
     // 4. Don-injected variables
     merged.extend(injected.clone());
 
     Ok((merged, all_warnings))
+}
+
+/// Expand `${VAR}` references in a string using values from the env map.
+/// Unknown variables are left as-is, so a value that merely *looks* like a
+/// reference (a shell snippet, a template for some downstream tool) survives
+/// untouched rather than being silently emptied.
+pub fn expand_env_vars(input: &str, env: &HashMap<String, String>) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut var_name = String::new();
+            let mut found_close = false;
+            for c in chars.by_ref() {
+                if c == '}' {
+                    found_close = true;
+                    break;
+                }
+                var_name.push(c);
+            }
+            if found_close {
+                if let Some(val) = env.get(&var_name) {
+                    result.push_str(val);
+                } else {
+                    // Leave unresolved vars as-is.
+                    result.push_str("${");
+                    result.push_str(&var_name);
+                    result.push('}');
+                }
+            } else {
+                // Unclosed ${, emit literally.
+                result.push_str("${");
+                result.push_str(&var_name);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -225,6 +299,154 @@ mod tests {
     use super::*;
     use crate::process::test_util::TempDir;
     use std::fs;
+
+    #[test]
+    fn test_expand_env_vars() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            env: Vec<(&'static str, &'static str)>,
+            expected: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "no vars",
+                input: "hello world",
+                env: vec![],
+                expected: "hello world",
+            },
+            Case {
+                name: "single var",
+                input: "--port ${PORT}",
+                env: vec![("PORT", "8080")],
+                expected: "--port 8080",
+            },
+            Case {
+                name: "multiple vars",
+                input: "${HOST}:${PORT}",
+                env: vec![("HOST", "localhost"), ("PORT", "3000")],
+                expected: "localhost:3000",
+            },
+            Case {
+                name: "unknown var left as-is",
+                input: "--port ${UNKNOWN}",
+                env: vec![],
+                expected: "--port ${UNKNOWN}",
+            },
+            Case {
+                name: "var at start",
+                input: "${PORT}",
+                env: vec![("PORT", "9090")],
+                expected: "9090",
+            },
+            Case {
+                name: "bare dollar sign",
+                input: "cost is $5",
+                env: vec![],
+                expected: "cost is $5",
+            },
+            Case {
+                name: "unclosed brace",
+                input: "broken ${VAR",
+                env: vec![("VAR", "val")],
+                expected: "broken ${VAR",
+            },
+        ];
+
+        for case in cases {
+            let env: HashMap<String, String> = case
+                .env
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let result = expand_env_vars(case.input, &env);
+            assert_eq!(result, case.expected, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn merge_env_expands_config_values() {
+        let dir = TempDir::new("env-expand");
+        let injected: HashMap<String, String> =
+            [("PORT".to_string(), "45678".to_string())].into();
+
+        struct Case {
+            name: &'static str,
+            value: &'static str,
+            expect: &'static str,
+        }
+
+        // `HOME` stands in for "something from the inherited environment";
+        // it's set in every environment don runs in.
+        let home = std::env::var("HOME").unwrap();
+
+        let cases = vec![
+            Case {
+                name: "an injected var, which is the point of the feature",
+                value: "postgres://localhost:${PORT}/app",
+                expect: "postgres://localhost:45678/app",
+            },
+            Case {
+                name: "PWD resolves to the child's own directory",
+                value: "${PWD}/.don/state",
+                expect: "DIR/.don/state",
+            },
+            Case {
+                name: "an unknown var is left alone rather than emptied",
+                value: "${NOT_SET_ANYWHERE}/x",
+                expect: "${NOT_SET_ANYWHERE}/x",
+            },
+            Case {
+                name: "a plain value is untouched",
+                value: "just-a-value",
+                expect: "just-a-value",
+            },
+        ];
+
+        for case in cases {
+            let config: HashMap<String, String> =
+                [("TARGET".to_string(), case.value.to_string())].into();
+            let (merged, _) =
+                merge_env("svc", Some(dir.path()), &[], &config, &injected).unwrap();
+            let expect = case
+                .expect
+                .replace("DIR", &dir.path().to_string_lossy())
+                .replace("HOME_UNUSED", &home);
+            assert_eq!(merged.get("TARGET"), Some(&expect), "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn merge_env_config_values_cannot_see_each_other() {
+        // Deliberate: HashMap order is arbitrary, so resolving config
+        // against config would give different answers on different runs.
+        // Leaving the reference intact is the honest, reproducible outcome.
+        let dir = TempDir::new("env-expand-order");
+        let config: HashMap<String, String> = [
+            ("BASE".to_string(), "/srv".to_string()),
+            ("FULL".to_string(), "${BASE}/app".to_string()),
+        ]
+        .into();
+
+        let (merged, _) =
+            merge_env("svc", Some(dir.path()), &[], &config, &HashMap::new()).unwrap();
+        assert_eq!(merged.get("BASE"), Some(&"/srv".to_string()));
+        assert_eq!(merged.get("FULL"), Some(&"${BASE}/app".to_string()));
+    }
+
+    #[test]
+    fn merge_env_points_pwd_at_the_child_directory() {
+        let dir = TempDir::new("env-pwd");
+        let (merged, _) =
+            merge_env("svc", Some(dir.path()), &[], &HashMap::new(), &HashMap::new()).unwrap();
+
+        assert_eq!(
+            merged.get("PWD").map(String::as_str),
+            Some(dir.path().to_string_lossy().as_ref()),
+            "PWD should name the directory the child will run in, not don's"
+        );
+    }
 
     #[test]
     fn test_parse_env_content() {

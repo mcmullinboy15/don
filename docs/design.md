@@ -624,10 +624,31 @@ server fails) — deliberately not done, on the same "it's your machine" grounds
 
 Environment variables are resolved in this order (later wins):
 
+0. The inherited environment, plus `PWD` set to the directory the child will
+   actually run in — Don changes the child's cwd, so leaving `PWD` pointing at
+   Don's own would be a lie that shell children silently correct and everything
+   else silently believes.
 1. `.env.<service-name>` — auto-loaded if the file exists (convention)
 2. `env_file` — explicitly listed env files, loaded in order
 3. `env` — inline variables from the config
 4. Don-injected variables (`LISTEN_FDS`, `LISTEN_FDNAMES`, `DON_PUBLIC_*`, `DON_DOWNLOAD_DIR`, etc.)
+
+### `${VAR}` expansion
+
+`cmd`, `args`, `ready.tcp`/`ready.http`, and inline `env` values expand
+`${VAR}` references. Unknown names are left verbatim, so a value that merely
+resembles a reference survives rather than being silently emptied.
+
+Inline `env` values expand against everything *except* the `env` block itself —
+the inherited environment (including `PWD`), env files, and Don's injected
+variables. They deliberately cannot reference each other: config env is a map,
+map order is arbitrary, and `A = "${B}"` beside `B = "x"` would otherwise
+resolve differently from run to run.
+
+```toml
+[services.api]
+env = { DATABASE_URL = "postgres://localhost:${PORT}/app", STATE = "${PWD}/.state" }
+```
 
 An env-mode proxy keeps its configured env variable (for example `PORT`) for
 the private backend port the service binds. Its actual public listener is

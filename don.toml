@@ -51,19 +51,15 @@ tasks = ["clippy", "test"]
 # address in your browser doesn't change and connections queue rather than
 # fail.
 #
-# Wrapped in bash for one reason: DON_STATE_DIR has to be absolute (see
-# src/daemon/paths.rs) and per-checkout, and Don expands `${VAR}` in cmd/args
-# but not in `env` values. Letting the shell expand `$PWD` — which Don has
-# already set to this project's root — gets both. `exec` means the bash
-# process is replaced, so Don is still supervising the daemon directly.
+# DON_STATE_DIR has to be absolute (see src/daemon/paths.rs) and per-checkout,
+# which is what `${PWD}` gives: Don points it at the directory the service
+# actually runs in.
 [services.daemon]
 build.cmd = "cargo"
 build.args = ["build", "--bin", "don"]
-run.cmd = "bash"
-run.args = [
-  "-c",
-  'DON_STATE_DIR="$PWD/.don/dev-daemon" exec ./target/debug/don daemon',
-]
+run.cmd = "./target/debug/don"
+run.args = ["daemon"]
+env = { DON_STATE_DIR = "${PWD}/.don/dev-daemon" }
 proxy = { listen = "127.0.0.1:3777", env = "DON_UI_PORT" }
 watch = ["src/**/*.rs", "Cargo.toml"]
 debounce = "500ms"
@@ -96,14 +92,11 @@ ready.retries = 60
 # the UI has a project to show. Uses the freshly built binary, so it also
 # smoke-tests that `don start` still works after your change.
 #
-# Same bash wrapper as the daemon, and it has to resolve to the same
-# directory — that's how the two find each other.
+# Same DON_STATE_DIR as the daemon — that's how the two find each other.
 [services.demo]
-run.cmd = "bash"
-run.args = [
-  "-c",
-  'DON_STATE_DIR="$PWD/.don/dev-daemon" exec ./target/debug/don --config dev/demo/don.toml start --no-tui',
-]
+run.cmd = "./target/debug/don"
+run.args = ["--config", "dev/demo/don.toml", "start", "--no-tui"]
+env = { DON_STATE_DIR = "${PWD}/.don/dev-daemon" }
 depends_on = ["daemon"]
 reload = false
 # Its children need to stop before it reports done.
