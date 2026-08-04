@@ -144,7 +144,7 @@ impl ServiceBuilder {
         self
     }
 
-    /// Add depends_on entries with explicit kinds: `(name, required)`.
+    /// Add depends_on entries with explicit kinds: `(name, blocking)`.
     pub fn depends_on_kinds(mut self, deps: &[(&str, bool)]) -> Self {
         self.lines
             .push(format!("depends_on = [{}]", format_dependencies(deps)));
@@ -343,7 +343,7 @@ impl TaskBuilder {
         self
     }
 
-    /// Add depends_on entries with explicit kinds: `(name, required)`.
+    /// Add depends_on entries with explicit kinds: `(name, blocking)`.
     pub fn depends_on_kinds(mut self, deps: &[(&str, bool)]) -> Self {
         self.lines
             .push(format!("depends_on = [{}]", format_dependencies(deps)));
@@ -416,14 +416,14 @@ impl TaskBuilder {
     }
 }
 
-/// Render `depends_on` entries, using the table form for optional edges.
+/// Render `depends_on` entries, using the table form for non-blocking edges.
 fn format_dependencies(deps: &[(&str, bool)]) -> String {
     deps.iter()
-        .map(|(name, required)| {
-            if *required {
+        .map(|(name, blocking)| {
+            if *blocking {
                 format!("\"{name}\"")
             } else {
-                format!("{{ name = \"{name}\", required = false }}")
+                format!("{{ name = \"{name}\", blocking = false }}")
             }
         })
         .collect::<Vec<_>>()

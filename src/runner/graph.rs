@@ -211,8 +211,8 @@ impl Runner {
     }
 
     /// Dependency edges reduced to names, for ordering-only consumers
-    /// (topological sort, shutdown depth). Optional edges still order the
-    /// graph — they just don't gate on success.
+    /// (topological sort, shutdown depth). Non-blocking edges still order
+    /// the graph — they just don't gate on success.
     pub(in crate::runner) fn build_dep_name_map(&self) -> HashMap<String, Vec<String>> {
         dep_name_map(&self.build_dep_map())
     }

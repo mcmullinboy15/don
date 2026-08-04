@@ -19,11 +19,11 @@ impl Runner {
             _ => return,
         };
 
-        // Only a required dependency's failure strands a lazy service — an
-        // optional one lets it start anyway.
+        // Only a blocking dependency's failure strands a lazy service — a
+        // non-blocking one lets it start anyway.
         if let Some(failed) = deps
             .iter()
-            .filter(|dep| dep.required)
+            .filter(|dep| dep.blocking)
             .find(|dep| self.is_dep_failed(&dep.name))
         {
             self.output_manager.service_error_event(

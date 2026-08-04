@@ -1409,11 +1409,11 @@ fn integration_restart_crashed_service_without_ready_check() {
     });
 }
 
-/// An optional (`required = false`) dependency orders startup without gating
-/// on success: when it fails, the dependent starts anyway while a sibling that
-/// depends on it the normal way is skipped.
+/// A non-blocking (`blocking = false`) dependency orders startup without
+/// gating on success: when it fails, the dependent starts anyway while a
+/// sibling that depends on it the normal way is skipped.
 #[test]
-fn integration_optional_dependency_failure_does_not_block_dependent() {
+fn integration_non_blocking_dependency_failure_does_not_block_dependent() {
     run_with_timeout(Duration::from_secs(30), async {
         let dir = TempDir::new("optional-dep-failure");
 
@@ -1445,7 +1445,7 @@ fn integration_optional_dependency_failure_does_not_block_dependent() {
         .await;
         wait_for_substr(
             &buf,
-            "api: starting without optional dependency 'seed'",
+            "api: starting without non-blocking dependency 'seed'",
             Duration::from_secs(10),
         )
         .await;
@@ -1468,7 +1468,7 @@ fn integration_optional_dependency_failure_does_not_block_dependent() {
                     ..
                 }
             )),
-            "api should be running despite its optional dependency failing: {statuses:?}"
+            "api should be running despite its non-blocking dependency failing: {statuses:?}"
         );
 
         let _ = shutdown_tx.send(()).await;
@@ -1476,12 +1476,12 @@ fn integration_optional_dependency_failure_does_not_block_dependent() {
     });
 }
 
-/// A task that only ever runs on a manual trigger has settled as far as an
-/// optional dependent is concerned — waiting for it would mean waiting
+/// A task that only ever runs on a manual trigger has settled as far as a
+/// non-blocking dependent is concerned — waiting for it would mean waiting
 /// forever. It must also not be parked as "required by dependents" when the
-/// only thing pointing at it is an optional edge.
+/// only thing pointing at it is a non-blocking edge.
 #[test]
-fn integration_optional_dependency_on_manual_task_does_not_block() {
+fn integration_non_blocking_dependency_on_manual_task_does_not_block() {
     run_with_timeout(Duration::from_secs(30), async {
         let dir = TempDir::new("optional-dep-manual-task");
 
@@ -1503,7 +1503,7 @@ fn integration_optional_dependency_on_manual_task_does_not_block() {
         wait_for_substr(&buf, "api: started", Duration::from_secs(10)).await;
         assert!(
             !read_buf(&buf).contains("SEED_RAN"),
-            "a manual task must not be auto-run for an optional dependent. output: {}",
+            "a manual task must not be auto-run for a non-blocking dependent. output: {}",
             read_buf(&buf)
         );
 
@@ -1512,10 +1512,10 @@ fn integration_optional_dependency_on_manual_task_does_not_block() {
     });
 }
 
-/// Stopping a service settles an optional edge, and the dependent has to be
-/// swept promptly — not left pending until something unrelated happens.
+/// Stopping a service settles a non-blocking edge, and the dependent has to
+/// be swept promptly — not left pending until something unrelated happens.
 #[test]
-fn integration_optional_dependency_unblocks_when_dependency_is_stopped() {
+fn integration_non_blocking_dependency_unblocks_when_dependency_is_stopped() {
     run_with_timeout(Duration::from_secs(30), async {
         let dir = TempDir::new("optional-dep-stopped");
         // Nothing ever listens here, so `dep` stays Running and un-ready for
@@ -1544,7 +1544,7 @@ fn integration_optional_dependency_unblocks_when_dependency_is_stopped() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
             !read_buf(&buf).contains("api: starting"),
-            "api should wait while its optional dependency is still coming up. output: {}",
+            "api should wait while its non-blocking dependency is still coming up. output: {}",
             read_buf(&buf)
         );
 
@@ -1567,10 +1567,10 @@ fn integration_optional_dependency_unblocks_when_dependency_is_stopped() {
     });
 }
 
-/// Optional is not the same as ignored: the dependent still starts *after*
-/// the dependency settles.
+/// Non-blocking is not the same as ignored: the dependent still starts
+/// *after* the dependency settles.
 #[test]
-fn integration_optional_dependency_still_orders_startup() {
+fn integration_non_blocking_dependency_still_orders_startup() {
     run_with_timeout(Duration::from_secs(30), async {
         let dir = TempDir::new("optional-dep-ordering");
 
@@ -1600,7 +1600,7 @@ fn integration_optional_dependency_still_orders_startup() {
             .unwrap_or_else(|| panic!("api should have started. output: {output}"));
         assert!(
             seed_done < api_started,
-            "api should start only after its optional dependency finished. output: {output}"
+            "api should start only after its non-blocking dependency finished. output: {output}"
         );
 
         let _ = shutdown_tx.send(()).await;

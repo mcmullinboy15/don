@@ -26,7 +26,7 @@ fn format_dependency_failure(dependencies: &[String]) -> String {
     }
 }
 
-fn format_optional_dependencies(dependencies: &[String]) -> String {
+fn format_non_blocking_dependencies(dependencies: &[String]) -> String {
     match dependencies {
         [dependency] => format!("dependency '{dependency}'"),
         dependencies => format!("dependencies '{}'", dependencies.join("', '")),
@@ -288,8 +288,8 @@ impl Runner {
 
     /// Whether a dependency has stopped making progress: it either failed or
     /// was stopped, and nothing is going to move it to a satisfied state
-    /// without another explicit request. Only optional (ordering-only) edges
-    /// use this — it is what lets a dependent start anyway.
+    /// without another explicit request. Only non-blocking (ordering-only)
+    /// edges use this — it is what lets a dependent start anyway.
     fn is_dep_settled(&self, dep: &str) -> bool {
         if let Some(rs) = self.services.get(dep) {
             return matches!(
@@ -300,7 +300,8 @@ impl Runner {
         if let Some(rt) = self.tasks.get(dep) {
             // `PendingRun`/`Skipped` are settled too: the task is waiting for
             // a manual trigger (or was judged unnecessary) and will not run on
-            // its own, so an optional dependent would otherwise wait forever.
+            // its own, so a non-blocking dependent would otherwise wait
+            // forever.
             return matches!(
                 rt.state(),
                 TaskItemState::Failed
@@ -314,37 +315,37 @@ impl Runner {
 
     /// Whether one `depends_on` edge no longer blocks its dependent.
     ///
-    /// A required edge opens only when the dependency is satisfied. An
-    /// optional edge is ordering-only: it also opens once the dependency has
-    /// settled into a failed or stopped state, so the dependent still starts
-    /// *after* it, but is not held hostage by it.
+    /// A blocking edge opens only when the dependency is satisfied. A
+    /// non-blocking edge is ordering-only: it also opens once the dependency
+    /// has settled into a failed or stopped state, so the dependent still
+    /// starts *after* it, but is not held hostage by it.
     pub(in crate::runner) fn is_dep_gate_open(&self, dep: &Dependency) -> bool {
         if self.is_dep_satisfied(&dep.name) {
             return true;
         }
-        !dep.required && self.is_dep_settled(&dep.name)
+        !dep.blocking && self.is_dep_settled(&dep.name)
     }
 
-    /// Announce the optional dependencies this item is not waiting for.
-    fn report_skipped_optional_dependencies(&self, name: &str, skipped: &[String]) {
+    /// Announce the non-blocking dependencies this item is not waiting for.
+    fn report_skipped_non_blocking_dependencies(&self, name: &str, skipped: &[String]) {
         if skipped.is_empty() {
             return;
         }
         self.output_manager.service_event(
             name,
             &format!(
-                "starting without optional {}",
-                format_optional_dependencies(skipped)
+                "starting without non-blocking {}",
+                format_non_blocking_dependencies(skipped)
             ),
         );
     }
 
-    /// Optional dependencies that settled unsuccessfully — reported when the
-    /// dependent starts anyway so the log explains why it didn't wait.
-    fn skipped_optional_dependencies(&self, dependencies: &[Dependency]) -> Vec<String> {
+    /// Non-blocking dependencies that settled unsuccessfully — reported when
+    /// the dependent starts anyway so the log explains why it didn't wait.
+    fn skipped_non_blocking_dependencies(&self, dependencies: &[Dependency]) -> Vec<String> {
         dependencies
             .iter()
-            .filter(|dep| !dep.required && !self.is_dep_satisfied(&dep.name))
+            .filter(|dep| !dep.blocking && !self.is_dep_satisfied(&dep.name))
             .filter(|dep| self.is_dep_settled(&dep.name))
             .map(|dep| dep.name.clone())
             .collect()
@@ -378,11 +379,11 @@ impl Runner {
     /// intermediate `DependencyFailed` item contributes the roots it already
     /// recorded, so a chain such as api -> worker -> db reports `db`.
     ///
-    /// Optional edges are ignored: their whole point is that a failure on the
-    /// other end must not cascade.
+    /// Non-blocking edges are ignored: their whole point is that a failure on
+    /// the other end must not cascade.
     fn failed_dependency_roots(&self, dependencies: &[Dependency]) -> Vec<String> {
         let mut roots = Vec::new();
-        for dependency in dependencies.iter().filter(|dep| dep.required) {
+        for dependency in dependencies.iter().filter(|dep| dep.blocking) {
             let dependency = &dependency.name;
             let inherited = if let Some(rs) = self.services.get(dependency) {
                 match rs.state() {
@@ -458,9 +459,9 @@ impl Runner {
                     // A lazy service reaches DependencyFailed only after a
                     // connection moved it out of Lazy. Pending preserves that
                     // queued request for the normal scheduler. That scheduler
-                    // still waits for every dependency gate to open — required
-                    // edges on a satisfied dependency, optional ones on a
-                    // dependency that has settled either way.
+                    // still waits for every dependency gate to open —
+                    // blocking edges on a satisfied dependency, non-blocking
+                    // ones on a dependency that has settled either way.
                     self.set_service_state(name, ServiceState::Pending);
                 } else {
                     self.set_task_state(name, TaskItemState::Pending);
@@ -587,13 +588,13 @@ impl Runner {
                 return;
             }
 
-            // Optional dependencies we are deliberately not waiting on.
+            // Non-blocking dependencies we are deliberately not waiting on.
             // Reported at the moment the item actually starts, so a start
             // that follows a visible failure doesn't look like don ignored
             // the dependency graph.
             let skipped = dep_map
                 .get(&name)
-                .map(|deps| self.skipped_optional_dependencies(deps))
+                .map(|deps| self.skipped_non_blocking_dependencies(deps))
                 .unwrap_or_default();
 
             let is_pending_svc = self
@@ -612,7 +613,7 @@ impl Runner {
                 if self.start_lazy_build_if_needed(&name) {
                     continue;
                 }
-                self.report_skipped_optional_dependencies(&name, &skipped);
+                self.report_skipped_non_blocking_dependencies(&name, &skipped);
                 self.output_manager
                     .service_debug_event(&name, "start triggered (deps satisfied)");
                 if let Err(e) = self.queue_scheduled_service_start(
@@ -639,15 +640,16 @@ impl Runner {
                 continue;
             };
 
-            self.report_skipped_optional_dependencies(&name, &skipped);
+            self.report_skipped_non_blocking_dependencies(&name, &skipped);
             if needs_startup_evaluation {
-                // Only a *required* dependent makes a manual task worth
-                // parking for. An optional dependent is happy either way, so
-                // counting it would park the task as "required by dependents"
-                // and then block the very dependent that didn't care.
+                // Only a *blocking* dependent makes a manual task worth
+                // parking for. A non-blocking dependent is happy either way,
+                // so counting it would park the task as "required by
+                // dependents" and then block the very dependent that didn't
+                // care.
                 let has_dependents = dep_map
                     .values()
-                    .any(|deps| deps.iter().any(|dep| dep.required && dep.name == name));
+                    .any(|deps| deps.iter().any(|dep| dep.blocking && dep.name == name));
                 if let Err(e) = self.spawn_task_worker(
                     &name,
                     task_cfg,

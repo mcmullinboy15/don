@@ -557,8 +557,9 @@ pub enum ItemStatus {
 /// Extended information for verbose status display.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VerboseInfo {
-    /// Services/tasks this item depends on. Optional (ordering-only) edges
-    /// serialize as `{ name, required = false }`, required ones as a string.
+    /// Services/tasks this item depends on. Non-blocking (ordering-only)
+    /// edges serialize as `{ name, blocking = false }`, blocking ones as a
+    /// string.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<crate::config::Dependency>,
     /// File watch patterns (explicit or resolved from build tool).
@@ -971,7 +972,7 @@ impl Runner {
                     ServiceState::Pending
                         | ServiceState::Lazy
                         | ServiceState::Ready
-                        // Stopped opens an optional dependency's gate, so
+                        // Stopped opens a non-blocking dependency's gate, so
                         // dependents need a sweep to notice.
                         | ServiceState::Stopped
                         | ServiceState::Failed
@@ -2197,7 +2198,7 @@ mod tests {
         let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
         if let Some(service) = runner.services.get_mut("api") {
             service.resolved.lazy = true;
-            service.resolved.depends_on = vec![crate::config::Dependency::required("setup")];
+            service.resolved.depends_on = vec![crate::config::Dependency::blocking("setup")];
         }
         runner.set_service_state("api", ServiceState::Building);
 
