@@ -2424,7 +2424,6 @@ async fn start_with_ui(
     tokio::spawn(don::web::serve_single(
         listener,
         entry,
-        addr.port(),
         shutdown_rx,
     ));
 

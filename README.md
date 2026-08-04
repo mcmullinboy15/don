@@ -715,10 +715,11 @@ don start --no-daemon        # no UI, and don't register with the daemon either
 
 The web UI binds loopback only and doesn't authenticate: anything that can
 reach the port is already running on your machine, and so can already do
-anything don can. It does refuse requests whose `Host` isn't its own address,
+anything don can. It does refuse requests whose `Host` isn't a loopback name,
 which is what a DNS-rebound request from a page you merely visited looks like
 — that blocks such a page from *reading* your logs and project paths, though
-not from firing a blind request it can't see the result of.
+not from firing a blind request it can't see the result of. The port isn't
+checked, so the UI works behind a reverse proxy.
 
 ### Daemon API
 

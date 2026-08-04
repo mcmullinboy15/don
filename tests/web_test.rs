@@ -82,7 +82,6 @@ impl Harness {
         tokio::spawn(don::web::serve_single(
             listener,
             entry,
-            addr.port(),
             web_shutdown_rx,
         ));
 
@@ -211,6 +210,15 @@ fn integration_web_api_rejects_rebound_requests() {
             Case {
                 name: "127.0.0.1 is served",
                 host: "127.0.0.1",
+                expect: 200,
+            },
+            // A reverse proxy forwards the port it was reached on, not the
+            // one this server bound. Don's own proxy does exactly this when
+            // the daemon runs behind `proxy = { ... }` — checking the port
+            // here would break the repo's own `don start`.
+            Case {
+                name: "a loopback host on a proxy's port is served",
+                host: "127.0.0.1:59999",
                 expect: 200,
             },
             Case {

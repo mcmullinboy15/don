@@ -605,8 +605,14 @@ to the machine at all — a web page the user merely visits. Same-origin policy
 stops such a page reading a response from 127.0.0.1, but DNS rebinding defeats
 it: point `evil.example.com` at 127.0.0.1 and the page becomes same-origin with
 don, free to read project paths, logs, and config. A rebound request carries the
-attacker's hostname, so `src/web/origin.rs` rejects any `Host` that isn't the
-address the server bound.
+attacker's hostname, so `src/web/origin.rs` rejects any `Host` whose name isn't
+a loopback one.
+
+Only the name is checked, not the port. A browser always sends the authority it
+connected to, so the port can't disagree in a way that signals an attack —
+while comparing it breaks every reverse proxy, which legitimately forwards a
+different one. Don's own proxy does this whenever the daemon runs behind
+`proxy = { ... }`, as it does in this repo's `don.toml`.
 
 That guard protects confidentiality, not integrity. A blind cross-origin `POST`
 that ignores the response carries the correct `Host` and still goes through, so

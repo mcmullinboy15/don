@@ -20,15 +20,25 @@ export default defineConfig({
     },
   },
   server: {
+    // Bind IPv4 explicitly. Left alone, Vite listens on `[::1]` only, which
+    // a Don proxy forwarding to 127.0.0.1 can't reach — and neither can a
+    // `ready.tcp` check.
+    host: "127.0.0.1",
+    // Under `don start`, Don assigns the port and forwards a stable public
+    // one to it; standalone `npm run dev` keeps Vite's usual 5173.
+    port: process.env.PORT ? Number(process.env.PORT) : 5173,
+    // Never silently drift to another port: Don's proxy is pointed at this
+    // one, so moving would break the forward rather than just relocating it.
+    strictPort: true,
     // `npm run dev` proxies the API to a locally running don, so the UI can
     // be iterated on with hot reload against a real stack.
     proxy: {
       "/api": {
         target: process.env.DON_UI_TARGET ?? "http://127.0.0.1:3666",
-        // Rewrite Host to the target's. don rejects requests whose Host
-        // isn't the address it bound — that's the DNS-rebinding guard in
-        // src/web/auth.rs — and without this the proxy forwards
-        // `localhost:5173` and every API call comes back 421.
+        // Present the target's host. Not strictly required — don's origin
+        // guard checks the hostname, not the port — but it's what a reverse
+        // proxy conventionally does, and it keeps this working if the guard
+        // ever tightens.
         changeOrigin: true,
       },
     },

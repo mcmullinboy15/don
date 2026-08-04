@@ -177,7 +177,7 @@ async fn start_web(
     let handle = tokio::spawn({
         let shutdown_rx = shutdown_rx.clone();
         async move {
-            let _ = crate::web::serve(listener, directory, addr.port(), shutdown_rx).await;
+            let _ = crate::web::serve(listener, directory, shutdown_rx).await;
         }
     });
     Ok(WebServer { addr, handle })

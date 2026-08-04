@@ -2,24 +2,30 @@
 #
 # `don start` here gives you the dev loop for working on this repo:
 #
-#   * a dev daemon on :3777, rebuilt and restarted when you touch src/
-#   * the Vite dev server on :5173, proxying to it, with hot reload
+#   * a dev daemon, rebuilt and restarted when you touch src/
+#   * the Vite dev server, proxying to it, with hot reload
 #   * a throwaway project (dev/demo) registered with the dev daemon, so the
 #     UI has something to render
 #   * clippy on every Rust save; `web/dist` rebuilt on every frontend save
 #
-# Then open http://127.0.0.1:5173 and you're editing the UI while watching it
-# run don.
-#
 #   don start                  # everything
 #   don start --profile rust   # no npm: just the daemon and clippy
+#   don ports                  # where things actually landed
 #
-# The dev daemon deliberately keeps its state in /tmp/don-dev-daemon rather
-# than the usual XDG location. A daemon you install with `don daemon install`
-# holds an flock on daemon.pid there, so sharing the directory would mean the
-# dev daemon refuses to start whenever your real one is running.
+# Then open the `web` address from `don ports` and you're editing the UI while
+# watching it run don.
+#
+# Everything here is addressed dynamically so several checkouts can run at
+# once. `fallback_ports` means the first instance gets the memorable ports and
+# later ones get whatever's free, and both services sit behind Don proxies, so
+# the address you opened survives the daemon restarting under you on every
+# save.
 
 default_profile = "all"
+
+# Take the nice ports when they're free, an OS-assigned one when they aren't.
+# This is what lets a second checkout start without a port fight.
+fallback_ports = true
 
 [profiles.all]
 services = ["daemon", "web", "demo"]
@@ -37,39 +43,67 @@ tasks = ["clippy", "test"]
 # so the UI you're looking at is always the code you just wrote.
 #
 # Not the `rust.binary` preset: that passes extra args to `cargo build`, and
-# this needs args on the *binary* (`daemon --port ...`).
+# this needs args on the *binary*.
+#
+# The proxy is what makes the restart-on-save loop bearable. Don holds the
+# public port; the daemon binds an ephemeral one it's handed as DON_UI_PORT
+# (which its `--port` flag reads). So when a save restarts the daemon, the
+# address in your browser doesn't change and connections queue rather than
+# fail.
+#
+# Wrapped in bash for one reason: DON_STATE_DIR has to be absolute (see
+# src/daemon/paths.rs) and per-checkout, and Don expands `${VAR}` in cmd/args
+# but not in `env` values. Letting the shell expand `$PWD` — which Don has
+# already set to this project's root — gets both. `exec` means the bash
+# process is replaced, so Don is still supervising the daemon directly.
 [services.daemon]
 build.cmd = "cargo"
 build.args = ["build", "--bin", "don"]
-run.cmd = "./target/debug/don"
-run.args = ["daemon", "--port", "3777"]
-env = { DON_STATE_DIR = "/tmp/don-dev-daemon" }
+run.cmd = "bash"
+run.args = [
+  "-c",
+  'DON_STATE_DIR="$PWD/.don/dev-daemon" exec ./target/debug/don daemon',
+]
+proxy = { listen = "127.0.0.1:3777", env = "DON_UI_PORT" }
 watch = ["src/**/*.rs", "Cargo.toml"]
 debounce = "500ms"
-ready.tcp = "127.0.0.1:3777"
+# The daemon answers on its ephemeral port; check the one Don handed it.
+ready.tcp = "127.0.0.1:${DON_UI_PORT}"
 ready.retries = 120
 
 # Vite. `reload = false` because it has its own HMR — don restarting it on
 # every save would throw away the thing it's for.
+#
+# Behind a proxy for the same reason as the daemon: a stable address you can
+# leave open in a browser. `vite.config.ts` reads the injected PORT and pins
+# `host: 127.0.0.1` — left to itself Vite binds `[::1]` only, which the proxy
+# can't forward to.
+#
+# `$(daemon.addr)` is the daemon's *public* proxy address, so this survives
+# the daemon restarting on every Rust save.
 [services.web]
 dir = "web"
 run.cmd = "npm"
 run.args = ["run", "dev"]
-env = { DON_UI_TARGET = "http://127.0.0.1:3777" }
+env = { DON_UI_TARGET = "http://$(daemon.addr)" }
+proxy = { listen = "127.0.0.1:5173", env = "PORT" }
 depends_on = ["daemon", "web-install"]
 reload = false
-# Not `ready.tcp`: Vite binds `[::1]` only, so a check against 127.0.0.1
-# never connects. Going through the name resolves the way a browser does.
-ready.http = "http://localhost:5173/"
+ready.tcp = "127.0.0.1:${PORT}"
 ready.retries = 60
 
 # don, running don, running don. Registers dev/demo with the dev daemon so
 # the UI has a project to show. Uses the freshly built binary, so it also
 # smoke-tests that `don start` still works after your change.
+#
+# Same bash wrapper as the daemon, and it has to resolve to the same
+# directory — that's how the two find each other.
 [services.demo]
-run.cmd = "./target/debug/don"
-run.args = ["--config", "dev/demo/don.toml", "start", "--no-tui"]
-env = { DON_STATE_DIR = "/tmp/don-dev-daemon" }
+run.cmd = "bash"
+run.args = [
+  "-c",
+  'DON_STATE_DIR="$PWD/.don/dev-daemon" exec ./target/debug/don --config dev/demo/don.toml start --no-tui',
+]
 depends_on = ["daemon"]
 reload = false
 # Its children need to stop before it reports done.

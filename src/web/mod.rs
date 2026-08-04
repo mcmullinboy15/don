@@ -64,10 +64,9 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), WebErro
 pub(crate) async fn serve(
     listener: TcpListener,
     directory: ProjectDirectory,
-    port: u16,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), WebError> {
-    let router = build_router(directory, port);
+    let router = build_router(directory);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             while shutdown.changed().await.is_ok() {
@@ -88,13 +87,11 @@ pub(crate) async fn serve(
 pub async fn serve_single(
     listener: TcpListener,
     project: crate::daemon::ProjectEntry,
-    port: u16,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), WebError> {
     serve(
         listener,
         ProjectDirectory::Single(Box::new(project)),
-        port,
         shutdown,
     )
     .await
@@ -102,15 +99,11 @@ pub async fn serve_single(
 
 /// Assemble the router: `/api` plus the embedded bundle, both behind the
 /// origin guard.
-fn build_router(directory: ProjectDirectory, port: u16) -> Router {
-    let origin_state = Arc::new(origin::OriginState { port });
+fn build_router(directory: ProjectDirectory) -> Router {
     let api_state = Arc::new(api::ApiState { directory });
 
     Router::new()
         .nest("/api", api::build_router(api_state))
         .fallback(get(assets::serve))
-        .layer(axum::middleware::from_fn_with_state(
-            origin_state,
-            origin::guard,
-        ))
+        .layer(axum::middleware::from_fn(origin::guard))
 }

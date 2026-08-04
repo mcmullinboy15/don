@@ -15,22 +15,29 @@ cargo clippy         # lint
 ### Running don on don
 
 There's a `don.toml` in this repo, so `don start` here brings up the dev loop:
-a dev daemon on `:3777` rebuilt whenever `src/` changes, the Vite dev server on
-`:5173` proxying to it, and a throwaway stack (`dev/demo/`) registered with the
-dev daemon so the web UI has something to render. Clippy runs on every Rust
-save and `web/dist` is rebuilt on every frontend save, which keeps the CI drift
-check happy.
+a dev daemon rebuilt whenever `src/` changes, the Vite dev server proxying to
+it, and a throwaway stack (`dev/demo/`) registered with the dev daemon so the
+web UI has something to render. Clippy runs on every Rust save and `web/dist`
+is rebuilt on every frontend save, which keeps the CI drift check happy.
 
 ```sh
 don start                  # everything
 don start --profile rust   # no npm: just the daemon and clippy
+don ports                  # where things actually landed — open the `web` one
 don run test               # the suite is manual — it'd fight the cargo lock
 ```
 
-The dev daemon keeps its state in `/tmp/don-dev-daemon`, deliberately away from
-the XDG location: a daemon installed with `don daemon install` holds an flock on
-`daemon.pid` there, so sharing the directory would make the dev daemon refuse to
+Several checkouts can run at once. `fallback_ports = true` gives the first
+instance the memorable ports (3777 / 5173) and later ones whatever is free, and
+the dev daemon's state lives in each checkout's own `.don/dev-daemon` rather
+than the XDG location — a daemon installed with `don daemon install` holds an
+flock on `daemon.pid` there, so sharing would make the dev daemon refuse to
 start whenever the real one is running.
+
+Both services sit behind Don proxies, so the address you opened survives the
+daemon restarting under you on every save. That means the daemon's *own* port
+is ephemeral and differs from the one you browse to — `don ports` is the source
+of truth, and `$(daemon.addr)` is how the Vite service learns it.
 
 For interactive testing of the TUI under realistic load (shutdown, log spam,
 hang detection), see [Testing the TUI](#testing-the-tui) — this is the

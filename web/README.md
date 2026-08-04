@@ -39,10 +39,9 @@ DON_UI_TARGET=http://127.0.0.1:3667 npm run dev
 There's nothing to authenticate — the UI serves anything that can reach the
 port, on the grounds that reaching it already means running on this machine.
 
-The proxy does need `changeOrigin: true`, because don rejects requests whose
-`Host` isn't the address it bound (the DNS-rebinding guard in
-`src/web/origin.rs`). Without it every API call through the dev server comes
-back 421.
+`DON_UI_TARGET` matters more than it used to: under `don start` the daemon is
+behind a Don proxy on a port that may not be 3666, so take the address from
+`don ports` rather than assuming.
 
 ## Skipping the dev server
 
