@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use super::dependency::Dependency;
 use super::download::{DownloadConfig, default_cache_base};
 
 fn default_true() -> bool {
@@ -51,8 +52,9 @@ pub struct Service {
     pub ignore: Vec<String>,
     /// Debounce window for file watch events (e.g. "500ms" or "1s"). Defaults to "200ms".
     pub debounce: Option<String>,
-    /// Services that must be started before this one.
-    pub depends_on: Vec<String>,
+    /// Services or tasks that must start before this one. A `required`
+    /// entry also gates on success; an optional entry only orders startup.
+    pub depends_on: Vec<Dependency>,
     /// Proxy entries: Don binds each entry's `listen` address and either
     /// forwards to an ephemeral backend port (env mode) or hands the bound
     /// listener to the service via `LISTEN_FDS` (listenfd mode). Don holds
@@ -118,7 +120,7 @@ struct RawService {
     ignore: Vec<String>,
     debounce: Option<String>,
     #[serde(default)]
-    depends_on: Vec<String>,
+    depends_on: Vec<Dependency>,
     #[serde(default, deserialize_with = "deserialize_proxy")]
     proxy: Vec<ProxyEntry>,
     #[serde(default)]
@@ -253,7 +255,7 @@ pub struct ServiceOverride {
     pub watch: Option<Vec<String>>,
     pub ignore: Option<Vec<String>>,
     pub debounce: Option<String>,
-    pub depends_on: Option<Vec<String>>,
+    pub depends_on: Option<Vec<Dependency>>,
     pub proxy: Option<Vec<ProxyEntry>>,
     pub lazy: Option<bool>,
     pub download: Option<DownloadConfig>,
@@ -280,7 +282,7 @@ struct RawServiceOverride {
     watch: Option<Vec<String>>,
     ignore: Option<Vec<String>>,
     debounce: Option<String>,
-    depends_on: Option<Vec<String>>,
+    depends_on: Option<Vec<Dependency>>,
     #[serde(default, deserialize_with = "deserialize_proxy_option")]
     proxy: Option<Vec<ProxyEntry>>,
     lazy: Option<bool>,
@@ -354,7 +356,7 @@ pub struct ResolvedService {
     pub watch: Vec<String>,
     pub ignore: Vec<String>,
     pub debounce: Option<String>,
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<Dependency>,
     pub proxy: Vec<ProxyEntry>,
     pub lazy: bool,
     pub download: Option<DownloadConfig>,

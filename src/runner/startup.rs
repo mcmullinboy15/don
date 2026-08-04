@@ -1,7 +1,7 @@
 use super::build_tools::{
     BatchBuildItem, BatchBuildOutcome, BatchBuildReplayItem, run_batch_build_chain,
 };
-use super::graph::topological_sort;
+use super::graph::{dep_name_map, topological_sort};
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ServiceStartMode;
 use super::signals::shutdown_requested;
@@ -10,6 +10,7 @@ use super::{
     NodeKind, Runner, RunnerCommand, RunnerInternalCommand, RuntimeService, ServiceState,
     TaskItemState, TaskRunIntent,
 };
+use crate::config::Dependency;
 use std::collections::HashMap;
 
 fn push_unique_name(names: &mut Vec<String>, name: &str) {
@@ -22,6 +23,13 @@ fn format_dependency_failure(dependencies: &[String]) -> String {
     match dependencies {
         [dependency] => format!("dependency '{dependency}' failed"),
         dependencies => format!("dependencies '{}' failed", dependencies.join("', '")),
+    }
+}
+
+fn format_optional_dependencies(dependencies: &[String]) -> String {
+    match dependencies {
+        [dependency] => format!("dependency '{dependency}'"),
+        dependencies => format!("dependencies '{}'", dependencies.join("', '")),
     }
 }
 
@@ -278,6 +286,70 @@ impl Runner {
         false
     }
 
+    /// Whether a dependency has stopped making progress: it either failed or
+    /// was stopped, and nothing is going to move it to a satisfied state
+    /// without another explicit request. Only optional (ordering-only) edges
+    /// use this — it is what lets a dependent start anyway.
+    fn is_dep_settled(&self, dep: &str) -> bool {
+        if let Some(rs) = self.services.get(dep) {
+            return matches!(
+                rs.state(),
+                ServiceState::Failed | ServiceState::DependencyFailed | ServiceState::Stopped
+            );
+        }
+        if let Some(rt) = self.tasks.get(dep) {
+            // `PendingRun`/`Skipped` are settled too: the task is waiting for
+            // a manual trigger (or was judged unnecessary) and will not run on
+            // its own, so an optional dependent would otherwise wait forever.
+            return matches!(
+                rt.state(),
+                TaskItemState::Failed
+                    | TaskItemState::DependencyFailed
+                    | TaskItemState::PendingRun
+                    | TaskItemState::Skipped
+            );
+        }
+        false
+    }
+
+    /// Whether one `depends_on` edge no longer blocks its dependent.
+    ///
+    /// A required edge opens only when the dependency is satisfied. An
+    /// optional edge is ordering-only: it also opens once the dependency has
+    /// settled into a failed or stopped state, so the dependent still starts
+    /// *after* it, but is not held hostage by it.
+    pub(in crate::runner) fn is_dep_gate_open(&self, dep: &Dependency) -> bool {
+        if self.is_dep_satisfied(&dep.name) {
+            return true;
+        }
+        !dep.required && self.is_dep_settled(&dep.name)
+    }
+
+    /// Announce the optional dependencies this item is not waiting for.
+    fn report_skipped_optional_dependencies(&self, name: &str, skipped: &[String]) {
+        if skipped.is_empty() {
+            return;
+        }
+        self.output_manager.service_event(
+            name,
+            &format!(
+                "starting without optional {}",
+                format_optional_dependencies(skipped)
+            ),
+        );
+    }
+
+    /// Optional dependencies that settled unsuccessfully — reported when the
+    /// dependent starts anyway so the log explains why it didn't wait.
+    fn skipped_optional_dependencies(&self, dependencies: &[Dependency]) -> Vec<String> {
+        dependencies
+            .iter()
+            .filter(|dep| !dep.required && !self.is_dep_satisfied(&dep.name))
+            .filter(|dep| self.is_dep_settled(&dep.name))
+            .map(|dep| dep.name.clone())
+            .collect()
+    }
+
     /// Check if a dependency has failed (including the transitive
     /// `DependencyFailed` cascade — if A fails, B depends on A, C depends
     /// on B, then C also needs to be marked).
@@ -305,9 +377,13 @@ impl Runner {
     /// Resolve failed direct dependencies to their root failures. An
     /// intermediate `DependencyFailed` item contributes the roots it already
     /// recorded, so a chain such as api -> worker -> db reports `db`.
-    fn failed_dependency_roots(&self, dependencies: &[String]) -> Vec<String> {
+    ///
+    /// Optional edges are ignored: their whole point is that a failure on the
+    /// other end must not cascade.
+    fn failed_dependency_roots(&self, dependencies: &[Dependency]) -> Vec<String> {
         let mut roots = Vec::new();
-        for dependency in dependencies {
+        for dependency in dependencies.iter().filter(|dep| dep.required) {
+            let dependency = &dependency.name;
             let inherited = if let Some(rs) = self.services.get(dependency) {
                 match rs.state() {
                     ServiceState::Failed => Some(std::slice::from_ref(dependency)),
@@ -343,7 +419,7 @@ impl Runner {
     /// update flow through every descendant in one sweep.
     fn reconcile_dependency_failures(
         &mut self,
-        dep_map: &HashMap<String, Vec<String>>,
+        dep_map: &HashMap<String, Vec<Dependency>>,
         order: &[String],
     ) {
         for name in order {
@@ -382,7 +458,9 @@ impl Runner {
                     // A lazy service reaches DependencyFailed only after a
                     // connection moved it out of Lazy. Pending preserves that
                     // queued request for the normal scheduler. That scheduler
-                    // still waits for every dependency to become satisfied.
+                    // still waits for every dependency gate to open — required
+                    // edges on a satisfied dependency, optional ones on a
+                    // dependency that has settled either way.
                     self.set_service_state(name, ServiceState::Pending);
                 } else {
                     self.set_task_state(name, TaskItemState::Pending);
@@ -472,7 +550,7 @@ impl Runner {
     /// connection; both are claimed and launched by this same sweep.
     pub(in crate::runner) async fn start_pending_items(&mut self) {
         let dep_map = self.build_dep_map();
-        let order = match topological_sort(&dep_map) {
+        let order = match topological_sort(&dep_name_map(&dep_map)) {
             Ok(o) => o,
             Err(_) => return,
         };
@@ -485,7 +563,7 @@ impl Runner {
             .filter(|name| {
                 dep_map
                     .get(name.as_str())
-                    .is_none_or(|deps| deps.iter().all(|dep| self.is_dep_satisfied(dep)))
+                    .is_none_or(|deps| deps.iter().all(|dep| self.is_dep_gate_open(dep)))
             })
             .cloned()
             .collect();
@@ -509,6 +587,15 @@ impl Runner {
                 return;
             }
 
+            // Optional dependencies we are deliberately not waiting on.
+            // Reported at the moment the item actually starts, so a start
+            // that follows a visible failure doesn't look like don ignored
+            // the dependency graph.
+            let skipped = dep_map
+                .get(&name)
+                .map(|deps| self.skipped_optional_dependencies(deps))
+                .unwrap_or_default();
+
             let is_pending_svc = self
                 .services
                 .get(&name)
@@ -525,6 +612,7 @@ impl Runner {
                 if self.start_lazy_build_if_needed(&name) {
                     continue;
                 }
+                self.report_skipped_optional_dependencies(&name, &skipped);
                 self.output_manager
                     .service_debug_event(&name, "start triggered (deps satisfied)");
                 if let Err(e) = self.queue_scheduled_service_start(
@@ -551,10 +639,15 @@ impl Runner {
                 continue;
             };
 
+            self.report_skipped_optional_dependencies(&name, &skipped);
             if needs_startup_evaluation {
+                // Only a *required* dependent makes a manual task worth
+                // parking for. An optional dependent is happy either way, so
+                // counting it would park the task as "required by dependents"
+                // and then block the very dependent that didn't care.
                 let has_dependents = dep_map
                     .values()
-                    .any(|deps| deps.iter().any(|dep| dep == &name));
+                    .any(|deps| deps.iter().any(|dep| dep.required && dep.name == name));
                 if let Err(e) = self.spawn_task_worker(
                     &name,
                     task_cfg,

@@ -19,16 +19,22 @@ impl Runner {
             _ => return,
         };
 
-        if let Some(failed) = deps.iter().find(|dep| self.is_dep_failed(dep)) {
+        // Only a required dependency's failure strands a lazy service — an
+        // optional one lets it start anyway.
+        if let Some(failed) = deps
+            .iter()
+            .filter(|dep| dep.required)
+            .find(|dep| self.is_dep_failed(&dep.name))
+        {
             self.output_manager.service_error_event(
                 name,
-                &format!("first connection — dependency '{failed}' has failed"),
+                &format!("first connection — dependency '{}' has failed", failed.name),
             );
         } else {
             let unsatisfied: Vec<&str> = deps
                 .iter()
-                .filter(|dep| !self.is_dep_satisfied(dep))
-                .map(String::as_str)
+                .filter(|dep| !self.is_dep_gate_open(dep))
+                .map(|dep| dep.name.as_str())
                 .collect();
             if unsatisfied.is_empty() {
                 self.output_manager

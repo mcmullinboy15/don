@@ -172,7 +172,18 @@ impl Runner {
                                 })
                                 .collect()
                         },
-                        crate::proxy::ServiceProxy::descriptions,
+                        |proxy| {
+                            let mut entries = proxy.descriptions();
+                            // A failed service's listeners still exist, so
+                            // say why they are closing connections instead of
+                            // leaving the address looking healthy.
+                            if proxy.is_refusing() {
+                                for entry in &mut entries {
+                                    entry.push_str(" — refusing (service failed)");
+                                }
+                            }
+                            entries
+                        },
                     ),
                     docker_ports: match rs.handle.as_ref() {
                         Some(ServiceHandle::Docker(handle)) => handle

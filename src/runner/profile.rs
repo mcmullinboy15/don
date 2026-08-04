@@ -39,16 +39,16 @@ fn resolve_profile_items_inner(
                 None => config.effective_depends_on(&name, &svc.depends_on),
             };
             for dep in &service_deps {
-                if !result.contains(dep) {
-                    queue.push(dep.clone());
+                if !result.contains(&dep.name) {
+                    queue.push(dep.name.clone());
                 }
             }
         }
         // Follow deps from tasks.
         if let Some(task) = config.tasks.get(&name) {
             for dep in &config.effective_depends_on(&name, &task.depends_on) {
-                if !result.contains(dep) {
-                    queue.push(dep.clone());
+                if !result.contains(&dep.name) {
+                    queue.push(dep.name.clone());
                 }
             }
         }

@@ -44,6 +44,7 @@ pub use terminal::{TerminalCoordinator, TerminalRequest};
 use crate::config::{Config, Platform, ShutdownConfig};
 use crate::output::OutputManager;
 use crate::process::pid_file::PidFile;
+use crate::proxy::ConnectionPolicy;
 use crate::watch::WatchManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -556,9 +557,10 @@ pub enum ItemStatus {
 /// Extended information for verbose status display.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VerboseInfo {
-    /// Services/tasks this item depends on.
+    /// Services/tasks this item depends on. Optional (ordering-only) edges
+    /// serialize as `{ name, required = false }`, required ones as a string.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<crate::config::Dependency>,
     /// File watch patterns (explicit or resolved from build tool).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch: Vec<String>,
@@ -961,6 +963,7 @@ impl Runner {
             .get_mut(name)
             .and_then(|rs| rs.set_state(new_state));
         if let Some(state) = changed {
+            self.sync_proxy_policy(name);
             self.broadcast_service_state(name, state);
             if self.done_tx.is_some()
                 && (matches!(
@@ -968,6 +971,9 @@ impl Runner {
                     ServiceState::Pending
                         | ServiceState::Lazy
                         | ServiceState::Ready
+                        // Stopped opens an optional dependency's gate, so
+                        // dependents need a sweep to notice.
+                        | ServiceState::Stopped
                         | ServiceState::Failed
                         | ServiceState::DependencyFailed
                 ) || matches!(
@@ -977,6 +983,57 @@ impl Runner {
             {
                 self.schedule_start_pending();
             }
+        }
+    }
+
+    /// Keep the proxy's connection policy in step with the service.
+    ///
+    /// Queuing connections is right while a service is starting or
+    /// restarting — the client waits a moment and gets served. It is wrong
+    /// once the service has failed *with no process left*: nothing is going
+    /// to read that socket, so the connection is refused instead of left
+    /// hanging.
+    ///
+    /// The liveness half matters. `Failed` does not imply "the process is
+    /// gone": a service whose ready check fails keeps running under the
+    /// default `on_failure = "notify"` and may well be serving traffic. Don
+    /// must not close its clients' connections — and in listenfd mode must
+    /// not race that live child for accepts. Only a service that has both
+    /// failed and lost its process refuses.
+    ///
+    /// Call this after any change to a service's state *or* its process
+    /// handle. It is idempotent.
+    fn sync_proxy_policy(&mut self, name: &str) {
+        let Some(rs) = self.services.get(name) else {
+            return;
+        };
+        let policy = match rs.state() {
+            ServiceState::Lazy => ConnectionPolicy::LazyTrigger,
+            ServiceState::Failed | ServiceState::DependencyFailed if rs.handle.is_none() => {
+                ConnectionPolicy::Refuse
+            }
+            _ => ConnectionPolicy::Serve,
+        };
+        let Some(proxy) = self.services.get_mut(name).and_then(|rs| rs.proxy.as_mut()) else {
+            return;
+        };
+        let was_refusing = proxy.is_refusing();
+        if !proxy.set_policy(policy) {
+            return;
+        }
+        // Only the refusal edge is worth a line, and it belongs in the normal
+        // log: a dev staring at `ECONNRESET` in their browser shouldn't have
+        // to rerun with `--verbose` to find out why.
+        let refusing = policy == ConnectionPolicy::Refuse;
+        if refusing == was_refusing {
+            return;
+        }
+        if refusing {
+            self.output_manager
+                .service_error_event(name, "proxy refusing connections (service failed)");
+        } else {
+            self.output_manager
+                .service_event(name, "proxy accepting connections again");
         }
     }
 
@@ -994,6 +1051,7 @@ impl Runner {
         if !rs.mark_dependency_failed(dependencies) {
             return false;
         }
+        self.sync_proxy_policy(name);
         self.broadcast_service_state(name, ServiceState::DependencyFailed);
         if state_changed && self.done_tx.is_some() {
             self.schedule_start_pending();
@@ -1378,7 +1436,7 @@ impl Runner {
         }
 
         // Validate the active dependency graph before starting anything.
-        let dep_map = self.build_dep_map();
+        let dep_map = self.build_dep_name_map();
         topological_sort(&dep_map).map_err(|cycle| RunnerError::Cycle { cycle })?;
 
         // Channel for dependency-scheduled completion notifications. Store the
@@ -2139,7 +2197,7 @@ mod tests {
         let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
         if let Some(service) = runner.services.get_mut("api") {
             service.resolved.lazy = true;
-            service.resolved.depends_on = vec!["setup".to_string()];
+            service.resolved.depends_on = vec![crate::config::Dependency::required("setup")];
         }
         runner.set_service_state("api", ServiceState::Building);
 

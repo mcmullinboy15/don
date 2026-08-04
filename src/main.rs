@@ -1134,7 +1134,8 @@ fn print_verbose_info(info: &don::runner::VerboseInfo, show_watch_paths: bool) {
         println!("  {dim}cmd:{reset}    {cmd}");
     }
     if !info.depends_on.is_empty() {
-        println!("  {dim}deps:{reset}   {}", info.depends_on.join(", "));
+        let deps: Vec<String> = info.depends_on.iter().map(ToString::to_string).collect();
+        println!("  {dim}deps:{reset}   {}", deps.join(", "));
     }
     if !info.proxy.is_empty() {
         println!("  {dim}proxy:{reset}  {}", info.proxy.join(", "));

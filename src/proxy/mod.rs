@@ -46,8 +46,21 @@ pub enum ProxyError {
 /// fixed (service binds a known port on its own).
 struct ForwardListener {
     backend: ForwardBackend,
-    backend_tx: watch::Sender<Option<SocketAddr>>,
+    backend_tx: watch::Sender<BackendStatus>,
     accept_handle: JoinHandle<()>,
+}
+
+/// What the accept loop should do with an incoming connection.
+///
+/// `addr: None` means "hold on" — the service is starting or restarting, so
+/// connections queue until it comes back. `refusing` means "give up" — the
+/// service is in a failed state, so a client is better off seeing the
+/// connection close immediately than hanging on a service that isn't coming
+/// back on its own. Refusal wins over a stale backend address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct BackendStatus {
+    addr: Option<SocketAddr>,
+    refusing: bool,
 }
 
 /// How the backend address for a [`ForwardListener`] is chosen.
@@ -70,16 +83,48 @@ impl ForwardBackend {
 }
 
 /// A listenfd listener: don holds the bound public listener and passes its
-/// fd to the child. If `lazy_watcher` is Some, don is watching for POLLIN
-/// so the first queued connection triggers a lazy start.
+/// fd to the child.
+///
+/// Exactly one supervisor task watches the socket, and `mode_tx` tells it
+/// what to do. A single task is not an implementation detail — `AsyncFd`
+/// registers the raw fd with the reactor, and a second registration of the
+/// same fd fails with `EEXIST`. Two independent watcher tasks would mean the
+/// loser silently does nothing.
 struct ListenfdListener {
     listen_addr: SocketAddr,
     /// `std::net::TcpListener` (not tokio's) because we need `AsRawFd` and
     /// stable fd semantics for passing into the child via `LISTEN_FDS`.
-    /// Wrapped in an `Arc` so the POLLIN watcher can hold its own handle
-    /// that survives across re-arms.
+    /// Wrapped in an `Arc` so the supervisor can hold its own handle.
     listener: std::sync::Arc<std::net::TcpListener>,
-    lazy_watcher: Option<JoinHandle<()>>,
+    mode_tx: watch::Sender<ListenfdMode>,
+    supervisor: JoinHandle<()>,
+}
+
+/// What don should be doing with a listenfd socket right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ListenfdMode {
+    /// Hands off: the child owns the accept queue (or will once it starts).
+    #[default]
+    Idle,
+    /// Lazy service: the first queued connection triggers a start. Don does
+    /// not accept, so the connection is still there for the child.
+    Lazy,
+    /// Failed service with no process: drain and close queued connections.
+    Refuse,
+}
+
+/// What don does with incoming connections for a service, derived by the
+/// runner from that service's lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionPolicy {
+    /// Normal operation: forward to the backend, or let the child accept.
+    /// Connections queue while the service is starting or restarting.
+    Serve,
+    /// Lazy service awaiting its first connection.
+    LazyTrigger,
+    /// Service failed and no process is alive to serve anything, so close
+    /// connections instead of parking clients on a dead socket.
+    Refuse,
 }
 
 /// Runtime metadata for one proxy listener, in configuration declaration
@@ -119,9 +164,8 @@ pub(crate) struct ServiceProxy {
     forward: Vec<ForwardListener>,
     listenfd: Vec<ListenfdListener>,
     bindings: Vec<ProxyBinding>,
-    service_name: String,
-    lazy_tx: Option<mpsc::Sender<String>>,
     active_forward_connections: Arc<AtomicUsize>,
+    policy: ConnectionPolicy,
 }
 
 enum PendingListener {
@@ -264,7 +308,7 @@ impl ServiceProxy {
         for listener in pending {
             match listener {
                 PendingListener::Forward { listener, backend } => {
-                    let (backend_tx, backend_rx) = watch::channel(None);
+                    let (backend_tx, backend_rx) = watch::channel(BackendStatus::default());
                     let accept_handle = tokio::spawn(proxy_accept_loop(
                         listener,
                         backend_rx,
@@ -284,17 +328,27 @@ impl ServiceProxy {
                     listen_addr,
                 } => {
                     let listener = std::sync::Arc::new(listener);
-                    let lazy_watcher = lazy_tx.as_ref().map(|tx| {
-                        spawn_listenfd_watcher(
-                            listener.clone(),
-                            tx.clone(),
-                            service_name.to_string(),
-                        )
-                    });
+                    // A lazy service starts armed; everything else hands the
+                    // socket straight to its child.
+                    let initial_mode = if lazy_tx.is_some() {
+                        ListenfdMode::Lazy
+                    } else {
+                        ListenfdMode::Idle
+                    };
+                    let (mode_tx, mode_rx) = watch::channel(initial_mode);
+                    let supervisor = tokio::spawn(listenfd_supervisor(
+                        listener.clone(),
+                        mode_rx,
+                        lazy_tx.clone(),
+                        service_name.to_string(),
+                        listen_addr,
+                        emitter.clone(),
+                    ));
                     listenfd.push(ListenfdListener {
                         listen_addr,
                         listener,
-                        lazy_watcher,
+                        mode_tx,
+                        supervisor,
                     });
                 }
             }
@@ -304,9 +358,12 @@ impl ServiceProxy {
             forward,
             listenfd,
             bindings,
-            service_name: service_name.to_string(),
-            lazy_tx,
             active_forward_connections,
+            policy: if lazy_tx.is_some() {
+                ConnectionPolicy::LazyTrigger
+            } else {
+                ConnectionPolicy::Serve
+            },
         })
     }
 
@@ -315,7 +372,9 @@ impl ServiceProxy {
     /// Listenfd entries are unaffected (the child owns the fd directly).
     pub(crate) fn set_backend(&self) {
         for fwd in &self.forward {
-            let _ = fwd.backend_tx.send(Some(fwd.backend.addr()));
+            let addr = fwd.backend.addr();
+            fwd.backend_tx
+                .send_modify(|status| status.addr = Some(addr));
         }
     }
 
@@ -323,8 +382,45 @@ impl ServiceProxy {
     /// backend is set again.
     pub(crate) fn clear_backend(&self) {
         for fwd in &self.forward {
-            let _ = fwd.backend_tx.send(None);
+            fwd.backend_tx.send_modify(|status| status.addr = None);
         }
+    }
+
+    /// Whether this proxy is currently refusing connections.
+    pub(crate) fn is_refusing(&self) -> bool {
+        self.policy == ConnectionPolicy::Refuse
+    }
+
+    /// Set what happens to incoming connections. Returns whether the policy
+    /// actually changed.
+    ///
+    /// The runner derives this from the service's lifecycle state. Queuing is
+    /// right while a service is starting or restarting — the client waits a
+    /// moment and gets served. [`ConnectionPolicy::Refuse`] is for a service
+    /// that failed *and* has no process left, where a queued client would
+    /// hang forever on a socket nothing is going to read.
+    pub(crate) fn set_policy(&mut self, policy: ConnectionPolicy) -> bool {
+        if self.policy == policy {
+            return false;
+        }
+        self.policy = policy;
+
+        let refusing = policy == ConnectionPolicy::Refuse;
+        for fwd in &self.forward {
+            fwd.backend_tx
+                .send_modify(|status| status.refusing = refusing);
+        }
+
+        let mode = match policy {
+            ConnectionPolicy::Serve => ListenfdMode::Idle,
+            ConnectionPolicy::LazyTrigger => ListenfdMode::Lazy,
+            ConnectionPolicy::Refuse => ListenfdMode::Refuse,
+        };
+        for l in &self.listenfd {
+            let _ = l.mode_tx.send(mode);
+        }
+
+        true
     }
 
     /// Allocate new ephemeral ports for env-mode entries. Used on restart so
@@ -514,36 +610,22 @@ impl ServiceProxy {
         Some(self.active_forward_connections.load(Ordering::Relaxed))
     }
 
-    /// Re-arm lazy POLLIN watchers for listenfd entries. Called after the
-    /// service stops and re-enters the `Lazy` state so the next queued
-    /// connection triggers another start cycle. No-op if the service isn't
-    /// lazy (no `lazy_tx`) or if a watcher is already armed.
+    /// Re-arm the lazy trigger for listenfd entries. Called after the service
+    /// stops and re-enters the `Lazy` state so the next queued connection
+    /// triggers another start cycle. Idempotent: the runner also derives this
+    /// policy from the service state.
     pub(crate) fn rearm_lazy_watchers(&mut self) {
-        let Some(tx) = self.lazy_tx.clone() else {
-            return;
-        };
-        for l in &mut self.listenfd {
-            if l.lazy_watcher.as_ref().is_some_and(|h| !h.is_finished()) {
-                continue;
-            }
-            l.lazy_watcher = Some(spawn_listenfd_watcher(
-                l.listener.clone(),
-                tx.clone(),
-                self.service_name.clone(),
-            ));
-        }
+        self.set_policy(ConnectionPolicy::LazyTrigger);
     }
 
-    /// Shut down all proxy work — abort forwarding accept loops and any
-    /// lazy POLLIN watchers.
+    /// Shut down all proxy work — abort forwarding accept loops and the
+    /// listenfd supervisors.
     pub(crate) fn shutdown(&self) {
         for fwd in &self.forward {
             fwd.accept_handle.abort();
         }
         for l in &self.listenfd {
-            if let Some(ref h) = l.lazy_watcher {
-                h.abort();
-            }
+            l.supervisor.abort();
         }
     }
 }
@@ -627,48 +709,122 @@ fn sanitize_env_suffix(name: &str) -> String {
         .collect()
 }
 
-/// Spawn a watcher that waits for POLLIN readability on `listener` (i.e.
-/// a queued connection) and sends `service_name` on `lazy_tx`. The watcher
-/// does not `accept` — the child will do that once it inherits the fd.
+/// The single task that watches one listenfd socket.
 ///
-/// `AsyncFd::readable()` can return false positives per tokio's docs
-/// ("the function may complete without the file descriptor being ready"),
-/// typically from spurious epoll wakeups or from edge-triggered state
-/// transitions on sibling events. For a listening socket, false positives
-/// would trigger lazy starts with no real client behind them.
+/// It owns the only `AsyncFd` registration for that fd and switches behavior
+/// from a [`ListenfdMode`] watch channel, so the lazy trigger and the refusal
+/// drain can never collide (a second `AsyncFd` on the same fd fails with
+/// `EEXIST`, which would silently disable whichever job lost).
 ///
-/// To verify, after `readable()` fires we re-check POLLIN using level-
-/// triggered `poll(2)` with zero timeout — that returns `POLLIN` iff the
-/// accept queue is *currently* non-empty. If empty, we call `clear_ready()`
-/// and wait again; only a confirmed pending connection triggers `lazy_tx`.
+/// `AsyncFd::readable()` can return false positives per tokio's docs ("the
+/// function may complete without the file descriptor being ready"), typically
+/// from spurious epoll wakeups. Every mode therefore re-checks POLLIN with
+/// level-triggered `poll(2)` (zero timeout), which reports whether the accept
+/// queue is *currently* non-empty. That check is also what makes the blocking
+/// `accept` in `Refuse` safe: the listener deliberately stays blocking because
+/// its `O_NONBLOCK` flag is shared with the child's inherited fd.
 ///
-/// Does not `accept` — the kernel's accept queue entry is preserved so the
-/// child's first `accept` consumes the queued connection.
-fn spawn_listenfd_watcher(
+/// Mode behavior:
+/// - `Idle`: don does nothing; the child owns the accept queue.
+/// - `Lazy`: fire the start trigger on the first queued connection, without
+///   accepting — the kernel's queue entry is preserved so the child's first
+///   `accept` consumes it. Fires once, then waits for the next mode change.
+/// - `Refuse`: accept and immediately close, draining the queue. Only used
+///   when the service has failed *and* has no live process, so nothing else
+///   is accepting on this socket.
+async fn listenfd_supervisor(
     listener: std::sync::Arc<std::net::TcpListener>,
-    lazy_tx: mpsc::Sender<String>,
+    mut mode_rx: watch::Receiver<ListenfdMode>,
+    lazy_tx: Option<mpsc::Sender<String>>,
     service_name: String,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let raw_fd = listener.as_raw_fd();
-        let Ok(async_fd) = AsyncFd::new(listener) else {
+    listen_addr: SocketAddr,
+    emitter: crate::output::LifecycleEmitter,
+) {
+    let raw_fd = listener.as_raw_fd();
+    let async_fd = match AsyncFd::new(listener) {
+        Ok(async_fd) => async_fd,
+        Err(e) => {
+            // Without a registration don can neither trigger a lazy start nor
+            // refuse connections on this socket. Say so — silence here reads
+            // as "the feature is off" with no way to find out why.
+            emitter.lifecycle_event(&format!(
+                "{service_name}: proxy {listen_addr} cannot be watched: {e}"
+            ));
             return;
-        };
-        loop {
-            let mut guard = match async_fd.readable().await {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            // Level-triggered verification: `poll(2)` returns the fd's
-            // current state, not a cached wakeup. POLLIN on a listening
-            // socket means the accept queue has at least one entry.
-            if has_pending_connection(raw_fd) {
-                let _ = lazy_tx.try_send(service_name);
-                return;
-            }
-            guard.clear_ready();
         }
-    })
+    };
+
+    'mode: loop {
+        let mode = *mode_rx.borrow_and_update();
+        match mode {
+            ListenfdMode::Idle => {
+                if mode_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+            ListenfdMode::Lazy => loop {
+                tokio::select! {
+                    // Biased: a mode change wins over a readiness wakeup, so
+                    // leaving a mode takes effect at the first opportunity.
+                    biased;
+                    changed = mode_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        continue 'mode;
+                    }
+                    guard = async_fd.readable() => {
+                        let Ok(mut guard) = guard else { return };
+                        if has_pending_connection(raw_fd) {
+                            if let Some(ref tx) = lazy_tx {
+                                let _ = tx.try_send(service_name.clone());
+                            }
+                            // Fired. Stay put until the runner moves us on.
+                            if mode_rx.changed().await.is_err() {
+                                return;
+                            }
+                            continue 'mode;
+                        }
+                        guard.clear_ready();
+                    }
+                }
+            },
+            ListenfdMode::Refuse => loop {
+                tokio::select! {
+                    biased;
+                    changed = mode_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        continue 'mode;
+                    }
+                    guard = async_fd.readable() => {
+                        let Ok(mut guard) = guard else { return };
+                        // Re-check the mode each iteration: draining is the one
+                        // place don accepts on a socket a child may be about to
+                        // own, so stop the instant we're told to.
+                        while !mode_rx.has_changed().unwrap_or(true)
+                            && has_pending_connection(raw_fd)
+                        {
+                            match async_fd.get_ref().accept() {
+                                Ok((stream, _peer)) => {
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                    emitter.service_debug_event(
+                                        &service_name,
+                                        &format!(
+                                            "proxy {listen_addr} refused connection (service failed)"
+                                        ),
+                                    );
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        guard.clear_ready();
+                    }
+                }
+            },
+        }
+    }
 }
 
 /// Non-blocking check for a queued connection on a listening fd.
@@ -712,7 +868,7 @@ async fn allocate_ephemeral_port() -> Result<SocketAddr, ProxyError> {
 /// waits for a backend to be available, then spawns per-connection forwarding.
 async fn proxy_accept_loop(
     listener: TcpListener,
-    backend_rx: watch::Receiver<Option<SocketAddr>>,
+    backend_rx: watch::Receiver<BackendStatus>,
     lazy_tx: Option<mpsc::Sender<String>>,
     service_name: String,
     emitter: crate::output::LifecycleEmitter,
@@ -738,7 +894,7 @@ async fn proxy_accept_loop(
 
 async fn proxy_accept_loop_with_permits(
     listener: TcpListener,
-    backend_rx: watch::Receiver<Option<SocketAddr>>,
+    backend_rx: watch::Receiver<BackendStatus>,
     lazy_tx: Option<mpsc::Sender<String>>,
     service_name: String,
     emitter: crate::output::LifecycleEmitter,
@@ -751,7 +907,7 @@ async fn proxy_accept_loop_with_permits(
         .map(|a| a.to_string())
         .unwrap_or_default();
     loop {
-        let (client, _peer) = match listener.accept().await {
+        let (mut client, _peer) = match listener.accept().await {
             Ok(conn) => {
                 consecutive_errors = 0;
                 conn
@@ -813,18 +969,33 @@ async fn proxy_accept_loop_with_permits(
             let _ = tx.try_send(service_name.clone());
         }
 
-        // Wait for a backend address to become available.
+        // Wait for a backend address to become available — or for the service
+        // to enter a failed state, in which case the connection is refused
+        // rather than parked indefinitely.
         let backend_addr = {
             let mut rx = backend_rx.clone();
             loop {
-                if let Some(addr) = *rx.borrow() {
-                    break addr;
+                let status = *rx.borrow();
+                if status.refusing {
+                    break None;
+                }
+                if let Some(addr) = status.addr {
+                    break Some(addr);
                 }
                 if rx.changed().await.is_err() {
                     // Channel closed — shutting down.
                     return;
                 }
             }
+        };
+
+        let Some(backend_addr) = backend_addr else {
+            emitter.service_debug_event(
+                &service_name,
+                &format!("proxy {listen_addr} refused connection (service failed)"),
+            );
+            let _ = client.shutdown().await;
+            continue;
         };
 
         // Spawn a forwarding task for this connection.
@@ -1005,10 +1176,10 @@ mod tests {
     use crate::output::{LifecycleEmitter, OutputManager};
 
     use super::{
-        DEFAULT_PROXY_CONNECTION_LIMIT, MIN_PROXY_CONNECTION_LIMIT, PROXY_FD_RESERVE, ProxyBinding,
-        ProxyBindingMode, ProxyConnectionAccounting, ProxyError, ServiceProxy,
-        backend_connect_candidates, proxy_accept_loop_with_permits,
-        proxy_connection_limit_for_soft_nofile,
+        BackendStatus, ConnectionPolicy, DEFAULT_PROXY_CONNECTION_LIMIT,
+        MIN_PROXY_CONNECTION_LIMIT, PROXY_FD_RESERVE, ProxyBinding, ProxyBindingMode,
+        ProxyConnectionAccounting, ProxyError, ServiceProxy, backend_connect_candidates,
+        proxy_accept_loop_with_permits, proxy_connection_limit_for_soft_nofile,
     };
 
     #[tokio::test]
@@ -1369,10 +1540,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_refuses_connections_while_the_service_is_failed() {
+        struct Case {
+            name: &'static str,
+            entries: Vec<ProxyMode>,
+            /// Lazy services keep a start trigger armed on every listenfd
+            /// socket. The refusal drain has to share that fd, not fight it.
+            lazy: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "env-mode forwarding listener",
+                entries: vec![ProxyMode::Env("PORT".to_string())],
+                lazy: false,
+            },
+            Case {
+                name: "listenfd listener",
+                entries: vec![ProxyMode::Listenfd],
+                lazy: false,
+            },
+            Case {
+                name: "lazy service with several listenfd listeners",
+                entries: vec![ProxyMode::Listenfd, ProxyMode::Listenfd],
+                lazy: true,
+            },
+            Case {
+                name: "lazy service mixing env and listenfd",
+                entries: vec![ProxyMode::Env("PORT".to_string()), ProxyMode::Listenfd],
+                lazy: true,
+            },
+        ];
+
+        let emitter = test_lifecycle_emitter().await;
+        for case in cases {
+            let entries: Vec<ProxyEntry> = case
+                .entries
+                .iter()
+                .map(|mode| ProxyEntry {
+                    listen: "127.0.0.1:0".to_string(),
+                    mode: mode.clone(),
+                })
+                .collect();
+            let (lazy_tx, _lazy_rx) = mpsc::channel(8);
+            let mut proxy = ServiceProxy::bind(
+                &entries,
+                false,
+                case.lazy.then_some(lazy_tx),
+                "svc",
+                emitter.clone(),
+            )
+            .await
+            .unwrap();
+            let addrs: Vec<SocketAddr> = proxy
+                .bindings()
+                .iter()
+                .map(|binding| binding.bound_addr)
+                .collect();
+
+            // Healthy-but-not-ready: connections are parked, not closed, so a
+            // client that arrives mid-restart is served once the service is up.
+            let mut parked = Vec::new();
+            let mut buf = [0u8; 1];
+            for addr in &addrs {
+                let mut early = tokio::net::TcpStream::connect(addr).await.unwrap();
+                assert!(
+                    read_timed_out(&mut early, &mut buf).await,
+                    "{} ({addr}): connections should queue before a failure",
+                    case.name
+                );
+                parked.push(early);
+            }
+
+            assert!(
+                proxy.set_policy(ConnectionPolicy::Refuse),
+                "{}: entering refusal should report a change",
+                case.name
+            );
+            assert!(proxy.is_refusing(), "{}", case.name);
+
+            // Every listener refuses — parked connections and new ones alike.
+            for (addr, mut early) in addrs.iter().zip(parked) {
+                assert_closed(
+                    &mut early,
+                    &mut buf,
+                    &format!("{} ({addr}): parked connection after failure", case.name),
+                )
+                .await;
+                let mut during = tokio::net::TcpStream::connect(addr).await.unwrap();
+                assert_closed(
+                    &mut during,
+                    &mut buf,
+                    &format!("{} ({addr}): new connection while failed", case.name),
+                )
+                .await;
+            }
+
+            // Leaving the failed state restores the queuing behavior.
+            let recovered = if case.lazy {
+                ConnectionPolicy::LazyTrigger
+            } else {
+                ConnectionPolicy::Serve
+            };
+            assert!(proxy.set_policy(recovered), "{}", case.name);
+            assert!(!proxy.is_refusing(), "{}", case.name);
+            for addr in &addrs {
+                let mut after = tokio::net::TcpStream::connect(addr).await.unwrap();
+                assert!(
+                    read_timed_out(&mut after, &mut buf).await,
+                    "{} ({addr}): connections should queue again after recovery",
+                    case.name
+                );
+            }
+        }
+    }
+
+    /// A lazy listenfd service must still fire its start trigger after it has
+    /// been through a refusal cycle — the supervisor is one long-lived task,
+    /// so a mishandled mode transition would leave it deaf.
+    #[tokio::test]
+    async fn lazy_trigger_survives_a_refusal_cycle() {
+        let entries = vec![
+            ProxyEntry {
+                listen: "127.0.0.1:0".to_string(),
+                mode: ProxyMode::Listenfd,
+            },
+            ProxyEntry {
+                listen: "127.0.0.1:0".to_string(),
+                mode: ProxyMode::Listenfd,
+            },
+        ];
+        let (lazy_tx, mut lazy_rx) = mpsc::channel(8);
+        let emitter = test_lifecycle_emitter().await;
+        let mut proxy = ServiceProxy::bind(&entries, false, Some(lazy_tx), "svc", emitter)
+            .await
+            .unwrap();
+        let addrs: Vec<SocketAddr> = proxy
+            .bindings()
+            .iter()
+            .map(|binding| binding.bound_addr)
+            .collect();
+
+        // Fail, refuse, then recover to Lazy.
+        assert!(proxy.set_policy(ConnectionPolicy::Refuse));
+        let mut buf = [0u8; 1];
+        let mut refused = tokio::net::TcpStream::connect(addrs[0]).await.unwrap();
+        assert_closed(&mut refused, &mut buf, "refused while failed").await;
+        proxy.rearm_lazy_watchers();
+
+        // The second listener — the one that never fired — must trigger too.
+        let _client = tokio::net::TcpStream::connect(addrs[1]).await.unwrap();
+        let triggered = tokio::time::timeout(std::time::Duration::from_secs(5), lazy_rx.recv())
+            .await
+            .expect("a queued connection should re-trigger the lazy start");
+        assert_eq!(triggered.as_deref(), Some("svc"));
+    }
+
+    /// Assert the peer closed the connection promptly and cleanly. A read of
+    /// 0 bytes is the orderly close don performs; anything else — data, a
+    /// reset, or a timeout — fails, so this can't pass on an unrelated error.
+    async fn assert_closed(stream: &mut tokio::net::TcpStream, buf: &mut [u8], context: &str) {
+        use tokio::io::AsyncReadExt;
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(buf))
+            .await
+            .unwrap_or_else(|_| panic!("{context}: should have been closed promptly, still open"));
+        match read {
+            Ok(0) => {}
+            Ok(n) => panic!("{context}: expected a close, read {n} bytes"),
+            Err(e) => panic!("{context}: expected a clean close, got {e}"),
+        }
+    }
+
+    /// Whether the connection stayed open (no data, no close) for a moment.
+    async fn read_timed_out(stream: &mut tokio::net::TcpStream, buf: &mut [u8]) -> bool {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(std::time::Duration::from_millis(250), stream.read(buf))
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
     async fn proxy_accept_loop_does_not_reserve_permits_while_idle() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
-        let (_backend_tx, backend_rx) = watch::channel(None);
+        let (_backend_tx, backend_rx) = watch::channel(BackendStatus::default());
         let (lazy_tx, mut lazy_rx) = mpsc::channel(1);
         let permits = Arc::new(Semaphore::new(1));
         let global_active_connections = Arc::new(AtomicUsize::new(0));

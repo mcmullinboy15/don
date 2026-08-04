@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use super::dependency::Dependency;
 use super::download::DownloadConfig;
 use super::param::TaskParam;
 use super::platform::Platform;
@@ -175,8 +176,10 @@ pub struct Task {
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// Services or tasks that must be ready/complete before this task runs.
+    /// A `required` entry also gates on success; an optional entry only
+    /// orders startup.
     #[serde(default)]
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<Dependency>,
     /// File glob patterns — task only re-runs if these files changed since last success.
     /// If empty, the task always runs.
     #[serde(default)]
