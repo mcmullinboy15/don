@@ -18,22 +18,48 @@ than content-hashed, so the committed bundle only changes when the code does.
 
 ## Working on it
 
+The dev server gives you hot reload against a real stack. It serves the UI
+itself and proxies `/api` to a running don, so you need a daemon (or
+`don start --with-ui`) up first.
+
 ```sh
 npm ci
 
-# Point at a running don and get hot reload. The dev server proxies /api,
-# so you need a daemon (or `don start --with-ui`) running.
+# 1. Something for the UI to talk to.
 don daemon &
-don ui --print              # copy the token out of the URL
-npm run dev                 # then open the dev server URL with ?token=…
+cd ~/some-project && don start -d
 
-# Override the proxy target when using --with-ui or a non-default port:
+# 2. Authorize the browser — note the localhost spelling, it matters (below).
+don ui --print                       # grab the token from the printed URL
+#    open http://localhost:3666/?token=<TOKEN> once in your browser
+
+# 3. Hot reload.
+npm run dev                          # http://localhost:5173
+
+# Pointing at --with-ui, or a daemon on a non-default port:
 DON_UI_TARGET=http://127.0.0.1:3667 npm run dev
 ```
 
-In debug builds `rust-embed` reads `web/dist` from disk, so
-`npm run build` alone is enough to see changes in a `cargo run` binary — no
-Rust rebuild needed.
+**Open the token URL as `localhost`, not `127.0.0.1`.** Auth is a cookie, and
+cookies are scoped by host but *not* by port — so a cookie set on `localhost`
+is sent to `localhost:5173`, while one set on `127.0.0.1` is not. `don ui`
+prints the `127.0.0.1` form (that's the address don bound), so for the dev
+server you have to retype it as `localhost`. Symptom if you get this wrong:
+the app loads but says "This tab isn't authorized".
+
+The proxy sets `changeOrigin: true` because don rejects requests whose `Host`
+isn't the address it bound (the DNS-rebinding guard in `src/web/auth.rs`).
+Without it every API call through the dev server returns 421.
+
+## Skipping the dev server
+
+In debug builds `rust-embed` reads `web/dist` from disk, so you can also just
+rebuild the bundle and reload — no Rust rebuild, no proxy, no cookie
+complications, but no hot reload either:
+
+```sh
+npm run build && open "$(don ui --print)"
+```
 
 ## Before committing
 

@@ -25,7 +25,11 @@ export default defineConfig({
     proxy: {
       "/api": {
         target: process.env.DON_UI_TARGET ?? "http://127.0.0.1:3666",
-        changeOrigin: false,
+        // Rewrite Host to the target's. don rejects requests whose Host
+        // isn't the address it bound — that's the DNS-rebinding guard in
+        // src/web/auth.rs — and without this the proxy forwards
+        // `localhost:5173` and every API call comes back 421.
+        changeOrigin: true,
       },
     },
   },
