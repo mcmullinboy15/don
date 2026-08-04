@@ -267,18 +267,36 @@ impl Client {
     /// `GET /logs/:name?last=N&follow=true` — opens a streaming connection
     /// and invokes `on_line` for each NDJSON line the server sends. Returns
     /// when the server closes the stream or the callback returns `Err`.
-    pub async fn logs_follow<F>(
-        &self,
-        name: &str,
-        last: usize,
-        mut on_line: F,
-    ) -> Result<(), ClientError>
+    pub async fn logs_follow<F>(&self, name: &str, last: usize, on_line: F) -> Result<(), ClientError>
     where
         F: FnMut(&str) -> Result<(), ClientError>,
     {
         let path = format!("/logs/{}?last={last}&follow=true", urlencode(name));
+        self.follow_ndjson(&path, on_line).await
+    }
+
+    /// `GET /events` — stream runner state changes, one JSON object per line.
+    ///
+    /// Same shape as [`Self::logs_follow`], and the same lifetime: the call
+    /// returns when the daemon closes the stream (normally at shutdown) or
+    /// when `on_line` asks to stop by returning `Err`.
+    pub async fn events_follow<F>(&self, on_line: F) -> Result<(), ClientError>
+    where
+        F: FnMut(&str) -> Result<(), ClientError>,
+    {
+        self.follow_ndjson("/events", on_line).await
+    }
+
+    /// Read a newline-delimited JSON stream, invoking `on_line` per line.
+    ///
+    /// Handles both chunked and read-until-close bodies, since the API uses
+    /// whichever hyper picks for a given response.
+    async fn follow_ndjson<F>(&self, path: &str, mut on_line: F) -> Result<(), ClientError>
+    where
+        F: FnMut(&str) -> Result<(), ClientError>,
+    {
         let mut stream = self.connect().await?;
-        write_request(&mut stream, "GET", &path, false).await?;
+        write_request(&mut stream, "GET", path, false).await?;
         // Parse status line + headers.
         let (status, headers, mut leftover) = read_head(&mut stream).await?;
         if status != 200 {
@@ -290,7 +308,6 @@ impl Client {
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"));
 
-        // NDJSON: one `{"line":"..."}` per line.
         // Buffer raw body bytes, decode chunks if needed, split on \n.
         let mut pending = Vec::<u8>::new();
         loop {

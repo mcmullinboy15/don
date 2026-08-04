@@ -19,6 +19,7 @@ pub mod task_state;
 pub(crate) mod tui;
 pub(crate) mod update;
 pub(crate) mod watch;
+pub mod web;
 
 pub use config::{Config, ConfigError, Platform, TaskAutoRun, TaskHeadless};
 pub use docker::stream::DockerLogReader;

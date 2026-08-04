@@ -35,6 +35,12 @@ pub(crate) enum DaemonCommand {
     List {
         reply: oneshot::Sender<Vec<ProjectEntry>>,
     },
+    /// Fetch a single project by id, pruning first so the web layer never
+    /// hands out a socket that has already gone away.
+    Get {
+        id: String,
+        reply: oneshot::Sender<Option<ProjectEntry>>,
+    },
     /// Count live projects, for `GET /info`.
     Count { reply: oneshot::Sender<usize> },
     /// Stop the daemon. Registered projects keep running.

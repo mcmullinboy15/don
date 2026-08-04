@@ -77,6 +77,19 @@ enum Commands {
         /// daemon not know about a project at all.
         #[arg(long)]
         no_daemon: bool,
+        /// Serve a web UI for this project from this process, instead of
+        /// relying on a system-wide daemon. Implies `--no-daemon`: the UI
+        /// shows only this project and lives exactly as long as it does.
+        /// Defaults to port 3667 (the daemon owns 3666); pass
+        /// `--with-ui=PORT` to choose another.
+        #[arg(
+            long,
+            value_name = "PORT",
+            num_args = 0..=1,
+            default_missing_value = "3667",
+            conflicts_with = "name"
+        )]
+        with_ui: Option<u16>,
     },
     /// Run or manage the system-wide daemon that serves the web UI
     ///
@@ -84,8 +97,21 @@ enum Commands {
     /// serves a UI over them. It never owns your services, so stopping it
     /// leaves every running stack untouched.
     Daemon {
+        /// Port to serve the web UI on. Use 0 to let the OS pick one.
+        #[arg(long, env = "DON_UI_PORT", default_value_t = don::web::DEFAULT_PORT)]
+        port: u16,
+        /// Run the control plane without a web UI. Useful for debugging
+        /// registration on its own.
+        #[arg(long, conflicts_with = "port")]
+        no_web: bool,
         #[command(subcommand)]
         command: Option<DaemonCommands>,
+    },
+    /// Open the don web UI in your browser
+    Ui {
+        /// Print the URL instead of opening a browser
+        #[arg(long)]
+        print: bool,
     },
     /// Stop the daemon, or stop one running service when a name is given
     Stop {
@@ -255,6 +281,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             no_tui,
             log_filter,
             no_daemon,
+            with_ui,
         } => {
             let result = if detached {
                 run_start_detached(
@@ -263,6 +290,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                     verbose,
                     log_filter,
                     no_daemon,
+                    with_ui,
                 )
                 .await
             } else {
@@ -273,6 +301,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                     no_tui,
                     log_filter,
                     no_daemon,
+                    with_ui,
                 )
                 .await
             };
@@ -299,7 +328,12 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             verbose,
             json,
         } => run_status(&config_path, name.as_deref(), verbose, json).await,
-        Commands::Daemon { command } => run_daemon_command(command).await,
+        Commands::Daemon {
+            port,
+            no_web,
+            command,
+        } => run_daemon_command(port, no_web, command).await,
+        Commands::Ui { print } => run_ui(print).await,
         Commands::Ports { json } => run_ports(&config_path, json),
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
@@ -691,7 +725,7 @@ where
 
 /// Dispatch `don daemon [status|stop]`. No subcommand runs the daemon in the
 /// foreground — that's what the systemd unit / launchd agent execs.
-async fn run_daemon_command(command: Option<DaemonCommands>) -> i32 {
+async fn run_daemon_command(port: u16, no_web: bool, command: Option<DaemonCommands>) -> i32 {
     let paths = match don::daemon::DaemonPaths::from_process_env() {
         Ok(paths) => paths,
         Err(e) => {
@@ -701,13 +735,13 @@ async fn run_daemon_command(command: Option<DaemonCommands>) -> i32 {
     };
 
     match command {
-        None => run_daemon_foreground(paths).await,
+        None => run_daemon_foreground(paths, port, no_web).await,
         Some(DaemonCommands::Status { json }) => run_daemon_status(paths, json).await,
         Some(DaemonCommands::Stop) => run_daemon_stop(paths).await,
     }
 }
 
-async fn run_daemon_foreground(paths: don::daemon::DaemonPaths) -> i32 {
+async fn run_daemon_foreground(paths: don::daemon::DaemonPaths, port: u16, no_web: bool) -> i32 {
     // The daemon has no OutputManager, so its progress goes straight to
     // stderr — which is where systemd and launchd capture it from anyway.
     let report: don::daemon::Reporter = std::sync::Arc::new(|line: &str| {
@@ -716,7 +750,7 @@ async fn run_daemon_foreground(paths: don::daemon::DaemonPaths) -> i32 {
 
     let options = don::daemon::DaemonOptions {
         paths,
-        web_addr: None,
+        web_addr: (!no_web).then(|| std::net::SocketAddr::from(([127, 0, 0, 1], port))),
     };
     match don::daemon::run(options, report).await {
         Ok(()) => 0,
@@ -793,6 +827,92 @@ async fn run_daemon_status(paths: don::daemon::DaemonPaths, json: bool) -> i32 {
         }
     }
     0
+}
+
+/// `don ui` — open the daemon's web UI in a browser, carrying the token.
+///
+/// The token lives in a 0600 file, so this is the only convenient way to get
+/// an authorized session: reading it and putting it in the URL is exactly
+/// what the user would otherwise do by hand.
+async fn run_ui(print_only: bool) -> i32 {
+    let paths = match don::daemon::DaemonPaths::from_process_env() {
+        Ok(paths) => paths,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    let client = don::daemon::DaemonClient::new(paths.socket());
+    let info = match client.info().await {
+        Ok(info) => info,
+        Err(ClientError::NotRunning { .. }) => {
+            errln(
+                "don daemon is not running, so there's no web ui to open.\n  \
+                 Start one with `don daemon`, install it with `don daemon install`,\n  \
+                 or serve a single project with `don start --with-ui`.",
+            );
+            return 1;
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    let Some(addr) = info.web_addr else {
+        errln(
+            "the don daemon is running with its web ui disabled.\n  \
+             Restart it without `--no-web` to enable it.",
+        );
+        return 1;
+    };
+
+    let token = match don::web::Token::load_or_create(&paths.token()) {
+        Ok(token) => token,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+    let url = format!("http://{addr}/?token={}", token.as_str());
+
+    if print_only {
+        println!("{url}");
+        return 0;
+    }
+
+    match open_in_browser(&url) {
+        Ok(()) => {
+            println!("opened {url}");
+            0
+        }
+        Err(e) => {
+            errln(format!("could not open a browser ({e}) — open this instead:"));
+            println!("{url}");
+            0
+        }
+    }
+}
+
+/// Hand a URL to the platform's URL opener.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("{opener}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{opener} exited with {status}"))
+    }
 }
 
 async fn run_daemon_stop(paths: don::daemon::DaemonPaths) -> i32 {
@@ -1627,6 +1747,7 @@ async fn run_start_detached(
     verbose: bool,
     log_filter: Vec<String>,
     no_daemon: bool,
+    with_ui: Option<u16>,
 ) -> Result<(), String> {
     let base = base_dir(config_path);
     let client = Client::new(&base);
@@ -1665,6 +1786,9 @@ async fn run_start_detached(
     cmd.arg("start").arg("--no-tui");
     if no_daemon {
         cmd.arg("--no-daemon");
+    }
+    if let Some(port) = with_ui {
+        cmd.arg(format!("--with-ui={port}"));
     }
     if let Some(profile_name) = profile {
         cmd.arg("--profile").arg(profile_name);
@@ -1779,8 +1903,12 @@ async fn run_start(
     no_tui: bool,
     log_filter: Vec<String>,
     no_daemon: bool,
+    with_ui: Option<u16>,
 ) -> Result<(), String> {
     use std::io::IsTerminal;
+
+    // Serving a UI from this process means not depending on a daemon at all.
+    let no_daemon = no_daemon || with_ui.is_some();
 
     let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
@@ -1936,6 +2064,15 @@ async fn run_start(
     let shutdown_rx = don::runner::install_signal_handlers()
         .await
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
+
+    // Bring the UI up before the runner so a port conflict fails before
+    // anything has been spawned — the same "validate everything before
+    // starting anything" rule the config checks above follow. Held until
+    // `run_start` returns, which is what stops the server.
+    let _ui = match with_ui {
+        Some(port) => Some(start_with_ui(port, &base, profile_ref).await?),
+        None => None,
+    };
 
     let _ = has_foreground_tasks; // logged earlier; TUI now handles fg tasks via pause/resume
 
@@ -2174,6 +2311,64 @@ fn apply_daemon_registration(
     if let Ok(paths) = don::daemon::DaemonPaths::from_process_env() {
         runner.enable_daemon_registration(paths.socket(), profile.map(str::to_string));
     }
+}
+
+/// A web UI served by `don start --with-ui`, alive for as long as this value.
+///
+/// Dropping the sender ends the server's graceful-shutdown wait, so the UI
+/// goes away with the stack it belongs to — no explicit teardown call to
+/// forget on one of `run_start`'s exit paths.
+struct WithUiGuard {
+    _shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// Start a project-local web UI on `port`.
+///
+/// Errors here are fatal rather than best-effort: unlike daemon
+/// registration, the user explicitly asked for this UI, so silently not
+/// getting one would be worse than a clear failure.
+async fn start_with_ui(
+    port: u16,
+    base: &Path,
+    profile: Option<&str>,
+) -> Result<WithUiGuard, String> {
+    let root = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let entry = don::daemon::ProjectEntry::new(
+        root,
+        std::process::id(),
+        profile.map(str::to_string),
+    );
+
+    // Share the machine-wide token so a single `don ui` link works whether
+    // the UI is served by the daemon or by a project.
+    let token = match don::daemon::DaemonPaths::from_process_env() {
+        Ok(paths) => don::web::Token::load_or_create(&paths.token())
+            .map_err(|e| format!("Error: {e}"))?,
+        // No usable state directory — fall back to a token for this run only.
+        Err(_) => don::web::Token::generate().map_err(|e| format!("Error: {e}"))?,
+    };
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let (listener, addr) = don::web::bind(addr).await.map_err(|e| {
+        format!(
+            "Error: {e}\n\
+             Another process is likely using port {port} — pass `--with-ui=PORT` to pick another."
+        )
+    })?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(don::web::serve_single(
+        listener,
+        entry,
+        token.clone(),
+        addr.port(),
+        shutdown_rx,
+    ));
+
+    println!("don web ui: http://{addr}/?token={}", token.as_str());
+    Ok(WithUiGuard {
+        _shutdown_tx: shutdown_tx,
+    })
 }
 
 async fn await_with_shutdown_supervision<T>(

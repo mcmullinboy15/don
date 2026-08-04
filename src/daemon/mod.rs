@@ -49,6 +49,12 @@ pub enum DaemonError {
     /// Installing signal handlers failed.
     #[error("failed to install signal handlers: {0}")]
     Signals(#[source] std::io::Error),
+    /// Binding or starting the web UI failed.
+    #[error(transparent)]
+    Web(#[from] crate::web::WebError),
+    /// Reading or creating the web UI token failed.
+    #[error(transparent)]
+    Token(#[from] crate::web::TokenError),
 }
 
 /// How the daemon should run.
@@ -107,10 +113,16 @@ pub async fn run(options: DaemonOptions, report: Reporter) -> Result<(), DaemonE
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let web_addr = options.web_addr.map(|a| a.to_string());
+    // Bind the web UI before announcing anything, so a port conflict fails
+    // the daemon outright instead of leaving it half-up with no UI.
+    let web = match options.web_addr {
+        Some(addr) => Some(start_web(addr, &options.paths, cmd_tx.clone(), &shutdown_rx).await?),
+        None => None,
+    };
+
     let control = Arc::new(ControlState {
         cmd_tx: cmd_tx.clone(),
-        web_addr: web_addr.clone(),
+        web_addr: web.as_ref().map(|w| w.addr.to_string()),
     });
     let router = routes::build_router(control);
 
@@ -121,9 +133,15 @@ pub async fn run(options: DaemonOptions, report: Reporter) -> Result<(), DaemonE
         shutdown_rx,
     ));
 
-    report(&format!("control socket listening on {}", socket_path.display()));
-    match &web_addr {
-        Some(addr) => report(&format!("web ui on http://{addr}")),
+    report(&format!(
+        "control socket listening on {}",
+        socket_path.display()
+    ));
+    match &web {
+        Some(web) => {
+            report(&format!("web ui on http://{}", web.addr));
+            report(&format!("open it with: {}", web.url()));
+        }
         None => report("web ui disabled"),
     }
 
@@ -138,8 +156,49 @@ pub async fn run(options: DaemonOptions, report: Reporter) -> Result<(), DaemonE
 
     let _ = shutdown_tx.send(true);
     let _ = server.await;
+    if let Some(web) = web {
+        let _ = web.handle.await;
+    }
     report("daemon stopped");
     Ok(())
+}
+
+/// A running web UI server.
+struct WebServer {
+    addr: SocketAddr,
+    token: crate::web::Token,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl WebServer {
+    /// A URL that will authorize whatever browser opens it.
+    fn url(&self) -> String {
+        format!("http://{}/?token={}", self.addr, self.token.as_str())
+    }
+}
+
+/// Bind and start serving the web UI over the daemon's registry.
+async fn start_web(
+    addr: SocketAddr,
+    paths: &DaemonPaths,
+    cmd_tx: mpsc::UnboundedSender<DaemonCommand>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> Result<WebServer, DaemonError> {
+    let token = crate::web::Token::load_or_create(&paths.token())?;
+    let (listener, addr) = crate::web::bind(addr).await?;
+    let directory = crate::web::ProjectDirectory::Daemon { cmd_tx };
+    let handle = tokio::spawn({
+        let token = token.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        async move {
+            let _ = crate::web::serve(listener, directory, token, addr.port(), shutdown_rx).await;
+        }
+    });
+    Ok(WebServer {
+        addr,
+        token,
+        handle,
+    })
 }
 
 /// Own the registry and serve commands until shutdown.
@@ -192,6 +251,14 @@ async fn registry_loop(
                             persist(&registry, report);
                         }
                         let _ = reply.send(registry.list());
+                    }
+                    DaemonCommand::Get { id, reply } => {
+                        let removed = registry.prune().await;
+                        if !removed.is_empty() {
+                            report_pruned(&removed, report);
+                            persist(&registry, report);
+                        }
+                        let _ = reply.send(registry.get(&id).cloned());
                     }
                     DaemonCommand::Count { reply } => {
                         let _ = reply.send(registry.len());
