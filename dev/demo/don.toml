@@ -1,0 +1,64 @@
+# A throwaway stack for working on don itself.
+#
+# The web UI is hard to develop against an empty project list, so `don start`
+# in the don repo runs this one and registers it with the dev daemon. It exists
+# to be *looked at*: a service that logs steadily, one that fails, one that's
+# lazy, a task that completes, and a task with params you run by hand — enough
+# states on screen to see whether the UI renders them properly.
+#
+# `touch dev/demo/seed.sql` moves `seed` into pending_run, which is how to get
+# the `*` flag on screen; `auto_run = false` tasks start out `skipped`.
+#
+# Nothing here should need anything but bash.
+
+[services.chatty]
+run.cmd = "bash"
+run.args = [
+  "-c",
+  """
+  while true; do
+    printf '\\033[32mINFO\\033[0m  request \\033[1;34mGET\\033[0m /users \\033[33m200\\033[0m in \\033[2m%sms\\033[0m\\n' $((RANDOM % 90 + 10))
+    sleep 1
+  done
+  """,
+]
+ready.exec = { cmd = "true" }
+
+# Something permanently red, so the failure styling is always on screen.
+[services.broken]
+run.cmd = "bash"
+run.args = ["-c", "echo 'could not connect to upstream' >&2; exit 1"]
+
+# Bound but not started until something connects — exercises the `lazy` pill.
+[services.on-demand]
+run.cmd = "bash"
+run.args = ["-c", "echo 'woken up'; while true; do sleep 5; done"]
+proxy = { listen = "127.0.0.1:0", listenfd = true }
+lazy = true
+
+[tasks.migrate]
+cmd = "bash"
+args = ["-c", "echo 'applying 3 migrations'; sleep 0.4; echo done"]
+depends_on = ["chatty"]
+
+# Manual-only, with params for the run dialog. Touch seed.sql to watch it
+# move from `skipped` to `pending_run` and pick up the `*` flag.
+[tasks.seed]
+cmd = "bash"
+args = ["-c", "echo 'seeding {{count}} users into {{env}}'"]
+auto_run = false
+watch = ["*.sql"]
+
+[[tasks.seed.params]]
+name = "count"
+prompt = "How many users?"
+kind = "int"
+default = "10"
+validate.min = 1
+validate.max = 1000
+
+[[tasks.seed.params]]
+name = "env"
+prompt = "Target environment"
+required = true
+choices = ["dev", "staging"]

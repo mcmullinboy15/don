@@ -1,0 +1,114 @@
+# don, running don.
+#
+# `don start` here gives you the dev loop for working on this repo:
+#
+#   * a dev daemon on :3777, rebuilt and restarted when you touch src/
+#   * the Vite dev server on :5173, proxying to it, with hot reload
+#   * a throwaway project (dev/demo) registered with the dev daemon, so the
+#     UI has something to render
+#   * clippy on every Rust save; `web/dist` rebuilt on every frontend save
+#
+# Then open http://127.0.0.1:5173 and you're editing the UI while watching it
+# run don.
+#
+#   don start                  # everything
+#   don start --profile rust   # no npm: just the daemon and clippy
+#
+# The dev daemon deliberately keeps its state in /tmp/don-dev-daemon rather
+# than the usual XDG location. A daemon you install with `don daemon install`
+# holds an flock on daemon.pid there, so sharing the directory would mean the
+# dev daemon refuses to start whenever your real one is running.
+
+default_profile = "all"
+
+[profiles.all]
+services = ["daemon", "web", "demo"]
+tasks = ["clippy", "test", "web-install", "web-build"]
+
+# For Rust-only work: skips npm and the demo stack, but still rebuilds and
+# restarts the daemon so you can exercise changes by hand.
+[profiles.rust]
+services = ["daemon"]
+tasks = ["clippy", "test"]
+
+# --- services ---
+
+# The daemon under development. Rebuilt and restarted whenever src/ changes,
+# so the UI you're looking at is always the code you just wrote.
+#
+# Not the `rust.binary` preset: that passes extra args to `cargo build`, and
+# this needs args on the *binary* (`daemon --port ...`).
+[services.daemon]
+build.cmd = "cargo"
+build.args = ["build", "--bin", "don"]
+run.cmd = "./target/debug/don"
+run.args = ["daemon", "--port", "3777"]
+env = { DON_STATE_DIR = "/tmp/don-dev-daemon" }
+watch = ["src/**/*.rs", "Cargo.toml"]
+debounce = "500ms"
+ready.tcp = "127.0.0.1:3777"
+ready.retries = 120
+
+# Vite. `reload = false` because it has its own HMR — don restarting it on
+# every save would throw away the thing it's for.
+[services.web]
+dir = "web"
+run.cmd = "npm"
+run.args = ["run", "dev"]
+env = { DON_UI_TARGET = "http://127.0.0.1:3777" }
+depends_on = ["daemon", "web-install"]
+reload = false
+# Not `ready.tcp`: Vite binds `[::1]` only, so a check against 127.0.0.1
+# never connects. Going through the name resolves the way a browser does.
+ready.http = "http://localhost:5173/"
+ready.retries = 60
+
+# don, running don, running don. Registers dev/demo with the dev daemon so
+# the UI has a project to show. Uses the freshly built binary, so it also
+# smoke-tests that `don start` still works after your change.
+[services.demo]
+run.cmd = "./target/debug/don"
+run.args = ["--config", "dev/demo/don.toml", "start", "--no-tui"]
+env = { DON_STATE_DIR = "/tmp/don-dev-daemon" }
+depends_on = ["daemon"]
+reload = false
+# Its children need to stop before it reports done.
+shutdown.timeout = "15s"
+
+# --- tasks ---
+
+[tasks.clippy]
+cmd = "cargo"
+args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+watch = ["src/**/*.rs", "tests/**/*.rs", "Cargo.toml"]
+debounce = "500ms"
+
+# Not automatic: the suite takes about two minutes and would fight the
+# daemon's rebuild over the cargo lock on every keystroke. Sits in
+# pending_run instead — trigger it from the UI, or `don run test`.
+[tasks.test]
+cmd = "bash"
+args = ["-c", "cargo test {{filter}}"]
+auto_run = false
+
+[[tasks.test.params]]
+name = "filter"
+prompt = "Test name filter (blank runs everything)"
+default = ""
+
+[tasks.web-install]
+dir = "web"
+cmd = "npm"
+args = ["ci"]
+watch = ["web/package-lock.json"]
+
+# Keeps the committed bundle in step with the sources. CI fails on drift
+# (web/dist is embedded in the binary and crates.io can't run npm), and
+# noticing that at review time is much worse than noticing it here.
+[tasks.web-build]
+dir = "web"
+cmd = "npm"
+args = ["run", "build"]
+depends_on = ["web-install"]
+watch = ["web/src/**", "web/index.html", "web/vite.config.ts"]
+debounce = "1s"

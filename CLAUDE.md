@@ -12,6 +12,26 @@ cargo test           # run all tests
 cargo clippy         # lint
 ```
 
+### Running don on don
+
+There's a `don.toml` in this repo, so `don start` here brings up the dev loop:
+a dev daemon on `:3777` rebuilt whenever `src/` changes, the Vite dev server on
+`:5173` proxying to it, and a throwaway stack (`dev/demo/`) registered with the
+dev daemon so the web UI has something to render. Clippy runs on every Rust
+save and `web/dist` is rebuilt on every frontend save, which keeps the CI drift
+check happy.
+
+```sh
+don start                  # everything
+don start --profile rust   # no npm: just the daemon and clippy
+don run test               # the suite is manual — it'd fight the cargo lock
+```
+
+The dev daemon keeps its state in `/tmp/don-dev-daemon`, deliberately away from
+the XDG location: a daemon installed with `don daemon install` holds an flock on
+`daemon.pid` there, so sharing the directory would make the dev daemon refuse to
+start whenever the real one is running.
+
 For interactive testing of the TUI under realistic load (shutdown, log spam,
 hang detection), see [Testing the TUI](#testing-the-tui) — this is the
 preferred way to validate any change that touches `src/tui/`, `src/output/`,
