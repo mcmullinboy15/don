@@ -256,8 +256,23 @@ path = "main.rs"
         )
         .unwrap();
 
+        // Pin the build output to the location don's rust preset resolves by
+        // default (`<dir>/target`).
+        //
+        // This exists because of a real don bug, not a test quirk, so don't
+        // delete it if the bug is ever fixed — delete it *when* it's fixed.
+        // `rust_binary_path` (src/runner/service.rs) computes
+        // `<dir>/target/<profile>/<binary>` and never consults
+        // `CARGO_TARGET_DIR`, while the build subprocess inherits the ambient
+        // environment and so does honour it. Repro: export CARGO_TARGET_DIR
+        // and run a `rust.binary` service — the build *succeeds*
+        // ("cargo build succeeded") and don then dies with "failed to spawn
+        // process '<dir>/target/debug/<binary>': No such file or directory".
+        // Users hitting this can set `rust.target_dir` explicitly.
+        let target_dir = dir.path().join("target");
         let toml = ConfigBuilder::new()
             .add_rust_service("app", "test-app")
+            .env("CARGO_TARGET_DIR", &target_dir.to_string_lossy())
             .ready_exec("true", &[])
             .done()
             .build();

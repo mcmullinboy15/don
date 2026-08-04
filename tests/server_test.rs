@@ -67,6 +67,63 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
     true
 }
 
+/// Poll `GET /status` until `name` reports `state`. Returns false on timeout.
+///
+/// The API socket is bound early in `Runner::run`, well before the startup
+/// sweep has decided what to do with each task. That sweep runs in a per-task
+/// worker, and a task with a worker in flight counts as "already running" — so
+/// a `POST /run/:name` issued right after `wait_for_socket` races the sweep and
+/// gets a 409 instead of actually starting the task. Waiting for the task's
+/// settled state (`skipped` for an `auto_run = false` task that has nothing to
+/// do) makes the run deterministic without guessing at a sleep duration.
+async fn wait_for_item_state(
+    socket_path: &Path,
+    name: &str,
+    state: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (status, body) = request(socket_path, "GET", "/status").await;
+        if status == 200
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(items) = parsed.get("items").and_then(|i| i.as_array())
+            && items.iter().any(|item| {
+                item.get("name").and_then(|n| n.as_str()) == Some(name)
+                    && item.get("state").and_then(|s| s.as_str()) == Some(state)
+            })
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Poll a GET endpoint until its body contains `needle`. Returns false on
+/// timeout. Used instead of sleeping for a service's output to reach the ring
+/// buffer — how long a spawn plus a first read takes is load-dependent.
+async fn wait_for_body_contains(
+    socket_path: &Path,
+    path: &str,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (status, body) = request(socket_path, "GET", path).await;
+        if status == 200 && body.contains(needle) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Make a runner + background task. Returns the socket path, shutdown tx,
 /// and join handle.
 async fn spawn_runner(
@@ -110,7 +167,9 @@ async fn spawn_runner(
     .unwrap();
     let socket_path = base_dir.join(".don").join("don.sock");
     let handle = tokio::spawn(async move {
-        let _ = runner.run().await;
+        if let Err(e) = runner.run().await {
+            eprintln!("RUNNER ERROR: {e}");
+        }
     });
     (socket_path, shutdown_tx, handle)
 }
@@ -428,7 +487,13 @@ fn integration_events_endpoint_streams_state_changes() {
         });
 
         // A stop produces two transitions: Stopping, then Stopped.
-        let lines = follow_lines(&socket, "/events", 2, Duration::from_secs(8)).await;
+        let lines = follow_lines(
+            &socket,
+            "/events",
+            "\"state\":\"stopped\"",
+            Duration::from_secs(8),
+        )
+        .await;
         let (stop_status, _) = stopper.await.unwrap();
         assert_eq!(stop_status, 204);
 
@@ -539,6 +604,11 @@ fn integration_run_task_wait_endpoint_returns_after_success() {
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
 
+        assert!(
+            wait_for_item_state(&socket, "once", "skipped", Duration::from_secs(3)).await,
+            "task should settle as skipped before the manual run"
+        );
+
         let (status, body) =
             request_with_body(&socket, "POST", "/run/once", Some(r#"{"wait":true}"#)).await;
         assert_eq!(status, 204, "body: {body}");
@@ -567,6 +637,11 @@ fn integration_run_task_wait_endpoint_maps_task_failure_to_422() {
 
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        assert!(
+            wait_for_item_state(&socket, "fail", "skipped", Duration::from_secs(3)).await,
+            "task should settle as skipped before the manual run"
+        );
 
         let (status, body) =
             request_with_body(&socket, "POST", "/run/fail", Some(r#"{"wait":true}"#)).await;
@@ -603,6 +678,11 @@ fn integration_run_task_wait_timeout_returns_408_without_stopping_task() {
 
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        assert!(
+            wait_for_item_state(&socket, "slow", "skipped", Duration::from_secs(3)).await,
+            "task should settle as skipped before the manual run"
+        );
 
         let (status, body) = request_with_body(
             &socket,
@@ -676,12 +756,19 @@ fn integration_unknown_name_returns_404() {
     });
 }
 
-/// Stream an NDJSON-body request until `want_lines` lines have been seen
-/// or `timeout` elapses. Returns the collected line texts.
+/// Stream an NDJSON-body request until a record containing `until` has been
+/// seen or `timeout` elapses. Returns the collected NDJSON records.
+///
+/// Stopping on a *record count* would be wrong: the follow sink forwards each
+/// chunk the output pipeline produces, and a chunk is whatever a single read
+/// from the service's PTY returned — one log line, several, or half of one. A
+/// service that emits N lines can therefore produce more (or fewer) than N
+/// NDJSON records, so the only reliable stop condition is the content the test
+/// is actually waiting for.
 async fn follow_lines(
     socket_path: &Path,
     path: &str,
-    want_lines: usize,
+    until: &str,
     timeout: Duration,
 ) -> Vec<String> {
     let mut stream = UnixStream::connect(socket_path).await.unwrap();
@@ -694,6 +781,10 @@ async fn follow_lines(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut buffer = Vec::new();
     let mut headers_consumed = false;
+    // Dechunked body bytes not yet terminated by a newline. An NDJSON record is
+    // only complete at its `\n`, and nothing guarantees a record and an HTTP
+    // chunk share a boundary.
+    let mut pending: Vec<u8> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -733,17 +824,18 @@ async fn follow_lines(
             if buffer.len() < rn + 2 + size + 2 {
                 break; // not enough data yet
             }
-            let data = buffer[rn + 2..rn + 2 + size].to_vec();
+            pending.extend_from_slice(&buffer[rn + 2..rn + 2 + size]);
             buffer.drain(..rn + 2 + size + 2);
-            for line_bytes in data.split(|b| *b == b'\n') {
-                if line_bytes.is_empty() {
+            while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+                let line_bytes: Vec<u8> = pending.drain(..nl + 1).collect();
+                let text = String::from_utf8_lossy(&line_bytes[..nl]).into_owned();
+                if text.is_empty() {
                     continue;
                 }
-                let text = String::from_utf8_lossy(line_bytes).into_owned();
                 lines.push(text);
             }
         }
-        if lines.len() >= want_lines {
+        if lines.iter().any(|l| l.contains(until)) {
             break;
         }
     }
@@ -773,13 +865,23 @@ fn integration_logs_follow_streams_lines() {
 
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
-        // Give the service time to emit pre1/pre2 into the ring buffer.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The follow snapshot can only replay what the ring buffer already
+        // holds, so wait for pre2 to land rather than guessing at spawn time.
+        assert!(
+            wait_for_body_contains(
+                &socket,
+                "/logs/chatty?last=2",
+                "pre2",
+                Duration::from_secs(3)
+            )
+            .await,
+            "service should have emitted pre1/pre2 into the ring buffer"
+        );
 
         let lines = follow_lines(
             &socket,
             "/logs/chatty?last=2&follow=true",
-            5,
+            "live3",
             Duration::from_secs(5),
         )
         .await;
@@ -835,7 +937,16 @@ fn integration_logs_endpoint_returns_ring_buffer() {
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
         // Wait for the service to emit its lines.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            wait_for_body_contains(
+                &socket,
+                "/logs/chatty?last=10",
+                "line5",
+                Duration::from_secs(3)
+            )
+            .await,
+            "service should have emitted all five lines"
+        );
 
         let (status, body) = request(&socket, "GET", "/logs/chatty?last=3").await;
         assert_eq!(status, 200);

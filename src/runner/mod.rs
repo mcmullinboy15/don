@@ -2072,9 +2072,26 @@ mod tests {
         }
 
         // Rebind so probes pass again — expect a recovery event.
-        let _restored = TcpListener::bind(format!("127.0.0.1:{port}"))
-            .await
-            .unwrap();
+        //
+        // The port had to be genuinely released to make the monitor fail, and
+        // the kernel can hand it to any other process in that window, so this
+        // bind can lose a race the test can't prevent. Retry briefly: a real
+        // regression keeps the port free and binds on the first attempt, while
+        // a thief that never leaves fails the test rather than hiding.
+        let restored = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            loop {
+                match TcpListener::bind(format!("127.0.0.1:{port}")).await {
+                    Ok(listener) => break Ok(listener),
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        let _ = e;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        };
+        let _restored = restored.expect("another process took the monitored port mid-test");
         let msg = tokio::time::timeout(std::time::Duration::from_millis(500), cmd_rx.recv())
             .await
             .expect("timeout waiting for recovery event")

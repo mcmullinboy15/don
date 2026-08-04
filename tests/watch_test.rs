@@ -836,7 +836,10 @@ fn integration_reload_false_skips_file_watch() {
 #[test]
 fn integration_global_watch_ignore_skips_service_rebuild() {
     run_with_timeout(Duration::from_secs(15), async {
-        let dir = TempDir::new("watch-global-ignore");
+        // Distinct from `integration_global_watch_ignore_is_silent_in_verbose`:
+        // TempDir names are only namespaced by PID, so two tests sharing a name
+        // share a directory — and each `TempDir::new` wipes it on creation.
+        let dir = TempDir::new("watch-global-ignore-rebuild");
 
         let src_dir = dir.path().join("src");
         let generated_dir = src_dir.join("generated");

@@ -1244,32 +1244,64 @@ mod tests {
 
         let emitter = test_lifecycle_emitter().await;
         for case in cases {
-            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let reserved_addr = reservation.local_addr().unwrap();
-            let configured_addr = if case.configured_port_zero {
-                SocketAddr::new(reserved_addr.ip(), 0)
-            } else {
-                reserved_addr
-            };
-            let blocker = if case.occupied {
-                Some(reservation)
-            } else {
-                drop(reservation);
-                None
-            };
-            let entry = ProxyEntry {
-                listen: configured_addr.to_string(),
-                mode: case.mode,
-            };
+            // A "free" port is obtained by binding 127.0.0.1:0, reading the
+            // address and dropping the listener — don has to perform the real
+            // bind itself, so the window between that drop and don's bind
+            // cannot be closed from the test and any other process on the
+            // machine can claim the port in it. A steal has an unambiguous
+            // signature (don reports a fallback for a port we expected to be
+            // free), so the *setup* is retried when it shows up. A genuine
+            // regression produces that same signature on every attempt and
+            // still fails the assertions below on the final one.
+            const SETUP_ATTEMPTS: usize = 10;
+            let mut attempt = 0;
+            let (configured_addr, blocker, result) = loop {
+                attempt += 1;
+                let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let reserved_addr = reservation.local_addr().unwrap();
+                let configured_addr = if case.configured_port_zero {
+                    SocketAddr::new(reserved_addr.ip(), 0)
+                } else {
+                    reserved_addr
+                };
+                let blocker = if case.occupied {
+                    Some(reservation)
+                } else {
+                    drop(reservation);
+                    None
+                };
+                let entry = ProxyEntry {
+                    listen: configured_addr.to_string(),
+                    mode: case.mode.clone(),
+                };
 
-            let result = ServiceProxy::bind(
-                &[entry],
-                case.fallback_ports,
-                None,
-                case.name,
-                emitter.clone(),
-            )
-            .await;
+                let result = ServiceProxy::bind(
+                    &[entry],
+                    case.fallback_ports,
+                    None,
+                    case.name,
+                    emitter.clone(),
+                )
+                .await;
+
+                // Only a case that hands don a port it expects to still own
+                // can be disturbed by a thief; occupied ports are held by a
+                // live listener and port 0 never falls back.
+                let port_stolen = !case.occupied
+                    && !case.configured_port_zero
+                    && matches!(
+                        &result,
+                        Ok(proxy) if proxy
+                            .bindings()
+                            .first()
+                            .is_some_and(|binding| binding.used_fallback)
+                            != case.expect_fallback
+                    );
+                if port_stolen && attempt < SETUP_ATTEMPTS {
+                    continue;
+                }
+                break (configured_addr, blocker, result);
+            };
 
             if case.expect_success {
                 let proxy = result.unwrap_or_else(|error| {
@@ -1449,32 +1481,63 @@ mod tests {
 
     #[tokio::test]
     async fn failed_bind_releases_all_earlier_pending_listeners() {
-        let first_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let first_addr = first_reservation.local_addr().unwrap();
-        drop(first_reservation);
-
-        let _blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let blocked_addr = _blocker.local_addr().unwrap();
-        let entries = vec![
-            ProxyEntry {
-                listen: first_addr.to_string(),
-                mode: ProxyMode::Env("PORT".to_string()),
-            },
-            ProxyEntry {
-                listen: blocked_addr.to_string(),
-                mode: ProxyMode::Listenfd,
-            },
-        ];
         let emitter = test_lifecycle_emitter().await;
 
-        let result = ServiceProxy::bind(&entries, false, None, "transactional", emitter).await;
-        assert!(matches!(result, Err(ProxyError::Bind { .. })));
+        // The first entry needs an address that is free when don binds it, and
+        // still free when the test re-binds it afterwards. Both ends of that
+        // sequence are races against every other process on the machine: the
+        // reserve-then-drop window before don's bind, and the gap between don
+        // releasing the address and the test's re-bind. Neither can be closed
+        // from the test, so the whole scenario is retried on a collision — a
+        // don that really holds the listener fails every attempt, and the
+        // assertions below fire on the last one.
+        const SETUP_ATTEMPTS: usize = 10;
+        for attempt in 1..=SETUP_ATTEMPTS {
+            let last_attempt = attempt == SETUP_ATTEMPTS;
 
-        let rebound = tokio::net::TcpListener::bind(first_addr).await;
-        assert!(
-            rebound.is_ok(),
-            "the first listener remained owned after a later bind failed"
-        );
+            let first_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let first_addr = first_reservation.local_addr().unwrap();
+            drop(first_reservation);
+
+            let _blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let blocked_addr = _blocker.local_addr().unwrap();
+            let entries = vec![
+                ProxyEntry {
+                    listen: first_addr.to_string(),
+                    mode: ProxyMode::Env("PORT".to_string()),
+                },
+                ProxyEntry {
+                    listen: blocked_addr.to_string(),
+                    mode: ProxyMode::Listenfd,
+                },
+            ];
+
+            let result =
+                ServiceProxy::bind(&entries, false, None, "transactional", emitter.clone()).await;
+
+            match &result {
+                // The intended failure: the *second* entry could not bind.
+                Err(ProxyError::Bind { addr, .. }) if *addr == blocked_addr.to_string() => {}
+                // Someone else took the first address inside the reservation
+                // window, so this attempt never exercised the rollback.
+                Err(ProxyError::Bind { addr, .. })
+                    if *addr == first_addr.to_string() && !last_attempt =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("expected the second entry to fail its bind, got {error}"),
+                Ok(_) => panic!("expected the second entry to fail its bind, it succeeded"),
+            }
+
+            let rebound = tokio::net::TcpListener::bind(first_addr).await;
+            if rebound.is_ok() {
+                return;
+            }
+            assert!(
+                !last_attempt,
+                "the first listener remained owned after a later bind failed"
+            );
+        }
     }
 
     #[test]

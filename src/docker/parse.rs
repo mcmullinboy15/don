@@ -125,7 +125,9 @@ pub(crate) fn conflict_ports_in_message(message: &str) -> HashSet<u16> {
             end += 1;
         }
         if end > start
-            && let Some(port) = message.get(start..end).and_then(|raw| raw.parse::<u16>().ok())
+            && let Some(port) = message
+                .get(start..end)
+                .and_then(|raw| raw.parse::<u16>().ok())
             && port != 0
         {
             ports.insert(port);
@@ -723,60 +725,84 @@ mod tests {
             },
         ];
 
+        // Cases that need a port to be *available* have to release it first,
+        // and the kernel can hand it to an unrelated process in that window.
+        // The steal then presents as the wrong `Expected` variant, which is
+        // indistinguishable from a real regression at the assert — so detect
+        // it explicitly and retry the case with fresh ports. A genuine
+        // regression reproduces on every attempt and still fails.
+        const ATTEMPTS: usize = 10;
+
         for case in cases {
-            let configured_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let configured_port = configured_listener.local_addr().unwrap().port();
-            let configured_listener = if case.occupy_configured {
-                Some(configured_listener)
-            } else {
+            for attempt in 1..=ATTEMPTS {
+                let configured_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let configured_port = configured_listener.local_addr().unwrap().port();
+                let configured_listener = if case.occupy_configured {
+                    Some(configured_listener)
+                } else {
+                    drop(configured_listener);
+                    None
+                };
+
+                let prior_listener = case.reuse_prior.then(|| {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    (listener, port)
+                });
+                let prior_port = prior_listener.as_ref().map(|(_, port)| *port).unwrap_or(0);
+                if let Some((listener, _)) = prior_listener {
+                    drop(listener);
+                }
+
+                let mapping = format!("127.0.0.1:{configured_port}:80");
+                let prior = if case.reuse_prior {
+                    vec![DockerPortBinding {
+                        configured: mapping.clone(),
+                        configured_host_port: configured_port,
+                        host_ip: "127.0.0.1".parse().unwrap(),
+                        host_port: prior_port,
+                        container_port: 80,
+                        protocol: "tcp".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                let prepared = prepare_port_mappings(
+                    std::slice::from_ref(&mapping),
+                    case.fallback_ports,
+                    &prior,
+                )
+                .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+                let host_port = prepared
+                    .bindings()
+                    .get("80/tcp")
+                    .and_then(Option::as_ref)
+                    .and_then(|bindings| bindings.first())
+                    .and_then(|binding| binding.host_port.as_deref())
+                    .unwrap();
+
+                let expected_host_port = match case.expected {
+                    Expected::Configured => configured_port.to_string(),
+                    Expected::Dynamic => String::new(),
+                    Expected::Prior => prior_port.to_string(),
+                };
+                let matched = host_port == expected_host_port;
+
+                // Probe only the ports this case *relied* on being free — an
+                // occupied configured port is held by us, not a thief.
+                let relied_on_port_taken = (!case.occupy_configured
+                    && TcpListener::bind(("127.0.0.1", configured_port)).is_err())
+                    || (case.reuse_prior && TcpListener::bind(("127.0.0.1", prior_port)).is_err());
+
+                let retry = !matched && attempt < ATTEMPTS && relied_on_port_taken;
                 drop(configured_listener);
-                None
-            };
-
-            let prior_listener = case.reuse_prior.then(|| {
-                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                let port = listener.local_addr().unwrap().port();
-                (listener, port)
-            });
-            let prior_port = prior_listener.as_ref().map(|(_, port)| *port).unwrap_or(0);
-            if let Some((listener, _)) = prior_listener {
-                drop(listener);
-            }
-
-            let mapping = format!("127.0.0.1:{configured_port}:80");
-            let prior = if case.reuse_prior {
-                vec![DockerPortBinding {
-                    configured: mapping.clone(),
-                    configured_host_port: configured_port,
-                    host_ip: "127.0.0.1".parse().unwrap(),
-                    host_port: prior_port,
-                    container_port: 80,
-                    protocol: "tcp".to_string(),
-                }]
-            } else {
-                Vec::new()
-            };
-            let prepared =
-                prepare_port_mappings(std::slice::from_ref(&mapping), case.fallback_ports, &prior)
-                    .unwrap_or_else(|e| panic!("{}: {e}", case.name));
-            let host_port = prepared
-                .bindings()
-                .get("80/tcp")
-                .and_then(Option::as_ref)
-                .and_then(|bindings| bindings.first())
-                .and_then(|binding| binding.host_port.as_deref())
-                .unwrap();
-
-            match case.expected {
-                Expected::Configured => {
-                    assert_eq!(host_port, configured_port.to_string(), "{}", case.name);
+                if retry {
+                    continue;
                 }
-                Expected::Dynamic => assert_eq!(host_port, "", "{}", case.name),
-                Expected::Prior => {
-                    assert_eq!(host_port, prior_port.to_string(), "{}", case.name);
-                }
+
+                assert_eq!(host_port, expected_host_port, "{}", case.name);
+                break;
             }
-            drop(configured_listener);
         }
     }
 
@@ -893,7 +919,10 @@ mod tests {
     #[test]
     fn test_force_dynamic_conflicts_is_targeted() {
         let mut prepared = prepare_port_mappings(
-            &["127.0.0.1:5432:5432".to_string(), "127.0.0.1:6060:80".to_string()],
+            &[
+                "127.0.0.1:5432:5432".to_string(),
+                "127.0.0.1:6060:80".to_string(),
+            ],
             false,
             &[],
         )

@@ -748,6 +748,21 @@ async fn wait_for_any_substr(
     }
 }
 
+/// A python one-liner that opens `port`, blocks until something connects, and
+/// then returns — for services that must reach `ready` and *then* exit.
+///
+/// `accept()` rather than a sleep on purpose. The service's whole job here is
+/// to stay alive across exactly one event: don's TCP ready check connecting.
+/// A fixed sleep guesses how long that takes, and a guess that's too short on a
+/// loaded machine makes the service exit before don ever observes it ready —
+/// which surfaces as "timeout waiting for ready (tcp)" and looks like a runner
+/// bug rather than a test that ran out of patience.
+fn listen_until_ready_check(port: u16) -> String {
+    format!(
+        "\nimport socket\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ns.accept()\n"
+    )
+}
+
 // --- Crash detection + on_failure policy ---
 
 #[test]
@@ -758,16 +773,17 @@ fn integration_clean_exit_status_zero_marks_stopped_not_failed() {
         let dir = TempDir::new("clean-exit");
         let port = free_port();
 
-        // Service that opens its ready port, sleeps long enough for the
-        // ready check to pass, then exits 0 — i.e. simulates a long-
-        // running service that decides to terminate cleanly.
+        // Service that opens its ready port, waits for the ready check to
+        // actually connect, then exits 0 — i.e. simulates a long-running
+        // service that decides to terminate cleanly.
         let script = dir.path().join("script.sh");
         std::fs::write(
             &script,
             format!(
                 "#!/bin/sh\n\
-                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(1.5)\n\" \n\
-                 exit 0\n"
+                 python3 -c \"{listen_until_ready_check}\" \n\
+                 exit 0\n",
+                listen_until_ready_check = listen_until_ready_check(port)
             ),
         )
         .unwrap();
@@ -838,9 +854,10 @@ fn integration_crash_triggers_auto_restart_when_on_failure_restart() {
                  N=$(cat {ctr})\n\
                  N=$((N + 1))\n\
                  echo $N > {ctr}\n\
-                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(0.8)\n\" \n\
+                 python3 -c \"{listen_until_ready_check}\" \n\
                  exit 7\n",
-                ctr = counter.display()
+                ctr = counter.display(),
+                listen_until_ready_check = listen_until_ready_check(port)
             ),
         )
         .unwrap();
@@ -912,7 +929,7 @@ fn integration_crash_after_ready_marks_failed_with_exit_code() {
 
         // A service that:
         //   1. opens the ready-check port,
-        //   2. sleeps briefly so the ready check passes and we observe Ready,
+        //   2. stays up until the ready check connects, so we observe Ready,
         //   3. exits with status 42.
         // Using `sh -c` keeps the script self-contained and exit-code-honest
         // (no signal complications).
@@ -922,8 +939,9 @@ fn integration_crash_after_ready_marks_failed_with_exit_code() {
             &crash_script,
             format!(
                 "#!/bin/sh\n\
-                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(1.5)\n\" \n\
-                 exit 42\n"
+                 python3 -c \"{listen_until_ready_check}\" \n\
+                 exit 42\n",
+                listen_until_ready_check = listen_until_ready_check(port)
             ),
         )
         .unwrap();
@@ -1297,7 +1315,8 @@ on_failure = "restart"
             .parse()
             .unwrap();
         assert_eq!(
-            launches, 2,
+            launches,
+            2,
             "initial start plus one retry should produce exactly two fast crashes \
              before giving up. output: {}",
             read_buf(&buf)

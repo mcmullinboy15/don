@@ -232,8 +232,12 @@ fn docker_service_builds_from_dockerfile_without_image() {
     skip_unless_docker!();
 
     run_with_timeout(Duration::from_secs(60), async {
-        let dir = TempDir::new("docker-build");
-        let container_name = "don-test-build";
+        // Temp dir and container name must be unique per test: TempDir paths are
+        // only namespaced by PID, and docker container names are global. Sharing
+        // either with `docker_build_and_run` means one test can delete the
+        // other's state.
+        let dir = TempDir::new("docker-build-no-image");
+        let container_name = "don-test-build-no-image";
 
         cleanup_container(container_name).await;
         // Remove any image left over from a previous run so we prove the build ran.
