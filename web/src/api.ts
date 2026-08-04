@@ -1,10 +1,9 @@
 /**
  * Thin wrapper over the don web API.
  *
- * Auth rides on a cookie the server set when the tokenized URL was first
- * opened, so nothing here handles credentials — a 401 means the tab was
- * opened without going through `don ui`, and the right response is to say so
- * rather than to retry.
+ * There are no credentials to carry: the server binds loopback and serves
+ * whatever reaches it, on the grounds that reaching it already means running
+ * on the same machine.
  */
 
 import type { Item, PortManifest, Project } from "./types";

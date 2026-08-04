@@ -5,16 +5,16 @@
 //! it is running. The difference is confined to which [`ProjectDirectory`]
 //! the router is built with — no handler knows or cares which mode it's in.
 //!
-//! The server binds loopback only and requires a token; see [`auth`] for why
-//! that's stricter than the unix-socket APIs elsewhere in don.
-
-pub mod auth;
+//! The server binds loopback only and does not authenticate: anything that
+//! can reach the port is already running on this machine, and so can already
+//! do everything don can. See [`origin`] for the one cross-origin case that
+//! *is* checked, and why it's different.
 
 mod api;
 mod assets;
 mod directory;
+mod origin;
 
-pub use auth::{Token, TokenError};
 pub(crate) use directory::ProjectDirectory;
 
 use axum::Router;
@@ -40,8 +40,6 @@ pub enum WebError {
     },
     #[error("web ui server error: {0}")]
     Serve(#[source] std::io::Error),
-    #[error(transparent)]
-    Token(#[from] TokenError),
 }
 
 /// The default address: loopback on [`DEFAULT_PORT`].
@@ -66,11 +64,10 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), WebErro
 pub(crate) async fn serve(
     listener: TcpListener,
     directory: ProjectDirectory,
-    token: Token,
     port: u16,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), WebError> {
-    let router = build_router(directory, token, port);
+    let router = build_router(directory, port);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             while shutdown.changed().await.is_ok() {
@@ -91,31 +88,29 @@ pub(crate) async fn serve(
 pub async fn serve_single(
     listener: TcpListener,
     project: crate::daemon::ProjectEntry,
-    token: Token,
     port: u16,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), WebError> {
     serve(
         listener,
         ProjectDirectory::Single(Box::new(project)),
-        token,
         port,
         shutdown,
     )
     .await
 }
 
-/// Assemble the router: `/api` behind the auth guard, everything else served
-/// from the embedded bundle behind the same guard.
-fn build_router(directory: ProjectDirectory, token: Token, port: u16) -> Router {
-    let auth_state = Arc::new(auth::AuthState { token, port });
+/// Assemble the router: `/api` plus the embedded bundle, both behind the
+/// origin guard.
+fn build_router(directory: ProjectDirectory, port: u16) -> Router {
+    let origin_state = Arc::new(origin::OriginState { port });
     let api_state = Arc::new(api::ApiState { directory });
 
     Router::new()
         .nest("/api", api::build_router(api_state))
         .fallback(get(assets::serve))
         .layer(axum::middleware::from_fn_with_state(
-            auth_state,
-            auth::guard,
+            origin_state,
+            origin::guard,
         ))
 }

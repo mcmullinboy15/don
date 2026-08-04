@@ -2,8 +2,9 @@
 //!
 //! Everything don writes for a *project* lives under that project's `.don/`.
 //! The daemon is the one documented exception: it is system-wide by
-//! definition, so it has nowhere project-local to put its socket, registry,
-//! and auth token. Those live under a single directory resolved here.
+//! definition, so it has nowhere project-local to put its socket and its
+//! registry of running projects. Those live under a single directory
+//! resolved here.
 //!
 //! Resolution order (first match wins):
 //!
@@ -142,11 +143,6 @@ impl DaemonPaths {
     /// up stacks that were already running.
     pub fn registry(&self) -> PathBuf {
         self.root.join("registry.json")
-    }
-
-    /// Shared secret required by the web UI's HTTP API.
-    pub fn token(&self) -> PathBuf {
-        self.root.join("token")
     }
 
     /// Directory for daemon logs.
@@ -305,7 +301,6 @@ mod tests {
         assert_eq!(paths.socket(), PathBuf::from("/state/don/daemon.sock"));
         assert_eq!(paths.pid_file(), PathBuf::from("/state/don/daemon.pid"));
         assert_eq!(paths.registry(), PathBuf::from("/state/don/registry.json"));
-        assert_eq!(paths.token(), PathBuf::from("/state/don/token"));
         assert_eq!(paths.log_dir(), PathBuf::from("/state/don/logs"));
         assert_eq!(paths.log_file(), PathBuf::from("/state/don/logs/daemon.log"));
     }

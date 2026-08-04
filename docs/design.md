@@ -549,7 +549,6 @@ Support/don` on macOS):
 | `daemon.sock` | Unix socket for the daemon's control API (register/deregister/list) |
 | `daemon.pid` | Flock'd single-instance guard |
 | `registry.json` | Cached list of running projects, so a daemon restart doesn't lose sight of them |
-| `token` | Shared secret required by the web UI (0600) |
 | `logs/daemon.log` | Daemon output when run under systemd/launchd |
 
 Nothing here belongs to a project, and the daemon never writes into one.
@@ -592,19 +591,28 @@ knows which mode it is in, and every handler forwards through
 `crate::client::Client` to the project API — the UI holds no orchestration logic
 of its own and so cannot drift from the CLI.
 
-### Why the web UI authenticates and the other APIs don't
+### Web UI access
 
-Every other don API is a unix socket chmod'd to 0600: only the owning user can
-open it, which is authentication enough. Browsers speak TCP, and a loopback port
-is reachable by every process on the machine — including scripts running in a
-tab on a page the user didn't write. Since this API can stop services, three
-things close that gap:
+The web UI binds loopback and does not authenticate. Every other don API is a
+unix socket chmod'd to 0600, where the filesystem does the work; a TCP port has
+no equivalent, so in principle any local process can drive the UI's API. That is
+an accepted trade: anything able to run a process on this machine can already do
+everything don can, so a shared secret would add ceremony without adding a
+guarantee.
 
-1. Bind loopback only.
-2. Reject requests whose `Host` isn't localhost, which is what a DNS-rebinding
-   request carries.
-3. Require a token from a 0600 file. `don ui` reads it and opens an authorized
-   link; the first request exchanges it for an `HttpOnly` cookie.
+One case is *not* covered by that reasoning, because the attacker has no access
+to the machine at all — a web page the user merely visits. Same-origin policy
+stops such a page reading a response from 127.0.0.1, but DNS rebinding defeats
+it: point `evil.example.com` at 127.0.0.1 and the page becomes same-origin with
+don, free to read project paths, logs, and config. A rebound request carries the
+attacker's hostname, so `src/web/origin.rs` rejects any `Host` that isn't the
+address the server bound.
+
+That guard protects confidentiality, not integrity. A blind cross-origin `POST`
+that ignores the response carries the correct `Host` and still goes through, so
+a visited page can trigger an action here without seeing its result. Closing
+that would take a custom-header requirement (which forces a CORS preflight the
+server fails) — deliberately not done, on the same "it's your machine" grounds.
 
 ## Environment Variables
 

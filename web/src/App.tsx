@@ -28,13 +28,7 @@ export function App() {
         setProjects(next);
         setError(null);
       })
-      .catch((e: ApiError) => {
-        setError(
-          e.status === 401
-            ? "This tab isn't authorized. Run `don ui` to open an authorized link."
-            : e.message,
-        );
-      })
+      .catch((e: ApiError) => setError(e.message))
       .finally(() => setLoading(false));
   }, []);
 

@@ -29,36 +29,29 @@ npm ci
 don daemon &
 cd ~/some-project && don start -d
 
-# 2. Authorize the browser — note the localhost spelling, it matters (below).
-don ui --print                       # grab the token from the printed URL
-#    open http://localhost:3666/?token=<TOKEN> once in your browser
-
-# 3. Hot reload.
+# 2. Hot reload.
 npm run dev                          # http://localhost:5173
 
 # Pointing at --with-ui, or a daemon on a non-default port:
 DON_UI_TARGET=http://127.0.0.1:3667 npm run dev
 ```
 
-**Open the token URL as `localhost`, not `127.0.0.1`.** Auth is a cookie, and
-cookies are scoped by host but *not* by port — so a cookie set on `localhost`
-is sent to `localhost:5173`, while one set on `127.0.0.1` is not. `don ui`
-prints the `127.0.0.1` form (that's the address don bound), so for the dev
-server you have to retype it as `localhost`. Symptom if you get this wrong:
-the app loads but says "This tab isn't authorized".
+There's nothing to authenticate — the UI serves anything that can reach the
+port, on the grounds that reaching it already means running on this machine.
 
-The proxy sets `changeOrigin: true` because don rejects requests whose `Host`
-isn't the address it bound (the DNS-rebinding guard in `src/web/auth.rs`).
-Without it every API call through the dev server returns 421.
+The proxy does need `changeOrigin: true`, because don rejects requests whose
+`Host` isn't the address it bound (the DNS-rebinding guard in
+`src/web/origin.rs`). Without it every API call through the dev server comes
+back 421.
 
 ## Skipping the dev server
 
 In debug builds `rust-embed` reads `web/dist` from disk, so you can also just
-rebuild the bundle and reload — no Rust rebuild, no proxy, no cookie
-complications, but no hot reload either:
+rebuild the bundle and reload — no Rust rebuild and no proxy, but no hot
+reload either:
 
 ```sh
-npm run build && open "$(don ui --print)"
+npm run build && don ui
 ```
 
 ## Before committing

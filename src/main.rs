@@ -910,11 +910,10 @@ async fn run_daemon_status(paths: don::daemon::DaemonPaths, json: bool) -> i32 {
     0
 }
 
-/// `don ui` — open the daemon's web UI in a browser, carrying the token.
+/// `don ui` — open the daemon's web UI in a browser.
 ///
-/// The token lives in a 0600 file, so this is the only convenient way to get
-/// an authorized session: reading it and putting it in the URL is exactly
-/// what the user would otherwise do by hand.
+/// Asks the daemon where it bound rather than assuming the default port, so
+/// this works against a daemon started with `--port` or with port 0.
 async fn run_ui(print_only: bool) -> i32 {
     let paths = match don::daemon::DaemonPaths::from_process_env() {
         Ok(paths) => paths,
@@ -949,14 +948,7 @@ async fn run_ui(print_only: bool) -> i32 {
         return 1;
     };
 
-    let token = match don::web::Token::load_or_create(&paths.token()) {
-        Ok(token) => token,
-        Err(e) => {
-            errln(format!("Error: {e}"));
-            return 1;
-        }
-    };
-    let url = format!("http://{addr}/?token={}", token.as_str());
+    let url = format!("http://{addr}/");
 
     if print_only {
         println!("{url}");
@@ -2420,15 +2412,6 @@ async fn start_with_ui(
         profile.map(str::to_string),
     );
 
-    // Share the machine-wide token so a single `don ui` link works whether
-    // the UI is served by the daemon or by a project.
-    let token = match don::daemon::DaemonPaths::from_process_env() {
-        Ok(paths) => don::web::Token::load_or_create(&paths.token())
-            .map_err(|e| format!("Error: {e}"))?,
-        // No usable state directory — fall back to a token for this run only.
-        Err(_) => don::web::Token::generate().map_err(|e| format!("Error: {e}"))?,
-    };
-
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let (listener, addr) = don::web::bind(addr).await.map_err(|e| {
         format!(
@@ -2441,12 +2424,11 @@ async fn start_with_ui(
     tokio::spawn(don::web::serve_single(
         listener,
         entry,
-        token.clone(),
         addr.port(),
         shutdown_rx,
     ));
 
-    println!("don web ui: http://{addr}/?token={}", token.as_str());
+    println!("don web ui: http://{addr}/");
     Ok(WithUiGuard {
         _shutdown_tx: shutdown_tx,
     })

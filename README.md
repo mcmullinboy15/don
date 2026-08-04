@@ -713,11 +713,12 @@ don start --with-ui=8100
 don start --no-daemon        # no UI, and don't register with the daemon either
 ```
 
-The web UI binds loopback only and requires a token stored 0600 next to the
-daemon's socket — a TCP port, unlike a unix socket, is reachable by every
-process on the machine, and this API can stop services. `don ui` reads the
-token and opens an authorized link; requests naming any host other than
-localhost are refused, so a hostile page can't drive it through your browser.
+The web UI binds loopback only and doesn't authenticate: anything that can
+reach the port is already running on your machine, and so can already do
+anything don can. It does refuse requests whose `Host` isn't its own address,
+which is what a DNS-rebound request from a page you merely visited looks like
+— that blocks such a page from *reading* your logs and project paths, though
+not from firing a blind request it can't see the result of.
 
 ### Daemon API
 

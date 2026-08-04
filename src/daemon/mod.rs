@@ -53,15 +53,12 @@ pub enum DaemonError {
     /// Binding or starting the web UI failed.
     #[error(transparent)]
     Web(#[from] crate::web::WebError),
-    /// Reading or creating the web UI token failed.
-    #[error(transparent)]
-    Token(#[from] crate::web::TokenError),
 }
 
 /// How the daemon should run.
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
-    /// Where the daemon keeps its socket, registry, and token.
+    /// Where the daemon keeps its socket and project registry.
     pub paths: DaemonPaths,
     /// Address to serve the web UI on. `None` runs the control plane only,
     /// which is useful for tests and for diagnosing registration on its own.
@@ -108,18 +105,20 @@ pub async fn run(options: DaemonOptions, report: Reporter) -> Result<(), DaemonE
         }
     }
 
-    let socket_path = options.paths.socket();
-    let listener = crate::server::bind_api(&socket_path)?;
-
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Bind the web UI before announcing anything, so a port conflict fails
-    // the daemon outright instead of leaving it half-up with no UI.
+    // Bind the web UI first. It's the failure most likely to happen (a port
+    // someone else already holds), and binding it before the control socket
+    // means a conflict can't leave a socket file behind — nothing has been
+    // created yet to clean up.
     let web = match options.web_addr {
-        Some(addr) => Some(start_web(addr, &options.paths, cmd_tx.clone(), &shutdown_rx).await?),
+        Some(addr) => Some(start_web(addr, cmd_tx.clone(), &shutdown_rx).await?),
         None => None,
     };
+
+    let socket_path = options.paths.socket();
+    let listener = crate::server::bind_api(&socket_path)?;
 
     let control = Arc::new(ControlState {
         cmd_tx: cmd_tx.clone(),
@@ -139,10 +138,7 @@ pub async fn run(options: DaemonOptions, report: Reporter) -> Result<(), DaemonE
         socket_path.display()
     ));
     match &web {
-        Some(web) => {
-            report(&format!("web ui on http://{}", web.addr));
-            report(&format!("open it with: {}", web.url()));
-        }
+        Some(web) => report(&format!("web ui on http://{}", web.addr)),
         None => report("web ui disabled"),
     }
 
@@ -167,39 +163,24 @@ pub async fn run(options: DaemonOptions, report: Reporter) -> Result<(), DaemonE
 /// A running web UI server.
 struct WebServer {
     addr: SocketAddr,
-    token: crate::web::Token,
     handle: tokio::task::JoinHandle<()>,
-}
-
-impl WebServer {
-    /// A URL that will authorize whatever browser opens it.
-    fn url(&self) -> String {
-        format!("http://{}/?token={}", self.addr, self.token.as_str())
-    }
 }
 
 /// Bind and start serving the web UI over the daemon's registry.
 async fn start_web(
     addr: SocketAddr,
-    paths: &DaemonPaths,
     cmd_tx: mpsc::UnboundedSender<DaemonCommand>,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<WebServer, DaemonError> {
-    let token = crate::web::Token::load_or_create(&paths.token())?;
     let (listener, addr) = crate::web::bind(addr).await?;
     let directory = crate::web::ProjectDirectory::Daemon { cmd_tx };
     let handle = tokio::spawn({
-        let token = token.clone();
         let shutdown_rx = shutdown_rx.clone();
         async move {
-            let _ = crate::web::serve(listener, directory, token, addr.port(), shutdown_rx).await;
+            let _ = crate::web::serve(listener, directory, addr.port(), shutdown_rx).await;
         }
     });
-    Ok(WebServer {
-        addr,
-        token,
-        handle,
-    })
+    Ok(WebServer { addr, handle })
 }
 
 /// Own the registry and serve commands until shutdown.

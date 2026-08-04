@@ -2,14 +2,13 @@
 //! End-to-end tests for the web UI server.
 //!
 //! These drive the real router over a real loopback socket, because the two
-//! things most worth testing here — the auth guard and the proxying to a
+//! things most worth testing here — the origin guard and the proxying to a
 //! project's unix socket — only exist at that boundary.
 
 mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::daemon::ProjectEntry;
-use don::web::Token;
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -24,7 +23,6 @@ const PLATFORM: Platform = Platform::LinuxX86_64;
 /// A web UI serving one project, plus the runner behind it.
 struct Harness {
     port: u16,
-    token: Token,
     project_id: String,
     runner_shutdown: mpsc::Sender<()>,
     runner: tokio::task::JoinHandle<()>,
@@ -79,20 +77,17 @@ impl Harness {
         let entry = ProjectEntry::new(root, std::process::id(), None);
         let project_id = entry.id.clone();
 
-        let token = Token::generate().unwrap();
         let (listener, addr) = don::web::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
         let (web_shutdown, web_shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(don::web::serve_single(
             listener,
             entry,
-            token.clone(),
             addr.port(),
             web_shutdown_rx,
         ));
 
         Self {
             port: addr.port(),
-            token,
             project_id,
             runner_shutdown,
             runner: runner_handle,
@@ -105,32 +100,22 @@ impl Harness {
         let _ = tokio::time::timeout(Duration::from_secs(10), self.runner).await;
     }
 
-    /// Issue a request with a valid token.
+    /// Issue a request that the origin guard should accept.
     async fn get(&self, path: &str) -> (u16, String) {
-        self.request("GET", path, Some(self.token.as_str()), "localhost")
-            .await
+        self.request("GET", path, "localhost").await
     }
 
-    async fn request(
-        &self,
-        method: &str,
-        path: &str,
-        token: Option<&str>,
-        host: &str,
-    ) -> (u16, String) {
+    async fn request(&self, method: &str, path: &str, host: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
         let host_header = if host.contains(':') || host.is_empty() {
             host.to_string()
         } else {
             format!("{host}:{}", self.port)
         };
-        let auth = token
-            .map(|t| format!("Authorization: Bearer {t}\r\n"))
-            .unwrap_or_default();
         let request = format!(
             "{method} {path} HTTP/1.1\r\n\
              Host: {host_header}\r\n\
-             {auth}Content-Length: 0\r\n\
+             Content-Length: 0\r\n\
              Connection: close\r\n\r\n"
         );
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -177,7 +162,6 @@ fn integration_web_api_proxies_to_the_project() {
             .request(
                 "POST",
                 &format!("/api/projects/{}/stop/keeper", harness.project_id),
-                Some(harness.token.as_str()),
                 "localhost",
             )
             .await;
@@ -203,67 +187,51 @@ fn integration_web_api_proxies_to_the_project() {
 }
 
 #[test]
-fn integration_web_api_rejects_unauthorized_and_rebound_requests() {
+fn integration_web_api_rejects_rebound_requests() {
     run_with_timeout(Duration::from_secs(30), async {
-        let dir = TempDir::new("web-auth");
+        let dir = TempDir::new("web-origin");
         let harness = Harness::start(&dir.child("proj")).await;
 
+        // The UI doesn't authenticate — anything that can reach the port is
+        // already on this machine. What it does refuse is a request that
+        // isn't addressed to it, which is what a DNS-rebound request from a
+        // page the user merely visited looks like.
         struct Case {
             name: &'static str,
-            token: Option<String>,
             host: &'static str,
             expect: u16,
         }
 
         let cases = vec![
             Case {
-                name: "valid token from localhost",
-                token: Some(harness.token.as_str().to_string()),
+                name: "localhost is served",
                 host: "localhost",
                 expect: 200,
             },
             Case {
-                name: "valid token from 127.0.0.1",
-                token: Some(harness.token.as_str().to_string()),
+                name: "127.0.0.1 is served",
                 host: "127.0.0.1",
                 expect: 200,
             },
             Case {
-                name: "no token",
-                token: None,
-                host: "localhost",
-                expect: 401,
-            },
-            Case {
-                name: "wrong token",
-                token: Some("0".repeat(64)),
-                host: "localhost",
-                expect: 401,
-            },
-            Case {
-                name: "dns rebinding is refused before the token is even checked",
-                token: Some(harness.token.as_str().to_string()),
+                name: "a rebound hostname is refused",
                 host: "evil.example.com",
                 expect: 421,
             },
             Case {
-                name: "a rebound host without a token is still refused",
-                token: None,
-                host: "attacker.test",
+                name: "a hostname that resolves to loopback is still refused",
+                host: "localtest.me",
                 expect: 421,
             },
             Case {
                 name: "missing host header",
-                token: Some(harness.token.as_str().to_string()),
                 host: "",
                 expect: 421,
             },
         ];
 
         for case in cases {
-            let (status, _) = harness
-                .request("GET", "/api/projects", case.token.as_deref(), case.host)
-                .await;
+            let (status, _) = harness.request("GET", "/api/projects", case.host).await;
             assert_eq!(status, case.expect, "case: {}", case.name);
         }
 
