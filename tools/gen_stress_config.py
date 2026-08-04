@@ -38,7 +38,7 @@ consumers = [
     ("notice-relay", "fake-mongo", False),
 ]
 NUM_APPS = 40
-START_PORT = 18000
+START_PORT = int(os.environ.get("DON_STRESS_PORT", 18000))
 
 def write_script(path, body):
     with open(path, 'w') as f:

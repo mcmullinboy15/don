@@ -646,9 +646,10 @@ Edit `don.toml` while don is running. Don detects the change, diffs it, and appl
 
 ```sh
 don init                     # scaffold a starter don.toml
-don start                    # start the daemon (bare `don` prints help)
+don start                    # start this project's stack (bare `don` prints help)
 don start --profile <name>   # start a subset
 don start <name>             # start a stopped service in the running daemon
+don stop                     # stop this project's stack
 don stop <name>              # stop a running service
 don restart <name>           # restart a service
 don status                   # show all services and their states
@@ -668,10 +669,55 @@ don validate                 # check config without starting
 don cleanup                  # remove stale state from a crashed run
 don cleanup --force          # kill a running daemon and clean up
 don completions <shell>      # print a completion script for bash/zsh/fish/...
+
+don ui                       # open the web UI in your browser
+don daemon                   # run the system-wide daemon in the foreground
+don daemon install           # install it as a user service (systemd/launchd)
+don daemon status            # what's running, and which projects it can see
+don daemon stop              # stop it (your projects keep running)
+don daemon uninstall         # remove the user service
 ```
 
 Completions are dynamic: service, task, and profile names from your `don.toml` tab-complete on subcommands that take them (`stop`, `restart`, `run`, `logs`, `attach`). Install with e.g. `don completions bash > ~/.local/share/bash-completion/completions/don` or `don completions zsh > "${fpath[1]}/_don"`.
 
+
+### Web UI
+
+Don can serve a browser UI over every project you have running — service and
+task states that update live, streaming logs with their colors intact, and the
+same start/stop/restart/run controls the CLI has.
+
+```sh
+don daemon install     # once: run the daemon as a user service
+don ui                 # open the UI
+```
+
+The daemon is a **broker, not an owner**. `don start` behaves exactly as it
+always has — same terminal, same TUI, same process group — and additionally
+tells the daemon where to find its socket. So:
+
+- Stopping the daemon doesn't touch a single running service; you just lose the
+  dashboard.
+- A project whose daemon isn't running starts exactly as fast. Registration is
+  best-effort and never blocks startup or Ctrl+C.
+- Nothing is written into your project. Daemon state lives in
+  `$XDG_STATE_HOME/don` (`~/Library/Application Support/don` on macOS), which is
+  the only thing don ever writes outside a project's `.don/`.
+
+Don't want a system-wide daemon? Serve a UI for one project from the process
+that's already running it:
+
+```sh
+don start --with-ui          # port 3667; the daemon owns 3666
+don start --with-ui=8100
+don start --no-daemon        # no UI, and don't register with the daemon either
+```
+
+The web UI binds loopback only and requires a token stored 0600 next to the
+daemon's socket — a TCP port, unlike a unix socket, is reachable by every
+process on the machine, and this API can stop services. `don ui` reads the
+token and opens an authorized link; requests naming any host other than
+localhost are refused, so a hostile page can't drive it through your browser.
 
 ### Daemon API
 
@@ -679,7 +725,8 @@ Don exposes a unix socket API at `.don/don.sock` for programmatic control:
 
 ```
 GET  /status                 → service/task states
-GET  /status?verbose=true    → states plus actual proxy/Docker addresses
+GET  /status?verbose=true    → states plus actual proxy/Docker addresses, and task params
+GET  /events                 → streaming NDJSON of state changes
 POST /start/:name            → start a stopped service
 POST /stop/:name             → stop a service
 POST /restart/:name          → restart a service
@@ -689,6 +736,9 @@ GET  /logs/:name?last=N      → ring buffer output
 GET  /logs/:name?follow=true → streaming NDJSON
 GET  /attach/:name           → raw-stream attach (stdin/stdout)
 ```
+
+The web UI is built on exactly these endpoints — it holds no logic of its own,
+so it can't drift from what the CLI does.
 
 ### Terminal Safety
 

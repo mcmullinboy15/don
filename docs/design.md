@@ -536,6 +536,76 @@ Don stores all mutable state under `.don/` in the project directory:
 
 This directory should be added to `.gitignore`.
 
+### System-wide daemon state
+
+The `don daemon` that serves the web UI is not scoped to any project, so it is
+the one component that writes outside a `.don/` directory. Its state lives in a
+single directory resolved by `src/daemon/paths.rs` — `$DON_STATE_DIR`, else
+`$XDG_STATE_HOME/don`, else `~/.local/state/don` (`~/Library/Application
+Support/don` on macOS):
+
+| Path | Purpose |
+|------|---------|
+| `daemon.sock` | Unix socket for the daemon's control API (register/deregister/list) |
+| `daemon.pid` | Flock'd single-instance guard |
+| `registry.json` | Cached list of running projects, so a daemon restart doesn't lose sight of them |
+| `token` | Shared secret required by the web UI (0600) |
+| `logs/daemon.log` | Daemon output when run under systemd/launchd |
+
+Nothing here belongs to a project, and the daemon never writes into one.
+
+## Web UI and the Broker Daemon
+
+The daemon is a **broker**: it holds a registry of running projects and serves a
+UI over them, reverse-proxying each project's existing `.don/don.sock`. It never
+spawns or supervises a service.
+
+```
+terminal A: don start ──runner──> services      terminal B: don start ──runner──> services
+              │ .don/don.sock                                 │ .don/don.sock
+              └──── register(name, root, sock) ───┬───────────┘
+                                                  ▼
+                                         don daemon (registry)
+                                           unix sock: control
+                                           tcp 127.0.0.1:3666: web UI ──> browser
+```
+
+That choice is what keeps the rest of don unchanged. `don start` still owns its
+process group, its `.don/`, and its terminal. Consequences worth stating:
+
+- **Registration is best-effort and never awaited on the runner task.** Most
+  users won't install a daemon, so a project that can't reach one must start and
+  stop exactly as fast. Deregistration is fired at the top of the shutdown path
+  and never awaited — per the shutdown-responsiveness rules, nothing may sit
+  between the user's Ctrl+C and the stack going down.
+- **Liveness is derived, not tracked.** There are no heartbeats. Reading the
+  registry probes each project's socket and drops the ones that don't answer, so
+  a `kill -9`'d runner cleans itself up without a background timer, and a
+  deregistration that never landed costs nothing.
+- **Stopping the daemon is harmless.** Every registered project keeps running.
+
+### Two hosts, one router
+
+The web router is built against a `ProjectDirectory` that either reads the
+daemon's registry or holds a single project (`don start --with-ui`). No handler
+knows which mode it is in, and every handler forwards through
+`crate::client::Client` to the project API — the UI holds no orchestration logic
+of its own and so cannot drift from the CLI.
+
+### Why the web UI authenticates and the other APIs don't
+
+Every other don API is a unix socket chmod'd to 0600: only the owning user can
+open it, which is authentication enough. Browsers speak TCP, and a loopback port
+is reachable by every process on the machine — including scripts running in a
+tab on a page the user didn't write. Since this API can stop services, three
+things close that gap:
+
+1. Bind loopback only.
+2. Reject requests whose `Host` isn't localhost, which is what a DNS-rebinding
+   request carries.
+3. Require a token from a 0600 file. `don ui` reads it and opens an authorized
+   link; the first request exchanges it for an `HttpOnly` cookie.
+
 ## Environment Variables
 
 Environment variables are resolved in this order (later wins):
