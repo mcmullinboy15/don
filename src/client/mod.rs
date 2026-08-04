@@ -334,20 +334,7 @@ impl Client {
     }
 
     async fn connect(&self) -> Result<UnixStream, ClientError> {
-        match UnixStream::connect(&self.socket_path).await {
-            Ok(s) => Ok(s),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                Err(ClientError::NotRunning {
-                    path: self.socket_path.clone(),
-                })
-            }
-            Err(e) => Err(ClientError::Io(e)),
-        }
+        connect_unix(&self.socket_path).await
     }
 
     async fn request(
@@ -370,12 +357,46 @@ impl Client {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>), ClientError> {
-        let mut stream = self.connect().await?;
-        write_request_with_body(&mut stream, method, path, body).await?;
-        let (status, headers, leftover) = read_head(&mut stream).await?;
-        let body = drain_body(&mut stream, &headers, leftover).await?;
-        Ok((status, body))
+        unix_request(&self.socket_path, method, path, body).await
     }
+}
+
+/// Connect to a unix socket, mapping "nothing is listening" to the friendlier
+/// [`ClientError::NotRunning`] rather than a bare io error.
+pub(crate) async fn connect_unix(socket_path: &Path) -> Result<UnixStream, ClientError> {
+    match UnixStream::connect(socket_path).await {
+        Ok(s) => Ok(s),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Err(ClientError::NotRunning {
+                path: socket_path.to_path_buf(),
+            })
+        }
+        Err(e) => Err(ClientError::Io(e)),
+    }
+}
+
+/// One-shot HTTP request over a unix socket, returning `(status, body)`.
+///
+/// Shared by the project API client above and the daemon control client
+/// (`crate::daemon::client`) — both speak plain HTTP/1.1 with
+/// `Connection: close` over a `UnixStream`, so neither needs its own
+/// request/response plumbing.
+pub(crate) async fn unix_request(
+    socket_path: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>), ClientError> {
+    let mut stream = connect_unix(socket_path).await?;
+    write_request_with_body(&mut stream, method, path, body).await?;
+    let (status, headers, leftover) = read_head(&mut stream).await?;
+    let response = drain_body(&mut stream, &headers, leftover).await?;
+    Ok((status, response))
 }
 
 fn ensure_ok(status: u16, body: &[u8]) -> Result<(), ClientError> {

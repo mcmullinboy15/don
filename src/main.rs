@@ -71,6 +71,21 @@ enum Commands {
         /// still returns full output. Example: `--log-filter=web,api,db`.
         #[arg(long, value_delimiter = ',')]
         log_filter: Vec<String>,
+        /// Don't announce this project to the system-wide don daemon, so it
+        /// won't appear in the web UI. Registration is best-effort and never
+        /// affects the stack itself; this flag is for when you'd rather the
+        /// daemon not know about a project at all.
+        #[arg(long)]
+        no_daemon: bool,
+    },
+    /// Run or manage the system-wide daemon that serves the web UI
+    ///
+    /// The daemon is a broker: it tracks which don projects are running and
+    /// serves a UI over them. It never owns your services, so stopping it
+    /// leaves every running stack untouched.
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommands>,
     },
     /// Stop the daemon, or stop one running service when a name is given
     Stop {
@@ -192,6 +207,18 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum DaemonCommands {
+    /// Show whether a daemon is running and which projects it knows about
+    Status {
+        /// Emit machine-readable JSON instead of the human-readable report
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the running daemon. Registered projects keep running.
+    Stop,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -227,9 +254,17 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             detached,
             no_tui,
             log_filter,
+            no_daemon,
         } => {
             let result = if detached {
-                run_start_detached(&config_path, profile.as_deref(), verbose, log_filter).await
+                run_start_detached(
+                    &config_path,
+                    profile.as_deref(),
+                    verbose,
+                    log_filter,
+                    no_daemon,
+                )
+                .await
             } else {
                 run_start(
                     &config_path,
@@ -237,6 +272,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                     verbose,
                     no_tui,
                     log_filter,
+                    no_daemon,
                 )
                 .await
             };
@@ -263,6 +299,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             verbose,
             json,
         } => run_status(&config_path, name.as_deref(), verbose, json).await,
+        Commands::Daemon { command } => run_daemon_command(command).await,
         Commands::Ports { json } => run_ports(&config_path, json),
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
@@ -645,6 +682,139 @@ where
     let client = client_for(config_path);
     match make_call(client).await {
         Ok(()) => 0,
+        Err(e) => {
+            errln(e);
+            1
+        }
+    }
+}
+
+/// Dispatch `don daemon [status|stop]`. No subcommand runs the daemon in the
+/// foreground — that's what the systemd unit / launchd agent execs.
+async fn run_daemon_command(command: Option<DaemonCommands>) -> i32 {
+    let paths = match don::daemon::DaemonPaths::from_process_env() {
+        Ok(paths) => paths,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    match command {
+        None => run_daemon_foreground(paths).await,
+        Some(DaemonCommands::Status { json }) => run_daemon_status(paths, json).await,
+        Some(DaemonCommands::Stop) => run_daemon_stop(paths).await,
+    }
+}
+
+async fn run_daemon_foreground(paths: don::daemon::DaemonPaths) -> i32 {
+    // The daemon has no OutputManager, so its progress goes straight to
+    // stderr — which is where systemd and launchd capture it from anyway.
+    let report: don::daemon::Reporter = std::sync::Arc::new(|line: &str| {
+        errln(format!("[don daemon] {line}"));
+    });
+
+    let options = don::daemon::DaemonOptions {
+        paths,
+        web_addr: None,
+    };
+    match don::daemon::run(options, report).await {
+        Ok(()) => 0,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            1
+        }
+    }
+}
+
+async fn run_daemon_status(paths: don::daemon::DaemonPaths, json: bool) -> i32 {
+    let client = don::daemon::DaemonClient::new(paths.socket());
+    let info = match client.info().await {
+        Ok(info) => info,
+        Err(ClientError::NotRunning { .. }) => {
+            if json {
+                println!("{}", serde_json::json!({ "running": false }));
+            } else {
+                println!("don daemon is not running");
+                println!("  start it with `don daemon`, or install it as a service");
+                println!("  with `don daemon install` so it comes back on login.");
+            }
+            // Not an error — "is it running?" was answered.
+            return 0;
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    let projects = client.projects().await.unwrap_or_default();
+
+    if json {
+        let body = serde_json::json!({
+            "running": true,
+            "version": info.version,
+            "pid": info.pid,
+            "web_addr": info.web_addr,
+            "projects": projects,
+        });
+        match serde_json::to_string_pretty(&body) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                errln(format!("Error: {e}"));
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    println!("don daemon {} (pid {})", info.version, info.pid);
+    match &info.web_addr {
+        Some(addr) => println!("  web ui: http://{addr}"),
+        None => println!("  web ui: disabled"),
+    }
+    println!("  socket: {}", paths.socket().display());
+    if projects.is_empty() {
+        println!("  projects: none registered");
+    } else {
+        println!("  projects:");
+        for project in &projects {
+            let profile = project
+                .profile
+                .as_ref()
+                .map(|p| format!(" [{p}]"))
+                .unwrap_or_default();
+            println!(
+                "    {}{profile}  pid {}  {}",
+                project.name,
+                project.pid,
+                project.root.display()
+            );
+        }
+    }
+    0
+}
+
+async fn run_daemon_stop(paths: don::daemon::DaemonPaths) -> i32 {
+    let socket = paths.socket();
+    let client = don::daemon::DaemonClient::new(socket.clone());
+    match client.shutdown().await {
+        Ok(()) => {}
+        Err(ClientError::NotRunning { .. }) => {
+            println!("don daemon is not running");
+            return 0;
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    }
+
+    match wait_for_daemon_socket_gone(&socket, std::time::Duration::from_secs(10)).await {
+        Ok(()) => {
+            println!("don daemon stopped (running projects were left alone)");
+            0
+        }
         Err(e) => {
             errln(e);
             1
@@ -1456,6 +1626,7 @@ async fn run_start_detached(
     profile: Option<&str>,
     verbose: bool,
     log_filter: Vec<String>,
+    no_daemon: bool,
 ) -> Result<(), String> {
     let base = base_dir(config_path);
     let client = Client::new(&base);
@@ -1492,6 +1663,9 @@ async fn run_start_detached(
         cmd.arg("--verbose");
     }
     cmd.arg("start").arg("--no-tui");
+    if no_daemon {
+        cmd.arg("--no-daemon");
+    }
     if let Some(profile_name) = profile {
         cmd.arg("--profile").arg(profile_name);
     }
@@ -1604,6 +1778,7 @@ async fn run_start(
     verbose: bool,
     no_tui: bool,
     log_filter: Vec<String>,
+    no_daemon: bool,
 ) -> Result<(), String> {
     use std::io::IsTerminal;
 
@@ -1859,7 +2034,7 @@ async fn run_start(
             )
             .collect();
 
-        let runner = await_with_shutdown_supervision(
+        let mut runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
                 async move {
@@ -1879,6 +2054,7 @@ async fn run_start(
             "starting runner",
         )
         .await?;
+        apply_daemon_registration(&mut runner, profile_ref, no_daemon);
 
         let events = runner.subscribe();
         let commands = runner.command_sender();
@@ -1952,7 +2128,7 @@ async fn run_start(
             output_manager.set_log_filter(allow);
         }
 
-        let runner = await_with_shutdown_supervision(
+        let mut runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
                 async move {
@@ -1972,10 +2148,31 @@ async fn run_start(
             "starting runner",
         )
         .await?;
+        apply_daemon_registration(&mut runner, profile_ref, no_daemon);
 
         let runner_task =
             tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
         await_with_shutdown_supervision(runner_task, "waiting for runner shutdown").await
+    }
+}
+
+/// Point the runner at the system-wide daemon so this project shows up in the
+/// web UI.
+///
+/// A state directory that can't be resolved (no `$HOME`, an unusual sandbox)
+/// costs you the UI listing and nothing else — never the ability to start a
+/// stack. The registration itself is best-effort too; see
+/// `runner::daemon_link`.
+fn apply_daemon_registration(
+    runner: &mut don::runner::Runner,
+    profile: Option<&str>,
+    no_daemon: bool,
+) {
+    if no_daemon {
+        return;
+    }
+    if let Ok(paths) = don::daemon::DaemonPaths::from_process_env() {
+        runner.enable_daemon_registration(paths.socket(), profile.map(str::to_string));
     }
 }
 

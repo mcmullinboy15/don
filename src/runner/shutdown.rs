@@ -31,6 +31,14 @@ impl Runner {
         self.output_manager
             .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");
 
+        // Withdraw from the daemon as early as possible, detached and never
+        // awaited: the user is waiting on Ctrl+C, and a slow or absent daemon
+        // must not add a millisecond to that. Stopping services takes long
+        // enough that this normally lands well before we exit — and if it
+        // doesn't, the daemon prunes unreachable projects on its next read,
+        // so the worst case is a stale row for a few seconds.
+        self.deregister_from_daemon();
+
         // Abort the detached batch-build task and await its termination so
         // it can't keep any `LifecycleEmitter`/`SinkHandle` clones alive
         // past shutdown. The `Child` inside has `kill_on_drop(true)`, so

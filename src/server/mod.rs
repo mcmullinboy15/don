@@ -109,6 +109,21 @@ pub async fn serve_api(
     accept_loop(listener, app, shutdown).await
 }
 
+/// Serve an arbitrary router on a pre-bound unix listener until `shutdown`.
+///
+/// Same lifecycle as [`serve_api`] — including removing the socket file on
+/// exit — but for callers that build their own router. The daemon's control
+/// plane ([`crate::daemon`]) uses this.
+pub(crate) async fn serve_router(
+    listener: UnixListener,
+    socket_path: PathBuf,
+    app: axum::Router,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), ServerError> {
+    let _guard = SocketGuard(socket_path);
+    accept_loop(listener, app, shutdown).await
+}
+
 /// RAII guard that removes the socket file on drop (normal exit or panic).
 struct SocketGuard(PathBuf);
 
@@ -118,7 +133,12 @@ impl Drop for SocketGuard {
     }
 }
 
-async fn accept_loop(
+/// Serve `app` on `listener` until `shutdown` flips to true.
+///
+/// Shared by the project API and the daemon's control socket
+/// ([`crate::daemon`]) — both are axum routers over a `UnixListener`, so
+/// neither needs its own accept loop.
+pub(crate) async fn accept_loop(
     listener: UnixListener,
     app: axum::Router,
     mut shutdown: tokio::sync::watch::Receiver<bool>,

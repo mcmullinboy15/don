@@ -8,6 +8,7 @@
 mod attach;
 mod build_tools;
 mod completions;
+mod daemon_link;
 mod env_refs;
 mod events;
 mod graph;
@@ -738,6 +739,19 @@ pub enum RunnerError {
 
 pub(crate) use state::{RuntimeService, RuntimeTask};
 
+/// Where and how to announce a running project to the system-wide daemon.
+///
+/// Registration is metadata only — the daemon is told where this project's
+/// API socket is and nothing else changes about how the stack runs. See
+/// [`crate::daemon`] for why the daemon is deliberately not an owner.
+#[derive(Debug, Clone)]
+pub struct DaemonRegistration {
+    /// The daemon's control socket.
+    pub socket: PathBuf,
+    /// Active profile, for display in the UI.
+    pub profile: Option<String>,
+}
+
 /// The main runner that orchestrates services and tasks.
 pub struct Runner {
     config: Config,
@@ -757,6 +771,10 @@ pub struct Runner {
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+
+    /// Where to announce this project so it appears in the web UI. `None`
+    /// (the default) means don't talk to a daemon at all.
+    daemon_registration: Option<DaemonRegistration>,
 
     /// Docker API client. `Some` if any service uses the docker preset.
     docker_client: Option<bollard::Docker>,
@@ -924,6 +942,7 @@ impl Runner {
             lazy_start_rx,
             lazy_start_tx,
             server_shutdown_tx: None,
+            daemon_registration: None,
             docker_client,
             cmd_tx,
             cmd_rx,
@@ -1345,6 +1364,9 @@ impl Runner {
                 self.output_manager
                     .lifecycle_event(&format!("api listening on {socket_display}"));
                 self.server_shutdown_tx = Some(server_shutdown_tx);
+                // Only worth announcing once the socket the daemon would
+                // proxy to actually exists.
+                self.register_with_daemon();
             }
             Err(e) => {
                 self.output_manager
