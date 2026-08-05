@@ -12,9 +12,58 @@
 //! for as long as a service takes to stop.
 
 use super::{RunnerCommand, RunnerEvent};
-use crate::watch::{WatchOutcome, WatchSignal};
-use tokio::sync::{broadcast, mpsc};
+use crate::watch::{WatchOutcome, WatchQuery, WatchSignal, WatchSnapshot, WatchUpdate};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+/// How long to wait for a watcher to answer a status query.
+///
+/// Verbose status is interactive, so a wedged watcher must degrade to "no
+/// watch info" rather than hang the caller.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The runner's half of the link to a *running* watcher.
+///
+/// Held as an `Option` on the runner, and `Some` only once the watcher is
+/// actually running — which is the point. These two senders used to be
+/// separate `Option` fields set together before `WatchManager` was even
+/// constructed, so `is_none()` meant "startup hasn't got there yet", never
+/// "there is no watcher". A config with nothing to watch left both `Some`,
+/// pointing at receivers that had already been dropped.
+pub(in crate::runner) struct WatchHandle {
+    /// Revised watch patterns, pushed after a build-tool re-query.
+    updates: mpsc::UnboundedSender<WatchUpdate>,
+    /// Status queries for verbose output.
+    queries: mpsc::Sender<WatchQuery>,
+}
+
+impl WatchHandle {
+    pub(in crate::runner) fn new(
+        updates: mpsc::UnboundedSender<WatchUpdate>,
+        queries: mpsc::Sender<WatchQuery>,
+    ) -> Self {
+        Self { updates, queries }
+    }
+
+    /// A sender for pushing revised watch patterns.
+    pub(in crate::runner) fn updates(&self) -> mpsc::UnboundedSender<WatchUpdate> {
+        self.updates.clone()
+    }
+
+    /// Ask the watcher what it is currently watching.
+    ///
+    /// `None` if it has gone away or does not answer within
+    /// [`QUERY_TIMEOUT`] — verbose status drops the watch section rather than
+    /// blocking on it.
+    pub(in crate::runner) async fn snapshot(&self) -> Option<WatchSnapshot> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.queries.send(WatchQuery { reply }).await.ok()?;
+        tokio::time::timeout(QUERY_TIMEOUT, reply_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+}
 
 /// Wire a watcher's two channels to the runner's, and run until either side
 /// goes away.

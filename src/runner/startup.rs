@@ -146,7 +146,10 @@ impl Runner {
         let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
-        let watch_update_tx = self.watch_update_tx.clone();
+        let watch_update_tx = self
+            .watch
+            .as_ref()
+            .map(super::watch_link::WatchHandle::updates);
         let global_watch_ignore = resolve_watch_ignore_patterns(
             &self.base_dir,
             &[],
@@ -180,7 +183,10 @@ impl Runner {
         let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
-        let watch_update_tx = self.watch_update_tx.clone();
+        let watch_update_tx = self
+            .watch
+            .as_ref()
+            .map(super::watch_link::WatchHandle::updates);
         let global_watch_ignore = resolve_watch_ignore_patterns(
             &self.base_dir,
             &[],

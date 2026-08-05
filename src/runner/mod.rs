@@ -877,11 +877,13 @@ pub struct Runner {
     // Don's own PID file
     _don_pid_file: Option<PidFile>,
 
-    /// Sender for pushing watch pattern updates to the WatchManager.
-    /// Used after build tool re-queries to update tier-2 watch patterns.
-    watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
-    /// Sender for querying the live watch manager state for verbose status.
-    watch_query_tx: Option<mpsc::Sender<crate::watch::WatchQuery>>,
+    /// The link to a running file watcher: revised watch patterns out,
+    /// status queries out.
+    ///
+    /// `None` until one is running, and stays `None` when the config gives it
+    /// nothing to watch — so this answers "is there a watcher?" rather than
+    /// "has startup got that far?".
+    watch: Option<watch_link::WatchHandle>,
 
     /// One start supervisor per service, plus the registry addressing them.
     ///
@@ -1038,8 +1040,7 @@ impl Runner {
             done_tx: None,
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
-            watch_update_tx: None,
-            watch_query_tx: None,
+            watch: None,
             batch_build_handle: None,
             lazy_build_handles: HashMap::new(),
             update_check_handle: None,
@@ -1474,9 +1475,7 @@ impl Runner {
         // changes that happen during startup (slow ready checks, long builds, etc.).
         let mut watch_handle: Option<tokio::task::JoinHandle<()>> = None;
         let (watch_update_tx, watch_update_rx) = mpsc::unbounded_channel();
-        self.watch_update_tx = Some(watch_update_tx);
         let (watch_query_tx, watch_query_rx) = mpsc::channel(8);
-        self.watch_query_tx = Some(watch_query_tx);
         // `WatchManager::new` calls `notify::Watcher::watch`, which is
         // synchronous and walks directory trees under the hood — offload
         // to a blocking thread so the runner's main task stays polled.
@@ -1534,7 +1533,14 @@ impl Runner {
                 for warning in &warnings {
                     self.output_manager.error_event(warning);
                 }
+                // Only publish the handle once there is a watcher to
+                // reach. With nothing to watch the manager is dropped here,
+                // and a `Some` handle would address dead receivers.
                 if watch_mgr.has_watches() {
+                    self.watch = Some(watch_link::WatchHandle::new(
+                        watch_update_tx,
+                        watch_query_tx,
+                    ));
                     watch_handle = Some(tokio::spawn(async move {
                         watch_mgr.run().await;
                     }));

@@ -242,7 +242,10 @@ impl Runner {
         &mut self,
         outcomes: Vec<GraphRequeryOutcomeItem>,
     ) {
-        let watch_update_tx = self.watch_update_tx.clone();
+        let watch_update_tx = self
+            .watch
+            .as_ref()
+            .map(super::watch_link::WatchHandle::updates);
         let mut services_to_rebuild: Vec<String> = Vec::new();
         let mut tasks_to_rerun: Vec<String> = Vec::new();
         let global_watch_ignore = resolve_watch_ignore_patterns(
@@ -371,7 +374,7 @@ impl Runner {
         if names.is_empty() {
             return;
         }
-        if self.watch_update_tx.is_none() {
+        if self.watch.is_none() {
             return;
         }
         if self.builds.requery_in_flight() {

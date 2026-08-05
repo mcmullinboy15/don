@@ -1,24 +1,11 @@
 use super::service::ServiceHandle;
 use super::{ItemStatus, Runner, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
-use tokio::sync::oneshot;
 
 impl Runner {
     pub(in crate::runner) async fn fetch_watch_snapshot(
         &self,
     ) -> Option<crate::watch::WatchSnapshot> {
-        let tx = self.watch_query_tx.as_ref()?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if tx
-            .send(crate::watch::WatchQuery { reply: reply_tx })
-            .await
-            .is_err()
-        {
-            return None;
-        }
-        tokio::time::timeout(std::time::Duration::from_millis(250), reply_rx)
-            .await
-            .ok()
-            .and_then(Result::ok)
+        self.watch.as_ref()?.snapshot().await
     }
 
     /// Build a global [`WatchReport`] of every active inotify registration and
