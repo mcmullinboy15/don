@@ -48,6 +48,9 @@ impl Runner {
             }
         }
 
+        // One handle for every output operation this spawn needs; see the
+        // note in `wire_task_output_and_wait` for why it's taken up front.
+        let output = self.output_manager.item_output(name);
         let mut spawned_pgid: Option<i32> = None;
         if let Some(rs) = self.services.get_mut(name) {
             if let ServiceHandle::Process(ref proc) = start_result.handle {
@@ -64,9 +67,9 @@ impl Runner {
             // Add OSC response sink if we have a PTY write handle.
             if let Some(ServiceHandle::Process(process)) = rs.handle.as_mut()
                 && let Some(pty) = process.take_pty_write()
-                && let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await
+                && let Some(output) = output.as_ref()
             {
-                rs.osc_sink = Some(osc_handle);
+                rs.osc_sink = Some(output.add_osc_sink(pty).await);
             }
         }
         if let Some(pgid) = spawned_pgid {
@@ -84,7 +87,8 @@ impl Runner {
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         let (crash_exit_tx, crash_exit_rx) = tokio::sync::oneshot::channel();
         let child_output = start_result.child_output;
-        let output_worker = self.output_manager.service_writer(name).map(|svc_writer| {
+        let output_worker = output.map(|output| {
+            let svc_writer = output.writer();
             tokio::spawn(async move {
                 let _ = svc_writer.process_stream(child_output).await;
                 let _ = exit_tx.send(());

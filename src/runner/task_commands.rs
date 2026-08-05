@@ -303,13 +303,20 @@ impl Runner {
         } = spawn;
 
         let pgid = handle.pgid();
+        // One handle for every output operation this run needs. Taking it up
+        // front is what lets this whole block move into a per-task supervisor
+        // later — `OutputManager` itself can't, since only one thing may own
+        // the writer handles it joins on shutdown.
+        let output = self.output_manager.item_output(name);
 
-        // Add OSC response sink if we have a PTY write handle.
-        if let Some(pty) = handle.take_pty_write()
-            && let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await
-            && let Some(rt) = self.tasks.get_mut(name)
-        {
-            rt.osc_sink = Some(osc_handle);
+        // Add OSC response sink if we have a PTY write handle. Take the write
+        // half unconditionally so an unregistered name still closes it.
+        let pty_write = handle.take_pty_write();
+        if let (Some(output), Some(pty)) = (output.as_ref(), pty_write) {
+            let osc_handle = output.add_osc_sink(pty).await;
+            if let Some(rt) = self.tasks.get_mut(name) {
+                rt.osc_sink = Some(osc_handle);
+            }
         }
 
         if let Some(rt) = self.tasks.get_mut(name) {
@@ -319,7 +326,8 @@ impl Runner {
         // Fulfill any pending attach waiter for this task.
         self.fulfill_pending_waiter(name).await;
 
-        let output_worker = self.output_manager.service_writer(name).map(|svc_writer| {
+        let output_worker = output.map(|output| {
+            let svc_writer = output.writer();
             tokio::spawn(async move {
                 let _ = svc_writer.process_stream(child_output).await;
             })

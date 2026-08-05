@@ -1126,6 +1126,20 @@ impl OutputManager {
         self.stdout_pause.resume();
     }
 
+    /// Get a cloneable output handle scoped to one registered item.
+    ///
+    /// Returns `None` for an unregistered name — every service and task is
+    /// registered at construction, so `None` means a genuine name mismatch,
+    /// not a timing window.
+    pub fn item_output(&self, name: &str) -> Option<ItemOutput> {
+        Some(ItemOutput {
+            name: name.to_string(),
+            state: Arc::clone(self.services.get(name)?),
+            events: self.clone_lifecycle_emitter(),
+            stdout_pause: self.stdout_pause.clone(),
+        })
+    }
+
     /// Get a lightweight, cloneable handle for emitting `[don]` lifecycle
     /// events from spawned tasks (e.g. build output).
     pub fn clone_lifecycle_emitter(&self) -> LifecycleEmitter {
@@ -1285,6 +1299,90 @@ impl OutputManager {
                 }
             }
         }
+    }
+}
+
+/// Everything one item needs to do its own output, in a cloneable handle.
+///
+/// [`OutputManager`] is deliberately not `Clone` — it owns the writer task
+/// handles that `shutdown` must join, so exactly one thing may own it. But a
+/// per-item supervisor still has to write its child's output, attach an OSC
+/// sink, mute the terminal for a foreground run, and emit its own lifecycle
+/// events. This hands out that slice, scoped to a single name.
+///
+/// "Item" rather than "service" because tasks use the same machinery — and so
+/// do the synthetic `bazel` / `turbo` streams. The name is whatever the
+/// stream was registered under.
+#[derive(Clone)]
+pub struct ItemOutput {
+    name: String,
+    state: Arc<Mutex<ServiceOutputState>>,
+    events: LifecycleEmitter,
+    stdout_pause: StdoutPauseControl,
+}
+
+impl ItemOutput {
+    /// The name this handle is scoped to.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// A writer for piping this item's child process output.
+    ///
+    /// Several may exist at once (a restart creates a new one before the old
+    /// reader has finished draining); they share one ring buffer.
+    pub fn writer(&self) -> ServiceWriter {
+        ServiceWriter {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Attach an OSC response sink so terminal queries from the child reach
+    /// its PTY. See [`OutputManager::add_osc_sink`].
+    pub async fn add_osc_sink(&self, pty_write: pty_process::OwnedWritePty) -> OscSinkHandle {
+        let (tx, rx) = mpsc::channel::<SinkLine>(16);
+        let handle = SinkHandle::BoundedDrop(tx);
+        {
+            let mut state = self.state.lock().await;
+            state.sinks.push(handle.clone());
+        }
+        let join = tokio::spawn(osc_sink_task(rx, pty_write));
+        OscSinkHandle {
+            handle: Some(handle),
+            join: Some(join),
+            service_state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Mute visible stdout/TUI output while this item owns the terminal.
+    /// Ring buffers and file sinks keep receiving output.
+    pub fn pause_visible_output(&self) {
+        self.stdout_pause.pause();
+    }
+
+    /// Unmute after a foreground run releases the terminal.
+    pub fn resume_visible_output(&self) {
+        self.stdout_pause.resume();
+    }
+
+    /// Emit a `[don]` event tagged with this item's name.
+    pub fn event(&self, message: &str) {
+        self.events.service_event(&self.name, message);
+    }
+
+    /// Emit a `[don]` error event tagged with this item's name.
+    pub fn error_event(&self, message: &str) {
+        self.events.service_error_event(&self.name, message);
+    }
+
+    /// Emit a `[don]` event tagged with this item's name, verbose mode only.
+    pub fn debug_event(&self, message: &str) {
+        self.events.service_debug_event(&self.name, message);
+    }
+
+    /// The untagged lifecycle emitter, for handing to spawned helpers.
+    pub fn emitter(&self) -> &LifecycleEmitter {
+        &self.events
     }
 }
 
@@ -2005,6 +2103,94 @@ mod tests {
         let output = read_buf(&buf);
         let stripped = strip_ansi(output.as_bytes());
         assert!(stripped.contains("[don]") && stripped.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn item_output_is_a_view_of_the_manager_not_a_copy() {
+        struct Case {
+            name: &'static str,
+            want: &'static str,
+            registered: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "alpha",
+                want: "alpha",
+                registered: true,
+            },
+            Case {
+                name: "beta",
+                want: "beta",
+                registered: true,
+            },
+            Case {
+                name: "never-registered",
+                want: "",
+                registered: false,
+            },
+        ];
+
+        let (writer, buf) = TestBuffer::new();
+        let config = crate::config::LogConfig::Stdout;
+        let mgr = OutputManager::new(&[("alpha", &config), ("beta", &config)], writer)
+            .await
+            .unwrap();
+
+        for case in cases {
+            let output = mgr.item_output(case.name);
+            assert_eq!(
+                output.is_some(),
+                case.registered,
+                "{}: registered items get a handle and nothing else does",
+                case.name
+            );
+            if let Some(output) = output {
+                assert_eq!(output.name(), case.want, "{}: scoped name", case.name);
+                output
+                    .writer()
+                    .process_stream(std::io::Cursor::new(
+                        format!(
+                            "{} via handle
+",
+                            case.name
+                        )
+                        .into_bytes(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // The pause control must be shared, not snapshotted: a supervisor
+        // muting the terminal for a foreground run has to mute everyone's
+        // output, including lines the manager itself emits. Asserted against
+        // the control rather than the captured bytes on purpose — whether a
+        // line already in the channel gets dropped is up to `stdout_sink_task`
+        // and racy to observe, whereas "both see one flag" is the invariant
+        // this handle is responsible for.
+        let alpha = mgr.item_output("alpha").unwrap();
+        let clone = alpha.clone();
+        assert!(!mgr.stdout_pause.is_paused());
+        alpha.pause_visible_output();
+        assert!(mgr.stdout_pause.is_paused(), "handle must mute the manager");
+        clone.resume_visible_output();
+        assert!(
+            !mgr.stdout_pause.is_paused(),
+            "and a clone of the handle must un-mute it"
+        );
+
+        mgr.shutdown().await;
+
+        let out = read_buf(&buf);
+        assert!(
+            out.contains("alpha via handle"),
+            "handle writer reached stdout: {out}"
+        );
+        assert!(
+            out.contains("beta via handle"),
+            "handle writer reached stdout: {out}"
+        );
     }
 
     #[tokio::test]
