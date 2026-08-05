@@ -127,41 +127,20 @@ impl Runner {
                 .await;
             }
             Ok(TaskRunPrepared::Spawned(spawn)) => {
-                if matches!(intent, TaskRunIntent::Scheduled { .. })
-                    && let Some(rt) = self.tasks.get_mut(name)
-                {
-                    rt.set_needs_run_now(true);
-                }
-                self.output_manager.service_debug_event(
+                let emitter = self.output_manager.clone_lifecycle_emitter();
+                emitter.service_debug_event(
                     name,
                     &format!("process spawned (pid {})", spawn.handle.pgid()),
                 );
-                self.output_manager
-                    .service_event(name, &format!("spawn {}", spawn.rendered_cmdline));
-                let done_tx = match intent {
-                    TaskRunIntent::Scheduled { done_tx } => {
-                        self.output_manager.service_event(name, "running...");
-                        self.set_task_state(name, TaskItemState::Running);
-                        Some(done_tx)
-                    }
-                    TaskRunIntent::Background => None,
-                };
+                emitter.service_event(name, &format!("spawn {}", spawn.rendered_cmdline));
+                let done_tx = self.begin_task_run(name, intent, Some("running..."));
                 self.wire_task_output_and_wait(name, *spawn, task_cfg, done_tx)
                     .await;
             }
             Ok(TaskRunPrepared::ForegroundSpawned(spawn)) => {
-                if matches!(intent, TaskRunIntent::Scheduled { .. })
-                    && let Some(rt) = self.tasks.get_mut(name)
-                {
-                    rt.set_needs_run_now(true);
-                }
-                let done_tx = match intent {
-                    TaskRunIntent::Scheduled { done_tx } => {
-                        self.set_task_state(name, TaskItemState::Running);
-                        Some(done_tx)
-                    }
-                    TaskRunIntent::Background => None,
-                };
+                // No spawn/running lines: a foreground task owns the terminal
+                // and its own output is the only thing worth showing there.
+                let done_tx = self.begin_task_run(name, intent, None);
                 self.wire_foreground_task_and_wait(name, *spawn, task_cfg, done_tx)
                     .await;
             }
@@ -174,6 +153,34 @@ impl Runner {
                 )
                 .await;
             }
+        }
+    }
+
+    /// Mark a freshly-spawned run as live, returning the scheduler's
+    /// completion channel if this run answers to one.
+    ///
+    /// Only a *scheduled* run transitions to `Running` and reports back: a
+    /// background `don run` is not something the dependency sweep is waiting
+    /// on, and moving the task to `Running` for one would make startup gating
+    /// depend on manual activity.
+    fn begin_task_run(
+        &mut self,
+        name: &str,
+        intent: TaskRunIntent,
+        running_message: Option<&str>,
+    ) -> Option<mpsc::Sender<ItemDone>> {
+        match intent {
+            TaskRunIntent::Scheduled { done_tx } => {
+                if let Some(rt) = self.tasks.get_mut(name) {
+                    rt.set_needs_run_now(true);
+                }
+                if let Some(message) = running_message {
+                    self.output_manager.service_event(name, message);
+                }
+                self.set_task_state(name, TaskItemState::Running);
+                Some(done_tx)
+            }
+            TaskRunIntent::Background => None,
         }
     }
 
