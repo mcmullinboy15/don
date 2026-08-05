@@ -1,7 +1,5 @@
 use super::service::{self, ServiceHandle};
-use super::service_worker::{
-    ServiceStartContext, ServiceStartMode, run_service_build_worker, start_service_worker,
-};
+use super::service_worker::{ServiceStartContext, ServiceStartMode, run_service_build_worker};
 use super::{
     CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
     ServiceStartIntent, ServiceState, ServiceStopAction,
@@ -59,6 +57,12 @@ impl Runner {
         })
     }
 
+    /// Queue a start on this service's supervisor.
+    ///
+    /// Bumps `start_generation` because the ready check and the dependency
+    /// sweep still key off it, but deciding whether a *prepared* start is
+    /// current is no longer a question the runner asks — the supervisor only
+    /// reports the start it is committed to.
     fn spawn_service_start_worker(
         &mut self,
         name: &str,
@@ -66,56 +70,30 @@ impl Runner {
         mode: ServiceStartMode,
         intent: ServiceStartIntent,
     ) -> Result<(), CommandError> {
-        let Some(rs) = self.services.get_mut(name) else {
+        let Some(handle) = self.service_starts.registry().get(name).cloned() else {
             return Err(CommandError::UnknownService {
                 name: name.to_string(),
             });
         };
-        rs.start_generation = rs.start_generation.saturating_add(1);
-        let op_id = rs.start_generation;
-
-        let cmd_tx = self.internal_tx.clone();
-        let name_owned = name.to_string();
-        let base_dir = self.base_dir.clone();
-        let pid_dir = self.base_dir.join(".don").join("pids");
-        let platform = self.platform;
-        let emitter = self.output_manager.clone_lifecycle_emitter();
-        let service_writer = self.output_manager.service_writer(name);
-        let docker_client = self.docker_client.clone();
-        let context_for_worker = context.clone();
-
-        let worker = tokio::spawn(async move {
-            let result = start_service_worker(
-                &base_dir,
-                &pid_dir,
-                platform,
-                docker_client.as_ref(),
-                &emitter,
-                &name_owned,
-                &context_for_worker,
-                mode,
-                service_writer.as_ref(),
-            )
-            .await;
-
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::ServiceStartPrepared {
-                    name: name_owned,
-                    op_id,
-                    context: Box::new(context),
-                    intent,
-                    result: result.map(Box::new),
-                })
-                .await;
-        });
-        rs.start_worker = Some(worker);
+        if !handle.request(super::service_supervisor::StartRequest {
+            context: Box::new(context),
+            mode,
+            intent,
+        }) {
+            return Err(CommandError::Failed {
+                name: name.to_string(),
+                message: "service supervisor is shutting down".to_string(),
+            });
+        }
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.start_generation = rs.start_generation.saturating_add(1);
+        }
         Ok(())
     }
 
     pub(in crate::runner) async fn handle_service_start_prepared(
         &mut self,
         name: &str,
-        op_id: u64,
         context: Box<ServiceStartContext>,
         intent: ServiceStartIntent,
         result: Result<Box<service::StartResult>, String>,
@@ -125,44 +103,11 @@ impl Runner {
                 .await;
             return;
         }
-        let is_current = self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.start_generation == op_id);
-        if !is_current {
-            if let Ok(start_result) = result {
-                let shutdown_config = context
-                    .resolved
-                    .shutdown
-                    .clone()
-                    .map(|shutdown| shutdown.merged_over(&self.config.shutdown))
-                    .unwrap_or_else(|| self.config.shutdown.clone());
-                let debug = service::StopDebug::new(
-                    name.to_string(),
-                    self.output_manager.clone_lifecycle_emitter(),
-                );
-                tokio::spawn(async move {
-                    let start_result = *start_result;
-                    let service::StartResult {
-                        handle,
-                        child_output,
-                    } = start_result;
-                    drop(child_output);
-                    let _ = service::stop_service(
-                        handle,
-                        Some(&shutdown_config),
-                        true,
-                        false,
-                        Some(debug),
-                    )
-                    .await;
-                });
-            }
-            return;
-        }
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.start_worker = None;
-        }
+        // The supervisor only reports the start it is committed to, so the
+        // service's current generation *is* this start's. Downstream still
+        // needs it: the ready check and the dependency sweep both use it to
+        // recognise their own start later.
+        let op_id = self.services.get(name).map_or(0, |rs| rs.start_generation);
 
         match result {
             Ok(start_result) => match intent {
@@ -445,7 +390,7 @@ impl Runner {
         }
         let state = self.services.get(name).map(|rs| rs.state());
         let operation_in_progress = self.services.get(name).is_some_and(|rs| {
-            rs.start_worker.is_some()
+            self.service_starts.registry().is_busy(name)
                 || matches!(
                     rs.state(),
                     ServiceState::Pending
@@ -526,9 +471,11 @@ impl Runner {
             }));
             return;
         }
-        if self.services.get(name).is_some_and(|rs| {
-            rs.rebuild_worker.is_some() || rs.control_worker.is_some() || rs.start_worker.is_some()
-        }) {
+        if self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.rebuild_worker.is_some() || rs.control_worker.is_some())
+        {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "operation already in progress".to_string(),
@@ -858,10 +805,7 @@ impl Runner {
                 | ServiceState::Building
                 | ServiceState::Starting
                 | ServiceState::Stopping
-        ) || self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.start_worker.is_some())
+        ) || self.services.get(name).is_some_and(|_| false)
         {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),

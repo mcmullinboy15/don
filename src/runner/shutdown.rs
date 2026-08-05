@@ -60,12 +60,6 @@ impl Runner {
 
         let mut service_worker_handles = Vec::new();
         for (name, rs) in &mut self.services {
-            if let Some(worker) = rs.start_worker.take() {
-                self.output_manager
-                    .service_event(name, "start cancelled by shutdown");
-                worker.abort();
-                service_worker_handles.push(worker);
-            }
             if let Some(worker) = rs.rebuild_worker.take() {
                 self.output_manager
                     .service_event(name, "rebuild cancelled by shutdown");
@@ -90,6 +84,16 @@ impl Runner {
         // preparing. Draining the map drops the senders too, so nothing can
         // queue a run after this point. Abort them all before awaiting any,
         // or the 1s bound is paid once per task rather than once.
+        let starting: Vec<String> = self
+            .service_starts
+            .registry()
+            .busy_names()
+            .map(str::to_string)
+            .collect();
+        for name in starting {
+            self.output_manager
+                .service_event(&name, "start cancelled by shutdown");
+        }
         let busy: Vec<String> = self
             .task_supervisors
             .registry()
@@ -100,7 +104,9 @@ impl Runner {
             self.output_manager
                 .service_event(&name, "run cancelled by shutdown");
         }
-        for (_, handle) in self.task_supervisors.abort_all() {
+        let mut supervisors = self.service_starts.abort_all();
+        supervisors.extend(self.task_supervisors.abort_all());
+        for (_, handle) in supervisors {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
 
@@ -326,9 +332,6 @@ impl Runner {
         // Drop remaining handles, release sockets, clear attach state.
         for rs in self.services.values_mut() {
             if let Some(worker) = rs.control_worker.take() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
-            if let Some(worker) = rs.start_worker.take() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
             }
             if let Some(worker) = rs.rebuild_worker.take() {

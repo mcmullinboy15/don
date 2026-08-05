@@ -93,7 +93,6 @@ pub(crate) struct RuntimeService {
     /// Follow-up action to run after the current stop completes.
     pub stop_action: ServiceStopAction,
     /// In-flight start-preparation worker (download/build) for this service.
-    pub start_worker: Option<tokio::task::JoinHandle<()>>,
     /// Monotonic generation for start-preparation workers so stale
     /// completions can be ignored.
     pub start_generation: u64,
@@ -143,7 +142,6 @@ impl RuntimeService {
             control_generation: 0,
             control_reply: None,
             stop_action: ServiceStopAction::None,
-            start_worker: None,
             start_generation: 0,
             rebuild_worker: None,
             rebuild_generation: 0,

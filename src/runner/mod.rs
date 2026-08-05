@@ -21,6 +21,7 @@ mod runtime_ports;
 mod service_commands;
 mod service_health;
 mod service_ready;
+mod service_supervisor;
 mod service_worker;
 mod setup;
 mod shutdown;
@@ -497,7 +498,6 @@ enum RunnerInternalCommand {
     /// Completion from a detached service start worker.
     ServiceStartPrepared {
         name: String,
-        op_id: u64,
         context: Box<ServiceStartContext>,
         intent: ServiceStartIntent,
         result: Result<Box<service::StartResult>, String>,
@@ -889,6 +889,12 @@ pub struct Runner {
     /// Sender for querying the live watch manager state for verbose status.
     watch_query_tx: Option<mpsc::Sender<crate::watch::WatchQuery>>,
 
+    /// One start supervisor per service, plus the registry addressing them.
+    ///
+    /// Same split as `task_supervisors`: the registry half is clone-able and
+    /// send-only, ending a supervisor stays here.
+    service_starts: service_supervisor::ServiceStarts,
+
     /// One run supervisor per task, plus the registry that addresses them.
     ///
     /// Each supervisor owns its task's run preparation and is the only thing
@@ -984,6 +990,21 @@ impl Runner {
         )
         .await;
 
+        // One supervisor per service, likewise immutable once built.
+        let service_starts = service_supervisor::ServiceStarts::spawn_all(
+            services.keys(),
+            &service_supervisor::StartEnv {
+                base_dir: base_dir.clone(),
+                pid_dir: base_dir.join(".don").join("pids"),
+                platform,
+                docker_client: docker_client.clone(),
+                emitter: output_manager.clone_lifecycle_emitter(),
+                shutdown: config.shutdown.clone(),
+            },
+            &|name| output_manager.item_output(name),
+            &internal_tx,
+        );
+
         // One supervisor per task, started before the runner exists so the
         // registry is immutable and can be shared without a lock.
         let task_supervisors = task_supervisor::TaskSupervisors::spawn_all(
@@ -1028,6 +1049,7 @@ impl Runner {
             batch_build_handle: None,
             lazy_build_handles: HashMap::new(),
             update_check_handle: None,
+            service_starts,
             task_supervisors,
             builds: BuildBatcher::new(),
             completion_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -1602,7 +1624,8 @@ impl Runner {
                     // wait_for_startup_complete`.
                     self.state.set_startup_complete(true);
                     let _ = self.event_tx.send(RunnerEvent::StartupSettled);
-                    let has_running_services = self.services.values().any(|rs| {
+                    let starts = self.service_starts.registry();
+                    let has_running_services = self.services.iter().any(|(name, rs)| {
                         matches!(
                             rs.state(),
                             ServiceState::Pending
@@ -1612,7 +1635,7 @@ impl Runner {
                                 | ServiceState::Starting
                                 | ServiceState::Lazy
                         ) || rs.pending_restart.is_some()
-                            || rs.start_worker.is_some()
+                            || starts.is_busy(name)
                     });
 
                     if has_running_services {
@@ -1742,19 +1765,12 @@ impl Runner {
                             }
                             RunnerInternalCommand::ServiceStartPrepared {
                                 name,
-                                op_id,
                                 context,
                                 intent,
                                 result,
                             } => {
-                                self.handle_service_start_prepared(
-                                    &name,
-                                    op_id,
-                                    context,
-                                    intent,
-                                    result,
-                                )
-                                .await;
+                                self.handle_service_start_prepared(&name, context, intent, result)
+                                    .await;
                             }
                             RunnerInternalCommand::ServiceRebuildPrepared {
                                 name,
@@ -2363,7 +2379,6 @@ mod tests {
 
         let service = runner.services.get("api").unwrap();
         assert_eq!(service.state(), ServiceState::Pending);
-        assert!(service.start_worker.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
