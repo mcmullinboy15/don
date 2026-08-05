@@ -47,10 +47,29 @@ struct StatusQuery {
 }
 
 /// `GET /status` — list all services/tasks and their current state.
+///
+/// The non-verbose answer comes straight out of the state projection, so it
+/// stays fast while the runner is mid-startup. Verbose still goes through the
+/// command channel: it needs a watch-manager round trip and per-service ready
+/// check resolution, neither of which belongs in a snapshot republished on
+/// every transition.
 async fn get_status(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<StatusQuery>,
 ) -> Response {
+    if !query.verbose {
+        let snapshot = state.state.snapshot();
+        let items = match query.name {
+            Some(want) => snapshot
+                .items
+                .iter()
+                .filter(|item| item_name(item) == want)
+                .cloned()
+                .collect(),
+            None => snapshot.items.clone(),
+        };
+        return Json(StatusResponse { items }).into_response();
+    }
     let (tx, rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -74,6 +93,13 @@ struct StatusResponse {
     items: Vec<ItemStatus>,
 }
 
+/// The name of a service or task, for filtering a snapshot by `?name=`.
+fn item_name(item: &ItemStatus) -> &str {
+    match item {
+        ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name,
+    }
+}
+
 /// How long a command will wait for the runner to finish deciding.
 ///
 /// Bounded so a wedged startup reports something honest instead of hanging a
@@ -87,20 +113,8 @@ const STARTUP_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// Safe to await here: this runs in the per-request axum task, not the
 /// runner's command loop, so waiting costs this one client and nothing else.
 async fn await_startup_settled(state: &ApiState) -> bool {
-    let mut settled = state.startup_settled.clone();
-    if *settled.borrow() {
-        return true;
-    }
-    let wait = async {
-        while settled.changed().await.is_ok() {
-            if *settled.borrow() {
-                return true;
-            }
-        }
-        // Sender dropped — the runner is going away; stop waiting.
-        false
-    };
-    tokio::time::timeout(STARTUP_SETTLE_WAIT, wait)
+    let mut reader = state.state.clone();
+    tokio::time::timeout(STARTUP_SETTLE_WAIT, reader.wait_for_startup_complete())
         .await
         .unwrap_or(false)
 }
@@ -118,7 +132,7 @@ struct ReadyResponse {
 /// watch for `startup_settled` on `GET /events`.
 async fn get_ready(State(state): State<Arc<ApiState>>) -> Response {
     Json(ReadyResponse {
-        startup_complete: *state.startup_settled.borrow(),
+        startup_complete: state.state.snapshot().startup_complete,
     })
     .into_response()
 }
@@ -528,4 +542,153 @@ fn not_found(name: &str) -> Response {
 
 fn error_body(message: &str) -> serde_json::Value {
     serde_json::json!({ "error": message })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::runner::state_store::{self, StateSnapshot};
+    use crate::runner::{ServiceState, StateReader};
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Build a router whose command channel is already dead.
+    ///
+    /// Any handler that reaches for `cmd_tx` answers 503 here, so a 200 is
+    /// proof the response came from the state projection alone.
+    fn router_without_a_runner(state: StateReader) -> Router {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(cmd_rx);
+        let (event_tx, _) = tokio::sync::broadcast::channel(16);
+        build_router(Arc::new(ApiState {
+            cmd_tx,
+            event_tx,
+            state,
+            attach_resize_txs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }))
+    }
+
+    async fn get(router: Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    fn snapshot() -> StateSnapshot {
+        StateSnapshot {
+            items: vec![
+                ItemStatus::Service {
+                    name: "api".to_string(),
+                    state: ServiceState::Ready,
+                    failed_dependencies: Vec::new(),
+                    verbose: None,
+                },
+                ItemStatus::Service {
+                    name: "web".to_string(),
+                    state: ServiceState::Starting,
+                    failed_dependencies: Vec::new(),
+                    verbose: None,
+                },
+            ],
+            startup_complete: true,
+        }
+    }
+
+    /// The whole point of the projection: the endpoints a client polls while
+    /// the runner is busy must not queue behind the runner's command loop.
+    /// These answer with the command channel severed entirely.
+    #[tokio::test]
+    async fn read_endpoints_answer_without_touching_the_command_channel() {
+        struct Case {
+            name: &'static str,
+            uri: &'static str,
+            want_status: StatusCode,
+            /// Item names expected in `items`, in order. Empty for `/ready`.
+            want_items: Vec<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "status lists every item",
+                uri: "/status",
+                want_status: StatusCode::OK,
+                want_items: vec!["api", "web"],
+            },
+            Case {
+                name: "status filters by name",
+                uri: "/status?name=web",
+                want_status: StatusCode::OK,
+                want_items: vec!["web"],
+            },
+            Case {
+                name: "an unknown name is an empty list, not an error",
+                uri: "/status?name=nope",
+                want_status: StatusCode::OK,
+                want_items: vec![],
+            },
+            Case {
+                name: "ready reports the startup flag",
+                uri: "/ready",
+                want_status: StatusCode::OK,
+                want_items: vec![],
+            },
+            // Verbose still needs the runner — it resolves ready checks and
+            // queries the watch manager, neither of which is in the snapshot.
+            Case {
+                name: "verbose status still goes through the runner",
+                uri: "/status?verbose=true",
+                want_status: StatusCode::SERVICE_UNAVAILABLE,
+                want_items: vec![],
+            },
+        ];
+
+        for case in cases {
+            let (writer, reader) = state_store::channel(snapshot());
+            let (status, body) = get(router_without_a_runner(reader), case.uri).await;
+            assert_eq!(status, case.want_status, "{}: status code", case.name);
+            if case.want_status == StatusCode::OK && case.uri.starts_with("/status") {
+                let names: Vec<&str> = body["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["name"].as_str().unwrap())
+                    .collect();
+                assert_eq!(names, case.want_items, "{}: items", case.name);
+            }
+            if case.uri == "/ready" {
+                assert_eq!(body["startup_complete"], true, "{}: flag", case.name);
+            }
+            drop(writer);
+        }
+    }
+
+    /// `/status` reflects a transition as soon as the runner publishes it —
+    /// the reader is not a cache with its own lifetime.
+    #[tokio::test]
+    async fn status_tracks_republished_state() {
+        let (writer, reader) = state_store::channel(snapshot());
+        let router = router_without_a_runner(reader);
+
+        let (_, before) = get(router.clone(), "/status?name=web").await;
+        assert_eq!(before["items"][0]["state"], "starting");
+
+        writer.publish_items(vec![ItemStatus::Service {
+            name: "web".to_string(),
+            state: ServiceState::Ready,
+            failed_dependencies: Vec::new(),
+            verbose: None,
+        }]);
+
+        let (_, after) = get(router, "/status?name=web").await;
+        assert_eq!(after["items"][0]["state"], "ready");
+    }
 }

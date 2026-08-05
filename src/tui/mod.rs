@@ -207,6 +207,8 @@ impl ActiveTerm {
 pub async fn run_tui(
     mut log_rx: mpsc::UnboundedReceiver<FormattedLogLine>,
     mut runner_events: broadcast::Receiver<RunnerEvent>,
+    // Authoritative item state, read only when the event broadcast lags.
+    state: crate::runner::StateReader,
     command_tx: mpsc::UnboundedSender<RunnerCommand>,
     verbosity: VerbosityControl,
     lifecycle_emitter: LifecycleEmitter,
@@ -355,35 +357,45 @@ pub async fn run_tui(
                 }
             }
             runner_result = runner_events.recv() => {
-                match runner_result {
+                // `Some(filter_changed)` when the view moved and needs a
+                // redraw; `None` when there is nothing to draw.
+                let redraw = match runner_result {
                     Ok(RunnerEvent::ShutdownStarted) => {
                         if let Some(act) = active.as_mut() {
                             enter_shutdown_mode(&mut app, &mut act.terminal, &mut act.modal)?;
                         } else if !app.shutdown_started {
                             app.begin_shutdown();
                         }
+                        None
                     }
-                    Ok(event) => {
-                        let filter_changed = apply_runner_event(event, &mut app);
-                        let lazy: std::collections::HashSet<String> = app
-                            .services_state
-                            .iter()
-                            .filter(|(_, s)| matches!(s, crate::runner::ServiceState::Lazy))
-                            .map(|(n, _)| n.clone())
-                            .collect();
-                        app.filter.set_hidden_from_display(lazy);
-                        if let Some(act) = active.as_mut() {
-                            if let Some(m) = act.modal.as_mut() {
-                                m.draw(&mut app)?;
-                            } else if filter_changed {
-                                clear_and_replay(&mut act.terminal, &store, &app)?;
-                            } else {
-                                draw_inline_bar(&mut act.terminal, &app)?;
-                            }
+                    Ok(event) => Some(apply_runner_event(event, &mut app)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Transitions were dropped, so the incremental view is
+                        // now wrong about an unknown set of items and would
+                        // stay wrong. Reload from the runner's projection — a
+                        // synchronous read that costs this loop nothing.
+                        app.resync_from(&state.snapshot());
+                        Some(false)
+                    }
+                    Err(broadcast::error::RecvError::Closed) => None,
+                };
+                if let Some(filter_changed) = redraw {
+                    let lazy: std::collections::HashSet<String> = app
+                        .services_state
+                        .iter()
+                        .filter(|(_, s)| matches!(s, crate::runner::ServiceState::Lazy))
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    app.filter.set_hidden_from_display(lazy);
+                    if let Some(act) = active.as_mut() {
+                        if let Some(m) = act.modal.as_mut() {
+                            m.draw(&mut app)?;
+                        } else if filter_changed {
+                            clear_and_replay(&mut act.terminal, &store, &app)?;
+                        } else {
+                            draw_inline_bar(&mut act.terminal, &app)?;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => {}
                 }
             }
             maybe_event = input_rx.recv(), if input_open && active_present => {

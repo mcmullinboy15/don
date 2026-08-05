@@ -63,6 +63,44 @@ impl Runner {
         })
     }
 
+    /// The cheap, allocation-only projection of every item's state.
+    ///
+    /// Synchronous by construction: it touches nothing but the runner's own
+    /// maps. That is what lets it be republished on every state transition and
+    /// read straight out of [`StateReader`] without a command round trip.
+    ///
+    /// [`StateReader`]: super::StateReader
+    pub(in crate::runner) fn status_projection(
+        &self,
+        detail_name: Option<&str>,
+    ) -> Vec<ItemStatus> {
+        let mut statuses = Vec::new();
+        for (name, rs) in &self.services {
+            if detail_name.is_some_and(|want| want != name) {
+                continue;
+            }
+            statuses.push(ItemStatus::Service {
+                name: name.clone(),
+                state: rs.state(),
+                failed_dependencies: rs.failed_dependencies().to_vec(),
+                verbose: None,
+            });
+        }
+        for (name, rt) in &self.tasks {
+            if detail_name.is_some_and(|want| want != name) {
+                continue;
+            }
+            statuses.push(ItemStatus::Task {
+                name: name.clone(),
+                state: rt.state(),
+                failed_dependencies: rt.failed_dependencies().to_vec(),
+                last_run: rt.last_run.clone(),
+                verbose: None,
+            });
+        }
+        statuses
+    }
+
     /// Collect status of all items.
     ///
     /// When `detail_name` is `Some`, only that single service/task is returned
@@ -70,23 +108,26 @@ impl Runner {
     /// (`detail_name == None`) deliberately omits the path list — for a
     /// build-tool stack it can be hundreds of resolved paths per service, so the
     /// default verbose view reports only the count and callers drill in by name.
+    ///
+    /// The non-verbose answer is [`status_projection`](Self::status_projection),
+    /// so what a client reads from the state store and what it reads from this
+    /// command cannot drift.
     pub(in crate::runner) async fn collect_status(
         &self,
         verbose: bool,
         detail_name: Option<&str>,
     ) -> Vec<ItemStatus> {
+        if !verbose {
+            return self.status_projection(detail_name);
+        }
         let mut statuses = Vec::new();
-        let watch_snapshot = if verbose {
-            self.fetch_watch_snapshot().await
-        } else {
-            None
-        };
+        let watch_snapshot = self.fetch_watch_snapshot().await;
         let watch_snapshot_available = watch_snapshot.is_some();
         for (name, rs) in &self.services {
             if detail_name.is_some_and(|want| want != name) {
                 continue;
             }
-            let verbose_info = if verbose {
+            let verbose_info = {
                 let resolved = &rs.resolved;
                 let ready = self
                     .effective_ready_check(name, resolved)
@@ -219,8 +260,6 @@ impl Runner {
                     }),
                     watch_notes,
                 })
-            } else {
-                None
             };
             statuses.push(ItemStatus::Service {
                 name: name.clone(),
@@ -233,7 +272,7 @@ impl Runner {
             if detail_name.is_some_and(|want| want != name) {
                 continue;
             }
-            let verbose_info = if verbose {
+            let verbose_info = {
                 let task = &rt.config;
                 let cmd_str = if task.args.is_empty() {
                     task.cmd.clone()
@@ -304,8 +343,6 @@ impl Runner {
                     }),
                     watch_notes,
                 })
-            } else {
-                None
             };
             statuses.push(ItemStatus::Task {
                 name: name.clone(),

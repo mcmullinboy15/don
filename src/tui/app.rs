@@ -489,6 +489,55 @@ impl App {
         filter_changed
     }
 
+    /// Reload every item's state from the runner's projection.
+    ///
+    /// The TUI applies transitions incrementally from the event broadcast,
+    /// which is correct right up until that broadcast *lags*. A dropped event
+    /// leaves this view silently wrong about the item it described, and it
+    /// stays wrong until that item happens to move again — a service can sit
+    /// on the status bar as `starting` for the rest of the session. Reloading
+    /// from the projection turns that unrecoverable drift into a missed frame.
+    ///
+    /// Deliberately not a replacement for event handling: the auto-filter on
+    /// failure is edge-triggered, and re-firing it here for every service that
+    /// is already failed would yank the user's filter out from under them.
+    pub(crate) fn resync_from(&mut self, snapshot: &crate::runner::StateSnapshot) {
+        for item in &snapshot.items {
+            match item {
+                crate::runner::ItemStatus::Service {
+                    name,
+                    state,
+                    failed_dependencies,
+                    ..
+                } => {
+                    // The projection carries no pid. Where the state moved
+                    // while we weren't looking the pid we hold is certainly
+                    // stale, so drop it rather than show a dead process;
+                    // where it didn't, it is still good.
+                    if self.services_state.get(name) != Some(state) {
+                        self.service_pids.insert(name.clone(), None);
+                    }
+                    self.services_state.insert(name.clone(), *state);
+                    self.apply_failed_dependencies(name.clone(), failed_dependencies.clone());
+                }
+                crate::runner::ItemStatus::Task {
+                    name,
+                    state,
+                    failed_dependencies,
+                    last_run,
+                    ..
+                } => {
+                    self.tasks_state.insert(name.clone(), *state);
+                    self.apply_failed_dependencies(name.clone(), failed_dependencies.clone());
+                    if let Some(last_run) = last_run {
+                        self.tasks_last_run.insert(name.clone(), last_run.clone());
+                    }
+                }
+            }
+        }
+        self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
+    }
+
     fn apply_failed_dependencies(&mut self, name: String, dependencies: Vec<String>) {
         if dependencies.is_empty() {
             self.failed_dependencies.remove(&name);
@@ -647,6 +696,132 @@ mod tests {
 
     fn apply_task(app: &mut App, name: &str, state: TaskItemState) -> bool {
         app.apply_task_state(name.to_string(), state, None, Vec::new())
+    }
+
+    #[test]
+    fn resync_from_replaces_drifted_state() {
+        use crate::runner::{ItemStatus, StateSnapshot};
+
+        fn snapshot_service(name: &str, state: ServiceState) -> ItemStatus {
+            ItemStatus::Service {
+                name: name.to_string(),
+                state,
+                failed_dependencies: Vec::new(),
+                verbose: None,
+            }
+        }
+
+        struct Case {
+            name: &'static str,
+            /// State the app believes, applied from events before the lag.
+            before: Vec<(&'static str, ServiceState, Option<i32>)>,
+            snapshot: Vec<ItemStatus>,
+            want_states: Vec<(&'static str, ServiceState)>,
+            want_pids: Vec<(&'static str, Option<i32>)>,
+            want_counts_ready: usize,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a dropped transition is picked up",
+                before: vec![("api", ServiceState::Starting, Some(42))],
+                snapshot: vec![snapshot_service("api", ServiceState::Ready)],
+                want_states: vec![("api", ServiceState::Ready)],
+                // The state moved while we weren't looking, so the pid we
+                // hold can't be trusted.
+                want_pids: vec![("api", None)],
+                want_counts_ready: 1,
+            },
+            Case {
+                name: "an unchanged item keeps its pid",
+                before: vec![("api", ServiceState::Ready, Some(42))],
+                snapshot: vec![snapshot_service("api", ServiceState::Ready)],
+                want_states: vec![("api", ServiceState::Ready)],
+                want_pids: vec![("api", Some(42))],
+                want_counts_ready: 1,
+            },
+            Case {
+                name: "several items resync independently",
+                before: vec![
+                    ("api", ServiceState::Ready, Some(1)),
+                    ("web", ServiceState::Starting, Some(2)),
+                ],
+                snapshot: vec![
+                    snapshot_service("api", ServiceState::Ready),
+                    snapshot_service("web", ServiceState::Failed),
+                ],
+                want_states: vec![("api", ServiceState::Ready), ("web", ServiceState::Failed)],
+                want_pids: vec![("api", Some(1)), ("web", None)],
+                want_counts_ready: 1,
+            },
+        ];
+
+        for case in cases {
+            let names: Vec<String> = case.before.iter().map(|(n, ..)| n.to_string()).collect();
+            let mut app = app_with_names(names, vec![]);
+            for (name, state, pid) in &case.before {
+                apply_service(&mut app, name, *state, *pid);
+            }
+
+            app.resync_from(&StateSnapshot {
+                items: case.snapshot,
+                startup_complete: true,
+            });
+
+            for (name, want) in case.want_states {
+                assert_eq!(
+                    app.services_state.get(name),
+                    Some(&want),
+                    "{}: state of {name}",
+                    case.name
+                );
+            }
+            for (name, want) in case.want_pids {
+                assert_eq!(
+                    app.service_pids.get(name).copied().flatten(),
+                    want,
+                    "{}: pid of {name}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                app.counts.services_ready, case.want_counts_ready,
+                "{}: counts recomputed",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn resync_does_not_fire_the_auto_filter_on_already_failed_items() {
+        use crate::runner::{ItemStatus, StateSnapshot};
+
+        // Auto-filter-on-failure is edge-triggered. Resyncing is not an edge:
+        // re-selecting every already-failed service would yank the user's
+        // filter out from under them on every broadcast lag.
+        let mut app = app_with_names_and_auto_filter(
+            vec!["api".to_string()],
+            vec![],
+            HashSet::from(["api".to_string()]),
+        );
+        let before = app.filter.clone();
+
+        app.resync_from(&StateSnapshot {
+            items: vec![ItemStatus::Service {
+                name: "api".to_string(),
+                state: ServiceState::Failed,
+                failed_dependencies: Vec::new(),
+                verbose: None,
+            }],
+            startup_complete: true,
+        });
+
+        assert_eq!(app.services_state.get("api"), Some(&ServiceState::Failed));
+        assert_eq!(
+            format!("{:?}", app.filter),
+            format!("{before:?}"),
+            "resync must not touch the filter"
+        );
     }
 
     #[test]

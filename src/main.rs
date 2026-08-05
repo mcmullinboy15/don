@@ -2338,6 +2338,7 @@ async fn run_start(
         apply_daemon_registration(&mut runner, profile_ref, no_daemon);
 
         let events = runner.subscribe();
+        let state_reader = runner.state_reader();
         let commands = runner.command_sender();
 
         // Wrap the TUI so that if it exits unexpectedly (e.g. a terminal IO
@@ -2352,6 +2353,7 @@ async fn run_start(
             let result = don::run_tui(
                 log_rx,
                 events,
+                state_reader,
                 commands,
                 verbosity,
                 lifecycle_emitter,

@@ -214,6 +214,7 @@ src/
     mod.rs                  # orchestrator — dependency graph, startup/shutdown, config reload, profiles
     service.rs              # service lifecycle: spawn, restart, stop
     task.rs                 # task execution, timeout, skip-if-unchanged
+    state_store.rs          # runner-written / world-readable state projection
   process/
     mod.rs                  # process group management, PTY spawning, identity tracking
     pid_file.rs             # PID file locking (flock-based) for single-instance guard
@@ -266,9 +267,24 @@ Modules communicate via **tokio channels**, not shared mutable state:
 
 - **`mpsc`** for commands into the runner (CLI/API -> runner). The runner owns an `mpsc::Receiver<RunnerCommand>` and processes commands sequentially. This gives it a clean command loop with no shared mutable state.
 - **`broadcast`** for events out of the runner (runner -> output/API/watch). Service state changes (started, ready, stopped, failed) are broadcast so multiple consumers can observe without coupling.
-- **`oneshot`** for request/reply (e.g., status queries). The API sends a command with a `oneshot::Sender` for the reply, the runner fills it.
+- **`oneshot`** for request/reply (e.g., verbose status). The API sends a command with a `oneshot::Sender` for the reply, the runner fills it.
+- **`watch`** for the state projection out of the runner (`runner/state_store.rs`). Readers see the latest value, not every intermediate one.
 
-**No `Arc<Mutex<_>>` for shared state.** The runner owns all service state in a plain `HashMap<String, ServiceState>`. Status queries go through the command channel. This avoids deadlocks and contention.
+**No `Arc<Mutex<_>>` for shared state.** The runner owns all service state in a plain `HashMap<String, ServiceState>` and is the only thing that may mutate it. This avoids deadlocks and contention.
+
+**Reading that state does not go through the command channel.** A status query is the one thing that should never queue behind whatever the runner is currently doing. `runner/state_store.rs` publishes a cheap projection — every item's `ItemStatus`, plus `startup_complete` — through a `watch`, and splits the handle by type so single-writer is enforced by ownership rather than by discipline:
+
+- `StateWriter` is **not** `Clone` and is moved into the runner at construction, so no other component can obtain one.
+- `StateReader` is `Clone` and exposes reads only. The server, the TUI and the web UI hold one.
+
+`Arc<RwLock<State>>` was rejected for exactly this reason: it hands every holder a `.write()`.
+
+Two rules for the projection:
+
+- **It carries only what is cheap to recompute on every transition.** Verbose status stays a command — it needs a watch-manager round trip and a per-service ready-check resolution.
+- **Reads return `Arc<StateSnapshot>`, never `watch::Ref`.** A `Ref` holds a read lock for as long as it lives; returning an `Arc` makes "held across an `.await`" unrepresentable rather than merely documented against.
+
+The state store and the `RunnerEvent` broadcast update on exactly the same transitions, which is what lets a consumer that missed an event resync from the snapshot and get a consistent answer. The TUI does this on `RecvError::Lagged`.
 
 ```rust
 // The actual command enum (see runner/mod.rs for the full definition)
