@@ -30,6 +30,7 @@ pub(crate) mod state_store;
 mod status;
 mod support;
 mod task_commands;
+mod task_supervisor;
 mod task_worker;
 mod terminal;
 

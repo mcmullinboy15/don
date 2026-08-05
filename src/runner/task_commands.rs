@@ -1,13 +1,11 @@
-use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::task;
 use super::task_worker::{TaskRunMode, TaskRunPrepared, TaskWorkerContext, run_task_worker};
 use super::{
     CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
     TaskItemState, TaskRunIntent, TaskRunWaiter, resolve_task_params,
 };
+use super::{task, task_supervisor};
 use crate::config::TaskAutoRun;
 use crate::duration::parse_duration;
-use crate::task_state::TaskState;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
@@ -339,83 +337,13 @@ impl Runner {
             rt.output_worker = output_worker;
         }
 
-        let name_owned = name.to_string();
-        let task_cfg_clone = task_cfg.clone();
-        let base_dir_owned = self.base_dir.clone();
-        let global_watch_ignore = self.config.watch_ignore.clone();
-        let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
-        let cmd_tx = self.internal_tx.clone();
-        let rerun = done_tx.is_none();
+        let timeout = task_cfg.timeout.clone();
+        let outcome = self.task_run_outcome(name, task_cfg, pgid, done_tx);
 
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result = task::wait_for_task(&mut handle, task_cfg_clone.timeout.as_deref()).await;
-            let elapsed = start.elapsed();
-
-            let (success, exit_code, message) = match result {
-                Ok(status) => {
-                    if status.success() {
-                        (true, status.code(), None)
-                    } else {
-                        let code = status.code().unwrap_or(-1);
-                        (false, status.code(), Some(format!("exit code {code}")))
-                    }
-                }
-                Err(e) => (false, None, Some(e.to_string())),
-            };
-            let last_run = crate::task_state::TaskRunInfo::finished_now(
-                success,
-                Some(elapsed),
-                exit_code,
-                message.clone(),
-            );
-            if success {
-                let task_dir = working_dir_for(&base_dir_owned, task_cfg_clone.dir.as_deref());
-                let ignore_patterns = resolve_watch_ignore_patterns(
-                    &task_dir,
-                    &task_cfg_clone.ignore,
-                    &base_dir_owned,
-                    &global_watch_ignore,
-                );
-                let _ = task_state
-                    .record_success_with_info(
-                        &name_owned,
-                        &task_cfg_clone.watch,
-                        &ignore_patterns,
-                        Some(&task_dir),
-                        &last_run,
-                    )
-                    .await;
-            } else {
-                let _ = task_state.record_run(&name_owned, &last_run).await;
-            }
-
-            if let Some(done_tx) = done_tx {
-                let _ = done_tx
-                    .send(ItemDone {
-                        name: name_owned,
-                        kind: NodeKind::Task,
-                        success,
-                        message,
-                        elapsed: Some(elapsed),
-                        last_run: Some(last_run),
-                        service_start_generation: None,
-                        task_run_generation: None,
-                    })
-                    .await;
-            } else {
-                let _ = cmd_tx
-                    .send(RunnerInternalCommand::TaskExited(super::TaskExit {
-                        name: name_owned,
-                        pgid,
-                        success,
-                        message,
-                        elapsed: Some(elapsed),
-                        last_run: Some(last_run),
-                        rerun,
-                    }))
-                    .await;
-            }
+            let result = task::wait_for_task(&mut handle, timeout.as_deref()).await;
+            outcome.finish(result, start.elapsed()).await;
         });
     }
 
@@ -436,92 +364,47 @@ impl Runner {
             rt.pgid = Some(pgid);
         }
 
-        let name_owned = name.to_string();
-        let task_cfg_clone = task_cfg.clone();
-        let base_dir_owned = self.base_dir.clone();
-        let global_watch_ignore = self.config.watch_ignore.clone();
-        let task_state = TaskState::new(base_dir_owned.join(".don").join("task-state"));
-        let cmd_tx = self.internal_tx.clone();
+        let timeout = task_cfg.timeout.clone();
         let terminal_coordinator = self.terminal_coordinator.clone();
-        let rerun = done_tx.is_none();
+        let outcome = self.task_run_outcome(name, task_cfg, pgid, done_tx);
 
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
-                task::wait_for_foreground_task(&mut handle, task_cfg_clone.timeout.as_deref())
-                    .await;
+            let result = task::wait_for_foreground_task(&mut handle, timeout.as_deref()).await;
             let elapsed = start.elapsed();
             drop(handle);
             // Hand the terminal back to the TUI now that the child has
             // released it. Drop happened above; tcsetpgrp/tcsetattr already
-            // restored pgrp + termios.
+            // restored pgrp + termios. This is the one thing the foreground
+            // path does that the background path must not, so it stays here
+            // rather than moving into the shared outcome.
             terminal_coordinator.release().await;
 
-            let (success, exit_code, message) = match result {
-                Ok(status) => {
-                    if status.success() {
-                        (true, status.code(), None)
-                    } else {
-                        let code = status.code().unwrap_or(-1);
-                        (false, status.code(), Some(format!("exit code {code}")))
-                    }
-                }
-                Err(e) => (false, None, Some(e.to_string())),
-            };
-            let last_run = crate::task_state::TaskRunInfo::finished_now(
-                success,
-                Some(elapsed),
-                exit_code,
-                message.clone(),
-            );
-            if success {
-                let task_dir = working_dir_for(&base_dir_owned, task_cfg_clone.dir.as_deref());
-                let ignore_patterns = resolve_watch_ignore_patterns(
-                    &task_dir,
-                    &task_cfg_clone.ignore,
-                    &base_dir_owned,
-                    &global_watch_ignore,
-                );
-                let _ = task_state
-                    .record_success_with_info(
-                        &name_owned,
-                        &task_cfg_clone.watch,
-                        &ignore_patterns,
-                        Some(&task_dir),
-                        &last_run,
-                    )
-                    .await;
-            } else {
-                let _ = task_state.record_run(&name_owned, &last_run).await;
-            }
-
-            if let Some(done_tx) = done_tx {
-                let _ = done_tx
-                    .send(ItemDone {
-                        name: name_owned,
-                        kind: NodeKind::Task,
-                        success,
-                        message,
-                        elapsed: Some(elapsed),
-                        last_run: Some(last_run),
-                        service_start_generation: None,
-                        task_run_generation: None,
-                    })
-                    .await;
-            } else {
-                let _ = cmd_tx
-                    .send(RunnerInternalCommand::TaskExited(super::TaskExit {
-                        name: name_owned,
-                        pgid,
-                        success,
-                        message,
-                        elapsed: Some(elapsed),
-                        last_run: Some(last_run),
-                        rerun,
-                    }))
-                    .await;
-            }
+            outcome.finish(result, elapsed).await;
         });
+    }
+
+    /// Bundle everything the exit half of a run needs, owned.
+    ///
+    /// `done_tx` being `Some` is what marks a startup-scheduled run: it
+    /// answers the dependency scheduler instead of reporting a rerun.
+    fn task_run_outcome(
+        &self,
+        name: &str,
+        task_cfg: &crate::config::Task,
+        pgid: i32,
+        done_tx: Option<mpsc::Sender<ItemDone>>,
+    ) -> task_supervisor::TaskRunOutcome {
+        task_supervisor::TaskRunOutcome {
+            name: name.to_string(),
+            task_cfg: task_cfg.clone(),
+            base_dir: self.base_dir.clone(),
+            global_watch_ignore: self.config.watch_ignore.clone(),
+            pgid,
+            rerun: done_tx.is_none(),
+            done_tx,
+            internal_tx: self.internal_tx.clone(),
+        }
     }
 
     async fn stop_task_pgid(&mut self, name: &str, pgid: i32) -> CommandResult {
