@@ -20,6 +20,97 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// How prominently a settled run's message is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runner) enum Report {
+    /// Normal lifecycle line.
+    Info,
+    /// Verbose-only — the run was a no-op and nobody asked.
+    Debug,
+    /// The run failed.
+    Error,
+}
+
+/// A prepared run that ended without leaving a process behind.
+///
+/// Three of the five outcomes of preparing a run never spawn: the task is
+/// waiting on something (`PendingRun`), its inputs were unchanged so it was
+/// skipped, or preparation itself failed. They were three near-identical
+/// branches on the runner; the differences between them are exactly the
+/// fields here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runner) struct NoSpawnOutcome {
+    /// Lifecycle state the task enters.
+    pub(in crate::runner) state: super::TaskItemState,
+    /// What the dependency scheduler is told. A skipped or deferred task is
+    /// still a *success* — it didn't fail, it just didn't run.
+    pub(in crate::runner) success: bool,
+    pub(in crate::runner) message: String,
+    pub(in crate::runner) report: Report,
+}
+
+impl NoSpawnOutcome {
+    /// The task can't run yet and is waiting on something.
+    pub(in crate::runner) fn pending_run(message: String) -> Self {
+        Self {
+            state: super::TaskItemState::PendingRun,
+            success: true,
+            message,
+            report: Report::Info,
+        }
+    }
+
+    /// The task's watched inputs were unchanged, so it didn't need to run.
+    pub(in crate::runner) fn skipped(message: String) -> Self {
+        Self {
+            state: super::TaskItemState::Skipped,
+            success: true,
+            message,
+            report: Report::Debug,
+        }
+    }
+
+    /// Preparing the run failed before anything was spawned.
+    pub(in crate::runner) fn failed(message: String) -> Self {
+        Self {
+            state: super::TaskItemState::Failed,
+            success: false,
+            message,
+            report: Report::Error,
+        }
+    }
+
+    /// Whether to update `needs_run_now`, and to what. `None` leaves it alone.
+    ///
+    /// The asymmetry is deliberate and pre-existing: a *scheduled* run that
+    /// fails to prepare marks the task as still needing a run, but a
+    /// background `don run` that fails to prepare leaves the flag untouched —
+    /// a manual invocation going wrong shouldn't change what startup decides
+    /// to do next time.
+    pub(in crate::runner) fn needs_run_now(&self, scheduled: bool) -> Option<bool> {
+        match self.state {
+            super::TaskItemState::PendingRun => Some(true),
+            super::TaskItemState::Skipped => Some(false),
+            super::TaskItemState::Failed if scheduled => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The message to hand a caller waiting on this run, if it failed.
+    pub(in crate::runner) fn failure_message(&self) -> Option<String> {
+        (!self.success).then(|| self.message.clone())
+    }
+
+    /// Emit this outcome's message at its own level.
+    pub(in crate::runner) fn emit(&self, emitter: &crate::output::LifecycleEmitter, name: &str) {
+        match self.report {
+            Report::Info => emitter.service_event(name, &self.message),
+            Report::Debug => emitter.service_debug_event(name, &self.message),
+            Report::Error => emitter.service_error_event(name, &self.message),
+        }
+    }
+}
+
 /// How long a superseded process gets to die politely before SIGKILL lands.
 const SUPERSEDED_KILL_GRACE: Duration = Duration::from_millis(500);
 
@@ -221,6 +312,86 @@ mod tests {
             done_tx,
             internal_tx,
             rerun,
+        }
+    }
+
+    #[test]
+    fn no_spawn_outcomes_classify_consistently() {
+        use super::super::TaskItemState;
+
+        struct Case {
+            label: &'static str,
+            outcome: NoSpawnOutcome,
+            want_state: TaskItemState,
+            want_success: bool,
+            want_report: Report,
+            /// `needs_run_now` for a scheduled run, then for a background one.
+            want_needs: (Option<bool>, Option<bool>),
+            want_failure_message: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                label: "deferred",
+                outcome: NoSpawnOutcome::pending_run("waiting on deps".to_string()),
+                want_state: TaskItemState::PendingRun,
+                // Not a failure: it just hasn't run yet.
+                want_success: true,
+                want_report: Report::Info,
+                want_needs: (Some(true), Some(true)),
+                want_failure_message: None,
+            },
+            Case {
+                label: "skipped",
+                outcome: NoSpawnOutcome::skipped("no changes".to_string()),
+                want_state: TaskItemState::Skipped,
+                want_success: true,
+                // Verbose-only: nobody asked for a no-op to be announced.
+                want_report: Report::Debug,
+                want_needs: (Some(false), Some(false)),
+                want_failure_message: None,
+            },
+            Case {
+                label: "prepare failed",
+                outcome: NoSpawnOutcome::failed("bad param".to_string()),
+                want_state: TaskItemState::Failed,
+                want_success: false,
+                want_report: Report::Error,
+                // Only a scheduled failure marks the task as still needing a
+                // run — a manual `don run` going wrong must not change what
+                // startup decides next time.
+                want_needs: (Some(true), None),
+                want_failure_message: Some("bad param"),
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(case.outcome.state, case.want_state, "{}: state", case.label);
+            assert_eq!(
+                case.outcome.success, case.want_success,
+                "{}: success",
+                case.label
+            );
+            assert_eq!(
+                case.outcome.report, case.want_report,
+                "{}: report level",
+                case.label
+            );
+            assert_eq!(
+                (
+                    case.outcome.needs_run_now(true),
+                    case.outcome.needs_run_now(false)
+                ),
+                case.want_needs,
+                "{}: needs_run_now (scheduled, background)",
+                case.label
+            );
+            assert_eq!(
+                case.outcome.failure_message().as_deref(),
+                case.want_failure_message,
+                "{}: failure message",
+                case.label
+            );
         }
     }
 

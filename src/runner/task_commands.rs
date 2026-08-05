@@ -109,52 +109,22 @@ impl Runner {
 
         match result {
             Ok(TaskRunPrepared::PendingRun { message }) => {
-                if task_cfg.terminal.is_foreground() {
-                    self.output_manager.resume_visible_output();
-                }
-                if let Some(rt) = self.tasks.get_mut(name) {
-                    rt.set_needs_run_now(true);
-                }
-                self.set_task_state(name, TaskItemState::PendingRun);
-                self.output_manager.service_event(name, &message);
-                if let TaskRunIntent::Scheduled { done_tx } = intent {
-                    let _ = done_tx
-                        .send(ItemDone {
-                            name: name.to_string(),
-                            kind: NodeKind::Task,
-                            success: true,
-                            message: None,
-                            elapsed: None,
-                            last_run: None,
-                            service_start_generation: None,
-                            task_run_generation: None,
-                        })
-                        .await;
-                }
+                self.settle_task_without_spawn(
+                    name,
+                    task_cfg,
+                    intent,
+                    task_supervisor::NoSpawnOutcome::pending_run(message),
+                )
+                .await;
             }
             Ok(TaskRunPrepared::Skipped { message }) => {
-                if task_cfg.terminal.is_foreground() {
-                    self.output_manager.resume_visible_output();
-                }
-                if let Some(rt) = self.tasks.get_mut(name) {
-                    rt.set_needs_run_now(false);
-                }
-                self.set_task_state(name, TaskItemState::Skipped);
-                self.output_manager.service_debug_event(name, &message);
-                if let TaskRunIntent::Scheduled { done_tx } = intent {
-                    let _ = done_tx
-                        .send(ItemDone {
-                            name: name.to_string(),
-                            kind: NodeKind::Task,
-                            success: true,
-                            message: None,
-                            elapsed: None,
-                            last_run: None,
-                            service_start_generation: None,
-                            task_run_generation: None,
-                        })
-                        .await;
-                }
+                self.settle_task_without_spawn(
+                    name,
+                    task_cfg,
+                    intent,
+                    task_supervisor::NoSpawnOutcome::skipped(message),
+                )
+                .await;
             }
             Ok(TaskRunPrepared::Spawned(spawn)) => {
                 if matches!(intent, TaskRunIntent::Scheduled { .. })
@@ -196,45 +166,74 @@ impl Runner {
                     .await;
             }
             Err(message) => {
-                if task_cfg.terminal.is_foreground() {
-                    self.output_manager.resume_visible_output();
-                }
-                if matches!(intent, TaskRunIntent::Scheduled { .. })
-                    && let Some(rt) = self.tasks.get_mut(name)
-                {
-                    rt.set_needs_run_now(true);
-                }
-                self.set_task_state(name, TaskItemState::Failed);
-                self.output_manager.service_error_event(name, &message);
-                match intent {
-                    TaskRunIntent::Scheduled { done_tx } => {
-                        let _ = done_tx
-                            .send(ItemDone {
-                                name: name.to_string(),
-                                kind: NodeKind::Task,
-                                success: false,
-                                message: Some(message),
-                                elapsed: None,
-                                last_run: None,
-                                service_start_generation: None,
-                                task_run_generation: None,
-                            })
-                            .await;
-                    }
-                    TaskRunIntent::Background => {
-                        if let Some(rt) = self.tasks.get_mut(name)
-                            && let Some(waiter) = rt.run_waiter.take()
-                        {
-                            waiter.complete(Err(CommandError::Failed {
-                                name: name.to_string(),
-                                message: message.clone(),
-                            }));
-                        }
-                        let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                self.settle_task_without_spawn(
+                    name,
+                    task_cfg,
+                    intent,
+                    task_supervisor::NoSpawnOutcome::failed(message),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Apply a prepared run that never spawned a process.
+    ///
+    /// `PendingRun`, `Skipped` and a preparation failure differ only in the
+    /// state they land in, what they tell the dependency scheduler, and how
+    /// loudly they say so — all of which live on the outcome. What stays here
+    /// is the part only the runner may do: transition item state, which wakes
+    /// the cross-item dependency sweep.
+    async fn settle_task_without_spawn(
+        &mut self,
+        name: &str,
+        task_cfg: &crate::config::Task,
+        intent: TaskRunIntent,
+        outcome: task_supervisor::NoSpawnOutcome,
+    ) {
+        if task_cfg.terminal.is_foreground() {
+            self.output_manager.resume_visible_output();
+        }
+        let scheduled = matches!(intent, TaskRunIntent::Scheduled { .. });
+        if let Some(needs_run_now) = outcome.needs_run_now(scheduled)
+            && let Some(rt) = self.tasks.get_mut(name)
+        {
+            rt.set_needs_run_now(needs_run_now);
+        }
+        self.set_task_state(name, outcome.state);
+        outcome.emit(&self.output_manager.clone_lifecycle_emitter(), name);
+
+        match intent {
+            TaskRunIntent::Scheduled { done_tx } => {
+                let _ = done_tx
+                    .send(ItemDone {
+                        name: name.to_string(),
+                        kind: NodeKind::Task,
+                        success: outcome.success,
+                        message: outcome.failure_message(),
+                        elapsed: None,
+                        last_run: None,
+                        service_start_generation: None,
+                        task_run_generation: None,
+                    })
+                    .await;
+            }
+            // A deferred or skipped background run has nobody to tell: it is
+            // not an outcome anyone is waiting on. Only a failure is.
+            TaskRunIntent::Background => {
+                if !outcome.success {
+                    if let Some(rt) = self.tasks.get_mut(name)
+                        && let Some(waiter) = rt.run_waiter.take()
+                    {
+                        waiter.complete(Err(CommandError::Failed {
                             name: name.to_string(),
-                            success: false,
-                        });
+                            message: outcome.message.clone(),
+                        }));
                     }
+                    let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
+                        name: name.to_string(),
+                        success: false,
+                    });
                 }
             }
         }
