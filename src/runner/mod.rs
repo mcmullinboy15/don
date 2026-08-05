@@ -25,7 +25,6 @@ mod service_ready;
 mod service_worker;
 mod setup;
 mod shutdown;
-mod signals;
 mod startup;
 mod state;
 mod status;
@@ -39,7 +38,6 @@ pub(crate) mod task;
 
 pub(crate) use params::resolve_task_params;
 pub use profile::resolve_profile_items;
-pub use signals::{install_signal_handlers, signal_count};
 pub use terminal::{TerminalCoordinator, TerminalRequest};
 
 use crate::config::{Config, Platform, ShutdownConfig};
@@ -68,9 +66,9 @@ use self::health::unhealthy_restart_backoff_secs;
 #[cfg(test)]
 use self::paths::any_glob_path_changed_since;
 use self::service_worker::ServiceStartContext;
-use self::signals::shutdown_requested;
 use self::support::check_gitignore;
 use self::task_worker::TaskRunPrepared;
+use crate::signals::shutdown_requested;
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);

@@ -5,51 +5,18 @@
 
 use bollard::models::PortBinding;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::path::PathBuf;
 
 use super::{DockerError, DockerPortBinding};
+// The port-mapping grammar lives with `config` so `don validate` can reject a
+// bad mapping without Docker involved; this layer adds the bollard types.
+use crate::config::ports::{DockerPortSpec, PortProtocol, PortSpecError};
 
 /// Bollard port binding map: container port -> host bindings.
 pub(crate) type PortMap = HashMap<String, Option<Vec<PortBinding>>>;
 /// Bollard exposed ports list.
 pub(crate) type ExposedPorts = Vec<String>;
-
-/// Transport protocol for a Docker port mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PortProtocol {
-    Tcp,
-    Udp,
-}
-
-impl PortProtocol {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Udp => "udp",
-        }
-    }
-}
-
-/// A validated Docker port mapping from configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DockerPortSpec {
-    pub(crate) configured: String,
-    pub(crate) host_ip: Option<IpAddr>,
-    pub(crate) host_port: u16,
-    pub(crate) container_port: u16,
-    pub(crate) protocol: PortProtocol,
-}
-
-impl DockerPortSpec {
-    pub(crate) fn container_key(&self) -> String {
-        format!("{}/{}", self.container_port, self.protocol.as_str())
-    }
-
-    fn bind_ip(&self) -> IpAddr {
-        self.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-    }
-}
 
 /// Validated mappings prepared for Docker container creation.
 #[derive(Debug, Clone)]
@@ -137,31 +104,16 @@ pub(crate) fn conflict_ports_in_message(message: &str) -> HashSet<u16> {
     ports
 }
 
-/// Parse port mapping strings into bollard's PortBinding format.
-///
-/// Accepts formats:
-/// - `"8080:80"` — host 8080 -> container 80/tcp
-/// - `"8080:80/tcp"` — explicit protocol
-/// - `"8080:80/udp"` — UDP
-/// - `"127.0.0.1:8080:80"` — bind to specific host IP
-///
-/// Returns `(port_bindings, exposed_ports)` for bollard's HostConfig and ContainerConfig.
-pub(crate) fn parse_port_mappings(
-    ports: &[String],
-) -> Result<(PortMap, ExposedPorts), DockerError> {
-    let prepared = prepare_port_mappings(ports, false, &[])?;
-    Ok((prepared.bindings, prepared.exposed))
-}
-
 /// Parse and validate Docker port mappings without probing the host.
 ///
 /// Both port numbers must be numeric and fit in `u16`; container port zero is
 /// rejected. Host IPs, when present, must be valid IP literals.
 pub(crate) fn parse_port_specs(ports: &[String]) -> Result<Vec<DockerPortSpec>, DockerError> {
-    ports
-        .iter()
-        .map(|mapping| parse_one_port(mapping))
-        .collect()
+    crate::config::ports::parse_port_specs(ports).map_err(docker_err)
+}
+
+fn docker_err(e: PortSpecError) -> DockerError {
+    DockerError::InvalidPort(e.mapping, e.reason)
 }
 
 /// Prepare validated mappings for Docker.
@@ -203,95 +155,6 @@ pub(crate) fn prepare_port_mappings(
         specs,
         bindings,
         exposed,
-    })
-}
-
-/// Parse a single port mapping string.
-fn parse_one_port(mapping: &str) -> Result<DockerPortSpec, DockerError> {
-    // Split off protocol suffix if present.
-    let (addr_part, protocol) = if let Some(idx) = mapping.rfind('/') {
-        let proto = &mapping[idx + 1..];
-        let protocol = match proto {
-            "tcp" => PortProtocol::Tcp,
-            "udp" => PortProtocol::Udp,
-            _ => {
-                return Err(DockerError::InvalidPort(
-                    mapping.to_string(),
-                    format!("unknown protocol '{proto}', expected 'tcp' or 'udp'"),
-                ));
-            }
-        };
-        (&mapping[..idx], protocol)
-    } else {
-        (mapping, PortProtocol::Tcp)
-    };
-
-    // Split from the right so bracketed or unbracketed IPv6 host literals can
-    // contain colons. The last two fields are always host and container port.
-    let mut parts = addr_part.rsplitn(3, ':');
-    let container_port = parts.next().ok_or_else(|| {
-        DockerError::InvalidPort(
-            mapping.to_string(),
-            "expected format 'host_port:container_port' or 'host_ip:host_port:container_port'"
-                .to_string(),
-        )
-    })?;
-    let host_port = parts.next().ok_or_else(|| {
-        DockerError::InvalidPort(
-            mapping.to_string(),
-            "expected format 'host_port:container_port' or 'host_ip:host_port:container_port'"
-                .to_string(),
-        )
-    })?;
-    let host_ip = parts
-        .next()
-        .map(|raw| {
-            raw.strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or(raw)
-        })
-        .map(|raw| {
-            raw.parse::<IpAddr>().map_err(|e| {
-                DockerError::InvalidPort(
-                    mapping.to_string(),
-                    format!("invalid host IP '{raw}': {e}"),
-                )
-            })
-        })
-        .transpose()?;
-
-    if host_port.is_empty() || container_port.is_empty() {
-        return Err(DockerError::InvalidPort(
-            mapping.to_string(),
-            "host and container ports must not be empty".to_string(),
-        ));
-    }
-
-    let host_port = host_port.parse::<u16>().map_err(|e| {
-        DockerError::InvalidPort(
-            mapping.to_string(),
-            format!("invalid host port '{host_port}': {e}"),
-        )
-    })?;
-    let container_port = container_port.parse::<u16>().map_err(|e| {
-        DockerError::InvalidPort(
-            mapping.to_string(),
-            format!("invalid container port '{container_port}': {e}"),
-        )
-    })?;
-    if container_port == 0 {
-        return Err(DockerError::InvalidPort(
-            mapping.to_string(),
-            "container port must be between 1 and 65535".to_string(),
-        ));
-    }
-
-    Ok(DockerPortSpec {
-        configured: mapping.to_string(),
-        host_ip,
-        host_port,
-        container_port,
-        protocol,
     })
 }
 
@@ -646,9 +509,13 @@ mod tests {
 
         for case in cases {
             let input: Vec<String> = case.input.iter().map(|s| s.to_string()).collect();
-            let result = parse_port_mappings(&input);
+            // `prepare_port_mappings` with fallback off is exactly what the
+            // old `parse_port_mappings` wrapper did; the wrapper existed only
+            // for config validation, which now parses the specs directly.
+            let result = prepare_port_mappings(&input, false, &[]);
             if case.expect_ok {
-                let (bindings, exposed) = result.unwrap_or_else(|e| panic!("{}: {e}", case.name));
+                let prepared = result.unwrap_or_else(|e| panic!("{}: {e}", case.name));
+                let (bindings, exposed) = (prepared.bindings(), prepared.exposed());
 
                 for (container_key, host_port, host_ip) in &case.expected_bindings {
                     assert!(

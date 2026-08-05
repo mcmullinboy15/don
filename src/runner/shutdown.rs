@@ -1,9 +1,9 @@
 use super::graph::topological_sort;
 use super::service::ServiceHandle;
-use super::signals::force_shutdown_requested;
 use super::task_worker::TaskRunPrepared;
 use super::{Runner, RunnerInternalCommand, ServiceState, ServiceStopAction};
 use crate::runner::service::stop_service;
+use crate::signals::force_shutdown_requested;
 use std::collections::{BTreeMap, HashMap};
 use tokio::task::JoinSet;
 

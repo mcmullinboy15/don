@@ -8,6 +8,7 @@ mod download;
 mod group;
 pub(crate) mod param;
 mod platform;
+pub(crate) mod ports;
 mod profile;
 pub(crate) mod service;
 pub(crate) mod task;
@@ -471,7 +472,7 @@ impl Config {
                         "service '{name}': docker service must set `docker.image` or `docker.build`"
                     ));
                 }
-                if let Err(error) = crate::docker::parse::parse_port_mappings(&docker.ports) {
+                if let Err(error) = ports::parse_port_specs(&docker.ports) {
                     errors.push(format!("service '{name}': {error}"));
                 }
                 if self.fallback_ports && docker.container.is_some() {

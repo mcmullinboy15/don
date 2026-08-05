@@ -1,3 +1,9 @@
+//! Process-level shutdown signal handling.
+//!
+//! Lives at the crate root rather than under `runner` because it is not
+//! orchestration: the daemon needs it too, and having it inside `runner` was
+//! the sole reason `daemon` depended on `runner` at all.
+
 use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::mpsc;
 
@@ -46,10 +52,10 @@ pub fn signal_count() -> u8 {
     SIGNAL_COUNT.load(Ordering::SeqCst)
 }
 
-pub(in crate::runner) fn shutdown_requested() -> bool {
+pub(crate) fn shutdown_requested() -> bool {
     signal_count() >= 1
 }
 
-pub(in crate::runner) fn force_shutdown_requested() -> bool {
+pub(crate) fn force_shutdown_requested() -> bool {
     signal_count() >= 2
 }

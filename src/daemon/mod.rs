@@ -142,7 +142,7 @@ pub async fn run(options: DaemonOptions, report: Reporter) -> Result<(), DaemonE
         None => report("web ui disabled"),
     }
 
-    let signals = crate::runner::install_signal_handlers()
+    let signals = crate::signals::install_signal_handlers()
         .await
         .map_err(DaemonError::Signals)?;
 

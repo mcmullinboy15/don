@@ -4,13 +4,13 @@ use super::build_tools::{
 use super::graph::{dep_name_map, topological_sort};
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ServiceStartMode;
-use super::signals::shutdown_requested;
 use super::task_worker::TaskRunMode;
 use super::{
     NodeKind, Runner, RunnerCommand, RunnerInternalCommand, RuntimeService, ServiceState,
     TaskItemState, TaskRunIntent,
 };
 use crate::config::Dependency;
+use crate::signals::shutdown_requested;
 use std::collections::HashMap;
 
 fn push_unique_name(names: &mut Vec<String>, name: &str) {

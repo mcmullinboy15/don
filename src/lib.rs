@@ -15,6 +15,7 @@ pub mod process;
 pub(crate) mod proxy;
 pub mod runner;
 pub(crate) mod server;
+pub mod signals;
 pub mod task_state;
 pub(crate) mod tui;
 pub(crate) mod update;

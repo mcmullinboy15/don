@@ -2205,7 +2205,7 @@ async fn run_start(
 
     // Install signal handlers before building the runner so Ctrl+C still
     // reaches the graceful-shutdown path even during a slow startup.
-    let shutdown_rx = don::runner::install_signal_handlers()
+    let shutdown_rx = don::signals::install_signal_handlers()
         .await
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
 
@@ -2511,7 +2511,7 @@ where
     let poll_interval = std::time::Duration::from_millis(100);
 
     loop {
-        if don::runner::signal_count() >= 2 {
+        if don::signals::signal_count() >= 2 {
             errln(format!("forcing exit while {phase}"));
             handle.abort();
             let _ = handle.await;
