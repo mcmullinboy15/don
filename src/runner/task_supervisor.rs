@@ -80,17 +80,25 @@ impl TaskRuns {
         self.busy.load(Ordering::Relaxed)
     }
 
-    /// Stop the supervisor, cancelling any run it is preparing.
+    /// Cancel any run in preparation, returning the handle to await.
+    ///
+    /// Deliberately *not* an `async fn` that also waits: shutdown has to fire
+    /// every abort before waiting on any of them, or a project with N tasks
+    /// pays the timeout N times over instead of once. Every other teardown
+    /// loop in `shutdown.rs` has the same shape.
     ///
     /// Aborting mid-preparation can strand a process the worker had just
     /// spawned — the handle dies with the future. That is pre-existing (the
     /// runner aborted `run_worker` the same way), and shutdown's
     /// `stop_late_task_start` is what catches the case where the spawn
     /// already reported in.
-    pub(in crate::runner) async fn shutdown(self) {
-        drop(self.tx);
-        self.join.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.join).await;
+    pub(in crate::runner) fn abort(self) -> tokio::task::JoinHandle<()> {
+        let Self { tx, join, busy: _ } = self;
+        // Dropping the sender closes the mailbox, so nothing can queue a run
+        // even if the abort races the supervisor finishing on its own.
+        drop(tx);
+        join.abort();
+        join
     }
 }
 

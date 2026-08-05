@@ -88,13 +88,18 @@ impl Runner {
 
         // Stop every task's run supervisor, cancelling anything it is
         // preparing. Draining the map drops the senders too, so nothing can
-        // queue a run after this point.
+        // queue a run after this point. Abort them all before awaiting any,
+        // or the 1s bound is paid once per task rather than once.
+        let mut run_supervisors = Vec::new();
         for (name, runs) in std::mem::take(&mut self.task_runs) {
             if runs.is_busy() {
                 self.output_manager
                     .service_event(&name, "run cancelled by shutdown");
             }
-            runs.shutdown().await;
+            run_supervisors.push(runs.abort());
+        }
+        for handle in run_supervisors {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
 
         // Same treatment for any in-flight JIT lazy builds. These are
