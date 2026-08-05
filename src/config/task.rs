@@ -6,7 +6,7 @@ use super::dependency::Dependency;
 use super::download::DownloadConfig;
 use super::param::TaskParam;
 use super::platform::Platform;
-use super::types::{BazelConfig, LogConfig, TurboConfig};
+use super::types::{BazelConfig, LogConfig};
 
 /// Automatic run policy for a task.
 ///
@@ -222,11 +222,7 @@ pub struct Task {
     /// replaces `cmd`. Without a matching platform entry, `cmd` is looked up on PATH.
     pub download: Option<DownloadConfig>,
     /// Bazel build tool integration — auto-resolve watch patterns from the build graph.
-    /// Mutually exclusive with `turbo`.
     pub bazel: Option<BazelConfig>,
-    /// Turborepo build tool integration — auto-resolve watch patterns from the task graph.
-    /// Mutually exclusive with `bazel`.
-    pub turbo: Option<TurboConfig>,
     /// Optional parameter declarations. When non-empty, the task is
     /// considered "interactive" — when the task is needed, file-watch
     /// changes or dependent startup will park it in `PendingRun` instead
@@ -250,7 +246,6 @@ pub struct Task {
 impl Task {
     pub(crate) fn build_tool_watch_enabled(&self) -> bool {
         self.bazel.as_ref().is_some_and(|bazel| bazel.watch)
-            || self.turbo.as_ref().is_some_and(|turbo| turbo.watch)
     }
 
     pub(crate) fn apply_headless_override(&mut self) {

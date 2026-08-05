@@ -1586,9 +1586,6 @@ fn print_verbose_info(info: &don::runner::VerboseInfo, show_watch_paths: bool) {
     if let Some(ref target) = info.bazel_target {
         println!("  {dim}bazel:{reset}  {target}");
     }
-    if let Some(ref task) = info.turbo_task {
-        println!("  {dim}turbo:{reset}  {task}");
-    }
     // When inspecting a single item, expand the full resolved watch path list
     // (these are dynamically resolved for build-tool services, so the count
     // alone hides what's actually being watched). In the all-items view keep it
@@ -2133,16 +2130,11 @@ async fn run_start(
     };
     let uses_bazel = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Bazel(_)))
         || config.tasks.values().any(|t| t.bazel.is_some());
-    let uses_turbo = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Turbo(_)))
-        || config.tasks.values().any(|t| t.turbo.is_some());
     let build_tool_log = don::config::LogConfig::Stdout;
-    let build_tool_configs: Vec<(&str, &don::config::LogConfig)> = [
-        uses_bazel.then_some(("bazel", &build_tool_log)),
-        uses_turbo.then_some(("turbo", &build_tool_log)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let build_tool_configs: Vec<(&str, &don::config::LogConfig)> = uses_bazel
+        .then_some(("bazel", &build_tool_log))
+        .into_iter()
+        .collect();
 
     let all_configs: Vec<(&str, &don::config::LogConfig)> = service_configs
         .into_iter()
@@ -2264,8 +2256,8 @@ async fn run_start(
         }
 
         // Synthetic build-tool stream names that should appear in the TUI
-        // filter. Without these entries, lines emitted by the bazel/turbo
-        // clients (which carry `name = "bazel"` / `"turbo"`) are silently
+        // filter. Without these entries, lines emitted by the bazel
+        // client (which carries `name = "bazel"`) are silently
         // dropped by the filter's allowlist — the user sees nothing during
         // the build phase.
         let build_tool_names: Vec<String> = build_tool_configs

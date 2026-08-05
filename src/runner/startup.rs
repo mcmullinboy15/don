@@ -120,9 +120,7 @@ impl Runner {
         }
 
         let rt = self.tasks.get(name)?;
-        if rt.config.bazel.is_none() && rt.config.turbo.is_none() {
-            return None;
-        }
+        rt.config.bazel.as_ref()?;
         let working_dir = working_dir_for(&self.base_dir, rt.config.dir.as_deref());
         let ignore = resolve_watch_ignore_patterns(
             &working_dir,
@@ -134,7 +132,6 @@ impl Runner {
             name: name.to_string(),
             kind: NodeKind::Task,
             bazel: rt.config.bazel.clone(),
-            turbo: rt.config.turbo.clone(),
             watch_enabled: rt.config.build_tool_watch_enabled(),
             working_dir,
             ignore,
@@ -482,7 +479,7 @@ impl Runner {
             if !rs.resolved.is_build_tool_managed() {
                 continue;
             }
-            // Lazy bazel/turbo services defer their query+build+cquery to
+            // Lazy bazel services defer their query+build+cquery to
             // first connection (JIT in the `lazy_start_rx` handler). Pulling
             // them into the startup batch would query and build services
             // the user may never touch this session.
@@ -492,7 +489,7 @@ impl Runner {
             items.push(self.build_batch_item(name, NodeKind::Service, rs));
         }
         for (name, rt) in &self.tasks {
-            if rt.config.bazel.is_none() && rt.config.turbo.is_none() {
+            if rt.config.bazel.is_none() {
                 continue;
             }
             let working_dir = working_dir_for(&self.base_dir, rt.config.dir.as_deref());
@@ -506,7 +503,6 @@ impl Runner {
                 name: name.clone(),
                 kind: NodeKind::Task,
                 bazel: rt.config.bazel.clone(),
-                turbo: rt.config.turbo.clone(),
                 watch_enabled: rt.config.build_tool_watch_enabled(),
                 working_dir,
                 ignore,
@@ -537,7 +533,6 @@ impl Runner {
             name: name.to_string(),
             kind,
             bazel: rs.resolved.bazel_config().cloned(),
-            turbo: rs.resolved.turbo_config().cloned(),
             watch_enabled: rs.resolved.build_tool_watch_enabled(),
             working_dir,
             ignore,

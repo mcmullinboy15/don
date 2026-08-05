@@ -1,7 +1,6 @@
 use super::build_tools::{
     BazelRebuildItem, GraphRequeryOutcomeItem, GraphRequeryRequestItem, RebuildBatchOutcome,
-    RebuildBatchRequest, TurboRebuildItem, run_graph_requery_worker, run_rebuild_batch_worker,
-    send_watch_update,
+    RebuildBatchRequest, run_graph_requery_worker, run_rebuild_batch_worker, send_watch_update,
 };
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::{
@@ -11,8 +10,8 @@ use super::{
 impl Runner {
     /// Flush all pending build-tool rebuilds as a single batch.
     ///
-    /// Collects Bazel targets and Turbo filters from the queued services,
-    /// runs one build per tool, then restarts each affected service.
+    /// Collects Bazel targets from the queued services, runs one build, then
+    /// restarts each affected service.
     pub(in crate::runner) async fn flush_pending_rebuilds(&mut self) {
         let mut names = self.builds.take_pending_rebuilds();
 
@@ -51,7 +50,6 @@ impl Runner {
         }
 
         let mut bazel_items: Vec<BazelRebuildItem> = Vec::new();
-        let mut turbo_items: Vec<TurboRebuildItem> = Vec::new();
         // Services without a build tool target (shouldn't happen, but handle gracefully)
         let mut plain_rebuilds: Vec<String> = Vec::new();
 
@@ -68,27 +66,6 @@ impl Runner {
                             ),
                         });
                     }
-                    Some(crate::config::ServiceKind::Turbo(turbo)) => {
-                        let build_task = turbo
-                            .build_task
-                            .clone()
-                            .unwrap_or_else(|| "build".to_string());
-                        if !build_task.is_empty()
-                            && let Some(ref filter) = turbo.filter
-                        {
-                            turbo_items.push(TurboRebuildItem {
-                                name: name.clone(),
-                                filter: filter.clone(),
-                                build_task,
-                                working_dir: working_dir_for(
-                                    &self.base_dir,
-                                    rs.resolved.dir.as_deref(),
-                                ),
-                            });
-                        } else {
-                            plain_rebuilds.push(name.clone());
-                        }
-                    }
                     _ => {
                         plain_rebuilds.push(name.clone());
                     }
@@ -97,7 +74,6 @@ impl Runner {
         }
         let request = RebuildBatchRequest {
             bazel_items,
-            turbo_items,
             plain_rebuilds,
             force: false,
         };
@@ -230,7 +206,6 @@ impl Runner {
                 name: name.to_string(),
             })?;
         let mut bazel_items: Vec<BazelRebuildItem> = Vec::new();
-        let mut turbo_items: Vec<TurboRebuildItem> = Vec::new();
         let mut plain_rebuilds: Vec<String> = Vec::new();
 
         match &rs.resolved.kind {
@@ -241,24 +216,6 @@ impl Runner {
                     working_dir: working_dir_for(&self.base_dir, rs.resolved.dir.as_deref()),
                 });
             }
-            Some(crate::config::ServiceKind::Turbo(turbo)) => {
-                let build_task = turbo
-                    .build_task
-                    .clone()
-                    .unwrap_or_else(|| "build".to_string());
-                if !build_task.is_empty()
-                    && let Some(ref filter) = turbo.filter
-                {
-                    turbo_items.push(TurboRebuildItem {
-                        name: name.to_string(),
-                        filter: filter.clone(),
-                        build_task,
-                        working_dir: working_dir_for(&self.base_dir, rs.resolved.dir.as_deref()),
-                    });
-                } else {
-                    plain_rebuilds.push(name.to_string());
-                }
-            }
             _ => plain_rebuilds.push(name.to_string()),
         }
         // This build supersedes anything queued for the batch.
@@ -266,7 +223,6 @@ impl Runner {
 
         let request = RebuildBatchRequest {
             bazel_items,
-            turbo_items,
             plain_rebuilds,
             force: true,
         };
@@ -431,14 +387,13 @@ impl Runner {
 
         let mut items = Vec::new();
         for name in &names {
-            let (bazel, turbo, watch_enabled, item_dir, ignore_patterns) =
+            let (bazel, watch_enabled, item_dir, ignore_patterns) =
                 if let Some(rs) = self.services.get(name) {
                     if !rs.resolved.build_tool_watch_enabled() {
                         continue;
                     }
                     (
                         rs.resolved.bazel_config().cloned(),
-                        rs.resolved.turbo_config().cloned(),
                         rs.resolved.build_tool_watch_enabled(),
                         rs.resolved.dir.clone(),
                         rs.resolved.ignore.clone(),
@@ -449,7 +404,6 @@ impl Runner {
                     }
                     (
                         rt.config.bazel.clone(),
-                        rt.config.turbo.clone(),
                         rt.config.build_tool_watch_enabled(),
                         rt.config.dir.clone(),
                         rt.config.ignore.clone(),
@@ -457,7 +411,7 @@ impl Runner {
                 } else {
                     continue;
                 };
-            if bazel.is_none() && turbo.is_none() {
+            if bazel.is_none() {
                 continue;
             }
             let working_dir = working_dir_for(&self.base_dir, item_dir.as_deref());
@@ -470,7 +424,6 @@ impl Runner {
             items.push(GraphRequeryRequestItem {
                 name: name.clone(),
                 bazel,
-                turbo,
                 watch_enabled,
                 working_dir,
                 ignore_patterns,

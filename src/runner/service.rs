@@ -174,25 +174,6 @@ pub(crate) async fn start_service(
                 )
             }
         }
-        Some(ServiceKind::Turbo(turbo)) => {
-            if let Some(ref filter) = turbo.filter {
-                (
-                    "npx".to_string(),
-                    vec![
-                        "turbo".to_string(),
-                        "run".to_string(),
-                        turbo.task.clone(),
-                        "--filter".to_string(),
-                        filter.clone(),
-                    ],
-                )
-            } else {
-                (
-                    "npx".to_string(),
-                    vec!["turbo".to_string(), "run".to_string(), turbo.task.clone()],
-                )
-            }
-        }
         _ => {
             return Err(crate::process::ProcessError::Spawn {
                 cmd: name.to_string(),

@@ -233,7 +233,7 @@ impl BuildBatcher {
     /// Awaiting matters as much as aborting. The worker holds
     /// [`LifecycleEmitter`] clones and the `Child` inside has
     /// `kill_on_drop(true)`, so dropping the aborted future is what SIGKILLs
-    /// the bazel/turbo client — and `OutputManager::shutdown` blocks until
+    /// the bazel client — and `OutputManager::shutdown` blocks until
     /// every sink handle is gone. The 5s bound guards the pathological case
     /// of a stuck bazel pipe: better to continue shutdown than wedge on it.
     ///

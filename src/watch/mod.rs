@@ -561,15 +561,15 @@ impl WatchManager {
         // Per-package BUILD / package.json watches are NOT seeded here —
         // they're registered lazily via `WatchUpdate { kind: BuildGraph, .. }`
         // once `run_batch_build_chain` resolves the actual package list from
-        // `bazel query` / `turbo run --dry-run`. Seeding them from `**/BUILD`
+        // `bazel query`. Seeding them from `**/BUILD`
         // would force a recursive `watcher.watch` on the workspace root,
         // which follows `bazel-*` symlinks into the bazel cache and takes
         // minutes on large monorepos (3,000+ external repos under
         // `execroot/_main/external/`).
         //
         // What IS seeded: a single non-recursive watch on the workspace root
-        // for workspace-level files (WORKSPACE, MODULE.bazel, turbo.json,
-        // pnpm-workspace.yaml). These change rarely but must trigger a full
+        // for workspace-level files (WORKSPACE, MODULE.bazel). These change
+        // rarely but must trigger a full
         // build-graph re-query.
         {
             let has_bazel = config.services.values().any(|s| {
@@ -581,29 +581,13 @@ impl WatchManager {
                 .tasks
                 .values()
                 .any(|t| t.bazel.as_ref().is_some_and(|bazel| bazel.watch));
-            let has_turbo = config.services.values().any(|s| {
-                let resolved = s.resolve(platform);
-                resolved
-                    .turbo_config()
-                    .is_some_and(|turbo| resolved.reload && turbo.watch)
-            }) || config
-                .tasks
-                .values()
-                .any(|t| t.turbo.as_ref().is_some_and(|turbo| turbo.watch));
-
-            if has_bazel || has_turbo {
+            if has_bazel {
                 let graph_setup_started = Instant::now();
                 emitter.debug_event(&format!(
-                    "watch: workspace graph setup started bazel={has_bazel} turbo={has_turbo} root={}",
+                    "watch: workspace graph setup started bazel={has_bazel} root={}",
                     base_dir.display()
                 ));
-                let mut root_file_names: Vec<&str> = Vec::new();
-                if has_bazel {
-                    root_file_names.extend(["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"]);
-                }
-                if has_turbo {
-                    root_file_names.extend(["turbo.json", "turbo.jsonc", "pnpm-workspace.yaml"]);
-                }
+                let root_file_names = ["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"];
 
                 let mut compiled_patterns = Vec::new();
                 for file_name in &root_file_names {

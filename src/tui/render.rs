@@ -65,7 +65,7 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(block, box_area);
 
     // Count only services for the filter badge — tasks and synthetic
-    // streams (don/bazel/turbo) are filterable too, but the bar should
+    // streams (don/bazel) are filterable too, but the bar should
     // echo what the user thinks of as "my services." Lazy services are
     // excluded so the denominator matches `counts.services_total` (which
     // excludes Lazy for the same "not-yet-started" reason).

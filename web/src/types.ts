@@ -59,7 +59,6 @@ export interface VerboseInfo {
   docker_ports?: string[];
   proxy_active_connections?: number;
   bazel_target?: string;
-  turbo_task?: string;
   ready?: string;
   cmd?: string;
   watch_state?: string;

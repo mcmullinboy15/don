@@ -145,7 +145,7 @@ pub(crate) enum ServiceStopAction {
 #[serde(rename_all = "lowercase")]
 pub enum ServiceState {
     Pending,
-    /// A batch or lazy JIT build (bazel/turbo) is in flight. Transitions to
+    /// A batch or lazy JIT build (bazel) is in flight. Transitions to
     /// Pending on success (then the service starts like any other) or Failed
     /// on build error. File-watch rebuilds keep the service in Running/Ready.
     Building,
@@ -643,9 +643,6 @@ pub struct VerboseInfo {
     /// Bazel target (if configured).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bazel_target: Option<String>,
-    /// Turbo task (if configured).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turbo_task: Option<String>,
     /// Params a task declares, so a client can render a run form without
     /// reading `don.toml` itself. Empty for services.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -865,11 +862,11 @@ pub struct Runner {
     shutdown_rx: Option<mpsc::Receiver<()>>,
 
     /// Detached batch-build task spawned at startup for services/tasks with
-    /// a bazel/turbo config. `Some` until [`RunnerInternalCommand::BatchBuildComplete`]
+    /// a bazel config. `Some` until [`RunnerInternalCommand::BatchBuildComplete`]
     /// arrives and the handle is consumed. Wrapped in [`AbortOnDrop`] so
     /// shutting the runner down — or dropping the field before completion —
     /// aborts the task, dropping the in-flight `Child` (with `kill_on_drop`)
-    /// and sending SIGKILL to the bazel/turbo client.
+    /// and sending SIGKILL to the bazel client.
     batch_build_handle: Option<crate::build_tool::AbortOnDrop<()>>,
 
     /// Detached JIT build tasks spawned when a lazy service's proxy gets
@@ -877,7 +874,7 @@ pub struct Runner {
     /// on spawn and removed when [`RunnerInternalCommand::LazyBuildComplete`]
     /// arrives. Wrapped in [`AbortOnDrop`] for the same reason as
     /// [`Self::batch_build_handle`]: on shutdown we abort any in-flight
-    /// JIT builds so bazel/turbo output stops streaming before
+    /// JIT builds so bazel output stops streaming before
     /// "shutdown complete" is emitted.
     lazy_build_handles: HashMap<String, (u64, crate::build_tool::AbortOnDrop<()>)>,
 
@@ -1350,7 +1347,7 @@ impl Runner {
             if task_count == 1 { "" } else { "s" },
         ));
 
-        // Register synthetic "bazel" / "turbo" streams so build-tool output
+        // Register the synthetic "bazel" stream so build-tool output
         // gets a color-coded prefix column like real services, instead of
         // riding on `[don]` lifecycle events with a `bazel:` text prefix.
         let has_bazel = self
@@ -1358,16 +1355,8 @@ impl Runner {
             .values()
             .any(|rs| rs.resolved.bazel_config().is_some())
             || self.config.tasks.values().any(|t| t.bazel.is_some());
-        let has_turbo = self
-            .services
-            .values()
-            .any(|rs| rs.resolved.turbo_config().is_some())
-            || self.config.tasks.values().any(|t| t.turbo.is_some());
         if has_bazel {
             self.output_manager.register_build_tool("bazel").await;
-        }
-        if has_turbo {
-            self.output_manager.register_build_tool("turbo").await;
         }
 
         // Pre-bind all proxy listeners. This catches port conflicts upfront
@@ -1534,7 +1523,7 @@ impl Runner {
             }
         }
 
-        // Kick off batch builds (bazel/turbo) as a detached task. The runner
+        // Kick off batch builds (bazel) as a detached task. The runner
         // keeps processing the main command loop — shutdown signals,
         // connection-triggered lazy starts, and non-build-tool services all
         // stay responsive while bazel crunches. On completion the task posts
@@ -1543,7 +1532,7 @@ impl Runner {
         //
         // The handle is stored as `AbortOnDrop` on `self` so `Shutdown` drops
         // the in-flight `Child`, whose `kill_on_drop(true)` sends SIGKILL to
-        // the bazel/turbo client.
+        // the bazel client.
         let batch_items = self.collect_batch_build_items();
         for item in &batch_items {
             match item.kind {
@@ -3149,7 +3138,6 @@ mod tests {
                 auto_run: crate::config::TaskAutoRun::Always,
                 download: None,
                 bazel: None,
-                turbo: None,
                 params: Vec::new(),
                 hidden: false,
                 auto_filter_on_failure: None,

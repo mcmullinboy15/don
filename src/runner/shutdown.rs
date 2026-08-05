@@ -40,7 +40,7 @@ impl Runner {
         // Abort the detached batch-build task and await its termination so
         // it can't keep any `LifecycleEmitter`/`SinkHandle` clones alive
         // past shutdown. The `Child` inside has `kill_on_drop(true)`, so
-        // dropping the aborted future SIGKILLs the bazel/turbo client;
+        // dropping the aborted future SIGKILLs the bazel client;
         // awaiting the JoinHandle guarantees the drop has actually run
         // before we continue. A 5s timeout guards against the pathological
         // case where the inner reader tasks don't drop promptly — we'd
@@ -98,7 +98,7 @@ impl Runner {
 
         // Same treatment for any in-flight JIT lazy builds. These are
         // spawned when a lazy service's proxy gets its first connection
-        // and, until this was tracked, would keep streaming bazel/turbo
+        // and, until this was tracked, would keep streaming bazel
         // output long past "shutdown complete".
         let lazy_handles: Vec<tokio::task::JoinHandle<()>> = self
             .lazy_build_handles

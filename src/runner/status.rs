@@ -249,7 +249,6 @@ impl Runner {
                         .as_ref()
                         .and_then(|proxy| proxy.active_forward_connections()),
                     bazel_target: resolved.bazel_config().map(|b| b.target.clone()),
-                    turbo_task: resolved.turbo_config().map(|t| t.task.clone()),
                     ready,
                     cmd,
                     watch_state: watch_item.map(|item| {
@@ -327,7 +326,6 @@ impl Runner {
                     docker_ports: Vec::new(),
                     proxy_active_connections: None,
                     bazel_target: task.bazel.as_ref().map(|b| b.target.clone()),
-                    turbo_task: task.turbo.as_ref().map(|t| t.task.clone()),
                     params: task
                         .params
                         .iter()

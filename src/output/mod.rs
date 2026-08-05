@@ -60,7 +60,6 @@ const SERVICE_COLORS: &[Color] = &[
 /// Dedicated build-tool colors so these synthetic streams stay neutral and
 /// never collide with the rotating service palette.
 const BAZEL_COLOR: Color = Color::Grey;
-const TURBO_COLOR: Color = Color::Grey;
 
 /// Handle to an active OSC response sink. Use [`take_pty_write`] to
 /// stop the sink and reclaim the PTY handle (e.g., for attach).
@@ -569,7 +568,6 @@ impl ServiceWriter {
 fn reserved_color(name: &str) -> Option<Color> {
     match name {
         "bazel" => Some(BAZEL_COLOR),
-        "turbo" => Some(TURBO_COLOR),
         _ => None,
     }
 }
@@ -672,8 +670,6 @@ pub struct OutputManager {
     /// back to a `[don]`-prefixed lifecycle event with a `bazel:` text
     /// prefix.
     bazel_prefix: Option<Bytes>,
-    /// Same as `bazel_prefix` for the synthetic "turbo" stream.
-    turbo_prefix: Option<Bytes>,
 }
 
 /// Errors from output handling.
@@ -872,16 +868,15 @@ impl OutputManager {
             stdout_pause,
             log_filter,
             bazel_prefix: None,
-            turbo_prefix: None,
         })
     }
 
-    /// Register a synthetic "tool" service (`bazel` or `turbo`) so build
+    /// Register a synthetic "tool" service (`bazel`) so build
     /// output gets its own color-coded prefix column instead of an inline
     /// `bazel: …` text prefix on a `[don]` lifecycle event.
     ///
     /// Idempotent: if already registered, just returns — the cached prefix
-    /// stays intact. Name must be either `"bazel"` or `"turbo"` (panics
+    /// stays intact. Name must be `"bazel"` (panics
     /// otherwise in debug builds; silently drops the prefix cache in
     /// release).
     /// Restrict stdout-bound output to lines whose source name is in
@@ -912,7 +907,6 @@ impl OutputManager {
         };
         match name {
             "bazel" => self.bazel_prefix = prefix,
-            "turbo" => self.turbo_prefix = prefix,
             _ => debug_assert!(false, "register_build_tool: unknown tool '{name}'"),
         }
     }
@@ -931,21 +925,6 @@ impl OutputManager {
                 });
             }
             None => self.lifecycle_event(&format!("bazel: {message}")),
-        }
-    }
-
-    /// Emit a line prefixed as turbo tool output.
-    pub fn turbo_event(&self, message: &str) {
-        match self.turbo_prefix.as_ref() {
-            Some(prefix) => {
-                let _ = self.stdout_sink.send(SinkLine {
-                    prefix: prefix.clone(),
-                    line: Bytes::from(format!("{message}\n")),
-                    name: "turbo".to_string(),
-                    is_lifecycle: true,
-                });
-            }
-            None => self.lifecycle_event(&format!("turbo: {message}")),
         }
     }
 
@@ -1057,7 +1036,7 @@ impl OutputManager {
     }
 
     /// Register a service that wasn't known at OutputManager construction
-    /// (currently used by `register_build_tool` to give `bazel` / `turbo`
+    /// (currently used by `register_build_tool` to give `bazel`
     /// their own prefix column). Creates a ring buffer, assigns a color,
     /// and wires up sinks based on the log config. Existing services are
     /// left unchanged.
@@ -1147,7 +1126,6 @@ impl OutputManager {
             don_prefix: self.don_prefix.clone(),
             stdout_sink: self.stdout_sink.clone(),
             bazel_prefix: self.bazel_prefix.clone(),
-            turbo_prefix: self.turbo_prefix.clone(),
             verbosity: self.verbosity.clone(),
         }
     }
@@ -1311,7 +1289,7 @@ impl OutputManager {
 /// events. This hands out that slice, scoped to a single name.
 ///
 /// "Item" rather than "service" because tasks use the same machinery — and so
-/// do the synthetic `bazel` / `turbo` streams. The name is whatever the
+/// does the synthetic `bazel` stream. The name is whatever the
 /// stream was registered under.
 #[derive(Clone)]
 pub struct ItemOutput {
@@ -1393,7 +1371,6 @@ pub struct LifecycleEmitter {
     don_prefix: String,
     stdout_sink: SinkHandle,
     bazel_prefix: Option<Bytes>,
-    turbo_prefix: Option<Bytes>,
     verbosity: VerbosityControl,
 }
 
@@ -1449,7 +1426,7 @@ impl LifecycleEmitter {
     /// to be passed to `execve`. Use before every `Command::spawn()` so
     /// `don -v` shows what don is actually asking the kernel to run.
     ///
-    /// `label` is a short tag (e.g. service name, "bazel", "turbo") to
+    /// `label` is a short tag (e.g. service name, "bazel") to
     /// help the user identify the source of the spawn.
     pub fn debug_spawn<S: AsRef<str>>(&self, label: &str, cmd: &str, args: &[S]) {
         if !self.verbosity.is_enabled() {
@@ -1472,21 +1449,6 @@ impl LifecycleEmitter {
                 });
             }
             None => self.lifecycle_event(&format!("bazel: {message}")),
-        }
-    }
-
-    /// Emit a line prefixed as turbo tool output.
-    pub fn turbo_event(&self, message: &str) {
-        match self.turbo_prefix.as_ref() {
-            Some(prefix) => {
-                let _ = self.stdout_sink.send(SinkLine {
-                    prefix: prefix.clone(),
-                    line: Bytes::from(format!("{message}\n")),
-                    name: "turbo".to_string(),
-                    is_lifecycle: true,
-                });
-            }
-            None => self.lifecycle_event(&format!("turbo: {message}")),
         }
     }
 }
@@ -1882,9 +1844,8 @@ mod tests {
 
     #[test]
     fn test_build_tool_colors_are_reserved() {
-        let result = assign_colors(&["api", "bazel", "turbo", "worker"]);
+        let result = assign_colors(&["api", "bazel", "worker"]);
         assert_eq!(result["bazel"], BAZEL_COLOR);
-        assert_eq!(result["turbo"], TURBO_COLOR);
         assert_eq!(result["bazel"], Color::Grey);
     }
 

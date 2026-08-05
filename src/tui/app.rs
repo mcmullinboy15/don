@@ -280,7 +280,7 @@ impl App {
 
         let mut all_filter_names = service_names;
         all_filter_names.extend(task_names);
-        // Synthetic build-tool streams ("bazel", "turbo") emit under their
+        // The synthetic build-tool stream ("bazel") emits under its
         // own prefix, not under a service/task name. Without a filter entry
         // they're silently gated out — the user sees nothing while bazel
         // crunches. Add them only when the config actually uses them, so

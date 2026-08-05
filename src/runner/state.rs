@@ -56,7 +56,7 @@ pub(crate) struct RuntimeService {
     /// TCP proxy listener — outlives restarts. Owns the bound public
     /// listeners for both env and listenfd mode entries.
     pub proxy: Option<crate::proxy::ServiceProxy>,
-    /// Watch paths resolved from build tool queries (bazel/turbo).
+    /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
     /// Bazel binary path resolved via `bazel cquery --output=files`.
     pub bazel_binary_path: Option<String>,
@@ -233,7 +233,7 @@ pub(crate) struct RuntimeTask {
     pub attach_lock: Option<u32>,
     /// Pending attach waiter (client waiting for process to start).
     pub attach_waiter: Option<AttachWaiter>,
-    /// Watch paths resolved from build tool queries (bazel/turbo).
+    /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
     /// Output reader task for the current process. It must drain before
     /// output sinks are torn down or final shutdown logs can be lost.

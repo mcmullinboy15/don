@@ -140,7 +140,6 @@ mod tests {
             auto_run: crate::config::TaskAutoRun::Always,
             download: None,
             bazel: None,
-            turbo: None,
             params: vec![],
             hidden: false,
             auto_filter_on_failure: None,

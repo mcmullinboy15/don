@@ -123,7 +123,7 @@ run.args = ["run", "dev"]
 reload = false   # no watch registration, rebuilds, or restarts for this service
 ```
 
-Bazel and Turbo services/tasks also have nested `watch` flags. These are narrower: they only disable auto-resolved build-tool watch paths while still using the build tool for startup builds. Explicit service `watch = [...]` patterns still work unless `reload = false` is set.
+Bazel services/tasks also have a nested `watch` flag. It is narrower: it only disables auto-resolved build-tool watch paths while still using Bazel for startup builds. Explicit service `watch = [...]` patterns still work unless `reload = false` is set.
 
 ```toml
 [services.api]
@@ -363,7 +363,7 @@ run.args = ["run", "dev"]
 reload = false
 ```
 
-Bazel and Turbo have a second, narrower switch: `bazel.watch = false` or `turbo.watch = false` disables build-tool-resolved watch paths, but does not disable explicit service `watch = [...]` patterns.
+Bazel has a second, narrower switch: `bazel.watch = false` disables build-tool-resolved watch paths, but does not disable explicit service `watch = [...]` patterns.
 
 ### Docker Services
 
@@ -455,21 +455,6 @@ bazel.target = "//services/api:api"
 bazel.watch = false
 watch = ["services/api/**/*.py", "libs/common/**/*.py"]
 ```
-
-### Turborepo Integration
-
-For monorepos using Turborepo, Don auto-resolves the task graph:
-
-```toml
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-proxy = { listen = "127.0.0.1:3000", env = "PORT" }
-```
-
-Don queries `turbo run --dry-run=json` to discover workspace dependencies and input files, then watches them for changes. At startup, a batch `turbo run build` runs for all configured packages.
-
-Set `turbo.watch = false` to keep Turbo startup builds/runs but skip Turbo-derived watch paths. Explicit service `watch = [...]` patterns still apply unless `reload = false` is also set.
 
 ### TCP Proxy
 
@@ -824,10 +809,6 @@ See [`examples/`](examples/) for complete working configs.
 | `lazy` | bool | Delay start until first proxy connection |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
 | `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
-| `turbo.task` | string | Turborepo task name |
-| `turbo.filter` | string | Turborepo package filter |
-| `turbo.build_task` | string | Task to run during batch build (default: "build") |
-| `turbo.watch` | bool | Auto-resolve Turbo watch paths from the task graph (default: true); does not disable explicit service `watch` |
 | `download.platform.<platform>` | table | Per-platform download config |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
 | `fallback_ports` | bool | Top-level: use an OS-assigned proxy/Docker host port when the preferred port is in use |

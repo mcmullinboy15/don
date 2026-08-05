@@ -29,7 +29,7 @@ pub use self::task::{
 };
 pub use self::types::{
     BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
-    ShutdownConfig, TurboConfig,
+    ShutdownConfig,
 };
 
 pub use self::service::{GoConfig, ServiceOverride};
@@ -92,8 +92,42 @@ impl std::str::FromStr for Config {
     type Err = toml::de::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        toml::from_str(s)
+        let value: toml::Value = toml::from_str(s)?;
+        reject_removed_keys(&value).map_err(serde::de::Error::custom)?;
+        value.try_into()
     }
+}
+
+/// Config keys that used to configure a feature don no longer has.
+///
+/// Deserialization ignores unknown keys, so without this an upgraded user
+/// whose `don.toml` still says `turbo.task = "dev"` is told the service
+/// "must have one of: bazel, docker, rust, go, or run" — true, and useless
+/// about why a config that worked yesterday doesn't today.
+const REMOVED_KEYS: &[(&str, &str)] = &[(
+    "turbo",
+    "Turborepo support has been removed. Replace it with a `run` command \
+     (plus `build` if you need one), or use the bazel preset.",
+)];
+
+/// Reject a config that still uses a removed key, by name and location.
+fn reject_removed_keys(value: &toml::Value) -> Result<(), String> {
+    for section in ["services", "tasks"] {
+        let Some(items) = value.get(section).and_then(toml::Value::as_table) else {
+            continue;
+        };
+        let kind = section.trim_end_matches('s');
+        for (name, item) in items {
+            for (key, guidance) in REMOVED_KEYS {
+                if item.get(key).is_some() {
+                    return Err(format!(
+                        "{kind} '{name}': '{key}' is no longer supported. {guidance}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 const VALID_SIGNALS: &[&str] = &[
@@ -162,6 +196,9 @@ impl Config {
             }
         }
 
+        reject_removed_keys(&value).map_err(|error| ConfigError::Validation {
+            errors: vec![error],
+        })?;
         Ok(value.try_into()?)
     }
 
@@ -362,7 +399,7 @@ impl Config {
             // ServiceKind must be set (either on the base or via a platform override).
             if resolved.kind.is_none() {
                 errors.push(format!(
-                    "service '{name}': must have one of: bazel, turbo, docker, rust, go, or run"
+                    "service '{name}': must have one of: bazel, docker, rust, go, or run"
                 ));
             }
             if let Some(ref ready) = resolved.ready {
@@ -579,12 +616,6 @@ impl Config {
 
         // Validate tasks
         for (name, task) in &self.tasks {
-            // Bazel and turbo are mutually exclusive.
-            if task.bazel.is_some() && task.turbo.is_some() {
-                errors.push(format!(
-                    "task '{name}': 'bazel' and 'turbo' are mutually exclusive"
-                ));
-            }
             for dep in &task.depends_on {
                 if !dependency_reference_names.contains(dep.name.as_str()) {
                     let suggestion = suggest_typo(&dep.name, &dependency_reference_names);
@@ -2752,8 +2783,7 @@ mod tests {
                 name: "reload = false disables file watching",
                 input: r#"
                     [services.frontend]
-                    turbo.task = "dev"
-                    turbo.filter = "@myorg/frontend"
+                    bazel.target = "//frontend:frontend"
                     reload = false
                 "#,
                 expect_err: false,
@@ -3095,6 +3125,54 @@ mod tests {
         }
     }
 
+    /// An upgraded `don.toml` that still configures a removed feature must
+    /// say so by name. Unknown keys are otherwise ignored, which would leave
+    /// the user with a generic "must have one of: ..." and no idea why a
+    /// config that worked yesterday stopped.
+    #[test]
+    fn removed_keys_are_rejected_by_name() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            want_fragment: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "turbo service",
+                input: "[services.web]\nturbo.task = \"dev\"\n",
+                want_fragment: Some("service 'web': 'turbo' is no longer supported"),
+            },
+            Case {
+                name: "turbo task",
+                input: "[tasks.build]\ncmd = \"true\"\nturbo.task = \"build\"\n",
+                want_fragment: Some("task 'build': 'turbo' is no longer supported"),
+            },
+            Case {
+                name: "bazel is untouched",
+                input: "[services.api]\nbazel.target = \"//api:api\"\n",
+                want_fragment: None,
+            },
+        ];
+
+        for case in cases {
+            let parsed = case.input.parse::<Config>();
+            match case.want_fragment {
+                Some(fragment) => {
+                    let err = parsed.expect_err(case.name).to_string();
+                    assert!(
+                        err.contains(fragment),
+                        "{}: expected {fragment:?} in {err:?}",
+                        case.name
+                    );
+                }
+                None => {
+                    assert!(parsed.is_ok(), "{}: should still parse", case.name);
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_parse_bazel_config() {
         let toml = r#"
@@ -3127,41 +3205,6 @@ bazel.watch = false
     }
 
     #[test]
-    fn test_parse_turbo_config() {
-        let toml = r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-"#;
-        let config: Config = toml.parse().unwrap();
-        let svc = config.services.get("web").unwrap();
-        let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
-            panic!("expected turbo kind");
-        };
-        assert_eq!(turbo.task, "dev");
-        assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
-        assert!(turbo.watch);
-    }
-
-    #[test]
-    fn test_parse_turbo_watch_false() {
-        let toml = r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-turbo.watch = false
-"#;
-        let config: Config = toml.parse().unwrap();
-        let svc = config.services.get("web").unwrap();
-        let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
-            panic!("expected turbo kind");
-        };
-        assert_eq!(turbo.task, "dev");
-        assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
-        assert!(!turbo.watch);
-    }
-
-    #[test]
     fn test_parse_task_with_bazel() {
         let toml = r#"
 [tasks.codegen]
@@ -3172,7 +3215,6 @@ bazel.target = "//tools/codegen:all"
         let config: Config = toml.parse().unwrap();
         let task = config.tasks.get("codegen").unwrap();
         assert_eq!(task.bazel.as_ref().unwrap().target, "//tools/codegen:all");
-        assert!(task.turbo.is_none());
     }
 
     #[test]
@@ -3191,24 +3233,6 @@ bazel.target = "//services/api:api"
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("only one of"),
-            "expected mutual exclusivity error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_validate_bazel_turbo_mutually_exclusive_task() {
-        let toml = r#"
-[tasks.codegen]
-cmd = "build"
-bazel.target = "//tools:codegen"
-turbo.task = "build"
-"#;
-        let config: Config = toml.parse().unwrap();
-        let result = config.validate(TEST_PLATFORM);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("mutually exclusive"),
             "expected mutual exclusivity error, got: {err}"
         );
     }
@@ -3238,61 +3262,6 @@ bazel.target = "//services/api:macos_arm64"
             panic!("expected bazel kind on macos");
         };
         assert_eq!(bazel_mac.target, "//services/api:macos_arm64");
-    }
-
-    #[test]
-    fn test_turbo_build_task_config() {
-        struct Case {
-            name: &'static str,
-            toml: &'static str,
-            expected_build_task: Option<&'static str>,
-        }
-
-        let cases = vec![
-            Case {
-                name: "default build_task (not specified)",
-                toml: r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-"#,
-                expected_build_task: None,
-            },
-            Case {
-                name: "explicit build_task",
-                toml: r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-turbo.build_task = "compile"
-"#,
-                expected_build_task: Some("compile"),
-            },
-            Case {
-                name: "empty build_task opts out of batch build",
-                toml: r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-turbo.build_task = ""
-"#,
-                expected_build_task: Some(""),
-            },
-        ];
-
-        for case in cases {
-            let config: Config = case.toml.parse().unwrap();
-            let svc = config.services.get("web").unwrap();
-            let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
-                panic!("case '{}': expected turbo kind", case.name);
-            };
-            assert_eq!(
-                turbo.build_task.as_deref(),
-                case.expected_build_task,
-                "case: {}",
-                case.name
-            );
-        }
     }
 
     #[test]
