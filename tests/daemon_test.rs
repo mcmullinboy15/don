@@ -80,7 +80,7 @@ async fn spawn_runner(
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
     let emitter = output_manager.clone_lifecycle_emitter();
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
@@ -91,6 +91,11 @@ async fn spawn_runner(
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     if let Some(socket) = daemon_socket {
         // Exactly what the binary does — registration is the embedder's job,
         // driven off the runner's event stream.

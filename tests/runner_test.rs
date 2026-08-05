@@ -90,7 +90,7 @@ async fn make_runner_verbose(
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
@@ -101,6 +101,11 @@ async fn make_runner_verbose(
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     (runner, shutdown_tx, buf)
 }
 
@@ -2141,7 +2146,7 @@ fn integration_don_pid_file_prevents_double_start() {
         let (_shutdown_tx1, shutdown_rx1) = mpsc::channel(2);
 
         // First runner acquires the PID file.
-        let _runner1 = Runner::new(
+        let mut _runner1 = Runner::new(
             config,
             PLATFORM,
             output_manager,
@@ -2152,6 +2157,10 @@ fn integration_don_pid_file_prevents_double_start() {
         )
         .await
         .unwrap();
+        // The runner no longer binds its own API socket; the binary does,
+        // and so must anything else that wants CLI/daemon access.
+        let api_shutdown = don::server::serve_for_runner(&_runner1).unwrap();
+        _runner1.set_api_shutdown(api_shutdown);
 
         // Second runner should fail — PID file is held.
         let config2: Config = toml.parse().unwrap();

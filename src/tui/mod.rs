@@ -613,12 +613,9 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
         }
         // The TUI already shows per-item states, so it learns nothing extra
         // from the sweep finishing — that signal is for API clients deciding
-        // whether it's meaningful to ask the runner to run something. The
-        // socket path is already in the log line the runner emits alongside
-        // `ApiListening`.
+        // whether it's meaningful to ask the runner to run something.
         RunnerEvent::RebuildComplete { .. }
         | RunnerEvent::TaskRerunComplete { .. }
-        | RunnerEvent::ApiListening { .. }
         | RunnerEvent::StartupSettled
         | RunnerEvent::ShutdownStarted
         | RunnerEvent::ShutdownComplete => false,

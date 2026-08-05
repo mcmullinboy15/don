@@ -7,9 +7,9 @@
 //! daemon exists. So the runner broadcasts what happened and this watches for
 //! the two moments that matter:
 //!
-//! - [`RunnerEvent::ApiListening`] — the socket a daemon would proxy to now
-//!   exists, so there is something worth announcing.
-//! - [`RunnerEvent::ShutdownStarted`] — withdraw, as early as possible.
+//! Registration happens when the caller says so — it binds the API socket, so
+//! it is the thing that knows when there is something worth announcing.
+//! Withdrawal watches for [`RunnerEvent::ShutdownStarted`].
 //!
 //! Everything here is best-effort and nothing is ever awaited by the runner.
 //! A daemon that is absent, slow, or wedged must not cost a project a single
@@ -23,7 +23,9 @@ use crate::runner::RunnerEvent;
 use std::path::PathBuf;
 use tokio::sync::broadcast;
 
-/// Watch `events` and keep the daemon at `socket` informed about this project.
+/// Announce this project to the daemon at `socket`, and withdraw on shutdown.
+///
+/// Call once the API socket is bound and serving.
 ///
 /// `base_dir` must be the runner's *canonical* root ([`crate::Runner::base_dir`]) —
 /// the daemon keys projects by a hash of it, so registering under the
@@ -39,7 +41,11 @@ pub fn spawn(
     profile: Option<String>,
     emitter: LifecycleEmitter,
 ) {
+    let entry = ProjectEntry::new(base_dir.clone(), std::process::id(), profile);
     tokio::spawn(async move {
+        if let Some(message) = super::client::register_best_effort(socket.clone(), entry).await {
+            emitter.debug_event(&message);
+        }
         loop {
             let event = match events.recv().await {
                 Ok(event) => event,
@@ -49,22 +55,9 @@ pub fn spawn(
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return,
             };
-            match event {
-                RunnerEvent::ApiListening { .. } => {
-                    let entry =
-                        ProjectEntry::new(base_dir.clone(), std::process::id(), profile.clone());
-                    if let Some(message) =
-                        super::client::register_best_effort(socket.clone(), entry).await
-                    {
-                        emitter.debug_event(&message);
-                    }
-                }
-                RunnerEvent::ShutdownStarted => {
-                    super::client::deregister_best_effort(socket.clone(), project_id(&base_dir))
-                        .await;
-                    return;
-                }
-                _ => {}
+            if matches!(event, RunnerEvent::ShutdownStarted) {
+                super::client::deregister_best_effort(socket.clone(), project_id(&base_dir)).await;
+                return;
             }
         }
     });

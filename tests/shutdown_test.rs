@@ -111,7 +111,7 @@ async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     configure(&output_manager);
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
@@ -122,6 +122,10 @@ async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
 
     let handle = tokio::spawn(async move {
         let _ = runner.run().await;
@@ -156,7 +160,7 @@ async fn make_runner(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
@@ -167,6 +171,11 @@ async fn make_runner(
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     (runner, shutdown_tx, buf)
 }
 

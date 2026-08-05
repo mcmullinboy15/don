@@ -2310,7 +2310,7 @@ async fn run_start(
         // Clone before `output_manager` moves into the runner — the daemon
         // registration watcher reports failures at debug verbosity.
         let daemon_emitter = output_manager.clone_lifecycle_emitter();
-        let runner = await_with_shutdown_supervision(
+        let mut runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
                 async move {
@@ -2330,6 +2330,7 @@ async fn run_start(
             "starting runner",
         )
         .await?;
+        serve_project_api(&mut runner, &daemon_emitter);
         spawn_daemon_registration(&runner, daemon_emitter, profile_ref, no_daemon);
 
         let events = runner.subscribe();
@@ -2407,7 +2408,7 @@ async fn run_start(
         }
 
         let daemon_emitter = output_manager.clone_lifecycle_emitter();
-        let runner = await_with_shutdown_supervision(
+        let mut runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
                 async move {
@@ -2427,11 +2428,25 @@ async fn run_start(
             "starting runner",
         )
         .await?;
+        serve_project_api(&mut runner, &daemon_emitter);
         spawn_daemon_registration(&runner, daemon_emitter, profile_ref, no_daemon);
 
         let runner_task =
             tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
         await_with_shutdown_supervision(runner_task, "waiting for runner shutdown").await
+    }
+}
+
+/// Bind and serve this project's unix-socket API.
+///
+/// Done here rather than inside `Runner::run` so the runner never names the
+/// server — that edge was half of a dependency cycle. A bind failure is
+/// reported and the stack still starts: the API is how you *inspect* a
+/// running project, and losing it should not stop the project running.
+fn serve_project_api(runner: &mut don::runner::Runner, emitter: &don::LifecycleEmitter) {
+    match don::server::serve_for_runner(runner) {
+        Ok(shutdown_tx) => runner.set_api_shutdown(shutdown_tx),
+        Err(e) => emitter.lifecycle_event(&format!("api server disabled: {e}")),
     }
 }
 

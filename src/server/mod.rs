@@ -118,6 +118,42 @@ pub async fn serve_api(
     accept_loop(listener, app, shutdown).await
 }
 
+/// Bind this project's API socket and serve it for `runner`.
+///
+/// Lives here, not on the runner: a runner has no business knowing an API
+/// exists, and `server -> runner` is the direction that doesn't close a
+/// cycle. Returns the shutdown sender, which the caller hands back with
+/// [`Runner::set_api_shutdown`] so the runner can stop accepting at the point
+/// in teardown it already chose.
+///
+/// Binding is synchronous so the socket exists before this returns — a client
+/// that sees the process start can connect immediately, with no window where
+/// `.don/don.sock` is missing.
+///
+/// [`Runner::set_api_shutdown`]: crate::Runner::set_api_shutdown
+pub fn serve_for_runner(
+    runner: &crate::runner::Runner,
+) -> Result<tokio::sync::watch::Sender<bool>, ServerError> {
+    let socket_path = runner.base_dir().join(".don").join("don.sock");
+    let socket_path = socket_path.as_path();
+    let emitter = runner.lifecycle_emitter();
+    let listener = bind_api(socket_path)?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let cmd_tx = runner.command_sender();
+    let event_tx = runner.subscribe_sender();
+    let state = runner.state_reader();
+    let path = socket_path.to_path_buf();
+    let display = socket_path.display().to_string();
+    let server_emitter = emitter.clone();
+    tokio::spawn(async move {
+        if let Err(e) = serve_api(listener, path, cmd_tx, event_tx, state, shutdown_rx).await {
+            server_emitter.lifecycle_event(&format!("api server error: {e}"));
+        }
+    });
+    emitter.lifecycle_event(&format!("api listening on {display}"));
+    Ok(shutdown_tx)
+}
+
 /// Serve an arbitrary router on a pre-bound unix listener until `shutdown`.
 ///
 /// Same lifecycle as [`serve_api`] — including removing the socket file on
@@ -169,8 +205,12 @@ pub(crate) async fn accept_loop(
                         .await;
                 });
             }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                // `Err` means the sender is gone. Treat that as shutdown:
+                // `changed()` would return immediately and forever, spinning
+                // this loop, and an owner that dropped the signal is not
+                // coming back to set it.
+                if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }

@@ -143,6 +143,22 @@ impl Client {
         Ok(parsed.watch)
     }
 
+    /// `GET /ready` — whether the runner has finished its initial sweep.
+    ///
+    /// The API socket is bound before the runner starts, so its presence says
+    /// nothing about readiness. This is that signal: wait for it before
+    /// issuing a control action whose meaning depends on startup being over.
+    pub async fn ready(&self) -> Result<bool, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct ReadyResponse {
+            startup_complete: bool,
+        }
+        let (status, body) = self.request("GET", "/ready", false).await?;
+        ensure_ok(status, &body)?;
+        let parsed: ReadyResponse = serde_json::from_slice(&body)?;
+        Ok(parsed.startup_complete)
+    }
+
     /// `POST /start/:name`
     pub async fn start(&self, name: &str) -> Result<(), ClientError> {
         self.control("/start/", name).await

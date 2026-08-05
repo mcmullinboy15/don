@@ -768,14 +768,6 @@ pub enum RunnerEvent {
     RebuildComplete { name: String, success: bool },
     /// A task re-run completed (file watch triggered).
     TaskRerunComplete { name: String, success: bool },
-    /// The unix-socket API is bound and accepting connections.
-    ///
-    /// Fires once per run, and only on success — a failed bind is reported as
-    /// an error event and no `ApiListening` follows. Anything that needs to
-    /// hand this project's socket to something else (the daemon registration
-    /// in `main`, for one) should wait for this rather than assume the path
-    /// exists as soon as the runner starts.
-    ApiListening { socket: String },
     /// The initial startup sweep has decided every item — nothing is left
     /// merely being *considered*. Fires once per run.
     StartupSettled,
@@ -1290,6 +1282,26 @@ impl Runner {
         &self.base_dir
     }
 
+    /// A cloneable emitter for this runner's lifecycle output.
+    pub fn lifecycle_emitter(&self) -> crate::output::LifecycleEmitter {
+        self.output_manager.clone_lifecycle_emitter()
+    }
+
+    /// The event sender, for a server that hands out a subscription per
+    /// connection rather than holding one.
+    pub fn subscribe_sender(&self) -> broadcast::Sender<RunnerEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Hand the runner the signal that stops the API accepting connections.
+    ///
+    /// Call after [`crate::server::serve_for_runner`]. Without it the API
+    /// keeps accepting until the process exits, which only matters for
+    /// embedders that serve one.
+    pub fn set_api_shutdown(&mut self, shutdown_tx: tokio::sync::watch::Sender<bool>) {
+        self.server_shutdown_tx = Some(shutdown_tx);
+    }
+
     /// A read-only view of every item's state, updated on each transition.
     ///
     /// Reads never queue behind the runner's command loop, so this is the
@@ -1457,46 +1469,6 @@ impl Runner {
         }
         self.refresh_runtime_port_manifest();
 
-        // Bind the unix socket API synchronously so bind errors surface
-        // visibly at startup. Only spawn the accept loop if bind succeeds.
-        let socket_path = self.base_dir.join(".don").join("don.sock");
-        let socket_display = socket_path.display().to_string();
-        match crate::server::bind_api(&socket_path) {
-            Ok(listener) => {
-                let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
-                let cmd_tx_for_server = self.cmd_tx.clone();
-                let event_tx_for_server = self.event_tx.clone();
-                let state_for_server = self.state.reader();
-                let socket_path_for_server = socket_path.clone();
-                let server_emitter = self.output_manager.clone_lifecycle_emitter();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::server::serve_api(
-                        listener,
-                        socket_path_for_server,
-                        cmd_tx_for_server,
-                        event_tx_for_server,
-                        state_for_server,
-                        server_shutdown_rx,
-                    )
-                    .await
-                    {
-                        server_emitter.lifecycle_event(&format!("api server error: {e}"));
-                    }
-                });
-                self.output_manager
-                    .lifecycle_event(&format!("api listening on {socket_display}"));
-                self.server_shutdown_tx = Some(server_shutdown_tx);
-                // Announce only once the socket a consumer would connect to
-                // actually exists.
-                let _ = self.event_tx.send(RunnerEvent::ApiListening {
-                    socket: socket_display,
-                });
-            }
-            Err(e) => {
-                self.output_manager
-                    .error_event(&format!("api server disabled: {e}"));
-            }
-        }
         // Start file watchers before spawning services so we don't miss
         // changes that happen during startup (slow ready checks, long builds, etc.).
         let mut watch_handle: Option<tokio::task::JoinHandle<()>> = None;

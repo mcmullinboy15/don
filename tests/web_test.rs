@@ -50,7 +50,7 @@ impl Harness {
             .await
             .unwrap();
         let (runner_shutdown, shutdown_rx) = mpsc::channel(2);
-        let runner = don::runner::Runner::new(
+        let mut runner = don::runner::Runner::new(
             config,
             PLATFORM,
             output_manager,
@@ -61,6 +61,10 @@ impl Harness {
         )
         .await
         .unwrap();
+        // The runner no longer binds its own API socket; the binary does,
+        // and so must anything else that wants CLI/daemon access.
+        let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+        runner.set_api_shutdown(api_shutdown);
         let runner_handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
@@ -72,6 +76,19 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(socket.exists(), "project socket never appeared");
+
+        // The socket now exists from before `run()` is even polled, so its
+        // presence no longer implies the runner has finished starting.
+        // `GET /ready` is that signal — without waiting on it, a control
+        // action below can land mid-startup and race the sweep.
+        let client = don::client::Client::with_socket_path(socket.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if client.ready().await.unwrap_or(false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         let root = std::fs::canonicalize(project_dir).unwrap();
         let entry = ProjectEntry::new(root, std::process::id(), None);

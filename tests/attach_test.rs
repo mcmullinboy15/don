@@ -56,7 +56,7 @@ async fn spawn_runner(
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
@@ -67,6 +67,11 @@ async fn spawn_runner(
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     let socket_path = base_dir.join(".don").join("don.sock");
     let handle = tokio::spawn(async move {
         if let Err(err) = runner.run().await {
