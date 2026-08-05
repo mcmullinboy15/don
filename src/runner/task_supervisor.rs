@@ -16,7 +16,6 @@
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::{ItemDone, NodeKind, RunnerInternalCommand, TaskExit};
 use crate::task_state::{TaskRunInfo, TaskState};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,154 +30,25 @@ pub(in crate::runner) struct RunRequest {
     pub(in crate::runner) intent: super::TaskRunIntent,
 }
 
-/// Send-only handle to one task's run supervisor.
+/// Owner half for tasks. See [`Supervisors`].
 ///
-/// Clone-able on purpose: this is the *addressing* half. Nothing here can
-/// create or destroy a supervisor, so handing one out to the file watcher or
-/// the API widens what can ask a task to run without widening what can change
-/// the set of tasks.
-#[derive(Clone)]
-pub(in crate::runner) struct TaskHandle {
-    tx: mpsc::UnboundedSender<RunRequest>,
-    /// True from the moment a run is queued until the supervisor goes back to
-    /// waiting with an empty mailbox. The startup sweep reads it to tell
-    /// "this task hasn't been asked to run" from "it is being prepared".
-    busy: Arc<AtomicBool>,
-}
+/// [`Supervisors`]: super::supervisor::Supervisors
+pub(in crate::runner) type TaskSupervisors = super::supervisor::Supervisors<RunRequest>;
 
-impl TaskHandle {
-    /// Queue a run. Fails only once the supervisor is gone (shutdown).
-    ///
-    /// Marks the task busy before sending, not after the supervisor picks the
-    /// request up — otherwise a caller could queue a run and immediately be
-    /// told the task is idle.
-    pub(in crate::runner) fn request(&self, request: RunRequest) -> bool {
-        self.busy.store(true, Ordering::Relaxed);
-        let sent = self.tx.send(request).is_ok();
-        if !sent {
-            self.busy.store(false, Ordering::Relaxed);
-        }
-        sent
-    }
-
-    /// Whether a run is queued or being prepared.
-    pub(in crate::runner) fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::Relaxed)
-    }
-}
-
-/// Every task's mailbox, addressable by name.
+/// Start one run supervisor per task.
 ///
-/// Clone-able and lock-free, and it can be both because **the item set is
-/// fixed at construction** (see `setup::build_runtime_maps`). There is no
-/// insert and no remove, so there is nothing to synchronise — an
-/// `Arc<HashMap<_, _>>` is the whole implementation. If items ever became
-/// dynamic this would need the [`StateWriter`]/[`StateReader`] treatment
-/// rather than a lock.
+/// Every task gets one up front so the registry is immutable — see
+/// [`Supervisors::spawn_all`].
 ///
-/// [`StateWriter`]: super::state_store::StateWriter
-/// [`StateReader`]: super::StateReader
-#[derive(Clone)]
-pub(in crate::runner) struct TaskRegistry {
-    handles: Arc<HashMap<String, TaskHandle>>,
-}
-
-impl TaskRegistry {
-    /// The mailbox for `name`, or `None` if it isn't a task.
-    pub(in crate::runner) fn get(&self, name: &str) -> Option<&TaskHandle> {
-        self.handles.get(name)
-    }
-
-    /// Whether `name` has a run queued or being prepared. `false` for an
-    /// unknown name, which is what callers asking "can I start this?" want.
-    pub(in crate::runner) fn is_busy(&self, name: &str) -> bool {
-        self.get(name).is_some_and(TaskHandle::is_busy)
-    }
-
-    /// Names with a run queued or being prepared.
-    pub(in crate::runner) fn busy_names(&self) -> impl Iterator<Item = &str> {
-        self.handles
-            .iter()
-            .filter(|(_, handle)| handle.is_busy())
-            .map(|(name, _)| name.as_str())
-    }
-}
-
-/// The owner half: the supervisor tasks themselves.
-///
-/// Split from [`TaskRegistry`] by capability rather than by convenience —
-/// addressing a task is something many components should be able to do, while
-/// *ending* one is the runner's alone. Holding the join handles here is what
-/// makes that true by construction.
-pub(in crate::runner) struct TaskSupervisors {
-    registry: TaskRegistry,
-    joins: Vec<(String, tokio::task::JoinHandle<()>)>,
-}
-
-impl TaskSupervisors {
-    /// Start one supervisor per task.
-    ///
-    /// Eager rather than on first use: it makes the registry immutable, which
-    /// is what lets it be shared without a lock. An idle supervisor is a
-    /// parked task that is never polled until something addresses it.
-    pub(in crate::runner) fn spawn_all<'a>(
-        names: impl Iterator<Item = &'a String>,
-        ctx: &super::task_worker::TaskWorkerContext,
-        internal_tx: &mpsc::Sender<RunnerInternalCommand>,
-    ) -> Self {
-        let mut handles = HashMap::new();
-        let mut joins = Vec::new();
-        for name in names {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let busy = Arc::new(AtomicBool::new(false));
-            let join = tokio::spawn(supervise(
-                name.clone(),
-                rx,
-                ctx.clone(),
-                internal_tx.clone(),
-                Arc::clone(&busy),
-            ));
-            handles.insert(name.clone(), TaskHandle { tx, busy });
-            joins.push((name.clone(), join));
-        }
-        Self {
-            registry: TaskRegistry {
-                handles: Arc::new(handles),
-            },
-            joins,
-        }
-    }
-
-    /// The addressing half, for handing to anything that needs to ask a task
-    /// to run.
-    pub(in crate::runner) fn registry(&self) -> &TaskRegistry {
-        &self.registry
-    }
-
-    /// Cancel every supervisor, returning the handles to await.
-    ///
-    /// Deliberately *not* an `async fn` that also waits: shutdown has to fire
-    /// every abort before waiting on any of them, or a project with N tasks
-    /// pays the timeout N times over instead of once. Every other teardown
-    /// loop in `shutdown.rs` has the same shape.
-    ///
-    /// Aborting mid-preparation can strand a process the worker had just
-    /// spawned — the handle dies with the future. That is pre-existing (the
-    /// runner aborted `run_worker` the same way), and shutdown's
-    /// `stop_late_task_start` is what catches the case where the spawn
-    /// already reported in.
-    /// Nothing needs to drop the registry first: the receiver lives inside
-    /// the supervisor future, so aborting it drops the receiver, and every
-    /// outstanding [`TaskHandle`] — including clones handed to other
-    /// components — starts reporting failure from `request`. That matters
-    /// once the file watcher holds one.
-    pub(in crate::runner) fn abort_all(&mut self) -> Vec<(String, tokio::task::JoinHandle<()>)> {
-        let joins = std::mem::take(&mut self.joins);
-        for (_, join) in &joins {
-            join.abort();
-        }
-        joins
-    }
+/// [`Supervisors::spawn_all`]: super::supervisor::Supervisors::spawn_all
+pub(in crate::runner) fn spawn_supervisors<'a>(
+    names: impl Iterator<Item = &'a String>,
+    ctx: &super::task_worker::TaskWorkerContext,
+    internal_tx: &mpsc::Sender<RunnerInternalCommand>,
+) -> TaskSupervisors {
+    TaskSupervisors::spawn_all(names, |name, rx, busy| {
+        supervise(name, rx, ctx.clone(), internal_tx.clone(), busy)
+    })
 }
 
 /// Drive one task's runs, strictly in order.
@@ -666,7 +536,7 @@ mod tests {
             terminal_coordinator: super::super::TerminalCoordinator::detached(),
         };
         let names = ["build".to_string(), "migrate".to_string()];
-        let mut supervisors = TaskSupervisors::spawn_all(names.iter(), &ctx, &internal_tx);
+        let mut supervisors = spawn_supervisors(names.iter(), &ctx, &internal_tx);
         let registry = supervisors.registry().clone();
 
         assert!(registry.get("build").is_some());

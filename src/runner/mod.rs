@@ -29,6 +29,7 @@ mod startup;
 mod state;
 pub(crate) mod state_store;
 mod status;
+mod supervisor;
 mod support;
 mod task_commands;
 mod task_supervisor;
@@ -991,7 +992,7 @@ impl Runner {
         .await;
 
         // One supervisor per service, likewise immutable once built.
-        let service_starts = service_supervisor::ServiceStarts::spawn_all(
+        let service_starts = service_supervisor::spawn_supervisors(
             services.keys(),
             &service_supervisor::StartEnv {
                 base_dir: base_dir.clone(),
@@ -1007,7 +1008,7 @@ impl Runner {
 
         // One supervisor per task, started before the runner exists so the
         // registry is immutable and can be shared without a lock.
-        let task_supervisors = task_supervisor::TaskSupervisors::spawn_all(
+        let task_supervisors = task_supervisor::spawn_supervisors(
             tasks.keys(),
             &task_worker::TaskWorkerContext {
                 base_dir: base_dir.clone(),

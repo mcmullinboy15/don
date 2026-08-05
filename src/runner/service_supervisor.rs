@@ -24,7 +24,6 @@ use super::service_worker::{ServiceStartMode, start_service_worker};
 use super::{ServiceStartContext, ServiceStartIntent};
 use crate::config::ShutdownConfig;
 use crate::output::{ItemOutput, LifecycleEmitter};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,119 +48,20 @@ pub(in crate::runner) struct StartEnv {
     pub(in crate::runner) shutdown: ShutdownConfig,
 }
 
-/// Send-only handle to one service's start supervisor.
-///
-/// The addressing half, exactly as [`TaskHandle`] is for tasks: it can ask a
-/// service to start and cannot create or destroy the supervisor.
-///
-/// [`TaskHandle`]: super::task_supervisor::TaskHandle
-#[derive(Clone)]
-pub(in crate::runner) struct StartHandle {
-    tx: mpsc::UnboundedSender<StartRequest>,
-    busy: Arc<AtomicBool>,
-}
+/// Owner half for services.
+pub(in crate::runner) type ServiceStarts = super::supervisor::Supervisors<StartRequest>;
 
-impl StartHandle {
-    /// Queue a start. Fails only once the supervisor is gone (shutdown).
-    pub(in crate::runner) fn request(&self, request: StartRequest) -> bool {
-        self.busy.store(true, Ordering::Relaxed);
-        let sent = self.tx.send(request).is_ok();
-        if !sent {
-            self.busy.store(false, Ordering::Relaxed);
-        }
-        sent
-    }
-
-    /// Whether a start is queued or being prepared.
-    pub(in crate::runner) fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::Relaxed)
-    }
-}
-
-/// Every service's start mailbox, addressable by name.
-///
-/// Lock-free for the same reason [`TaskRegistry`] is: the item set is fixed
-/// at construction, so there is no insert and no remove to synchronise.
-///
-/// [`TaskRegistry`]: super::task_supervisor::TaskRegistry
-#[derive(Clone)]
-pub(in crate::runner) struct StartRegistry {
-    handles: Arc<HashMap<String, StartHandle>>,
-}
-
-impl StartRegistry {
-    pub(in crate::runner) fn get(&self, name: &str) -> Option<&StartHandle> {
-        self.handles.get(name)
-    }
-
-    /// Whether `name` has a start queued or being prepared. `false` for an
-    /// unknown name.
-    pub(in crate::runner) fn is_busy(&self, name: &str) -> bool {
-        self.get(name).is_some_and(StartHandle::is_busy)
-    }
-
-    /// Names with a start queued or being prepared.
-    pub(in crate::runner) fn busy_names(&self) -> impl Iterator<Item = &str> {
-        self.handles
-            .iter()
-            .filter(|(_, handle)| handle.is_busy())
-            .map(|(name, _)| name.as_str())
-    }
-}
-
-/// The owner half: the supervisor tasks themselves.
-pub(in crate::runner) struct ServiceStarts {
-    registry: StartRegistry,
-    joins: Vec<(String, tokio::task::JoinHandle<()>)>,
-}
-
-impl ServiceStarts {
-    /// Start one supervisor per service. Eager, so the registry is immutable.
-    pub(in crate::runner) fn spawn_all<'a>(
-        names: impl Iterator<Item = &'a String>,
-        env: &StartEnv,
-        outputs: &dyn Fn(&str) -> Option<ItemOutput>,
-        internal_tx: &mpsc::Sender<RunnerInternalCommand>,
-    ) -> Self {
-        let mut handles = HashMap::new();
-        let mut joins = Vec::new();
-        for name in names {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let busy = Arc::new(AtomicBool::new(false));
-            let join = tokio::spawn(supervise(
-                name.clone(),
-                rx,
-                env.clone(),
-                outputs(name),
-                internal_tx.clone(),
-                Arc::clone(&busy),
-            ));
-            handles.insert(name.clone(), StartHandle { tx, busy });
-            joins.push((name.clone(), join));
-        }
-        Self {
-            registry: StartRegistry {
-                handles: Arc::new(handles),
-            },
-            joins,
-        }
-    }
-
-    pub(in crate::runner) fn registry(&self) -> &StartRegistry {
-        &self.registry
-    }
-
-    /// Cancel every supervisor, returning the handles to await.
-    ///
-    /// Returns rather than awaits so shutdown can fire all the aborts before
-    /// waiting on any — see `TaskSupervisors::abort_all`.
-    pub(in crate::runner) fn abort_all(&mut self) -> Vec<(String, tokio::task::JoinHandle<()>)> {
-        let joins = std::mem::take(&mut self.joins);
-        for (_, join) in &joins {
-            join.abort();
-        }
-        joins
-    }
+/// Start one start-supervisor per service.
+pub(in crate::runner) fn spawn_supervisors<'a>(
+    names: impl Iterator<Item = &'a String>,
+    env: &StartEnv,
+    outputs: &dyn Fn(&str) -> Option<ItemOutput>,
+    internal_tx: &mpsc::Sender<RunnerInternalCommand>,
+) -> ServiceStarts {
+    ServiceStarts::spawn_all(names, |name, rx, busy| {
+        let output = outputs(&name);
+        supervise(name, rx, env.clone(), output, internal_tx.clone(), busy)
+    })
 }
 
 /// Stop a service brought up by a start that has since been superseded.
