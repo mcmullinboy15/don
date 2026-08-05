@@ -16,6 +16,7 @@
 pub mod client;
 pub mod install;
 pub mod paths;
+pub mod registration;
 pub mod registry;
 pub(crate) mod routes;
 

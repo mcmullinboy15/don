@@ -79,7 +79,8 @@ async fn spawn_runner(
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let mut runner = Runner::new(
+    let emitter = output_manager.clone_lifecycle_emitter();
+    let runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
@@ -91,7 +92,15 @@ async fn spawn_runner(
     .await
     .unwrap();
     if let Some(socket) = daemon_socket {
-        runner.enable_daemon_registration(socket, Some("dev".to_string()));
+        // Exactly what the binary does — registration is the embedder's job,
+        // driven off the runner's event stream.
+        don::daemon::registration::spawn(
+            runner.subscribe(),
+            socket,
+            runner.base_dir().to_path_buf(),
+            Some("dev".to_string()),
+            emitter,
+        );
     }
     let handle = tokio::spawn(async move {
         let _ = runner.run().await;

@@ -8,7 +8,6 @@
 mod attach;
 mod build_tools;
 mod completions;
-mod daemon_link;
 mod env_refs;
 mod events;
 mod graph;
@@ -771,6 +770,14 @@ pub enum RunnerEvent {
     RebuildComplete { name: String, success: bool },
     /// A task re-run completed (file watch triggered).
     TaskRerunComplete { name: String, success: bool },
+    /// The unix-socket API is bound and accepting connections.
+    ///
+    /// Fires once per run, and only on success — a failed bind is reported as
+    /// an error event and no `ApiListening` follows. Anything that needs to
+    /// hand this project's socket to something else (the daemon registration
+    /// in `main`, for one) should wait for this rather than assume the path
+    /// exists as soon as the runner starts.
+    ApiListening { socket: String },
     /// The initial startup sweep has decided every item — nothing is left
     /// merely being *considered*. Fires once per run.
     StartupSettled,
@@ -806,19 +813,6 @@ pub enum RunnerError {
 
 pub(crate) use state::{RuntimeService, RuntimeTask};
 
-/// Where and how to announce a running project to the system-wide daemon.
-///
-/// Registration is metadata only — the daemon is told where this project's
-/// API socket is and nothing else changes about how the stack runs. See
-/// [`crate::daemon`] for why the daemon is deliberately not an owner.
-#[derive(Debug, Clone)]
-pub struct DaemonRegistration {
-    /// The daemon's control socket.
-    pub socket: PathBuf,
-    /// Active profile, for display in the UI.
-    pub profile: Option<String>,
-}
-
 /// The main runner that orchestrates services and tasks.
 pub struct Runner {
     config: Config,
@@ -838,10 +832,6 @@ pub struct Runner {
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-
-    /// Where to announce this project so it appears in the web UI. `None`
-    /// (the default) means don't talk to a daemon at all.
-    daemon_registration: Option<DaemonRegistration>,
 
     /// Docker API client. `Some` if any service uses the docker preset.
     docker_client: Option<bollard::Docker>,
@@ -1004,7 +994,6 @@ impl Runner {
             lazy_start_rx,
             lazy_start_tx,
             server_shutdown_tx: None,
-            daemon_registration: None,
             docker_client,
             cmd_tx,
             cmd_rx,
@@ -1247,6 +1236,17 @@ impl Runner {
         self.event_tx.subscribe()
     }
 
+    /// The canonical project root this runner manages.
+    ///
+    /// Canonical, not as-passed: [`Runner::new`] resolves symlinks and `..`
+    /// before storing it, and the daemon derives a project's identity by
+    /// hashing this path. A caller registering the project must use this
+    /// value rather than the path it handed in, or it will register under one
+    /// id and deregister under another.
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
+    }
+
     /// A read-only view of every item's state, updated on each transition.
     ///
     /// Reads never queue behind the runner's command loop, so this is the
@@ -1451,9 +1451,11 @@ impl Runner {
                 self.output_manager
                     .lifecycle_event(&format!("api listening on {socket_display}"));
                 self.server_shutdown_tx = Some(server_shutdown_tx);
-                // Only worth announcing once the socket the daemon would
-                // proxy to actually exists.
-                self.register_with_daemon();
+                // Announce only once the socket a consumer would connect to
+                // actually exists.
+                let _ = self.event_tx.send(RunnerEvent::ApiListening {
+                    socket: socket_display,
+                });
             }
             Err(e) => {
                 self.output_manager

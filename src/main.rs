@@ -2315,7 +2315,10 @@ async fn run_start(
             )
             .collect();
 
-        let mut runner = await_with_shutdown_supervision(
+        // Clone before `output_manager` moves into the runner — the daemon
+        // registration watcher reports failures at debug verbosity.
+        let daemon_emitter = output_manager.clone_lifecycle_emitter();
+        let runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
                 async move {
@@ -2335,7 +2338,7 @@ async fn run_start(
             "starting runner",
         )
         .await?;
-        apply_daemon_registration(&mut runner, profile_ref, no_daemon);
+        spawn_daemon_registration(&runner, daemon_emitter, profile_ref, no_daemon);
 
         let events = runner.subscribe();
         let state_reader = runner.state_reader();
@@ -2411,7 +2414,8 @@ async fn run_start(
             output_manager.set_log_filter(allow);
         }
 
-        let mut runner = await_with_shutdown_supervision(
+        let daemon_emitter = output_manager.clone_lifecycle_emitter();
+        let runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
                 async move {
@@ -2431,7 +2435,7 @@ async fn run_start(
             "starting runner",
         )
         .await?;
-        apply_daemon_registration(&mut runner, profile_ref, no_daemon);
+        spawn_daemon_registration(&runner, daemon_emitter, profile_ref, no_daemon);
 
         let runner_task =
             tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
@@ -2439,24 +2443,41 @@ async fn run_start(
     }
 }
 
-/// Point the runner at the system-wide daemon so this project shows up in the
-/// web UI.
+/// Announce this project to the system-wide daemon so it shows up in the web
+/// UI, and withdraw it again on shutdown.
 ///
-/// A state directory that can't be resolved (no `$HOME`, an unusual sandbox)
-/// costs you the UI listing and nothing else — never the ability to start a
-/// stack. The registration itself is best-effort too; see
-/// `runner::daemon_link`.
-fn apply_daemon_registration(
-    runner: &mut don::runner::Runner,
+/// This lives in the binary, not the runner: which projects a daemon should
+/// list is a deployment policy, and the runner has no business knowing one
+/// exists. It learns the two moments that matter from the event stream —
+/// `ApiListening` (the socket a daemon would proxy to now exists) and
+/// `ShutdownStarted`.
+///
+/// Best-effort throughout. A state directory that can't be resolved (no
+/// `$HOME`, an unusual sandbox) or a daemon that isn't running costs you the
+/// UI listing and nothing else — never the ability to start a stack. Nothing
+/// here is ever awaited by the runner, so a slow or absent daemon cannot add
+/// a millisecond to startup or to Ctrl+C.
+fn spawn_daemon_registration(
+    runner: &don::runner::Runner,
+    emitter: don::output::LifecycleEmitter,
     profile: Option<&str>,
     no_daemon: bool,
 ) {
     if no_daemon {
         return;
     }
-    if let Ok(paths) = don::daemon::DaemonPaths::from_process_env() {
-        runner.enable_daemon_registration(paths.socket(), profile.map(str::to_string));
-    }
+    let Ok(paths) = don::daemon::DaemonPaths::from_process_env() else {
+        return;
+    };
+    don::daemon::registration::spawn(
+        runner.subscribe(),
+        paths.socket(),
+        // The runner's canonical root, not the path we passed in — the daemon
+        // keys projects by a hash of it. See `Runner::base_dir`.
+        runner.base_dir().to_path_buf(),
+        profile.map(str::to_string),
+        emitter,
+    );
 }
 
 /// A web UI served by `don start --with-ui`, alive for as long as this value.

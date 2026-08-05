@@ -25,7 +25,7 @@ pub mod web;
 pub use config::{Config, ConfigError, Platform, TaskAutoRun, TaskHeadless};
 pub use docker::stream::DockerLogReader;
 pub use duration::{DurationError, parse_duration};
-pub use output::{OutputError, OutputManager, ServiceWriter};
+pub use output::{LifecycleEmitter, OutputError, OutputManager, ServiceWriter};
 pub use runner::{Runner, RunnerError, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
 pub use task_state::{TaskRunInfo, TaskState, TaskStateError};
 pub use tui::{TuiError, run_tui};
