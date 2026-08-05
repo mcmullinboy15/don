@@ -201,18 +201,15 @@ impl NoSpawnOutcome {
 
     /// Whether to update `needs_run_now`, and to what. `None` leaves it alone.
     ///
-    /// **The `Failed` asymmetry is a suspected bug, preserved verbatim.** A
-    /// *scheduled* run that fails to prepare marks the task as still needing
-    /// a run; a background `don run` that fails to prepare leaves the flag
-    /// untouched, so the failure is invisible to the next startup sweep. That
-    /// looks wrong — a task whose preparation failed has not run either way —
-    /// but changing it here would bury a behaviour change inside a refactor
-    /// that is otherwise a no-op. It gets its own commit and its own test.
-    pub(in crate::runner) fn needs_run_now(&self, scheduled: bool) -> Option<bool> {
+    /// A run that failed to prepare has not run, however it was triggered, so
+    /// the task still needs one. This used to depend on *who asked*: a
+    /// scheduled failure set the flag and a background `don run` failure left
+    /// it alone, which meant a task could fail under `don run` and the next
+    /// startup sweep would see nothing outstanding and skip it.
+    pub(in crate::runner) fn needs_run_now(&self) -> Option<bool> {
         match self.state {
-            super::TaskItemState::PendingRun => Some(true),
+            super::TaskItemState::PendingRun | super::TaskItemState::Failed => Some(true),
             super::TaskItemState::Skipped => Some(false),
-            super::TaskItemState::Failed if scheduled => Some(true),
             _ => None,
         }
     }
@@ -446,8 +443,7 @@ mod tests {
             want_state: TaskItemState,
             want_success: bool,
             want_report: Report,
-            /// `needs_run_now` for a scheduled run, then for a background one.
-            want_needs: (Option<bool>, Option<bool>),
+            want_needs: Option<bool>,
             want_failure_message: Option<&'static str>,
         }
 
@@ -459,7 +455,7 @@ mod tests {
                 // Not a failure: it just hasn't run yet.
                 want_success: true,
                 want_report: Report::Info,
-                want_needs: (Some(true), Some(true)),
+                want_needs: Some(true),
                 want_failure_message: None,
             },
             Case {
@@ -469,7 +465,7 @@ mod tests {
                 want_success: true,
                 // Verbose-only: nobody asked for a no-op to be announced.
                 want_report: Report::Debug,
-                want_needs: (Some(false), Some(false)),
+                want_needs: Some(false),
                 want_failure_message: None,
             },
             Case {
@@ -478,11 +474,11 @@ mod tests {
                 want_state: TaskItemState::Failed,
                 want_success: false,
                 want_report: Report::Error,
-                // Pinning current behaviour, not endorsing it: only a
-                // scheduled failure marks the task as still needing a run.
-                // See `needs_run_now` — the background case is a suspected
-                // bug and this expectation should flip when it is fixed.
-                want_needs: (Some(true), None),
+                // A failed run hasn't run, whoever asked for it — so the
+                // task still needs one. This used to be `None` for a
+                // background `don run`, which let the next startup sweep
+                // skip a task that had just failed.
+                want_needs: Some(true),
                 want_failure_message: Some("bad param"),
             },
         ];
@@ -500,12 +496,9 @@ mod tests {
                 case.label
             );
             assert_eq!(
-                (
-                    case.outcome.needs_run_now(true),
-                    case.outcome.needs_run_now(false)
-                ),
+                case.outcome.needs_run_now(),
                 case.want_needs,
-                "{}: needs_run_now (scheduled, background)",
+                "{}: needs_run_now",
                 case.label
             );
             assert_eq!(
@@ -565,6 +558,40 @@ mod tests {
                 intent: super::super::TaskRunIntent::Background,
             }),
             "a handle to a stopped supervisor must report the failure"
+        );
+    }
+
+    /// The bug this classifier used to encode, stated as the behaviour a
+    /// user would see: a task whose preparation fails under `don run` must
+    /// still look outstanding to the next startup sweep. Previously the
+    /// background case returned `None`, leaving `needs_run_now` false, so a
+    /// task that had just failed was treated as satisfied.
+    #[test]
+    fn a_failed_run_leaves_the_task_needing_one_however_it_was_triggered() {
+        let failed = NoSpawnOutcome::failed("bad param".to_string());
+        assert_eq!(
+            failed.needs_run_now(),
+            Some(true),
+            "a failed run has not run, whoever asked for it"
+        );
+
+        // And that flag is what the dependency gate reads: a task with a
+        // successful history but an outstanding run is *not* satisfied, so
+        // dependents wait rather than starting against stale output.
+        let config: crate::config::Config = "[tasks.build]\ncmd = \"true\"\n".parse().unwrap();
+        let task = config.tasks.get("build").unwrap().clone();
+        let mut rt = super::super::state::RuntimeTask::new(
+            task,
+            super::super::TaskItemState::Completed,
+            true,
+            None,
+        );
+        assert!(rt.dependency_satisfied(), "a completed task satisfies deps");
+        rt.set_needs_run_now(true);
+        assert!(
+            !rt.dependency_satisfied(),
+            "an outstanding run must block dependents, which is what the \
+             background-failure case used to skip"
         );
     }
 

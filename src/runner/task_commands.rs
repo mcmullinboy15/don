@@ -168,8 +168,7 @@ impl Runner {
         if task_cfg.terminal.is_foreground() {
             self.output_manager.resume_visible_output();
         }
-        let scheduled = matches!(intent, TaskRunIntent::Scheduled { .. });
-        if let Some(needs_run_now) = outcome.needs_run_now(scheduled)
+        if let Some(needs_run_now) = outcome.needs_run_now()
             && let Some(rt) = self.tasks.get_mut(name)
         {
             rt.set_needs_run_now(needs_run_now);
