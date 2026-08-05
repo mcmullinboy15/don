@@ -82,11 +82,13 @@ impl NoSpawnOutcome {
 
     /// Whether to update `needs_run_now`, and to what. `None` leaves it alone.
     ///
-    /// The asymmetry is deliberate and pre-existing: a *scheduled* run that
-    /// fails to prepare marks the task as still needing a run, but a
-    /// background `don run` that fails to prepare leaves the flag untouched —
-    /// a manual invocation going wrong shouldn't change what startup decides
-    /// to do next time.
+    /// **The `Failed` asymmetry is a suspected bug, preserved verbatim.** A
+    /// *scheduled* run that fails to prepare marks the task as still needing
+    /// a run; a background `don run` that fails to prepare leaves the flag
+    /// untouched, so the failure is invisible to the next startup sweep. That
+    /// looks wrong — a task whose preparation failed has not run either way —
+    /// but changing it here would bury a behaviour change inside a refactor
+    /// that is otherwise a no-op. It gets its own commit and its own test.
     pub(in crate::runner) fn needs_run_now(&self, scheduled: bool) -> Option<bool> {
         match self.state {
             super::TaskItemState::PendingRun => Some(true),
@@ -357,9 +359,10 @@ mod tests {
                 want_state: TaskItemState::Failed,
                 want_success: false,
                 want_report: Report::Error,
-                // Only a scheduled failure marks the task as still needing a
-                // run — a manual `don run` going wrong must not change what
-                // startup decides next time.
+                // Pinning current behaviour, not endorsing it: only a
+                // scheduled failure marks the task as still needing a run.
+                // See `needs_run_now` — the background case is a suspected
+                // bug and this expectation should flip when it is fixed.
                 want_needs: (Some(true), None),
                 want_failure_message: Some("bad param"),
             },
