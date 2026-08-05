@@ -53,18 +53,8 @@ impl Runner {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
-        if let Some(guard) = self.rebuild_batch_handle.take()
-            && let Some(handle) = guard.into_inner()
-        {
-            handle.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        }
-        if let Some(guard) = self.graph_requery_handle.take()
-            && let Some(handle) = guard.into_inner()
-        {
-            handle.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        }
+        // Same treatment for the batched rebuild / graph re-query workers.
+        self.builds.abort_in_flight().await;
         if let Some(handle) = self.update_check_handle.take() {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;

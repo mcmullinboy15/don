@@ -12,6 +12,7 @@
 //!   the build tool reports as inputs for a given target.
 
 pub(crate) mod bazel;
+pub(crate) mod manager;
 pub(crate) mod turbo;
 
 use std::path::Path;

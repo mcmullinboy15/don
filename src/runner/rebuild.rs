@@ -14,20 +14,13 @@ impl Runner {
     /// Collects Bazel targets and Turbo filters from the queued services,
     /// runs one build per tool, then restarts each affected service.
     pub(in crate::runner) async fn flush_pending_rebuilds(&mut self) {
-        let mut names = std::mem::take(&mut self.pending_bt_rebuilds);
-        self.bt_rebuild_deadline = None;
+        let mut names = self.builds.take_pending_rebuilds();
 
         if names.is_empty() {
             return;
         }
-        if self.rebuild_batch_handle.is_some() {
-            for name in names {
-                if !self.pending_bt_rebuilds.contains(&name) {
-                    self.pending_bt_rebuilds.push(name);
-                }
-            }
-            self.bt_rebuild_deadline =
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+        if self.builds.rebuild_in_flight() {
+            self.builds.queue_rebuilds(names);
             return;
         }
 
@@ -52,15 +45,7 @@ impl Runner {
                 true
             }
         });
-        if !deferred.is_empty() {
-            for name in deferred {
-                if !self.pending_bt_rebuilds.contains(&name) {
-                    self.pending_bt_rebuilds.push(name);
-                }
-            }
-            self.bt_rebuild_deadline =
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
-        }
+        self.builds.queue_rebuilds(deferred);
         if names.is_empty() {
             return;
         }
@@ -118,14 +103,13 @@ impl Runner {
         };
         let cmd_tx = self.internal_tx.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
-        let bazel_build_mutex = self.bazel_build_mutex.clone();
-        let handle = tokio::spawn(async move {
+        let bazel_build_mutex = self.builds.bazel_mutex();
+        self.builds.set_rebuild_batch(tokio::spawn(async move {
             let outcome = run_rebuild_batch_worker(request, emitter, bazel_build_mutex).await;
             let _ = cmd_tx
                 .send(RunnerInternalCommand::RebuildBatchComplete(outcome))
                 .await;
-        });
-        self.rebuild_batch_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+        }));
     }
 
     pub(in crate::runner) fn fail_rebuild(&self, name: &str, message: &str) {
@@ -226,17 +210,13 @@ impl Runner {
             }
             self.do_rebuild(name).await;
         }
-        if !self.pending_bt_rebuilds.is_empty() {
-            self.bt_rebuild_deadline =
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
-        }
     }
 
     pub(in crate::runner) fn spawn_forced_build_tool_rebuild(
         &mut self,
         name: &str,
     ) -> Result<(), super::CommandError> {
-        if self.rebuild_batch_handle.is_some() {
+        if self.builds.rebuild_in_flight() {
             return Err(super::CommandError::InvalidState {
                 name: name.to_string(),
                 message: "build-tool rebuild already in progress".to_string(),
@@ -281,7 +261,8 @@ impl Runner {
             }
             _ => plain_rebuilds.push(name.to_string()),
         }
-        self.pending_bt_rebuilds.retain(|queued| queued != name);
+        // This build supersedes anything queued for the batch.
+        self.builds.cancel_pending_rebuild(name);
 
         let request = RebuildBatchRequest {
             bazel_items,
@@ -291,14 +272,13 @@ impl Runner {
         };
         let cmd_tx = self.internal_tx.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
-        let bazel_build_mutex = self.bazel_build_mutex.clone();
-        let handle = tokio::spawn(async move {
+        let bazel_build_mutex = self.builds.bazel_mutex();
+        self.builds.set_rebuild_batch(tokio::spawn(async move {
             let outcome = run_rebuild_batch_worker(request, emitter, bazel_build_mutex).await;
             let _ = cmd_tx
                 .send(RunnerInternalCommand::RebuildBatchComplete(outcome))
                 .await;
-        });
-        self.rebuild_batch_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+        }));
         Ok(())
     }
 
@@ -385,21 +365,10 @@ impl Runner {
                 }
             }
         }
-        if !self.pending_graph_requery.is_empty() {
-            self.bt_requery_deadline =
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
-        }
-
-        if !services_to_rebuild.is_empty() {
-            for name in services_to_rebuild {
-                self.output_manager
-                    .service_event(&name, "build graph changed — rebuilding");
-                if !self.pending_bt_rebuilds.contains(&name) {
-                    self.pending_bt_rebuilds.push(name);
-                }
-            }
-            self.bt_rebuild_deadline =
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+        for name in services_to_rebuild {
+            self.output_manager
+                .service_event(&name, "build graph changed — rebuilding");
+            self.builds.queue_rebuild(name);
         }
 
         for name in tasks_to_rerun {
@@ -428,16 +397,11 @@ impl Runner {
                 .filter(|(_, rt)| rt.config.build_tool_watch_enabled())
                 .map(|(task_name, _)| task_name.clone())
                 .collect();
-            for item_name in service_names.into_iter().chain(task_names) {
-                if !self.pending_graph_requery.contains(&item_name) {
-                    self.pending_graph_requery.push(item_name);
-                }
-            }
-        } else if !self.pending_graph_requery.contains(&name.to_string()) {
-            self.pending_graph_requery.push(name.to_string());
+            self.builds
+                .queue_requeries(service_names.into_iter().chain(task_names));
+        } else {
+            self.builds.queue_requery(name);
         }
-        self.bt_requery_deadline =
-            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
     }
 
     /// Flush all pending build-graph re-queries.
@@ -446,8 +410,7 @@ impl Runner {
     /// patterns to the WatchManager. Uses stale-while-revalidate: old watch
     /// patterns remain active during the re-query.
     pub(in crate::runner) async fn flush_pending_graph_requery(&mut self) {
-        let names = std::mem::take(&mut self.pending_graph_requery);
-        self.bt_requery_deadline = None;
+        let names = self.builds.take_pending_requeries();
 
         if names.is_empty() {
             return;
@@ -455,14 +418,8 @@ impl Runner {
         if self.watch_update_tx.is_none() {
             return;
         }
-        if self.graph_requery_handle.is_some() {
-            for name in names {
-                if !self.pending_graph_requery.contains(&name) {
-                    self.pending_graph_requery.push(name);
-                }
-            }
-            self.bt_requery_deadline =
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+        if self.builds.requery_in_flight() {
+            self.builds.queue_requeries(names);
             return;
         }
 
@@ -524,13 +481,12 @@ impl Runner {
         }
         let cmd_tx = self.internal_tx.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();
-        let handle = tokio::spawn(async move {
+        self.builds.set_requery_batch(tokio::spawn(async move {
             let outcomes = run_graph_requery_worker(items, emitter).await;
             let _ = cmd_tx
                 .send(RunnerInternalCommand::GraphRequeryComplete(outcomes))
                 .await;
-        });
-        self.graph_requery_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
+        }));
     }
 
     /// Runs the build (if any), stops the old process, starts a new one.
@@ -561,14 +517,10 @@ impl Runner {
         // file edited during the build still triggers a rebuild instead of
         // being silently lost.
         if rs.resolved.is_build_tool_managed() {
-            if !self.pending_bt_rebuilds.contains(&name.to_string()) {
-                self.pending_bt_rebuilds.push(name.to_string());
-            }
-            // Set or extend the batch window (50ms). This allows multiple
-            // Rebuild commands from the watch module (which fire per-service
-            // after their individual debounce timers) to coalesce.
-            self.bt_rebuild_deadline =
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+            // Queueing extends the batch window, so several Rebuild commands
+            // from the watch module — which fire per-service after their own
+            // debounce timers — coalesce into one build.
+            self.builds.queue_rebuild(name);
             return;
         }
 

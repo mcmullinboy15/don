@@ -42,6 +42,7 @@ pub use profile::resolve_profile_items;
 pub use state_store::{StateReader, StateSnapshot};
 pub use terminal::{TerminalCoordinator, TerminalRequest};
 
+use crate::build_tool::manager::{BatchDue, BuildBatcher};
 use crate::config::{Config, Platform, ShutdownConfig};
 use crate::output::OutputManager;
 use crate::process::pid_file::PidFile;
@@ -889,12 +890,6 @@ pub struct Runner {
     /// "shutdown complete" is emitted.
     lazy_build_handles: HashMap<String, (u64, crate::build_tool::AbortOnDrop<()>)>,
 
-    /// Detached file-watch build-tool rebuild batch, if one is in flight.
-    rebuild_batch_handle: Option<crate::build_tool::AbortOnDrop<()>>,
-
-    /// Detached build-graph re-query batch, if one is in flight.
-    graph_requery_handle: Option<crate::build_tool::AbortOnDrop<()>>,
-
     /// Detached periodic crates.io update checker.
     update_check_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -907,23 +902,14 @@ pub struct Runner {
     /// Sender for querying the live watch manager state for verbose status.
     watch_query_tx: Option<mpsc::Sender<crate::watch::WatchQuery>>,
 
-    /// Mutex to serialize Bazel build invocations. Concurrent `bazel build`
-    /// commands contend for Bazel's server lock, so we queue them.
-    bazel_build_mutex: std::sync::Arc<tokio::sync::Mutex<()>>,
-
-    /// Services queued for a batched build-tool rebuild (file watch triggered).
-    /// Collected during a short batch window, then flushed as one build command.
-    pending_bt_rebuilds: Vec<String>,
-    /// Deadline for flushing the pending build-tool rebuild batch.
-    /// When this expires, all pending rebuilds are built in one invocation.
-    bt_rebuild_deadline: Option<tokio::time::Instant>,
-
-    /// Services/tasks queued for a batched build-graph re-query.
-    /// When BUILD/package.json files change, affected items are collected here
-    /// and flushed after a short window to avoid redundant concurrent queries.
-    pending_graph_requery: Vec<String>,
-    /// Deadline for flushing the pending graph re-query batch.
-    bt_requery_deadline: Option<tokio::time::Instant>,
+    /// Coalescing for build-tool work: the rebuild and graph-re-query queues,
+    /// their batch windows, the in-flight batches, and the mutex that
+    /// serialises Bazel.
+    ///
+    /// The runner still decides *what* a rebuild means — which items are
+    /// eligible and what happens when one finishes, both of which need item
+    /// state. This owns *when* that work runs.
+    builds: BuildBatcher,
 
     /// Per-param completion results cache. Populated as the TUI / CLI
     /// resolves completions.
@@ -1033,14 +1019,8 @@ impl Runner {
             watch_query_tx: None,
             batch_build_handle: None,
             lazy_build_handles: HashMap::new(),
-            rebuild_batch_handle: None,
-            graph_requery_handle: None,
             update_check_handle: None,
-            bazel_build_mutex: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            pending_bt_rebuilds: Vec::new(),
-            bt_rebuild_deadline: None,
-            pending_graph_requery: Vec::new(),
-            bt_requery_deadline: None,
+            builds: BuildBatcher::new(),
             completion_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 completions::CompletionCache::default(),
             )),
@@ -1813,7 +1793,11 @@ impl Runner {
                                 self.schedule_startup_batch_replays(&replay_items);
                             }
                             RunnerInternalCommand::RebuildBatchComplete(outcome) => {
-                                self.rebuild_batch_handle = None;
+                                // Release the batch first: handling the outcome
+                                // can queue follow-up rebuilds, and those must
+                                // see a free slot rather than being deferred
+                                // behind a batch that has already finished.
+                                self.builds.finish_rebuild_batch();
                                 self.handle_rebuild_batch_complete(outcome).await;
                             }
                             RunnerInternalCommand::LazyBuildComplete {
@@ -1824,7 +1808,7 @@ impl Runner {
                                 self.handle_lazy_build_complete(&name, generation, outcome);
                             }
                             RunnerInternalCommand::GraphRequeryComplete(outcomes) => {
-                                self.graph_requery_handle = None;
+                                self.builds.finish_requery_batch();
                                 self.handle_graph_requery_complete(outcomes).await;
                             }
                             RunnerInternalCommand::UpdateCheckComplete(update) => {
@@ -1838,23 +1822,13 @@ impl Runner {
                         // the service from there.
                         self.handle_lazy_connection(&name);
                     }
-                    // Flush batched build-tool rebuilds when the batch window expires.
-                    _ = async {
-                        match self.bt_rebuild_deadline {
-                            Some(d) => tokio::time::sleep_until(d).await,
-                            None => std::future::pending().await,
+                    // Flush a build-tool batch when its window expires. Never
+                    // resolves while both queues are empty.
+                    due = self.builds.next_due() => {
+                        match due {
+                            BatchDue::Rebuilds => self.flush_pending_rebuilds().await,
+                            BatchDue::Requeries => self.flush_pending_graph_requery().await,
                         }
-                    } => {
-                        self.flush_pending_rebuilds().await;
-                    }
-                    // Flush batched build-graph re-queries when the batch window expires.
-                    _ = async {
-                        match self.bt_requery_deadline {
-                            Some(d) => tokio::time::sleep_until(d).await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        self.flush_pending_graph_requery().await;
                     }
                     _ = shutdown_rx.recv() => {
                         self.initiate_shutdown().await;
@@ -2677,6 +2651,43 @@ mod tests {
         );
     }
 
+    /// The point of the batch window: one edit under a shared source tree
+    /// fans out into a rebuild request per affected service, and those must
+    /// collapse into a single `bazel build` naming every target. Running them
+    /// separately contends for Bazel's server lock and is an order of
+    /// magnitude slower.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_burst_of_rebuild_requests_becomes_one_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+
+        // A second bazel service caught by the same edit.
+        let resolved = runner.services.get("api").unwrap().resolved.clone();
+        runner.services.insert(
+            "web".to_string(),
+            RuntimeService::new(resolved, ServiceState::Ready),
+        );
+        runner.set_service_state("api", ServiceState::Ready);
+
+        for name in ["api", "web", "api", "web", "api"] {
+            runner.handle_rebuild(name).await;
+        }
+        assert!(runner.builds.has_pending_rebuild("api"));
+        assert!(runner.builds.has_pending_rebuild("web"));
+        assert!(
+            !runner.builds.rebuild_in_flight(),
+            "queued requests must wait for the window, not build on arrival",
+        );
+
+        runner.flush_pending_rebuilds().await;
+
+        assert!(runner.builds.rebuild_in_flight());
+        assert!(
+            !runner.builds.has_pending_rebuild("api") && !runner.builds.has_pending_rebuild("web"),
+            "all five requests went into the one batch — nothing left over to build again",
+        );
+    }
+
     /// Regression: a watched file changes while a build-tool service is still in
     /// its initial/JIT build (`Building`). That rebuild request must not be
     /// dropped — it has to be queued and held until the service finishes coming
@@ -2693,7 +2704,7 @@ mod tests {
         // A watched file changes during the build. The request must be queued.
         runner.handle_rebuild("api").await;
         assert!(
-            runner.pending_bt_rebuilds.contains(&"api".to_string()),
+            runner.builds.has_pending_rebuild("api"),
             "a rebuild requested during the build must be queued, not dropped",
         );
 
@@ -2701,11 +2712,11 @@ mod tests {
         // or double-start the service before startup attaches a handle.
         runner.flush_pending_rebuilds().await;
         assert!(
-            runner.pending_bt_rebuilds.contains(&"api".to_string()),
+            runner.builds.has_pending_rebuild("api"),
             "rebuild should stay deferred while the service is still building",
         );
         assert!(
-            runner.rebuild_batch_handle.is_none(),
+            !runner.builds.rebuild_in_flight(),
             "no rebuild build should start while the service is still building",
         );
 
@@ -2713,11 +2724,11 @@ mod tests {
         runner.set_service_state("api", ServiceState::Ready);
         runner.flush_pending_rebuilds().await;
         assert!(
-            !runner.pending_bt_rebuilds.contains(&"api".to_string()),
+            !runner.builds.has_pending_rebuild("api"),
             "deferred rebuild should fire once the service is running",
         );
         assert!(
-            runner.rebuild_batch_handle.is_some(),
+            runner.builds.rebuild_in_flight(),
             "a rebuild build should start once the service is running",
         );
     }
