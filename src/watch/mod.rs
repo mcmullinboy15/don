@@ -1,8 +1,8 @@
 //! File watching with per-service debounce and change-during-build handling.
 //!
 //! The [`WatchManager`] sets up `notify` watchers for services and tasks with
-//! `watch` patterns, debounces events per-service, and sends [`RunnerCommand::Rebuild`]
-//! or [`RunnerCommand::TaskRerun`] to the runner when a rebuild cycle should start.
+//! `watch` patterns, debounces events per-service, and emits a
+//! [`WatchSignal`] when a rebuild cycle should start.
 //!
 //! Each watched service has its own state machine:
 //!
@@ -12,22 +12,27 @@
 //!                      Rebuilding (another cycle)
 //! ```
 //!
-//! The watch module subscribes to [`RunnerEvent::RebuildComplete`] to know when
-//! a cycle finishes, and checks the `stale` flag to decide whether to immediately
-//! start another cycle.
+//! A cycle ends when the matching [`WatchOutcome`] arrives; the `stale` flag
+//! then decides whether to immediately start another one.
+//!
+//! This module deliberately knows nothing about the runner — see
+//! [`signal`] for why the two vocabularies are separate.
+
+pub(crate) mod signal;
+
+pub(crate) use signal::{WatchOutcome, WatchSignal};
 
 use crate::config::{Config, Platform};
 use crate::duration::parse_duration;
 use crate::globwalk::{matches_glob, matches_ignore};
 use crate::output::LifecycleEmitter;
-use crate::runner::{RunnerCommand, RunnerEvent};
 use glob::Pattern;
 use ignore::overrides::{Override, OverrideBuilder};
 use notify::{EventKind, PathsMut, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 /// Default debounce window when none is configured.
@@ -60,11 +65,11 @@ enum WatchState {
 /// What command to send when this item's debounce timer fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchItemKind {
-    /// Send `RunnerCommand::Rebuild { name }`.
+    /// Send `WatchSignal::Rebuild { name }`.
     Service,
-    /// Send `RunnerCommand::TaskRerun { name }`.
+    /// Send `WatchSignal::TaskRerun { name }`.
     Task,
-    /// Send `RunnerCommand::BuildGraphChanged { name }` — tier-1 watch for
+    /// Send `WatchSignal::BuildGraphChanged { name }` — tier-1 watch for
     /// build tool definition files (BUILD, package.json, etc.). No rebuild cycle;
     /// the runner re-queries the build tool and updates tier-2 watch patterns.
     BuildGraph,
@@ -156,10 +161,10 @@ pub(crate) struct WatchManager {
     event_rx: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     /// Per-item (service or task) state.
     items: HashMap<String, WatchedItem>,
-    /// Sender to the runner's command channel.
-    cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
-    /// Receiver for runner events (rebuild/rerun completion).
-    runner_events: broadcast::Receiver<RunnerEvent>,
+    /// Where debounced change signals go.
+    signal_tx: mpsc::UnboundedSender<WatchSignal>,
+    /// Completions for the cycles this watcher started.
+    outcome_rx: mpsc::UnboundedReceiver<WatchOutcome>,
     /// Receiver for watch pattern updates from the runner (build tool re-queries).
     update_rx: mpsc::UnboundedReceiver<WatchUpdate>,
     /// Receiver for debug/status queries from the runner.
@@ -244,8 +249,8 @@ impl WatchManager {
         config: &Config,
         platform: Platform,
         base_dir: &Path,
-        cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
-        runner_events: broadcast::Receiver<RunnerEvent>,
+        signal_tx: mpsc::UnboundedSender<WatchSignal>,
+        outcome_rx: mpsc::UnboundedReceiver<WatchOutcome>,
         update_rx: mpsc::UnboundedReceiver<WatchUpdate>,
         query_rx: mpsc::Receiver<WatchQuery>,
         emitter: LifecycleEmitter,
@@ -700,8 +705,8 @@ impl WatchManager {
                 notify_tx,
                 event_rx,
                 items,
-                cmd_tx,
-                runner_events,
+                signal_tx,
+                outcome_rx,
                 update_rx,
                 query_rx,
                 registered_dirs,
@@ -738,12 +743,10 @@ impl WatchManager {
                 _ = sleep_until_or_pending(next_deadline) => {
                     self.fire_debounce_timers().await;
                 }
-                result = self.runner_events.recv() => {
+                result = self.outcome_rx.recv() => {
                     match result {
-                        Ok(event) => self.handle_runner_event(&event).await,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            // Missed n events. If one was a RebuildComplete,
+                        Some(WatchOutcome::Lagged(n)) => {
+                            // Missed n outcomes. If one was a RebuildComplete,
                             // the corresponding WatchedItem is stuck in
                             // `Rebuilding` and will swallow future edits until
                             // the item is re-registered. Surface it loudly.
@@ -753,6 +756,11 @@ impl WatchManager {
                                 "watch: broadcast lag — missed {n} runner events; a service may be stuck in Rebuilding"
                             ));
                         }
+                        Some(outcome) => self.handle_outcome(&outcome).await,
+                        // The sender is gone, so no cycle this watcher starts
+                        // can ever complete. Stop rather than debounce into a
+                        // channel nobody reads.
+                        None => break,
                     }
                 }
                 Some(update) = self.update_rx.recv() => {
@@ -1070,7 +1078,7 @@ impl WatchManager {
         }
 
         for name in stale_services {
-            let _ = self.cmd_tx.send(RunnerCommand::RebuildStale { name });
+            let _ = self.signal_tx.send(WatchSignal::RebuildStale { name });
         }
     }
 
@@ -1146,20 +1154,20 @@ impl WatchManager {
                 let (cmd, label) = match kind {
                     WatchItemKind::Task => {
                         item.state = WatchState::Rebuilding;
-                        (RunnerCommand::TaskRerun { name: name.clone() }, "TaskRerun")
+                        (WatchSignal::TaskRerun { name: name.clone() }, "TaskRerun")
                     }
                     WatchItemKind::Service => {
                         item.state = WatchState::Rebuilding;
-                        (RunnerCommand::Rebuild { name: name.clone() }, "Rebuild")
+                        (WatchSignal::Rebuild { name: name.clone() }, "Rebuild")
                     }
                     WatchItemKind::BuildGraph => {
                         // Build graph change has no rebuild/complete cycle —
-                        // the runner re-queries the build tool asynchronously.
+                        // the owner re-queries the build tool asynchronously.
                         // Extract the service/task name by stripping "__graph" suffix.
                         item.state = WatchState::Idle;
                         let item_name = build_graph_command_name(&name);
                         (
-                            RunnerCommand::BuildGraphChanged { name: item_name },
+                            WatchSignal::BuildGraphChanged { name: item_name },
                             "BuildGraphChanged",
                         )
                     }
@@ -1171,21 +1179,25 @@ impl WatchManager {
                         label, item.state
                     ),
                 );
-                // If the channel is closed, the runner is shutting down.
-                if self.cmd_tx.send(cmd).is_err() {
+                // If the channel is closed, the owner is shutting down.
+                if self.signal_tx.send(cmd).is_err() {
                     self.emitter.service_debug_event(
                         &name,
-                        "watch: command channel closed — runner is shutting down",
+                        "watch: signal channel closed — owner is shutting down",
                     );
                 }
             }
         }
     }
 
-    /// Handle a runner event — mainly looking for rebuild/rerun completion.
-    async fn handle_runner_event(&mut self, event: &RunnerEvent) {
-        match event {
-            RunnerEvent::RebuildComplete { name, success } => {
+    /// End the cycle this outcome completes, or start the next one if edits
+    /// arrived while it was running.
+    ///
+    /// [`WatchOutcome::Lagged`] is handled by the caller, which owns the lag
+    /// counter.
+    async fn handle_outcome(&mut self, outcome: &WatchOutcome) {
+        match outcome {
+            WatchOutcome::RebuildComplete { name, success } => {
                 if let Some(item) = self.items.get_mut(name) {
                     if item.stale {
                         // More changes came in during the rebuild — trigger another cycle.
@@ -1198,8 +1210,8 @@ impl WatchManager {
                             ),
                         );
                         let _ = self
-                            .cmd_tx
-                            .send(RunnerCommand::Rebuild { name: name.clone() });
+                            .signal_tx
+                            .send(WatchSignal::Rebuild { name: name.clone() });
                     } else {
                         item.state = WatchState::Idle;
                         self.emitter.service_debug_event(
@@ -1212,7 +1224,7 @@ impl WatchManager {
                         .debug_event(&format!("watch: RebuildComplete for unknown item {name:?}"));
                 }
             }
-            RunnerEvent::TaskRerunComplete { name, success } => {
+            WatchOutcome::TaskRerunComplete { name, success } => {
                 if let Some(item) = self.items.get_mut(name) {
                     if item.stale {
                         item.stale = false;
@@ -1224,8 +1236,8 @@ impl WatchManager {
                             ),
                         );
                         let _ = self
-                            .cmd_tx
-                            .send(RunnerCommand::TaskRerun { name: name.clone() });
+                            .signal_tx
+                            .send(WatchSignal::TaskRerun { name: name.clone() });
                     } else {
                         item.state = WatchState::Idle;
                         self.emitter.service_debug_event(
@@ -1239,10 +1251,8 @@ impl WatchManager {
                     ));
                 }
             }
-            RunnerEvent::ShutdownComplete => {
-                // Stop watching.
-            }
-            _ => {}
+            // Handled by the caller, which owns the lag counter.
+            WatchOutcome::Lagged(_) => {}
         }
     }
 
@@ -2318,7 +2328,7 @@ bazel.target = "//services/api:api"
             let temp = tempfile::tempdir().unwrap();
             let config: crate::config::Config = case.toml.parse().unwrap();
             let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-            let (_event_tx, event_rx) = broadcast::channel(8);
+            let (_outcome_tx, outcome_rx) = mpsc::unbounded_channel();
             let (_update_tx, update_rx) = mpsc::unbounded_channel();
             let (_query_tx, query_rx) = mpsc::channel(8);
             let output = crate::output::OutputManager::new(
@@ -2333,7 +2343,7 @@ bazel.target = "//services/api:api"
                 crate::config::Platform::LinuxX86_64,
                 temp.path(),
                 cmd_tx,
-                event_rx,
+                outcome_rx,
                 update_rx,
                 query_rx,
                 output.clone_lifecycle_emitter(),
@@ -2515,15 +2525,15 @@ bazel.target = "//services/api:api"
 
         // Should have received exactly one Rebuild command.
         let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::Rebuild { ref name } if name == "api"));
+        assert!(matches!(cmd, WatchSignal::Rebuild { ref name } if name == "api"));
         assert!(cmd_rx.try_recv().is_err());
 
         // Clean up: send rebuild complete event to reset state.
-        let event = RunnerEvent::RebuildComplete {
+        let event = WatchOutcome::RebuildComplete {
             name: "api".to_string(),
             success: true,
         };
-        handle_runner_event_standalone(&mut mgr_items, &event, &cmd_tx).await;
+        handle_outcome_standalone(&mut mgr_items, &event, &cmd_tx).await;
         assert_eq!(mgr_items["api"].state, WatchState::Idle);
     }
 
@@ -2563,11 +2573,11 @@ bazel.target = "//services/api:api"
         let _ = cmd_rx.try_recv().unwrap(); // consume first Rebuild
 
         // Simulate rebuild completion.
-        let complete = RunnerEvent::RebuildComplete {
+        let complete = WatchOutcome::RebuildComplete {
             name: "api".to_string(),
             success: true,
         };
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
+        handle_outcome_standalone(&mut items, &complete, &cmd_tx).await;
         assert_eq!(items["api"].state, WatchState::Idle);
 
         // Second event: should start a new cycle.
@@ -2577,7 +2587,7 @@ bazel.target = "//services/api:api"
         tokio::time::advance(Duration::from_millis(200)).await;
         fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
         let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::Rebuild { ref name } if name == "api"));
+        assert!(matches!(cmd, WatchSignal::Rebuild { ref name } if name == "api"));
     }
 
     #[tokio::test]
@@ -2657,18 +2667,18 @@ bazel.target = "//services/api:api"
         assert!(items["api"].stale);
         assert_eq!(items["api"].state, WatchState::Rebuilding);
         let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api"));
+        assert!(matches!(cmd, WatchSignal::RebuildStale { ref name } if name == "api"));
 
         // Build completes — should trigger another Rebuild because stale.
-        let complete = RunnerEvent::RebuildComplete {
+        let complete = WatchOutcome::RebuildComplete {
             name: "api".to_string(),
             success: true,
         };
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
+        handle_outcome_standalone(&mut items, &complete, &cmd_tx).await;
         assert_eq!(items["api"].state, WatchState::Rebuilding);
         assert!(!items["api"].stale);
         let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::Rebuild { ref name } if name == "api"));
+        assert!(matches!(cmd, WatchSignal::Rebuild { ref name } if name == "api"));
     }
 
     #[tokio::test]
@@ -2707,20 +2717,20 @@ bazel.target = "//services/api:api"
         assert!(items["api"].stale);
         let mut stale_count = 0;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api") {
+            if matches!(cmd, WatchSignal::RebuildStale { ref name } if name == "api") {
                 stale_count += 1;
             }
         }
         assert_eq!(stale_count, 5);
 
         // Build completes — only one follow-up rebuild.
-        let complete = RunnerEvent::RebuildComplete {
+        let complete = WatchOutcome::RebuildComplete {
             name: "api".to_string(),
             success: true,
         };
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
+        handle_outcome_standalone(&mut items, &complete, &cmd_tx).await;
         let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::Rebuild { ref name } if name == "api"));
+        assert!(matches!(cmd, WatchSignal::Rebuild { ref name } if name == "api"));
         assert!(cmd_rx.try_recv().is_err()); // No extra commands.
     }
 
@@ -2769,20 +2779,20 @@ bazel.target = "//services/api:api"
         assert!(items["api"].stale);
         assert_eq!(items["api"].state, WatchState::Rebuilding);
         let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api"));
+        assert!(matches!(cmd, WatchSignal::RebuildStale { ref name } if name == "api"));
 
         // Rebuild completes with stale -> immediately Rebuilding again.
-        let complete = RunnerEvent::RebuildComplete {
+        let complete = WatchOutcome::RebuildComplete {
             name: "api".to_string(),
             success: true,
         };
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
+        handle_outcome_standalone(&mut items, &complete, &cmd_tx).await;
         assert_eq!(items["api"].state, WatchState::Rebuilding);
         assert!(!items["api"].stale);
         let _ = cmd_rx.try_recv().unwrap();
 
         // Second rebuild completes without stale -> Idle.
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
+        handle_outcome_standalone(&mut items, &complete, &cmd_tx).await;
         assert_eq!(items["api"].state, WatchState::Idle);
         assert!(cmd_rx.try_recv().is_err());
     }
@@ -2792,7 +2802,7 @@ bazel.target = "//services/api:api"
     async fn handle_notify_event_standalone(
         items: &mut HashMap<String, WatchedItem>,
         event: &notify::Event,
-        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
+        cmd_tx: &mpsc::UnboundedSender<WatchSignal>,
     ) {
         if !matches!(
             event.kind,
@@ -2846,13 +2856,13 @@ bazel.target = "//services/api:api"
         }
 
         for name in stale_services {
-            let _ = cmd_tx.send(RunnerCommand::RebuildStale { name });
+            let _ = cmd_tx.send(WatchSignal::RebuildStale { name });
         }
     }
 
     async fn fire_debounce_timers_standalone(
         items: &mut HashMap<String, WatchedItem>,
-        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
+        cmd_tx: &mpsc::UnboundedSender<WatchSignal>,
     ) {
         let now = Instant::now();
         let mut to_fire: Vec<(String, WatchItemKind)> = Vec::new();
@@ -2872,16 +2882,16 @@ bazel.target = "//services/api:api"
                 let cmd = match kind {
                     WatchItemKind::Task => {
                         item.state = WatchState::Rebuilding;
-                        RunnerCommand::TaskRerun { name }
+                        WatchSignal::TaskRerun { name }
                     }
                     WatchItemKind::Service => {
                         item.state = WatchState::Rebuilding;
-                        RunnerCommand::Rebuild { name }
+                        WatchSignal::Rebuild { name }
                     }
                     WatchItemKind::BuildGraph => {
                         item.state = WatchState::Idle;
                         let item_name = build_graph_command_name(&name);
-                        RunnerCommand::BuildGraphChanged { name: item_name }
+                        WatchSignal::BuildGraphChanged { name: item_name }
                     }
                 };
                 let _ = cmd_tx.send(cmd);
@@ -2889,29 +2899,29 @@ bazel.target = "//services/api:api"
         }
     }
 
-    async fn handle_runner_event_standalone(
+    async fn handle_outcome_standalone(
         items: &mut HashMap<String, WatchedItem>,
-        event: &RunnerEvent,
-        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
+        event: &WatchOutcome,
+        cmd_tx: &mpsc::UnboundedSender<WatchSignal>,
     ) {
         match event {
-            RunnerEvent::RebuildComplete { name, .. } => {
+            WatchOutcome::RebuildComplete { name, .. } => {
                 if let Some(item) = items.get_mut(name) {
                     if item.stale {
                         item.stale = false;
                         item.state = WatchState::Rebuilding;
-                        let _ = cmd_tx.send(RunnerCommand::Rebuild { name: name.clone() });
+                        let _ = cmd_tx.send(WatchSignal::Rebuild { name: name.clone() });
                     } else {
                         item.state = WatchState::Idle;
                     }
                 }
             }
-            RunnerEvent::TaskRerunComplete { name, .. } => {
+            WatchOutcome::TaskRerunComplete { name, .. } => {
                 if let Some(item) = items.get_mut(name) {
                     if item.stale {
                         item.stale = false;
                         item.state = WatchState::Rebuilding;
-                        let _ = cmd_tx.send(RunnerCommand::TaskRerun { name: name.clone() });
+                        let _ = cmd_tx.send(WatchSignal::TaskRerun { name: name.clone() });
                     } else {
                         item.state = WatchState::Idle;
                     }
@@ -2964,7 +2974,7 @@ bazel.target = "//services/api:api"
         // Should receive BuildGraphChanged with the service name (not the __graph suffix).
         let cmd = cmd_rx.try_recv().unwrap();
         assert!(
-            matches!(cmd, RunnerCommand::BuildGraphChanged { ref name } if name == "api"),
+            matches!(cmd, WatchSignal::BuildGraphChanged { ref name } if name == "api"),
             "expected BuildGraphChanged for 'api', got different command"
         );
     }
@@ -3045,7 +3055,7 @@ bazel.target = "//services/api:api"
 
         let cmd = cmd_rx.try_recv().unwrap();
         assert!(
-            matches!(cmd, RunnerCommand::BuildGraphChanged { ref name } if name == WORKSPACE_GRAPH_ITEM_NAME),
+            matches!(cmd, WatchSignal::BuildGraphChanged { ref name } if name == WORKSPACE_GRAPH_ITEM_NAME),
             "expected BuildGraphChanged for workspace sentinel, got different command"
         );
     }

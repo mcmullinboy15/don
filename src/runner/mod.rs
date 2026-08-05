@@ -35,6 +35,7 @@ mod task_commands;
 mod task_supervisor;
 mod task_worker;
 mod terminal;
+mod watch_link;
 
 pub(crate) mod service;
 pub(crate) mod task;
@@ -1484,8 +1485,17 @@ impl Runner {
         let config_for_watch = self.config.clone();
         let platform_for_watch = self.platform;
         let base_dir_for_watch = self.base_dir.clone();
-        let cmd_tx_for_watch = self.cmd_tx.clone();
-        let runner_events_for_watch = self.event_tx.subscribe();
+        // The watcher speaks its own vocabulary; `watch_link` adapts it to the
+        // runner's, so `watch` needs no runner types. Subscribe before setup
+        // so no completion emitted during it is missed.
+        let (watch_signal_tx, watch_signal_rx) = mpsc::unbounded_channel();
+        let (watch_outcome_tx, watch_outcome_rx) = mpsc::unbounded_channel();
+        let watch_link_handle = watch_link::spawn(
+            watch_signal_rx,
+            self.cmd_tx.clone(),
+            self.event_tx.subscribe(),
+            watch_outcome_tx,
+        );
         let emitter_for_watch = self.output_manager.clone_lifecycle_emitter();
         let watch_setup_started = Instant::now();
         self.output_manager.debug_event(&format!(
@@ -1497,8 +1507,8 @@ impl Runner {
                 &config_for_watch,
                 platform_for_watch,
                 &base_dir_for_watch,
-                cmd_tx_for_watch,
-                runner_events_for_watch,
+                watch_signal_tx,
+                watch_outcome_rx,
                 watch_update_rx,
                 watch_query_rx,
                 emitter_for_watch,
@@ -1860,6 +1870,12 @@ impl Runner {
             handle.abort();
             let _ = handle.await;
         }
+        // Aborting the watcher drops its signal sender, so the link would
+        // exit on its own — but only once it is next polled. Ending it here
+        // keeps teardown deterministic rather than leaving a task racing the
+        // rest of shutdown.
+        watch_link_handle.abort();
+        let _ = watch_link_handle.await;
 
         self.finish_runtime_port_manifest().await;
         if self.shutting_down {
