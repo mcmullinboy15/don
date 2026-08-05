@@ -672,7 +672,7 @@ impl Runner {
                 .tasks
                 .get(name)
                 .is_some_and(|rt| rt.state() == TaskItemState::Pending)
-                && !self.task_runs.get(name).is_some_and(|runs| runs.is_busy())
+                && !self.task_supervisors.registry().is_busy(name)
     }
 
     /// Whether every item participating in initial startup has settled.

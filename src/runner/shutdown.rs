@@ -90,15 +90,17 @@ impl Runner {
         // preparing. Draining the map drops the senders too, so nothing can
         // queue a run after this point. Abort them all before awaiting any,
         // or the 1s bound is paid once per task rather than once.
-        let mut run_supervisors = Vec::new();
-        for (name, runs) in std::mem::take(&mut self.task_runs) {
-            if runs.is_busy() {
-                self.output_manager
-                    .service_event(&name, "run cancelled by shutdown");
-            }
-            run_supervisors.push(runs.abort());
+        let busy: Vec<String> = self
+            .task_supervisors
+            .registry()
+            .busy_names()
+            .map(str::to_string)
+            .collect();
+        for name in busy {
+            self.output_manager
+                .service_event(&name, "run cancelled by shutdown");
         }
-        for handle in run_supervisors {
+        for (_, handle) in self.task_supervisors.abort_all() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
 

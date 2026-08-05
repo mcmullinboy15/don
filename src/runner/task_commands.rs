@@ -1,4 +1,4 @@
-use super::task_worker::{TaskRunMode, TaskRunPrepared, TaskWorkerContext};
+use super::task_worker::{TaskRunMode, TaskRunPrepared};
 use super::{
     CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
     TaskItemState, TaskRunIntent, TaskRunWaiter, resolve_task_params,
@@ -27,27 +27,18 @@ impl Runner {
         intent: TaskRunIntent,
     ) -> Result<u64, CommandError> {
         self.render_runtime_env(name, &mut task_cfg.env)?;
-        if !self.tasks.contains_key(name) {
+        // The registry is built from the task map, so a hit here is proof the
+        // task exists — no separate existence check needed.
+        let Some(handle) = self.task_supervisors.registry().get(name).cloned() else {
             return Err(CommandError::UnknownTask {
                 name: name.to_string(),
             });
-        }
-        let ctx = TaskWorkerContext {
-            base_dir: self.base_dir.clone(),
-            platform: self.platform,
-            emitter: self.output_manager.clone_lifecycle_emitter(),
-            global_watch_ignore: self.config.watch_ignore.clone(),
-            terminal_coordinator: self.terminal_coordinator.clone(),
         };
-        let internal_tx = self.internal_tx.clone();
-        let runs = self.task_runs.entry(name.to_string()).or_insert_with(|| {
-            task_supervisor::TaskRuns::spawn(name.to_string(), ctx, internal_tx)
-        });
 
         if task_cfg.terminal.is_foreground() {
             self.output_manager.pause_visible_output();
         }
-        let queued = runs.request(task_supervisor::RunRequest {
+        let queued = handle.request(task_supervisor::RunRequest {
             task_cfg: Box::new(task_cfg),
             params,
             mode,
@@ -60,13 +51,10 @@ impl Runner {
             });
         }
 
-        let Some(rt) = self.tasks.get_mut(name) else {
-            return Err(CommandError::UnknownTask {
-                name: name.to_string(),
-            });
-        };
-        rt.run_generation = rt.run_generation.saturating_add(1);
-        Ok(rt.run_generation)
+        Ok(self.tasks.get_mut(name).map_or(0, |rt| {
+            rt.run_generation = rt.run_generation.saturating_add(1);
+            rt.run_generation
+        }))
     }
 
     pub(in crate::runner) async fn handle_task_run_prepared(
@@ -739,7 +727,7 @@ impl Runner {
         // the same task and the output would interleave unpredictably.
         let already_in_flight = self.tasks.get(name).is_some_and(|rt| {
             matches!(rt.state(), TaskItemState::Running | TaskItemState::Building)
-        }) || self.task_runs.get(name).is_some_and(|runs| runs.is_busy());
+        }) || self.task_supervisors.registry().is_busy(name);
         if already_in_flight {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),

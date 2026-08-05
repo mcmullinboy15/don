@@ -889,12 +889,13 @@ pub struct Runner {
     /// Sender for querying the live watch manager state for verbose status.
     watch_query_tx: Option<mpsc::Sender<crate::watch::WatchQuery>>,
 
-    /// Per-task run supervisors, created on a task's first run.
+    /// One run supervisor per task, plus the registry that addresses them.
     ///
-    /// Each owns its task's run preparation and is the only thing that
-    /// reports a prepared run, so a superseded one can't reach the runner at
-    /// all. Keyed by task name; entries live until shutdown.
-    task_runs: HashMap<String, task_supervisor::TaskRuns>,
+    /// Each supervisor owns its task's run preparation and is the only thing
+    /// that reports a prepared run, so a superseded one can't reach the
+    /// runner at all. The registry half is clone-able and send-only; ending a
+    /// supervisor stays here.
+    task_supervisors: task_supervisor::TaskSupervisors,
 
     /// Coalescing for build-tool work: the rebuild and graph-re-query queues,
     /// their batch windows, the in-flight batches, and the mutex that
@@ -983,6 +984,20 @@ impl Runner {
         )
         .await;
 
+        // One supervisor per task, started before the runner exists so the
+        // registry is immutable and can be shared without a lock.
+        let task_supervisors = task_supervisor::TaskSupervisors::spawn_all(
+            tasks.keys(),
+            &task_worker::TaskWorkerContext {
+                base_dir: base_dir.clone(),
+                platform,
+                emitter: output_manager.clone_lifecycle_emitter(),
+                global_watch_ignore: config.watch_ignore.clone(),
+                terminal_coordinator: terminal_coordinator.clone(),
+            },
+            &internal_tx,
+        );
+
         let (manifest_writer_tx, manifest_writer_handle) = runtime_ports::spawn_manifest_writer(
             base_dir.clone(),
             output_manager.clone_lifecycle_emitter(),
@@ -1013,7 +1028,7 @@ impl Runner {
             batch_build_handle: None,
             lazy_build_handles: HashMap::new(),
             update_check_handle: None,
-            task_runs: HashMap::new(),
+            task_supervisors,
             builds: BuildBatcher::new(),
             completion_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 completions::CompletionCache::default(),
