@@ -21,6 +21,7 @@ pub(in crate::runner) enum TaskRunPrepared {
     ForegroundSpawned(Box<task::ForegroundTaskSpawn>),
 }
 
+#[derive(Clone)]
 pub(in crate::runner) struct TaskWorkerContext {
     pub(in crate::runner) base_dir: PathBuf,
     pub(in crate::runner) platform: Platform,

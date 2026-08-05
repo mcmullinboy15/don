@@ -453,7 +453,6 @@ enum RunnerInternalCommand {
     /// Completion from a detached task run worker.
     TaskRunPrepared {
         name: String,
-        op_id: u64,
         task_cfg: Box<crate::config::Task>,
         intent: TaskRunIntent,
         result: Result<TaskRunPrepared, String>,
@@ -890,6 +889,13 @@ pub struct Runner {
     /// Sender for querying the live watch manager state for verbose status.
     watch_query_tx: Option<mpsc::Sender<crate::watch::WatchQuery>>,
 
+    /// Per-task run supervisors, created on a task's first run.
+    ///
+    /// Each owns its task's run preparation and is the only thing that
+    /// reports a prepared run, so a superseded one can't reach the runner at
+    /// all. Keyed by task name; entries live until shutdown.
+    task_runs: HashMap<String, task_supervisor::TaskRuns>,
+
     /// Coalescing for build-tool work: the rebuild and graph-re-query queues,
     /// their batch windows, the in-flight batches, and the mutex that
     /// serialises Bazel.
@@ -1007,6 +1013,7 @@ impl Runner {
             batch_build_handle: None,
             lazy_build_handles: HashMap::new(),
             update_check_handle: None,
+            task_runs: HashMap::new(),
             builds: BuildBatcher::new(),
             completion_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 completions::CompletionCache::default(),
@@ -1708,12 +1715,11 @@ impl Runner {
                         match cmd {
                             RunnerInternalCommand::TaskRunPrepared {
                                 name,
-                                op_id,
                                 task_cfg,
                                 intent,
                                 result,
                             } => {
-                                self.handle_task_run_prepared(&name, op_id, &task_cfg, intent, result)
+                                self.handle_task_run_prepared(&name, &task_cfg, intent, result)
                                     .await;
                             }
                             RunnerInternalCommand::ServiceStopComplete { name, op_id, result } => {

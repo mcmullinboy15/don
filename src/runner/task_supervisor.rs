@@ -17,8 +17,170 @@ use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::{ItemDone, NodeKind, RunnerInternalCommand, TaskExit};
 use crate::task_state::{TaskRunInfo, TaskState};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// One request to run a task, as handed to its supervisor.
+pub(in crate::runner) struct RunRequest {
+    pub(in crate::runner) task_cfg: Box<crate::config::Task>,
+    pub(in crate::runner) params: std::collections::HashMap<String, String>,
+    pub(in crate::runner) mode: super::task_worker::TaskRunMode,
+    pub(in crate::runner) intent: super::TaskRunIntent,
+}
+
+/// A task's run supervisor: one task, one mailbox, one run at a time.
+///
+/// Preparing a run is slow — it resolves params, expands watch globs and
+/// hashes inputs — so it has always been detached. What is new is that it is
+/// detached *per task* rather than onto a shared completion channel, which is
+/// what removes the need to ask "is this completion still current?" when it
+/// lands. The supervisor is the only thing that emits
+/// [`RunnerInternalCommand::TaskRunPrepared`] for its task, and it only emits
+/// for the run it is currently committed to.
+pub(in crate::runner) struct TaskRuns {
+    tx: mpsc::UnboundedSender<RunRequest>,
+    join: tokio::task::JoinHandle<()>,
+    /// True from the moment a run is queued until the supervisor goes back to
+    /// waiting with an empty mailbox. The startup sweep reads it to tell
+    /// "this task hasn't been asked to run" from "it is being prepared".
+    busy: Arc<AtomicBool>,
+}
+
+impl TaskRuns {
+    /// Start a supervisor for `name`.
+    pub(in crate::runner) fn spawn(
+        name: String,
+        ctx: super::task_worker::TaskWorkerContext,
+        internal_tx: mpsc::Sender<RunnerInternalCommand>,
+    ) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let busy = Arc::new(AtomicBool::new(false));
+        let join = tokio::spawn(supervise(name, rx, ctx, internal_tx, Arc::clone(&busy)));
+        Self { tx, join, busy }
+    }
+
+    /// Queue a run. Fails only once the supervisor is gone (shutdown).
+    ///
+    /// Marks the task busy before sending, not after the supervisor picks the
+    /// request up — otherwise a caller could queue a run and immediately be
+    /// told the task is idle.
+    pub(in crate::runner) fn request(&self, request: RunRequest) -> bool {
+        self.busy.store(true, Ordering::Relaxed);
+        let sent = self.tx.send(request).is_ok();
+        if !sent {
+            self.busy.store(false, Ordering::Relaxed);
+        }
+        sent
+    }
+
+    /// Whether a run is queued or being prepared.
+    pub(in crate::runner) fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
+
+    /// Stop the supervisor, cancelling any run it is preparing.
+    ///
+    /// Aborting mid-preparation can strand a process the worker had just
+    /// spawned — the handle dies with the future. That is pre-existing (the
+    /// runner aborted `run_worker` the same way), and shutdown's
+    /// `stop_late_task_start` is what catches the case where the spawn
+    /// already reported in.
+    pub(in crate::runner) async fn shutdown(self) {
+        drop(self.tx);
+        self.join.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.join).await;
+    }
+}
+
+/// Drive one task's runs, strictly in order.
+///
+/// The shape that matters is that a superseded run is **finished, not
+/// aborted**. `run_task_worker` may already have spawned a process by the
+/// time a newer request arrives; dropping that future would take the handle
+/// with it and leave a child nothing will ever reap. So the worker always
+/// runs to completion and the result is then killed off explicitly.
+async fn supervise(
+    name: String,
+    mut rx: mpsc::UnboundedReceiver<RunRequest>,
+    ctx: super::task_worker::TaskWorkerContext,
+    internal_tx: mpsc::Sender<RunnerInternalCommand>,
+    busy: Arc<AtomicBool>,
+) {
+    let mut pending: Option<RunRequest> = None;
+    let mut mailbox_closed = false;
+
+    loop {
+        let request = match pending.take() {
+            Some(request) => request,
+            None => {
+                // Idle only here: everywhere else there is work in hand.
+                busy.store(false, Ordering::Relaxed);
+                match rx.recv().await {
+                    Some(request) => {
+                        busy.store(true, Ordering::Relaxed);
+                        request
+                    }
+                    None => return,
+                }
+            }
+        };
+        let RunRequest {
+            task_cfg,
+            params,
+            mode,
+            intent,
+        } = request;
+
+        let task_cfg_for_worker = task_cfg.clone();
+        let worker = super::task_worker::run_task_worker(
+            ctx.clone(),
+            &name,
+            task_cfg_for_worker.as_ref(),
+            &params,
+            mode,
+        );
+        tokio::pin!(worker);
+
+        // Watch for a newer request while the current one prepares, keeping
+        // only the most recent — anything older is already superseded too.
+        let mut superseded: Option<RunRequest> = None;
+        let result = loop {
+            tokio::select! {
+                result = &mut worker => break result,
+                next = rx.recv(), if !mailbox_closed => match next {
+                    Some(next) => superseded = Some(next),
+                    // Guarded so a closed mailbox doesn't spin this select:
+                    // `recv` on a closed channel returns immediately, forever.
+                    None => mailbox_closed = true,
+                },
+            }
+        };
+
+        match superseded {
+            Some(next) => {
+                if let Ok(prepared) = result {
+                    kill_superseded_spawn(&ctx.emitter, &name, prepared);
+                }
+                pending = Some(next);
+            }
+            None => {
+                let sent = internal_tx
+                    .send(RunnerInternalCommand::TaskRunPrepared {
+                        name: name.clone(),
+                        task_cfg,
+                        intent,
+                        result,
+                    })
+                    .await;
+                if sent.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
 
 /// How prominently a settled run's message is reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

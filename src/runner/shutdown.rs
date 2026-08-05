@@ -17,7 +17,7 @@ impl Runner {
         // A foreground task pauses the stdout/TUI sink while it owns the
         // terminal, and normally releases it from `handle_task_exit` /
         // `handle_task_done`. During shutdown those completion paths can be
-        // skipped — the run_worker may be aborted before it sends
+        // skipped — a run supervisor may be stopped before it reports
         // `TaskRunPrepared`, or the foreground task gets SIGKILL'd at the
         // end of this function and its `TaskExited` arrives after the main
         // loop has already broken out. If we leave the pause engaged, every
@@ -77,7 +77,6 @@ impl Runner {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
         }
 
-        let mut task_worker_handles = Vec::new();
         for (name, rt) in &mut self.tasks {
             if let Some(waiter) = rt.run_waiter.take() {
                 waiter.complete(Err(super::CommandError::Failed {
@@ -85,15 +84,17 @@ impl Runner {
                     message: "run cancelled by shutdown".to_string(),
                 }));
             }
-            if let Some(worker) = rt.run_worker.take() {
-                self.output_manager
-                    .service_event(name, "run cancelled by shutdown");
-                worker.abort();
-                task_worker_handles.push(worker);
-            }
         }
-        for worker in task_worker_handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
+
+        // Stop every task's run supervisor, cancelling anything it is
+        // preparing. Draining the map drops the senders too, so nothing can
+        // queue a run after this point.
+        for (name, runs) in std::mem::take(&mut self.task_runs) {
+            if runs.is_busy() {
+                self.output_manager
+                    .service_event(&name, "run cancelled by shutdown");
+            }
+            runs.shutdown().await;
         }
 
         // Same treatment for any in-flight JIT lazy builds. These are
@@ -336,9 +337,6 @@ impl Runner {
             rs.stop_action = ServiceStopAction::None;
         }
         for rt in self.tasks.values_mut() {
-            if let Some(worker) = rt.run_worker.take() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
             if let Some(worker) = rt.output_worker.take() {
                 Self::await_output_worker(worker).await;
             }

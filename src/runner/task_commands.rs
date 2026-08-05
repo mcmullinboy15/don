@@ -1,4 +1,4 @@
-use super::task_worker::{TaskRunMode, TaskRunPrepared, TaskWorkerContext, run_task_worker};
+use super::task_worker::{TaskRunMode, TaskRunPrepared, TaskWorkerContext};
 use super::{
     CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
     TaskItemState, TaskRunIntent, TaskRunWaiter, resolve_task_params,
@@ -10,6 +10,14 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
 impl Runner {
+    /// Queue a run on this task's supervisor.
+    ///
+    /// Returns the run's generation, which now has exactly one remaining job:
+    /// identifying which run a `don run --wait` reply belongs to. Deciding
+    /// whether a *prepared* run is still current is no longer a question the
+    /// runner asks — the supervisor is the only thing that emits
+    /// `TaskRunPrepared` for its task, and only for the run it is committed
+    /// to.
     pub(in crate::runner) fn spawn_task_worker(
         &mut self,
         name: &str,
@@ -19,53 +27,51 @@ impl Runner {
         intent: TaskRunIntent,
     ) -> Result<u64, CommandError> {
         self.render_runtime_env(name, &mut task_cfg.env)?;
+        if !self.tasks.contains_key(name) {
+            return Err(CommandError::UnknownTask {
+                name: name.to_string(),
+            });
+        }
+        let ctx = TaskWorkerContext {
+            base_dir: self.base_dir.clone(),
+            platform: self.platform,
+            emitter: self.output_manager.clone_lifecycle_emitter(),
+            global_watch_ignore: self.config.watch_ignore.clone(),
+            terminal_coordinator: self.terminal_coordinator.clone(),
+        };
+        let internal_tx = self.internal_tx.clone();
+        let runs = self.task_runs.entry(name.to_string()).or_insert_with(|| {
+            task_supervisor::TaskRuns::spawn(name.to_string(), ctx, internal_tx)
+        });
+
+        if task_cfg.terminal.is_foreground() {
+            self.output_manager.pause_visible_output();
+        }
+        let queued = runs.request(task_supervisor::RunRequest {
+            task_cfg: Box::new(task_cfg),
+            params,
+            mode,
+            intent,
+        });
+        if !queued {
+            return Err(CommandError::Failed {
+                name: name.to_string(),
+                message: "task supervisor is shutting down".to_string(),
+            });
+        }
+
         let Some(rt) = self.tasks.get_mut(name) else {
             return Err(CommandError::UnknownTask {
                 name: name.to_string(),
             });
         };
         rt.run_generation = rt.run_generation.saturating_add(1);
-        let op_id = rt.run_generation;
-
-        let cmd_tx = self.internal_tx.clone();
-        let base_dir = self.base_dir.clone();
-        let platform = self.platform;
-        let emitter = self.output_manager.clone_lifecycle_emitter();
-        let name_owned = name.to_string();
-        let task_cfg_for_worker = task_cfg.clone();
-        let global_watch_ignore = self.config.watch_ignore.clone();
-        let terminal_coordinator = self.terminal_coordinator.clone();
-        if task_cfg.terminal.is_foreground() {
-            self.output_manager.pause_visible_output();
-        }
-        let worker = tokio::spawn(async move {
-            let ctx = TaskWorkerContext {
-                base_dir,
-                platform,
-                emitter,
-                global_watch_ignore,
-                terminal_coordinator,
-            };
-            let result =
-                run_task_worker(ctx, &name_owned, &task_cfg_for_worker, &params, mode).await;
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::TaskRunPrepared {
-                    name: name_owned,
-                    op_id,
-                    task_cfg: Box::new(task_cfg),
-                    intent,
-                    result,
-                })
-                .await;
-        });
-        rt.run_worker = Some(worker);
-        Ok(op_id)
+        Ok(rt.run_generation)
     }
 
     pub(in crate::runner) async fn handle_task_run_prepared(
         &mut self,
         name: &str,
-        op_id: u64,
         task_cfg: &crate::config::Task,
         intent: TaskRunIntent,
         result: Result<TaskRunPrepared, String>,
@@ -80,33 +86,6 @@ impl Runner {
             }
             return;
         }
-        let is_current = self
-            .tasks
-            .get(name)
-            .is_some_and(|rt| rt.run_generation == op_id);
-        if !is_current {
-            if let Ok(prepared) = result {
-                task_supervisor::kill_superseded_spawn(
-                    &self.output_manager.clone_lifecycle_emitter(),
-                    name,
-                    prepared,
-                );
-            }
-            if task_cfg.terminal.is_foreground() {
-                self.output_manager.resume_visible_output();
-                // For the ForegroundSpawned branch above, the worker had
-                // already paused the TUI before the spawn; release it.
-                // The TUI ignores Release while it's not paused, so this
-                // is safe in the other branches too (where the worker
-                // never acquired in the first place).
-                self.terminal_coordinator.release().await;
-            }
-            return;
-        }
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.run_worker = None;
-        }
-
         match result {
             Ok(TaskRunPrepared::PendingRun { message }) => {
                 self.settle_task_without_spawn(
@@ -760,8 +739,7 @@ impl Runner {
         // the same task and the output would interleave unpredictably.
         let already_in_flight = self.tasks.get(name).is_some_and(|rt| {
             matches!(rt.state(), TaskItemState::Running | TaskItemState::Building)
-                || rt.run_worker.is_some()
-        });
+        }) || self.task_runs.get(name).is_some_and(|runs| runs.is_busy());
         if already_in_flight {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),

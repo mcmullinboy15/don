@@ -239,7 +239,6 @@ pub(crate) struct RuntimeTask {
     /// output sinks are torn down or final shutdown logs can be lost.
     pub output_worker: Option<tokio::task::JoinHandle<()>>,
     /// In-flight detached task run worker.
-    pub run_worker: Option<tokio::task::JoinHandle<()>>,
     /// Monotonic generation for task run workers so stale completions can
     /// be ignored.
     pub run_generation: u64,
@@ -275,7 +274,6 @@ impl RuntimeTask {
             attach_waiter: None,
             resolved_watch_paths: Vec::new(),
             output_worker: None,
-            run_worker: None,
             run_generation: 0,
             run_waiter: None,
             has_success,

@@ -671,7 +671,8 @@ impl Runner {
             || self
                 .tasks
                 .get(name)
-                .is_some_and(|rt| rt.state() == TaskItemState::Pending && rt.run_worker.is_none())
+                .is_some_and(|rt| rt.state() == TaskItemState::Pending)
+                && !self.task_runs.get(name).is_some_and(|runs| runs.is_busy())
     }
 
     /// Whether every item participating in initial startup has settled.
