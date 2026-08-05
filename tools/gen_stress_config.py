@@ -100,7 +100,23 @@ def emit_service(name, hidden=True, deps=None, lazy=False, port=None):
         lines.append(f'depends_on = {deps}\n')
     lines.append('\n')
 
+# A handful of startup tasks. Services dominate the shape of a real
+# monorepo, but with zero tasks the PTY driver exercises none of the task
+# run/exit path — which is most of what `don run`, watch reruns and the
+# `--wait` reply are built on.
+NUM_TASKS = 4
+
+def emit_task(name, deps=None, sleep="0.2"):
+    lines.append(f'[tasks.{name}]\n')
+    lines.append('cmd = "sh"\n')
+    lines.append(f'args = ["-c", "echo {name} running; sleep {sleep}"]\n')
+    lines.append('hidden = true\n')
+    if deps:
+        lines.append(f'depends_on = {deps}\n')
+    lines.append('\n')
+
 active_names = []
+active_tasks = []
 for name, hidden, _ in infra:
     emit_service(name, hidden=hidden)
     active_names.append(name)
@@ -111,6 +127,12 @@ for i in range(NUM_APPS):
     name = f"app-{i:02d}"
     emit_service(name, hidden=False, lazy=True, port=START_PORT + i, deps=["infra"])
     active_names.append(name)
+# `migrate-00` runs bare; the rest chain off it so the dependency gate and
+# the task-completion path both get exercised during startup.
+for i in range(NUM_TASKS):
+    name = f"migrate-{i:02d}"
+    emit_task(name, deps=["migrate-00"] if i else None)
+    active_tasks.append(name)
 
 # Format deps lists as TOML arrays.
 text = "".join(lines).replace("['", '["').replace("']", '"]').replace("',", '",').replace("'", '"')
@@ -121,9 +143,16 @@ for n in active_names:
     text += ""
 text2 = text + 'services = [\n' + "".join(f'  "{n}",\n' for n in active_names) + ']\n'
 # Restructure: prepend profile header.
-text_final = text + '[profiles.all]\nservices = [\n' + "".join(f'  "{n}",\n' for n in active_names) + ']\n'
+text_final = (
+    text
+    + '[profiles.all]\nservices = [\n'
+    + "".join(f'  "{n}",\n' for n in active_names)
+    + ']\ntasks = [\n'
+    + "".join(f'  "{n}",\n' for n in active_tasks)
+    + ']\n'
+)
 
 dest_toml = os.path.join(dest_dir, 'don.toml')
 with open(dest_toml, 'w') as f:
     f.write(text_final)
-print(f"wrote {dest_toml} with {len(active_names)} services")
+print(f"wrote {dest_toml} with {len(active_names)} services and {len(active_tasks)} tasks")
