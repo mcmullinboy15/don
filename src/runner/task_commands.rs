@@ -85,53 +85,12 @@ impl Runner {
             .get(name)
             .is_some_and(|rt| rt.run_generation == op_id);
         if !is_current {
-            match result {
-                Ok(TaskRunPrepared::Spawned(spawn)) => {
-                    let task::TaskSpawn {
-                        handle,
-                        child_output,
-                        rendered_cmdline: _rendered_cmdline,
-                    } = *spawn;
-                    drop(child_output);
-                    self.output_manager.service_event(
-                        name,
-                        &format!("send SIGKILL to stale task pgid {}", handle.pgid()),
-                    );
-                    tokio::spawn(async move {
-                        let mut handle = handle;
-                        let _ = handle
-                            .terminate(
-                                nix::sys::signal::Signal::SIGKILL,
-                                std::time::Duration::from_millis(500),
-                            )
-                            .await;
-                    });
-                }
-                Ok(TaskRunPrepared::ForegroundSpawned(spawn)) => {
-                    let task::ForegroundTaskSpawn {
-                        handle,
-                        rendered_cmdline: _rendered_cmdline,
-                    } = *spawn;
-                    self.output_manager.service_event(
-                        name,
-                        &format!(
-                            "send SIGKILL to stale foreground task pgid {}",
-                            handle.pgid()
-                        ),
-                    );
-                    tokio::spawn(async move {
-                        let mut handle = handle;
-                        let _ = handle
-                            .terminate(
-                                nix::sys::signal::Signal::SIGKILL,
-                                std::time::Duration::from_millis(500),
-                            )
-                            .await;
-                    });
-                }
-                Ok(TaskRunPrepared::PendingRun { .. })
-                | Ok(TaskRunPrepared::Skipped { .. })
-                | Err(_) => {}
+            if let Ok(prepared) = result {
+                task_supervisor::kill_superseded_spawn(
+                    &self.output_manager.clone_lifecycle_emitter(),
+                    name,
+                    prepared,
+                );
             }
             if task_cfg.terminal.is_foreground() {
                 self.output_manager.resume_visible_output();

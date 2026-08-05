@@ -20,6 +20,74 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// How long a superseded process gets to die politely before SIGKILL lands.
+const SUPERSEDED_KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Kill the process from a run that has been superseded by a newer one.
+///
+/// A run that loses a race may already have spawned; the process is live and
+/// nothing else will ever reap it, so it has to be killed here. Today the
+/// runner discovers this by comparing generations after the fact. Once a
+/// supervisor owns the run it will call this directly when it cancels one —
+/// same work, but as cleanup of something it owns rather than as recovery
+/// from a race it could not prevent.
+///
+/// Detached on purpose: the caller is on the runner's command loop, and
+/// waiting out a grace period there would stall every other item.
+///
+/// Takes the untagged emitter rather than an `ItemOutput` so the kill can
+/// never be gated on a name lookup succeeding — failing to log is a cosmetic
+/// problem, failing to kill leaks a process nothing will ever reap.
+pub(in crate::runner) fn kill_superseded_spawn(
+    emitter: &crate::output::LifecycleEmitter,
+    name: &str,
+    prepared: super::task_worker::TaskRunPrepared,
+) {
+    use super::task_worker::TaskRunPrepared;
+
+    match prepared {
+        TaskRunPrepared::Spawned(spawn) => {
+            let super::task::TaskSpawn {
+                mut handle,
+                child_output,
+                rendered_cmdline: _,
+            } = *spawn;
+            // Drop the read half first: nothing is going to consume it, and
+            // holding it open keeps the child's pipe alive.
+            drop(child_output);
+            emitter.service_event(
+                name,
+                &format!("send SIGKILL to stale task pgid {}", handle.pgid()),
+            );
+            tokio::spawn(async move {
+                let _ = handle
+                    .terminate(nix::sys::signal::Signal::SIGKILL, SUPERSEDED_KILL_GRACE)
+                    .await;
+            });
+        }
+        TaskRunPrepared::ForegroundSpawned(spawn) => {
+            let super::task::ForegroundTaskSpawn {
+                mut handle,
+                rendered_cmdline: _,
+            } = *spawn;
+            emitter.service_event(
+                name,
+                &format!(
+                    "send SIGKILL to stale foreground task pgid {}",
+                    handle.pgid()
+                ),
+            );
+            tokio::spawn(async move {
+                let _ = handle
+                    .terminate(nix::sys::signal::Signal::SIGKILL, SUPERSEDED_KILL_GRACE)
+                    .await;
+            });
+        }
+        // Nothing was spawned, so there is nothing to clean up.
+        TaskRunPrepared::PendingRun { .. } | TaskRunPrepared::Skipped { .. } => {}
+    }
+}
+
 /// Everything the exit half of a task run needs, owned outright.
 ///
 /// Owned rather than borrowed because this outlives the runner's command loop
