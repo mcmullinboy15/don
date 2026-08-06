@@ -237,6 +237,17 @@ impl Client {
         self.control("/hard-restart/", name).await
     }
 
+    /// `POST /shutdown?force=true` — escalate like a second Ctrl+C:
+    /// in-flight graceful stops SIGKILL their process groups.
+    pub async fn shutdown_force(&self) -> Result<(), ClientError> {
+        let (status, body) = self.request("POST", "/shutdown?force=true", false).await?;
+        if status == 204 {
+            return Ok(());
+        }
+        ensure_ok(status, &body)?;
+        Ok(())
+    }
+
     /// `POST /shutdown` — gracefully stop the daemon and all running services.
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         let (status, body) = self.request("POST", "/shutdown", false).await?;

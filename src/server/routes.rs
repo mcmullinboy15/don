@@ -293,8 +293,25 @@ async fn post_hard_restart(
     .await
 }
 
+#[derive(Deserialize)]
+struct ShutdownQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 /// `POST /shutdown` — gracefully stop the daemon.
-async fn post_shutdown(State(state): State<Arc<ApiState>>) -> Response {
+///
+/// `?force=true` escalates exactly like a second Ctrl+C: in-flight
+/// graceful stops SIGKILL their process groups and shutdown stops
+/// waiting. Idempotent with the graceful request — the runner's shutdown
+/// guard ignores the repeat, and the escalation flag does the rest.
+async fn post_shutdown(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ShutdownQuery>,
+) -> Response {
+    if query.force {
+        crate::signals::request_force_shutdown();
+    }
     if state.cmd_tx.send(RunnerCommand::Shutdown).is_err() {
         return runner_unavailable();
     }

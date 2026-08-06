@@ -52,6 +52,17 @@ pub fn signal_count() -> u8 {
     SIGNAL_COUNT.load(Ordering::SeqCst)
 }
 
+/// Escalate to force-shutdown as if a second signal had arrived.
+///
+/// The API's `POST /shutdown?force=true` lands here: attached clients run
+/// in raw mode, so their Ctrl+C arrives as a key event and goes over the
+/// socket — this gives that path the same escalation a second SIGINT gets.
+/// `fetch_max` so it never *un*-escalates, and works whether or not a
+/// graceful shutdown is already in flight.
+pub(crate) fn request_force_shutdown() {
+    SIGNAL_COUNT.fetch_max(2, Ordering::SeqCst);
+}
+
 pub(crate) fn shutdown_requested() -> bool {
     signal_count() >= 1
 }

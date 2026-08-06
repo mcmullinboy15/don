@@ -836,10 +836,19 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => {
+                // Second press escalates, matching the runner's own
+                // "Ctrl+C again to force" contract — raw mode means the key
+                // never becomes a SIGINT, so the escalation goes over the
+                // API instead of through the signal counter.
+                let force = app.shutdown_started;
                 {
                     let client = client.clone();
                     tokio::spawn(async move {
-                        let _ = client.shutdown().await;
+                        let _ = if force {
+                            client.shutdown_force().await
+                        } else {
+                            client.shutdown().await
+                        };
                     });
                 }
                 if controls.mode == TuiMode::InProcess {

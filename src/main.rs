@@ -3015,10 +3015,23 @@ where
 
     loop {
         if don::signals::signal_count() >= 2 {
-            errln(format!("forcing exit while {phase}"));
-            handle.abort();
-            let _ = handle.await;
-            return Err(format!("forced exit while {phase}"));
+            // Escalation requested. Do NOT abort yet: the runner polls the
+            // same flag (100ms) and its force branch is what SIGKILLs child
+            // process groups — aborting the task here races that sweep and
+            // strands children as orphans, which is the one thing shutdown
+            // must never do. A healthy runner finishes the sweep well inside
+            // this window; the abort below is only for a wedged one.
+            match tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle).await {
+                Ok(result) => return map_join_result(result, phase),
+                Err(_) => {
+                    errln(format!(
+                        "runner unresponsive after force — exiting while {phase}"
+                    ));
+                    handle.abort();
+                    let _ = handle.await;
+                    return Err(format!("forced exit while {phase}"));
+                }
+            }
         }
 
         tokio::select! {
