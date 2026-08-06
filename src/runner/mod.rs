@@ -465,6 +465,12 @@ pub(in crate::runner) enum ItemReport {
     /// service has dependencies, and starting it is a scheduling decision
     /// like any other.
     Demand { name: String },
+    /// A service's process died (its output stream EOF'd). `pgid` says
+    /// *which* process — the currency check against the live handle stays
+    /// with the runner until the supervisor owns the handle outright.
+    ServiceExited { name: String, pgid: i32 },
+    /// A service's restart backoff elapsed; attempt `attempt` may begin.
+    RestartDue { name: String, attempt: u32 },
 }
 
 enum RunnerInternalCommand {
@@ -495,10 +501,6 @@ enum RunnerInternalCommand {
     },
     /// Health-check monitor reported a state transition for a service.
     ServiceHealthChanged { name: String, healthy: bool },
-    /// Backoff timer fired for an auto-restart.
-    AutoRestart { name: String, attempt: u32 },
-    /// A service process exited.
-    ServiceExited { name: String, pgid: i32 },
     /// Ready-check completed for a manual-start or rebuild spawn.
     ReadyCheckComplete {
         name: String,
@@ -1831,12 +1833,6 @@ impl Runner {
                             RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
                                 self.handle_service_health_changed(&name, healthy).await;
                             }
-                            RunnerInternalCommand::AutoRestart { name, attempt } => {
-                                self.handle_auto_restart(&name, attempt).await;
-                            }
-                            RunnerInternalCommand::ServiceExited { name, pgid } => {
-                                self.handle_service_exited(&name, pgid).await;
-                            }
                             RunnerInternalCommand::ReadyCheckComplete {
                                 name,
                                 generation,
@@ -1889,6 +1885,12 @@ impl Runner {
                             // Pending, and the normal dependency scheduler
                             // owns the service from there.
                             ItemReport::Demand { name } => self.handle_lazy_connection(&name),
+                            ItemReport::ServiceExited { name, pgid } => {
+                                self.handle_service_exited(&name, pgid).await;
+                            }
+                            ItemReport::RestartDue { name, attempt } => {
+                                self.handle_auto_restart(&name, attempt).await;
+                            }
                         }
                     }
                     // Flush a build-tool batch when its window expires. Never

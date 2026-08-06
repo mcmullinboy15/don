@@ -382,8 +382,6 @@ impl Runner {
                 | RunnerInternalCommand::RebuildBatchComplete(_)
                 | RunnerInternalCommand::LazyBuildComplete { .. }
                 | RunnerInternalCommand::ServiceHealthChanged { .. }
-                | RunnerInternalCommand::AutoRestart { .. }
-                | RunnerInternalCommand::ServiceExited { .. }
                 | RunnerInternalCommand::ReadyCheckComplete { .. }
                 | RunnerInternalCommand::UpdateCheckComplete(_) => {}
             }

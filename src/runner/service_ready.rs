@@ -108,16 +108,14 @@ impl Runner {
         // code path. The pgid lets the handler ignore stale events that
         // arrive after the service has already been respawned.
         if let Some(pgid) = spawned_pgid {
-            let cmd_tx = self.internal_tx.clone();
+            let report_tx = self.report_tx.clone();
             let watch_name = name.to_string();
             tokio::spawn(async move {
                 let _ = crash_exit_rx.await;
-                let _ = cmd_tx
-                    .send(RunnerInternalCommand::ServiceExited {
-                        name: watch_name,
-                        pgid,
-                    })
-                    .await;
+                let _ = report_tx.send(super::ItemReport::ServiceExited {
+                    name: watch_name,
+                    pgid,
+                });
             });
         }
 

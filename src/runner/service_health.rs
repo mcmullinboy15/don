@@ -1,7 +1,7 @@
 use super::health::{format_unexpected_exit, unhealthy_restart_backoff_secs};
 use super::service::ServiceHandle;
 use super::service_worker::ServiceStartMode;
-use super::{Runner, RunnerInternalCommand, ServiceState};
+use super::{Runner, ServiceState};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -131,16 +131,14 @@ impl Runner {
             name,
             &format!("{reason} — auto-restart in {backoff_secs}s (attempt {attempt})"),
         );
-        let cmd_tx = self.internal_tx.clone();
+        let report_tx = self.report_tx.clone();
         let name_owned = name.to_string();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::AutoRestart {
-                    name: name_owned,
-                    attempt,
-                })
-                .await;
+            let _ = report_tx.send(super::ItemReport::RestartDue {
+                name: name_owned,
+                attempt,
+            });
         });
         if let Some(rs) = self.services.get_mut(name) {
             rs.restart_attempts = attempt;
