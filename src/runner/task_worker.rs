@@ -1,9 +1,9 @@
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ensure_download_for_config_worker;
 use super::task;
-use super::terminal::TerminalCoordinator;
 use crate::config::{Platform, TaskAutoRun};
 use crate::task_state::{TaskHashProgress, TaskState};
+use crate::terminal::TerminalCoordinator;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;

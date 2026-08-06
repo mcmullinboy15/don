@@ -17,6 +17,7 @@ pub mod runner;
 pub mod server;
 pub mod signals;
 pub mod task_state;
+pub mod terminal;
 pub(crate) mod tui;
 pub(crate) mod update;
 pub(crate) mod watch;

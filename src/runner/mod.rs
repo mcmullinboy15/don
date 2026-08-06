@@ -34,16 +34,15 @@ mod support;
 mod task_commands;
 mod task_supervisor;
 mod task_worker;
-mod terminal;
 mod watch_link;
 
 pub(crate) mod service;
 pub(crate) mod task;
 
+pub use crate::terminal::{TerminalCoordinator, TerminalRequest};
 pub(crate) use params::resolve_task_params;
 pub use profile::resolve_profile_items;
 pub use state_store::{StateReader, StateSnapshot};
-pub use terminal::{TerminalCoordinator, TerminalRequest};
 
 use crate::build_tool::manager::{BatchDue, BuildBatcher};
 use crate::config::{Config, Platform, ShutdownConfig};
