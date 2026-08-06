@@ -1289,6 +1289,15 @@ impl Runner {
         self.output_manager.clone_lifecycle_emitter()
     }
 
+    /// The merged-log-stream sender, for a server that hands out a
+    /// subscription per follower. See
+    /// [`crate::output::OutputManager::log_stream_sender`].
+    pub fn log_stream_sender(
+        &self,
+    ) -> broadcast::Sender<std::sync::Arc<crate::output::FormattedLogLine>> {
+        self.output_manager.log_stream_sender()
+    }
+
     /// The event sender, for a server that hands out a subscription per
     /// connection rather than holding one.
     pub fn subscribe_sender(&self) -> broadcast::Sender<RunnerEvent> {

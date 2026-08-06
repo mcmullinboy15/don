@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 /// Default ring buffer capacity per service (lines).
@@ -670,6 +670,13 @@ pub struct OutputManager {
     /// back to a `[don]`-prefixed lifecycle event with a `bazel:` text
     /// prefix.
     bazel_prefix: Option<Bytes>,
+    /// Broadcast tap on the merged, formatted log stream — every line that
+    /// [`stdout_sink_task`] emits (post filter, post sanitize), regardless
+    /// of whether the primary target is stdout or the TUI channel. This is
+    /// what lets N socket clients follow the same stream the terminal sees.
+    /// Lines are `Arc`ed so fan-out clones are pointer-cheap; a slow client
+    /// lags its own receiver and nobody else's.
+    log_tap: broadcast::Sender<Arc<FormattedLogLine>>,
 }
 
 /// Errors from output handling.
@@ -790,12 +797,16 @@ impl OutputManager {
 
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        // Capacity trades memory for how far a slow follower may fall behind
+        // before it must resync; lines are Arc'ed, so entries are pointers.
+        let (log_tap, _) = broadcast::channel(4096);
         let stdout_handle = tokio::spawn(stdout_sink_task(
             stdout_rx,
             target,
             verbosity.clone(),
             stdout_pause.clone(),
             log_filter.clone(),
+            log_tap.clone(),
         ));
         let stdout_sink = SinkHandle::Unbounded(stdout_tx);
 
@@ -868,7 +879,16 @@ impl OutputManager {
             stdout_pause,
             log_filter,
             bazel_prefix: None,
+            log_tap,
         })
+    }
+
+    /// A sender handle for the merged log stream, for components that need
+    /// to hand out subscriptions (the API server). Subscribing via the
+    /// sender rather than holding a receiver means idle handles cost
+    /// nothing and never lag.
+    pub fn log_stream_sender(&self) -> broadcast::Sender<Arc<FormattedLogLine>> {
+        self.log_tap.clone()
     }
 
     /// Register a synthetic "tool" service (`bazel`) so build
@@ -1466,6 +1486,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     verbosity: VerbosityControl,
     pause: StdoutPauseControl,
     filter: LogFilterControl,
+    tap: broadcast::Sender<Arc<FormattedLogLine>>,
 ) {
     use bytes::BytesMut;
 
@@ -1518,6 +1539,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     };
                     emit_line(
                         &mut target,
+                        &tap,
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
@@ -1541,6 +1563,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     };
                     emit_line(
                         &mut target,
+                        &tap,
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
@@ -1564,6 +1587,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     };
                     emit_line(
                         &mut target,
+                        &tap,
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
@@ -1596,6 +1620,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             // child closed its pipe.
             emit_line(
                 &mut target,
+                &tap,
                 "",
                 prefix,
                 &sanitized,
@@ -1629,8 +1654,10 @@ fn build_formatted_bytes(
 
 /// Emit a complete formatted line to the target — either write to the pipe
 /// writer with a trailing `\n`, or ship it to the TUI as a [`FormattedLogLine`].
+#[allow(clippy::too_many_arguments)]
 async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     target: &mut StdoutTarget<W>,
+    tap: &broadcast::Sender<Arc<FormattedLogLine>>,
     name: &str,
     prefix: &[u8],
     line: &[u8],
@@ -1639,6 +1666,13 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     start: std::time::Instant,
 ) {
     let bytes = build_formatted_bytes(prefix, line, verbosity, start);
+    // Feed the tap first — send on a receiver-less broadcast is a cheap
+    // no-op, so this costs nothing until someone follows.
+    let _ = tap.send(Arc::new(FormattedLogLine {
+        name: name.to_string(),
+        is_lifecycle,
+        bytes: bytes.clone(),
+    }));
     match target {
         StdoutTarget::Writer(writer) => {
             use tokio::io::AsyncWriteExt;
@@ -2052,6 +2086,64 @@ mod tests {
         let output = read_buf(&buf);
         let stripped = strip_ansi(output.as_bytes());
         assert!(stripped.contains("[don]") && stripped.contains("loading don.toml"));
+    }
+
+    #[tokio::test]
+    async fn log_tap_mirrors_the_emitted_stream() {
+        struct Case {
+            name: &'static str,
+            emit: fn(&OutputManager),
+            want_name: &'static str,
+            want_contains: &'static str,
+            want_lifecycle: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "top-level lifecycle event",
+                emit: |mgr| mgr.lifecycle_event("loading don.toml"),
+                want_name: LIFECYCLE_EVENT_NAME,
+                want_contains: "loading don.toml",
+                want_lifecycle: true,
+            },
+            Case {
+                // Tagged with the service so followers can filter it the way
+                // the TUI does.
+                name: "service-scoped lifecycle event",
+                emit: |mgr| mgr.service_event("postgres", "started"),
+                want_name: "postgres",
+                want_contains: "postgres: started",
+                want_lifecycle: true,
+            },
+        ];
+
+        for case in cases {
+            let (writer, _buf) = TestBuffer::new();
+            let config = crate::config::LogConfig::Stdout;
+            let mgr = OutputManager::new(&[("postgres", &config)], writer)
+                .await
+                .unwrap();
+            // Subscribe before emitting — the tap is a broadcast, not a ring.
+            let mut tap = mgr.log_stream_sender().subscribe();
+            (case.emit)(&mgr);
+            mgr.shutdown().await;
+
+            let line = tap.recv().await.unwrap();
+            assert_eq!(line.name, case.want_name, "{}: name", case.name);
+            assert_eq!(
+                line.is_lifecycle, case.want_lifecycle,
+                "{}: lifecycle flag",
+                case.name
+            );
+            let text = strip_ansi(&line.bytes);
+            assert!(
+                text.contains(case.want_contains),
+                "{}: expected {:?} in {:?}",
+                case.name,
+                case.want_contains,
+                text
+            );
+        }
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/stop/{name}", post(post_stop))
         .route("/restart/{name}", post(post_restart))
         .route("/shutdown", post(post_shutdown))
+        .route("/logs", get(get_all_logs))
         .route("/logs/{name}", get(get_logs))
         .route("/attach/{name}", get(super::attach::attach_handler))
         .route("/attach/{name}/resize", post(super::attach::resize_handler))
@@ -286,6 +287,70 @@ async fn get_logs(
             Json(LogsResponse { name, lines }).into_response()
         }
         Ok(None) => not_found(&name),
+        Err(_) => runner_unavailable(),
+    }
+}
+
+/// `GET /logs?follow=true` — stream the merged, formatted log stream: every
+/// item plus `[don]` lifecycle events, in arrival order, exactly what the
+/// terminal sees. NDJSON, one record per line:
+///
+/// - `{"name":"api","lifecycle":false,"line":"..."}` — a log line. `name`
+///   is the owning item; `lifecycle` is true for `[don]` events. `line` is
+///   the formatted bytes (ANSI colors included) as lossy UTF-8, no trailing
+///   newline.
+/// - `{"lagged":n}` — this follower fell `n` lines behind and they are
+///   gone; resync from `/status` if state matters. Emitted instead of
+///   silently dropping, for the same reason the watcher's outcome channel
+///   carries `Lagged` — a gap you can see beats a stream you wrongly trust.
+///
+/// There is no `last=N` preload yet: history for late joiners is per-item
+/// (`/logs/:name`) until a merged ring exists (planned with the detach
+/// work, which is what creates late joiners).
+async fn get_all_logs(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<LogsQuery>,
+) -> Response {
+    if !query.follow {
+        return (
+            StatusCode::BAD_REQUEST,
+            "merged logs are follow-only: use /logs?follow=true, or /logs/:name for history",
+        )
+            .into_response();
+    }
+    let mut tap = state.log_tap.subscribe();
+    // Bridge broadcast → mpsc so lag is translated, not panicked over, and
+    // a gone client (send error) tears the forwarder down.
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
+    tokio::spawn(async move {
+        loop {
+            let record = match tap.recv().await {
+                Ok(line) => serde_json::json!({
+                    "name": line.name,
+                    "lifecycle": line.is_lifecycle,
+                    "line": String::from_utf8_lossy(&line.bytes),
+                }),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    serde_json::json!({ "lagged": n })
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            let mut chunk = serde_json::to_vec(&record).unwrap_or_default();
+            chunk.push(b'\n');
+            if tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+    let stream = ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>);
+    match axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .body(axum::body::Body::from_stream(stream))
+    {
+        Ok(resp) => resp,
         Err(_) => runner_unavailable(),
     }
 }
@@ -562,11 +627,13 @@ mod tests {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(cmd_rx);
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
+        let (log_tap, _) = tokio::sync::broadcast::channel(16);
         build_router(Arc::new(ApiState {
             cmd_tx,
             event_tx,
             state,
             attach_resize_txs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            log_tap,
         }))
     }
 

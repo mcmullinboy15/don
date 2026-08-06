@@ -75,6 +75,28 @@ pub struct LogsResponse {
 }
 
 /// Options for running a task through the daemon API.
+/// One record from the merged log stream (`GET /logs?follow=true`).
+///
+/// Untagged: a record is either a log line or a lag notice, distinguished
+/// by shape. See the endpoint docs in `server/routes.rs` for field
+/// semantics.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum LogStreamEvent {
+    /// A formatted log line, ANSI colors included, no trailing newline.
+    Line {
+        /// Owning item name; `[don]` lifecycle events carry their own
+        /// sentinel name (see [`crate::output::LIFECYCLE_EVENT_NAME`]).
+        name: String,
+        /// True for `[don]`-prefixed lifecycle events.
+        lifecycle: bool,
+        line: String,
+    },
+    /// This follower fell `lagged` lines behind and they are gone —
+    /// resync from `/status` if state matters.
+    Lagged { lagged: u64 },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunTaskOptions {
     /// Wait until the task process exits before returning.
@@ -294,6 +316,21 @@ impl Client {
     {
         let path = format!("/logs/{}?last={last}&follow=true", urlencode(name));
         self.follow_ndjson(&path, on_line).await
+    }
+
+    /// `GET /logs?follow=true` — stream the merged log stream: every item
+    /// plus `[don]` lifecycle events, in arrival order, with the metadata
+    /// a renderer needs to filter and color. Returns when the server closes
+    /// the stream or the callback returns `Err`.
+    pub async fn logs_follow_all<F>(&self, mut on_event: F) -> Result<(), ClientError>
+    where
+        F: FnMut(LogStreamEvent) -> Result<(), ClientError>,
+    {
+        self.follow_ndjson("/logs?follow=true", |line| {
+            let event: LogStreamEvent = serde_json::from_str(line)?;
+            on_event(event)
+        })
+        .await
     }
 
     /// `GET /events` — stream runner state changes, one JSON object per line.

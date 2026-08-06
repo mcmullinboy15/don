@@ -848,6 +848,59 @@ async fn follow_lines(
 }
 
 #[test]
+fn integration_merged_logs_follow_carries_name_and_lifecycle() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("server-merged-follow");
+        // Emit continuously so a subscriber that connects after startup still
+        // sees lines — the merged stream has no history preload.
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "chatty",
+                "bash",
+                &[
+                    "-c",
+                    "for i in $(seq 1 100); do echo tick$i; sleep 0.2; done",
+                ],
+            )
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        let lines =
+            follow_lines(&socket, "/logs?follow=true", "tick", Duration::from_secs(5)).await;
+        assert!(!lines.is_empty(), "merged follow produced no records");
+
+        // Every record must parse and carry the structured fields — this is
+        // the contract that lets a client filter and color without
+        // in-process access.
+        let mut saw_service_line = false;
+        for line in &lines {
+            let v: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("not NDJSON: {line:?} ({e})"));
+            if v.get("lagged").is_some() {
+                continue;
+            }
+            assert!(v.get("name").is_some(), "missing 'name': {line}");
+            assert!(v.get("lifecycle").is_some(), "missing 'lifecycle': {line}");
+            let text = v["line"].as_str().unwrap_or_default();
+            if v["name"] == "chatty" && v["lifecycle"] == false && text.contains("tick") {
+                saw_service_line = true;
+            }
+        }
+        assert!(
+            saw_service_line,
+            "expected a non-lifecycle 'chatty' tick record; got: {lines:?}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
 fn integration_logs_follow_streams_lines() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("server-follow");

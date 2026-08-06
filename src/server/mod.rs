@@ -56,6 +56,10 @@ pub(crate) struct ApiState {
     /// Resize channels for active attach sessions. The attach bridge task
     /// registers its receiver here; the resize HTTP handler sends through it.
     pub attach_resize_txs: std::sync::Arc<tokio::sync::Mutex<ResizeMap>>,
+    /// Merged formatted log stream, used by `GET /logs?follow=true`.
+    /// Subscribing per-request keeps followers independent: a slow client
+    /// lags its own receiver and nobody else's.
+    pub log_tap: broadcast::Sender<std::sync::Arc<crate::output::FormattedLogLine>>,
 }
 
 /// Bind the unix socket at `socket_path` and chmod it to 0o600 so only the
@@ -97,12 +101,14 @@ pub fn bind_api(socket_path: &Path) -> Result<UnixListener, ServerError> {
 ///
 /// The socket file at `socket_path` is removed on exit (including panic,
 /// via the [`SocketGuard`] Drop impl).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_api(
     listener: UnixListener,
     socket_path: PathBuf,
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
     state: crate::runner::StateReader,
+    log_tap: broadcast::Sender<std::sync::Arc<crate::output::FormattedLogLine>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);
@@ -113,6 +119,7 @@ pub async fn serve_api(
         attach_resize_txs: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        log_tap,
     });
     let app = routes::build_router(state);
     accept_loop(listener, app, shutdown).await
@@ -142,11 +149,22 @@ pub fn serve_for_runner(
     let cmd_tx = runner.command_sender();
     let event_tx = runner.subscribe_sender();
     let state = runner.state_reader();
+    let log_tap = runner.log_stream_sender();
     let path = socket_path.to_path_buf();
     let display = socket_path.display().to_string();
     let server_emitter = emitter.clone();
     tokio::spawn(async move {
-        if let Err(e) = serve_api(listener, path, cmd_tx, event_tx, state, shutdown_rx).await {
+        if let Err(e) = serve_api(
+            listener,
+            path,
+            cmd_tx,
+            event_tx,
+            state,
+            log_tap,
+            shutdown_rx,
+        )
+        .await
+        {
             server_emitter.lifecycle_event(&format!("api server error: {e}"));
         }
     });
