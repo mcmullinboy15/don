@@ -851,8 +851,8 @@ async fn follow_lines(
 fn integration_merged_logs_follow_carries_name_and_lifecycle() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("server-merged-follow");
-        // Emit continuously so a subscriber that connects after startup still
-        // sees lines — the merged stream has no history preload.
+        // Emit continuously; ticks both before the connection (preload path)
+        // and after it (live path) get asserted on.
         let toml = ConfigBuilder::new()
             .add_custom_service(
                 "chatty",
@@ -868,9 +868,29 @@ fn integration_merged_logs_follow_carries_name_and_lifecycle() {
 
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+        // Let tick1 land before connecting, so seeing it proves the preload
+        // path — a live-only stream could never deliver it.
+        assert!(
+            wait_for_body_contains(
+                &socket,
+                "/logs/chatty?last=5",
+                "tick1",
+                Duration::from_secs(5)
+            )
+            .await,
+            "service should have emitted tick1 before the follower connects"
+        );
 
-        let lines =
-            follow_lines(&socket, "/logs?follow=true", "tick", Duration::from_secs(5)).await;
+        // Follow until tick3: tick1 arrives from the preload, tick3 arrives
+        // live, so the stream provably crosses the preload/live boundary —
+        // which is also where a dedupe failure would double a line.
+        let lines = follow_lines(
+            &socket,
+            "/logs?follow=true",
+            "tick3",
+            Duration::from_secs(8),
+        )
+        .await;
         assert!(!lines.is_empty(), "merged follow produced no records");
 
         // Every record must parse and carry the structured fields — this is
@@ -894,6 +914,22 @@ fn integration_merged_logs_follow_carries_name_and_lifecycle() {
             saw_service_line,
             "expected a non-lifecycle 'chatty' tick record; got: {lines:?}"
         );
+        // tick1 was emitted before the connection — only the history preload
+        // can have delivered it.
+        assert!(
+            lines.iter().any(|l| l.contains("tick1")),
+            "expected preloaded tick1; got: {lines:?}"
+        );
+        // And the preload/live overlap must be deduplicated: every tick
+        // record appears at most once.
+        for n in 1..=3 {
+            let needle = format!("tick{n}\"");
+            let count = lines.iter().filter(|l| l.contains(&needle)).count();
+            assert!(
+                count <= 1,
+                "tick{n} appeared {count} times — preload/live dedupe failed: {lines:?}"
+            );
+        }
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

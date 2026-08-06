@@ -59,7 +59,7 @@ pub(crate) struct ApiState {
     /// Merged formatted log stream, used by `GET /logs?follow=true`.
     /// Subscribing per-request keeps followers independent: a slow client
     /// lags its own receiver and nobody else's.
-    pub log_tap: broadcast::Sender<std::sync::Arc<crate::output::FormattedLogLine>>,
+    pub log_tap: crate::output::MergedLogTap,
     /// The server's shutdown signal, observed by *streaming* handlers.
     ///
     /// A follow response holds an `ApiState` clone — and with it live
@@ -117,7 +117,7 @@ pub async fn serve_api(
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
     state: crate::runner::StateReader,
-    log_tap: broadcast::Sender<std::sync::Arc<crate::output::FormattedLogLine>>,
+    log_tap: crate::output::MergedLogTap,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);

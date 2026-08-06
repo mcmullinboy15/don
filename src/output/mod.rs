@@ -670,13 +670,77 @@ pub struct OutputManager {
     /// back to a `[don]`-prefixed lifecycle event with a `bazel:` text
     /// prefix.
     bazel_prefix: Option<Bytes>,
-    /// Broadcast tap on the merged, formatted log stream — every line that
-    /// [`stdout_sink_task`] emits (post filter, post sanitize), regardless
-    /// of whether the primary target is stdout or the TUI channel. This is
-    /// what lets N socket clients follow the same stream the terminal sees.
-    /// Lines are `Arc`ed so fan-out clones are pointer-cheap; a slow client
-    /// lags its own receiver and nobody else's.
-    log_tap: broadcast::Sender<Arc<FormattedLogLine>>,
+    /// Broadcast tap + bounded history of the merged, formatted log stream.
+    /// See [`MergedLogTap`].
+    log_tap: MergedLogTap,
+}
+
+/// The merged log stream's fan-out point: a broadcast of every line
+/// [`stdout_sink_task`] emits (post filter, post sanitize), plus a bounded
+/// history of the same lines so a late-connecting follower can preload.
+///
+/// History and broadcast carry the *same* `Arc`s — one allocation per line —
+/// which is also what makes preload/live dedupe exact: a follower that
+/// subscribes first and snapshots second can drop live lines already seen in
+/// the snapshot by pointer identity, no sequence numbers needed.
+#[derive(Clone)]
+pub struct MergedLogTap {
+    tx: broadcast::Sender<Arc<FormattedLogLine>>,
+    history: Arc<Mutex<std::collections::VecDeque<Arc<FormattedLogLine>>>>,
+}
+
+/// How many merged lines a late joiner can preload. Smaller than the
+/// per-service rings (which serve `don logs <name>`): this covers "what was
+/// happening just before I attached", not deep history.
+const MERGED_HISTORY_CAPACITY: usize = 2_000;
+
+impl MergedLogTap {
+    fn new() -> Self {
+        // Broadcast capacity trades memory for how far a slow follower may
+        // fall behind before it must resync; entries are pointers.
+        let (tx, _) = broadcast::channel(4096);
+        Self {
+            tx,
+            history: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+                MERGED_HISTORY_CAPACITY,
+            ))),
+        }
+    }
+
+    /// Record and fan out one line.
+    async fn publish(&self, line: Arc<FormattedLogLine>) {
+        {
+            let mut history = self.history.lock().await;
+            if history.len() == MERGED_HISTORY_CAPACITY {
+                history.pop_front();
+            }
+            history.push_back(line.clone());
+        }
+        // Send on a receiver-less broadcast is a cheap no-op.
+        let _ = self.tx.send(line);
+    }
+
+    /// Subscribe to lines from now on.
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<FormattedLogLine>> {
+        self.tx.subscribe()
+    }
+
+    /// An empty tap for tests that need an `ApiState` without an
+    /// `OutputManager`.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self::new()
+    }
+
+    /// The last `n` lines, oldest first.
+    pub async fn history(&self, n: usize) -> Vec<Arc<FormattedLogLine>> {
+        let history = self.history.lock().await;
+        history
+            .iter()
+            .skip(history.len().saturating_sub(n))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Errors from output handling.
@@ -771,9 +835,7 @@ impl OutputManager {
 
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
-        // Capacity trades memory for how far a slow follower may fall behind
-        // before it must resync; lines are Arc'ed, so entries are pointers.
-        let (log_tap, _) = broadcast::channel(4096);
+        let log_tap = MergedLogTap::new();
         let stdout_handle = tokio::spawn(stdout_sink_task(
             stdout_rx,
             target,
@@ -857,11 +919,11 @@ impl OutputManager {
         })
     }
 
-    /// A sender handle for the merged log stream, for components that need
-    /// to hand out subscriptions (the API server). Subscribing via the
-    /// sender rather than holding a receiver means idle handles cost
-    /// nothing and never lag.
-    pub fn log_stream_sender(&self) -> broadcast::Sender<Arc<FormattedLogLine>> {
+    /// A handle on the merged log stream — subscriptions plus bounded
+    /// history — for components that hand out follows (the API server, the
+    /// in-process TUI forwarder). Holding the handle rather than a receiver
+    /// means idle handles cost nothing and never lag.
+    pub fn log_stream_sender(&self) -> MergedLogTap {
         self.log_tap.clone()
     }
 
@@ -1460,7 +1522,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     verbosity: VerbosityControl,
     pause: StdoutPauseControl,
     filter: LogFilterControl,
-    tap: broadcast::Sender<Arc<FormattedLogLine>>,
+    tap: MergedLogTap,
 ) {
     use bytes::BytesMut;
 
@@ -1631,7 +1693,7 @@ fn build_formatted_bytes(
 #[allow(clippy::too_many_arguments)]
 async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     target: &mut StdoutTarget<W>,
-    tap: &broadcast::Sender<Arc<FormattedLogLine>>,
+    tap: &MergedLogTap,
     name: &str,
     prefix: &[u8],
     line: &[u8],
@@ -1640,13 +1702,14 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     start: std::time::Instant,
 ) {
     let bytes = build_formatted_bytes(prefix, line, verbosity, start);
-    // Feed the tap first — send on a receiver-less broadcast is a cheap
-    // no-op, so this costs nothing until someone follows.
-    let _ = tap.send(Arc::new(FormattedLogLine {
+    // Feed the tap first, so history and followers see the line even if
+    // the writer below blocks.
+    tap.publish(Arc::new(FormattedLogLine {
         name: name.to_string(),
         is_lifecycle,
         bytes: bytes.clone(),
-    }));
+    }))
+    .await;
     match target {
         StdoutTarget::Writer(writer) => {
             use tokio::io::AsyncWriteExt;

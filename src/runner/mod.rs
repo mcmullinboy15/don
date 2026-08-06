@@ -1291,12 +1291,10 @@ impl Runner {
         self.output_manager.clone_lifecycle_emitter()
     }
 
-    /// The merged-log-stream sender, for a server that hands out a
-    /// subscription per follower. See
+    /// The merged-log-stream handle (subscriptions + bounded history), for
+    /// a server that hands out a follow per client. See
     /// [`crate::output::OutputManager::log_stream_sender`].
-    pub fn log_stream_sender(
-        &self,
-    ) -> broadcast::Sender<std::sync::Arc<crate::output::FormattedLogLine>> {
+    pub fn log_stream_sender(&self) -> crate::output::MergedLogTap {
         self.output_manager.log_stream_sender()
     }
 

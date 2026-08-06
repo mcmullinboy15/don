@@ -355,9 +355,12 @@ async fn get_logs(
 ///   silently dropping, for the same reason the watcher's outcome channel
 ///   carries `Lagged` — a gap you can see beats a stream you wrongly trust.
 ///
-/// There is no `last=N` preload yet: history for late joiners is per-item
-/// (`/logs/:name`) until a merged ring exists (planned with the detach
-/// work, which is what creates late joiners).
+/// `last=N` (default 100) preloads the tail of the merged history, so a
+/// late joiner sees what was happening just before it attached. Preload and
+/// live stream are deduplicated exactly: both carry the same `Arc`s, so a
+/// line that lands in both is dropped from the live side by pointer
+/// identity (the subscription opens before the history snapshot, so nothing
+/// is ever *missing* — only briefly doubled, and the dedupe eats that).
 async fn get_all_logs(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<LogsQuery>,
@@ -369,23 +372,54 @@ async fn get_all_logs(
         )
             .into_response();
     }
+    // Subscribe first, snapshot second — see the dedupe note above.
     let mut tap = state.log_tap.subscribe();
+    let preload = state.log_tap.history(query.last).await;
     // Bridge broadcast → mpsc so lag is translated, not panicked over, and
     // a gone client (send error) tears the forwarder down. Ends on the
     // shutdown signal too — see `ApiState::shutdown`.
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
     let mut shutdown = state.shutdown.clone();
     tokio::spawn(async move {
+        fn record(line: &crate::output::FormattedLogLine) -> bytes::Bytes {
+            let mut chunk = serde_json::to_vec(&serde_json::json!({
+                "name": line.name,
+                "lifecycle": line.is_lifecycle,
+                "line": String::from_utf8_lossy(&line.bytes),
+            }))
+            .unwrap_or_default();
+            chunk.push(b'\n');
+            bytes::Bytes::from(chunk)
+        }
+
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for line in &preload {
+            seen.insert(Arc::as_ptr(line) as usize);
+            if tx.send(record(line)).await.is_err() {
+                return;
+            }
+        }
         loop {
-            let record = tokio::select! {
+            let chunk = tokio::select! {
                 item = tap.recv() => match item {
-                    Ok(line) => serde_json::json!({
-                        "name": line.name,
-                        "lifecycle": line.is_lifecycle,
-                        "line": String::from_utf8_lossy(&line.bytes),
-                    }),
+                    Ok(line) => {
+                        // Already sent in the preload — the subscription
+                        // opened before the snapshot, so the overlap window
+                        // shows up here, not as a gap.
+                        if !seen.is_empty() && seen.remove(&(Arc::as_ptr(&line) as usize)) {
+                            continue;
+                        }
+                        // Past the overlap window: nothing older can arrive
+                        // on the live side again, so stop checking.
+                        seen.clear();
+                        record(&line)
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        serde_json::json!({ "lagged": n })
+                        let mut chunk =
+                            serde_json::to_vec(&serde_json::json!({ "lagged": n }))
+                                .unwrap_or_default();
+                        chunk.push(b'\n');
+                        bytes::Bytes::from(chunk)
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
@@ -396,9 +430,7 @@ async fn get_all_logs(
                     continue;
                 }
             };
-            let mut chunk = serde_json::to_vec(&record).unwrap_or_default();
-            chunk.push(b'\n');
-            if tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+            if tx.send(chunk).await.is_err() {
                 return;
             }
         }
@@ -688,7 +720,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(cmd_rx);
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
-        let (log_tap, _) = tokio::sync::broadcast::channel(16);
+        let log_tap = crate::output::MergedLogTap::for_tests();
         let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         // Leak the sender so the receiver stays live for the router's
         // lifetime — tests never signal shutdown.
