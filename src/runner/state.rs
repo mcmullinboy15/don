@@ -14,7 +14,6 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::service::ServiceHandle;
 use super::{
     AttachWaiter, CommandResult, ServiceState, ServiceStopAction, TaskItemState, TaskRunWaiter,
 };
@@ -35,11 +34,14 @@ pub(crate) struct RuntimeService {
     failed_dependencies: Vec<String>,
     /// The fully resolved service config (platform overrides applied once).
     pub resolved: crate::config::service::ResolvedService,
-    /// Handle to the running process (if spawned).
-    pub handle: Option<ServiceHandle>,
     /// Last authoritative Docker host-port bindings. Retained while the
     /// container is stopped so a restart can request the same fallback ports.
     pub docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
+    /// What kind of process the service's supervisor currently holds, if
+    /// any — the runner-side shadow of custody, for liveness gates and
+    /// docker-ness checks now that the handle itself lives with the
+    /// supervisor. Set at wire, cleared wherever the handle used to be.
+    pub handle_identity: Option<ServiceHandleIdentity>,
     /// Process group ID for the current local process. This is equal to the
     /// child PID for services spawned by don. Docker services do not expose a
     /// local PID here.
@@ -122,8 +124,9 @@ impl RuntimeService {
             state: initial_state,
             failed_dependencies: Vec::new(),
             resolved,
-            handle: None,
+
             docker_port_bindings: Vec::new(),
+            handle_identity: None,
             pgid: None,
             output_worker: None,
             osc_sink: None,
@@ -351,4 +354,13 @@ impl RuntimeTask {
         }
         true
     }
+}
+
+/// See [`RuntimeService::handle_identity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceHandleIdentity {
+    /// A locally spawned process group.
+    Process { pgid: i32 },
+    /// A Docker container.
+    Docker,
 }

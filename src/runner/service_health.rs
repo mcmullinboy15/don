@@ -1,5 +1,5 @@
 use super::health::{format_unexpected_exit, unhealthy_restart_backoff_secs};
-use super::service::ServiceHandle;
+
 use super::service_worker::ServiceStartMode;
 use super::{Runner, ServiceState};
 use std::time::Duration;
@@ -153,35 +153,32 @@ impl Runner {
     /// The watcher fires whenever the child's output stream EOFs. That happens
     /// for both crashes and graceful stops, so the handler filters stale/known
     /// stop paths before reaping and applying the on_failure policy.
-    pub(in crate::runner) async fn handle_service_exited(&mut self, name: &str, pgid: i32) {
+    pub(in crate::runner) async fn handle_service_exited(
+        &mut self,
+        name: &str,
+        pgid: i32,
+        status: Option<std::process::ExitStatus>,
+    ) {
         let state = match self.services.get(name) {
             Some(rs) => rs.state(),
             None => return,
         };
-        let current_pgid = self.services.get(name).and_then(|rs| match &rs.handle {
-            Some(ServiceHandle::Process(p)) => Some(p.pgid()),
-            _ => None,
-        });
-        if current_pgid != Some(pgid) {
+        // Custody already matched this exit to the process the supervisor
+        // held; this guards the *fold*: by the time the report lands, the
+        // runner may have wired a newer process for the service, and this
+        // exit is then history, not news.
+        if self.services.get(name).and_then(|rs| rs.pgid) != Some(pgid) {
             return;
         }
         // A service can sit in `Failed` with its process still alive: a failed
         // ready check under the default `on_failure = "notify"` reports the
         // failure and leaves the process running. When that process later
-        // exits, the live-state path below doesn't run, so nothing reaps it —
-        // the zombie and its PTY stay held, and the proxy keeps parking
-        // clients on a socket that now has nobody behind it. Reap it and let
-        // the proxy switch to refusing.
+        // exits (the supervisor has already reaped it), clear the runtime
+        // fields and let the proxy switch to refusing.
         if state == ServiceState::Failed {
-            if let Some(ServiceHandle::Process(mut proc)) =
-                self.services.get_mut(name).and_then(|rs| rs.handle.take())
-            {
-                // The crash watcher only fires after the child's output
-                // EOF'd, so this wait doesn't block the runner.
-                let _ = proc.wait().await;
-            }
             if let Some(rs) = self.services.get_mut(name) {
                 rs.pgid = None;
+                rs.handle_identity = None;
                 rs.osc_sink = None;
                 rs.stop_health_tracking();
             }
@@ -197,15 +194,6 @@ impl Runner {
         ) {
             return;
         }
-        let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
-            Some(h) => h,
-            None => return,
-        };
-        let status = if let ServiceHandle::Process(mut proc) = handle {
-            proc.wait().await.ok()
-        } else {
-            None
-        };
         if let Some(rs) = self.services.get_mut(name) {
             rs.stop_health_tracking();
         }
@@ -215,6 +203,7 @@ impl Runner {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.reset_restart_tracking();
                 rs.pgid = None;
+                rs.handle_identity = None;
             }
             self.set_service_state(name, ServiceState::Stopped);
             self.output_manager
@@ -227,6 +216,7 @@ impl Runner {
 
         if let Some(rs) = self.services.get_mut(name) {
             rs.pgid = None;
+            rs.handle_identity = None;
         }
         let exit_msg = format_unexpected_exit(status);
         self.output_manager.service_error_event(name, &exit_msg);
@@ -346,8 +336,25 @@ impl Runner {
             // drop releases the PTY. On the crash path the handle is already
             // gone, so these are no-ops. The output worker drains and drops the
             // read half on EOF once the process is gone.
-            rs.handle = None;
+            rs.handle_identity = None;
             rs.osc_sink = None;
+        }
+        // Dropping the handle used to kill the lingering process
+        // (kill_on_drop); the supervisor owns it now, so ask it to. A
+        // supervisor holding nothing answers immediately.
+        {
+            let (done_tx, _done_rx) = tokio::sync::oneshot::channel();
+            if let Some(handle) = self.service_starts.registry().get(name) {
+                let _ = handle.request(super::service_supervisor::ServiceCommand::Stop(
+                    super::service_supervisor::StopRequest {
+                        config: self.effective_shutdown_config(name),
+                        force: true,
+                        wait_full_exit: false,
+                        interrupt: None,
+                        notify: super::service_supervisor::StopNotify::Done(done_tx),
+                    },
+                ));
+            }
         }
         if give_up {
             self.set_service_state(name, ServiceState::Failed);
@@ -391,7 +398,7 @@ impl Runner {
         if self
             .services
             .get(name)
-            .is_some_and(|rs| rs.handle.is_some())
+            .is_some_and(|rs| rs.handle_identity.is_some())
         {
             let (reply_tx, _reply_rx) = oneshot::channel();
             self.handle_auto_restart_running_service(name, reply_tx)
@@ -409,14 +416,10 @@ impl Runner {
         if let Some(rs) = self.services.get_mut(name) {
             rs.stop_health_tracking();
         }
-        let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
-            Some(h) => h,
-            None => {
-                let _ =
-                    reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
-                return;
-            }
-        };
+        if self.services.get(name).and_then(|rs| rs.pgid).is_none() {
+            let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
+            return;
+        }
         let shutdown_config = self.effective_shutdown_config(name);
         if self.remove_attach_lock(name) {
             self.output_manager.resume_stdout_sink(name).await;
@@ -424,9 +427,8 @@ impl Runner {
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .service_event(name, "stopping... (auto-restart)");
-        self.spawn_manual_service_stop_worker(
+        self.send_service_stop(
             name,
-            handle,
             shutdown_config,
             false,
             reply,

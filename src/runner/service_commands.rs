@@ -1,4 +1,4 @@
-use super::service::{self, ServiceHandle};
+use super::service;
 use super::service_worker::{ServiceStartContext, ServiceStartMode, run_service_build_worker};
 use super::{
     CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
@@ -239,7 +239,7 @@ impl Runner {
             proxy.clear_backend();
         }
 
-        if let Some(handle) = self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
+        if self.services.get(name).is_some_and(|rs| rs.pgid.is_some()) {
             if self.remove_attach_lock(name) {
                 self.output_manager.resume_stdout_sink(name).await;
             }
@@ -251,9 +251,8 @@ impl Runner {
                 .and_then(|rs| rs.proxy.as_ref())
                 .is_some_and(|p| p.requires_full_exit_on_restart());
             let (reply_tx, _reply_rx) = oneshot::channel();
-            self.spawn_manual_service_stop_worker(
+            self.send_service_stop(
                 name,
-                handle,
                 shutdown_config,
                 wait_full,
                 reply_tx,
@@ -412,7 +411,7 @@ impl Runner {
         if self
             .services
             .get(name)
-            .is_some_and(|rs| rs.handle.is_some())
+            .is_some_and(|rs| rs.handle_identity.is_some())
         {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
@@ -517,10 +516,14 @@ impl Runner {
         }
     }
 
-    pub(in crate::runner) fn spawn_manual_service_stop_worker(
+    /// Ask the service's supervisor — the process's owner — to stop it.
+    ///
+    /// Bookkeeping (`control_generation`, `control_reply`, `stop_action`)
+    /// is unchanged from the worker era; only the executor moved. The
+    /// completion still arrives as `ServiceStopComplete{op_id}`.
+    pub(in crate::runner) fn send_service_stop(
         &mut self,
         name: &str,
-        handle: ServiceHandle,
         shutdown_config: crate::config::ShutdownConfig,
         wait_full_exit: bool,
         reply: oneshot::Sender<CommandResult>,
@@ -537,32 +540,31 @@ impl Runner {
         rs.control_reply = Some(reply);
         rs.stop_action = stop_action;
 
-        let cmd_tx = self.internal_tx.clone();
-        let name_owned = name.to_string();
         let shutdown_rx = self.shutdown_flag_tx.subscribe();
-        let debug = service::StopDebug::new(
-            name_owned.clone(),
-            self.output_manager.clone_lifecycle_emitter(),
-        );
-        let worker = tokio::spawn(async move {
-            let result = service::stop_service_interruptibly(
-                handle,
-                Some(&shutdown_config),
-                wait_full_exit,
-                shutdown_rx,
-                Some(debug),
-            )
-            .await
-            .map_err(|e| e.to_string());
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::ServiceStopComplete {
-                    name: name_owned,
-                    op_id,
-                    result,
-                })
-                .await;
-        });
-        rs.control_worker = Some(worker);
+        let sent = self
+            .service_starts
+            .registry()
+            .get(name)
+            .is_some_and(|handle| {
+                handle.request(super::service_supervisor::ServiceCommand::Stop(
+                    super::service_supervisor::StopRequest {
+                        config: shutdown_config,
+                        force: false,
+                        wait_full_exit,
+                        interrupt: Some(shutdown_rx),
+                        notify: super::service_supervisor::StopNotify::Internal { op_id },
+                    },
+                ))
+            });
+        if !sent
+            && let Some(rs) = self.services.get_mut(name)
+            && let Some(reply) = rs.control_reply.take()
+        {
+            let _ = reply.send(Err(CommandError::Failed {
+                name: name.to_string(),
+                message: "service supervisor is shutting down".to_string(),
+            }));
+        }
     }
 
     pub(in crate::runner) async fn handle_service_stop_complete(
@@ -595,6 +597,7 @@ impl Runner {
             Ok(()) => {
                 if let Some(rs) = self.services.get_mut(name) {
                     rs.pgid = None;
+                    rs.handle_identity = None;
                 }
                 self.set_service_state(name, ServiceState::Stopped);
                 let next_result = match stop_action {
@@ -621,6 +624,7 @@ impl Runner {
             Err(message) => {
                 if let Some(rs) = self.services.get_mut(name) {
                     rs.pgid = None;
+                    rs.handle_identity = None;
                 }
                 self.set_service_state(name, ServiceState::Failed);
                 self.output_manager.service_error_event(name, &message);
@@ -668,7 +672,7 @@ impl Runner {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.stop_health_tracking();
                 rs.reset_restart_tracking();
-                rs.handle = None;
+                rs.handle_identity = None;
             }
             self.set_service_state(name, ServiceState::Stopped);
             self.refresh_runtime_port_manifest();
@@ -683,21 +687,13 @@ impl Runner {
             rs.stop_health_tracking();
             rs.reset_restart_tracking();
         }
-        let handle = self
-            .services
-            .get_mut(name)
-            .and_then(|rs| rs.handle.take())
-            .ok_or_else(|| CommandError::InvalidState {
+        if self.services.get(name).and_then(|rs| rs.pgid).is_none() {
+            let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "not running".to_string(),
-            });
-        let handle = match handle {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
+            }));
+            return;
+        }
         let shutdown_config = self.effective_shutdown_config(name);
         // Release attach lock if held — the PTY write in the attach session
         // becomes invalid once the service stops (process gone).
@@ -707,14 +703,7 @@ impl Runner {
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .service_event(name, "stopping... (requested)");
-        self.spawn_manual_service_stop_worker(
-            name,
-            handle,
-            shutdown_config,
-            false,
-            reply,
-            ServiceStopAction::None,
-        );
+        self.send_service_stop(name, shutdown_config, false, reply, ServiceStopAction::None);
     }
 
     /// Runner-internal handler for [`RunnerInternalCommand::ReadyCheckComplete`].
@@ -815,10 +804,6 @@ impl Runner {
             }));
             return;
         }
-        if state == ServiceState::Failed && self.reap_exited_process_handle(name).await {
-            let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
-            return;
-        }
         if matches!(state, ServiceState::Lazy | ServiceState::Stopped) {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
@@ -828,14 +813,10 @@ impl Runner {
             rs.stop_health_tracking();
             rs.reset_restart_tracking();
         }
-        let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
-            Some(h) => h,
-            None => {
-                let _ =
-                    reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
-                return;
-            }
-        };
+        if self.services.get(name).and_then(|rs| rs.pgid).is_none() {
+            let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
+            return;
+        }
         let shutdown_config = self.effective_shutdown_config(name);
         if self.remove_attach_lock(name) {
             self.output_manager.resume_stdout_sink(name).await;
@@ -843,38 +824,12 @@ impl Runner {
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .service_event(name, "stopping... (requested restart)");
-        self.spawn_manual_service_stop_worker(
+        self.send_service_stop(
             name,
-            handle,
             shutdown_config,
             false,
             reply,
             ServiceStopAction::RestartFull,
         );
-    }
-
-    async fn reap_exited_process_handle(&mut self, name: &str) -> bool {
-        let exited = match self
-            .services
-            .get_mut(name)
-            .and_then(|rs| rs.handle.as_mut())
-        {
-            Some(ServiceHandle::Process(process)) => match process.try_wait() {
-                Ok(Some(_)) => true,
-                Ok(None) | Err(_) => false,
-            },
-            _ => false,
-        };
-        if !exited {
-            return false;
-        }
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.handle = None;
-            rs.stop_health_tracking();
-        }
-        if let Some(writer) = self.output_manager.service_writer(name) {
-            writer.close_follow_sinks().await;
-        }
-        true
     }
 }

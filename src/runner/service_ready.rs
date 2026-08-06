@@ -52,25 +52,43 @@ impl Runner {
         // note in `wire_task_output_and_wait` for why it's taken up front.
         let output = self.output_manager.item_output(name);
         let mut spawned_pgid: Option<i32> = None;
-        if let Some(rs) = self.services.get_mut(name) {
-            if let ServiceHandle::Process(ref proc) = start_result.handle {
+        // Everything the runner needs from the handle is extracted here;
+        // the handle itself goes to the service's supervisor (Adopt, below),
+        // which owns the process from wire to reap.
+        let mut handle = start_result.handle;
+        let identity = match &handle {
+            ServiceHandle::Process(proc) => {
                 spawned_pgid = Some(proc.pgid());
+                super::state::ServiceHandleIdentity::Process { pgid: proc.pgid() }
             }
+            ServiceHandle::Docker(_) => super::state::ServiceHandleIdentity::Docker,
+        };
+        // Take the PTY write half for the OSC sink before custody transfers.
+        let pty = match &mut handle {
+            ServiceHandle::Process(process) => process.take_pty_write(),
+            ServiceHandle::Docker(_) => None,
+        };
+        if let Some(rs) = self.services.get_mut(name) {
             rs.pgid = spawned_pgid;
             rs.docker_port_bindings = docker_port_bindings;
-            rs.handle = Some(start_result.handle);
+            rs.handle_identity = Some(identity);
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop
             // guard in `handle_service_exited`).
             rs.last_start = Some(std::time::Instant::now());
 
             // Add OSC response sink if we have a PTY write handle.
-            if let Some(ServiceHandle::Process(process)) = rs.handle.as_mut()
-                && let Some(pty) = process.take_pty_write()
+            if let Some(pty) = pty
                 && let Some(output) = output.as_ref()
             {
                 rs.osc_sink = Some(output.add_osc_sink(pty).await);
             }
+        }
+        // Hand the process to its owner. Enqueued before any Stop for this
+        // process can be (single runner task), so mailbox order is custody
+        // order.
+        if let Some(supervisor) = self.service_starts.registry().get(name) {
+            let _ = supervisor.request(super::service_supervisor::ServiceCommand::Adopt { handle });
         }
         if let Some(pgid) = spawned_pgid {
             self.output_manager
@@ -108,15 +126,15 @@ impl Runner {
         // code path. The pgid lets the handler ignore stale events that
         // arrive after the service has already been respawned.
         if let Some(pgid) = spawned_pgid {
-            let report_tx = self.report_tx.clone();
-            let watch_name = name.to_string();
-            tokio::spawn(async move {
-                let _ = crash_exit_rx.await;
-                let _ = report_tx.send(super::ItemReport::ServiceExited {
-                    name: watch_name,
-                    pgid,
+            // EOF goes to the service's own supervisor — the process's
+            // owner — which reaps and reports the exit upstream.
+            if let Some(handle) = self.service_starts.registry().get(name).cloned() {
+                tokio::spawn(async move {
+                    let _ = crash_exit_rx.await;
+                    let _ = handle
+                        .request(super::service_supervisor::ServiceCommand::ProcessEof { pgid });
                 });
-            });
+            }
         }
 
         let name_owned = name.to_string();

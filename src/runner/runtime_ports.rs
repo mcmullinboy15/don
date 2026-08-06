@@ -1,6 +1,5 @@
 //! Runtime port publication, references, and ready-check resolution.
 
-use super::service::ServiceHandle;
 use super::{CommandError, Runner};
 use crate::config::ReadyCheck;
 use crate::output::LifecycleEmitter;
@@ -147,11 +146,11 @@ impl Runner {
         for (service_name, runtime) in &self.services {
             // A proxy is the outer public endpoint when a service declares
             // both proxy and Docker mappings, so insert it last.
-            if let Some(ServiceHandle::Docker(handle)) = runtime.handle.as_ref() {
+            if runtime.handle_identity == Some(super::state::ServiceHandleIdentity::Docker) {
                 extend_service_references(
                     &mut references,
                     service_name,
-                    handle.env_reference_values(),
+                    crate::docker::env_reference_values(&runtime.docker_port_bindings),
                 );
             }
             if let Some(proxy) = runtime.proxy.as_ref() {
@@ -181,8 +180,10 @@ impl Runner {
         let Some(runtime) = self.services.get(name) else {
             return env;
         };
-        if let Some(ServiceHandle::Docker(handle)) = runtime.handle.as_ref() {
-            env.extend(handle.public_env_vars());
+        if runtime.handle_identity == Some(super::state::ServiceHandleIdentity::Docker) {
+            env.extend(crate::docker::public_env_vars(
+                &runtime.docker_port_bindings,
+            ));
         }
         if let Some(proxy) = runtime.proxy.as_ref() {
             env.extend(proxy.public_env_vars());
@@ -208,9 +209,9 @@ impl Runner {
                 );
             }
         }
-        if let Some(ServiceHandle::Docker(handle)) = runtime.handle.as_ref() {
-            for binding in handle
-                .port_bindings()
+        if runtime.handle_identity == Some(super::state::ServiceHandleIdentity::Docker) {
+            for binding in runtime
+                .docker_port_bindings
                 .iter()
                 .filter(|binding| binding.protocol == "tcp")
             {
@@ -264,9 +265,9 @@ impl Runner {
                 })
                 .unwrap_or_default();
 
-            let docker = match runtime.handle.as_ref() {
-                Some(ServiceHandle::Docker(handle)) => handle
-                    .port_bindings()
+            let docker = match runtime.handle_identity {
+                Some(super::state::ServiceHandleIdentity::Docker) => runtime
+                    .docker_port_bindings
                     .iter()
                     .map(|binding| DockerPort {
                         configured: binding.configured.clone(),

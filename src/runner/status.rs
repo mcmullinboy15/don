@@ -1,4 +1,3 @@
-use super::service::ServiceHandle;
 use super::{ItemStatus, Runner, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
 
 impl Runner {
@@ -215,9 +214,9 @@ impl Runner {
                             entries
                         },
                     ),
-                    docker_ports: match rs.handle.as_ref() {
-                        Some(ServiceHandle::Docker(handle)) => handle
-                            .port_bindings()
+                    docker_ports: match rs.handle_identity {
+                        Some(super::state::ServiceHandleIdentity::Docker) => rs
+                            .docker_port_bindings
                             .iter()
                             .map(|binding| {
                                 format!(

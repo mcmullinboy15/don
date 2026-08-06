@@ -120,7 +120,7 @@ impl Runner {
         let is_running = if is_service {
             self.services
                 .get(name)
-                .is_some_and(|rs| rs.handle.is_some())
+                .is_some_and(|rs| rs.handle_identity.is_some())
         } else {
             self.tasks.get(name).is_some_and(|rt| rt.pgid.is_some())
         };

@@ -465,10 +465,13 @@ pub(in crate::runner) enum ItemReport {
     /// service has dependencies, and starting it is a scheduling decision
     /// like any other.
     Demand { name: String },
-    /// A service's process died (its output stream EOF'd). `pgid` says
-    /// *which* process — the currency check against the live handle stays
-    /// with the runner until the supervisor owns the handle outright.
-    ServiceExited { name: String, pgid: i32 },
+    /// A service's process died and its supervisor reaped it. `status` is
+    /// the reaped exit status (`None` when the wait itself failed).
+    ServiceExited {
+        name: String,
+        pgid: i32,
+        status: Option<std::process::ExitStatus>,
+    },
     /// A service's restart backoff elapsed; attempt `attempt` may begin.
     RestartDue { name: String, attempt: u32 },
 }
@@ -1026,6 +1029,7 @@ impl Runner {
             },
             &|name| output_manager.item_output(name),
             &internal_tx,
+            &report_tx,
         );
 
         // One supervisor per task, started before the runner exists so the
@@ -1160,7 +1164,9 @@ impl Runner {
         };
         let policy = match rs.state() {
             ServiceState::Lazy => ConnectionPolicy::LazyTrigger,
-            ServiceState::Failed | ServiceState::DependencyFailed if rs.handle.is_none() => {
+            ServiceState::Failed | ServiceState::DependencyFailed
+                if rs.handle_identity.is_none() =>
+            {
                 ConnectionPolicy::Refuse
             }
             _ => ConnectionPolicy::Serve,
@@ -1885,8 +1891,8 @@ impl Runner {
                             // Pending, and the normal dependency scheduler
                             // owns the service from there.
                             ItemReport::Demand { name } => self.handle_lazy_connection(&name),
-                            ItemReport::ServiceExited { name, pgid } => {
-                                self.handle_service_exited(&name, pgid).await;
+                            ItemReport::ServiceExited { name, pgid, status } => {
+                                self.handle_service_exited(&name, pgid, status).await;
                             }
                             ItemReport::RestartDue { name, attempt } => {
                                 self.handle_auto_restart(&name, attempt).await;
@@ -3170,7 +3176,7 @@ mod tests {
         );
 
         assert_eq!(rs.state(), ServiceState::Pending);
-        assert!(rs.handle.is_none());
+        assert!(rs.handle_identity.is_none());
         assert!(rs.osc_sink.is_none());
         assert!(rs.attach_lock.is_none());
         assert!(rs.attach_waiter.is_none());

@@ -1,5 +1,5 @@
 use super::graph::topological_sort;
-use super::service::ServiceHandle;
+
 use super::task_worker::TaskRunPrepared;
 use super::{Runner, RunnerInternalCommand, ServiceState, ServiceStopAction};
 use crate::runner::service::stop_service;
@@ -104,8 +104,12 @@ impl Runner {
             self.output_manager
                 .service_event(&name, "run cancelled by shutdown");
         }
-        let mut supervisors = self.service_starts.abort_all();
-        supervisors.extend(self.task_supervisors.abort_all());
+        // Task supervisors can be ended here — they only *prepare* runs.
+        // Service supervisors must NOT be: they own the processes now, and
+        // the reverse-dependency stop loop below works by sending them Stop.
+        // They are ended at the end of this function, once every stop has
+        // been executed and joined.
+        let supervisors = self.task_supervisors.abort_all();
         for (_, handle) in supervisors {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
@@ -185,7 +189,7 @@ impl Runner {
             let Some(service) = self.services.get(name) else {
                 continue;
             };
-            if service.handle.is_none() {
+            if service.handle_identity.is_none() {
                 continue;
             }
             let depth = depths.get(name).copied().unwrap_or(0);
@@ -207,21 +211,31 @@ impl Runner {
             let mut stopping_pgids: HashMap<String, i32> = HashMap::new();
             let mut join_set: JoinSet<String> = JoinSet::new();
             for name in &names {
-                if let Some(handle) = self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
-                    if let ServiceHandle::Process(ref proc) = handle {
-                        stopping_pgids.insert(name.clone(), proc.pgid());
-                    }
-                    let shutdown_config = self.effective_shutdown_config(name);
-                    let force = force_shutdown_requested();
+                if let Some(pgid) = self.services.get(name).and_then(|rs| rs.pgid) {
+                    stopping_pgids.insert(name.clone(), pgid);
+                }
+                // The supervisor owns the process; ask it to stop and join
+                // on the done-signal. A supervisor holding nothing answers
+                // immediately, so sending unconditionally is safe — and it
+                // is what keeps docker services (no pgid) covered.
+                let shutdown_config = self.effective_shutdown_config(name);
+                let force = force_shutdown_requested();
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                let sent = self.service_starts.registry().get(name).is_some_and(|h| {
+                    h.request(super::service_supervisor::ServiceCommand::Stop(
+                        super::service_supervisor::StopRequest {
+                            config: shutdown_config,
+                            force,
+                            wait_full_exit: true,
+                            interrupt: None,
+                            notify: super::service_supervisor::StopNotify::Done(done_tx),
+                        },
+                    ))
+                });
+                if sent {
                     let name_owned = name.clone();
-                    let debug = super::service::StopDebug::new(
-                        name.clone(),
-                        self.output_manager.clone_lifecycle_emitter(),
-                    );
                     join_set.spawn(async move {
-                        let _ =
-                            stop_service(handle, Some(&shutdown_config), force, true, Some(debug))
-                                .await;
+                        let _ = done_rx.await;
                         name_owned
                     });
                 }
@@ -251,6 +265,7 @@ impl Runner {
                     for name in names {
                         if let Some(rs) = self.services.get_mut(&name) {
                             rs.pgid = None;
+                            rs.handle_identity = None;
                         }
                         self.set_service_state(&name, ServiceState::Stopped);
                     }
@@ -272,6 +287,7 @@ impl Runner {
                         stopping_pgids.remove(&name);
                         if let Some(rs) = self.services.get_mut(&name) {
                             rs.pgid = None;
+                            rs.handle_identity = None;
                         }
                         self.set_service_state(&name, ServiceState::Stopped);
                         self.drain_service_output(&name).await;
@@ -328,6 +344,14 @@ impl Runner {
                 }
             }
         }
+
+        // Every stop has been executed and joined; the service supervisors
+        // are idle and can end now. Abort-all-then-await keeps the 1s bound
+        // paid once, not once per service.
+        let supervisors = self.service_starts.abort_all();
+        for (_, handle) in supervisors {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        }
     }
 
     /// Wait for remaining async tasks to finish after shutdown.
@@ -344,7 +368,7 @@ impl Runner {
             if let Some(worker) = rs.output_worker.take() {
                 Self::await_output_worker(worker).await;
             }
-            rs.handle = None;
+            rs.handle_identity = None;
             rs.attach_lock = None;
             rs.attach_waiter = None;
             rs.control_reply = None;
