@@ -15,7 +15,8 @@ mod assets;
 mod directory;
 mod origin;
 
-pub(crate) use directory::ProjectDirectory;
+pub use directory::Project;
+pub(crate) use directory::{DirectoryQuery, ProjectDirectory};
 
 use axum::Router;
 use axum::routing::get;
@@ -82,11 +83,11 @@ pub(crate) async fn serve(
 /// Serve the UI over a single project, for `don start --with-ui`.
 ///
 /// The public entry point for the project-local mode: `ProjectDirectory` is
-/// internal, so callers outside the crate hand over a [`ProjectEntry`] and
+/// internal, so callers outside the crate hand over a [`Project`] and
 /// get the same router the daemon serves.
 pub async fn serve_single(
     listener: TcpListener,
-    project: crate::daemon::ProjectEntry,
+    project: Project,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), WebError> {
     serve(

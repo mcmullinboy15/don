@@ -174,7 +174,43 @@ async fn start_web(
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<WebServer, DaemonError> {
     let (listener, addr) = crate::web::bind(addr).await?;
-    let directory = crate::web::ProjectDirectory::Daemon { cmd_tx };
+    // Adapt the registry onto the web layer's own query vocabulary — the
+    // daemon answers the web's questions; the web never learns the
+    // registry's types. Ends when the web server drops its sender.
+    let (query_tx, mut query_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let cmd_tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            while let Some(query) = query_rx.recv().await {
+                match query {
+                    crate::web::DirectoryQuery::List { reply } => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        if cmd_tx
+                            .send(routes::DaemonCommand::List { reply: tx })
+                            .is_err()
+                        {
+                            let _ = reply.send(Vec::new());
+                            continue;
+                        }
+                        let entries = rx.await.unwrap_or_default();
+                        let _ = reply.send(entries.into_iter().map(Into::into).collect());
+                    }
+                    crate::web::DirectoryQuery::Get { id, reply } => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        if cmd_tx
+                            .send(routes::DaemonCommand::Get { id, reply: tx })
+                            .is_err()
+                        {
+                            let _ = reply.send(None);
+                            continue;
+                        }
+                        let _ = reply.send(rx.await.ok().flatten().map(Into::into));
+                    }
+                }
+            }
+        });
+    }
+    let directory = crate::web::ProjectDirectory::Queried { query_tx };
     let handle = tokio::spawn({
         let shutdown_rx = shutdown_rx.clone();
         async move {

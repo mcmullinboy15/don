@@ -96,7 +96,7 @@ impl Harness {
 
         let (listener, addr) = don::web::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
         let (web_shutdown, web_shutdown_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(don::web::serve_single(listener, entry, web_shutdown_rx));
+        tokio::spawn(don::web::serve_single(listener, entry.into(), web_shutdown_rx));
 
         Self {
             port: addr.port(),

@@ -12,7 +12,6 @@
 
 use super::directory::ProjectDirectory;
 use crate::client::{Client, ClientError, RunTaskOptions};
-use crate::daemon::registry::ProjectEntry;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -62,7 +61,7 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
 
 #[derive(Serialize)]
 struct ProjectsResponse {
-    projects: Vec<ProjectEntry>,
+    projects: Vec<super::directory::Project>,
 }
 
 /// `GET /api/projects` — every project the UI can show.

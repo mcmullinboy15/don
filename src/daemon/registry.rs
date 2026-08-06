@@ -38,6 +38,23 @@ pub struct ProjectEntry {
     pub registered_at_unix_secs: u64,
 }
 
+/// The registry row, translated into the web layer's vocabulary. Lives
+/// here — on the daemon's side of the arrow — so `web` never imports the
+/// registry.
+impl From<ProjectEntry> for crate::web::Project {
+    fn from(entry: ProjectEntry) -> Self {
+        crate::web::Project {
+            id: entry.id,
+            name: entry.name,
+            root: entry.root,
+            socket: entry.socket,
+            pid: entry.pid,
+            profile: entry.profile,
+            registered_at_unix_secs: entry.registered_at_unix_secs,
+        }
+    }
+}
+
 impl ProjectEntry {
     /// Build an entry for a project rooted at `root`.
     ///

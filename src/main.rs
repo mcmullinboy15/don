@@ -2980,8 +2980,12 @@ async fn start_with_ui(
     profile: Option<&str>,
 ) -> Result<WithUiGuard, String> {
     let root = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-    let entry =
-        don::daemon::ProjectEntry::new(root, std::process::id(), profile.map(str::to_string));
+    // Built as a registry row (one id-derivation to rule them all), then
+    // converted to the web layer's own type. In fork mode this runs in the
+    // runner child, so the pid really is the runner's.
+    let entry: don::web::Project =
+        don::daemon::ProjectEntry::new(root, std::process::id(), profile.map(str::to_string))
+            .into();
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let (listener, addr) = don::web::bind(addr).await.map_err(|e| {
