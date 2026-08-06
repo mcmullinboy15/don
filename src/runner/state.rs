@@ -225,6 +225,12 @@ pub(crate) struct RuntimeTask {
     pub last_params: HashMap<String, String>,
     /// Process group ID of the running task (for shutdown kills).
     pub pgid: Option<i32>,
+    /// A run request is with the supervisor and its prepared result has not
+    /// come back yet. Covers the window the supervisor's `is_busy` cannot:
+    /// after it emits `TaskRunPrepared` (busy drops) but before the runner
+    /// wires the run (state becomes `Running`). Without this, a scheduler
+    /// sweep landing in that window re-requests the task and double-spawns.
+    pub run_requested: bool,
     /// OSC query sink for reclaiming PTY write on attach.
     pub osc_sink: Option<crate::output::OscSinkHandle>,
     /// PID of the client holding the interactive attach lock.
@@ -273,6 +279,7 @@ impl RuntimeTask {
             resolved_watch_paths: Vec::new(),
             output_worker: None,
             run_generation: 0,
+            run_requested: false,
             run_waiter: None,
             has_success,
             last_run,

@@ -52,6 +52,7 @@ impl Runner {
         }
 
         Ok(self.tasks.get_mut(name).map_or(0, |rt| {
+            rt.run_requested = true;
             rt.run_generation = rt.run_generation.saturating_add(1);
             rt.run_generation
         }))
@@ -64,6 +65,9 @@ impl Runner {
         intent: TaskRunIntent,
         result: Result<TaskRunPrepared, String>,
     ) {
+        if let Some(rt) = self.tasks.get_mut(name) {
+            rt.run_requested = false;
+        }
         if self.shutting_down {
             self.stop_late_task_start(name.to_string(), result).await;
             if task_cfg.terminal.is_foreground() {
@@ -94,6 +98,21 @@ impl Runner {
                 .await;
             }
             Ok(TaskRunPrepared::Spawned(spawn)) => {
+                // A run is already live for this task. Request-side dedup
+                // (`run_requested`) should prevent this, but a spawned
+                // process must be reaped however it came to exist — kill
+                // the duplicate rather than clobbering the live run's
+                // execution wiring (pgid, waiter, output worker), which is
+                // what turned a benign race into "failed (exit code -1)".
+                if self.tasks.get(name).is_some_and(|rt| rt.pgid.is_some()) {
+                    let emitter = self.output_manager.clone_lifecycle_emitter();
+                    task_supervisor::kill_superseded_spawn(
+                        &emitter,
+                        name,
+                        TaskRunPrepared::Spawned(spawn),
+                    );
+                    return;
+                }
                 let emitter = self.output_manager.clone_lifecycle_emitter();
                 emitter.service_debug_event(
                     name,
@@ -105,6 +124,19 @@ impl Runner {
                     .await;
             }
             Ok(TaskRunPrepared::ForegroundSpawned(spawn)) => {
+                // Same duplicate guard as the background arm — plus giving
+                // the terminal back, since the worker paused it pre-spawn.
+                if self.tasks.get(name).is_some_and(|rt| rt.pgid.is_some()) {
+                    let emitter = self.output_manager.clone_lifecycle_emitter();
+                    task_supervisor::kill_superseded_spawn(
+                        &emitter,
+                        name,
+                        TaskRunPrepared::ForegroundSpawned(spawn),
+                    );
+                    self.output_manager.resume_visible_output();
+                    self.terminal_coordinator.release().await;
+                    return;
+                }
                 // No spawn/running lines: a foreground task owns the terminal
                 // and its own output is the only thing worth showing there.
                 let done_tx = self.begin_task_run(name, intent, None);
@@ -726,6 +758,7 @@ impl Runner {
         // the same task and the output would interleave unpredictably.
         let already_in_flight = self.tasks.get(name).is_some_and(|rt| {
             matches!(rt.state(), TaskItemState::Running | TaskItemState::Building)
+                || rt.run_requested
         }) || self.task_supervisors.registry().is_busy(name);
         if already_in_flight {
             let _ = reply.send(Err(CommandError::InvalidState {

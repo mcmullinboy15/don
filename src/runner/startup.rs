@@ -677,7 +677,11 @@ impl Runner {
             || self
                 .tasks
                 .get(name)
-                .is_some_and(|rt| rt.state() == TaskItemState::Pending)
+                // `run_requested` covers the window `is_busy` cannot: the
+                // supervisor has emitted the prepared run (busy dropped) but
+                // the runner hasn't wired it yet (state still Pending). A
+                // sweep landing there used to re-request and double-spawn.
+                .is_some_and(|rt| rt.state() == TaskItemState::Pending && !rt.run_requested)
                 && !self.task_supervisors.registry().is_busy(name)
     }
 
