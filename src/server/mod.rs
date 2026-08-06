@@ -162,7 +162,11 @@ pub fn serve_for_runner(
     let log_tap = runner.log_stream_sender();
     let path = socket_path.to_path_buf();
     let display = socket_path.display().to_string();
-    let server_emitter = emitter.clone();
+    // Deliberately NO LifecycleEmitter in this task: an emitter holds a
+    // sink sender, and this task outlives the output flush (it ends on the
+    // post-flush shutdown flip) — holding one would stall the flush until
+    // its 2s abort. Accept-loop errors are rare and terminal; stderr is
+    // honest enough (in fork mode that's `.don/logs/runner.log`).
     tokio::spawn(async move {
         if let Err(e) = serve_api(
             listener,
@@ -175,7 +179,7 @@ pub fn serve_for_runner(
         )
         .await
         {
-            server_emitter.lifecycle_event(&format!("api server error: {e}"));
+            eprintln!("don: api server error: {e}");
         }
     });
     emitter.lifecycle_event(&format!("api listening on {display}"));

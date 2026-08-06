@@ -135,10 +135,14 @@ impl Runner {
             }
         }
 
-        // Tell the API server to stop accepting connections.
-        if let Some(tx) = self.server_shutdown_tx.take() {
-            let _ = tx.send(true);
-        }
+        // The API server is NOT told to stop here, deliberately. Streaming
+        // responses (log/event followers) end on that signal, and firing it
+        // before the stop loop would cut every attached client off from the
+        // entire teardown narration — the stopping/stopped lines they are
+        // watching for. The flip happens at the end of teardown, after the
+        // output flush, in `run`'s tail; serving reads during teardown is
+        // harmless (commands land in a queue nobody reads and their reply
+        // channels drop, which clients already handle).
 
         // Build reverse dependency order for shutdown.
         // Services at the same depth (no dependency relationship) stop concurrently.

@@ -1874,9 +1874,6 @@ impl Runner {
         }
 
         // Stop the API server (no-op if already signalled by initiate_shutdown).
-        if let Some(tx) = self.server_shutdown_tx.take() {
-            let _ = tx.send(true);
-        }
 
         // Abort the watch task so its LifecycleEmitter (which holds a clone of
         // the stdout sink sender) drops. Otherwise the subsequent output
@@ -1899,6 +1896,26 @@ impl Runner {
 
         // Shut down the output system — flush all pending messages to sinks.
         self.output_manager.shutdown().await;
+
+        // NOW end the API server, streams included. This must be the last
+        // act of teardown, after the output flush: every lifecycle line —
+        // "shutdown complete" included — is in the log tap's buffers by this
+        // point, and the streaming forwarders drain those buffers on this
+        // signal before closing. Flipping any earlier cuts attached clients
+        // off mid-narration; not flipping at all deadlocks exit (a follower
+        // connection holds ApiState senders — see `ApiState::shutdown`).
+        if let Some(tx) = self.server_shutdown_tx.take() {
+            let _ = tx.send(true);
+            // Wait for the server to actually finish: `closed()` resolves
+            // when every receiver is gone — the accept loop's and each
+            // streaming connection's `ApiState` clone — which is also when
+            // the socket file is removed (SocketGuard). Without this, `run`
+            // returning would not imply the API is down, and an embedder
+            // (or test) checking `.don/don.sock` right after would race the
+            // detached server task. Bounded: a wedged connection must not
+            // hold exit hostage — the drain is finite, this is a backstop.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tx.closed()).await;
+        }
 
         Ok(())
     }

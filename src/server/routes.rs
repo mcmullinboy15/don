@@ -125,6 +125,9 @@ async fn await_startup_settled(state: &ApiState) -> bool {
 struct ReadyResponse {
     /// Whether the initial startup sweep has decided every item.
     startup_complete: bool,
+    /// The runner's crate version. A long-lived runner can outlive a `don`
+    /// upgrade; clients compare and warn instead of misbehaving quietly.
+    version: &'static str,
 }
 
 /// `GET /ready` — whether the runner has finished its initial sweep.
@@ -135,6 +138,7 @@ struct ReadyResponse {
 async fn get_ready(State(state): State<Arc<ApiState>>) -> Response {
     Json(ReadyResponse {
         startup_complete: state.state.snapshot().startup_complete,
+        version: env!("CARGO_PKG_VERSION"),
     })
     .into_response()
 }
@@ -189,6 +193,19 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
                 },
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        // Deliver what's already buffered — the shutdown
+                        // narration was published before this signal fired
+                        // (the runner flips it after the output flush) —
+                        // then end the stream.
+                        while let Ok(event) = events_rx.try_recv() {
+                            let value = serde_json::to_value(&event)
+                                .unwrap_or_else(|_| serde_json::json!({ "type": "error" }));
+                            let mut chunk = serde_json::to_vec(&value).unwrap_or_default();
+                            chunk.push(b'\n');
+                            if tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+                                return;
+                            }
+                        }
                         return;
                     }
                     continue;
@@ -425,6 +442,18 @@ async fn get_all_logs(
                 },
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        // Same contract as the events stream: the final
+                        // lines are already in this receiver's buffer, so
+                        // deliver them before closing.
+                        while let Ok(line) = tap.try_recv() {
+                            if !seen.is_empty() && seen.remove(&(Arc::as_ptr(&line) as usize)) {
+                                continue;
+                            }
+                            seen.clear();
+                            if tx.send(record(&line)).await.is_err() {
+                                return;
+                            }
+                        }
                         return;
                     }
                     continue;

@@ -320,6 +320,16 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                     with_ui,
                 )
                 .await
+            } else if should_auto_attach(&config_path, no_tui) {
+                run_start_attached(
+                    &config_path,
+                    profile.as_deref(),
+                    verbose,
+                    log_filter,
+                    no_daemon,
+                    with_ui,
+                )
+                .await
             } else {
                 run_start(
                     &config_path,
@@ -1403,6 +1413,159 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
     }
 }
 
+/// TTY-mode `don start`: spawn the runner as a background child and attach
+/// the TUI as a client — the fork model.
+///
+/// The runner never has a terminal; the thing in your terminal is an
+/// ordinary client of the socket API, identical to `don tui`. Ctrl+C keeps
+/// its contract (graceful stack shutdown — the TUI requests it over the
+/// API; a terminal-delivered SIGINT is forwarded to the child, so a second
+/// one still reaches the runner's force-kill escalation). Ctrl+D detaches,
+/// leaving the stack running.
+///
+/// The parent gates on the *socket*, not on startup completing — watching
+/// startup happen is what the TUI is for. A child that dies before the
+/// socket answers gets its log tail relayed, so startup failures surface
+/// exactly where the user is looking.
+async fn run_start_attached(
+    config_path: &Path,
+    profile: Option<&str>,
+    verbose: bool,
+    log_filter: Vec<String>,
+    no_daemon: bool,
+    with_ui: Option<u16>,
+) -> Result<(), String> {
+    let base = base_dir(config_path);
+
+    // Already running: attaching is the answer, not a second runner.
+    let probe = Client::new(&base);
+    match probe.status(false, None).await {
+        Ok(_) => {
+            return Err(
+                "don is already running here — `don tui` to attach, `don stop` to stop it"
+                    .to_string(),
+            );
+        }
+        Err(ClientError::NotRunning { .. }) => {}
+        Err(e) => return Err(format!("failed to check for a running don: {e}")),
+    }
+
+    let (mut child, log_path) = spawn_runner_child(
+        config_path,
+        profile,
+        verbose,
+        &log_filter,
+        no_daemon,
+        with_ui,
+    )?;
+    let child_pid = child.id();
+
+    // Wait for the API socket to answer. Generous only about the socket —
+    // binding happens before the runner's main loop, so a healthy child
+    // answers almost immediately.
+    let client = Client::new(&base);
+    let start = tokio::time::Instant::now();
+    let socket_timeout = std::time::Duration::from_secs(10);
+    loop {
+        if client.ready().await.is_ok() {
+            break;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed to check the runner process: {e}"))?
+        {
+            let status_text = match status.code() {
+                Some(code) => format!("exit code {code}"),
+                None => "terminated by signal".to_string(),
+            };
+            let tail = read_log_tail(&log_path, 20);
+            let mut msg = format!(
+                "the runner exited before its API came up ({status_text}); log: {}",
+                log_path.display()
+            );
+            if !tail.is_empty() {
+                msg.push_str("\n\n");
+                msg.push_str(&tail);
+            }
+            return Err(msg);
+        }
+        if start.elapsed() >= socket_timeout {
+            return Err(format!(
+                "the runner did not answer within {socket_timeout:?} (pid {child_pid}); log: {}",
+                log_path.display()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+
+    // Forward terminal signals to the runner child. The TUI's raw mode
+    // means Ctrl+C arrives as a key (handled over the API), so this exists
+    // for signals sent from *outside* — `kill -INT`, a closing terminal
+    // emulator — and it preserves the two-press force-kill escalation,
+    // because the child's own signal counter sees each forwarded SIGINT.
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+            return;
+        };
+        let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                received = sigint.recv() => { if received.is_none() { return; } }
+                received = sigterm.recv() => { if received.is_none() { return; } }
+            }
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child_pid as i32),
+                nix::sys::signal::Signal::SIGINT,
+            );
+        }
+    });
+
+    let log_filter_set: Option<std::collections::HashSet<String>> = if log_filter.is_empty() {
+        None
+    } else {
+        Some(log_filter.into_iter().collect())
+    };
+    attach_tui_inner(config_path, log_filter_set).await?;
+
+    // After a shutdown the child has exited (or is about to); reap it so a
+    // fast exit doesn't leave a zombie for the brief rest of our lifetime.
+    // After a detach it is alive and this is a no-op — init inherits it.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = child.try_wait();
+    Ok(())
+}
+
+/// Whether TTY-mode `don start` should use the fork model.
+///
+/// Conservative: any config that fails to load or validate falls back to
+/// the in-process path, which reports the error exactly as it always has.
+/// Foreground (interactive) tasks also fall back — a background runner has
+/// no stdin to hand them, and the terminal handoff only exists in-process
+/// until attach bridging replaces it.
+fn should_auto_attach(config_path: &Path, no_tui: bool) -> bool {
+    use std::io::IsTerminal;
+    if no_tui || !std::io::stdout().is_terminal() {
+        return false;
+    }
+    let Ok(config) = don::config::Config::from_file(config_path) else {
+        return false;
+    };
+    let Some(platform) = don::config::Platform::current() else {
+        return false;
+    };
+    if config.validate(platform).is_err() {
+        return false;
+    }
+    let has_foreground_tasks = config
+        .tasks
+        .values()
+        .any(|task| task.terminal.is_foreground());
+    !has_foreground_tasks
+}
+
 /// `don tui` — attach the full TUI to an already-running project.
 ///
 /// A pure client of the socket API: the item set comes from `GET /status`
@@ -1413,7 +1576,7 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
 /// Ctrl+C requests a graceful shutdown and the TUI exits when the runner's
 /// streams close.
 async fn run_attach_tui(config_path: &Path) -> i32 {
-    match attach_tui_inner(config_path).await {
+    match attach_tui_inner(config_path, None).await {
         Ok(()) => 0,
         Err(message) => {
             eprintln!("{message}");
@@ -1422,7 +1585,10 @@ async fn run_attach_tui(config_path: &Path) -> i32 {
     }
 }
 
-async fn attach_tui_inner(config_path: &Path) -> Result<(), String> {
+async fn attach_tui_inner(
+    config_path: &Path,
+    cli_log_filter: Option<std::collections::HashSet<String>>,
+) -> Result<(), String> {
     use don::client::{Client, LogStreamEvent};
 
     {
@@ -1538,6 +1704,21 @@ async fn attach_tui_inner(config_path: &Path) -> Result<(), String> {
     let lifecycle_emitter = local_output.clone_lifecycle_emitter();
     let mut local_tap = local_output.log_stream_sender().subscribe();
 
+    // A long-lived runner can outlive a `don` upgrade. Warn about skew as a
+    // rendered line rather than misbehaving quietly.
+    if let Ok(info) = client.ready_info().await {
+        let mine = env!("CARGO_PKG_VERSION");
+        match info.version.as_deref() {
+            Some(theirs) if theirs != mine => lifecycle_emitter.lifecycle_event(&format!(
+                "version skew: this client is {mine}, the runner is {theirs} — restart the stack to align"
+            )),
+            None => lifecycle_emitter.lifecycle_event(&format!(
+                "version skew: this client is {mine}, the runner predates version reporting — restart the stack to align"
+            )),
+            _ => {}
+        }
+    }
+
     // Remote merged stream -> intermediate channel. The spawned follow ends
     // when the server closes the stream (shutdown) or the merger drops the
     // receiver (TUI exited).
@@ -1618,7 +1799,7 @@ async fn attach_tui_inner(config_path: &Path) -> Result<(), String> {
         task_last_runs,
         hidden_names,
         auto_filter_on_failure_names,
-        None,
+        cli_log_filter,
         terminal_request_rx,
     )
     .await
@@ -2139,12 +2320,40 @@ async fn run_start_detached(
         Err(e) => return Err(format!("failed to check daemon status: {e}")),
     }
 
-    let log_path = base.join(".don").join("logs").join("detached.log");
+    let (mut child, log_path) = spawn_runner_child(
+        config_path,
+        profile,
+        verbose,
+        &log_filter,
+        no_daemon,
+        with_ui,
+    )?;
+    let pid = child.id();
+    wait_for_detached_start(&mut child, &base, &log_path, pid).await
+}
+
+/// Spawn the runner as a background child: new session (no controlling
+/// terminal, so terminal-generated signals never reach it), stdin null,
+/// stdout+stderr appended to `.don/logs/runner.log` — the post-mortem for a
+/// runner nobody is attached to.
+///
+/// Used by both `don start -d` (spawn and exit) and TTY-mode `don start`
+/// (spawn and attach).
+fn spawn_runner_child(
+    config_path: &Path,
+    profile: Option<&str>,
+    verbose: bool,
+    log_filter: &[String],
+    no_daemon: bool,
+    with_ui: Option<u16>,
+) -> Result<(std::process::Child, PathBuf), String> {
+    let base = base_dir(config_path);
+    let log_path = base.join(".don").join("logs").join("runner.log");
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
-    append_detached_log_header(&log_path)?;
+    append_runner_log_header(&log_path)?;
 
     let exe = std::env::current_exe().map_err(|e| format!("failed to locate don binary: {e}"))?;
     let stdout = std::fs::OpenOptions::new()
@@ -2182,8 +2391,9 @@ async fn run_start_detached(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Run the daemon in a new session so terminal-generated signals for
-        // the parent shell do not also hit the detached don process.
+        // Run the runner in a new session so terminal-generated signals for
+        // the parent shell do not also hit it. Signal *forwarding* (for the
+        // attached case) is explicit and pid-targeted.
         unsafe {
             cmd.pre_exec(|| {
                 if nix::libc::setsid() == -1 {
@@ -2194,20 +2404,19 @@ async fn run_start_detached(
         }
     }
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn detached don: {e}"))?;
-    let pid = child.id();
-    wait_for_detached_start(&mut child, &base, &log_path, pid).await
+        .map_err(|e| format!("failed to spawn don runner: {e}"))?;
+    Ok((child, log_path))
 }
 
-fn append_detached_log_header(log_path: &Path) -> Result<(), String> {
+fn append_runner_log_header(log_path: &Path) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
         .map_err(|e| format!("failed to open {}: {e}", log_path.display()))?;
-    writeln!(file, "\n--- don start --detached ---")
+    writeln!(file, "\n--- don runner (background) ---")
         .map_err(|e| format!("failed to write {}: {e}", log_path.display()))?;
     Ok(())
 }

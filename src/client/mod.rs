@@ -129,6 +129,17 @@ pub struct RunTaskOptions {
     pub wait_timeout: Option<String>,
 }
 
+/// Deserialised body of `GET /ready`.
+#[derive(Debug, Deserialize)]
+pub struct ReadyInfo {
+    /// Whether the initial startup sweep has decided every item.
+    pub startup_complete: bool,
+    /// The runner's crate version. `None` from a runner that predates the
+    /// field.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ErrorBody {
     error: String,
@@ -195,14 +206,15 @@ impl Client {
     /// nothing about readiness. This is that signal: wait for it before
     /// issuing a control action whose meaning depends on startup being over.
     pub async fn ready(&self) -> Result<bool, ClientError> {
-        #[derive(serde::Deserialize)]
-        struct ReadyResponse {
-            startup_complete: bool,
-        }
+        Ok(self.ready_info().await?.startup_complete)
+    }
+
+    /// `GET /ready`, full body — readiness plus the runner's version, for
+    /// clients that want to warn about skew against a long-lived runner.
+    pub async fn ready_info(&self) -> Result<ReadyInfo, ClientError> {
         let (status, body) = self.request("GET", "/ready", false).await?;
         ensure_ok(status, &body)?;
-        let parsed: ReadyResponse = serde_json::from_slice(&body)?;
-        Ok(parsed.startup_complete)
+        Ok(serde_json::from_slice(&body)?)
     }
 
     /// `POST /start/:name`
