@@ -2361,9 +2361,12 @@ async fn run_start(
         serve_project_api(&mut runner, &daemon_emitter);
         spawn_daemon_registration(&runner, daemon_emitter, profile_ref, no_daemon);
 
-        let events = runner.subscribe();
-        let state_reader = runner.state_reader();
-        let commands = runner.command_sender();
+        // The TUI is a client of the socket API — same surface a detached
+        // client will use. The socket is already bound (serve_project_api
+        // above), so the connection cannot race the bind.
+        // `base` moved into the runner spawn; the canonical root is on the
+        // runner anyway, and canonical is the safer of the two.
+        let tui_client = don::client::Client::new(runner.base_dir());
 
         // Wrap the TUI so that if it exits unexpectedly (e.g. a terminal IO
         // error or panic), we signal the runner to shut down instead of
@@ -2376,9 +2379,7 @@ async fn run_start(
         let tui = tokio::spawn(async move {
             let result = don::run_tui(
                 log_rx,
-                events,
-                state_reader,
-                commands,
+                tui_client,
                 verbosity,
                 lifecycle_emitter,
                 service_names,

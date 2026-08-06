@@ -60,6 +60,15 @@ pub(crate) struct ApiState {
     /// Subscribing per-request keeps followers independent: a slow client
     /// lags its own receiver and nobody else's.
     pub log_tap: broadcast::Sender<std::sync::Arc<crate::output::FormattedLogLine>>,
+    /// The server's shutdown signal, observed by *streaming* handlers.
+    ///
+    /// A follow response holds an `ApiState` clone — and with it live
+    /// `event_tx` / `log_tap` senders — for as long as it streams. If the
+    /// stream only ended on channel closure, a connected follower would keep
+    /// the very senders open whose closure it is waiting for, and the
+    /// process could never exit. (The TUI is exactly such a follower.)
+    /// Streams must end when this flips instead.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Bind the unix socket at `socket_path` and chmod it to 0o600 so only the
@@ -120,6 +129,7 @@ pub async fn serve_api(
             std::collections::HashMap::new(),
         )),
         log_tap,
+        shutdown: shutdown.clone(),
     });
     let app = routes::build_router(state);
     accept_loop(listener, app, shutdown).await

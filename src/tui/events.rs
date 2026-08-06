@@ -6,7 +6,7 @@
 
 use crossterm::event::KeyEvent;
 
-use crate::runner::CompletionError;
+use crate::client::{CompletionError, ItemStatus};
 
 /// Event delivered from the input task to the main TUI loop.
 #[derive(Debug, Clone)]
@@ -30,5 +30,12 @@ pub(crate) enum AppEvent {
         /// Either the list of candidate values, or the resolver's error
         /// (which the form renders inline with a pointer to the log file).
         result: Result<Vec<String>, CompletionError>,
+    },
+    /// A fresh state projection, fetched after the event stream reported
+    /// lag. Injected through the input channel so it applies in order with
+    /// user input rather than racing the render loop.
+    StateResync {
+        items: Vec<ItemStatus>,
+        startup_complete: bool,
     },
 }

@@ -13,9 +13,9 @@ use super::failure_summary::{self, FailureSummaryItem};
 use super::filter::FilterState;
 use super::form::FormState;
 use super::status_table::{StatusTableState, retain_fuzzy_matches};
+use crate::client::{ServiceState, TaskItemState};
 use crate::config::Task;
 use crate::output::{FormattedLogLine, LIFECYCLE_EVENT_NAME};
-use crate::runner::{ServiceState, TaskItemState};
 use crate::task_state::TaskRunInfo;
 
 const LOG_POPUP_MAX_LINES: usize = 500;
@@ -501,10 +501,10 @@ impl App {
     /// Deliberately not a replacement for event handling: the auto-filter on
     /// failure is edge-triggered, and re-firing it here for every service that
     /// is already failed would yank the user's filter out from under them.
-    pub(crate) fn resync_from(&mut self, snapshot: &crate::runner::StateSnapshot) {
+    pub(crate) fn resync_from(&mut self, snapshot: &crate::client::StateSnapshot) {
         for item in &snapshot.items {
             match item {
-                crate::runner::ItemStatus::Service {
+                crate::client::ItemStatus::Service {
                     name,
                     state,
                     failed_dependencies,
@@ -520,7 +520,7 @@ impl App {
                     self.services_state.insert(name.clone(), *state);
                     self.apply_failed_dependencies(name.clone(), failed_dependencies.clone());
                 }
-                crate::runner::ItemStatus::Task {
+                crate::client::ItemStatus::Task {
                     name,
                     state,
                     failed_dependencies,
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn resync_from_replaces_drifted_state() {
-        use crate::runner::{ItemStatus, StateSnapshot};
+        use crate::client::{ItemStatus, StateSnapshot};
 
         fn snapshot_service(name: &str, state: ServiceState) -> ItemStatus {
             ItemStatus::Service {
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn resync_does_not_fire_the_auto_filter_on_already_failed_items() {
-        use crate::runner::{ItemStatus, StateSnapshot};
+        use crate::client::{ItemStatus, StateSnapshot};
 
         // Auto-filter-on-failure is edge-triggered. Resyncing is not an edge:
         // re-selecting every already-failed service would yank the user's

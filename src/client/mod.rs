@@ -7,8 +7,32 @@
 
 pub mod attach;
 
-use crate::runner::{CompletionError, ItemStatus};
 use serde::Deserialize;
+
+// Re-exported (and used here) so client-side consumers (the TUI) can name
+// every type the API surface speaks without importing from `runner` — the
+// types live there, but the *dependency* reads `crate::client`, which is
+// the module edge the TUI separation enforces.
+pub use crate::runner::{
+    CompletionError, ItemStatus, RunnerEvent, ServiceState, StateSnapshot, TaskItemState,
+};
+
+/// One parsed record from `GET /events`.
+#[derive(Debug, Clone)]
+pub enum EventStreamItem {
+    /// The stream's first record: full current state, so a connecting (or
+    /// reconnecting) client starts consistent instead of
+    /// stale-until-the-next-event.
+    Snapshot {
+        items: Vec<ItemStatus>,
+        startup_complete: bool,
+    },
+    /// A runner event, exactly as broadcast.
+    Event(RunnerEvent),
+    /// This follower fell `n` events behind and they are unrecoverable —
+    /// resync from `GET /status`.
+    Lagged(u64),
+}
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -196,6 +220,11 @@ impl Client {
         self.control("/restart/", name).await
     }
 
+    /// `POST /hard-restart/:name` — kill and restart, skipping graceful stop.
+    pub async fn hard_restart(&self, name: &str) -> Result<(), ClientError> {
+        self.control("/hard-restart/", name).await
+    }
+
     /// `POST /shutdown` — gracefully stop the daemon and all running services.
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         let (status, body) = self.request("POST", "/shutdown", false).await?;
@@ -329,6 +358,49 @@ impl Client {
         self.follow_ndjson("/logs?follow=true", |line| {
             let event: LogStreamEvent = serde_json::from_str(line)?;
             on_event(event)
+        })
+        .await
+    }
+
+    /// `GET /events`, parsed. Each record is either a [`RunnerEvent`] or a
+    /// lag notice; records that parse as neither (a serialization-error
+    /// notice, an event variant this binary predates) are skipped, which is
+    /// what makes version skew between a long-lived runner and a newer
+    /// client degrade to "some events invisible" instead of a hard error.
+    pub async fn events_follow_typed<F>(&self, mut on_event: F) -> Result<(), ClientError>
+    where
+        F: FnMut(EventStreamItem) -> Result<(), ClientError>,
+    {
+        self.follow_ndjson("/events", |line| {
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_) => return Ok(()),
+            };
+            let item = match value.get("type").and_then(|t| t.as_str()) {
+                Some("lagged") => EventStreamItem::Lagged(
+                    value.get("skipped").and_then(|n| n.as_u64()).unwrap_or(0),
+                ),
+                Some("snapshot") => {
+                    #[derive(Deserialize)]
+                    struct Snapshot {
+                        items: Vec<ItemStatus>,
+                        #[serde(default)]
+                        startup_complete: bool,
+                    }
+                    match serde_json::from_value::<Snapshot>(value) {
+                        Ok(snapshot) => EventStreamItem::Snapshot {
+                            items: snapshot.items,
+                            startup_complete: snapshot.startup_complete,
+                        },
+                        Err(_) => return Ok(()),
+                    }
+                }
+                _ => match serde_json::from_value::<RunnerEvent>(value) {
+                    Ok(event) => EventStreamItem::Event(event),
+                    Err(_) => return Ok(()),
+                },
+            };
+            on_event(item)
         })
         .await
     }

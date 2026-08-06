@@ -745,7 +745,10 @@ pub fn all_services_ready(items: &[ItemStatus]) -> bool {
 /// Serialized as an internally-tagged JSON object (`{"type": "...", ...}`) so
 /// the unix-socket API can stream state changes to the web UI and any other
 /// consumer over `GET /events`. Variant names are snake_cased on the wire.
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// `Deserialize` because the TUI consumes this stream *as a client* — the
+/// wire format is the one representation, so client and server cannot drift.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunnerEvent {
     /// A service changed state.

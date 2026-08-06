@@ -22,6 +22,7 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/start/{name}", post(post_start))
         .route("/stop/{name}", post(post_stop))
         .route("/restart/{name}", post(post_restart))
+        .route("/hard-restart/{name}", post(post_hard_restart))
         .route("/shutdown", post(post_shutdown))
         .route("/logs", get(get_all_logs))
         .route("/logs/{name}", get(get_logs))
@@ -140,6 +141,11 @@ async fn get_ready(State(state): State<Arc<ApiState>>) -> Response {
 
 /// `GET /events` — stream runner state changes as newline-delimited JSON.
 ///
+/// The first record is always `{"type":"snapshot","items":[...],
+/// "startup_complete":bool}` — the full current state, so a client that
+/// connects (or reconnects) starts consistent instead of stale-until-the-
+/// next-event. Existing consumers that switch on `type` ignore it.
+///
 /// Each line is a serialized [`RunnerEvent`] (`{"type": "...", ...}`). The
 /// stream stays open until the client disconnects or the runner shuts down;
 /// consumers should treat `shutdown_complete` as the terminator.
@@ -148,23 +154,56 @@ async fn get_ready(State(state): State<Arc<ApiState>>) -> Response {
 /// `{"type":"lagged","skipped":N}` instead of silently missing transitions —
 /// the correct response is to refetch `GET /status` and resync.
 async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
-    use tokio_stream::StreamExt;
-    use tokio_stream::wrappers::BroadcastStream;
-    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-
-    let stream = BroadcastStream::new(state.event_tx.subscribe()).map(|item| {
-        let value = match item {
-            Ok(event) => serde_json::to_value(&event).unwrap_or_else(
-                |_| serde_json::json!({ "type": "error", "message": "event serialization failed" }),
-            ),
-            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                serde_json::json!({ "type": "lagged", "skipped": skipped })
-            }
-        };
-        let mut chunk = serde_json::to_vec(&value).unwrap_or_default();
-        chunk.push(b'\n');
-        Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk))
+    // Subscribe *before* reading the snapshot: an event that fires between
+    // the two lands in the subscription and is applied after the snapshot —
+    // replay-safe. The other order loses it entirely.
+    let mut events_rx = state.event_tx.subscribe();
+    let snapshot = state.state.snapshot();
+    let preamble = serde_json::json!({
+        "type": "snapshot",
+        "items": snapshot.items,
+        "startup_complete": snapshot.startup_complete,
     });
+
+    // Forwarder task rather than stream combinators so the stream can end on
+    // the server's shutdown signal — see `ApiState::shutdown` for why ending
+    // only on channel closure would deadlock the exit path.
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
+    let mut shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        let mut chunk = serde_json::to_vec(&preamble).unwrap_or_default();
+        chunk.push(b'\n');
+        if tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+            return;
+        }
+        loop {
+            let value = tokio::select! {
+                item = events_rx.recv() => match item {
+                    Ok(event) => serde_json::to_value(&event).unwrap_or_else(|_| {
+                        serde_json::json!({ "type": "error", "message": "event serialization failed" })
+                    }),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        serde_json::json!({ "type": "lagged", "skipped": skipped })
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let mut chunk = serde_json::to_vec(&value).unwrap_or_default();
+            chunk.push(b'\n');
+            if tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+    let stream = ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>);
 
     match axum::response::Response::builder()
         .status(StatusCode::OK)
@@ -219,6 +258,18 @@ async fn post_stop(State(state): State<Arc<ApiState>>, Path(name): Path<String>)
 /// `POST /restart/:name` — restart a service.
 async fn post_restart(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::Restart {
+        name,
+        reply,
+    })
+    .await
+}
+
+/// `POST /hard-restart/:name` — kill and restart without graceful stop.
+async fn post_hard_restart(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Response {
+    dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::HardRestart {
         name,
         reply,
     })
@@ -320,20 +371,30 @@ async fn get_all_logs(
     }
     let mut tap = state.log_tap.subscribe();
     // Bridge broadcast → mpsc so lag is translated, not panicked over, and
-    // a gone client (send error) tears the forwarder down.
+    // a gone client (send error) tears the forwarder down. Ends on the
+    // shutdown signal too — see `ApiState::shutdown`.
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
+    let mut shutdown = state.shutdown.clone();
     tokio::spawn(async move {
         loop {
-            let record = match tap.recv().await {
-                Ok(line) => serde_json::json!({
-                    "name": line.name,
-                    "lifecycle": line.is_lifecycle,
-                    "line": String::from_utf8_lossy(&line.bytes),
-                }),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    serde_json::json!({ "lagged": n })
+            let record = tokio::select! {
+                item = tap.recv() => match item {
+                    Ok(line) => serde_json::json!({
+                        "name": line.name,
+                        "lifecycle": line.is_lifecycle,
+                        "line": String::from_utf8_lossy(&line.bytes),
+                    }),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        serde_json::json!({ "lagged": n })
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             };
             let mut chunk = serde_json::to_vec(&record).unwrap_or_default();
             chunk.push(b'\n');
@@ -628,12 +689,17 @@ mod tests {
         drop(cmd_rx);
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
         let (log_tap, _) = tokio::sync::broadcast::channel(16);
+        let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        // Leak the sender so the receiver stays live for the router's
+        // lifetime — tests never signal shutdown.
+        std::mem::forget(shutdown_tx);
         build_router(Arc::new(ApiState {
             cmd_tx,
             event_tx,
             state,
             attach_resize_txs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             log_tap,
+            shutdown,
         }))
     }
 

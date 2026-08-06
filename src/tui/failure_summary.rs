@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
-use crate::runner::{ServiceState, TaskItemState};
+use crate::client::{ServiceState, TaskItemState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FailureKind {

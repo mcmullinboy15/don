@@ -60,13 +60,14 @@ use ratatui::layout::Rect;
 use ratatui::text::Text;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use backend::FixedBottomBackend;
 
+use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot};
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
-use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState, TerminalRequest};
+use crate::terminal::TerminalRequest;
 use app::{App, AppInit, ViewMode, line_matches_log_popup};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
@@ -206,10 +207,7 @@ impl ActiveTerm {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
     mut log_rx: mpsc::UnboundedReceiver<FormattedLogLine>,
-    mut runner_events: broadcast::Receiver<RunnerEvent>,
-    // Authoritative item state, read only when the event broadcast lags.
-    state: crate::runner::StateReader,
-    command_tx: mpsc::UnboundedSender<RunnerCommand>,
+    client: Client,
     verbosity: VerbosityControl,
     lifecycle_emitter: LifecycleEmitter,
     service_names: Vec<String>,
@@ -226,6 +224,26 @@ pub async fn run_tui(
         verbosity,
         lifecycle_emitter,
     };
+    let client = std::sync::Arc::new(client);
+
+    // Follow the runner's event stream as a client. The first record is a
+    // state snapshot (see `GET /events`), so the view starts consistent no
+    // matter when the connection lands relative to startup. The task ends
+    // when the server closes the stream (shutdown) or the TUI drops the
+    // receiver; either way the loop's `None` arm takes over.
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<EventStreamItem>();
+    {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = client
+                .events_follow_typed(|item| {
+                    events_tx
+                        .send(item)
+                        .map_err(|_| crate::client::ClientError::Invalid("tui closed".into()))
+                })
+                .await;
+        });
+    }
 
     let mut app = App::new(AppInit {
         service_names,
@@ -356,11 +374,11 @@ pub async fn run_tui(
                     None => break, // runner closed the log channel — shut down
                 }
             }
-            runner_result = runner_events.recv() => {
+            runner_result = events_rx.recv() => {
                 // `Some(filter_changed)` when the view moved and needs a
                 // redraw; `None` when there is nothing to draw.
                 let redraw = match runner_result {
-                    Ok(RunnerEvent::ShutdownStarted) => {
+                    Some(EventStreamItem::Event(RunnerEvent::ShutdownStarted)) => {
                         if let Some(act) = active.as_mut() {
                             enter_shutdown_mode(&mut app, &mut act.terminal, &mut act.modal)?;
                         } else if !app.shutdown_started {
@@ -368,22 +386,32 @@ pub async fn run_tui(
                         }
                         None
                     }
-                    Ok(event) => Some(apply_runner_event(event, &mut app)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Transitions were dropped, so the incremental view is
-                        // now wrong about an unknown set of items and would
-                        // stay wrong. Reload from the runner's projection — a
-                        // synchronous read that costs this loop nothing.
-                        app.resync_from(&state.snapshot());
+                    Some(EventStreamItem::Event(event)) => {
+                        Some(apply_runner_event(event, &mut app))
+                    }
+                    Some(EventStreamItem::Snapshot { items, startup_complete }) => {
+                        // The stream's opening record — the authoritative
+                        // state at connect time. Later events are newer or
+                        // equal, so applying them after this is safe.
+                        app.resync_from(&StateSnapshot { items, startup_complete });
                         Some(false)
                     }
-                    Err(broadcast::error::RecvError::Closed) => None,
+                    Some(EventStreamItem::Lagged(_)) => {
+                        // Transitions were dropped, so the incremental view
+                        // is wrong about an unknown set of items and would
+                        // stay wrong. Refetch the projection off-loop and
+                        // inject it as an input event — awaiting here would
+                        // wedge rendering behind a slow server.
+                        spawn_state_resync(&client);
+                        Some(false)
+                    }
+                    None => None,
                 };
                 if let Some(filter_changed) = redraw {
                     let lazy: std::collections::HashSet<String> = app
                         .services_state
                         .iter()
-                        .filter(|(_, s)| matches!(s, crate::runner::ServiceState::Lazy))
+                        .filter(|(_, s)| matches!(s, ServiceState::Lazy))
                         .map(|(n, _)| n.clone())
                         .collect();
                     app.filter.set_hidden_from_display(lazy);
@@ -407,7 +435,7 @@ pub async fn run_tui(
                                 &mut app,
                                 &mut act.terminal,
                                 &mut store,
-                                &command_tx,
+                                &client,
                                 &controls,
                                 &mut act.modal,
                             )?;
@@ -703,7 +731,7 @@ fn handle_app_event(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
@@ -733,7 +761,7 @@ fn handle_app_event(
             // own that cache. The autoresize path inside ratatui has already
             // adopted the new size by this point.
         }
-        AppEvent::Key(key) => handle_key(key, app, terminal, store, command_tx, controls, modal)?,
+        AppEvent::Key(key) => handle_key(key, app, terminal, store, client, controls, modal)?,
         AppEvent::CompletionsReady {
             param,
             request_id,
@@ -742,6 +770,20 @@ fn handle_app_event(
             if let Some(form) = app.form.as_mut() {
                 form.apply_completions(&param, request_id, result);
                 redraw_modal(modal, app)?;
+            }
+        }
+        AppEvent::StateResync {
+            items,
+            startup_complete,
+        } => {
+            app.resync_from(&StateSnapshot {
+                items,
+                startup_complete,
+            });
+            if let Some(m) = modal.as_mut() {
+                m.draw(app)?;
+            } else {
+                draw_inline_bar(terminal, app)?;
             }
         }
     }
@@ -753,7 +795,7 @@ fn handle_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
@@ -765,7 +807,12 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => {
-                let _ = command_tx.send(RunnerCommand::Shutdown);
+                {
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        let _ = client.shutdown().await;
+                    });
+                }
                 let _ = nix::sys::signal::kill(
                     nix::unistd::Pid::this(),
                     nix::sys::signal::Signal::SIGINT,
@@ -794,12 +841,12 @@ fn handle_key(
     match app.view_mode {
         ViewMode::Normal => handle_normal_key(key, app, terminal, store, modal)?,
         ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
-        ViewMode::Tasks => handle_tasks_key(key, app, terminal, store, command_tx, modal)?,
+        ViewMode::Tasks => handle_tasks_key(key, app, terminal, store, client, modal)?,
         ViewMode::Services => {
-            handle_services_key(key, app, terminal, store, command_tx, controls, modal)?;
+            handle_services_key(key, app, terminal, store, client, controls, modal)?;
         }
         ViewMode::Failures => handle_failure_summary_key(key, app, terminal, store, modal)?,
-        ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
+        ViewMode::Form => handle_form_key(key, app, terminal, store, client, modal)?,
     }
     Ok(())
 }
@@ -999,7 +1046,7 @@ fn handle_tasks_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
@@ -1029,11 +1076,11 @@ fn handle_tasks_key(
             return Ok(());
         }
         if item.has_params {
-            open_form_for_task(app, &item.name, command_tx)?;
+            open_form_for_task(app, &item.name, client)?;
             redraw_modal(modal, app)?;
         } else {
             let task_name = item.name;
-            dispatch_run_task(command_tx, task_name.clone());
+            dispatch_run_task(client, task_name.clone());
             return_to_logs_after_task_run(&task_name, app, terminal, store, modal)?;
         }
     } else if key.code == KeyCode::Char('l') {
@@ -1051,7 +1098,7 @@ fn handle_services_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
@@ -1078,21 +1125,21 @@ fn handle_services_key(
         KeyCode::Enter => {
             // Start or stop the highlighted service, depending on its state.
             if let Some(cmd) = overlay_toggle_command(app) {
-                dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
+                dispatch_overlay_command(client, &controls.lifecycle_emitter, cmd);
             }
         }
         KeyCode::Char('r') => {
             // Restart the highlighted service, if it's in a state that can
             // be restarted.
             if let Some(cmd) = highlighted_service_restart_command(app) {
-                dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
+                dispatch_overlay_command(client, &controls.lifecycle_emitter, cmd);
             }
         }
         KeyCode::Char('R') => {
             // Hard restart the highlighted service: force a rebuild, then
             // start/restart it on success.
             if let Some(cmd) = highlighted_service_hard_restart_command(app) {
-                dispatch_overlay_command(command_tx, &controls.lifecycle_emitter, cmd);
+                dispatch_overlay_command(client, &controls.lifecycle_emitter, cmd);
             }
         }
         KeyCode::Char('l') => {
@@ -1198,75 +1245,103 @@ fn highlighted_service_hard_restart_command(app: &App) -> Option<OverlayCommand>
     }
 }
 
+/// Which control endpoint an overlay action maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlAction {
+    Start,
+    Stop,
+    Restart,
+    HardRestart,
+}
+
+impl ControlAction {
+    fn label(self) -> &'static str {
+        match self {
+            ControlAction::Start => "start",
+            ControlAction::Stop => "stop",
+            ControlAction::Restart => "restart",
+            ControlAction::HardRestart => "hard restart",
+        }
+    }
+}
+
 struct OverlayCommand {
     name: String,
-    action: &'static str,
-    command: RunnerCommand,
-    reply: oneshot::Receiver<CommandResult>,
+    action: ControlAction,
 }
 
 fn overlay_start_command(name: String) -> OverlayCommand {
-    let (reply, rx) = oneshot::channel();
     OverlayCommand {
-        name: name.clone(),
-        action: "start",
-        command: RunnerCommand::Start { name, reply },
-        reply: rx,
+        name,
+        action: ControlAction::Start,
     }
 }
 
 fn overlay_stop_command(name: String) -> OverlayCommand {
-    let (reply, rx) = oneshot::channel();
     OverlayCommand {
-        name: name.clone(),
-        action: "stop",
-        command: RunnerCommand::Stop { name, reply },
-        reply: rx,
+        name,
+        action: ControlAction::Stop,
     }
 }
 
 fn overlay_restart_command(name: String) -> OverlayCommand {
-    let (reply, rx) = oneshot::channel();
     OverlayCommand {
-        name: name.clone(),
-        action: "restart",
-        command: RunnerCommand::Restart { name, reply },
-        reply: rx,
+        name,
+        action: ControlAction::Restart,
     }
 }
 
 fn overlay_hard_restart_command(name: String) -> OverlayCommand {
-    let (reply, rx) = oneshot::channel();
     OverlayCommand {
-        name: name.clone(),
-        action: "hard restart",
-        command: RunnerCommand::HardRestart { name, reply },
-        reply: rx,
+        name,
+        action: ControlAction::HardRestart,
     }
 }
 
 fn dispatch_overlay_command(
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
     emitter: &LifecycleEmitter,
     pending: OverlayCommand,
 ) {
-    let command_tx = command_tx.clone();
+    let client = client.clone();
     let emitter = emitter.clone();
     tokio::spawn(async move {
-        emitter.service_event(&pending.name, &format!("{} requested", pending.action));
-        if command_tx.send(pending.command).is_err() {
-            emitter.service_error_event(&pending.name, "control failed: runner unavailable");
+        let label = pending.action.label();
+        emitter.service_event(&pending.name, &format!("{label} requested"));
+        let result = match pending.action {
+            ControlAction::Start => client.start(&pending.name).await,
+            ControlAction::Stop => client.stop(&pending.name).await,
+            ControlAction::Restart => client.restart(&pending.name).await,
+            ControlAction::HardRestart => client.hard_restart(&pending.name).await,
+        };
+        if let Err(e) = result {
+            emitter.service_error_event(&pending.name, &format!("{label} failed: {e}"));
+        }
+    });
+}
+
+/// Refetch the state projection off-loop and inject it as an input event.
+///
+/// Used when the event stream reports lag: the fetch must not run on the
+/// render loop (a slow server would freeze the UI), and the result must
+/// come back through the input channel so it is applied in order with
+/// whatever the user is doing.
+fn spawn_state_resync(client: &std::sync::Arc<Client>) {
+    let Some(input_tx) = app_input_tx().cloned() else {
+        return;
+    };
+    let client = client.clone();
+    tokio::spawn(async move {
+        let Ok(items) = client.status(false, None).await else {
             return;
-        }
-        match pending.reply.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => emitter
-                .service_error_event(&pending.name, &format!("{} failed: {e}", pending.action)),
-            Err(_) => emitter.service_error_event(
-                &pending.name,
-                &format!("{} failed: runner dropped reply", pending.action),
-            ),
-        }
+        };
+        let startup_complete = client.ready().await.unwrap_or(false);
+        let _ = input_tx
+            .send(AppEvent::StateResync {
+                items,
+                startup_complete,
+            })
+            .await;
     });
 }
 
@@ -1297,41 +1372,23 @@ fn return_to_logs_after_task_run(
     Ok(())
 }
 
-/// Fire a param-less [`RunnerCommand::RunTask`] without waiting for the reply.
-/// State updates come through the runner event broadcast.
-fn dispatch_run_task(command_tx: &mpsc::UnboundedSender<RunnerCommand>, name: String) {
-    let command_tx = command_tx.clone();
-    tokio::spawn(async move {
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        let cmd = RunnerCommand::RunTask {
-            name,
-            params: std::collections::HashMap::new(),
-            wait: false,
-            wait_timeout: None,
-            reply: reply_tx,
-        };
-        let _ = command_tx.send(cmd);
-    });
+/// Fire a param-less task run without waiting for the outcome. State
+/// updates come through the event stream like any other transition.
+fn dispatch_run_task(client: &std::sync::Arc<Client>, name: String) {
+    dispatch_run_task_with_params(client, name, std::collections::HashMap::new());
 }
 
-/// Fire `RunnerCommand::RunTask` with the params map the user just submitted
-/// via the form modal. Reply is swallowed; state updates come through the
-/// event broadcast like any other runner command.
+/// Fire a task run with the params map the user just submitted via the
+/// form modal. The HTTP result is swallowed on success; failures surface
+/// through the event stream (`task_state_changed` → failed).
 fn dispatch_run_task_with_params(
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
     name: String,
     params: std::collections::HashMap<String, String>,
 ) {
-    let command_tx = command_tx.clone();
+    let client = client.clone();
     tokio::spawn(async move {
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        let _ = command_tx.send(RunnerCommand::RunTask {
-            name,
-            params,
-            wait: false,
-            wait_timeout: None,
-            reply: reply_tx,
-        });
+        let _ = client.run_task(&name, params).await;
     });
 }
 
@@ -1345,7 +1402,7 @@ fn dispatch_run_task_with_params(
 fn open_form_for_task(
     app: &mut App,
     task_name: &str,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
 ) -> Result<(), TuiError> {
     let Some(task) = app.task_configs.get(task_name).cloned() else {
         // Palette built the action from task_configs, so a missing entry
@@ -1370,7 +1427,7 @@ fn open_form_for_task(
     // come back through `input_tx` so they land in the same event queue
     // the main loop already reads.
     for param in dyn_fields {
-        request_form_completion(app, task_name, &param, false, command_tx);
+        request_form_completion(app, task_name, &param, false, client);
     }
     Ok(())
 }
@@ -1383,7 +1440,7 @@ fn request_form_completion(
     task: &str,
     param: &str,
     force_refresh: bool,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
 ) {
     let Some(form) = app.form.as_mut() else {
         return;
@@ -1396,42 +1453,33 @@ fn request_form_completion(
         .collect();
     let request_id = form.start_request(param);
 
-    let command_tx = command_tx.clone();
+    let client = client.clone();
     let Some(input_tx) = app_input_tx().cloned() else {
         return;
     };
     let task = task.to_string();
     let param = param.to_string();
     tokio::spawn(async move {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if command_tx
-            .send(RunnerCommand::ResolveCompletions {
-                task,
-                param: param.clone(),
-                partial,
-                force_refresh,
-                reply: reply_tx,
+        let result = client
+            .resolve_completions(&task, &param, partial, force_refresh)
+            .await
+            .map_err(|e| match e {
+                // The server ran the completion command and it failed —
+                // structured, with the log path the form renders.
+                crate::client::ClientError::Completion(err) => err,
+                // Transport-level failure — degrade to a plain message.
+                other => crate::client::CompletionError {
+                    message: other.to_string(),
+                    log_path: None,
+                },
+            });
+        let _ = input_tx
+            .send(AppEvent::CompletionsReady {
+                param,
+                request_id,
+                result,
             })
-            .is_err()
-        {
-            return;
-        }
-        match reply_rx.await {
-            Ok(result) => {
-                let _ = input_tx
-                    .send(AppEvent::CompletionsReady {
-                        param,
-                        request_id,
-                        result,
-                    })
-                    .await;
-            }
-            Err(_) => {
-                // Runner dropped the reply channel (shutting down) — nothing
-                // useful to display; the form stays in Loading until the
-                // user moves on.
-            }
-        }
+            .await;
     });
 }
 
@@ -1455,7 +1503,7 @@ fn handle_form_key(
     app: &mut App,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
     modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     // Grab these up front so later `app.form` borrows don't conflict.
@@ -1474,7 +1522,7 @@ fn handle_form_key(
         }
         KeyCode::Enter if ctrl => {
             // Submit regardless of focused field.
-            try_submit_form(app, command_tx, terminal, store, modal)?;
+            try_submit_form(app, client, terminal, store, modal)?;
             return Ok(());
         }
         KeyCode::Enter => {
@@ -1489,7 +1537,7 @@ fn handle_form_key(
             if let Some(form) = app.form.as_ref()
                 && form.focus + 1 >= form.fields.len()
             {
-                try_submit_form(app, command_tx, terminal, store, modal)?;
+                try_submit_form(app, client, terminal, store, modal)?;
                 return Ok(());
             }
             if let Some(form) = app.form.as_mut() {
@@ -1516,7 +1564,7 @@ fn handle_form_key(
                 .and_then(|f| f.focused())
                 .map(|f| f.name.clone());
             if refresh && let Some(param) = focused_param {
-                request_form_completion(app, &task_name, &param, true, command_tx);
+                request_form_completion(app, &task_name, &param, true, client);
             } else if let Some(form) = app.form.as_mut() {
                 form.focus_next();
             }
@@ -1615,7 +1663,7 @@ fn handle_form_key(
 /// form so the renderer can show it, and stay open.
 fn try_submit_form(
     app: &mut App,
-    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    client: &std::sync::Arc<Client>,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
     modal: &mut Option<Modal>,
@@ -1636,7 +1684,7 @@ fn try_submit_form(
             }
         }
     };
-    dispatch_run_task_with_params(command_tx, task_name.clone(), params);
+    dispatch_run_task_with_params(client, task_name.clone(), params);
     app.form = None;
     return_to_logs_after_task_run(&task_name, app, terminal, store, modal)?;
     Ok(())
@@ -1725,12 +1773,13 @@ mod tests {
             let Some(command) = overlay_toggle_command(&app) else {
                 panic!("{}: expected command", case.name);
             };
-            match command.command {
-                RunnerCommand::Stop { name, .. } => {
-                    assert_eq!(name, "api", "{}: wrong service", case.name);
-                }
-                _ => panic!("{}: expected stop command", case.name),
-            }
+            assert_eq!(
+                command.action,
+                ControlAction::Stop,
+                "{}: expected stop",
+                case.name
+            );
+            assert_eq!(command.name, "api", "{}: wrong service", case.name);
         }
     }
 
@@ -1789,11 +1838,7 @@ mod tests {
         let Some(command) = highlighted_service_hard_restart_command(&app) else {
             panic!("expected hard restart command");
         };
-        match command.command {
-            RunnerCommand::HardRestart { name, .. } => {
-                assert_eq!(name, "api");
-            }
-            _ => panic!("expected hard restart command"),
-        }
+        assert_eq!(command.action, ControlAction::HardRestart);
+        assert_eq!(command.name, "api");
     }
 }

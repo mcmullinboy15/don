@@ -33,7 +33,7 @@ use super::app::{App, OverlayItem, StatusCounts, TaskStatusItem, ViewMode};
 use super::failure_summary;
 use super::filter::{FilterFocus, FilterRow, FilterState};
 use super::status_table::{StatusTableView, draw_status_table};
-use crate::runner::{ServiceState, TaskItemState};
+use crate::client::{ServiceState, TaskItemState};
 use crate::task_state::TaskRunInfo;
 
 /// Total rows the inline viewport reserves: 1 blank buffer row + 3 rows
@@ -72,7 +72,7 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
     let countable = || {
         app.services_state
             .iter()
-            .filter(|(_, s)| !matches!(s, crate::runner::ServiceState::Lazy))
+            .filter(|(_, s)| !matches!(s, ServiceState::Lazy))
     };
     let visible_services = countable()
         .filter(|(name, _)| app.filter.passes(name))

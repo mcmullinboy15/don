@@ -27,8 +27,8 @@
 
 use std::collections::HashMap;
 
+use crate::client::CompletionError;
 use crate::config::{ParamKind, Task, TaskParam};
-use crate::runner::CompletionError;
 
 use super::fuzzy::fuzzy_match;
 
