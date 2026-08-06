@@ -315,7 +315,6 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                     &config_path,
                     profile.as_deref(),
                     verbose,
-                    log_filter,
                     no_daemon,
                     with_ui,
                 )
@@ -1437,27 +1436,27 @@ async fn run_start_attached(
 ) -> Result<(), String> {
     let base = base_dir(config_path);
 
-    // Already running: attaching is the answer, not a second runner.
+    // Already running: `don start` is idempotent in TTY mode — attach the
+    // TUI to the stack that's up (tmux-attach muscle memory) instead of
+    // erroring about it. Decided with PJ 2026-08-06.
     let probe = Client::new(&base);
     match probe.status(false, None).await {
         Ok(_) => {
-            return Err(
-                "don is already running here — `don tui` to attach, `don stop` to stop it"
-                    .to_string(),
-            );
+            println!("don is already running here — attaching (Ctrl+D detaches, `don stop` stops)");
+            let log_filter_set: Option<std::collections::HashSet<String>> = if log_filter.is_empty()
+            {
+                None
+            } else {
+                Some(log_filter.into_iter().collect())
+            };
+            return attach_tui_inner(config_path, log_filter_set).await;
         }
         Err(ClientError::NotRunning { .. }) => {}
         Err(e) => return Err(format!("failed to check for a running don: {e}")),
     }
 
-    let (mut child, log_path) = spawn_runner_child(
-        config_path,
-        profile,
-        verbose,
-        &log_filter,
-        no_daemon,
-        with_ui,
-    )?;
+    let (mut child, log_path) =
+        spawn_runner_child(config_path, profile, verbose, no_daemon, with_ui)?;
     let child_pid = child.id();
 
     // Wait for the API socket to answer. Generous only about the socket —
@@ -2308,7 +2307,6 @@ async fn run_start_detached(
     config_path: &Path,
     profile: Option<&str>,
     verbose: bool,
-    log_filter: Vec<String>,
     no_daemon: bool,
     with_ui: Option<u16>,
 ) -> Result<(), String> {
@@ -2320,14 +2318,8 @@ async fn run_start_detached(
         Err(e) => return Err(format!("failed to check daemon status: {e}")),
     }
 
-    let (mut child, log_path) = spawn_runner_child(
-        config_path,
-        profile,
-        verbose,
-        &log_filter,
-        no_daemon,
-        with_ui,
-    )?;
+    let (mut child, log_path) =
+        spawn_runner_child(config_path, profile, verbose, no_daemon, with_ui)?;
     let pid = child.id();
     wait_for_detached_start(&mut child, &base, &log_path, pid).await
 }
@@ -2343,7 +2335,6 @@ fn spawn_runner_child(
     config_path: &Path,
     profile: Option<&str>,
     verbose: bool,
-    log_filter: &[String],
     no_daemon: bool,
     with_ui: Option<u16>,
 ) -> Result<(std::process::Child, PathBuf), String> {
@@ -2384,9 +2375,11 @@ fn spawn_runner_child(
     if let Some(profile_name) = profile {
         cmd.arg("--profile").arg(profile_name);
     }
-    if !log_filter.is_empty() {
-        cmd.arg("--log-filter").arg(log_filter.join(","));
-    }
+    // `--log-filter` is deliberately NOT forwarded: in pipe mode it
+    // filters stdout, and the child's stdout is runner.log — the
+    // post-mortem log should be complete. The filter is presentation;
+    // the attached TUI applies it client-side. (`-d` callers who want a
+    // filtered background log can be catered to later if anyone asks.)
 
     #[cfg(unix)]
     {
