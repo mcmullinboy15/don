@@ -451,6 +451,22 @@ pub enum RunnerCommand {
 }
 
 /// Runner-private messages emitted by detached workers.
+/// What an item tells the scheduler, on the lossless report channel.
+///
+/// This is the up-direction of the supervisor architecture: items report,
+/// the runner folds. It is `mpsc`, not `broadcast`, because the scheduler
+/// must never miss one — lossy observation is for peers and edges, which
+/// resync from the snapshot. Starts with lazy demand; per-item lifecycle
+/// reports (exit, transitions) migrate here as supervisors absorb them.
+#[derive(Debug)]
+pub(in crate::runner) enum ItemReport {
+    /// A lazy service's proxy saw its first connection. Demand originates
+    /// inside the item, but the *reaction* belongs to the scheduler: a lazy
+    /// service has dependencies, and starting it is a scheduling decision
+    /// like any other.
+    Demand { name: String },
+}
+
 enum RunnerInternalCommand {
     /// Completion from a detached task run worker.
     TaskRunPrepared {
@@ -818,10 +834,16 @@ pub struct Runner {
     /// Consolidated per-task runtime state.
     tasks: HashMap<String, RuntimeTask>,
 
-    /// Receives service names when a lazy service's proxy gets its first connection.
-    lazy_start_rx: mpsc::Receiver<String>,
-    /// Sender half kept for passing to ServiceProxy::bind.
+    /// Sender half handed to ServiceProxy::bind for lazy services. The
+    /// proxy speaks plain names, not runner types; a forwarder in `run`
+    /// adapts its channel onto the report channel. Moves inside the service
+    /// supervisor when it takes proxy ownership.
     lazy_start_tx: mpsc::Sender<String>,
+    /// Receiver half, consumed by the forwarder spawned in `run`.
+    lazy_start_rx: Option<mpsc::Receiver<String>>,
+    /// The items' lossless report channel — see [`ItemReport`].
+    report_tx: mpsc::UnboundedSender<ItemReport>,
+    report_rx: mpsc::UnboundedReceiver<ItemReport>,
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -953,6 +975,7 @@ impl Runner {
         let (event_tx, _) = broadcast::channel(256);
         let (state, _state_reader) = state_store::channel(state_store::StateSnapshot::default());
         let (lazy_start_tx, lazy_start_rx) = mpsc::channel(16);
+        let (report_tx, report_rx) = mpsc::unbounded_channel();
         let (shutdown_flag_tx, _shutdown_flag_rx) = tokio::sync::watch::channel(false);
 
         for outcome in crate::process::rlimit::raise_soft_resource_limits() {
@@ -1029,8 +1052,10 @@ impl Runner {
             base_dir,
             services,
             tasks,
-            lazy_start_rx,
             lazy_start_tx,
+            lazy_start_rx: Some(lazy_start_rx),
+            report_tx,
+            report_rx,
             server_shutdown_tx: None,
             docker_client,
             cmd_tx,
@@ -1496,6 +1521,21 @@ impl Runner {
         // The watcher speaks its own vocabulary; `watch_link` adapts it to the
         // runner's, so `watch` needs no runner types. Subscribe before setup
         // so no completion emitted during it is missed.
+        // Adapt the proxies' plain-name lazy channel onto the report
+        // channel. Ends when every proxy's sender is gone (shutdown) or the
+        // runner drops its report receiver. Lives here, not on a proxy or
+        // supervisor, only until supervisors own their proxies.
+        if let Some(mut lazy_rx) = self.lazy_start_rx.take() {
+            let report_tx = self.report_tx.clone();
+            tokio::spawn(async move {
+                while let Some(name) = lazy_rx.recv().await {
+                    if report_tx.send(ItemReport::Demand { name }).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+
         let (watch_signal_tx, watch_signal_rx) = mpsc::unbounded_channel();
         let (watch_outcome_tx, watch_outcome_rx) = mpsc::unbounded_channel();
         let watch_link_handle = watch_link::spawn(
@@ -1843,11 +1883,13 @@ impl Runner {
                             }
                         }
                     }
-                    Some(name) = self.lazy_start_rx.recv() => {
-                        // Only the first connection acts: it moves Lazy →
-                        // Pending, and the normal dependency scheduler owns
-                        // the service from there.
-                        self.handle_lazy_connection(&name);
+                    Some(report) = self.report_rx.recv() => {
+                        match report {
+                            // Only the first connection acts: it moves Lazy →
+                            // Pending, and the normal dependency scheduler
+                            // owns the service from there.
+                            ItemReport::Demand { name } => self.handle_lazy_connection(&name),
+                        }
                     }
                     // Flush a build-tool batch when its window expires. Never
                     // resolves while both queues are empty.
