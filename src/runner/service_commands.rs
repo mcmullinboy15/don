@@ -75,11 +75,13 @@ impl Runner {
                 name: name.to_string(),
             });
         };
-        if !handle.request(super::service_supervisor::StartRequest {
-            context: Box::new(context),
-            mode,
-            intent,
-        }) {
+        if !handle.request(super::service_supervisor::ServiceCommand::Start(
+            super::service_supervisor::StartRequest {
+                context: Box::new(context),
+                mode,
+                intent,
+            },
+        )) {
             return Err(CommandError::Failed {
                 name: name.to_string(),
                 message: "service supervisor is shutting down".to_string(),

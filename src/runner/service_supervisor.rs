@@ -36,6 +36,16 @@ pub(in crate::runner) struct StartRequest {
     pub(in crate::runner) intent: ServiceStartIntent,
 }
 
+/// Everything a service's supervisor can be asked to do.
+///
+/// Grows as the supervisor absorbs the lifecycle: `Stop` and the
+/// process-EOF notice land with handle custody, per the slice-1 protocol
+/// in the plan.
+pub(in crate::runner) enum ServiceCommand {
+    /// Begin a start — or supersede the one being prepared.
+    Start(StartRequest),
+}
+
 /// Everything a supervisor needs that doesn't vary per request.
 #[derive(Clone)]
 pub(in crate::runner) struct StartEnv {
@@ -49,7 +59,7 @@ pub(in crate::runner) struct StartEnv {
 }
 
 /// Owner half for services.
-pub(in crate::runner) type ServiceStarts = super::supervisor::Supervisors<StartRequest>;
+pub(in crate::runner) type ServiceStarts = super::supervisor::Supervisors<ServiceCommand>;
 
 /// Start one start-supervisor per service.
 pub(in crate::runner) fn spawn_supervisors<'a>(
@@ -103,35 +113,35 @@ fn stop_superseded_start(
 /// time a newer request arrives, and dropping that future would strand it.
 async fn supervise(
     name: String,
-    mut rx: mpsc::UnboundedReceiver<StartRequest>,
+    mut rx: mpsc::UnboundedReceiver<ServiceCommand>,
     env: StartEnv,
     output: Option<ItemOutput>,
     internal_tx: mpsc::Sender<RunnerInternalCommand>,
     busy: Arc<AtomicBool>,
 ) {
     let service_writer = output.map(|output| output.writer());
-    let mut pending: Option<StartRequest> = None;
+    let mut pending: Option<ServiceCommand> = None;
     let mut mailbox_closed = false;
 
     loop {
-        let request = match pending.take() {
-            Some(request) => request,
+        let command = match pending.take() {
+            Some(command) => command,
             None => {
                 busy.store(false, Ordering::Relaxed);
                 match rx.recv().await {
-                    Some(request) => {
+                    Some(command) => {
                         busy.store(true, Ordering::Relaxed);
-                        request
+                        command
                     }
                     None => return,
                 }
             }
         };
-        let StartRequest {
+        let ServiceCommand::Start(StartRequest {
             context,
             mode,
             intent,
-        } = request;
+        }) = command;
 
         // Clone the context the worker borrows so the original can move into
         // the completion message afterwards.
@@ -149,7 +159,7 @@ async fn supervise(
         );
         tokio::pin!(worker);
 
-        let mut superseded: Option<StartRequest> = None;
+        let mut superseded: Option<ServiceCommand> = None;
         let result = loop {
             tokio::select! {
                 result = &mut worker => break result,
