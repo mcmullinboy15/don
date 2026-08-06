@@ -174,6 +174,9 @@ enum Commands {
         /// Name of the service to attach to
         name: String,
     },
+    /// Attach the full TUI to an already-running project. Ctrl+D detaches
+    /// (the stack keeps running); Ctrl+C requests a graceful shutdown.
+    Tui,
     /// Clean up stale state from a previous run
     Cleanup {
         /// Kill a running daemon first, then clean up
@@ -362,6 +365,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
+        Commands::Tui => run_attach_tui(&config_path).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
         Commands::Run {
             name,
@@ -1399,6 +1403,243 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
     }
 }
 
+/// `don tui` — attach the full TUI to an already-running project.
+///
+/// A pure client of the socket API: the item set comes from `GET /status`
+/// (which doubles as the "is anything running?" check, answered before the
+/// terminal is touched), logs from the merged follow with history preload,
+/// events from `GET /events` (whose snapshot preamble makes the view
+/// consistent at connect). Ctrl+D detaches, leaving the stack running;
+/// Ctrl+C requests a graceful shutdown and the TUI exits when the runner's
+/// streams close.
+async fn run_attach_tui(config_path: &Path) -> i32 {
+    match attach_tui_inner(config_path).await {
+        Ok(()) => 0,
+        Err(message) => {
+            eprintln!("{message}");
+            1
+        }
+    }
+}
+
+async fn attach_tui_inner(config_path: &Path) -> Result<(), String> {
+    use don::client::{Client, LogStreamEvent};
+
+    {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            return Err(
+                "don tui needs a terminal — use `don status` or `don logs` in scripts".into(),
+            );
+        }
+    }
+
+    let base = base_dir(config_path);
+    let client = Client::new(&base);
+
+    // Authoritative item set from the runner. Everything below intersects
+    // against it, so profile filtering and config drift can't invent items
+    // the runner doesn't have.
+    let items = client
+        .status(false, None)
+        .await
+        .map_err(|e| format!("cannot attach: {e}"))?;
+    let mut service_names: Vec<String> = Vec::new();
+    let mut task_names: Vec<String> = Vec::new();
+    for item in &items {
+        match item {
+            don::client::ItemStatus::Service { name, .. } => service_names.push(name.clone()),
+            don::client::ItemStatus::Task { name, .. } => task_names.push(name.clone()),
+        }
+    }
+    let active: std::collections::HashSet<&String> =
+        service_names.iter().chain(task_names.iter()).collect();
+
+    // Config supplies what /status doesn't: task param schemas, hidden and
+    // auto-filter flags, whether a bazel stream exists. Best-effort — the
+    // file may have drifted since the runner started.
+    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+    let platform =
+        don::config::Platform::current().ok_or_else(|| "unsupported platform".to_string())?;
+
+    let task_configs: std::collections::HashMap<String, don::config::Task> = config
+        .tasks
+        .iter()
+        .filter(|(name, _)| active.contains(name))
+        .map(|(name, task)| (name.clone(), task.clone()))
+        .collect();
+    let hidden_names: std::collections::HashSet<String> = config
+        .services
+        .iter()
+        .filter(|(name, svc)| active.contains(name) && svc.hidden)
+        .map(|(name, _)| name.clone())
+        .chain(
+            config
+                .tasks
+                .iter()
+                .filter(|(name, task)| active.contains(name) && task.hidden)
+                .map(|(name, _)| name.clone()),
+        )
+        .collect();
+    let auto_filter_on_failure_names: std::collections::HashSet<String> = config
+        .services
+        .iter()
+        .filter(|(name, svc)| {
+            active.contains(name)
+                && svc
+                    .resolve(platform)
+                    .auto_filter_on_failure
+                    .unwrap_or(config.auto_filter_on_failure)
+        })
+        .map(|(name, _)| name.clone())
+        .chain(
+            config
+                .tasks
+                .iter()
+                .filter(|(name, task)| {
+                    active.contains(name)
+                        && task
+                            .auto_filter_on_failure
+                            .unwrap_or(config.auto_filter_on_failure)
+                })
+                .map(|(name, _)| name.clone()),
+        )
+        .collect();
+    let has_build_tool =
+        config.services.iter().any(|(name, svc)| {
+            active.contains(name) && svc.resolve(platform).bazel_config().is_some()
+        }) || config
+            .tasks
+            .iter()
+            .any(|(name, task)| active.contains(name) && task.bazel.is_some());
+    let build_tool_names: Vec<String> = if has_build_tool {
+        vec!["bazel".to_string()]
+    } else {
+        Vec::new()
+    };
+
+    let task_state = don::TaskState::new(base.join(".don").join("task-state"));
+    let mut task_last_runs = std::collections::HashMap::new();
+    for name in &task_names {
+        if let Ok(Some(last_run)) = task_state.last_run(name).await {
+            task_last_runs.insert(name.clone(), last_run);
+        }
+    }
+
+    // A local, null-writer output manager gives the TUI a lifecycle emitter
+    // whose feedback lines ("restart requested") render locally with the
+    // same formatting as runner output, plus the verbosity control the `v`
+    // key flips. The emitter's lines flow local sink task -> tap -> merger
+    // below, exactly like runner lines flow into the socket stream.
+    let local_output = don::output::OutputManager::new(&[], tokio::io::sink())
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
+    let verbosity = local_output.verbosity_control();
+    let lifecycle_emitter = local_output.clone_lifecycle_emitter();
+    let mut local_tap = local_output.log_stream_sender().subscribe();
+
+    // Remote merged stream -> intermediate channel. The spawned follow ends
+    // when the server closes the stream (shutdown) or the merger drops the
+    // receiver (TUI exited).
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::unbounded_channel::<LogStreamEvent>();
+    {
+        let follow = Client::new(&base);
+        tokio::spawn(async move {
+            let _ = follow
+                .logs_follow_all(|event| {
+                    remote_tx
+                        .send(event)
+                        .map_err(|_| don::client::ClientError::Invalid("tui closed".into()))
+                })
+                .await;
+        });
+    }
+
+    // One merger owns the TUI's log sender. That ownership is the exit
+    // path: when the remote stream ends (runner gone), the merger returns,
+    // the sender drops, and the TUI loop sees its log channel close.
+    let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                remote = remote_rx.recv() => match remote {
+                    Some(LogStreamEvent::Line { name, lifecycle, line }) => {
+                        let line = don::output::FormattedLogLine {
+                            name,
+                            is_lifecycle: lifecycle,
+                            bytes: line.into_bytes(),
+                        };
+                        if log_tx.send(line).is_err() {
+                            return;
+                        }
+                    }
+                    Some(LogStreamEvent::Lagged { lagged }) => {
+                        let notice = don::output::FormattedLogLine {
+                            name: don::output::LIFECYCLE_EVENT_NAME.to_string(),
+                            is_lifecycle: true,
+                            bytes: format!("log stream lagged — {lagged} lines dropped")
+                                .into_bytes(),
+                        };
+                        if log_tx.send(notice).is_err() {
+                            return;
+                        }
+                    }
+                    None => return,
+                },
+                local = local_tap.recv() => match local {
+                    Ok(line) => {
+                        if log_tx.send((*line).clone()).is_err() {
+                            return;
+                        }
+                    }
+                    // Local feedback is best-effort; the remote stream is
+                    // the one whose end must end the session.
+                    Err(_) => continue,
+                },
+            }
+        }
+    });
+
+    // Foreground-task terminal handoff has no meaning for a remote client
+    // (that becomes attach bridging); park the channel, sender held open so
+    // the arm stays quiet instead of spinning on a closed channel.
+    let (_terminal_request_tx, terminal_request_rx) = tokio::sync::mpsc::channel(1);
+
+    don::run_tui(
+        log_rx,
+        client,
+        don::TuiMode::Remote,
+        verbosity,
+        lifecycle_emitter,
+        service_names,
+        task_names,
+        build_tool_names,
+        task_configs,
+        task_last_runs,
+        hidden_names,
+        auto_filter_on_failure_names,
+        None,
+        terminal_request_rx,
+    )
+    .await
+    .map_err(|e| format!("tui error: {e}"))?;
+
+    // Keep the local sink alive for the whole session (its task carries the
+    // emitter's feedback lines into the merger above).
+    drop(local_output);
+
+    // Distinguish detach from shutdown for the user: after Ctrl+C the
+    // runner's socket is already closing by the time the TUI exits, so this
+    // probe fails and stays quiet; after Ctrl+D it answers.
+    let probe = Client::new(&base);
+    if probe.ready().await.is_ok() {
+        println!(
+            "detached — the stack is still running (`don tui` to reattach, `don stop` to stop)"
+        );
+    }
+    Ok(())
+}
+
 async fn run_attach(config_path: &Path, name: &str) -> i32 {
     let base = base_dir(config_path);
     let socket_path = base.join(".don").join("don.sock");
@@ -2380,6 +2621,7 @@ async fn run_start(
             let result = don::run_tui(
                 log_rx,
                 tui_client,
+                don::TuiMode::InProcess,
                 verbosity,
                 lifecycle_emitter,
                 service_names,

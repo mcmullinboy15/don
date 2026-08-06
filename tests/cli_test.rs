@@ -106,6 +106,28 @@ fn run_cli(config_path: &Path, extra: &[&str]) -> (i32, String, String) {
 // --- tests ---
 
 #[test]
+fn cli_tui_without_runner_errors_actionably() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("cli-tui-no-runner");
+        let toml = keeper_config();
+        let config_path = dir.path().join("don.toml");
+        std::fs::write(&config_path, &toml).unwrap();
+
+        // No runner: the error must point at `don start` (or, headless, at
+        // the terminal requirement) *before* the terminal is touched.
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&config_path, &["tui"]))
+                .await
+                .unwrap();
+        assert_ne!(code, 0, "attaching with no runner must fail");
+        assert!(
+            stderr.contains("don start") || stderr.contains("needs a terminal"),
+            "error should be actionable; got: {stderr}"
+        );
+    });
+}
+
+#[test]
 fn cli_status_against_running_daemon() {
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("cli-status");

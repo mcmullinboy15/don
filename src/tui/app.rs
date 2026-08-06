@@ -199,6 +199,9 @@ impl StatusCounts {
 /// Top-level TUI app state. Owns everything the renderer reads from.
 #[derive(Debug)]
 pub(crate) struct App {
+    /// Set by key handling (remote-mode Ctrl+D) to ask the main loop to
+    /// exit cleanly, restoring the terminal, without a shutdown.
+    pub(crate) exit_requested: bool,
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
     pub(crate) verbose_enabled: bool,
@@ -294,6 +297,7 @@ impl App {
         let counts = StatusCounts::from_state(&services_state, &tasks_state);
 
         Self {
+            exit_requested: false,
             counts,
             view_mode: ViewMode::Normal,
             verbose_enabled,

@@ -99,10 +99,30 @@ impl Drop for RawModeGuard {
 
 type TuiTerminal = Terminal<FixedBottomBackend<std::io::Stdout>>;
 
+/// Whether this TUI shares a process with the runner or attached over the
+/// socket. The two differ in exactly two keys:
+///
+/// - **Ctrl+C**: in-process raises SIGINT alongside the shutdown request so
+///   the runner's two-press force-kill escalation still works; a remote
+///   client must not signal itself (there is no runner in this process to
+///   catch it — just a TUI to kill mid-raw-mode) and settles for the
+///   graceful request.
+/// - **Ctrl+D**: remote detaches — exit the TUI, leave the stack running.
+///   In-process there is nothing to detach *to* until the fork model lands,
+///   so it is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiMode {
+    /// The TUI shares a process with the runner (`don start` today).
+    InProcess,
+    /// The TUI attached to a running project over the socket (`don tui`).
+    Remote,
+}
+
 #[derive(Clone)]
 struct TuiControls {
     verbosity: VerbosityControl,
     lifecycle_emitter: LifecycleEmitter,
+    mode: TuiMode,
 }
 
 /// Alt-screen full-screen terminal used by Filter, Palette, and Overlay
@@ -208,6 +228,7 @@ impl ActiveTerm {
 pub async fn run_tui(
     mut log_rx: mpsc::UnboundedReceiver<FormattedLogLine>,
     client: Client,
+    mode: TuiMode,
     verbosity: VerbosityControl,
     lifecycle_emitter: LifecycleEmitter,
     service_names: Vec<String>,
@@ -223,6 +244,7 @@ pub async fn run_tui(
     let controls = TuiControls {
         verbosity,
         lifecycle_emitter,
+        mode,
     };
     let client = std::sync::Arc::new(client);
 
@@ -268,6 +290,8 @@ pub async fn run_tui(
     // task exits (crossterm EventStream error), we gate its select arm off
     // so the select loop doesn't busy-spin on a perpetually-ready None.
     let mut input_open = true;
+    // Same gating for the terminal-request channel, whose sender may drop.
+    let mut terminal_open = true;
 
     // Terminal-side state — Some while the TUI owns the terminal, None
     // while a foreground task does. We start in the active state.
@@ -440,13 +464,16 @@ pub async fn run_tui(
                                 &mut act.modal,
                             )?;
                         }
+                        if app.exit_requested {
+                            break;
+                        }
                     }
                     None => {
                         input_open = false;
                     }
                 }
             }
-            terminal_req = terminal_request_rx.recv() => {
+            terminal_req = terminal_request_rx.recv(), if terminal_open => {
                 match terminal_req {
                     Some(TerminalRequest::Acquire(ack)) => {
                         if let Some(act) = active.take() {
@@ -494,8 +521,10 @@ pub async fn run_tui(
                         // be conservative with release calls in error paths.
                     }
                     None => {
-                        // Coordinator dropped — runner is gone. Loop exits
-                        // via log_rx close or shutdown event.
+                        // Coordinator dropped — runner is gone. Gate this
+                        // arm off (a closed channel returns None instantly
+                        // forever); the loop exits via log_rx close.
+                        terminal_open = false;
                     }
                 }
             }
@@ -813,11 +842,18 @@ fn handle_key(
                         let _ = client.shutdown().await;
                     });
                 }
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::this(),
-                    nix::sys::signal::Signal::SIGINT,
-                );
+                if controls.mode == TuiMode::InProcess {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::this(),
+                        nix::sys::signal::Signal::SIGINT,
+                    );
+                }
                 enter_shutdown_mode(app, terminal, modal)?;
+            }
+            // Detach: leave the stack running, exit this client. Only
+            // meaningful for a remote TUI — see [`TuiMode`].
+            KeyCode::Char('d') if controls.mode == TuiMode::Remote => {
+                app.exit_requested = true;
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 let enabled = controls.verbosity.toggle();
