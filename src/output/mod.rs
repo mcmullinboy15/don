@@ -201,11 +201,12 @@ impl SinkHandle {
 
 /// A fully formatted, sanitized log line emitted by the stdout pipeline.
 ///
-/// In TTY mode the stdout sink emits these over an mpsc instead of writing
-/// raw bytes, so the TUI can feed each line into `terminal.insert_before`
-/// (preserving native scrollback) and stamp the `name` for filter matching.
+/// Emitted on the merged log-stream tap ([`OutputManager::log_stream_sender`])
+/// for every follower — the TUI feeds each line into `terminal.insert_before`
+/// (preserving native scrollback) and stamps the `name` for filter matching.
 /// The bytes already include any verbose-mode timestamp and the color-coded
 /// service prefix; the consumer just renders them as-is.
+#[derive(Debug, Clone)]
 pub struct FormattedLogLine {
     /// Owning service/task name. `[don]` lifecycle events carry
     /// [`LIFECYCLE_EVENT_NAME`] so the filter treats them as a selectable
@@ -355,11 +356,10 @@ impl CompiledLogKeepFilter {
 /// Where the stdout sink task sends its formatted lines.
 ///
 /// Pipe-mode output writes bytes directly to an `AsyncWrite` (today's stdout).
-/// TUI mode sends [`FormattedLogLine`]s over an mpsc for the TUI task to
-/// render via `Terminal::insert_before`.
+/// The TUI is not a target: it follows [`OutputManager::log_stream_sender`]
+/// and TUI-mode callers pass a null writer.
 enum StdoutTarget<W: tokio::io::AsyncWrite + Unpin + Send> {
     Writer(W),
-    Tui(mpsc::UnboundedSender<FormattedLogLine>),
 }
 
 /// Per-service output state. Owned by OutputManager, never removed.
@@ -751,36 +751,10 @@ impl OutputManager {
         Self::new_inner(services, log_filters, verbose, StdoutTarget::Writer(writer)).await
     }
 
-    /// Create a new output manager that emits formatted log lines to the TUI
-    /// over an mpsc channel instead of writing raw bytes to stdout.
-    ///
-    /// Returns `(manager, log_rx)` — `log_rx` receives one [`FormattedLogLine`]
-    /// per complete log line (already prefixed, sanitized, and timestamp-stamped
-    /// if `verbose`). The caller is the TUI task, which feeds each line into
-    /// `Terminal::insert_before` for natural scrollback.
-    ///
-    /// Lifecycle events (`[don]`) arrive with `name = ""` so the TUI treats
-    /// them as unfilterable.
-    pub async fn new_with_tui(
-        services: &[(&str, &crate::config::LogConfig)],
-        verbose: bool,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<FormattedLogLine>), OutputError> {
-        Self::new_with_tui_and_log_filters(services, &HashMap::new(), verbose).await
-    }
-
-    /// Create a TUI output manager with per-service regex keep filters.
-    pub async fn new_with_tui_and_log_filters(
-        services: &[(&str, &crate::config::LogConfig)],
-        log_filters: &HashMap<String, crate::config::LogFilterConfig>,
-        verbose: bool,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<FormattedLogLine>), OutputError> {
-        let (log_tx, log_rx) = mpsc::unbounded_channel();
-        // `tokio::io::Sink` only satisfies the generic bound — `StdoutTarget::Tui`
-        // never touches the writer arm, so the value is never exercised.
-        let target: StdoutTarget<tokio::io::Sink> = StdoutTarget::Tui(log_tx);
-        let mgr = Self::new_inner(services, log_filters, verbose, target).await?;
-        Ok((mgr, log_rx))
-    }
+    // The TUI has no dedicated constructor: it subscribes to
+    // [`Self::log_stream_sender`] like any other follower, and TUI-mode
+    // callers pass `tokio::io::sink()` as the writer so nothing touches the
+    // real stdout while the TUI owns the screen.
 
     async fn new_inner<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         services: &[(&str, &crate::config::LogConfig)],
@@ -1678,13 +1652,6 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
             use tokio::io::AsyncWriteExt;
             let _ = writer.write_all(&bytes).await;
             let _ = writer.write_all(b"\n").await;
-        }
-        StdoutTarget::Tui(tx) => {
-            let _ = tx.send(FormattedLogLine {
-                name: name.to_string(),
-                is_lifecycle,
-                bytes,
-            });
         }
     }
 }

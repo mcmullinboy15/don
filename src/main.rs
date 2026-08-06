@@ -2213,13 +2213,41 @@ async fn run_start(
     let _ = has_foreground_tasks; // logged earlier; TUI now handles fg tasks via pause/resume
 
     if is_tty {
-        let (output_manager, log_rx) = don::output::OutputManager::new_with_tui_and_log_filters(
+        // TUI mode: nothing may write to the real stdout while the TUI owns
+        // the screen, so the writer is a null sink and the TUI follows the
+        // merged log stream — the same tap `GET /logs?follow=true` serves,
+        // subscribed before the runner starts so no startup line is missed.
+        let output_manager = don::output::OutputManager::new_verbose_with_log_filters(
             &all_configs,
             &log_keep_filters,
+            tokio::io::sink(),
             verbose,
         )
         .await
         .map_err(|e| format!("Error creating output manager: {e}"))?;
+        let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tap = output_manager.log_stream_sender().subscribe();
+        tokio::spawn(async move {
+            loop {
+                let line = match tap.recv().await {
+                    Ok(line) => (*line).clone(),
+                    // The TUI's old private channel was unbounded and could
+                    // not lag; the shared tap can. Surface the gap as a
+                    // lifecycle line rather than silently thinning the log.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        don::output::FormattedLogLine {
+                            name: don::output::LIFECYCLE_EVENT_NAME.to_string(),
+                            is_lifecycle: true,
+                            bytes: format!("log stream lagged — {n} lines dropped").into_bytes(),
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
+                if log_tx.send(line).is_err() {
+                    return; // TUI is gone; stop following.
+                }
+            }
+        });
         let verbosity = output_manager.verbosity_control();
         let lifecycle_emitter = output_manager.clone_lifecycle_emitter();
 
