@@ -75,7 +75,6 @@ impl Runner {
             self.output_manager
                 .service_debug_event(name, &format!("spawned pid={pgid}"));
         }
-        self.fulfill_pending_waiter(name).await;
         self.set_service_state(name, ServiceState::Running);
         self.refresh_runtime_port_manifest();
 

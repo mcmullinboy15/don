@@ -540,13 +540,6 @@ pub struct AttachSession {
     pub output_rx: mpsc::Receiver<crate::output::SinkLine>,
 }
 
-/// A pending attach waiter — registered when a client wants to attach
-/// to a service/task that isn't running yet.
-pub(crate) struct AttachWaiter {
-    pub(crate) pid: u32,
-    pub(crate) reply: oneshot::Sender<Result<AttachSession, CommandError>>,
-}
-
 /// Status of a single item (service or task) for status queries.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -3108,8 +3101,7 @@ mod tests {
         assert_eq!(rs.state(), ServiceState::Pending);
         assert!(rs.handle_identity.is_none());
         assert!(rs.osc_sink.is_none());
-        assert!(rs.attach_lock.is_none());
-        assert!(rs.attach_waiter.is_none());
+        assert_eq!(rs.attach_count, 0);
         assert!(rs.proxy_view.is_none());
         assert!(rs.resolved_watch_paths.is_empty());
         assert!(rs.bazel_binary_path.is_none());
@@ -3187,8 +3179,7 @@ mod tests {
         assert_eq!(rt.state(), TaskItemState::Pending);
         assert!(rt.pgid.is_none());
         assert!(rt.osc_sink.is_none());
-        assert!(rt.attach_lock.is_none());
-        assert!(rt.attach_waiter.is_none());
+        assert_eq!(rt.attach_count, 0);
         assert!(rt.resolved_watch_paths.is_empty());
         assert_eq!(rt.config.cmd, "echo");
 

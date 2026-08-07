@@ -776,7 +776,7 @@ mod tests {
             event_tx,
             state,
             emulator: crate::output::emulator::spawn_emulator_thread(),
-            attach_resize_txs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            attach_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             log_tap,
             shutdown,
         }))

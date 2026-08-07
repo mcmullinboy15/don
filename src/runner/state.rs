@@ -14,9 +14,7 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::{
-    AttachWaiter, CommandResult, ServiceState, ServiceStopAction, TaskItemState, TaskRunWaiter,
-};
+use super::{CommandResult, ServiceState, ServiceStopAction, TaskItemState, TaskRunWaiter};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -55,10 +53,10 @@ pub(crate) struct RuntimeService {
     /// PTY (docker, pipe mode) or no live process. Cleared wherever
     /// `osc_sink` is.
     pub pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
-    /// PID of the client holding the interactive attach lock.
-    pub attach_lock: Option<u32>,
-    /// Pending attach waiter (client waiting for process to start).
-    pub attach_waiter: Option<AttachWaiter>,
+    /// Number of clients currently attached. Attach is multi-client
+    /// (tmux-style shared input); the count drives the stdout-sink pause
+    /// (paused while any client is attached) and the lifecycle events.
+    pub attach_count: usize,
     /// The runner's read-only view of the supervisor-owned proxy: binding
     /// metadata for status, port references and the ports manifest, plus the
     /// policy and backend-env shadows the runner refreshes itself.
@@ -135,8 +133,7 @@ impl RuntimeService {
             output_worker: None,
             osc_sink: None,
             pty_input: None,
-            attach_lock: None,
-            attach_waiter: None,
+            attach_count: 0,
             proxy_view: None,
             resolved_watch_paths: Vec::new(),
             bazel_binary_path: None,
@@ -244,10 +241,10 @@ pub(crate) struct RuntimeTask {
     /// PTY (docker, pipe mode) or no live process. Cleared wherever
     /// `osc_sink` is.
     pub pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
-    /// PID of the client holding the interactive attach lock.
-    pub attach_lock: Option<u32>,
-    /// Pending attach waiter (client waiting for process to start).
-    pub attach_waiter: Option<AttachWaiter>,
+    /// Number of clients currently attached. Attach is multi-client
+    /// (tmux-style shared input); the count drives the stdout-sink pause
+    /// (paused while any client is attached) and the lifecycle events.
+    pub attach_count: usize,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
     /// Output reader task for the current process. It must drain before
@@ -286,8 +283,7 @@ impl RuntimeTask {
             pgid: None,
             osc_sink: None,
             pty_input: None,
-            attach_lock: None,
-            attach_waiter: None,
+            attach_count: 0,
             resolved_watch_paths: Vec::new(),
             output_worker: None,
             run_generation: 0,

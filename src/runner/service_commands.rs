@@ -241,7 +241,7 @@ impl Runner {
         }
 
         if self.services.get(name).is_some_and(|rs| rs.pgid.is_some()) {
-            if self.remove_attach_lock(name) {
+            if self.reset_attach_state(name) {
                 self.output_manager.resume_stdout_sink(name).await;
             }
             self.set_service_state(name, ServiceState::Stopping);
@@ -690,7 +690,7 @@ impl Runner {
         let shutdown_config = self.effective_shutdown_config(name);
         // Release attach lock if held — the PTY write in the attach session
         // becomes invalid once the service stops (process gone).
-        if self.remove_attach_lock(name) {
+        if self.reset_attach_state(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
         self.set_service_state(name, ServiceState::Stopping);
@@ -811,7 +811,7 @@ impl Runner {
             return;
         }
         let shutdown_config = self.effective_shutdown_config(name);
-        if self.remove_attach_lock(name) {
+        if self.reset_attach_state(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
         self.set_service_state(name, ServiceState::Stopping);

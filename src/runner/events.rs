@@ -150,8 +150,8 @@ impl Runner {
         if let Some(rt) = self.tasks.get_mut(&item.name)
             && rt.pgid.take().is_some()
         {
-            // Release attach lock if held.
-            rt.attach_lock = None;
+            // Reset attach bookkeeping.
+            rt.attach_count = 0;
             rt.pty_input = None;
             // Can't await here (sync fn), but the stdout sink resume
             // will happen naturally when the follow sink closes.
@@ -221,7 +221,7 @@ impl Runner {
 
         if let Some(rt) = self.tasks.get_mut(name) {
             rt.pgid = None;
-            rt.attach_lock = None;
+            rt.attach_count = 0;
             rt.pty_input = None;
         }
 

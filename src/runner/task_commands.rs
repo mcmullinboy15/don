@@ -289,9 +289,6 @@ impl Runner {
             rt.pgid = Some(pgid);
         }
 
-        // Fulfill any pending attach waiter for this task.
-        self.fulfill_pending_waiter(name).await;
-
         let output_worker = output.map(|output| {
             let svc_writer = output.writer();
             tokio::spawn(async move {
@@ -376,7 +373,7 @@ impl Runner {
     }
 
     async fn stop_task_pgid(&mut self, name: &str, pgid: i32) -> CommandResult {
-        if self.remove_attach_lock(name) {
+        if self.reset_attach_state(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
         if let Some(writer) = self.output_manager.service_writer(name) {
@@ -576,7 +573,7 @@ impl Runner {
         }
         // Release attach lock and close follow sinks so any active attach
         // session exits cleanly before the new process starts.
-        if self.remove_attach_lock(name) {
+        if self.reset_attach_state(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
         if let Some(writer) = self.output_manager.service_writer(name) {

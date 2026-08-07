@@ -43,16 +43,29 @@ enum DisconnectReason {
 /// Auto-reconnects when the server disconnects (e.g. task rerun or
 /// service restart). Returns when the user detaches with Ctrl+C/Ctrl+D.
 pub async fn run_attach(socket_path: &Path, name: &str) -> Result<(), ClientError> {
+    let mut waiting_notice_shown = false;
     loop {
         match attach_once(socket_path, name).await {
             DisconnectReason::UserDetach => return Ok(()),
+            // "Not running yet" — the runner answers immediately and waiting
+            // is the client's job. Retry until the process appears (Ctrl+C
+            // exits; the terminal is not in raw mode between attempts).
+            DisconnectReason::Error(ClientError::Conflict { .. }) => {
+                if !waiting_notice_shown {
+                    waiting_notice_shown = true;
+                    let mut stdout = tokio::io::stdout();
+                    let _ = stdout.write_all(b"[waiting for process...]\r\n").await;
+                    let _ = stdout.flush().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
             DisconnectReason::Error(e) => return Err(e),
             DisconnectReason::ServerDisconnect => {
-                // Write a notice — the next attach_once will block on the
-                // server side until the process starts again.
+                waiting_notice_shown = true;
                 let mut stdout = tokio::io::stdout();
                 let _ = stdout.write_all(b"\r\n[waiting for process...]\r\n").await;
                 let _ = stdout.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             }
         }
     }
@@ -108,6 +121,12 @@ async fn attach_once(socket_path: &Path, name: &str) -> DisconnectReason {
         return DisconnectReason::Error(super::classify_error(status, &body));
     }
 
+    // The session id for resize requests, issued in the 101 response.
+    let session_id = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-don-attach-session"))
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok());
+
     // 101 — the stream is now raw. Enter raw mode.
     let _guard = match RawModeGuard::enable() {
         Ok(g) => g,
@@ -124,7 +143,7 @@ async fn attach_once(socket_path: &Path, name: &str) -> DisconnectReason {
 
     // Bridge stdin/stdout with the raw stream.
     // Stream closes when we drop it.
-    bridge_terminal(&mut stream, socket_path, name, pid).await
+    bridge_terminal(&mut stream, socket_path, name, session_id).await
 }
 
 /// Check data for detach triggers: Ctrl+C (\x03) or Ctrl+D (\x04).
@@ -137,7 +156,7 @@ async fn bridge_terminal(
     stream: &mut UnixStream,
     socket_path: &Path,
     name: &str,
-    pid: u32,
+    session_id: Option<u64>,
 ) -> DisconnectReason {
     let (mut stream_read, mut stream_write) = stream.split();
     let mut stdin = tokio::io::stdin();
@@ -202,7 +221,7 @@ async fn bridge_terminal(
                 let sp = socket_path.clone();
                 let n = name.clone();
                 tokio::spawn(async move {
-                    let _ = send_resize(&sp, &n, pid, cols, rows).await;
+                    let _ = send_resize(&sp, &n, session_id, cols, rows).await;
                 });
             }
         }
@@ -216,12 +235,15 @@ async fn bridge_terminal(
 async fn send_resize(
     socket_path: &Path,
     name: &str,
-    _pid: u32,
+    session_id: Option<u64>,
     cols: u16,
     rows: u16,
 ) -> Result<(), ClientError> {
     let mut stream = UnixStream::connect(socket_path).await?;
-    let body = serde_json::json!({"cols": cols, "rows": rows});
+    let body = match session_id {
+        Some(id) => serde_json::json!({"cols": cols, "rows": rows, "session": id}),
+        None => serde_json::json!({"cols": cols, "rows": rows}),
+    };
     let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
     let path = format!("/attach/{}/resize", super::urlencode(name));
     let req = format!(

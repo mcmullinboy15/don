@@ -4,7 +4,7 @@
 //! byte stream — stdin bytes flow in, PTY output bytes flow out, with zero
 //! framing overhead. Resize events arrive via a separate POST endpoint.
 
-use super::ApiState;
+use super::{ApiState, NameSessions};
 use crate::runner::RunnerCommand;
 use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
@@ -22,11 +22,42 @@ pub(crate) struct AttachParams {
     rows: u16,
 }
 
-/// Body for the resize endpoint.
+/// Body for the resize endpoint. `session` is the id issued in the attach
+/// response's `x-don-attach-session` header; without it (an older client),
+/// the resize applies to every session the client could mean.
 #[derive(Deserialize)]
 pub(crate) struct ResizeBody {
     cols: u16,
     rows: u16,
+    #[serde(default)]
+    session: Option<u64>,
+}
+
+/// The effective size for an item: the smallest attached client wins each
+/// dimension, so every client sees the whole grid (tmux-style letterboxing).
+fn effective_size(sizes: &std::collections::HashMap<u64, (u16, u16)>) -> Option<(u16, u16)> {
+    let cols = sizes.values().map(|(c, _)| *c).min()?;
+    let rows = sizes.values().map(|(_, r)| *r).min()?;
+    Some((cols, rows))
+}
+
+/// Recompute and apply the effective grid size for `name`. Retains the last
+/// size when no sessions remain.
+async fn apply_effective_size(state: &ApiState, name: &str) {
+    let (gate, size) = {
+        let map = state.attach_sessions.lock().await;
+        let Some(sessions) = map.get(name) else {
+            return;
+        };
+        match effective_size(&sessions.sizes) {
+            Some(size) => (sessions.gate.clone(), size),
+            None => return,
+        }
+    };
+    let _ = gate
+        .send(crate::output::PtyInput::Resize(size.0, size.1))
+        .await;
+    state.emulator.resize(name, size.0, size.1);
 }
 
 /// `GET /attach/{name}?pid=N&cols=C&rows=R` — upgrade to raw stream.
@@ -99,18 +130,23 @@ pub(crate) async fn attach_handler(
     let pty_input = session.pty_input;
     let output_rx = session.output_rx;
 
-    // Apply initial resize — the PTY and the emulated grid move together.
-    let _ = pty_input
-        .send(crate::output::PtyInput::Resize(params.cols, params.rows))
-        .await;
-    state.emulator.resize(&name, params.cols, params.rows);
-
-    // Register resize channel.
-    let (resize_tx, resize_rx) = mpsc::channel::<(u16, u16)>(4);
-    {
-        let mut map = state.attach_resize_txs.lock().await;
-        map.insert(name.clone(), resize_tx);
-    }
+    // Register this session and apply the new effective size — the smallest
+    // attached client wins each dimension.
+    let session_id = {
+        let mut map = state.attach_sessions.lock().await;
+        let sessions = map.entry(name.clone()).or_insert_with(|| NameSessions {
+            next_id: 0,
+            gate: pty_input.clone(),
+            sizes: std::collections::HashMap::new(),
+        });
+        // A restart hands out a fresh gate; keep the stored one current.
+        sessions.gate = pty_input.clone();
+        let id = sessions.next_id;
+        sessions.next_id += 1;
+        sessions.sizes.insert(id, (params.cols, params.rows));
+        id
+    };
+    apply_effective_size(&state, &name).await;
 
     // Spawn background task to handle the upgraded connection.
     let state_clone = state.clone();
@@ -119,9 +155,7 @@ pub(crate) async fn attach_handler(
         let upgraded = match hyper::upgrade::on(request).await {
             Ok(upgraded) => upgraded,
             Err(_) => {
-                // Upgrade failed — clean up.
-                let mut map = state_clone.attach_resize_txs.lock().await;
-                map.remove(&name_clone);
+                end_session(&state_clone, &name_clone, session_id).await;
                 let _ = state_clone
                     .cmd_tx
                     .send(RunnerCommand::Detach { name: name_clone });
@@ -130,26 +164,44 @@ pub(crate) async fn attach_handler(
         };
 
         let io = hyper_util::rt::TokioIo::new(upgraded);
-        bridge_raw(io, pty_input, output_rx, resize_rx).await;
+        bridge_raw(io, pty_input, output_rx).await;
 
-        // Clean up resize channel.
-        {
-            let mut map = state_clone.attach_resize_txs.lock().await;
-            map.remove(&name_clone);
-        }
-
+        end_session(&state_clone, &name_clone, session_id).await;
         let _ = state_clone
             .cmd_tx
             .send(RunnerCommand::Detach { name: name_clone });
     });
 
-    // Return 101 Switching Protocols.
+    // Return 101 Switching Protocols, with the session id the client echoes
+    // in resize requests.
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header("connection", "Upgrade")
         .header("upgrade", "don-attach")
+        .header("x-don-attach-session", session_id.to_string())
         .body(axum::body::Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Remove a session and re-apply the effective size for the remaining
+/// clients (none remaining retains the last size — no SIGWINCH churn for
+/// the running program).
+async fn end_session(state: &ApiState, name: &str, session_id: u64) {
+    let remaining = {
+        let mut map = state.attach_sessions.lock().await;
+        let Some(sessions) = map.get_mut(name) else {
+            return;
+        };
+        sessions.sizes.remove(&session_id);
+        let remaining = !sessions.sizes.is_empty();
+        if !remaining {
+            map.remove(name);
+        }
+        remaining
+    };
+    if remaining {
+        apply_effective_size(state, name).await;
+    }
 }
 
 /// `POST /attach/{name}/resize` — resize the attached PTY.
@@ -158,21 +210,40 @@ pub(crate) async fn resize_handler(
     Path(name): Path<String>,
     Json(body): Json<ResizeBody>,
 ) -> Response {
-    let map = state.attach_resize_txs.lock().await;
-    match map.get(&name) {
-        Some(tx) => {
-            let _ = tx.try_send((body.cols, body.rows));
-            state.emulator.resize(&name, body.cols, body.rows);
-            StatusCode::NO_CONTENT.into_response()
+    let known = {
+        let mut map = state.attach_sessions.lock().await;
+        match map.get_mut(&name) {
+            Some(sessions) => {
+                match body.session {
+                    Some(id) if sessions.sizes.contains_key(&id) => {
+                        sessions.sizes.insert(id, (body.cols, body.rows));
+                    }
+                    Some(_) => {}
+                    // Older client without a session id: the only honest
+                    // reading is "this client is now this size" for every
+                    // session it could mean.
+                    None => {
+                        for size in sessions.sizes.values_mut() {
+                            *size = (body.cols, body.rows);
+                        }
+                    }
+                }
+                true
+            }
+            None => false,
         }
-        None => (
+    };
+    if !known {
+        return (
             StatusCode::NOT_FOUND,
             axum::Json(
                 serde_json::json!({"error": format!("no active attach session for '{name}'")}),
             ),
         )
-            .into_response(),
+            .into_response();
     }
+    apply_effective_size(&state, &name).await;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Bridge a raw bidirectional stream to the PTY's input gate. Each client
@@ -182,7 +253,6 @@ async fn bridge_raw<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     io: S,
     pty_input: mpsc::Sender<crate::output::PtyInput>,
     mut output_rx: mpsc::Receiver<crate::output::SinkLine>,
-    mut resize_rx: mpsc::Receiver<(u16, u16)>,
 ) {
     use crate::output::PtyInput;
 
@@ -220,9 +290,6 @@ async fn bridge_raw<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 }
                 Some(data) = osc_rx.recv() => {
                     let _ = pty_input.send(PtyInput::Frame(data.to_vec())).await;
-                }
-                Some((cols, rows)) = resize_rx.recv() => {
-                    let _ = pty_input.send(PtyInput::Resize(cols, rows)).await;
                 }
             }
         }

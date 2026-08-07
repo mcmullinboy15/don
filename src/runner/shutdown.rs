@@ -389,8 +389,7 @@ impl Runner {
                 Self::await_output_worker(worker).await;
             }
             rs.handle_identity = None;
-            rs.attach_lock = None;
-            rs.attach_waiter = None;
+            rs.attach_count = 0;
             rs.control_reply = None;
             rs.stop_action = ServiceStopAction::None;
         }
@@ -398,8 +397,7 @@ impl Runner {
             if let Some(worker) = rt.output_worker.take() {
                 Self::await_output_worker(worker).await;
             }
-            rt.attach_lock = None;
-            rt.attach_waiter = None;
+            rt.attach_count = 0;
         }
     }
 

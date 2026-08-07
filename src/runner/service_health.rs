@@ -423,7 +423,7 @@ impl Runner {
             return;
         }
         let shutdown_config = self.effective_shutdown_config(name);
-        if self.remove_attach_lock(name) {
+        if self.reset_attach_state(name) {
             self.output_manager.resume_stdout_sink(name).await;
         }
         self.set_service_state(name, ServiceState::Stopping);
