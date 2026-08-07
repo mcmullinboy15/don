@@ -142,6 +142,14 @@ fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {
 }
 
 /// A command sent to the runner via its public `mpsc` channel.
+///
+/// **Admission test for new variants:** a command belongs here only if its
+/// handler mutates scheduling state or must serialize with the fold. Pure
+/// reads go through a projection ([`StateReader`], [`crate::output::LogReader`],
+/// [`crate::watch::report::WatchStatusReader`]); mechanism that only needs
+/// fixed-at-construction config belongs to whoever calls it (see
+/// [`crate::param_completions::CompletionResolver`]); and the runner's own
+/// deferred ticks are internal, not commands.
 pub enum RunnerCommand {
     /// Start a stopped service.
     Start {
