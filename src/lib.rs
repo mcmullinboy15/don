@@ -7,6 +7,7 @@ pub mod daemon;
 pub(crate) mod docker;
 pub mod download;
 pub mod duration;
+pub(crate) mod endpoints;
 pub mod exec;
 pub(crate) mod globwalk;
 pub mod init;

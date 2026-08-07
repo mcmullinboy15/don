@@ -410,6 +410,11 @@ pub struct Runner {
     /// server at bind time — the runner itself never resolves completions.
     completions: crate::param_completions::CompletionResolver,
 
+    /// Where every service can be reached, published for supervisors that
+    /// render their own `$(peer.KEY)` env references. See
+    /// [`crate::endpoints`].
+    endpoints: crate::endpoints::EndpointWriter,
+
     /// Publisher for the watch manager's query sender; the paired
     /// [`crate::watch::report::WatchStatusReader`] goes to the API server.
     /// Outer `None` until watch setup decides; then `Some(None)` (nothing
@@ -501,6 +506,13 @@ impl Runner {
         // proxy at spawn below; the runner keeps only the view. Lazy services
         // get a per-service trigger channel whose receiving half rides along,
         // and the supervisor forwards each trigger as a demand report.
+        // Publish endpoints before binding: the key set decides which
+        // `$(name.key)` tokens count as runtime references at all, and proxy
+        // bindings land below — before any supervisor exists, which is what
+        // lets a service resolve a peer that has not started yet.
+        let endpoints = crate::endpoints::channel();
+        endpoints.seed(services.keys().cloned());
+
         let mut proxies: HashMap<String, service_supervisor::ProxyAssets> = HashMap::new();
         for (name, rs) in services.iter_mut() {
             if rs.resolved.proxy.is_empty() {
@@ -531,7 +543,9 @@ impl Runner {
                         name,
                         &format!("proxy listening on {}", addrs.join(", ")),
                     );
-                    rs.proxy_view = Some(proxy.view());
+                    let view = proxy.view();
+                    endpoints.publish_proxy(name, view.bindings.clone());
+                    rs.proxy_view = Some(view);
                     proxies.insert(
                         name.clone(),
                         service_supervisor::ProxyAssets { proxy, demand_rx },
@@ -609,6 +623,7 @@ impl Runner {
             batch_outcome_rx,
             batcher_handle: Some(batcher_handle),
             completions,
+            endpoints,
             watch_status_tx,
             watch_status_reader,
             shutdown_flag_tx,

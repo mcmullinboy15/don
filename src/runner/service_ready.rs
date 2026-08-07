@@ -50,27 +50,19 @@ impl Runner {
 
         if let Some(rs) = self.services.get_mut(name) {
             rs.pgid = spawned_pgid;
-            rs.docker_port_bindings = docker_port_bindings;
-            rs.handle_identity = Some(identity);
             rs.osc_sink = osc_sink;
             rs.scheduled_start = scheduled;
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop
             // guard in `handle_service_exited`).
             rs.last_start = Some(std::time::Instant::now());
-            // Refresh the backend-env shadow: a restart reallocates ephemeral
-            // backend ports, and the status path's `${PORT}` display must
-            // resolve to the port this spawn was told.
-            if let (Some(view), Some(backend_env)) = (rs.proxy_view.as_mut(), proxy_backend_env) {
-                view.backend_env = backend_env;
-            }
         }
+        self.fold_service_custody(name, identity, docker_port_bindings, proxy_backend_env);
         if let Some(pgid) = spawned_pgid {
             self.output_manager
                 .service_debug_event(name, &format!("spawned pid={pgid}"));
         }
         self.set_service_state(name, ServiceState::Running);
-        self.refresh_runtime_port_manifest();
     }
 
     /// Fold a ready outcome reported by the service's supervisor.
@@ -105,22 +97,30 @@ impl Runner {
             // Report the address actually probed, not the configured
             // template — `effective_ready_check` is what the probe ran
             // against (the supervisor resolves through the same function).
-            let ready_message = scheduled
-                .then(|| {
-                    self.services.get(name).map(|rs| {
-                        match self.effective_ready_check(name, &rs.resolved) {
-                            Some(r) if r.tcp.is_some() => {
-                                format!("ready (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
+            let ready_message =
+                scheduled
+                    .then(|| {
+                        self.services.get(name).map(|rs| {
+                            match crate::endpoints::effective_ready_check(
+                                &self.endpoints.snapshot(),
+                                name,
+                                &rs.resolved,
+                            ) {
+                                Some(r) if r.tcp.is_some() => {
+                                    format!("ready (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
+                                }
+                                Some(r) if r.http.is_some() => {
+                                    format!(
+                                        "ready (http {})",
+                                        r.http.as_deref().unwrap_or("unknown")
+                                    )
+                                }
+                                Some(r) if r.exec.is_some() => "ready (exec)".to_string(),
+                                _ => "started".to_string(),
                             }
-                            Some(r) if r.http.is_some() => {
-                                format!("ready (http {})", r.http.as_deref().unwrap_or("unknown"))
-                            }
-                            Some(r) if r.exec.is_some() => "ready (exec)".to_string(),
-                            _ => "started".to_string(),
-                        }
+                        })
                     })
-                })
-                .flatten();
+                    .flatten();
             // Re-activate the proxy backend on ready. The supervisor already
             // activates at wire time; this covers a backend cleared between
             // wire and ready (e.g. a rebuild's ClearBackend landing late).

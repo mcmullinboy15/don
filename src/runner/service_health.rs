@@ -178,10 +178,10 @@ impl Runner {
         if state == ServiceState::Failed {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.pgid = None;
-                rs.handle_identity = None;
                 rs.osc_sink = None;
                 rs.stop_health_tracking();
             }
+            self.clear_service_custody(name);
             self.sync_proxy_policy(name);
             if let Some(writer) = self.output_manager.service_writer(name) {
                 writer.close_follow_sinks().await;
@@ -203,8 +203,8 @@ impl Runner {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.reset_restart_tracking();
                 rs.pgid = None;
-                rs.handle_identity = None;
             }
+            self.clear_service_custody(name);
             self.set_service_state(name, ServiceState::Stopped);
             self.output_manager
                 .service_event(name, "exited cleanly (status 0)");
@@ -216,8 +216,8 @@ impl Runner {
 
         if let Some(rs) = self.services.get_mut(name) {
             rs.pgid = None;
-            rs.handle_identity = None;
         }
+        self.clear_service_custody(name);
         let exit_msg = format_unexpected_exit(status);
         self.output_manager.service_error_event(name, &exit_msg);
         let is_lazy = self
@@ -336,9 +336,9 @@ impl Runner {
             // drop releases the PTY. On the crash path the handle is already
             // gone, so these are no-ops. The output worker drains and drops the
             // read half on EOF once the process is gone.
-            rs.handle_identity = None;
             rs.osc_sink = None;
         }
+        self.clear_service_custody(name);
         // Dropping the handle used to kill the lingering process
         // (kill_on_drop); the supervisor owns it now, so ask it to. A
         // supervisor holding nothing answers immediately.

@@ -269,8 +269,8 @@ impl Runner {
                     for name in names {
                         if let Some(rs) = self.services.get_mut(&name) {
                             rs.pgid = None;
-                            rs.handle_identity = None;
                         }
+                        self.clear_service_custody(&name);
                         self.set_service_state(&name, ServiceState::Stopped);
                     }
                     join_set.abort_all();
@@ -291,8 +291,8 @@ impl Runner {
                         stopping_pgids.remove(&name);
                         if let Some(rs) = self.services.get_mut(&name) {
                             rs.pgid = None;
-                            rs.handle_identity = None;
                         }
+                        self.clear_service_custody(&name);
                         self.set_service_state(&name, ServiceState::Stopped);
                         self.drain_service_output(&name).await;
                         remaining -= 1;
@@ -378,9 +378,14 @@ impl Runner {
             if let Some(worker) = rs.output_worker.take() {
                 Self::await_output_worker(worker).await;
             }
-            rs.handle_identity = None;
             rs.control_reply = None;
             rs.stop_action = ServiceStopAction::None;
+        }
+        // Custody goes through the funnel even here, so the projection and
+        // the shadow end teardown agreeing.
+        let names: Vec<String> = self.services.keys().cloned().collect();
+        for name in names {
+            self.clear_service_custody(&name);
         }
     }
 

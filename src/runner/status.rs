@@ -73,20 +73,17 @@ impl Runner {
             }
             let verbose_info = {
                 let resolved = &rs.resolved;
-                let ready = self
-                    .effective_ready_check(name, resolved)
-                    .as_ref()
-                    .map(|r| {
-                        if let Some(ref tcp) = r.tcp {
-                            format!("tcp {tcp}")
-                        } else if let Some(ref http) = r.http {
-                            format!("http {http}")
-                        } else if let Some(ref exec) = r.exec {
-                            format!("{} {}", exec.cmd, exec.args.join(" "))
-                        } else {
-                            "none".to_string()
-                        }
-                    });
+                let ready = self.endpoint_ready_check(name, resolved).as_ref().map(|r| {
+                    if let Some(ref tcp) = r.tcp {
+                        format!("tcp {tcp}")
+                    } else if let Some(ref http) = r.http {
+                        format!("http {http}")
+                    } else if let Some(ref exec) = r.exec {
+                        format!("{} {}", exec.cmd, exec.args.join(" "))
+                    } else {
+                        "none".to_string()
+                    }
+                });
                 let cmd = resolved.run_cmd().map(|r| {
                     if r.args.is_empty() {
                         r.cmd.clone()

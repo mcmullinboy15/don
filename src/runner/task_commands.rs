@@ -26,7 +26,7 @@ impl Runner {
         mode: TaskRunMode,
         intent: TaskRunIntent,
     ) -> Result<(), CommandError> {
-        self.render_runtime_env(name, &mut task_cfg.env)?;
+        crate::endpoints::render_env(&self.endpoints.snapshot(), name, &mut task_cfg.env)?;
         // The registry is built from the task map, so a hit here is proof the
         // task exists — no separate existence check needed.
         let Some(handle) = self.task_supervisors.registry().get(name).cloned() else {

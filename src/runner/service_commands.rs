@@ -30,7 +30,7 @@ impl Runner {
                 });
             }
         };
-        self.render_runtime_env(name, &mut resolved.env)?;
+        crate::endpoints::render_env(&self.endpoints.snapshot(), name, &mut resolved.env)?;
         let batch_built = self.services.get(name).is_some_and(|rs| rs.batch_built);
         let prior_docker_port_bindings = self
             .services
@@ -540,8 +540,8 @@ impl Runner {
             Ok(()) => {
                 if let Some(rs) = self.services.get_mut(name) {
                     rs.pgid = None;
-                    rs.handle_identity = None;
                 }
+                self.clear_service_custody(name);
                 self.set_service_state(name, ServiceState::Stopped);
                 let next_result = match stop_action {
                     ServiceStopAction::None => Ok(()),
@@ -567,8 +567,8 @@ impl Runner {
             Err(message) => {
                 if let Some(rs) = self.services.get_mut(name) {
                     rs.pgid = None;
-                    rs.handle_identity = None;
                 }
+                self.clear_service_custody(name);
                 self.set_service_state(name, ServiceState::Failed);
                 self.output_manager.service_error_event(name, &message);
                 if let Some(reply) = reply {
@@ -615,10 +615,9 @@ impl Runner {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.stop_health_tracking();
                 rs.reset_restart_tracking();
-                rs.handle_identity = None;
             }
+            self.clear_service_custody(name);
             self.set_service_state(name, ServiceState::Stopped);
-            self.refresh_runtime_port_manifest();
             self.output_manager
                 .service_event(name, "stopped (was failed)");
             let _ = reply.send(Ok(()));

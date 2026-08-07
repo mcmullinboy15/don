@@ -208,19 +208,6 @@ impl ProxyView {
             .map(|count| count.load(Ordering::Relaxed))
     }
 
-    /// Public address env vars — see [`ServiceProxy::public_env_vars`].
-    pub(crate) fn public_env_vars(&self) -> HashMap<String, String> {
-        public_env_vars_for(&self.bindings)
-    }
-
-    /// Runtime reference values for other services' inline env expansion.
-    /// Values always describe public listener addresses, never env-mode
-    /// backend ports: `$(database.PORT)` resolves to the public port for
-    /// `proxy = { ..., env = "PORT" }`.
-    pub(crate) fn env_reference_values(&self) -> HashMap<String, String> {
-        env_reference_values_for(&self.bindings)
-    }
-
     /// True if any proxy entry requires serial (no-overlap) restart. A fixed
     /// `Forward` backend can't have two processes binding the same port at
     /// once, so the old instance must fully exit before the new one starts.
@@ -665,7 +652,7 @@ fn fallback_addr(mut configured_addr: SocketAddr) -> SocketAddr {
 
 /// Public address env vars derived from binding metadata — the body of
 /// [`ServiceProxy::public_env_vars`] and [`ProxyView::public_env_vars`].
-fn public_env_vars_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
+pub(crate) fn public_env_vars_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
     let mut vars = HashMap::new();
 
     for (idx, binding) in bindings.iter().enumerate() {
@@ -693,7 +680,7 @@ fn public_env_vars_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
 
 /// Reference values (`$(service.PORT)` and friends) derived from binding
 /// metadata. Always public listener addresses, never env-mode backend ports.
-fn env_reference_values_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
+pub(crate) fn env_reference_values_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
     let mut vars = HashMap::new();
 
     for (idx, binding) in bindings.iter().enumerate() {
@@ -1225,7 +1212,8 @@ mod tests {
         BackendStatus, ConnectionPolicy, DEFAULT_PROXY_CONNECTION_LIMIT,
         MIN_PROXY_CONNECTION_LIMIT, PROXY_FD_RESERVE, ProxyBinding, ProxyBindingMode,
         ProxyConnectionAccounting, ProxyError, ServiceProxy, backend_connect_candidates,
-        proxy_accept_loop_with_permits, proxy_connection_limit_for_soft_nofile,
+        env_reference_values_for, proxy_accept_loop_with_permits,
+        proxy_connection_limit_for_soft_nofile,
     };
 
     #[tokio::test]
@@ -1476,7 +1464,7 @@ mod tests {
             Some(&actual_addrs[1].to_string())
         );
 
-        let references = proxy.view().env_reference_values();
+        let references = env_reference_values_for(proxy.view().bindings.as_slice());
         assert_eq!(references.get("addr"), Some(&actual_addrs[0].to_string()));
         assert_eq!(
             references.get("port_2"),
