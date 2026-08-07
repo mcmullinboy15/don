@@ -510,7 +510,7 @@ impl Runner {
         // `$(name.key)` tokens count as runtime references at all, and proxy
         // bindings land below — before any supervisor exists, which is what
         // lets a service resolve a peer that has not started yet.
-        let endpoints = crate::endpoints::channel();
+        let (endpoints, endpoints_reader) = crate::endpoints::channel();
         endpoints.seed(services.keys().cloned());
 
         let mut proxies: HashMap<String, service_supervisor::ProxyAssets> = HashMap::new();
@@ -567,8 +567,11 @@ impl Runner {
                 docker_client: docker_client.clone(),
                 emitter: output_manager.clone_lifecycle_emitter(),
                 shutdown: config.shutdown.clone(),
+                fallback_ports: config.fallback_ports,
+                endpoints: endpoints_reader,
             },
             &|name| output_manager.process_output(name),
+            &|name| services.get(name).map(|rs| rs.resolved.clone()),
             &report_tx,
             &mut proxies,
         );
@@ -903,6 +906,27 @@ impl Runner {
     /// [`crate::param_completions::CompletionResolver`].
     pub fn completion_resolver(&self) -> crate::param_completions::CompletionResolver {
         self.completions.clone()
+    }
+
+    /// Push build-tool facts to a service's supervisor, which owns its own
+    /// start context and cannot derive them.
+    ///
+    /// Sent alongside the shadow update rather than instead of it: the runner
+    /// still reads `resolved` for dependency edges and status.
+    pub(crate) fn configure_supervisor(
+        &self,
+        name: &str,
+        resolved: Option<Box<crate::config::ResolvedService>>,
+        batch_built: Option<bool>,
+    ) {
+        if let Some(handle) = self.service_starts.registry().get(name) {
+            let _ = handle.request(service_supervisor::ServiceCommand::Configure(
+                service_supervisor::ConfigureRequest {
+                    resolved,
+                    batch_built,
+                },
+            ));
+        }
     }
 
     /// A read-only handle for the global watch report; see
@@ -1363,11 +1387,10 @@ impl Runner {
                             }
                             ProcessReport::ServiceStartPrepared {
                                 name,
-                                context,
                                 intent,
                                 result,
                             } => {
-                                self.handle_service_start_prepared(&name, context, intent, result)
+                                self.handle_service_start_prepared(&name, intent, result)
                                     .await;
                             }
                             ProcessReport::ServiceReady {

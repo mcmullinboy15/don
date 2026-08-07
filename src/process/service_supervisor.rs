@@ -33,13 +33,21 @@ use tokio::sync::mpsc;
 
 /// One request to start a service, as handed to its supervisor.
 pub(crate) struct StartRequest {
-    pub(crate) context: Box<ServiceStartContext>,
     pub(crate) mode: ServiceStartMode,
     pub(crate) intent: ServiceStartIntent,
     /// Allocate new ephemeral backend ports before spawning. Set on the
     /// restart path so the new process binds a fresh port while draining
     /// connections to the old one finish undisturbed.
     pub(crate) fresh_backend_ports: bool,
+}
+
+/// Build-tool facts the runner learns from the batcher and the supervisor
+/// cannot derive. Each field is `None` when that fact did not change.
+pub(crate) struct ConfigureRequest {
+    /// A re-resolved config — currently only the bazel-binary rewrite.
+    pub(crate) resolved: Option<Box<crate::config::ResolvedService>>,
+    /// Whether the startup batch build has produced this service's artifact.
+    pub(crate) batch_built: Option<bool>,
 }
 
 /// Everything a service's supervisor can be asked to do.
@@ -51,6 +59,11 @@ pub(crate) enum ServiceCommand {
     /// The reply waits for the output reader to drain, so "stopped" can
     /// never outrun the process's last lines.
     Stop(StopRequest),
+    /// Build-tool resolution changed what this service *is*: a bazel binary
+    /// path resolved, or a batch build completed. Applied immediately like a
+    /// proxy directive; mailbox FIFO gives the only ordering that matters —
+    /// a `Configure` sent before a `Start` is applied first.
+    Configure(ConfigureRequest),
     /// Adjust the owned proxy. Applied immediately, even while a start is
     /// being prepared — a proxy directive is never a supersession.
     Proxy(ProxyDirective),
@@ -143,6 +156,12 @@ pub(crate) struct StartEnv {
     pub(crate) emitter: LifecycleEmitter,
     /// Global shutdown defaults, for stopping a start that lost a race.
     pub(crate) shutdown: ShutdownConfig,
+    /// Whether a bound port may fall back to an ephemeral one. A workspace
+    /// constant, so it belongs here rather than on every start request.
+    pub(crate) fallback_ports: bool,
+    /// Where every peer can be reached, for rendering this service's
+    /// `$(peer.KEY)` env references at the moment it starts.
+    pub(crate) endpoints: crate::endpoints::EndpointReader,
 }
 
 /// Owner half for services.
@@ -154,12 +173,14 @@ pub(crate) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     env: &StartEnv,
     outputs: &dyn Fn(&str) -> Option<ProcessOutput>,
+    resolved: &dyn Fn(&str) -> Option<crate::config::ResolvedService>,
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     proxies: &mut std::collections::HashMap<String, ProxyAssets>,
 ) -> ServiceStarts {
     ServiceStarts::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
         let assets = proxies.remove(&name);
+        let resolved = resolved(&name);
         supervise(
             name,
             rx,
@@ -168,8 +189,35 @@ pub(crate) fn spawn_supervisors<'a>(
             report_tx.clone(),
             busy,
             assets,
+            resolved,
         )
     })
+}
+
+/// Assemble the context for one start.
+///
+/// Everything here is either the supervisor's own (its resolved config, its
+/// last docker mapping) or read from a published projection — which is what
+/// lets a supervisor start itself without asking the scheduler for anything.
+fn build_context(
+    name: &str,
+    resolved: &crate::config::ResolvedService,
+    batch_built: bool,
+    env: &StartEnv,
+    last_docker_bindings: &[crate::docker::DockerPortBinding],
+) -> Result<Box<ServiceStartContext>, String> {
+    let mut resolved = resolved.clone();
+    crate::endpoints::render_env(&env.endpoints.snapshot(), name, &mut resolved.env)
+        .map_err(|error| error.to_string())?;
+    Ok(Box::new(ServiceStartContext {
+        resolved,
+        batch_built,
+        // The proxy's contribution is filled in per spawn below.
+        listen_fds: Vec::new(),
+        listen_fds_env: std::collections::HashMap::new(),
+        fallback_ports: env.fallback_ports,
+        prior_docker_port_bindings: last_docker_bindings.to_vec(),
+    }))
 }
 
 /// Stop a service brought up by a start that has since been superseded.
@@ -218,8 +266,18 @@ async fn supervise(
     report_tx: mpsc::UnboundedSender<super::ProcessReport>,
     busy: Arc<AtomicBool>,
     proxy_assets: Option<ProxyAssets>,
+    resolved: Option<crate::config::ResolvedService>,
 ) {
+    // Names come from the same map the configs do, so `None` is unreachable;
+    // ending the supervisor beats panicking, and callers already treat a dead
+    // mailbox as "supervisor is gone".
+    let Some(mut resolved) = resolved else { return };
     let service_writer = output.as_ref().map(|output| output.writer());
+    // Build-tool facts, kept current by `ServiceCommand::Configure`.
+    let mut batch_built = false;
+    // The docker host-port mapping this supervisor's last spawn got. Retained
+    // across stops so the next start can request the same ports.
+    let mut last_docker_bindings: Vec<crate::docker::DockerPortBinding> = Vec::new();
     let mut pending: Option<ServiceCommand> = None;
     let mut mailbox_closed = false;
     // The proxy outlives individual starts — its listeners span process
@@ -311,12 +369,20 @@ async fn supervise(
             },
         };
         let StartRequest {
-            mut context,
             mode,
             intent,
             fresh_backend_ports,
         } = match command {
             ServiceCommand::Start(request) => request,
+            ServiceCommand::Configure(request) => {
+                if let Some(next) = request.resolved {
+                    resolved = *next;
+                }
+                if let Some(next) = request.batch_built {
+                    batch_built = next;
+                }
+                continue;
+            }
             ServiceCommand::Proxy(directive) => {
                 apply_proxy_directive(&mut proxy, directive);
                 continue;
@@ -392,6 +458,28 @@ async fn supervise(
         // exactly the stale-completion race this loop exists to prevent.
         ready_pending = None;
 
+        // Build this start's context here, as the thing that owns the start.
+        // `$(peer.KEY)` references resolve against the endpoint projection at
+        // *this* moment, so a peer that moved to a new port since the last
+        // start is picked up without anyone re-issuing the request.
+        let mut context =
+            match build_context(&name, &resolved, batch_built, &env, &last_docker_bindings) {
+                Ok(context) => context,
+                Err(message) => {
+                    if report_tx
+                        .send(super::ProcessReport::ServiceStartPrepared {
+                            name: name.clone(),
+                            intent,
+                            result: Err(message),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
         // The proxy's per-spawn contribution: fresh ephemeral backend ports
         // on restart, the backend/public env vars, and the listenfd sockets
         // the child inherits.
@@ -400,7 +488,6 @@ async fn supervise(
                 if report_tx
                     .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
-                        context,
                         intent,
                         result: Err(format!("failed to allocate ephemeral ports: {error}")),
                     })
@@ -485,6 +572,10 @@ async fn supervise(
                             proxy.as_ref(),
                             &wired.docker_port_bindings,
                         );
+                        // Remember the mapping so a restart can request the
+                        // same host ports. This supervisor produced them, so
+                        // its copy is the authoritative one.
+                        last_docker_bindings = wired.docker_port_bindings.clone();
                         (Ok(Box::new(wired)), Some((ready, exit_rx, cancel_rx)))
                     }
                     Err(message) => (Err(message), None),
@@ -492,7 +583,6 @@ async fn supervise(
                 if report_tx
                     .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
-                        context,
                         intent,
                         result: wired,
                     })
@@ -822,7 +912,27 @@ mod tests {
             docker_client: None,
             emitter: output_manager.clone_lifecycle_emitter(),
             shutdown: ShutdownConfig::default(),
+            fallback_ports: false,
+            endpoints: {
+                let (writer, reader) = crate::endpoints::channel();
+                writer.seed(std::iter::once("svc".to_string()));
+                // Keep the writer alive for the reader's lifetime.
+                std::mem::forget(writer);
+                reader
+            },
         }
+    }
+
+    /// A minimal service config for the supervisor harness.
+    fn test_resolved() -> crate::config::ResolvedService {
+        let config: crate::config::Config = "[services.svc]\nrun = { cmd = \"true\" }\n"
+            .parse()
+            .unwrap();
+        config
+            .services
+            .get("svc")
+            .unwrap()
+            .resolve(Platform::LinuxX86_64)
     }
 
     struct Harness {
@@ -842,6 +952,7 @@ mod tests {
             report_tx,
             Arc::new(AtomicBool::new(false)),
             assets,
+            Some(test_resolved()),
         ));
         Harness {
             tx,

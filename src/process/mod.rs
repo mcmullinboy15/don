@@ -87,7 +87,6 @@ pub(crate) enum ProcessReport {
     /// only; custody stays with the supervisor) or failed to prepare.
     ServiceStartPrepared {
         name: String,
-        context: Box<service_worker::ServiceStartContext>,
         intent: ServiceStartIntent,
         result: Result<Box<service_supervisor::ServiceWired>, String>,
     },

@@ -394,13 +394,8 @@ impl Runner {
         // those. Everything else is bookkeeping nobody needs mid-teardown.
         while let Ok(report) = self.report_rx.try_recv() {
             match report {
-                super::ProcessReport::ServiceStartPrepared {
-                    name,
-                    context,
-                    result,
-                    ..
-                } => {
-                    self.stop_late_service_start(name, context, result).await;
+                super::ProcessReport::ServiceStartPrepared { name, result, .. } => {
+                    self.stop_late_service_start(name, result).await;
                 }
                 super::ProcessReport::TaskRunPrepared { name, result, .. } => {
                     self.stop_late_task_start(name, result).await;
@@ -414,7 +409,6 @@ impl Runner {
     pub(in crate::runner) async fn stop_late_service_start(
         &mut self,
         name: String,
-        context: Box<super::service_worker::ServiceStartContext>,
         result: Result<Box<super::service_supervisor::ServiceWired>, String>,
     ) {
         let Ok(_wired) = result else {
@@ -425,12 +419,7 @@ impl Runner {
         // The supervisor wired this spawn and holds the process — ask it to
         // stop. Its reader drains before the done-signal, so joining this
         // covers the output too (what the old inline reader+stop did).
-        let shutdown_config = context
-            .resolved
-            .shutdown
-            .clone()
-            .map(|shutdown| shutdown.merged_over(&self.config.shutdown))
-            .unwrap_or_else(|| self.config.shutdown.clone());
+        let shutdown_config = self.effective_shutdown_config(&name);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let sent = self.service_starts.registry().get(&name).is_some_and(|h| {
             h.request(super::service_supervisor::ServiceCommand::Stop(

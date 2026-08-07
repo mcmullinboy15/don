@@ -78,7 +78,8 @@ impl Runner {
                     resolved.depends_on = self
                         .config
                         .effective_depends_on(&name, &resolved.depends_on);
-                    rs.resolved = resolved;
+                    rs.resolved = resolved.clone();
+                    self.configure_supervisor(&name, Some(Box::new(resolved)), None);
                 }
             }
         }
@@ -90,6 +91,7 @@ impl Runner {
             } else {
                 false
             };
+            self.configure_supervisor(&name, None, Some(true));
             if was_building {
                 self.set_service_state(&name, ServiceState::Pending);
                 continue;

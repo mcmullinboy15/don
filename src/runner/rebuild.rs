@@ -125,6 +125,7 @@ impl Runner {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.batch_built = true;
             }
+            self.configure_supervisor(name, None, Some(true));
             if self.requeue_if_coming_up(name) {
                 continue;
             }

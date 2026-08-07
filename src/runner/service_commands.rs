@@ -1,9 +1,8 @@
-use super::service_worker::{ServiceStartContext, ServiceStartMode, run_service_build_worker};
+use super::service_worker::{ServiceStartMode, run_service_build_worker};
 use super::{
     CommandError, CommandResult, Runner, RunnerEvent, RunnerInternalCommand, ServiceStartIntent,
     ServiceState, ServiceStopAction,
 };
-use std::collections::HashMap;
 use tokio::sync::oneshot;
 
 impl Runner {
@@ -21,35 +20,6 @@ impl Runner {
         })
     }
 
-    fn service_start_snapshot(&self, name: &str) -> Result<ServiceStartContext, CommandError> {
-        let mut resolved = match self.services.get(name) {
-            Some(rs) => rs.resolved.clone(),
-            None => {
-                return Err(CommandError::UnknownService {
-                    name: name.to_string(),
-                });
-            }
-        };
-        crate::endpoints::render_env(&self.endpoints.snapshot(), name, &mut resolved.env)?;
-        let batch_built = self.services.get(name).is_some_and(|rs| rs.batch_built);
-        let prior_docker_port_bindings = self
-            .services
-            .get(name)
-            .map(|rs| rs.docker_port_bindings.clone())
-            .unwrap_or_default();
-        Ok(ServiceStartContext {
-            resolved,
-            batch_built,
-            // The supervisor owns the proxy, so the proxy's contribution —
-            // backend/public env vars and the listenfd sockets — is filled
-            // in per spawn on its side.
-            listen_fds: Vec::new(),
-            listen_fds_env: HashMap::new(),
-            fallback_ports: self.config.fallback_ports,
-            prior_docker_port_bindings,
-        })
-    }
-
     /// Queue a start on this service's supervisor.
     ///
     /// Bumps `start_generation` because the ready check and the dependency
@@ -59,7 +29,6 @@ impl Runner {
     fn spawn_service_start_worker(
         &mut self,
         name: &str,
-        context: ServiceStartContext,
         mode: ServiceStartMode,
         intent: ServiceStartIntent,
         fresh_backend_ports: bool,
@@ -71,7 +40,6 @@ impl Runner {
         };
         if !handle.request(super::service_supervisor::ServiceCommand::Start(
             super::service_supervisor::StartRequest {
-                context: Box::new(context),
                 mode,
                 intent,
                 fresh_backend_ports,
@@ -88,13 +56,11 @@ impl Runner {
     pub(in crate::runner) async fn handle_service_start_prepared(
         &mut self,
         name: &str,
-        context: Box<ServiceStartContext>,
         intent: ServiceStartIntent,
         result: Result<Box<super::service_supervisor::ServiceWired>, String>,
     ) {
         if self.shutting_down {
-            self.stop_late_service_start(name.to_string(), context, result)
-                .await;
+            self.stop_late_service_start(name.to_string(), result).await;
             return;
         }
         match result {
@@ -270,10 +236,9 @@ impl Runner {
                 message: "shutdown in progress".to_string(),
             });
         }
-        let context = self.service_start_snapshot(name)?;
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "starting...");
-        self.spawn_service_start_worker(name, context, mode, ServiceStartIntent::Background, false)
+        self.spawn_service_start_worker(name, mode, ServiceStartIntent::Background, false)
     }
 
     pub(in crate::runner) async fn queue_rebuild_service_start(
@@ -291,12 +256,10 @@ impl Runner {
         // surfaces through the prepared-Err path like any other prepare
         // failure. The runner's backend-env shadow refreshes from the wired
         // message, before ready resolution reads it.
-        let context = self.service_start_snapshot(name)?;
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "restarting...");
         self.spawn_service_start_worker(
             name,
-            context,
             ServiceStartMode::SpawnOnly,
             ServiceStartIntent::Background,
             // Restart: the new process must bind fresh ephemeral backend
@@ -316,10 +279,9 @@ impl Runner {
                 message: "shutdown in progress".to_string(),
             });
         }
-        let context = self.service_start_snapshot(name)?;
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "starting...");
-        self.spawn_service_start_worker(name, context, mode, ServiceStartIntent::Scheduled, false)
+        self.spawn_service_start_worker(name, mode, ServiceStartIntent::Scheduled, false)
     }
 
     pub(in crate::runner) async fn handle_start_service_cmd(
@@ -361,19 +323,11 @@ impl Runner {
             }));
             return;
         }
-        let context = match self.service_start_snapshot(name) {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager
             .service_event(name, "starting... (requested)");
         if let Err(e) = self.spawn_service_start_worker(
             name,
-            context,
             ServiceStartMode::Full,
             ServiceStartIntent::Reply { reply },
             false,

@@ -230,15 +230,27 @@ impl EndpointWriter {
     }
 }
 
-/// Create a writer over an empty snapshot.
+/// The read half of the endpoint projection. Clone one per consumer.
 ///
-/// There is no reader half yet: the runner is currently the only consumer and
-/// reads through [`EndpointWriter::snapshot`]. A cloneable `EndpointReader`
-/// arrives with the supervisors that render their own env — added when
-/// something needs it, not before.
-pub(crate) fn channel() -> EndpointWriter {
-    let (tx, _rx) = watch::channel(Arc::new(EndpointSnapshot::default()));
-    EndpointWriter { tx }
+/// Reads never block on the runner's command loop, which is what lets a
+/// supervisor render its own `$(peer.KEY)` references at the moment it
+/// starts, with no round trip and no dependency on `crate::runner`.
+#[derive(Clone, Debug)]
+pub(crate) struct EndpointReader {
+    rx: watch::Receiver<Arc<EndpointSnapshot>>,
+}
+
+impl EndpointReader {
+    /// The latest published snapshot.
+    pub(crate) fn snapshot(&self) -> Arc<EndpointSnapshot> {
+        self.rx.borrow().clone()
+    }
+}
+
+/// Create a linked writer/reader pair over an empty snapshot.
+pub(crate) fn channel() -> (EndpointWriter, EndpointReader) {
+    let (tx, rx) = watch::channel(Arc::new(EndpointSnapshot::default()));
+    (EndpointWriter { tx }, EndpointReader { rx })
 }
 
 /// Render `$(service.key)` references in inline environment values.
@@ -369,15 +381,15 @@ mod tests {
         }
     }
 
-    fn seeded(names: &[&str]) -> EndpointWriter {
-        let writer = channel();
+    fn seeded(names: &[&str]) -> (EndpointWriter, EndpointReader) {
+        let (writer, reader) = channel();
         writer.seed(names.iter().map(|n| n.to_string()));
-        writer
+        (writer, reader)
     }
 
     #[test]
     fn seeding_fixes_the_known_service_set() {
-        let reader = seeded(&["api", "db"]);
+        let (_writer, reader) = seeded(&["api", "db"]);
         let snapshot = reader.snapshot();
         assert_eq!(snapshot.known_services().len(), 2);
         assert!(snapshot.known_services().contains("api"));
@@ -391,8 +403,7 @@ mod tests {
     fn proxy_references_resolve_before_the_service_ever_starts() {
         // The `$(daemon.addr)` case: bindings are published at bind time, so a
         // dependent can render its env before the dependency has spawned.
-        let writer = seeded(&["daemon"]);
-        let reader = &writer;
+        let (writer, reader) = seeded(&["daemon"]);
         writer.publish_proxy(
             "daemon",
             vec![proxy_binding(
@@ -443,8 +454,7 @@ mod tests {
         ];
 
         for case in cases {
-            let writer = seeded(&["db"]);
-            let reader = &writer;
+            let (writer, reader) = seeded(&["db"]);
             if case.wire {
                 writer.publish_wired("db", vec![docker_binding("5432", 55432, 5432)], None, true);
             }
@@ -469,8 +479,7 @@ mod tests {
 
     #[test]
     fn stopping_a_docker_service_keeps_its_bindings_for_the_next_start() {
-        let writer = seeded(&["db"]);
-        let reader = &writer;
+        let (writer, reader) = seeded(&["db"]);
         writer.publish_wired("db", vec![docker_binding("5432", 55432, 5432)], None, true);
         writer.clear_custody("db");
 
@@ -484,8 +493,7 @@ mod tests {
 
     #[test]
     fn a_service_with_both_resolves_to_its_proxy() {
-        let writer = seeded(&["api"]);
-        let reader = &writer;
+        let (writer, reader) = seeded(&["api"]);
         writer.publish_wired("api", vec![docker_binding("8080", 18080, 8080)], None, true);
         writer.publish_proxy(
             "api",
@@ -503,8 +511,7 @@ mod tests {
 
     #[test]
     fn backend_env_is_never_published_as_a_reference() {
-        let writer = seeded(&["api"]);
-        let reader = &writer;
+        let (writer, reader) = seeded(&["api"]);
         writer.publish_proxy(
             "api",
             vec![proxy_binding(
@@ -531,7 +538,7 @@ mod tests {
 
     #[test]
     fn an_unknown_service_reference_is_an_error_but_a_shell_call_is_not() {
-        let reader = seeded(&["api"]);
+        let (_writer, reader) = seeded(&["api"]);
         let snapshot = reader.snapshot();
 
         let mut shell = HashMap::from([("REV".to_string(), "$(git rev-parse HEAD)".to_string())]);
@@ -548,10 +555,9 @@ mod tests {
 
     #[test]
     fn writes_land_with_no_readers_alive() {
-        // Every write takes this path today — `channel()` drops the only
-        // receiver — so `send_replace`, not `send`, is load-bearing rather
-        // than merely defensive. Same bug `state_store` pins.
-        let writer = seeded(&["api"]);
+        // `send_replace`, not `send` — the same bug `state_store` pins.
+        let (writer, reader) = seeded(&["api"]);
+        drop(reader);
         writer.publish_proxy(
             "api",
             vec![proxy_binding(
