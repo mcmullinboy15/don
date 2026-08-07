@@ -31,15 +31,6 @@ impl Runner {
             }
         };
         self.render_runtime_env(name, &mut resolved.env)?;
-        let (listen_fds, listen_fds_env) = if let Some(rs) = self.services.get(name)
-            && let Some(ref proxy) = rs.proxy
-        {
-            resolved.env.extend(proxy.env_vars());
-            resolved.env.extend(proxy.public_env_vars());
-            (proxy.listenfd_raw_fds(), proxy.listenfd_env())
-        } else {
-            (Vec::new(), HashMap::new())
-        };
         let batch_built = self.services.get(name).is_some_and(|rs| rs.batch_built);
         let prior_docker_port_bindings = self
             .services
@@ -49,8 +40,11 @@ impl Runner {
         Ok(ServiceStartContext {
             resolved,
             batch_built,
-            listen_fds,
-            listen_fds_env,
+            // The supervisor owns the proxy, so the proxy's contribution —
+            // backend/public env vars and the listenfd sockets — is filled
+            // in per spawn on its side.
+            listen_fds: Vec::new(),
+            listen_fds_env: HashMap::new(),
             fallback_ports: self.config.fallback_ports,
             prior_docker_port_bindings,
         })
@@ -68,6 +62,7 @@ impl Runner {
         context: ServiceStartContext,
         mode: ServiceStartMode,
         intent: ServiceStartIntent,
+        fresh_backend_ports: bool,
     ) -> Result<(), CommandError> {
         let Some(handle) = self.service_starts.registry().get(name).cloned() else {
             return Err(CommandError::UnknownService {
@@ -79,6 +74,7 @@ impl Runner {
                 context: Box::new(context),
                 mode,
                 intent,
+                fresh_backend_ports,
             },
         )) {
             return Err(CommandError::Failed {
@@ -230,12 +226,18 @@ impl Runner {
         if self.shutting_down {
             return;
         }
-        let has_proxy = self.services.get(name).is_some_and(|rs| rs.proxy.is_some());
-        if has_proxy
-            && let Some(rs) = self.services.get(name)
-            && let Some(ref proxy) = rs.proxy
+        // Clear the backend before the stop is queued: mailbox FIFO applies
+        // it first, so connections arriving during the restart queue instead
+        // of racing the dying process.
+        if self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.proxy_view.is_some())
         {
-            proxy.clear_backend();
+            self.send_proxy_directive(
+                name,
+                super::service_supervisor::ProxyDirective::ClearBackend,
+            );
         }
 
         if self.services.get(name).is_some_and(|rs| rs.pgid.is_some()) {
@@ -314,7 +316,7 @@ impl Runner {
         let context = self.service_start_snapshot(name)?;
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "starting...");
-        self.spawn_service_start_worker(name, context, mode, ServiceStartIntent::Background)
+        self.spawn_service_start_worker(name, context, mode, ServiceStartIntent::Background, false)
     }
 
     pub(in crate::runner) async fn queue_rebuild_service_start(
@@ -327,33 +329,11 @@ impl Runner {
                 message: "shutdown in progress".to_string(),
             });
         }
-        let realloc_result = if let Some(rs) = self.services.get_mut(name) {
-            if let Some(ref mut proxy) = rs.proxy {
-                let result = proxy.reallocate_ephemeral_ports().await;
-                // The view's backend env is a shadow; refresh it so ready
-                // checks written against `${PORT}` resolve to the port the
-                // *new* process was told to bind.
-                if result.is_ok()
-                    && let Some(view) = rs.proxy_view.as_mut()
-                {
-                    view.backend_env = proxy.env_vars();
-                }
-                Some(result)
-            } else {
-                None
-            }
-        } else {
-            return Err(CommandError::UnknownService {
-                name: name.to_string(),
-            });
-        };
-        if let Some(Err(e)) = realloc_result {
-            return Err(CommandError::Failed {
-                name: name.to_string(),
-                message: format!("failed to allocate ephemeral ports: {e}"),
-            });
-        }
-
+        // Ephemeral backend ports are reallocated by the supervisor (the
+        // proxy's owner) as part of handling this start — a failure there
+        // surfaces through the prepared-Err path like any other prepare
+        // failure. The runner's backend-env shadow refreshes from the wired
+        // message, before ready resolution reads it.
         let context = self.service_start_snapshot(name)?;
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "restarting...");
@@ -362,6 +342,9 @@ impl Runner {
             context,
             ServiceStartMode::SpawnOnly,
             ServiceStartIntent::Background,
+            // Restart: the new process must bind fresh ephemeral backend
+            // ports while connections draining to the old ones finish.
+            true,
         )
     }
 
@@ -385,6 +368,7 @@ impl Runner {
             context,
             mode,
             ServiceStartIntent::Scheduled { done_tx },
+            false,
         )
     }
 
@@ -442,6 +426,7 @@ impl Runner {
             context,
             ServiceStartMode::Full,
             ServiceStartIntent::Reply { reply },
+            false,
         ) {
             self.output_manager
                 .service_error_event(name, &e.to_string());

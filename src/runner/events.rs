@@ -70,12 +70,18 @@ impl Runner {
                     _ => "started".to_string(),
                 }
             });
-            // Activate proxy backend before state flip so the proxy is ready
-            // to forward the moment observers see `Ready`.
-            if let Some(rs) = self.services.get(&item.name)
-                && let Some(ref proxy) = rs.proxy
+            // Re-activate the proxy backend on ready. The supervisor already
+            // activates at wire time; this covers a backend cleared between
+            // wire and ready (e.g. a rebuild's ClearBackend landing late).
+            if self
+                .services
+                .get(&item.name)
+                .is_some_and(|rs| rs.proxy_view.is_some())
             {
-                proxy.set_backend();
+                self.send_proxy_directive(
+                    &item.name,
+                    super::service_supervisor::ProxyDirective::SetBackend,
+                );
             }
             // Reaching Ready resets the backoff counter, but not the
             // rapid-crash streak — see `handle_service_exited`, which clears

@@ -12,11 +12,13 @@
 //! reports a prepared start for its service, and only for the start it is
 //! committed to.
 //!
-//! Note this owns *preparation only*. Wiring the process up, running the
-//! ready check and sequencing shutdown all stay on the runner, because they
-//! read cross-item state (dependency order) or are read back from many places
-//! — see the task-side measurement in the plan for why moving them is a net
-//! loss rather than the obvious next step.
+//! The supervisor owns its service's process from wire to reap — prepare,
+//! spawn, output reader, OSC sink, crash detection, stop-with-drain — and
+//! its proxy, whose listeners span process generations. The runner keeps
+//! what is genuinely cross-item: scheduling, state folds, ready resolution
+//! and completion (which cross channels — see the plan's ordering note),
+//! restart policy, and shutdown sequencing. Proxy *decisions* likewise stay
+//! with the runner and arrive as [`ProxyDirective`]s.
 
 use super::RunnerInternalCommand;
 use super::service;
@@ -34,6 +36,10 @@ pub(in crate::runner) struct StartRequest {
     pub(in crate::runner) context: Box<ServiceStartContext>,
     pub(in crate::runner) mode: ServiceStartMode,
     pub(in crate::runner) intent: ServiceStartIntent,
+    /// Allocate new ephemeral backend ports before spawning. Set on the
+    /// restart path so the new process binds a fresh port while draining
+    /// connections to the old one finish undisturbed.
+    pub(in crate::runner) fresh_backend_ports: bool,
 }
 
 /// Everything a service's supervisor can be asked to do.
@@ -45,6 +51,38 @@ pub(in crate::runner) enum ServiceCommand {
     /// The reply waits for the output reader to drain, so "stopped" can
     /// never outrun the process's last lines.
     Stop(StopRequest),
+    /// Adjust the owned proxy. Applied immediately, even while a start is
+    /// being prepared — a proxy directive is never a supersession.
+    Proxy(ProxyDirective),
+}
+
+/// What the runner may ask a supervisor to do with its proxy.
+///
+/// The runner stays the *decider* — connection policy is derived from
+/// lifecycle state it folds, and backend activation on ready is gated by a
+/// ready outcome it resolves — but the proxy itself lives here, so decisions
+/// arrive as directives. Mailbox FIFO gives the only ordering that matters:
+/// a `ClearBackend` sent before a `Stop` is applied before the stop runs.
+pub(in crate::runner) enum ProxyDirective {
+    /// Set the connection policy (serve / lazy-trigger / refuse).
+    SetPolicy(crate::proxy::ConnectionPolicy),
+    /// Point forwarding backends at their configured addresses.
+    SetBackend,
+    /// Clear forwarding backends; new connections queue until set again.
+    ClearBackend,
+    /// Stop listening entirely — teardown is beginning.
+    Shutdown,
+}
+
+/// A service's bound proxy and its lazy-demand channel, handed to the
+/// supervisor at spawn. Bound by the runner during construction so port
+/// conflicts still fail startup before anything spawns.
+pub(in crate::runner) struct ProxyAssets {
+    pub(in crate::runner) proxy: crate::proxy::ServiceProxy,
+    /// The receiving half of the proxy's lazy trigger channel — `Some` only
+    /// for lazy services. The supervisor forwards each trigger as
+    /// [`super::ItemReport::Demand`].
+    pub(in crate::runner) demand_rx: Option<mpsc::Receiver<String>>,
 }
 
 /// What the runner receives for a spawned, wired start.
@@ -67,6 +105,13 @@ pub(in crate::runner) struct ServiceWired {
     /// so monitor lifetime is tied to custody rather than to per-site
     /// bookkeeping discipline.
     pub(in crate::runner) monitor_cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    /// The proxy's env-mode backend vars this spawn was launched with —
+    /// `Some` iff the service has a proxy. The runner refreshes its
+    /// `ProxyView` shadow from this, so ready checks written against
+    /// `${PORT}` resolve to the port the new process was actually told to
+    /// bind. Wiring precedes ready resolution, so the shadow is always
+    /// current where it is read.
+    pub(in crate::runner) proxy_backend_env: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Parameters for [`ServiceCommand::Stop`].
@@ -111,16 +156,19 @@ pub(in crate::runner) struct StartEnv {
 /// Owner half for services.
 pub(in crate::runner) type ServiceStarts = super::supervisor::Supervisors<ServiceCommand>;
 
-/// Start one start-supervisor per service.
+/// Start one start-supervisor per service, each taking ownership of its
+/// bound proxy (if any) from `proxies`.
 pub(in crate::runner) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     env: &StartEnv,
     outputs: &dyn Fn(&str) -> Option<ItemOutput>,
     internal_tx: &mpsc::Sender<RunnerInternalCommand>,
     report_tx: &mpsc::UnboundedSender<super::ItemReport>,
+    proxies: &mut std::collections::HashMap<String, ProxyAssets>,
 ) -> ServiceStarts {
     ServiceStarts::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
+        let assets = proxies.remove(&name);
         supervise(
             name,
             rx,
@@ -129,6 +177,7 @@ pub(in crate::runner) fn spawn_supervisors<'a>(
             internal_tx.clone(),
             report_tx.clone(),
             busy,
+            assets,
         )
     })
 }
@@ -170,6 +219,7 @@ fn stop_superseded_start(
 /// Same rule as the task supervisor: a superseded start is **finished, not
 /// aborted**. `start_service_worker` may already have a process up by the
 /// time a newer request arrives, and dropping that future would strand it.
+#[allow(clippy::too_many_arguments)]
 async fn supervise(
     name: String,
     mut rx: mpsc::UnboundedReceiver<ServiceCommand>,
@@ -178,10 +228,17 @@ async fn supervise(
     internal_tx: mpsc::Sender<RunnerInternalCommand>,
     report_tx: mpsc::UnboundedSender<super::ItemReport>,
     busy: Arc<AtomicBool>,
+    proxy_assets: Option<ProxyAssets>,
 ) {
     let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<ServiceCommand> = None;
     let mut mailbox_closed = false;
+    // The proxy outlives individual starts — its listeners span process
+    // generations, which is what makes zero-downtime restart possible.
+    let (mut proxy, mut demand_rx) = match proxy_assets {
+        Some(assets) => (Some(assets.proxy), assets.demand_rx),
+        None => (None, None),
+    };
     // The process this supervisor currently owns, from wire to reap/stop.
     let mut held: Option<service::ServiceHandle> = None;
     // The output reader for the held process, and its end-of-stream signal.
@@ -218,15 +275,35 @@ async fn supervise(
                         reap_and_report(&name, &mut held, &report_tx).await;
                         continue;
                     }
+                    // The lazy proxy saw a connection: demand. The runner
+                    // gates on service state, so duplicates are harmless.
+                    demand = wait_demand(&mut demand_rx), if demand_rx.is_some() => {
+                        match demand {
+                            Some(_) => {
+                                let _ = report_tx.send(super::ItemReport::Demand {
+                                    name: name.clone(),
+                                });
+                            }
+                            // Every trigger sender is gone (proxy shut down);
+                            // stop selecting on a closed channel.
+                            None => demand_rx = None,
+                        }
+                        continue;
+                    }
                 }
             },
         };
         let StartRequest {
-            context,
+            mut context,
             mode,
             intent,
+            fresh_backend_ports,
         } = match command {
             ServiceCommand::Start(request) => request,
+            ServiceCommand::Proxy(directive) => {
+                apply_proxy_directive(&mut proxy, directive);
+                continue;
+            }
             ServiceCommand::Stop(request) => {
                 reader_eof = None;
                 monitor_cancel = None;
@@ -285,6 +362,30 @@ async fn supervise(
             }
         };
 
+        // The proxy's per-spawn contribution: fresh ephemeral backend ports
+        // on restart, the backend/public env vars, and the listenfd sockets
+        // the child inherits.
+        if let Some(p) = proxy.as_mut() {
+            if fresh_backend_ports && let Err(error) = p.reallocate_ephemeral_ports().await {
+                let sent = internal_tx
+                    .send(RunnerInternalCommand::ServiceStartPrepared {
+                        name: name.clone(),
+                        context,
+                        intent,
+                        result: Err(format!("failed to allocate ephemeral ports: {error}")),
+                    })
+                    .await;
+                if sent.is_err() {
+                    return;
+                }
+                continue;
+            }
+            context.resolved.env.extend(p.env_vars());
+            context.resolved.env.extend(p.public_env_vars());
+            context.listen_fds = p.listenfd_raw_fds();
+            context.listen_fds_env = p.listenfd_env();
+        }
+
         // Clone the context the worker borrows so the original can move into
         // the completion message afterwards.
         let context_for_worker = context.clone();
@@ -306,6 +407,15 @@ async fn supervise(
             tokio::select! {
                 result = &mut worker => break result,
                 next = rx.recv(), if !mailbox_closed => match next {
+                    // Proxy directives apply immediately, not as a
+                    // supersession. A directive queued *behind* a parked
+                    // Start/Stop does run ahead of it, which is safe: the
+                    // one order-sensitive pair the runner sends is
+                    // ClearBackend-then-Stop, and that order is preserved
+                    // because the directive comes first in the mailbox.
+                    Some(ServiceCommand::Proxy(directive)) => {
+                        apply_proxy_directive(&mut proxy, directive);
+                    }
                     Some(next) => superseded = Some(next),
                     // Guarded so a closed mailbox doesn't spin this select.
                     None => mailbox_closed = true,
@@ -330,6 +440,7 @@ async fn supervise(
                             output.as_ref(),
                             service_writer.as_ref(),
                             start_result,
+                            proxy.as_ref(),
                             &mut held,
                             &mut reader,
                             &mut reader_eof,
@@ -352,6 +463,44 @@ async fn supervise(
                 }
             }
         }
+    }
+}
+
+/// Apply a runner proxy decision to the owned proxy. No-op for services
+/// without one, and after `Shutdown`.
+fn apply_proxy_directive(
+    proxy: &mut Option<crate::proxy::ServiceProxy>,
+    directive: ProxyDirective,
+) {
+    match directive {
+        ProxyDirective::SetPolicy(policy) => {
+            if let Some(p) = proxy.as_mut() {
+                p.set_policy(policy);
+            }
+        }
+        ProxyDirective::SetBackend => {
+            if let Some(p) = proxy.as_ref() {
+                p.set_backend();
+            }
+        }
+        ProxyDirective::ClearBackend => {
+            if let Some(p) = proxy.as_ref() {
+                p.clear_backend();
+            }
+        }
+        ProxyDirective::Shutdown => {
+            if let Some(p) = proxy.take() {
+                p.shutdown();
+            }
+        }
+    }
+}
+
+/// Await a lazy trigger without consuming the select slot on `None`.
+async fn wait_demand(demand_rx: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+    match demand_rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -381,11 +530,14 @@ async fn await_reader(handle: tokio::task::JoinHandle<()>) {
 }
 
 /// Take ownership of a fresh spawn: extract everything the runner's
-/// bookkeeping needs, start the output reader, and hold the handle.
+/// bookkeeping needs, start the output reader, activate the proxy backend,
+/// and hold the handle.
+#[allow(clippy::too_many_arguments)]
 async fn wire_spawn(
     output: Option<&ItemOutput>,
     service_writer: Option<&crate::output::ServiceWriter>,
     start_result: service::StartResult,
+    proxy: Option<&crate::proxy::ServiceProxy>,
     held: &mut Option<service::ServiceHandle>,
     reader: &mut Option<tokio::task::JoinHandle<()>>,
     reader_eof: &mut Option<tokio::sync::oneshot::Receiver<()>>,
@@ -435,6 +587,13 @@ async fn wire_spawn(
     *held = Some(handle);
     *monitor_cancel = Some(cancel_tx);
 
+    // Activate forwarding immediately — the proxy's connect loop retries
+    // with backoff, so a service that hasn't bound its port yet just makes
+    // early connections wait, exactly as when the runner did this on wiring.
+    if let Some(p) = proxy {
+        p.set_backend();
+    }
+
     ServiceWired {
         identity,
         pgid,
@@ -442,6 +601,7 @@ async fn wire_spawn(
         osc_sink,
         ready_exit_rx: exit_rx,
         monitor_cancel_rx: cancel_rx,
+        proxy_backend_env: proxy.map(|p| p.env_vars()),
     }
 }
 
@@ -469,4 +629,259 @@ async fn reap_and_report(
         pgid,
         status,
     });
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::config::{LogConfig, Platform, ProxyEntry, ProxyMode};
+    use crate::output::OutputManager;
+    use crate::proxy::{ConnectionPolicy, ServiceProxy};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    async fn test_env() -> StartEnv {
+        let log_config = LogConfig::Stdout;
+        let services = [("svc", &log_config)];
+        let output_manager = OutputManager::new(&services, tokio::io::sink())
+            .await
+            .unwrap();
+        StartEnv {
+            base_dir: std::env::temp_dir(),
+            pid_dir: std::env::temp_dir(),
+            platform: Platform::LinuxX86_64,
+            docker_client: None,
+            emitter: output_manager.clone_lifecycle_emitter(),
+            shutdown: ShutdownConfig::default(),
+        }
+    }
+
+    struct Harness {
+        tx: mpsc::UnboundedSender<ServiceCommand>,
+        _internal_rx: mpsc::Receiver<RunnerInternalCommand>,
+        report_rx: mpsc::UnboundedReceiver<super::super::ItemReport>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_harness(assets: Option<ProxyAssets>) -> Harness {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (internal_tx, internal_rx) = mpsc::channel(64);
+        let (report_tx, report_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(supervise(
+            "svc".to_string(),
+            rx,
+            test_env().await,
+            None,
+            internal_tx,
+            report_tx,
+            Arc::new(AtomicBool::new(false)),
+            assets,
+        ));
+        Harness {
+            tx,
+            _internal_rx: internal_rx,
+            report_rx,
+            handle,
+        }
+    }
+
+    async fn bind_env_proxy(lazy_tx: Option<mpsc::Sender<String>>) -> ServiceProxy {
+        let entries = vec![ProxyEntry {
+            listen: "127.0.0.1:0".to_string(),
+            mode: ProxyMode::Env("PORT".to_string()),
+        }];
+        let log_config = LogConfig::Stdout;
+        let services = [("svc", &log_config)];
+        let output_manager = OutputManager::new(&services, tokio::io::sink())
+            .await
+            .unwrap();
+        ServiceProxy::bind(
+            &entries,
+            false,
+            lazy_tx,
+            "svc",
+            output_manager.clone_lifecycle_emitter(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The supervisor applies each proxy directive to the proxy it owns —
+    /// observable from the outside as connection behavior on the public
+    /// address.
+    #[tokio::test]
+    async fn proxy_directives_drive_the_owned_listener() {
+        enum Expect {
+            /// The connection is closed cleanly (refusal).
+            Refused,
+            /// Bytes flow through to a live backend.
+            Forwarded,
+            /// The listener itself is gone.
+            ConnectFails,
+        }
+        struct Case {
+            name: &'static str,
+            directives: Vec<ProxyDirective>,
+            expect: Expect,
+        }
+        let cases = vec![
+            Case {
+                name: "refuse policy closes connections",
+                directives: vec![ProxyDirective::SetPolicy(ConnectionPolicy::Refuse)],
+                expect: Expect::Refused,
+            },
+            Case {
+                name: "set backend forwards to the service",
+                directives: vec![ProxyDirective::SetBackend],
+                expect: Expect::Forwarded,
+            },
+            Case {
+                name: "clear after set parks, refuse then closes",
+                directives: vec![
+                    ProxyDirective::SetBackend,
+                    ProxyDirective::ClearBackend,
+                    ProxyDirective::SetPolicy(ConnectionPolicy::Refuse),
+                ],
+                expect: Expect::Refused,
+            },
+            Case {
+                name: "shutdown drops the listener",
+                directives: vec![ProxyDirective::Shutdown],
+                expect: Expect::ConnectFails,
+            },
+        ];
+
+        for case in cases {
+            // The proxy's ephemeral backend port is allocated bind-and-drop,
+            // so any other process (or parallel test) can steal it before the
+            // stand-in backend below rebinds it. A steal is a setup failure,
+            // not a regression — retry with a fresh proxy.
+            const SETUP_ATTEMPTS: usize = 10;
+            let mut attempt = 0;
+            let (proxy, backend) = loop {
+                attempt += 1;
+                let proxy = bind_env_proxy(None).await;
+                let backend_port: u16 = proxy
+                    .view()
+                    .backend_env
+                    .get("PORT")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                match tokio::net::TcpListener::bind(("127.0.0.1", backend_port)).await {
+                    Ok(listener) => break (proxy, listener),
+                    Err(error) => assert!(
+                        attempt < SETUP_ATTEMPTS,
+                        "{}: could not claim backend port: {error}",
+                        case.name
+                    ),
+                }
+            };
+            let view = proxy.view();
+            let public_addr = view.bindings[0].bound_addr;
+
+            // A stand-in service on the ephemeral backend port that writes
+            // one byte to every connection.
+            let backend_task = tokio::spawn(async move {
+                while let Ok((mut conn, _)) = backend.accept().await {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = conn.write_all(b"x").await;
+                }
+            });
+
+            let harness = spawn_harness(Some(ProxyAssets {
+                proxy,
+                demand_rx: None,
+            }))
+            .await;
+            for directive in case.directives {
+                harness.tx.send(ServiceCommand::Proxy(directive)).unwrap();
+            }
+
+            // Directive application is asynchronous, so a connection can be
+            // served under an *intermediate* state of a multi-directive
+            // sequence (e.g. accepted after SetBackend but before the
+            // ClearBackend behind it). Poll fresh connections until the
+            // final state is observed; only never settling is a failure.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{}: directives never took effect",
+                    case.name
+                );
+                match case.expect {
+                    Expect::Refused | Expect::Forwarded => {
+                        let mut conn = match tokio::net::TcpStream::connect(public_addr).await {
+                            Ok(conn) => conn,
+                            Err(_) => panic!("{}: listener vanished", case.name),
+                        };
+                        let mut buf = [0u8; 1];
+                        let read =
+                            tokio::time::timeout(Duration::from_millis(500), conn.read(&mut buf))
+                                .await;
+                        match (&case.expect, read) {
+                            (Expect::Refused, Ok(Ok(0))) => break,
+                            (Expect::Forwarded, Ok(Ok(read))) if &buf[..read] == b"x" => break,
+                            // Parked, served under a stale intermediate
+                            // state, or errored — not settled yet.
+                            _ => {}
+                        }
+                    }
+                    Expect::ConnectFails => {
+                        if tokio::net::TcpStream::connect(public_addr).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            backend_task.abort();
+            harness.handle.abort();
+        }
+    }
+
+    /// A lazy proxy's trigger reaches the runner as a demand report, and a
+    /// closed trigger channel leaves the supervisor alive.
+    #[tokio::test]
+    async fn lazy_trigger_forwards_as_demand_report() {
+        let (lazy_tx, demand_rx) = mpsc::channel(16);
+        let proxy = bind_env_proxy(Some(lazy_tx.clone())).await;
+        let mut harness = spawn_harness(Some(ProxyAssets {
+            proxy,
+            demand_rx: Some(demand_rx),
+        }))
+        .await;
+
+        lazy_tx.send("svc".to_string()).await.unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(5), harness.report_rx.recv())
+            .await
+            .expect("demand should be forwarded")
+            .expect("report channel open");
+        match report {
+            super::super::ItemReport::Demand { name } => assert_eq!(name, "svc"),
+            _ => panic!("expected a demand report"),
+        }
+
+        // Dropping every trigger sender must not end the supervisor: it
+        // still owns the proxy and must keep answering directives. The
+        // proxy holds a sender clone, so shut it down first.
+        harness
+            .tx
+            .send(ServiceCommand::Proxy(ProxyDirective::Shutdown))
+            .unwrap();
+        drop(lazy_tx);
+        harness
+            .tx
+            .send(ServiceCommand::Proxy(ProxyDirective::SetBackend))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !harness.handle.is_finished(),
+            "supervisor must survive its demand channel closing"
+        );
+        harness.handle.abort();
+    }
 }

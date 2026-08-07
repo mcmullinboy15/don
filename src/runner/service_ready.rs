@@ -26,6 +26,7 @@ impl Runner {
             osc_sink,
             ready_exit_rx: exit_rx,
             monitor_cancel_rx,
+            proxy_backend_env,
         } = wired;
         for binding in docker_port_bindings
             .iter()
@@ -61,6 +62,12 @@ impl Runner {
             // failure after the service did real work (see the crash-loop
             // guard in `handle_service_exited`).
             rs.last_start = Some(std::time::Instant::now());
+            // Refresh the backend-env shadow before ready resolution below:
+            // a restart reallocates ephemeral backend ports, and a `${PORT}`
+            // ready check must resolve to the port this spawn was told.
+            if let (Some(view), Some(backend_env)) = (rs.proxy_view.as_mut(), proxy_backend_env) {
+                view.backend_env = backend_env;
+            }
         }
         if let Some(pgid) = spawned_pgid {
             self.output_manager
@@ -79,14 +86,8 @@ impl Runner {
         // actual host ports are authoritative only after container start.
         let ready_config = self.effective_ready_check(name, resolved);
         let event_tx = self.event_tx.clone();
-        // For proxy services, activate the backend immediately so the proxy
-        // can start forwarding. The proxy has connection-level retry with
-        // backoff, so it handles the case where the service isn't listening yet.
-        if let Some(rs) = self.services.get(name)
-            && let Some(ref proxy) = rs.proxy
-        {
-            proxy.set_backend();
-        }
+        // The proxy backend was activated by the supervisor at wire time —
+        // forwarding is live before this bookkeeping runs.
 
         if let Some(ready) = ready_config {
             // The monitor's cancellation lives with the supervisor — it

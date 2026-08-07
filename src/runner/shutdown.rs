@@ -131,11 +131,18 @@ impl Runner {
 
         self.drain_late_worker_results().await;
 
-        // Shut down all proxy listeners first (stop accepting new connections).
-        for rs in self.services.values_mut() {
-            if let Some(proxy) = rs.proxy.take() {
-                proxy.shutdown();
-            }
+        // Shut down all proxy listeners first (stop accepting new
+        // connections). The supervisors own them; the directive is applied
+        // even mid-prepare, and lands before any queued Stop per mailbox
+        // FIFO — so no listener outlives the teardown it narrates.
+        let proxy_names: Vec<String> = self
+            .services
+            .iter()
+            .filter(|(_, rs)| rs.proxy_view.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in proxy_names {
+            self.send_proxy_directive(&name, super::service_supervisor::ProxyDirective::Shutdown);
         }
 
         // The API server is NOT told to stop here, deliberately. Streaming

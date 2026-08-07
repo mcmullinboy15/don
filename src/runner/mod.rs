@@ -841,13 +841,6 @@ pub struct Runner {
     /// Consolidated per-task runtime state.
     tasks: HashMap<String, RuntimeTask>,
 
-    /// Sender half handed to ServiceProxy::bind for lazy services. The
-    /// proxy speaks plain names, not runner types; a forwarder in `run`
-    /// adapts its channel onto the report channel. Moves inside the service
-    /// supervisor when it takes proxy ownership.
-    lazy_start_tx: mpsc::Sender<String>,
-    /// Receiver half, consumed by the forwarder spawned in `run`.
-    lazy_start_rx: Option<mpsc::Receiver<String>>,
     /// The items' lossless report channel — see [`ItemReport`].
     report_tx: mpsc::UnboundedSender<ItemReport>,
     report_rx: mpsc::UnboundedReceiver<ItemReport>,
@@ -981,7 +974,6 @@ impl Runner {
         let (internal_tx, internal_rx) = mpsc::channel(64);
         let (event_tx, _) = broadcast::channel(256);
         let (state, _state_reader) = state_store::channel(state_store::StateSnapshot::default());
-        let (lazy_start_tx, lazy_start_rx) = mpsc::channel(16);
         let (report_tx, report_rx) = mpsc::unbounded_channel();
         let (shutdown_flag_tx, _shutdown_flag_rx) = tokio::sync::watch::channel(false);
 
@@ -1008,7 +1000,7 @@ impl Runner {
 
         setup::prune_download_cache(&config, platform, &don_dir, &output_manager);
 
-        let (services, tasks) = setup::build_runtime_maps(
+        let (mut services, tasks) = setup::build_runtime_maps(
             &config,
             platform,
             &base_dir,
@@ -1017,6 +1009,54 @@ impl Runner {
             headless,
         )
         .await;
+
+        // Bind every proxy before any supervisor exists, so a port conflict
+        // fails startup before anything spawns — "validate everything before
+        // starting anything". Each supervisor takes ownership of its bound
+        // proxy at spawn below; the runner keeps only the view. Lazy services
+        // get a per-service trigger channel whose receiving half rides along,
+        // and the supervisor forwards each trigger as a demand report.
+        let mut proxies: HashMap<String, service_supervisor::ProxyAssets> = HashMap::new();
+        for (name, rs) in services.iter_mut() {
+            if rs.resolved.proxy.is_empty() {
+                continue;
+            }
+            let (lazy_tx, demand_rx) = if rs.resolved.lazy {
+                let (tx, rx) = mpsc::channel(16);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            match crate::proxy::ServiceProxy::bind(
+                &rs.resolved.proxy,
+                config.fallback_ports,
+                lazy_tx,
+                name,
+                output_manager.clone_lifecycle_emitter(),
+            )
+            .await
+            {
+                Ok(proxy) => {
+                    for message in proxy.fallback_descriptions() {
+                        output_manager.service_event(name, &message);
+                    }
+                    let addrs: Vec<String> =
+                        proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
+                    output_manager.service_debug_event(
+                        name,
+                        &format!("proxy listening on {}", addrs.join(", ")),
+                    );
+                    rs.proxy_view = Some(proxy.view());
+                    proxies.insert(
+                        name.clone(),
+                        service_supervisor::ProxyAssets { proxy, demand_rx },
+                    );
+                }
+                Err(e) => {
+                    return Err(RunnerError::Config(format!("{name}: {e}")));
+                }
+            }
+        }
 
         // One supervisor per service, likewise immutable once built.
         let service_starts = service_supervisor::spawn_supervisors(
@@ -1032,6 +1072,7 @@ impl Runner {
             &|name| output_manager.item_output(name),
             &internal_tx,
             &report_tx,
+            &mut proxies,
         );
 
         // One supervisor per task, started before the runner exists so the
@@ -1060,8 +1101,6 @@ impl Runner {
             base_dir,
             services,
             tasks,
-            lazy_start_tx,
-            lazy_start_rx: Some(lazy_start_rx),
             report_tx,
             report_rx,
             server_shutdown_tx: None,
@@ -1186,9 +1225,7 @@ impl Runner {
         }
         let was_refusing = view.is_refusing();
         view.policy = policy;
-        if let Some(proxy) = rs.proxy.as_mut() {
-            proxy.set_policy(policy);
-        }
+        self.send_proxy_directive(name, service_supervisor::ProxyDirective::SetPolicy(policy));
         // Only the refusal edge is worth a line, and it belongs in the normal
         // log: a dev staring at `ECONNRESET` in their browser shouldn't have
         // to rerun with `--verbose` to find out why.
@@ -1202,6 +1239,19 @@ impl Runner {
         } else {
             self.output_manager
                 .service_event(name, "proxy accepting connections again");
+        }
+    }
+
+    /// Hand a proxy decision to the service's supervisor, which owns the
+    /// listeners. Fire-and-forget: a closed mailbox means teardown is ahead
+    /// of us and the proxy is already gone.
+    pub(in crate::runner) fn send_proxy_directive(
+        &self,
+        name: &str,
+        directive: service_supervisor::ProxyDirective,
+    ) {
+        if let Some(handle) = self.service_starts.registry().get(name) {
+            let _ = handle.request(service_supervisor::ServiceCommand::Proxy(directive));
         }
     }
 
@@ -1471,57 +1521,18 @@ impl Runner {
             self.output_manager.register_build_tool("bazel").await;
         }
 
-        // Pre-bind all proxy listeners. This catches port conflicts upfront
-        // and starts the accept loops (connections queue until the service is ready).
-        let proxy_service_names: Vec<(String, bool)> = self
+        // The proxies were bound during construction (fail-fast) and belong
+        // to the supervisors. Set lazy services to `Lazy` here — they won't
+        // enter the startup flow until a connection demands them — and
+        // publish the initial ports manifest.
+        let lazy_names: Vec<String> = self
             .services
             .iter()
-            .filter(|(_, rs)| !rs.resolved.proxy.is_empty())
-            .map(|(name, rs)| (name.clone(), rs.resolved.lazy))
+            .filter(|(_, rs)| rs.resolved.lazy && rs.proxy_view.is_some())
+            .map(|(name, _)| name.clone())
             .collect();
-        for (name, is_lazy) in &proxy_service_names {
-            let proxy_config = match self.services.get(name) {
-                Some(rs) => rs.resolved.proxy.clone(),
-                None => continue,
-            };
-            let lazy_tx = if *is_lazy {
-                Some(self.lazy_start_tx.clone())
-            } else {
-                None
-            };
-            match crate::proxy::ServiceProxy::bind(
-                &proxy_config,
-                self.config.fallback_ports,
-                lazy_tx,
-                name,
-                self.output_manager.clone_lifecycle_emitter(),
-            )
-            .await
-            {
-                Ok(proxy) => {
-                    for message in proxy.fallback_descriptions() {
-                        self.output_manager.service_event(name, &message);
-                    }
-                    let addrs: Vec<String> =
-                        proxy.listen_addrs().iter().map(|a| a.to_string()).collect();
-                    self.output_manager.service_debug_event(
-                        name,
-                        &format!("proxy listening on {}", addrs.join(", ")),
-                    );
-                    if let Some(rs) = self.services.get_mut(name) {
-                        rs.proxy_view = Some(proxy.view());
-                        rs.proxy = Some(proxy);
-                    }
-                    // Set lazy services to Lazy state (they won't enter the
-                    // startup flow until triggered by a connection).
-                    if *is_lazy {
-                        self.set_service_state(name, ServiceState::Lazy);
-                    }
-                }
-                Err(e) => {
-                    return Err(RunnerError::Config(format!("{name}: {e}")));
-                }
-            }
+        for name in lazy_names {
+            self.set_service_state(&name, ServiceState::Lazy);
         }
         self.refresh_runtime_port_manifest();
 
@@ -1541,21 +1552,6 @@ impl Runner {
         // The watcher speaks its own vocabulary; `watch_link` adapts it to the
         // runner's, so `watch` needs no runner types. Subscribe before setup
         // so no completion emitted during it is missed.
-        // Adapt the proxies' plain-name lazy channel onto the report
-        // channel. Ends when every proxy's sender is gone (shutdown) or the
-        // runner drops its report receiver. Lives here, not on a proxy or
-        // supervisor, only until supervisors own their proxies.
-        if let Some(mut lazy_rx) = self.lazy_start_rx.take() {
-            let report_tx = self.report_tx.clone();
-            tokio::spawn(async move {
-                while let Some(name) = lazy_rx.recv().await {
-                    if report_tx.send(ItemReport::Demand { name }).is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-
         let (watch_signal_tx, watch_signal_rx) = mpsc::unbounded_channel();
         let (watch_outcome_tx, watch_outcome_rx) = mpsc::unbounded_channel();
         let watch_link_handle = watch_link::spawn(
@@ -3191,7 +3187,7 @@ mod tests {
         assert!(rs.osc_sink.is_none());
         assert!(rs.attach_lock.is_none());
         assert!(rs.attach_waiter.is_none());
-        assert!(rs.proxy.is_none());
+        assert!(rs.proxy_view.is_none());
         assert!(rs.resolved_watch_paths.is_empty());
         assert!(rs.bazel_binary_path.is_none());
         assert!(!rs.batch_built);
