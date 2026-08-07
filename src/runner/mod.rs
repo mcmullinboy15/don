@@ -59,7 +59,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use self::build_tools::BatchBuildOutcome;
 #[cfg(test)]
 use self::build_tools::bazel_graph_requery_group_dir;
-use self::events::{ItemDone, TaskExit};
+use self::events::TaskExit;
 #[cfg(test)]
 use self::graph::compute_depths;
 use self::graph::topological_sort;
@@ -87,31 +87,35 @@ enum ServiceStartIntent {
 }
 
 enum TaskRunIntent {
-    Scheduled { done_tx: mpsc::Sender<ItemDone> },
+    /// The dependency sweep asked for this run; its exit report drives the
+    /// sweep-visible transition.
+    Scheduled,
     Background,
 }
 
 pub(crate) struct TaskRunWaiter {
-    generation: u64,
+    /// Identifies which registration this waiter is — so a timeout fired
+    /// for a superseded waiter cannot answer its replacement.
+    token: u64,
     reply: Option<oneshot::Sender<CommandResult>>,
     timeout_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TaskRunWaiter {
     pub(crate) fn new(
-        generation: u64,
+        token: u64,
         reply: oneshot::Sender<CommandResult>,
         timeout_task: Option<tokio::task::JoinHandle<()>>,
     ) -> Self {
         Self {
-            generation,
+            token,
             reply: Some(reply),
             timeout_task,
         }
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
+    pub(crate) fn token(&self) -> u64 {
+        self.token
     }
 
     pub(crate) fn complete(mut self, result: CommandResult) {
@@ -510,7 +514,7 @@ enum RunnerInternalCommand {
     /// A manually-triggered task wait exceeded its requested wait deadline.
     TaskRunWaitTimedOut {
         name: String,
-        generation: u64,
+        token: u64,
         timeout: String,
     },
     /// Result of the startup-phase batch build.
@@ -856,8 +860,9 @@ pub struct Runner {
 
     /// Item-completion sender shared by dependency-scheduled starts and config
     /// reload paths. Ready-check and task-completion callbacks send here.
-    /// The main loop's `done_rx` receives these.
-    done_tx: Option<mpsc::Sender<ItemDone>>,
+    /// True once `run()`'s scheduler is live. Transitions before that
+    /// (construction, setup) must not enqueue dependency sweeps.
+    scheduler_live: bool,
 
     // Shutdown signal receiver — wakes the select loop when Ctrl+C is pressed.
     // `Option` because `run()` takes it out at the top to consume in the
@@ -1095,7 +1100,7 @@ impl Runner {
             internal_rx,
             event_tx,
             state,
-            done_tx: None,
+            scheduler_live: false,
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
             watch: None,
@@ -1146,7 +1151,7 @@ impl Runner {
         if let Some(state) = changed {
             self.sync_proxy_policy(name);
             self.broadcast_service_state(name, state);
-            if self.done_tx.is_some()
+            if self.scheduler_live
                 && (matches!(
                     state,
                     ServiceState::Pending
@@ -1256,7 +1261,7 @@ impl Runner {
         }
         self.sync_proxy_policy(name);
         self.broadcast_service_state(name, ServiceState::DependencyFailed);
-        if state_changed && self.done_tx.is_some() {
+        if state_changed && self.scheduler_live {
             self.schedule_start_pending();
         }
         state_changed
@@ -1284,7 +1289,7 @@ impl Runner {
             .and_then(|rt| rt.set_state(new_state));
         if let Some(state) = changed {
             self.broadcast_task_state(name, state);
-            if self.done_tx.is_some()
+            if self.scheduler_live
                 && (matches!(
                     state,
                     TaskItemState::Pending
@@ -1318,7 +1323,7 @@ impl Runner {
             return false;
         }
         self.broadcast_task_state(name, TaskItemState::DependencyFailed);
-        if state_changed && self.done_tx.is_some() {
+        if state_changed && self.scheduler_live {
             self.schedule_start_pending();
         }
         state_changed
@@ -1639,8 +1644,7 @@ impl Runner {
 
         // Channel for dependency-scheduled completion notifications. Store the
         // sender on `self` so services requested later use the same path.
-        let (done_tx, mut done_rx) = mpsc::channel::<ItemDone>(64);
-        self.done_tx = Some(done_tx);
+        self.scheduler_live = true;
 
         // Initial non-lazy items already occupy Pending. A lazy connection
         // performs the same state transition and can join this scheduler at
@@ -1692,9 +1696,6 @@ impl Runner {
                 }
 
                 tokio::select! {
-                    Some(item_done) = done_rx.recv() => {
-                        self.handle_item_done(&item_done);
-                    }
                     Some(cmd) = self.cmd_rx.recv() => {
                         match cmd {
                             RunnerCommand::Shutdown => {
@@ -1806,10 +1807,10 @@ impl Runner {
                             }
                             RunnerInternalCommand::TaskRunWaitTimedOut {
                                 name,
-                                generation,
+                                token,
                                 timeout,
                             } => {
-                                self.handle_task_run_wait_timeout(&name, generation, &timeout);
+                                self.handle_task_run_wait_timeout(&name, token, &timeout);
                             }                            RunnerInternalCommand::BatchBuildComplete(outcome) => {
                                 // Drop the abort-on-drop handle: the task is done,
                                 // and leaving the handle live would abort after the

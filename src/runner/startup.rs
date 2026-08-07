@@ -580,9 +580,9 @@ impl Runner {
             ready = vec![foreground_name.clone()];
         }
 
-        let Some(done_tx) = self.done_tx.clone() else {
+        if !self.scheduler_live {
             return;
-        };
+        }
 
         for name in ready {
             if shutdown_requested() {
@@ -652,9 +652,7 @@ impl Runner {
                     task_cfg,
                     HashMap::new(),
                     TaskRunMode::Startup { has_dependents },
-                    TaskRunIntent::Scheduled {
-                        done_tx: done_tx.clone(),
-                    },
+                    TaskRunIntent::Scheduled,
                 ) {
                     self.set_task_state(&name, TaskItemState::Failed);
                     self.output_manager

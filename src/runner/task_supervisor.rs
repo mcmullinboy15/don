@@ -1,20 +1,16 @@
-//! The parts of a task run that belong to the task, not to the runner.
+//! Per-task run supervision: the whole pipeline — prepare (resolve params,
+//! hash inputs, decide whether to run at all) → spawn → wire → wait for
+//! exit → record the outcome — owned by one task per task.
 //!
-//! A task run is a pipeline: prepare (resolve params, hash inputs, decide
-//! whether to run at all) → spawn → wire output → wait for exit → record the
-//! outcome. Today the runner drives that pipeline, which is why it needs
-//! `run_generation`: each stage hands off through a detached task, completions
-//! from every task land on one shared channel, and the runner cannot otherwise
-//! tell a current completion from a superseded one.
-//!
-//! This module is where that pipeline moves. It starts with the exit half —
-//! the stage that has no runner state to touch at all — as free functions
-//! taking owned inputs, so they can run anywhere. What is left in
-//! `task_commands` after each piece moves is the part only the runner may do:
-//! transition item state, which drives the cross-item dependency scheduler.
+//! Being the single producer of a task's messages, on the one lossless
+//! report channel, is what deleted the old generation counters: a
+//! completion can only arrive after its own prepared report and before
+//! anything a later run produces. What remains in `task_commands` is the
+//! part only the runner may do: transition item state, which drives the
+//! cross-item dependency scheduler.
 
+use super::TaskExit;
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::{ItemDone, NodeKind, TaskExit};
 use crate::task_state::{TaskRunInfo, TaskState};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -201,19 +197,14 @@ async fn supervise(
             Err(message) => (Err(message), None),
         };
 
-        // The scheduler answer travels with the supervisor: `done_tx` is
-        // cloneable, so the exit half can complete it from here while the
-        // intent still reaches the runner for the state transition.
+        // Everything the exit half needs, owned before the request's parts
+        // move into the prepared report.
         let outcome = run.as_ref().map(|(handle, _, _)| TaskRunOutcome {
             name: name.clone(),
             task_cfg: (*task_cfg).clone(),
             base_dir: ctx.base_dir.clone(),
             global_watch_ignore: ctx.global_watch_ignore.clone(),
             pgid: handle.pgid(),
-            done_tx: match &intent {
-                super::TaskRunIntent::Scheduled { done_tx } => Some(done_tx.clone()),
-                super::TaskRunIntent::Background => None,
-            },
             report_tx: report_tx.clone(),
             rerun: matches!(intent, super::TaskRunIntent::Background),
         });
@@ -350,11 +341,6 @@ impl NoSpawnOutcome {
         }
     }
 
-    /// The message to hand a caller waiting on this run, if it failed.
-    pub(in crate::runner) fn failure_message(&self) -> Option<String> {
-        (!self.success).then(|| self.message.clone())
-    }
-
     /// Emit this outcome's message at its own level.
     pub(in crate::runner) fn emit(&self, emitter: &crate::output::LifecycleEmitter, name: &str) {
         match self.report {
@@ -427,10 +413,6 @@ pub(in crate::runner) struct TaskRunOutcome {
     pub(in crate::runner) global_watch_ignore: Vec<String>,
     /// Process group of the run that just ended.
     pub(in crate::runner) pgid: i32,
-    /// `Some` for a startup-scheduled run — the dependency scheduler is
-    /// waiting on it. `None` for a watch rerun or a background `don run`,
-    /// which report through the runner's internal channel instead.
-    pub(in crate::runner) done_tx: Option<mpsc::Sender<ItemDone>>,
     /// Exit reports for non-scheduled runs travel on the items' lossless
     /// report channel, like service exits.
     pub(in crate::runner) report_tx: mpsc::UnboundedSender<super::ItemReport>,
@@ -489,32 +471,15 @@ impl TaskRunOutcome {
             let _ = task_state.record_run(&self.name, &last_run).await;
         }
 
-        match self.done_tx {
-            Some(done_tx) => {
-                let _ = done_tx
-                    .send(ItemDone {
-                        name: self.name,
-                        kind: NodeKind::Task,
-                        success,
-                        message,
-                        elapsed: Some(elapsed),
-                        last_run: Some(last_run),
-                        task_run_generation: None,
-                    })
-                    .await;
-            }
-            None => {
-                let _ = self.report_tx.send(super::ItemReport::TaskExited(TaskExit {
-                    name: self.name,
-                    pgid: self.pgid,
-                    success,
-                    message,
-                    elapsed: Some(elapsed),
-                    last_run: Some(last_run),
-                    rerun: self.rerun,
-                }));
-            }
-        }
+        let _ = self.report_tx.send(super::ItemReport::TaskExited(TaskExit {
+            name: self.name,
+            pgid: self.pgid,
+            success,
+            message,
+            elapsed: Some(elapsed),
+            last_run: Some(last_run),
+            rerun: self.rerun,
+        }));
     }
 }
 
@@ -533,7 +498,6 @@ mod tests {
     fn outcome(
         name: &str,
         base_dir: &std::path::Path,
-        done_tx: Option<mpsc::Sender<ItemDone>>,
         report_tx: mpsc::UnboundedSender<super::super::ItemReport>,
         rerun: bool,
     ) -> TaskRunOutcome {
@@ -543,7 +507,6 @@ mod tests {
             base_dir: base_dir.to_path_buf(),
             global_watch_ignore: Vec::new(),
             pgid: 4242,
-            done_tx,
             report_tx,
             rerun,
         }
@@ -560,7 +523,6 @@ mod tests {
             want_success: bool,
             want_report: Report,
             want_needs: Option<bool>,
-            want_failure_message: Option<&'static str>,
         }
 
         let cases = vec![
@@ -572,7 +534,6 @@ mod tests {
                 want_success: true,
                 want_report: Report::Info,
                 want_needs: Some(true),
-                want_failure_message: None,
             },
             Case {
                 label: "skipped",
@@ -582,7 +543,6 @@ mod tests {
                 // Verbose-only: nobody asked for a no-op to be announced.
                 want_report: Report::Debug,
                 want_needs: Some(false),
-                want_failure_message: None,
             },
             Case {
                 label: "prepare failed",
@@ -595,7 +555,6 @@ mod tests {
                 // background `don run`, which let the next startup sweep
                 // skip a task that had just failed.
                 want_needs: Some(true),
-                want_failure_message: Some("bad param"),
             },
         ];
 
@@ -615,12 +574,6 @@ mod tests {
                 case.outcome.needs_run_now(),
                 case.want_needs,
                 "{}: needs_run_now",
-                case.label
-            );
-            assert_eq!(
-                case.outcome.failure_message().as_deref(),
-                case.want_failure_message,
-                "{}: failure message",
                 case.label
             );
         }
@@ -710,15 +663,14 @@ mod tests {
         );
     }
 
-    /// A scheduled run answers the dependency scheduler; anything else
-    /// reports through the runner's internal channel. Exactly one of the two,
-    /// never both — a startup task that also emitted `TaskExited` would be
-    /// applied twice.
+    /// Every finished run reports exactly one `TaskExited` on the report
+    /// channel — arrival order there IS the fold order, which is what let
+    /// the run/done split (and its generation guard) be deleted.
     #[tokio::test]
-    async fn a_finished_run_reports_to_exactly_one_place() {
+    async fn a_finished_run_reports_exactly_once() {
         struct Case {
             name: &'static str,
-            scheduled: bool,
+            rerun: bool,
             status: std::process::ExitStatus,
             want_success: bool,
             want_message: Option<&'static str>,
@@ -727,28 +679,28 @@ mod tests {
         let cases = vec![
             Case {
                 name: "scheduled success",
-                scheduled: true,
+                rerun: false,
                 status: ExitStatusExt::from_raw(0),
                 want_success: true,
                 want_message: None,
             },
             Case {
                 name: "scheduled failure carries the exit code",
-                scheduled: true,
+                rerun: false,
                 status: ExitStatusExt::from_raw(3 << 8),
                 want_success: false,
                 want_message: Some("exit code 3"),
             },
             Case {
                 name: "rerun success",
-                scheduled: false,
+                rerun: true,
                 status: ExitStatusExt::from_raw(0),
                 want_success: true,
                 want_message: None,
             },
             Case {
                 name: "rerun failure",
-                scheduled: false,
+                rerun: true,
                 status: ExitStatusExt::from_raw(1 << 8),
                 want_success: false,
                 want_message: Some("exit code 1"),
@@ -757,39 +709,25 @@ mod tests {
 
         for case in cases {
             let temp = tempfile::tempdir().unwrap();
-            let (done_tx, mut done_rx) = mpsc::channel(4);
             let (report_tx, mut report_rx) = mpsc::unbounded_channel();
-            let scheduled = case.scheduled.then_some(done_tx);
 
-            outcome("build", temp.path(), scheduled, report_tx, !case.scheduled)
+            outcome("build", temp.path(), report_tx, case.rerun)
                 .finish(Ok(case.status), Duration::from_millis(5))
                 .await;
 
-            if case.scheduled {
-                let done = done_rx.try_recv().expect("scheduled run answers done_tx");
-                assert_eq!(done.name, "build", "{}", case.name);
-                assert_eq!(done.success, case.want_success, "{}", case.name);
-                assert_eq!(done.message.as_deref(), case.want_message, "{}", case.name);
-                assert!(
-                    report_rx.try_recv().is_err(),
-                    "{}: must not also emit TaskExited",
-                    case.name
-                );
-            } else {
-                let Ok(super::super::ItemReport::TaskExited(exit)) = report_rx.try_recv() else {
-                    panic!("{}: expected a TaskExited", case.name);
-                };
-                assert_eq!(exit.name, "build", "{}", case.name);
-                assert_eq!(exit.pgid, 4242, "{}", case.name);
-                assert_eq!(exit.success, case.want_success, "{}", case.name);
-                assert_eq!(exit.message.as_deref(), case.want_message, "{}", case.name);
-                assert!(exit.rerun, "{}", case.name);
-                assert!(
-                    done_rx.try_recv().is_err(),
-                    "{}: must not also answer done_tx",
-                    case.name
-                );
-            }
+            let Ok(super::super::ItemReport::TaskExited(exit)) = report_rx.try_recv() else {
+                panic!("{}: expected a TaskExited", case.name);
+            };
+            assert_eq!(exit.name, "build", "{}", case.name);
+            assert_eq!(exit.pgid, 4242, "{}", case.name);
+            assert_eq!(exit.success, case.want_success, "{}", case.name);
+            assert_eq!(exit.message.as_deref(), case.want_message, "{}", case.name);
+            assert_eq!(exit.rerun, case.rerun, "{}", case.name);
+            assert!(
+                report_rx.try_recv().is_err(),
+                "{}: exactly one report per run",
+                case.name
+            );
         }
     }
 
@@ -803,7 +741,7 @@ mod tests {
         ] {
             let temp = tempfile::tempdir().unwrap();
             let (report_tx, _report_rx) = mpsc::unbounded_channel();
-            outcome("build", temp.path(), None, report_tx, false)
+            outcome("build", temp.path(), report_tx, false)
                 .finish(Ok(status), Duration::from_millis(1))
                 .await;
 

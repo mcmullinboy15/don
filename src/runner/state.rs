@@ -253,10 +253,12 @@ pub(crate) struct RuntimeTask {
     pub attach_count: usize,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
-    /// In-flight detached task run worker.
-    /// Monotonic generation for task run workers so stale completions can
-    /// be ignored.
-    pub run_generation: u64,
+    /// Monotonic token for `don run --wait` waiters, bumped per waiter
+    /// registration so a superseded waiter's timeout cannot answer its
+    /// replacement. Exit completions need no token: a present waiter always
+    /// belongs to the in-flight run (concurrent runs are rejected, and
+    /// supersession replaces the waiter explicitly).
+    pub waiter_token: u64,
     /// Pending reply for a manually-triggered `don run --wait` request.
     pub run_waiter: Option<TaskRunWaiter>,
     /// Whether the task has ever completed successfully.
@@ -287,7 +289,7 @@ impl RuntimeTask {
             pty_input: None,
             attach_count: 0,
             resolved_watch_paths: Vec::new(),
-            run_generation: 0,
+            waiter_token: 0,
             run_requested: false,
             run_waiter: None,
             has_success,

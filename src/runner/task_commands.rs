@@ -1,13 +1,13 @@
 use super::task_supervisor;
 use super::task_worker::TaskRunMode;
 use super::{
-    CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
-    TaskItemState, TaskRunIntent, TaskRunWaiter, resolve_task_params,
+    CommandError, CommandResult, Runner, RunnerEvent, RunnerInternalCommand, TaskItemState,
+    TaskRunIntent, TaskRunWaiter, resolve_task_params,
 };
 use crate::config::TaskAutoRun;
 use crate::duration::parse_duration;
 use std::collections::HashMap;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 impl Runner {
     /// Queue a run on this task's supervisor.
@@ -25,7 +25,7 @@ impl Runner {
         params: HashMap<String, String>,
         mode: TaskRunMode,
         intent: TaskRunIntent,
-    ) -> Result<u64, CommandError> {
+    ) -> Result<(), CommandError> {
         self.render_runtime_env(name, &mut task_cfg.env)?;
         // The registry is built from the task map, so a hit here is proof the
         // task exists — no separate existence check needed.
@@ -48,11 +48,10 @@ impl Runner {
             });
         }
 
-        Ok(self.tasks.get_mut(name).map_or(0, |rt| {
+        if let Some(rt) = self.tasks.get_mut(name) {
             rt.run_requested = true;
-            rt.run_generation = rt.run_generation.saturating_add(1);
-            rt.run_generation
-        }))
+        }
+        Ok(())
     }
 
     pub(in crate::runner) async fn handle_task_run_prepared(
@@ -107,7 +106,7 @@ impl Runner {
                     rt.pgid = Some(wired.pgid);
                     rt.pty_input = wired.pty_input;
                 }
-                let _ = self.begin_task_run(name, intent, Some("running..."));
+                self.begin_task_run(name, intent, Some("running..."));
             }
             Err(message) => {
                 self.settle_task_without_spawn(
@@ -127,14 +126,9 @@ impl Runner {
     /// background `don run` is not something the dependency sweep is waiting
     /// on, and moving the task to `Running` for one would make startup gating
     /// depend on manual activity.
-    fn begin_task_run(
-        &mut self,
-        name: &str,
-        intent: TaskRunIntent,
-        running_message: Option<&str>,
-    ) -> Option<mpsc::Sender<ItemDone>> {
+    fn begin_task_run(&mut self, name: &str, intent: TaskRunIntent, running_message: Option<&str>) {
         match intent {
-            TaskRunIntent::Scheduled { done_tx } => {
+            TaskRunIntent::Scheduled => {
                 if let Some(rt) = self.tasks.get_mut(name) {
                     rt.set_needs_run_now(true);
                 }
@@ -142,9 +136,8 @@ impl Runner {
                     self.output_manager.service_event(name, message);
                 }
                 self.set_task_state(name, TaskItemState::Running);
-                Some(done_tx)
             }
-            TaskRunIntent::Background => None,
+            TaskRunIntent::Background => {}
         }
     }
 
@@ -170,19 +163,11 @@ impl Runner {
         outcome.emit(&self.output_manager.clone_lifecycle_emitter(), name);
 
         match intent {
-            TaskRunIntent::Scheduled { done_tx } => {
-                let _ = done_tx
-                    .send(ItemDone {
-                        name: name.to_string(),
-                        kind: NodeKind::Task,
-                        success: outcome.success,
-                        message: outcome.failure_message(),
-                        elapsed: None,
-                        last_run: None,
-                        task_run_generation: None,
-                    })
-                    .await;
-            }
+            // The transitions above are the whole answer for a scheduled
+            // settle: PendingRun/Skipped/Failed all re-schedule the sweep,
+            // and the old completion message's fold was a no-op for every
+            // settle state.
+            TaskRunIntent::Scheduled => {}
             // A deferred or skipped background run has nobody to tell: it is
             // not an outcome anyone is waiting on. Only a failure is.
             TaskRunIntent::Background => {
@@ -424,9 +409,9 @@ impl Runner {
             TaskRunMode::Triggered,
             TaskRunIntent::Background,
         ) {
-            Ok(generation) => {
+            Ok(()) => {
                 if let Some((reply, timeout)) = wait_reply {
-                    self.register_task_run_waiter(name, generation, reply, timeout);
+                    self.register_task_run_waiter(name, reply, timeout);
                 }
             }
             Err(e) => {
@@ -450,10 +435,16 @@ impl Runner {
     fn register_task_run_waiter(
         &mut self,
         name: &str,
-        generation: u64,
         reply: oneshot::Sender<CommandResult>,
         timeout: Option<String>,
     ) {
+        let token = match self.tasks.get_mut(name) {
+            Some(rt) => {
+                rt.waiter_token = rt.waiter_token.saturating_add(1);
+                rt.waiter_token
+            }
+            None => return,
+        };
         let timeout_task = timeout.as_ref().and_then(|timeout| {
             let duration = parse_duration(timeout).ok()?;
             let cmd_tx = self.internal_tx.clone();
@@ -464,21 +455,21 @@ impl Runner {
                 let _ = cmd_tx
                     .send(RunnerInternalCommand::TaskRunWaitTimedOut {
                         name,
-                        generation,
+                        token,
                         timeout,
                     })
                     .await;
             }))
         });
         if let Some(rt) = self.tasks.get_mut(name) {
-            rt.run_waiter = Some(TaskRunWaiter::new(generation, reply, timeout_task));
+            rt.run_waiter = Some(TaskRunWaiter::new(token, reply, timeout_task));
         }
     }
 
     pub(in crate::runner) fn handle_task_run_wait_timeout(
         &mut self,
         name: &str,
-        generation: u64,
+        token: u64,
         timeout: &str,
     ) {
         let Some(rt) = self.tasks.get_mut(name) else {
@@ -487,7 +478,7 @@ impl Runner {
         let is_matching_waiter = rt
             .run_waiter
             .as_ref()
-            .is_some_and(|waiter| waiter.generation() == generation);
+            .is_some_and(|waiter| waiter.token() == token);
         if !is_matching_waiter {
             return;
         }
