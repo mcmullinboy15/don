@@ -12,33 +12,35 @@ mod completions;
 mod env_refs;
 mod events;
 mod graph;
-mod health;
 mod lazy;
 mod params;
-mod paths;
 mod profile;
 mod rebuild;
 mod runtime_ports;
 mod service_commands;
 mod service_health;
 mod service_ready;
-mod service_supervisor;
-mod service_worker;
 mod setup;
 mod shutdown;
 mod startup;
 mod state;
 pub(crate) mod state_store;
 mod status;
-mod supervisor;
 mod support;
 mod task_commands;
-mod task_supervisor;
-mod task_worker;
 mod watch_link;
 
-pub(crate) mod service;
-pub(crate) mod task;
+// The per-item mechanism — supervisors, spawn/stop workers, health monitor,
+// ready resolution — lives in `crate::item` and imports nothing from here.
+// These aliases keep the runner's internal paths stable and the shared state
+// vocabulary on its public `don::runner::…` path.
+pub use crate::command::{CommandError, CommandResult};
+pub(crate) use crate::item::{ItemReport, NodeKind};
+pub(in crate::runner) use crate::item::{
+    ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, health, paths,
+    service_supervisor, service_worker, task_supervisor, task_worker,
+};
+pub use crate::item::{ServiceState, TaskItemState};
 
 pub(crate) use params::resolve_task_params;
 pub use profile::resolve_profile_items;
@@ -59,7 +61,6 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use self::build_tools::BatchBuildOutcome;
 #[cfg(test)]
 use self::build_tools::bazel_graph_requery_group_dir;
-use self::events::TaskExit;
 #[cfg(test)]
 use self::graph::compute_depths;
 use self::graph::topological_sort;
@@ -69,29 +70,11 @@ use self::health::run_health_monitor;
 use self::health::unhealthy_restart_backoff_secs;
 #[cfg(test)]
 use self::paths::any_glob_path_changed_since;
-use self::service_worker::ServiceStartContext;
 use self::support::check_gitignore;
 use crate::signals::shutdown_requested;
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-
-enum ServiceStartIntent {
-    /// The dependency sweep asked for this start; the ready outcome drives
-    /// the sweep-visible transition.
-    Scheduled,
-    Reply {
-        reply: oneshot::Sender<CommandResult>,
-    },
-    Background,
-}
-
-enum TaskRunIntent {
-    /// The dependency sweep asked for this run; its exit report drives the
-    /// sweep-visible transition.
-    Scheduled,
-    Background,
-}
 
 pub(crate) struct TaskRunWaiter {
     /// Identifies which registration this waiter is — so a timeout fired
@@ -142,166 +125,6 @@ pub(crate) enum ServiceStopAction {
     None,
     RestartFull,
     RestartSpawnOnly,
-}
-
-/// The state of a service in the runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServiceState {
-    Pending,
-    /// A batch or lazy JIT build (bazel) is in flight. Transitions to
-    /// Pending on success (then the service starts like any other) or Failed
-    /// on build error. File-watch rebuilds keep the service in Running/Ready.
-    Building,
-    /// Proxy is bound and accepting connections, but the service process is not
-    /// requested yet. Transitions to Pending on the first incoming connection.
-    Lazy,
-    Starting,
-    Running,
-    Ready,
-    /// Process is alive but its health-check monitor is failing. Dependents
-    /// are still considered satisfied — we don't tear them down on flap. The
-    /// service can recover back to Ready, or it can be restarted (manually
-    /// or by `on_failure = "restart"`).
-    Unhealthy,
-    Stopping,
-    Stopped,
-    Failed,
-    /// A transitive dependency failed, so we never attempted to start this
-    /// service. Distinct from `Failed` (which means *this* service itself
-    /// blew up) so the UI can highlight the actual culprit — and sort it
-    /// above everything that merely got stranded.
-    DependencyFailed,
-}
-
-impl ServiceState {
-    /// Whether this state is considered "satisfied" for dependency resolution.
-    /// A dependency is satisfied when the service is Ready, lazy-bound, or
-    /// merely Unhealthy (process is still alive — leave dependents alone).
-    pub(crate) fn is_satisfied(&self) -> bool {
-        matches!(self, Self::Ready | Self::Lazy | Self::Unhealthy)
-    }
-
-    /// Valid transitions from one state to another.
-    #[cfg(test)]
-    pub(crate) fn can_transition_to(&self, next: Self) -> bool {
-        matches!(
-            (self, next),
-            (Self::Pending, Self::Building)
-                | (Self::Pending, Self::Starting)
-                | (Self::Pending, Self::Lazy)
-                | (Self::Building, Self::Pending)
-                | (Self::Building, Self::Failed)
-                | (Self::Lazy, Self::Pending)
-                | (Self::Lazy, Self::Building)
-                | (Self::Lazy, Self::Starting)
-                | (Self::Starting, Self::Running)
-                | (Self::Starting, Self::Failed)
-                | (Self::Running, Self::Ready)
-                | (Self::Running, Self::Stopping)
-                | (Self::Running, Self::Stopped)
-                | (Self::Running, Self::Failed)
-                | (Self::Ready, Self::Stopping)
-                | (Self::Ready, Self::Stopped)
-                | (Self::Ready, Self::Failed)
-                | (Self::Ready, Self::Unhealthy)
-                | (Self::Unhealthy, Self::Ready)
-                | (Self::Unhealthy, Self::Stopping)
-                | (Self::Unhealthy, Self::Stopped)
-                | (Self::Unhealthy, Self::Failed)
-                | (Self::Unhealthy, Self::Pending)
-                | (Self::Stopping, Self::Stopped)
-                | (Self::Stopping, Self::Failed)
-                // Restart: from stopped / failed / dep-failed back to pending.
-                | (Self::Stopped, Self::Pending)
-                | (Self::Failed, Self::Pending)
-                | (Self::DependencyFailed, Self::Pending)
-                // A pending item gets marked DependencyFailed when a dep blew up.
-                | (Self::Pending, Self::DependencyFailed)
-        )
-    }
-}
-
-/// The state of a task in the runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskItemState {
-    Pending,
-    /// Waiting on the startup-phase batch build. Transitions to Pending on
-    /// success or Failed on build error.
-    Building,
-    Running,
-    Completed,
-    Skipped,
-    Failed,
-    /// A transitive dependency failed, so we never ran this task. See
-    /// [`ServiceState::DependencyFailed`] for the rationale.
-    DependencyFailed,
-    /// The task is waiting for a manual trigger. Dependency satisfaction also
-    /// depends on task history and auto-run policy.
-    PendingRun,
-}
-
-/// An item in the dependency graph — either a service or a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeKind {
-    Service,
-    Task,
-}
-
-/// Result of a user-initiated command (Start/Stop/Restart).
-/// `Ok(())` on success, `Err(String)` with a user-facing error message.
-pub type CommandResult = Result<(), CommandError>;
-
-/// Errors returned to API callers for service control commands.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CommandError {
-    /// No service with this name exists in the config.
-    UnknownService { name: String },
-    /// No task with this name exists in the config.
-    UnknownTask { name: String },
-    /// The name refers to a task, not a service — start/stop/restart only
-    /// apply to services.
-    NotAService { name: String },
-    /// The name refers to a service, not a task — `run` only applies to tasks.
-    NotATask { name: String },
-    /// The service is already running (for Start) or already stopped (for Stop).
-    InvalidState { name: String, message: String },
-    /// The operation itself failed.
-    Failed { name: String, message: String },
-    /// A synchronous `don run --wait --timeout` request stopped waiting.
-    TimedOut { name: String, timeout: String },
-    /// User supplied params that the task doesn't declare, or the validation
-    /// rules on a declared param rejected the value.
-    InvalidParams { name: String, message: String },
-}
-
-impl std::fmt::Display for CommandError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownService { name } => write!(f, "unknown service '{name}'"),
-            Self::UnknownTask { name } => write!(f, "unknown task '{name}'"),
-            Self::NotAService { name } => {
-                write!(
-                    f,
-                    "'{name}' is a task — start/stop/restart only apply to services"
-                )
-            }
-            Self::NotATask { name } => {
-                write!(
-                    f,
-                    "'{name}' is a service — use `don start/stop/restart` instead of `don run`"
-                )
-            }
-            Self::InvalidState { name, message } => write!(f, "{name}: {message}"),
-            Self::Failed { name, message } => write!(f, "{name}: {message}"),
-            Self::TimedOut { name, timeout } => {
-                write!(f, "{name}: did not finish within {timeout}")
-            }
-            Self::InvalidParams { name, message } => write!(f, "{name}: {message}"),
-        }
-    }
 }
 
 /// Error returned from [`RunnerCommand::ResolveCompletions`].
@@ -444,67 +267,6 @@ pub enum RunnerCommand {
     },
     /// Initiate graceful shutdown.
     Shutdown,
-}
-
-/// Runner-private messages emitted by detached workers.
-/// What an item tells the scheduler, on the lossless report channel.
-///
-/// This is the up-direction of the supervisor architecture: items report,
-/// the runner folds. It is `mpsc`, not `broadcast`, because the scheduler
-/// must never miss one — lossy observation is for peers and edges, which
-/// resync from the snapshot. Starts with lazy demand; per-item lifecycle
-/// reports (exit, transitions) migrate here as supervisors absorb them.
-pub(in crate::runner) enum ItemReport {
-    /// A lazy service's proxy saw its first connection. Demand originates
-    /// inside the item, but the *reaction* belongs to the scheduler: a lazy
-    /// service has dependencies, and starting it is a scheduling decision
-    /// like any other.
-    Demand { name: String },
-    /// A service's process died and its supervisor reaped it. `status` is
-    /// the reaped exit status (`None` when the wait itself failed).
-    ServiceExited {
-        name: String,
-        pgid: i32,
-        status: Option<std::process::ExitStatus>,
-    },
-    /// A service's restart backoff elapsed; attempt `attempt` may begin.
-    RestartDue { name: String, attempt: u32 },
-    /// The health monitor observed a transition. State-guarded on fold;
-    /// the monitor itself dies with custody (its cancel lives in the
-    /// supervisor), so it cannot outlive its process by more than a probe.
-    HealthChanged { name: String, healthy: bool },
-    /// A task process exited after an explicit run/restart.
-    TaskExited(TaskExit),
-    /// A service's supervisor settled a start request — wired (metadata
-    /// only; custody stays with the supervisor) or failed to prepare.
-    ServiceStartPrepared {
-        name: String,
-        context: Box<ServiceStartContext>,
-        intent: ServiceStartIntent,
-        result: Result<Box<service_supervisor::ServiceWired>, String>,
-    },
-    /// A service's ready check settled — or reported immediately when no
-    /// check is configured (`had_check: false`). Forwarded by the
-    /// supervisor loop, so it always trails its own prepared report.
-    ServiceReady {
-        name: String,
-        success: bool,
-        message: Option<String>,
-        had_check: bool,
-    },
-    /// A service's supervisor finished executing a stop.
-    ServiceStopComplete {
-        name: String,
-        op_id: u64,
-        result: Result<(), String>,
-    },
-    /// A task's supervisor settled a run request.
-    TaskRunPrepared {
-        name: String,
-        task_cfg: Box<crate::config::Task>,
-        intent: TaskRunIntent,
-        result: Result<task_supervisor::TaskRunReport, String>,
-    },
 }
 
 enum RunnerInternalCommand {

@@ -14,7 +14,10 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::{CommandResult, ServiceState, ServiceStopAction, TaskItemState, TaskRunWaiter};
+use super::{
+    CommandResult, ServiceHandleIdentity, ServiceState, ServiceStopAction, TaskItemState,
+    TaskRunWaiter,
+};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -364,11 +367,26 @@ impl RuntimeTask {
     }
 }
 
-/// See [`RuntimeService::handle_identity`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ServiceHandleIdentity {
-    /// A locally spawned process group.
-    Process { pgid: i32 },
-    /// A Docker container.
-    Docker,
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{RuntimeTask, TaskItemState};
+
+    /// The dependency gate reads `needs_run_now`: a task with a successful
+    /// history but an outstanding run is *not* satisfied, so dependents wait
+    /// rather than starting against stale output. This is the runner half of
+    /// the background-failure bug the task supervisor's `NoSpawnOutcome`
+    /// classifier tests pin from the item side.
+    #[test]
+    fn an_outstanding_run_blocks_dependents_despite_a_successful_history() {
+        let config: crate::config::Config = "[tasks.build]\ncmd = \"true\"\n".parse().unwrap();
+        let task = config.tasks.get("build").unwrap().clone();
+        let mut rt = RuntimeTask::new(task, TaskItemState::Completed, true, None);
+        assert!(rt.dependency_satisfied(), "a completed task satisfies deps");
+        rt.set_needs_run_now(true);
+        assert!(
+            !rt.dependency_satisfied(),
+            "an outstanding run must block dependents"
+        );
+    }
 }

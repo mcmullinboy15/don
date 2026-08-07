@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 /// Send-only handle to one item's supervisor.
-pub(in crate::runner) struct ItemHandle<M> {
+pub(crate) struct ItemHandle<M> {
     tx: mpsc::UnboundedSender<M>,
     busy: Arc<AtomicBool>,
 }
@@ -50,7 +50,7 @@ impl<M> ItemHandle<M> {
     /// Marks the item busy before sending, not after the supervisor picks the
     /// request up — otherwise a caller could queue work and immediately be
     /// told the item is idle.
-    pub(in crate::runner) fn request(&self, message: M) -> bool {
+    pub(crate) fn request(&self, message: M) -> bool {
         self.busy.store(true, Ordering::Relaxed);
         let sent = self.tx.send(message).is_ok();
         if !sent {
@@ -60,13 +60,13 @@ impl<M> ItemHandle<M> {
     }
 
     /// Whether work is queued or in progress.
-    pub(in crate::runner) fn is_busy(&self) -> bool {
+    pub(crate) fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Relaxed)
     }
 }
 
 /// Every item's mailbox, addressable by name.
-pub(in crate::runner) struct ItemRegistry<M> {
+pub(crate) struct ItemRegistry<M> {
     handles: Arc<HashMap<String, ItemHandle<M>>>,
 }
 
@@ -80,18 +80,18 @@ impl<M> Clone for ItemRegistry<M> {
 
 impl<M> ItemRegistry<M> {
     /// The mailbox for `name`, or `None` if it isn't an item of this kind.
-    pub(in crate::runner) fn get(&self, name: &str) -> Option<&ItemHandle<M>> {
+    pub(crate) fn get(&self, name: &str) -> Option<&ItemHandle<M>> {
         self.handles.get(name)
     }
 
     /// Whether `name` has work queued or in progress. `false` for an unknown
     /// name, which is what callers asking "may I start this?" want.
-    pub(in crate::runner) fn is_busy(&self, name: &str) -> bool {
+    pub(crate) fn is_busy(&self, name: &str) -> bool {
         self.get(name).is_some_and(ItemHandle::is_busy)
     }
 
     /// Names with work queued or in progress.
-    pub(in crate::runner) fn busy_names(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn busy_names(&self) -> impl Iterator<Item = &str> {
         self.handles
             .iter()
             .filter(|(_, handle)| handle.is_busy())
@@ -100,7 +100,7 @@ impl<M> ItemRegistry<M> {
 }
 
 /// The owner half: the supervisor tasks themselves.
-pub(in crate::runner) struct Supervisors<M> {
+pub(crate) struct Supervisors<M> {
     registry: ItemRegistry<M>,
     joins: Vec<(String, tokio::task::JoinHandle<()>)>,
 }
@@ -111,7 +111,7 @@ impl<M: Send + 'static> Supervisors<M> {
     /// Eager rather than on first use: it makes the registry immutable, which
     /// is what lets it be shared without a lock. An idle supervisor is a
     /// parked task that is never polled until something addresses it.
-    pub(in crate::runner) fn spawn_all<'a, F, Fut>(
+    pub(crate) fn spawn_all<'a, F, Fut>(
         names: impl Iterator<Item = &'a String>,
         mut body: F,
     ) -> Self
@@ -138,7 +138,7 @@ impl<M: Send + 'static> Supervisors<M> {
 
     /// The addressing half, for handing to anything that needs to ask an item
     /// to do something.
-    pub(in crate::runner) fn registry(&self) -> &ItemRegistry<M> {
+    pub(crate) fn registry(&self) -> &ItemRegistry<M> {
         &self.registry
     }
 
@@ -153,7 +153,7 @@ impl<M: Send + 'static> Supervisors<M> {
     /// supervisor future, so aborting it drops the receiver, and every
     /// outstanding [`ItemHandle`] — including clones held elsewhere — starts
     /// reporting failure from `request`.
-    pub(in crate::runner) fn abort_all(&mut self) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+    pub(crate) fn abort_all(&mut self) -> Vec<(String, tokio::task::JoinHandle<()>)> {
         let joins = std::mem::take(&mut self.joins);
         for (_, join) in &joins {
             join.abort();

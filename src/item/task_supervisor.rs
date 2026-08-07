@@ -19,31 +19,31 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// One request to run a task, as handed to its supervisor.
-pub(in crate::runner) struct RunRequest {
-    pub(in crate::runner) task_cfg: Box<crate::config::Task>,
-    pub(in crate::runner) params: std::collections::HashMap<String, String>,
-    pub(in crate::runner) mode: super::task_worker::TaskRunMode,
-    pub(in crate::runner) intent: super::TaskRunIntent,
+pub(crate) struct RunRequest {
+    pub(crate) task_cfg: Box<crate::config::Task>,
+    pub(crate) params: std::collections::HashMap<String, String>,
+    pub(crate) mode: super::task_worker::TaskRunMode,
+    pub(crate) intent: super::TaskRunIntent,
 }
 
 /// Owner half for tasks. See [`Supervisors`].
 ///
-/// [`Supervisors`]: super::supervisor::Supervisors
-pub(in crate::runner) type TaskSupervisors = super::supervisor::Supervisors<RunRequest>;
+/// [`Supervisors`]: super::registry::Supervisors
+pub(crate) type TaskSupervisors = super::registry::Supervisors<RunRequest>;
 
 /// What the runner receives for a spawned, wired run. The supervisor keeps
 /// the process handle and the output reader; this is what the runner's
 /// bookkeeping (shadows for attach/status, spawn lines) needs.
-pub(in crate::runner) struct TaskWired {
-    pub(in crate::runner) pgid: i32,
+pub(crate) struct TaskWired {
+    pub(crate) pgid: i32,
     /// Sender into this run's PTY input gate; `None` for pipe-mode spawns.
-    pub(in crate::runner) pty_input: Option<mpsc::Sender<crate::output::PtyInput>>,
-    pub(in crate::runner) rendered_cmdline: String,
+    pub(crate) pty_input: Option<mpsc::Sender<crate::output::PtyInput>>,
+    pub(crate) rendered_cmdline: String,
 }
 
 /// What a run request settled into, as reported to the runner. The spawned
 /// case carries wired metadata, never the process — custody stays here.
-pub(in crate::runner) enum TaskRunReport {
+pub(crate) enum TaskRunReport {
     PendingRun { message: String },
     Skipped { message: Option<String> },
     Running(TaskWired),
@@ -54,8 +54,8 @@ pub(in crate::runner) enum TaskRunReport {
 /// Every task gets one up front so the registry is immutable — see
 /// [`Supervisors::spawn_all`].
 ///
-/// [`Supervisors::spawn_all`]: super::supervisor::Supervisors::spawn_all
-pub(in crate::runner) fn spawn_supervisors<'a>(
+/// [`Supervisors::spawn_all`]: super::registry::Supervisors::spawn_all
+pub(crate) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     ctx: &super::task_worker::TaskWorkerContext,
     outputs: &dyn Fn(&str) -> Option<crate::output::ItemOutput>,
@@ -155,7 +155,7 @@ async fn supervise(
                 None,
             ),
             Ok(super::task_worker::TaskRunPrepared::Spawned(spawn)) => {
-                let super::task::TaskSpawn {
+                let super::task_process::TaskSpawn {
                     mut handle,
                     child_output,
                     rendered_cmdline,
@@ -231,7 +231,7 @@ async fn supervise(
         let Some(outcome) = outcome else { continue };
         let timeout = task_cfg.timeout.clone();
         let start = std::time::Instant::now();
-        let wait = super::task::wait_for_task(&mut handle, timeout.as_deref());
+        let wait = super::task_process::wait_for_task(&mut handle, timeout.as_deref());
         tokio::pin!(wait);
         let result = loop {
             tokio::select! {
@@ -268,7 +268,7 @@ async fn await_reader(handle: tokio::task::JoinHandle<()>) {
 
 /// How prominently a settled run's message is reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runner) enum Report {
+pub(crate) enum Report {
     /// Normal lifecycle line.
     Info,
     /// Verbose-only — the run was a no-op and nobody asked.
@@ -285,19 +285,19 @@ pub(in crate::runner) enum Report {
 /// branches on the runner; the differences between them are exactly the
 /// fields here.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::runner) struct NoSpawnOutcome {
+pub(crate) struct NoSpawnOutcome {
     /// Lifecycle state the task enters.
-    pub(in crate::runner) state: super::TaskItemState,
+    pub(crate) state: super::TaskItemState,
     /// What the dependency scheduler is told. A skipped or deferred task is
     /// still a *success* — it didn't fail, it just didn't run.
-    pub(in crate::runner) success: bool,
-    pub(in crate::runner) message: String,
-    pub(in crate::runner) report: Report,
+    pub(crate) success: bool,
+    pub(crate) message: String,
+    pub(crate) report: Report,
 }
 
 impl NoSpawnOutcome {
     /// The task can't run yet and is waiting on something.
-    pub(in crate::runner) fn pending_run(message: String) -> Self {
+    pub(crate) fn pending_run(message: String) -> Self {
         Self {
             state: super::TaskItemState::PendingRun,
             success: true,
@@ -307,7 +307,7 @@ impl NoSpawnOutcome {
     }
 
     /// The task's watched inputs were unchanged, so it didn't need to run.
-    pub(in crate::runner) fn skipped(message: String) -> Self {
+    pub(crate) fn skipped(message: String) -> Self {
         Self {
             state: super::TaskItemState::Skipped,
             success: true,
@@ -317,7 +317,7 @@ impl NoSpawnOutcome {
     }
 
     /// Preparing the run failed before anything was spawned.
-    pub(in crate::runner) fn failed(message: String) -> Self {
+    pub(crate) fn failed(message: String) -> Self {
         Self {
             state: super::TaskItemState::Failed,
             success: false,
@@ -333,7 +333,7 @@ impl NoSpawnOutcome {
     /// scheduled failure set the flag and a background `don run` failure left
     /// it alone, which meant a task could fail under `don run` and the next
     /// startup sweep would see nothing outstanding and skip it.
-    pub(in crate::runner) fn needs_run_now(&self) -> Option<bool> {
+    pub(crate) fn needs_run_now(&self) -> Option<bool> {
         match self.state {
             super::TaskItemState::PendingRun | super::TaskItemState::Failed => Some(true),
             super::TaskItemState::Skipped => Some(false),
@@ -342,7 +342,7 @@ impl NoSpawnOutcome {
     }
 
     /// Emit this outcome's message at its own level.
-    pub(in crate::runner) fn emit(&self, emitter: &crate::output::LifecycleEmitter, name: &str) {
+    pub(crate) fn emit(&self, emitter: &crate::output::LifecycleEmitter, name: &str) {
         match self.report {
             Report::Info => emitter.service_event(name, &self.message),
             Report::Debug => emitter.service_debug_event(name, &self.message),
@@ -369,7 +369,7 @@ const SUPERSEDED_KILL_GRACE: Duration = Duration::from_millis(500);
 /// Takes the untagged emitter rather than an `ItemOutput` so the kill can
 /// never be gated on a name lookup succeeding — failing to log is a cosmetic
 /// problem, failing to kill leaks a process nothing will ever reap.
-pub(in crate::runner) fn kill_superseded_spawn(
+pub(crate) fn kill_superseded_spawn(
     emitter: &crate::output::LifecycleEmitter,
     name: &str,
     prepared: super::task_worker::TaskRunPrepared,
@@ -378,7 +378,7 @@ pub(in crate::runner) fn kill_superseded_spawn(
 
     match prepared {
         TaskRunPrepared::Spawned(spawn) => {
-            let super::task::TaskSpawn {
+            let super::task_process::TaskSpawn {
                 mut handle,
                 child_output,
                 rendered_cmdline: _,
@@ -406,19 +406,19 @@ pub(in crate::runner) fn kill_superseded_spawn(
 /// Owned rather than borrowed because this outlives the runner's command loop
 /// — the exit wait is a detached task, and holding a reference into runner
 /// state across it is what the whole decomposition is trying to stop.
-pub(in crate::runner) struct TaskRunOutcome {
-    pub(in crate::runner) name: String,
-    pub(in crate::runner) task_cfg: crate::config::Task,
-    pub(in crate::runner) base_dir: PathBuf,
-    pub(in crate::runner) global_watch_ignore: Vec<String>,
+pub(crate) struct TaskRunOutcome {
+    pub(crate) name: String,
+    pub(crate) task_cfg: crate::config::Task,
+    pub(crate) base_dir: PathBuf,
+    pub(crate) global_watch_ignore: Vec<String>,
     /// Process group of the run that just ended.
-    pub(in crate::runner) pgid: i32,
+    pub(crate) pgid: i32,
     /// Exit reports for non-scheduled runs travel on the items' lossless
     /// report channel, like service exits.
-    pub(in crate::runner) report_tx: mpsc::UnboundedSender<super::ItemReport>,
+    pub(crate) report_tx: mpsc::UnboundedSender<super::ItemReport>,
     /// Whether this run was triggered by a file watch, which decides if a
     /// `TaskRerunComplete` event is broadcast when it lands.
-    pub(in crate::runner) rerun: bool,
+    pub(crate) rerun: bool,
 }
 
 impl TaskRunOutcome {
@@ -433,9 +433,9 @@ impl TaskRunOutcome {
     /// the next startup can skip it when nothing changed; a failed one records
     /// only the run info, leaving the previous input hashes stale on purpose
     /// so the task is not skipped next time.
-    pub(in crate::runner) async fn finish(
+    pub(crate) async fn finish(
         self,
-        result: Result<std::process::ExitStatus, super::task::TaskError>,
+        result: Result<std::process::ExitStatus, super::task_process::TaskError>,
         elapsed: Duration,
     ) {
         let (success, exit_code, message) = match result {
@@ -641,25 +641,6 @@ mod tests {
             failed.needs_run_now(),
             Some(true),
             "a failed run has not run, whoever asked for it"
-        );
-
-        // And that flag is what the dependency gate reads: a task with a
-        // successful history but an outstanding run is *not* satisfied, so
-        // dependents wait rather than starting against stale output.
-        let config: crate::config::Config = "[tasks.build]\ncmd = \"true\"\n".parse().unwrap();
-        let task = config.tasks.get("build").unwrap().clone();
-        let mut rt = super::super::state::RuntimeTask::new(
-            task,
-            super::super::TaskItemState::Completed,
-            true,
-            None,
-        );
-        assert!(rt.dependency_satisfied(), "a completed task satisfies deps");
-        rt.set_needs_run_now(true);
-        assert!(
-            !rt.dependency_satisfied(),
-            "an outstanding run must block dependents, which is what the \
-             background-failure case used to skip"
         );
     }
 

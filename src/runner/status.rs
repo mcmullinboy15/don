@@ -215,7 +215,7 @@ impl Runner {
                         },
                     ),
                     docker_ports: match rs.handle_identity {
-                        Some(super::state::ServiceHandleIdentity::Docker) => rs
+                        Some(super::ServiceHandleIdentity::Docker) => rs
                             .docker_port_bindings
                             .iter()
                             .map(|binding| {

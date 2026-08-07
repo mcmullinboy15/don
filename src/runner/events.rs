@@ -1,16 +1,5 @@
 use super::support::format_duration;
-use super::{CommandError, CommandResult, Runner, RunnerEvent, TaskItemState};
-
-#[derive(Debug)]
-pub(in crate::runner) struct TaskExit {
-    pub(in crate::runner) name: String,
-    pub(in crate::runner) pgid: i32,
-    pub(in crate::runner) success: bool,
-    pub(in crate::runner) message: Option<String>,
-    pub(in crate::runner) elapsed: Option<std::time::Duration>,
-    pub(in crate::runner) last_run: Option<crate::task_state::TaskRunInfo>,
-    pub(in crate::runner) rerun: bool,
-}
+use super::{CommandError, CommandResult, Runner, RunnerEvent, TaskExit, TaskItemState};
 
 impl Runner {
     pub(in crate::runner) fn handle_task_exit(&mut self, exit: TaskExit) {

@@ -1,13 +1,11 @@
-use super::service;
+use super::service_process as service;
 use tokio::sync::{mpsc, oneshot};
 
 /// Render an unexpected-exit lifecycle message from the reaped status.
 /// Reports the exit code for normal exits, the signal number (and core
 /// dump flag) for signal-killed processes, and a plain "no status" line
 /// when the wait failed.
-pub(in crate::runner) fn format_unexpected_exit(
-    status: Option<std::process::ExitStatus>,
-) -> String {
+pub(crate) fn format_unexpected_exit(status: Option<std::process::ExitStatus>) -> String {
     use std::os::unix::process::ExitStatusExt;
     match status {
         Some(s) => {
@@ -31,7 +29,7 @@ pub(in crate::runner) fn format_unexpected_exit(
 /// Compute the wait before the next auto-restart of an Unhealthy service.
 /// Doubles each attempt (1, 2, 4, 8, 16, 32, 60, 60, ...) up to a 60s cap.
 /// `attempt` is 1-based — the first restart waits 1s.
-pub(in crate::runner) fn unhealthy_restart_backoff_secs(attempt: u32) -> u64 {
+pub(crate) fn unhealthy_restart_backoff_secs(attempt: u32) -> u64 {
     let exp = attempt.saturating_sub(1).min(6);
     (1u64 << exp).min(60)
 }
@@ -41,7 +39,7 @@ pub(in crate::runner) fn unhealthy_restart_backoff_secs(attempt: u32) -> u64 {
 /// `monitor_interval` and reports state transitions back to the runner via
 /// `RunnerInternalCommand::ServiceHealthChanged`. Exits when the cancel oneshot
 /// fires (sent or dropped) — typically on stop/restart/process exit.
-pub(in crate::runner) async fn run_health_monitor(
+pub(crate) async fn run_health_monitor(
     name: String,
     ready: crate::config::ReadyCheck,
     report_tx: mpsc::UnboundedSender<super::ItemReport>,

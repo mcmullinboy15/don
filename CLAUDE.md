@@ -215,10 +215,22 @@ src/
     platform.rs             # Platform enum, deserialization
     download.rs             # DownloadConfig, PlatformDownload, cache paths
     types.rs                # Shared types: Command, ReadyCheck, ShutdownConfig, LogConfig
+  command.rs                # CommandError / CommandResult — shared reply vocabulary (item + runner)
+  item/
+    mod.rs                  # per-item mechanism root; the edge rule: imports nothing from runner/
+    registry.rs             # ItemRegistry — addressed, send-only handles to supervisors
+    service_supervisor.rs   # service lifecycle owner: spawn → ready → reap, stop, restart
+    service_process.rs      # service spawn/stop mechanics (process + docker)
+    service_worker.rs       # service start preparation (build, ports, env, proxy)
+    task_supervisor.rs      # task run owner: prepare → wire → exit, mailbox supersession
+    task_process.rs         # task execution: timeout, skip-if-unchanged
+    task_worker.rs          # task run preparation (params, hashing, spawn)
+    health.rs               # health monitor loop
+    ready.rs                # ready-check resolution against live runtime ports
+    state.rs                # ServiceState / TaskItemState machines, NodeKind
+    paths.rs                # watch-path staleness checks
   runner/
-    mod.rs                  # orchestrator — dependency graph, startup/shutdown, config reload, profiles
-    service.rs              # service lifecycle: spawn, restart, stop
-    task.rs                 # task execution, timeout, skip-if-unchanged
+    mod.rs                  # scheduler — dependency graph, startup/shutdown order, folds ItemReports
     state_store.rs          # runner-written / world-readable state projection
   process/
     mod.rs                  # process group management, PTY spawning, identity tracking

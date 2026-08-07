@@ -1,25 +1,25 @@
-use super::service;
+use super::service_process as service;
 use crate::config::Platform;
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 
 #[derive(Clone, Copy)]
-pub(in crate::runner) enum ServiceStartMode {
+pub(crate) enum ServiceStartMode {
     Full,
     SpawnOnly,
 }
 
 #[derive(Clone)]
-pub(in crate::runner) struct ServiceStartContext {
-    pub(in crate::runner) resolved: crate::config::ResolvedService,
-    pub(in crate::runner) batch_built: bool,
-    pub(in crate::runner) listen_fds: Vec<RawFd>,
-    pub(in crate::runner) listen_fds_env: HashMap<String, String>,
-    pub(in crate::runner) fallback_ports: bool,
-    pub(in crate::runner) prior_docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
+pub(crate) struct ServiceStartContext {
+    pub(crate) resolved: crate::config::ResolvedService,
+    pub(crate) batch_built: bool,
+    pub(crate) listen_fds: Vec<RawFd>,
+    pub(crate) listen_fds_env: HashMap<String, String>,
+    pub(crate) fallback_ports: bool,
+    pub(crate) prior_docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
 }
 
-pub(in crate::runner) async fn ensure_download_for_config_worker(
+pub(crate) async fn ensure_download_for_config_worker(
     base_dir: &std::path::Path,
     platform: Platform,
     name: &str,
@@ -119,7 +119,7 @@ async fn run_preset_build_worker(
     }
 }
 
-pub(in crate::runner) async fn run_service_build_worker(
+pub(crate) async fn run_service_build_worker(
     base_dir: &std::path::Path,
     docker_client: Option<&bollard::Docker>,
     emitter: &crate::output::LifecycleEmitter,
@@ -185,7 +185,7 @@ pub(in crate::runner) async fn run_service_build_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::runner) async fn start_service_worker(
+pub(crate) async fn start_service_worker(
     base_dir: &std::path::Path,
     pid_dir: &std::path::Path,
     platform: Platform,

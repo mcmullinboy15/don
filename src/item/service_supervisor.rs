@@ -20,9 +20,10 @@
 //! restart policy, and shutdown sequencing. Proxy *decisions* likewise stay
 //! with the runner and arrive as [`ProxyDirective`]s.
 
-use super::service;
+use super::ServiceStartIntent;
+use super::service_process as service;
+use super::service_worker::ServiceStartContext;
 use super::service_worker::{ServiceStartMode, start_service_worker};
-use super::{ServiceStartContext, ServiceStartIntent};
 use crate::config::ShutdownConfig;
 use crate::output::{ItemOutput, LifecycleEmitter};
 use std::path::PathBuf;
@@ -31,18 +32,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 /// One request to start a service, as handed to its supervisor.
-pub(in crate::runner) struct StartRequest {
-    pub(in crate::runner) context: Box<ServiceStartContext>,
-    pub(in crate::runner) mode: ServiceStartMode,
-    pub(in crate::runner) intent: ServiceStartIntent,
+pub(crate) struct StartRequest {
+    pub(crate) context: Box<ServiceStartContext>,
+    pub(crate) mode: ServiceStartMode,
+    pub(crate) intent: ServiceStartIntent,
     /// Allocate new ephemeral backend ports before spawning. Set on the
     /// restart path so the new process binds a fresh port while draining
     /// connections to the old one finish undisturbed.
-    pub(in crate::runner) fresh_backend_ports: bool,
+    pub(crate) fresh_backend_ports: bool,
 }
 
 /// Everything a service's supervisor can be asked to do.
-pub(in crate::runner) enum ServiceCommand {
+pub(crate) enum ServiceCommand {
     /// Begin a start — or supersede the one being prepared.
     Start(StartRequest),
     /// End the held process: graceful signal per the config, bounded wait,
@@ -62,7 +63,7 @@ pub(in crate::runner) enum ServiceCommand {
 /// ready outcome it resolves — but the proxy itself lives here, so decisions
 /// arrive as directives. Mailbox FIFO gives the only ordering that matters:
 /// a `ClearBackend` sent before a `Stop` is applied before the stop runs.
-pub(in crate::runner) enum ProxyDirective {
+pub(crate) enum ProxyDirective {
     /// Set the connection policy (serve / lazy-trigger / refuse).
     SetPolicy(crate::proxy::ConnectionPolicy),
     /// Point forwarding backends at their configured addresses.
@@ -76,12 +77,12 @@ pub(in crate::runner) enum ProxyDirective {
 /// A service's bound proxy and its lazy-demand channel, handed to the
 /// supervisor at spawn. Bound by the runner during construction so port
 /// conflicts still fail startup before anything spawns.
-pub(in crate::runner) struct ProxyAssets {
-    pub(in crate::runner) proxy: crate::proxy::ServiceProxy,
+pub(crate) struct ProxyAssets {
+    pub(crate) proxy: crate::proxy::ServiceProxy,
     /// The receiving half of the proxy's lazy trigger channel — `Some` only
     /// for lazy services. The supervisor forwards each trigger as
     /// [`super::ItemReport::Demand`].
-    pub(in crate::runner) demand_rx: Option<mpsc::Receiver<String>>,
+    pub(crate) demand_rx: Option<mpsc::Receiver<String>>,
 }
 
 /// What the runner receives for a spawned, wired start.
@@ -89,42 +90,42 @@ pub(in crate::runner) struct ProxyAssets {
 /// The supervisor keeps the process handle and the output reader; this is
 /// everything the runner's bookkeeping and ready-check paths need —
 /// extracted once, at wire time, by the owner.
-pub(in crate::runner) struct ServiceWired {
-    pub(in crate::runner) identity: super::state::ServiceHandleIdentity,
-    pub(in crate::runner) pgid: Option<i32>,
-    pub(in crate::runner) docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
+pub(crate) struct ServiceWired {
+    pub(crate) identity: super::state::ServiceHandleIdentity,
+    pub(crate) pgid: Option<i32>,
+    pub(crate) docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
     /// OSC response scanner handle — dropped on restart/stop to end the
     /// scanner and release its gate sender.
-    pub(in crate::runner) osc_sink: Option<crate::output::OscSinkHandle>,
+    pub(crate) osc_sink: Option<crate::output::OscSinkHandle>,
     /// Sender into this spawn's PTY input gate. `None` for docker and
     /// pipe-mode spawns. Attach bridges clone it; the runner's copy is
     /// cleared on exit so the gate (and the PTY write half) can end.
-    pub(in crate::runner) pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
+    pub(crate) pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
     /// The proxy's env-mode backend vars this spawn was launched with —
     /// `Some` iff the service has a proxy. The runner refreshes its
     /// `ProxyView` shadow from this, so ready checks written against
     /// `${PORT}` resolve to the port the new process was actually told to
     /// bind. Wiring precedes ready resolution, so the shadow is always
     /// current where it is read.
-    pub(in crate::runner) proxy_backend_env: Option<std::collections::HashMap<String, String>>,
+    pub(crate) proxy_backend_env: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Parameters for [`ServiceCommand::Stop`].
-pub(in crate::runner) struct StopRequest {
-    pub(in crate::runner) config: ShutdownConfig,
+pub(crate) struct StopRequest {
+    pub(crate) config: ShutdownConfig,
     /// Skip the graceful signal entirely (force-shutdown path).
-    pub(in crate::runner) force: bool,
-    pub(in crate::runner) wait_full_exit: bool,
+    pub(crate) force: bool,
+    pub(crate) wait_full_exit: bool,
     /// When set, a mid-stop force request (second Ctrl+C) escalates the
     /// in-flight graceful wait — the manual-stop paths pass the runner's
     /// shutdown flag here.
-    pub(in crate::runner) interrupt: Option<tokio::sync::watch::Receiver<bool>>,
+    pub(crate) interrupt: Option<tokio::sync::watch::Receiver<bool>>,
     /// Where completion goes; see [`StopNotify`].
-    pub(in crate::runner) notify: StopNotify,
+    pub(crate) notify: StopNotify,
 }
 
 /// How a stop's completion travels back.
-pub(in crate::runner) enum StopNotify {
+pub(crate) enum StopNotify {
     /// The manual/restart path: `ServiceStopComplete{op_id}` through the
     /// internal channel, so the runner's control plumbing
     /// (`control_reply`, `stop_action`, `control_generation`) is untouched
@@ -138,22 +139,22 @@ pub(in crate::runner) enum StopNotify {
 
 /// Everything a supervisor needs that doesn't vary per request.
 #[derive(Clone)]
-pub(in crate::runner) struct StartEnv {
-    pub(in crate::runner) base_dir: PathBuf,
-    pub(in crate::runner) pid_dir: PathBuf,
-    pub(in crate::runner) platform: crate::config::Platform,
-    pub(in crate::runner) docker_client: Option<bollard::Docker>,
-    pub(in crate::runner) emitter: LifecycleEmitter,
+pub(crate) struct StartEnv {
+    pub(crate) base_dir: PathBuf,
+    pub(crate) pid_dir: PathBuf,
+    pub(crate) platform: crate::config::Platform,
+    pub(crate) docker_client: Option<bollard::Docker>,
+    pub(crate) emitter: LifecycleEmitter,
     /// Global shutdown defaults, for stopping a start that lost a race.
-    pub(in crate::runner) shutdown: ShutdownConfig,
+    pub(crate) shutdown: ShutdownConfig,
 }
 
 /// Owner half for services.
-pub(in crate::runner) type ServiceStarts = super::supervisor::Supervisors<ServiceCommand>;
+pub(crate) type ServiceStarts = super::registry::Supervisors<ServiceCommand>;
 
 /// Start one start-supervisor per service, each taking ownership of its
 /// bound proxy (if any) from `proxies`.
-pub(in crate::runner) fn spawn_supervisors<'a>(
+pub(crate) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     env: &StartEnv,
     outputs: &dyn Fn(&str) -> Option<ItemOutput>,
@@ -705,11 +706,11 @@ fn resolve_supervisor_ready(
     if let Some(p) = proxy {
         public_env.extend(p.public_env_vars());
     }
-    let replacements = super::runtime_ports::port_replacements_for(
+    let replacements = super::ready::port_replacements_for(
         proxy.map(|p| p.bindings()).unwrap_or(&[]),
         docker_bindings,
     );
-    super::runtime_ports::resolve_ready_check(
+    super::ready::resolve_ready_check(
         resolved.ready.as_ref(),
         &resolved.env,
         &backend_env,

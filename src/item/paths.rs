@@ -2,7 +2,7 @@ use crate::globwalk::{glob_pattern_base_dir, matches_glob, matches_ignore};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub(in crate::runner) fn working_dir_for(base_dir: &Path, dir: Option<&Path>) -> PathBuf {
+pub(crate) fn working_dir_for(base_dir: &Path, dir: Option<&Path>) -> PathBuf {
     match dir {
         Some(dir) => base_dir.join(dir),
         None => base_dir.to_path_buf(),
@@ -18,7 +18,7 @@ fn resolve_glob_pattern(base_dir: &Path, pattern: &str) -> String {
     }
 }
 
-pub(in crate::runner) fn resolve_watch_ignore_patterns(
+pub(crate) fn resolve_watch_ignore_patterns(
     item_base_dir: &Path,
     item_ignore_patterns: &[String],
     workspace_base_dir: &Path,
@@ -36,7 +36,7 @@ pub(in crate::runner) fn resolve_watch_ignore_patterns(
     patterns
 }
 
-pub(in crate::runner) fn any_glob_path_changed_since(
+pub(crate) fn any_glob_path_changed_since(
     base_dir: &Path,
     patterns: &[String],
     ignore_patterns: &[String],

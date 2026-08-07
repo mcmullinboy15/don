@@ -1,6 +1,6 @@
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ensure_download_for_config_worker;
-use super::task;
+use super::task_process as task;
 use crate::config::{Platform, TaskAutoRun};
 use crate::task_state::{TaskHashProgress, TaskState};
 use std::collections::HashMap;
@@ -8,23 +8,23 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Clone, Copy)]
-pub(in crate::runner) enum TaskRunMode {
+pub(crate) enum TaskRunMode {
     Startup { has_dependents: bool },
     Triggered,
 }
 
-pub(in crate::runner) enum TaskRunPrepared {
+pub(crate) enum TaskRunPrepared {
     PendingRun { message: String },
     Skipped { message: String },
     Spawned(Box<task::TaskSpawn>),
 }
 
 #[derive(Clone)]
-pub(in crate::runner) struct TaskWorkerContext {
-    pub(in crate::runner) base_dir: PathBuf,
-    pub(in crate::runner) platform: Platform,
-    pub(in crate::runner) emitter: crate::output::LifecycleEmitter,
-    pub(in crate::runner) global_watch_ignore: Vec<String>,
+pub(crate) struct TaskWorkerContext {
+    pub(crate) base_dir: PathBuf,
+    pub(crate) platform: Platform,
+    pub(crate) emitter: crate::output::LifecycleEmitter,
+    pub(crate) global_watch_ignore: Vec<String>,
 }
 
 fn format_hash_progress(progress: TaskHashProgress) -> String {
@@ -171,7 +171,7 @@ fn decide_startup_task(inputs: StartupTaskInputs) -> StartupTaskDecision {
     StartupTaskDecision::Run
 }
 
-pub(in crate::runner) async fn run_task_worker(
+pub(crate) async fn run_task_worker(
     ctx: TaskWorkerContext,
     name: &str,
     task_cfg: &crate::config::Task,

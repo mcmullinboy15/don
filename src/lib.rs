@@ -1,5 +1,6 @@
 pub(crate) mod build_tool;
 pub mod client;
+pub mod command;
 pub mod completions;
 pub mod config;
 pub mod daemon;
@@ -9,6 +10,7 @@ pub mod duration;
 pub mod exec;
 pub(crate) mod globwalk;
 pub mod init;
+pub mod item;
 pub mod output;
 pub mod ports;
 pub mod process;
