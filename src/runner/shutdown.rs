@@ -404,7 +404,6 @@ impl Runner {
                 | RunnerInternalCommand::BatchBuildComplete(_)
                 | RunnerInternalCommand::RebuildBatchComplete(_)
                 | RunnerInternalCommand::LazyBuildComplete { .. }
-                | RunnerInternalCommand::ServiceHealthChanged { .. }
                 | RunnerInternalCommand::ReadyCheckComplete { .. }
                 | RunnerInternalCommand::UpdateCheckComplete(_) => {}
             }

@@ -67,7 +67,6 @@ pub(crate) struct RuntimeService {
     /// Cancel channel for the per-service health monitor task. `Some` when
     /// the monitor is running; dropping it (or sending) signals the loop
     /// to exit. Cleared on stop, restart, or process exit.
-    pub monitor_cancel: Option<oneshot::Sender<()>>,
     /// Number of consecutive `on_failure = "restart"` cycles we've
     /// triggered without the service recovering to Ready. Drives backoff
     /// for the next scheduled restart. Reset to 0 on Ready.
@@ -136,7 +135,6 @@ impl RuntimeService {
             resolved_watch_paths: Vec::new(),
             bazel_binary_path: None,
             batch_built: false,
-            monitor_cancel: None,
             restart_attempts: 0,
             last_start: None,
             rapid_crashes: 0,
@@ -158,9 +156,9 @@ impl RuntimeService {
     /// to make sure stale monitor traffic and stale auto-restart timers
     /// can't fire after the service is no longer in Ready/Unhealthy.
     pub(crate) fn stop_health_tracking(&mut self) {
-        if let Some(tx) = self.monitor_cancel.take() {
-            let _ = tx.send(());
-        }
+        // Monitor cancellation moved to the supervisor (dropped on Stop or
+        // process death); this now only clears the runner-side restart
+        // timer.
         if let Some(handle) = self.pending_restart.take() {
             handle.abort();
         }

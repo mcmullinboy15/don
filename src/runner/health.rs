@@ -1,4 +1,4 @@
-use super::{RunnerInternalCommand, service};
+use super::service;
 use tokio::sync::{mpsc, oneshot};
 
 /// Render an unexpected-exit lifecycle message from the reaped status.
@@ -44,7 +44,7 @@ pub(in crate::runner) fn unhealthy_restart_backoff_secs(attempt: u32) -> u64 {
 pub(in crate::runner) async fn run_health_monitor(
     name: String,
     ready: crate::config::ReadyCheck,
-    cmd_tx: mpsc::Sender<RunnerInternalCommand>,
+    report_tx: mpsc::UnboundedSender<super::ItemReport>,
     mut cancel: oneshot::Receiver<()>,
 ) {
     let interval_str = ready.monitor_interval.as_str();
@@ -67,24 +67,20 @@ pub(in crate::runner) async fn run_health_monitor(
                 consecutive_failures = 0;
                 if currently_unhealthy {
                     currently_unhealthy = false;
-                    let _ = cmd_tx
-                        .send(RunnerInternalCommand::ServiceHealthChanged {
-                            name: name.clone(),
-                            healthy: true,
-                        })
-                        .await;
+                    let _ = report_tx.send(super::ItemReport::HealthChanged {
+                        name: name.clone(),
+                        healthy: true,
+                    });
                 }
             }
             Err(_) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 if !currently_unhealthy && consecutive_failures >= unhealthy_after {
                     currently_unhealthy = true;
-                    let _ = cmd_tx
-                        .send(RunnerInternalCommand::ServiceHealthChanged {
-                            name: name.clone(),
-                            healthy: false,
-                        })
-                        .await;
+                    let _ = report_tx.send(super::ItemReport::HealthChanged {
+                        name: name.clone(),
+                        healthy: false,
+                    });
                 }
             }
         }

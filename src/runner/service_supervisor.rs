@@ -62,6 +62,11 @@ pub(in crate::runner) struct ServiceWired {
     /// check races against it. Errs immediately when the service has no
     /// registered output, which matches the old wiring's behavior.
     pub(in crate::runner) ready_exit_rx: tokio::sync::oneshot::Receiver<()>,
+    /// Cancellation for the health monitor this spawn may start. The
+    /// supervisor holds the sender and drops it on Stop or process death,
+    /// so monitor lifetime is tied to custody rather than to per-site
+    /// bookkeeping discipline.
+    pub(in crate::runner) monitor_cancel_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Parameters for [`ServiceCommand::Stop`].
@@ -184,6 +189,8 @@ async fn supervise(
     // the crash path (reap + report).
     let mut reader: Option<tokio::task::JoinHandle<()>> = None;
     let mut reader_eof: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    // Dropping this ends the held process's health monitor, if one ran.
+    let mut monitor_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
 
     loop {
         let command = match pending.take() {
@@ -204,6 +211,7 @@ async fn supervise(
                     _ = wait_eof(&mut reader_eof), if reader_eof.is_some() => {
                         busy.store(true, Ordering::Relaxed);
                         reader_eof = None;
+                        monitor_cancel = None;
                         if let Some(handle) = reader.take() {
                             await_reader(handle).await;
                         }
@@ -221,6 +229,7 @@ async fn supervise(
             ServiceCommand::Start(request) => request,
             ServiceCommand::Stop(request) => {
                 reader_eof = None;
+                monitor_cancel = None;
                 let result = match held.take() {
                     Some(handle) => {
                         let debug = service::StopDebug::new(name.clone(), env.emitter.clone());
@@ -324,6 +333,7 @@ async fn supervise(
                             &mut held,
                             &mut reader,
                             &mut reader_eof,
+                            &mut monitor_cancel,
                         )
                         .await,
                     )),
@@ -379,6 +389,7 @@ async fn wire_spawn(
     held: &mut Option<service::ServiceHandle>,
     reader: &mut Option<tokio::task::JoinHandle<()>>,
     reader_eof: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    monitor_cancel: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> ServiceWired {
     let service::StartResult {
         mut handle,
@@ -411,6 +422,7 @@ async fn wire_spawn(
     // wiring did too.
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     *reader = service_writer.map(|writer| {
         let writer = writer.clone();
         tokio::spawn(async move {
@@ -421,6 +433,7 @@ async fn wire_spawn(
     });
     *reader_eof = Some(eof_rx);
     *held = Some(handle);
+    *monitor_cancel = Some(cancel_tx);
 
     ServiceWired {
         identity,
@@ -428,6 +441,7 @@ async fn wire_spawn(
         docker_port_bindings,
         osc_sink,
         ready_exit_rx: exit_rx,
+        monitor_cancel_rx: cancel_rx,
     }
 }
 

@@ -25,6 +25,7 @@ impl Runner {
             docker_port_bindings,
             osc_sink,
             ready_exit_rx: exit_rx,
+            monitor_cancel_rx,
         } = wired;
         for binding in docker_port_bindings
             .iter()
@@ -88,23 +89,12 @@ impl Runner {
         }
 
         if let Some(ready) = ready_config {
-            // If the new instance has `monitor = true`, build the cancel
-            // channel up front and stash the sender on the RuntimeService —
-            // the spawned task spawns the monitor on Ready and uses the
-            // matching receiver. Stop/restart cancels by dropping the sender.
-            let monitor_cancel_rx = if ready.monitor {
-                if let Some(rs) = self.services.get_mut(name) {
-                    rs.stop_health_tracking();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    rs.monitor_cancel = Some(tx);
-                    Some(rx)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let cmd_tx_for_monitor = self.internal_tx.clone();
+            // The monitor's cancellation lives with the supervisor — it
+            // drops the sender when the process stops or dies, so monitor
+            // lifetime is tied to custody. This side only threads the
+            // receiver through to the task that starts the monitor.
+            let monitor_cancel_rx = ready.monitor.then_some(monitor_cancel_rx);
+            let report_tx_for_monitor = self.report_tx.clone();
             let cmd_tx_for_state = self.internal_tx.clone();
             tokio::spawn(async move {
                 let ready_result = tokio::select! {
@@ -142,7 +132,7 @@ impl Runner {
                 if success && let Some(cancel_rx) = monitor_cancel_rx {
                     let monitor_name = name_owned.clone();
                     tokio::spawn(async move {
-                        run_health_monitor(monitor_name, ready, cmd_tx_for_monitor, cancel_rx)
+                        run_health_monitor(monitor_name, ready, report_tx_for_monitor, cancel_rx)
                             .await;
                     });
                 }

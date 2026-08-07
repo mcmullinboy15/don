@@ -474,6 +474,10 @@ pub(in crate::runner) enum ItemReport {
     },
     /// A service's restart backoff elapsed; attempt `attempt` may begin.
     RestartDue { name: String, attempt: u32 },
+    /// The health monitor observed a transition. State-guarded on fold;
+    /// the monitor itself dies with custody (its cancel lives in the
+    /// supervisor), so it cannot outlive its process by more than a probe.
+    HealthChanged { name: String, healthy: bool },
 }
 
 enum RunnerInternalCommand {
@@ -502,8 +506,6 @@ enum RunnerInternalCommand {
         generation: u64,
         outcome: BatchBuildOutcome,
     },
-    /// Health-check monitor reported a state transition for a service.
-    ServiceHealthChanged { name: String, healthy: bool },
     /// Ready-check completed for a manual-start or rebuild spawn.
     ReadyCheckComplete {
         name: String,
@@ -1835,11 +1837,7 @@ impl Runner {
                                 timeout,
                             } => {
                                 self.handle_task_run_wait_timeout(&name, generation, &timeout);
-                            }
-                            RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
-                                self.handle_service_health_changed(&name, healthy).await;
-                            }
-                            RunnerInternalCommand::ReadyCheckComplete {
+                            }                            RunnerInternalCommand::ReadyCheckComplete {
                                 name,
                                 generation,
                                 success,
@@ -1896,6 +1894,9 @@ impl Runner {
                             }
                             ItemReport::RestartDue { name, attempt } => {
                                 self.handle_auto_restart(&name, attempt).await;
+                            }
+                            ItemReport::HealthChanged { name, healthy } => {
+                                self.handle_service_health_changed(&name, healthy).await;
                             }
                         }
                     }
@@ -2159,7 +2160,7 @@ mod tests {
             unhealthy_after: 2,
         };
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let monitor = tokio::spawn(run_health_monitor(
             "svc".to_string(),
@@ -2185,12 +2186,12 @@ mod tests {
             .expect("timeout waiting for unhealthy event")
             .expect("monitor channel closed unexpectedly");
         match msg {
-            RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
+            ItemReport::HealthChanged { name, healthy } => {
                 assert_eq!(name, "svc");
                 assert!(!healthy, "expected unhealthy event first");
             }
             _ => {
-                panic!("unexpected command variant — monitor should only send ServiceHealthChanged")
+                panic!("unexpected report variant — monitor should only send HealthChanged")
             }
         }
 
@@ -2220,12 +2221,12 @@ mod tests {
             .expect("timeout waiting for recovery event")
             .expect("monitor channel closed unexpectedly");
         match msg {
-            RunnerInternalCommand::ServiceHealthChanged { name, healthy } => {
+            ItemReport::HealthChanged { name, healthy } => {
                 assert_eq!(name, "svc");
                 assert!(healthy, "expected recovery event after rebind");
             }
             _ => {
-                panic!("unexpected command variant — monitor should only send ServiceHealthChanged")
+                panic!("unexpected report variant — monitor should only send HealthChanged")
             }
         }
 
@@ -2247,7 +2248,7 @@ mod tests {
             monitor_interval: "10s".to_string(),
             unhealthy_after: 5,
         };
-        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let monitor = tokio::spawn(run_health_monitor(
             "svc".to_string(),
