@@ -71,7 +71,6 @@ use self::health::unhealthy_restart_backoff_secs;
 use self::paths::any_glob_path_changed_since;
 use self::service_worker::ServiceStartContext;
 use self::support::check_gitignore;
-use self::task_worker::TaskRunPrepared;
 use crate::signals::shutdown_requested;
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -479,12 +478,14 @@ pub(in crate::runner) enum ItemReport {
 }
 
 enum RunnerInternalCommand {
-    /// Completion from a detached task run worker.
+    /// Report from a task's run supervisor: the run settled without a
+    /// spawn, is now running (wired metadata only — custody stays with the
+    /// supervisor), or failed to prepare.
     TaskRunPrepared {
         name: String,
         task_cfg: Box<crate::config::Task>,
         intent: TaskRunIntent,
-        result: Result<TaskRunPrepared, String>,
+        result: Result<task_supervisor::TaskRunReport, String>,
     },
     /// A manually-triggered task wait exceeded its requested wait deadline.
     TaskRunWaitTimedOut {
@@ -1069,7 +1070,9 @@ impl Runner {
                 emitter: output_manager.clone_lifecycle_emitter(),
                 global_watch_ignore: config.watch_ignore.clone(),
             },
+            &|name| output_manager.item_output(name),
             &internal_tx,
+            &report_tx,
         );
 
         let (manifest_writer_tx, manifest_writer_handle) = runtime_ports::spawn_manifest_writer(
@@ -3170,7 +3173,6 @@ mod tests {
 
         assert_eq!(rt.state(), TaskItemState::Pending);
         assert!(rt.pgid.is_none());
-        assert!(rt.osc_sink.is_none());
         assert_eq!(rt.attach_count, 0);
         assert!(rt.resolved_watch_paths.is_empty());
         assert_eq!(rt.config.cmd, "echo");

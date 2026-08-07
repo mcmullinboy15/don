@@ -35,6 +35,24 @@ pub(in crate::runner) struct RunRequest {
 /// [`Supervisors`]: super::supervisor::Supervisors
 pub(in crate::runner) type TaskSupervisors = super::supervisor::Supervisors<RunRequest>;
 
+/// What the runner receives for a spawned, wired run. The supervisor keeps
+/// the process handle and the output reader; this is what the runner's
+/// bookkeeping (shadows for attach/status, spawn lines) needs.
+pub(in crate::runner) struct TaskWired {
+    pub(in crate::runner) pgid: i32,
+    /// Sender into this run's PTY input gate; `None` for pipe-mode spawns.
+    pub(in crate::runner) pty_input: Option<mpsc::Sender<crate::output::PtyInput>>,
+    pub(in crate::runner) rendered_cmdline: String,
+}
+
+/// What a run request settled into, as reported to the runner. The spawned
+/// case carries wired metadata, never the process — custody stays here.
+pub(in crate::runner) enum TaskRunReport {
+    PendingRun { message: String },
+    Skipped { message: Option<String> },
+    Running(TaskWired),
+}
+
 /// Start one run supervisor per task.
 ///
 /// Every task gets one up front so the registry is immutable — see
@@ -44,10 +62,21 @@ pub(in crate::runner) type TaskSupervisors = super::supervisor::Supervisors<RunR
 pub(in crate::runner) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     ctx: &super::task_worker::TaskWorkerContext,
+    outputs: &dyn Fn(&str) -> Option<crate::output::ItemOutput>,
     internal_tx: &mpsc::Sender<RunnerInternalCommand>,
+    report_tx: &mpsc::UnboundedSender<super::ItemReport>,
 ) -> TaskSupervisors {
     TaskSupervisors::spawn_all(names, |name, rx, busy| {
-        supervise(name, rx, ctx.clone(), internal_tx.clone(), busy)
+        let output = outputs(&name);
+        supervise(
+            name,
+            rx,
+            ctx.clone(),
+            output,
+            internal_tx.clone(),
+            report_tx.clone(),
+            busy,
+        )
     })
 }
 
@@ -58,13 +87,17 @@ pub(in crate::runner) fn spawn_supervisors<'a>(
 /// time a newer request arrives; dropping that future would take the handle
 /// with it and leave a child nothing will ever reap. So the worker always
 /// runs to completion and the result is then killed off explicitly.
+#[allow(clippy::too_many_arguments)]
 async fn supervise(
     name: String,
     mut rx: mpsc::UnboundedReceiver<RunRequest>,
     ctx: super::task_worker::TaskWorkerContext,
+    output: Option<crate::output::ItemOutput>,
     internal_tx: mpsc::Sender<RunnerInternalCommand>,
+    report_tx: mpsc::UnboundedSender<super::ItemReport>,
     busy: Arc<AtomicBool>,
 ) {
+    let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<RunRequest> = None;
     let mut mailbox_closed = false;
 
@@ -115,27 +148,140 @@ async fn supervise(
             }
         };
 
-        match superseded {
-            Some(next) => {
-                if let Ok(prepared) = result {
-                    kill_superseded_spawn(&ctx.emitter, &name, prepared);
-                }
-                pending = Some(next);
+        if let Some(next) = superseded {
+            if let Ok(prepared) = result {
+                kill_superseded_spawn(&ctx.emitter, &name, prepared);
             }
-            None => {
-                let sent = internal_tx
-                    .send(RunnerInternalCommand::TaskRunPrepared {
-                        name: name.clone(),
-                        task_cfg,
-                        intent,
-                        result,
-                    })
-                    .await;
-                if sent.is_err() {
-                    return;
-                }
-            }
+            pending = Some(next);
+            continue;
         }
+
+        // Translate the worker's outcome into the runner-facing report; a
+        // spawned run is wired here, by its owner, and held to exit.
+        let (report, run) = match result {
+            Ok(super::task_worker::TaskRunPrepared::PendingRun { message }) => {
+                (Ok(TaskRunReport::PendingRun { message }), None)
+            }
+            Ok(super::task_worker::TaskRunPrepared::Skipped { message }) => (
+                Ok(TaskRunReport::Skipped {
+                    message: Some(message),
+                }),
+                None,
+            ),
+            Ok(super::task_worker::TaskRunPrepared::Spawned(spawn)) => {
+                let super::task::TaskSpawn {
+                    mut handle,
+                    child_output,
+                    rendered_cmdline,
+                } = *spawn;
+                let pgid = handle.pgid();
+                // Wire the spawn: PTY input gate, server-side screen, OSC
+                // scanner, output reader — all owned here now.
+                let pty_write = handle.take_pty_write();
+                let pty_input = match (pty_write, output.as_ref()) {
+                    (Some(pty), Some(output)) => {
+                        output.register_emulator(80, 24).await;
+                        let pty_input = crate::output::spawn_pty_gate(pty);
+                        // The scanner handle's drop removes its sink; tying it
+                        // to this run's scope is exactly the lifetime we want.
+                        let osc = output.add_osc_sink(pty_input.clone()).await;
+                        Some((pty_input, osc))
+                    }
+                    _ => None,
+                };
+                let reader = service_writer.as_ref().map(|writer| {
+                    let writer = writer.clone();
+                    tokio::spawn(async move {
+                        let _ = writer.process_stream(child_output).await;
+                    })
+                });
+                let (pty_input_tx, osc) = match pty_input {
+                    Some((tx, osc)) => (Some(tx), Some(osc)),
+                    None => (None, None),
+                };
+                (
+                    Ok(TaskRunReport::Running(TaskWired {
+                        pgid,
+                        pty_input: pty_input_tx,
+                        rendered_cmdline,
+                    })),
+                    Some((handle, reader, osc)),
+                )
+            }
+            Err(message) => (Err(message), None),
+        };
+
+        // The scheduler answer travels with the supervisor: `done_tx` is
+        // cloneable, so the exit half can complete it from here while the
+        // intent still reaches the runner for the state transition.
+        let outcome = run.as_ref().map(|(handle, _, _)| TaskRunOutcome {
+            name: name.clone(),
+            task_cfg: (*task_cfg).clone(),
+            base_dir: ctx.base_dir.clone(),
+            global_watch_ignore: ctx.global_watch_ignore.clone(),
+            pgid: handle.pgid(),
+            done_tx: match &intent {
+                super::TaskRunIntent::Scheduled { done_tx } => Some(done_tx.clone()),
+                super::TaskRunIntent::Background => None,
+            },
+            report_tx: report_tx.clone(),
+            rerun: matches!(intent, super::TaskRunIntent::Background),
+        });
+
+        let sent = internal_tx
+            .send(RunnerInternalCommand::TaskRunPrepared {
+                name: name.clone(),
+                task_cfg: task_cfg.clone(),
+                intent,
+                result: report,
+            })
+            .await;
+        if sent.is_err() {
+            return;
+        }
+
+        // Hold the run to exit. A request arriving mid-run parks and runs
+        // strictly after — owning the exit is what makes run N+1 unable to
+        // start early, which is the race the old `run_requested` flag and
+        // duplicate-pgid guard papered over.
+        let Some((mut handle, reader, osc)) = run else {
+            continue;
+        };
+        let Some(outcome) = outcome else { continue };
+        let timeout = task_cfg.timeout.clone();
+        let start = std::time::Instant::now();
+        let wait = super::task::wait_for_task(&mut handle, timeout.as_deref());
+        tokio::pin!(wait);
+        let result = loop {
+            tokio::select! {
+                result = &mut wait => break result,
+                next = rx.recv(), if !mailbox_closed => match next {
+                    Some(next) => pending = Some(next),
+                    None => mailbox_closed = true,
+                },
+            }
+        };
+        // Drain the reader before reporting, so "complete" never outruns
+        // the task's final output. Then the scanner handle drops with this
+        // scope, removing its sink.
+        if let Some(reader) = reader {
+            await_reader(reader).await;
+        }
+        drop(osc);
+        outcome.finish(result, start.elapsed()).await;
+    }
+}
+
+/// Join the finished reader, bounded — a wedged sink must not hold the
+/// supervisor hostage.
+async fn await_reader(handle: tokio::task::JoinHandle<()>) {
+    let mut handle = handle;
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
+        .await
+        .is_err()
+    {
+        handle.abort();
+        let _ = handle.await;
     }
 }
 
@@ -509,7 +655,9 @@ mod tests {
             global_watch_ignore: Vec::new(),
         };
         let names = ["build".to_string(), "migrate".to_string()];
-        let mut supervisors = spawn_supervisors(names.iter(), &ctx, &internal_tx);
+        let (report_tx, _report_rx) = mpsc::unbounded_channel();
+        let mut supervisors =
+            spawn_supervisors(names.iter(), &ctx, &|_| None, &internal_tx, &report_tx);
         let registry = supervisors.registry().clone();
 
         assert!(registry.get("build").is_some());

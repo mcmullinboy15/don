@@ -236,7 +236,6 @@ pub(crate) struct RuntimeTask {
     /// sweep landing in that window re-requests the task and double-spawns.
     pub run_requested: bool,
     /// OSC query sink for reclaiming PTY write on attach.
-    pub osc_sink: Option<crate::output::OscSinkHandle>,
     /// Sender into the live spawn's PTY input gate; `None` when there is no
     /// PTY (docker, pipe mode) or no live process. Cleared wherever
     /// `osc_sink` is.
@@ -247,9 +246,6 @@ pub(crate) struct RuntimeTask {
     pub attach_count: usize,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
-    /// Output reader task for the current process. It must drain before
-    /// output sinks are torn down or final shutdown logs can be lost.
-    pub output_worker: Option<tokio::task::JoinHandle<()>>,
     /// In-flight detached task run worker.
     /// Monotonic generation for task run workers so stale completions can
     /// be ignored.
@@ -281,11 +277,9 @@ impl RuntimeTask {
             config,
             last_params: HashMap::new(),
             pgid: None,
-            osc_sink: None,
             pty_input: None,
             attach_count: 0,
             resolved_watch_paths: Vec::new(),
-            output_worker: None,
             run_generation: 0,
             run_requested: false,
             run_waiter: None,

@@ -1,9 +1,9 @@
-use super::task_worker::{TaskRunMode, TaskRunPrepared};
+use super::task_supervisor;
+use super::task_worker::TaskRunMode;
 use super::{
     CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
     TaskItemState, TaskRunIntent, TaskRunWaiter, resolve_task_params,
 };
-use super::{task, task_supervisor};
 use crate::config::TaskAutoRun;
 use crate::duration::parse_duration;
 use std::collections::HashMap;
@@ -60,7 +60,7 @@ impl Runner {
         name: &str,
         task_cfg: &crate::config::Task,
         intent: TaskRunIntent,
-        result: Result<TaskRunPrepared, String>,
+        result: Result<task_supervisor::TaskRunReport, String>,
     ) {
         if let Some(rt) = self.tasks.get_mut(name) {
             rt.run_requested = false;
@@ -70,7 +70,7 @@ impl Runner {
             return;
         }
         match result {
-            Ok(TaskRunPrepared::PendingRun { message }) => {
+            Ok(task_supervisor::TaskRunReport::PendingRun { message }) => {
                 self.settle_task_without_spawn(
                     name,
                     intent,
@@ -78,36 +78,20 @@ impl Runner {
                 )
                 .await;
             }
-            Ok(TaskRunPrepared::Skipped { message }) => {
+            Ok(task_supervisor::TaskRunReport::Skipped { message }) => {
                 self.settle_task_without_spawn(
                     name,
                     intent,
-                    task_supervisor::NoSpawnOutcome::skipped(message),
+                    task_supervisor::NoSpawnOutcome::skipped(
+                        message.unwrap_or_else(|| "skipped".to_string()),
+                    ),
                 )
                 .await;
             }
-            Ok(TaskRunPrepared::Spawned(spawn)) => {
-                // A run is already live for this task. Request-side dedup
-                // (`run_requested`) should prevent this, but a spawned
-                // process must be reaped however it came to exist — kill
-                // the duplicate rather than clobbering the live run's
-                // execution wiring (pgid, waiter, output worker), which is
-                // what turned a benign race into "failed (exit code -1)".
-                if self.tasks.get(name).is_some_and(|rt| rt.pgid.is_some()) {
-                    let emitter = self.output_manager.clone_lifecycle_emitter();
-                    task_supervisor::kill_superseded_spawn(
-                        &emitter,
-                        name,
-                        TaskRunPrepared::Spawned(spawn),
-                    );
-                    return;
-                }
+            Ok(task_supervisor::TaskRunReport::Running(wired)) => {
                 let emitter = self.output_manager.clone_lifecycle_emitter();
-                emitter.service_debug_event(
-                    name,
-                    &format!("process spawned (pid {})", spawn.handle.pgid()),
-                );
-                emitter.service_event(name, &format!("spawn {}", spawn.rendered_cmdline));
+                emitter.service_debug_event(name, &format!("process spawned (pid {})", wired.pgid));
+                emitter.service_event(name, &format!("spawn {}", wired.rendered_cmdline));
                 // An interactive task waits for a user on its PTY; say how
                 // to reach it, loudly enough to act on.
                 if task_cfg.terminal.is_foreground() {
@@ -116,9 +100,14 @@ impl Runner {
                         &format!("waiting for input — run 'don attach {name}'"),
                     );
                 }
-                let done_tx = self.begin_task_run(name, intent, Some("running..."));
-                self.wire_task_output_and_wait(name, *spawn, task_cfg, done_tx)
-                    .await;
+                // The supervisor holds the process, the reader, and the
+                // scheduler answer; this side keeps the shadows attach and
+                // status read, and makes the runner-only state transition.
+                if let Some(rt) = self.tasks.get_mut(name) {
+                    rt.pgid = Some(wired.pgid);
+                    rt.pty_input = wired.pty_input;
+                }
+                let _ = self.begin_task_run(name, intent, Some("running..."));
             }
             Err(message) => {
                 self.settle_task_without_spawn(
@@ -213,97 +202,6 @@ impl Runner {
                     });
                 }
             }
-        }
-    }
-
-    /// Wire up a spawned task's output and wait for completion.
-    ///
-    /// Starts output capture, spawns a background task to wait for exit,
-    /// records success in task state, and sends completion events.
-    /// - If `done_tx` is `Some`, sends `ItemDone` (initial startup path).
-    /// - If `done_tx` is `None`, sends `TaskRerunComplete` (file-watch rerun path).
-    async fn wire_task_output_and_wait(
-        &mut self,
-        name: &str,
-        spawn: task::TaskSpawn,
-        task_cfg: &crate::config::Task,
-        done_tx: Option<mpsc::Sender<ItemDone>>,
-    ) {
-        let task::TaskSpawn {
-            mut handle,
-            child_output,
-            rendered_cmdline: _rendered_cmdline,
-        } = spawn;
-
-        let pgid = handle.pgid();
-        // One handle for every output operation this run needs. Taking it up
-        // front is what lets this whole block move into a per-task supervisor
-        // later — `OutputManager` itself can't, since only one thing may own
-        // the writer handles it joins on shutdown.
-        let output = self.output_manager.item_output(name);
-
-        // Add OSC response sink if we have a PTY write handle. Take the write
-        // half unconditionally so an unregistered name still closes it.
-        let pty_write = handle.take_pty_write();
-        if let (Some(output), Some(pty)) = (output.as_ref(), pty_write) {
-            // Feed the server-side screen from process start so an attach
-            // gets a coherent repaint. Matches the PTY's initial 80x24.
-            output.register_emulator(80, 24).await;
-            let pty_input = crate::output::spawn_pty_gate(pty);
-            let osc_handle = output.add_osc_sink(pty_input.clone()).await;
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.osc_sink = Some(osc_handle);
-                rt.pty_input = Some(pty_input);
-            }
-        }
-
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.pgid = Some(pgid);
-        }
-
-        let output_worker = output.map(|output| {
-            let svc_writer = output.writer();
-            tokio::spawn(async move {
-                let _ = svc_writer.process_stream(child_output).await;
-            })
-        });
-        if let Some(rt) = self.tasks.get_mut(name) {
-            if let Some(old_worker) = rt.output_worker.take() {
-                old_worker.abort();
-            }
-            rt.output_worker = output_worker;
-        }
-
-        let timeout = task_cfg.timeout.clone();
-        let outcome = self.task_run_outcome(name, task_cfg, pgid, done_tx);
-
-        tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            let result = task::wait_for_task(&mut handle, timeout.as_deref()).await;
-            outcome.finish(result, start.elapsed()).await;
-        });
-    }
-
-    /// Bundle everything the exit half of a run needs, owned.
-    ///
-    /// `done_tx` being `Some` is what marks a startup-scheduled run: it
-    /// answers the dependency scheduler instead of reporting a rerun.
-    fn task_run_outcome(
-        &self,
-        name: &str,
-        task_cfg: &crate::config::Task,
-        pgid: i32,
-        done_tx: Option<mpsc::Sender<ItemDone>>,
-    ) -> task_supervisor::TaskRunOutcome {
-        task_supervisor::TaskRunOutcome {
-            name: name.to_string(),
-            task_cfg: task_cfg.clone(),
-            base_dir: self.base_dir.clone(),
-            global_watch_ignore: self.config.watch_ignore.clone(),
-            pgid,
-            rerun: done_tx.is_none(),
-            done_tx,
-            report_tx: self.report_tx.clone(),
         }
     }
 

@@ -1,6 +1,5 @@
 use super::graph::topological_sort;
 
-use super::task_worker::TaskRunPrepared;
 use super::{Runner, RunnerInternalCommand, ServiceState, ServiceStopAction};
 use crate::signals::force_shutdown_requested;
 use std::collections::{BTreeMap, HashMap};
@@ -105,15 +104,12 @@ impl Runner {
             self.output_manager
                 .service_event(&name, "run cancelled by shutdown");
         }
-        // Task supervisors can be ended here — they only *prepare* runs.
-        // Service supervisors must NOT be: they own the processes now, and
-        // the reverse-dependency stop loop below works by sending them Stop.
-        // They are ended at the end of this function, once every stop has
-        // been executed and joined.
-        let supervisors = self.task_supervisors.abort_all();
-        for (_, handle) in supervisors {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
-        }
+        // Neither supervisor set may be ended here: both own processes now
+        // (task supervisors hold their runs to exit; service supervisors
+        // execute the reverse-dependency stops below). Both are ended at the
+        // teardown tail, once the stops have joined and the task pgid sweep
+        // has run — aborting earlier would drop held handles (kill_on_drop)
+        // before the graceful path decides anything.
 
         // Same treatment for any in-flight JIT lazy builds. These are
         // spawned when a lazy service's proxy gets its first connection
@@ -353,10 +349,16 @@ impl Runner {
             }
         }
 
-        // Every stop has been executed and joined; the service supervisors
-        // are idle and can end now. Abort-all-then-await keeps the 1s bound
-        // paid once, not once per service.
+        // Every stop has been executed and joined, and the task pgid sweep
+        // has run; both supervisor sets are idle (or their waits have
+        // completed against killed processes) and can end now.
+        // Abort-all-then-await keeps the 1s bound paid once, not once per
+        // item.
         let supervisors = self.service_starts.abort_all();
+        for (_, handle) in supervisors {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        }
+        let supervisors = self.task_supervisors.abort_all();
         for (_, handle) in supervisors {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
@@ -382,9 +384,6 @@ impl Runner {
             rs.stop_action = ServiceStopAction::None;
         }
         for rt in self.tasks.values_mut() {
-            if let Some(worker) = rt.output_worker.take() {
-                Self::await_output_worker(worker).await;
-            }
             rt.attach_count = 0;
         }
     }
@@ -454,41 +453,22 @@ impl Runner {
     pub(in crate::runner) async fn stop_late_task_start(
         &mut self,
         name: String,
-        result: Result<TaskRunPrepared, String>,
+        result: Result<super::task_supervisor::TaskRunReport, String>,
     ) {
-        let Ok(prepared) = result else {
+        let Ok(super::task_supervisor::TaskRunReport::Running(wired)) = result else {
             return;
         };
-        match prepared {
-            TaskRunPrepared::Spawned(spawn) => {
-                self.output_manager
-                    .service_event(&name, "run cancelled by shutdown");
-                let crate::runner::task::TaskSpawn {
-                    mut handle,
-                    child_output,
-                    rendered_cmdline: _rendered_cmdline,
-                } = *spawn;
-                let output_worker = self.output_manager.service_writer(&name).map(|writer| {
-                    tokio::spawn(async move {
-                        let _ = writer.process_stream(child_output).await;
-                    })
-                });
-                self.output_manager.service_event(
-                    &name,
-                    &format!("send SIGKILL to task pgid {}", handle.pgid()),
-                );
-                let _ = handle
-                    .terminate(
-                        nix::sys::signal::Signal::SIGKILL,
-                        std::time::Duration::from_millis(500),
-                    )
-                    .await;
-                if let Some(worker) = output_worker {
-                    Self::await_output_worker(worker).await;
-                }
-            }
-            TaskRunPrepared::PendingRun { .. } | TaskRunPrepared::Skipped { .. } => {}
-        }
+        // The supervisor holds the process and is waiting on its exit; kill
+        // the group and let that wait complete. The reader drains inside
+        // the supervisor before it reports.
+        self.output_manager
+            .service_event(&name, "run cancelled by shutdown");
+        self.output_manager
+            .service_event(&name, &format!("send SIGKILL to task pgid {}", wired.pgid));
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(wired.pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
     }
 
     async fn drain_service_output(&mut self, name: &str) {
