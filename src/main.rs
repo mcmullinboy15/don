@@ -2532,7 +2532,7 @@ async fn run_start(
                 .profiles
                 .get(profile_name)
                 .ok_or_else(|| format!("Error: unknown profile '{profile_name}'"))?;
-            Some(don::runner::resolve_profile_processes(&config, prof))
+            Some(don::config::resolve_profile_processes(&config, prof))
         } else {
             None
         };

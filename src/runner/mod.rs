@@ -7,12 +7,9 @@
 
 mod attach;
 mod completions;
-mod env_refs;
 mod events;
 mod graph;
 mod lazy;
-mod params;
-mod profile;
 mod rebuild;
 mod runtime_ports;
 mod service_commands;
@@ -38,6 +35,7 @@ pub use crate::command::{CommandError, CommandResult};
 // Aliases keep the runner's internal paths and the public `don::runner::…`
 // surface stable.
 pub(in crate::runner) use crate::build_tool::{batch as build_tools, batcher as build_batcher};
+pub use crate::param_completions::CompletionError;
 pub(crate) use crate::process::{ProcessKind, ProcessReport};
 pub(in crate::runner) use crate::process::{
     ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, health, paths,
@@ -49,8 +47,7 @@ pub use crate::state_store::{
     ParamInfo, ProcessStatus, StateReader, StateSnapshot, VerboseInfo, all_services_ready,
 };
 
-pub(crate) use params::resolve_task_params;
-pub use profile::resolve_profile_processes;
+pub(crate) use crate::process::params::resolve_task_params;
 
 use crate::config::{Config, Platform, ShutdownConfig};
 use crate::output::OutputManager;
@@ -131,30 +128,6 @@ pub(crate) enum ServiceStopAction {
     None,
     RestartFull,
     RestartSpawnOnly,
-}
-
-/// Error returned from [`RunnerCommand::ResolveCompletions`].
-///
-/// The TUI displays `message` inline and, when `log_path` is set, offers
-/// the user a way to pull up the full command invocation + stdout/stderr
-/// that was saved at that path.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CompletionError {
-    /// Human-readable summary suitable for a status bar / inline banner.
-    pub message: String,
-    /// Filesystem path to the saved log file, when one was written.
-    /// Absent when the failure happened before the command was invoked
-    /// (e.g., unknown task or param).
-    pub log_path: Option<std::path::PathBuf>,
-}
-
-impl std::fmt::Display for CompletionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.log_path {
-            Some(p) => write!(f, "{} (see {})", self.message, p.display()),
-            None => write!(f, "{}", self.message),
-        }
-    }
 }
 
 fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {
@@ -525,7 +498,8 @@ pub struct Runner {
 
     /// Per-param completion results cache. Populated as the TUI / CLI
     /// resolves completions.
-    completion_cache: std::sync::Arc<tokio::sync::RwLock<completions::CompletionCache>>,
+    completion_cache:
+        std::sync::Arc<tokio::sync::RwLock<crate::param_completions::CompletionCache>>,
 
     /// Internal shutdown flag broadcast to detached control workers so they
     /// can force-kill promptly when don is exiting.
@@ -711,7 +685,7 @@ impl Runner {
             batch_outcome_rx,
             batcher_handle: Some(batcher_handle),
             completion_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
-                completions::CompletionCache::default(),
+                crate::param_completions::CompletionCache::default(),
             )),
             shutdown_flag_tx,
             shutting_down: false,

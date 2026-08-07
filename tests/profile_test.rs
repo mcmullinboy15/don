@@ -3,9 +3,10 @@
 
 mod helpers;
 
+use don::config::resolve_profile_processes;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, resolve_profile_processes};
+use don::runner::Runner;
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;

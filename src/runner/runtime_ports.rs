@@ -67,12 +67,10 @@ impl Runner {
         // this keeps shell-style `$(...)` values in inline env untouched.
         let known_services: HashSet<String> = self.services.keys().cloned().collect();
         for (key, value) in env.iter_mut() {
-            *value =
-                super::env_refs::render(value, &references, &known_services).map_err(|error| {
-                    CommandError::Failed {
-                        name: process_name.to_string(),
-                        message: format!("invalid runtime port reference in env.{key}: {error}"),
-                    }
+            *value = crate::process::env_refs::render(value, &references, &known_services)
+                .map_err(|error| CommandError::Failed {
+                    name: process_name.to_string(),
+                    message: format!("invalid runtime port reference in env.{key}: {error}"),
                 })?;
         }
         Ok(())

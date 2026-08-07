@@ -211,7 +211,7 @@ src/
     diff.rs                 # config diffing for live reload (added/removed/changed detection)
     service.rs              # Service, ServiceOverride, ResolvedService, presets
     task.rs                 # Task config
-    profile.rs              # Profile config
+    profile.rs              # Profile config + profile → process-set resolution
     platform.rs             # Platform enum, deserialization
     download.rs             # DownloadConfig, PlatformDownload, cache paths
     types.rs                # Shared types: Command, ReadyCheck, ShutdownConfig, LogConfig
@@ -227,11 +227,14 @@ src/
     task_worker.rs          # task run preparation (params, hashing, spawn)
     health.rs               # health monitor loop
     ready.rs                # ready-check resolution against live runtime ports
+    params.rs               # task param value resolution
+    env_refs.rs             # $(service.key) runtime env reference rendering
     state.rs                # ServiceState / TaskState machines, ProcessKind
     paths.rs                # watch-path staleness checks
   runner/
     mod.rs                  # scheduler — dependency graph, startup/shutdown order, folds ProcessReports
   state_store.rs            # runner-written / world-readable state projection + ProcessStatus
+  param_completions.rs      # task-param completion engine: cache, shell-out, parse, failure log
   sys/
     mod.rs                  # process group management, PTY spawning, identity tracking
     pid_file.rs             # PID file locking (flock-based) for single-instance guard

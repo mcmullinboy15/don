@@ -7,7 +7,9 @@
 //! decides what starts next. Commands flow down, reports flow up, and the
 //! scheduler never reaches into an process's internals.
 
+pub(crate) mod env_refs;
 pub(crate) mod health;
+pub(crate) mod params;
 pub(crate) mod paths;
 pub(crate) mod ready;
 pub(crate) mod registry;

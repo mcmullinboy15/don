@@ -9,7 +9,7 @@ mod group;
 pub(crate) mod param;
 mod platform;
 pub(crate) mod ports;
-mod profile;
+pub(crate) mod profile;
 pub(crate) mod service;
 pub(crate) mod task;
 pub(crate) mod template;
@@ -31,6 +31,7 @@ pub use self::types::{
     BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
     ShutdownConfig,
 };
+pub use profile::resolve_profile_processes;
 
 pub use self::service::{GoConfig, ServiceOverride};
 

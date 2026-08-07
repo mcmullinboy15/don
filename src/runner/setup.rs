@@ -1,5 +1,5 @@
-use super::profile::resolve_profile_processes_for_platform;
 use super::{RunnerError, RuntimeService, RuntimeTask, ServiceState, TaskState};
+use crate::config::profile::resolve_profile_processes_for_platform;
 use crate::config::{Config, Platform, ServiceKind};
 use crate::output::OutputManager;
 use crate::sys::pid_file::{PidFile, PidFileError};

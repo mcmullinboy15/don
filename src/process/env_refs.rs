@@ -14,14 +14,14 @@
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(in crate::runner) enum EnvRefError {
+pub(crate) enum EnvRefError {
     #[error(
         "unknown runtime port reference '$({reference})' — ensure the service is in depends_on and exposes a proxy or Docker port"
     )]
     Unknown { reference: String },
 }
 
-pub(in crate::runner) fn render(
+pub(crate) fn render(
     value: &str,
     refs: &HashMap<String, String>,
     known_services: &HashSet<String>,
