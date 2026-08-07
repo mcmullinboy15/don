@@ -8,6 +8,11 @@ use tokio::task::JoinSet;
 impl Runner {
     /// Initiate graceful shutdown of all services.
     pub(in crate::runner) async fn initiate_shutdown(&mut self) {
+        // Revoke every permission first: a grant published a moment ago must
+        // not be spendable into a process this teardown has already decided
+        // which supervisors to stop.
+        self.start_gates.block_all();
+
         if self.shutting_down {
             return;
         }

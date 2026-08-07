@@ -572,6 +572,15 @@ impl Runner {
             .cloned()
             .collect();
 
+        // Publish permission for *every* process, not only the newly-ready
+        // ones: a gate is a level, so "you may not run" has to be said out
+        // loud. Teardown revokes everything regardless of readiness.
+        let blocked_by_shutdown = self.shutting_down || shutdown_requested();
+        for name in &order {
+            let allow = !blocked_by_shutdown && ready.contains(name);
+            self.start_gates.set(name, allow);
+        }
+
         if !self.scheduler_live {
             return;
         }

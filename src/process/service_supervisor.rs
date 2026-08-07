@@ -176,11 +176,13 @@ pub(crate) fn spawn_supervisors<'a>(
     resolved: &dyn Fn(&str) -> Option<crate::config::ResolvedService>,
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     proxies: &mut std::collections::HashMap<String, ProxyAssets>,
+    gates: &mut std::collections::HashMap<String, crate::gate::GateReader>,
 ) -> ServiceStarts {
     ServiceStarts::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
         let assets = proxies.remove(&name);
         let resolved = resolved(&name);
+        let gate = gates.remove(&name);
         supervise(
             name,
             rx,
@@ -190,6 +192,7 @@ pub(crate) fn spawn_supervisors<'a>(
             busy,
             assets,
             resolved,
+            gate,
         )
     })
 }
@@ -218,6 +221,15 @@ fn build_context(
         fallback_ports: env.fallback_ports,
         prior_docker_port_bindings: last_docker_bindings.to_vec(),
     }))
+}
+
+/// Wait on a gate slot, parking forever when there is none — so an absent
+/// gate never completes and never consumes its `select!` branch.
+async fn wait_gate(gate: &mut Option<crate::gate::GateReader>) -> Option<()> {
+    match gate.as_mut() {
+        Some(gate) => gate.changed().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Stop a service brought up by a start that has since been superseded.
@@ -267,6 +279,7 @@ async fn supervise(
     busy: Arc<AtomicBool>,
     proxy_assets: Option<ProxyAssets>,
     resolved: Option<crate::config::ResolvedService>,
+    mut gate: Option<crate::gate::GateReader>,
 ) {
     // Names come from the same map the configs do, so `None` is unreachable;
     // ending the supervisor beats panicking, and callers already treat a dead
@@ -306,6 +319,17 @@ async fn supervise(
             Some(command) => command,
             None => loop {
                 busy.store(false, Ordering::Relaxed);
+                // Level read: a grant published while this supervisor was
+                // busy is still visible here. Spending requires holding no
+                // process, which with the epoch is the whole anti-double-
+                // start argument.
+                if held.is_none()
+                    && let Some(gate) = gate.as_mut()
+                    && let Some(epoch) = gate.take()
+                {
+                    env.emitter
+                        .service_debug_event(&name, &format!("start permitted (epoch {epoch})"));
+                }
                 tokio::select! {
                     received = rx.recv() => match received {
                         Some(command) => {
@@ -350,6 +374,18 @@ async fn supervise(
                         }
                         continue;
                     }
+                    // Permission changed. Nothing is decided here: the level
+                    // is read at the top of this loop, which is the single
+                    // place a grant is spent.
+                    changed = wait_gate(&mut gate), if gate.is_some() => {
+                        // The scheduler is gone. A `watch::Receiver` with no
+                        // sender errors immediately and forever, so drop the
+                        // slot rather than spin the select.
+                        if changed.is_none() {
+                            gate = None;
+                        }
+                        continue;
+                    }
                     // The lazy proxy saw a connection: demand. The runner
                     // gates on service state, so duplicates are harmless.
                     demand = wait_demand(&mut demand_rx), if demand_rx.is_some() => {
@@ -391,6 +427,13 @@ async fn supervise(
                 reader_eof = None;
                 monitor_cancel = None;
                 ready_pending = None;
+                // Spend the standing permission without acting on it: a stop
+                // must not be undone by a grant published just before it. A
+                // restart's follow-up start arrives as a mailbox Start, not a
+                // permit, so this cannot suppress one.
+                if let Some(gate) = gate.as_mut() {
+                    gate.burn();
+                }
                 let result = match held.take() {
                     Some(handle) => {
                         let debug = service::StopDebug::new(name.clone(), env.emitter.clone());
@@ -953,6 +996,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             assets,
             Some(test_resolved()),
+            None,
         ));
         Harness {
             tx,

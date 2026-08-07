@@ -340,6 +340,9 @@ pub struct Runner {
     /// True once `run()`'s scheduler is live. Transitions before that
     /// (construction, setup) must not enqueue dependency sweeps.
     scheduler_live: bool,
+    /// Per-process permission to run — the scheduler's whole output. See
+    /// [`crate::gate`].
+    start_gates: crate::gate::GateWriter,
     /// A start-pending sweep is due. Set by fold transitions (see
     /// `schedule_start_pending`), consumed at the top of the main loop —
     /// the runner's own deferred tick, invisible to clients by construction.
@@ -506,6 +509,11 @@ impl Runner {
         // proxy at spawn below; the runner keeps only the view. Lazy services
         // get a per-service trigger channel whose receiving half rides along,
         // and the supervisor forwards each trigger as a demand report.
+        // One gate per process, created before any supervisor so each can be
+        // handed its own reader at spawn.
+        let gate_names: Vec<String> = services.keys().chain(tasks.keys()).cloned().collect();
+        let (start_gates, mut gate_readers) = crate::gate::channel(gate_names.iter());
+
         // Publish endpoints before binding: the key set decides which
         // `$(name.key)` tokens count as runtime references at all, and proxy
         // bindings land below — before any supervisor exists, which is what
@@ -574,6 +582,7 @@ impl Runner {
             &|name| services.get(name).map(|rs| rs.resolved.clone()),
             &report_tx,
             &mut proxies,
+            &mut gate_readers,
         );
 
         // One supervisor per task, started before the runner exists so the
@@ -614,6 +623,7 @@ impl Runner {
             event_tx,
             state,
             scheduler_live: false,
+            start_gates,
             start_pending_scheduled: false,
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
@@ -1221,6 +1231,7 @@ impl Runner {
         // Channel for dependency-scheduled completion notifications. Store the
         // sender on `self` so services requested later use the same path.
         self.scheduler_live = true;
+        self.start_gates.arm();
 
         // Initial non-lazy processes already occupy Pending. A lazy connection
         // performs the same state transition and can join this scheduler at
