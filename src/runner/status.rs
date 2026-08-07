@@ -1,52 +1,10 @@
-use super::{ProcessStatus, Runner, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
+use super::{ProcessStatus, Runner, VerboseInfo};
 
 impl Runner {
     pub(in crate::runner) async fn fetch_watch_snapshot(
         &self,
     ) -> Option<crate::watch::WatchSnapshot> {
         self.watch.as_ref()?.snapshot().await
-    }
-
-    /// Build a global [`WatchReport`] of every active inotify registration and
-    /// per-process watch pattern. Returns `None` when no watches are active (no
-    /// service/task declared watch patterns, or the watcher is unreachable).
-    pub(in crate::runner) async fn collect_watch_report(&self) -> Option<WatchReport> {
-        let snapshot = self.fetch_watch_snapshot().await?;
-
-        let mut directories: Vec<WatchDir> = snapshot
-            .registered_dirs
-            .iter()
-            .map(|(path, mode)| WatchDir {
-                path: path.to_string_lossy().into_owned(),
-                mode: (*mode).to_string(),
-            })
-            .collect();
-        directories.sort_by(|a, b| a.path.cmp(&b.path));
-
-        let mut items: Vec<WatchReportItem> = snapshot
-            .items
-            .iter()
-            .map(|(name, process)| WatchReportItem {
-                name: name.clone(),
-                kind: process.kind.to_string(),
-                state: process.state.to_string(),
-                stale: process.stale,
-                debounce_ms: process.debounce_ms,
-                patterns: process.patterns.clone(),
-                ignore_patterns: process.ignore_patterns.clone(),
-                last_error: process.last_error.clone(),
-            })
-            .collect();
-        items.sort_by(|a, b| a.name.cmp(&b.name));
-
-        Some(WatchReport {
-            directories,
-            items,
-            global_ignore: snapshot.global_ignore.clone(),
-            notify_error_count: snapshot.notify_error_count,
-            runner_event_lag_count: snapshot.runner_event_lag_count,
-            last_notify_error: snapshot.last_notify_error.clone(),
-        })
     }
 
     /// The cheap, allocation-only projection of every process's state.

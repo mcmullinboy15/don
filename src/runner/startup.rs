@@ -6,8 +6,8 @@ use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ServiceStartMode;
 use super::task_worker::TaskRunMode;
 use super::{
-    ProcessKind, Runner, RunnerCommand, RunnerInternalCommand, RuntimeService, ServiceState,
-    TaskRunIntent, TaskState,
+    ProcessKind, Runner, RunnerInternalCommand, RuntimeService, ServiceState, TaskRunIntent,
+    TaskState,
 };
 use crate::config::Dependency;
 use crate::signals::shutdown_requested;
@@ -372,9 +372,10 @@ impl Runner {
         false
     }
 
-    /// Ask the runner loop to re-check `Pending` processes on its own task.
-    pub(in crate::runner) fn schedule_start_pending(&self) {
-        let _ = self.cmd_tx.send(RunnerCommand::StartPending);
+    /// Mark a start-pending sweep as due. Consumed at the top of the main
+    /// loop, so a burst of transitions coalesces into one sweep.
+    pub(in crate::runner) fn schedule_start_pending(&mut self) {
+        self.start_pending_scheduled = true;
     }
 
     /// Resolve failed direct dependencies to their root failures. An

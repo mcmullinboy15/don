@@ -820,21 +820,13 @@ cmd = "false"
 "#,
         );
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let completions = runner.completion_resolver();
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::ResolveCompletions {
-                task: "sync".to_string(),
-                param: "index".to_string(),
-                partial: HashMap::new(),
-                force_refresh: false,
-                reply: reply_tx,
-            })
-            .unwrap();
-        let result = reply_rx.await.unwrap();
+        let result = completions
+            .resolve_param("sync", "index", &HashMap::new(), false)
+            .await;
         let err = result.expect_err("completion command exits 1, should be an error");
         let log_path = err.log_path.expect("error should carry a log path");
         assert!(log_path.exists(), "log file should have been written");
@@ -870,21 +862,14 @@ choices = ["dev", "staging", "prod"]
 "#,
         );
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let completions = runner.completion_resolver();
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::ResolveCompletions {
-                task: "sync".to_string(),
-                param: "env".to_string(),
-                partial: HashMap::new(),
-                force_refresh: false,
-                reply: reply_tx,
-            })
+        let values = completions
+            .resolve_param("sync", "env", &HashMap::new(), false)
+            .await
             .unwrap();
-        let values = reply_rx.await.unwrap().unwrap();
         assert_eq!(values, vec!["dev", "staging", "prod"]);
 
         let _ = shutdown_tx.send(()).await;

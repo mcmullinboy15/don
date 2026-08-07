@@ -67,6 +67,12 @@ pub(crate) struct ApiState {
     /// `state`: `GET /logs` answers off the ring buffers directly instead of
     /// queueing a command behind the runner's current work.
     pub logs: crate::output::LogReader,
+    /// Task-param completion resolver — same rationale again: a slow
+    /// completions command blocks its own request, never the runner.
+    pub completions: crate::param_completions::CompletionResolver,
+    /// Read-only handle for the global watch report — `GET /watch` queries
+    /// the watch manager directly, without the runner.
+    pub watch_status: crate::watch::report::WatchStatusReader,
     /// Active attach sessions per process — see [`NameSessions`].
     pub attach_sessions: std::sync::Arc<tokio::sync::Mutex<SessionMap>>,
     /// Handle to the server-side terminal-emulator thread — resize
@@ -136,6 +142,8 @@ pub async fn serve_api(
     emulator: crate::output::emulator::EmulatorHandle,
     log_tap: crate::output::MergedLogTap,
     logs: crate::output::LogReader,
+    completions: crate::param_completions::CompletionResolver,
+    watch_status: crate::watch::report::WatchStatusReader,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);
@@ -149,6 +157,8 @@ pub async fn serve_api(
         )),
         log_tap,
         logs,
+        completions,
+        watch_status,
         shutdown: shutdown.clone(),
     });
     let app = routes::build_router(state);
@@ -182,6 +192,8 @@ pub fn serve_for_runner(
     let emulator = runner.emulator_handle();
     let log_tap = runner.log_stream_sender();
     let logs = runner.log_reader();
+    let completions = runner.completion_resolver();
+    let watch_status = runner.watch_status_reader();
     let path = socket_path.to_path_buf();
     let display = socket_path.display().to_string();
     // Deliberately NO LifecycleEmitter in this task: an emitter holds a
@@ -199,6 +211,8 @@ pub fn serve_for_runner(
             emulator,
             log_tap,
             logs,
+            completions,
+            watch_status,
             shutdown_rx,
         )
         .await

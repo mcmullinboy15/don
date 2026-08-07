@@ -237,18 +237,11 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
 
 /// `GET /watch` — global file-watch state (inotify dirs + per-process patterns).
 async fn get_watch(State(state): State<Arc<ApiState>>) -> Response {
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(RunnerCommand::WatchStatus { reply: tx })
-        .is_err()
-    {
-        return runner_unavailable();
-    }
-    match rx.await {
-        Ok(watch) => Json(WatchResponse { watch }).into_response(),
-        Err(_) => runner_unavailable(),
-    }
+    // Straight to the watch manager — the runner is not involved. `None`
+    // (no watcher, or it didn't answer) serializes as JSON null, exactly
+    // the old "no watches active" reply.
+    let watch = state.watch_status.report().await;
+    Json(WatchResponse { watch }).into_response()
 }
 
 #[derive(Serialize)]
@@ -635,24 +628,16 @@ async fn post_resolve_completions(
     body: Option<Json<CompletionsBody>>,
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(RunnerCommand::ResolveCompletions {
-            task,
-            param,
-            partial: body.partial,
-            force_refresh: body.force_refresh,
-            reply: tx,
-        })
-        .is_err()
+    // Resolved right here on the request task — task configs are fixed at
+    // construction and the cache is shared, so a slow completion command
+    // blocks only this request, never the runner.
+    match state
+        .completions
+        .resolve_param(&task, &param, &body.partial, body.force_refresh)
+        .await
     {
-        return runner_unavailable();
-    }
-    match rx.await {
-        Ok(Ok(values)) => Json(CompletionsResponse { values }).into_response(),
-        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(completion_error_body(&e))).into_response(),
-        Err(_) => runner_unavailable(),
+        Ok(values) => Json(CompletionsResponse { values }).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(completion_error_body(&e))).into_response(),
     }
 }
 
@@ -749,6 +734,8 @@ mod tests {
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
         let log_tap = crate::output::MergedLogTap::for_tests();
         let logs = crate::output::LogReader::for_tests();
+        let completions = crate::param_completions::CompletionResolver::for_tests();
+        let watch_status = crate::watch::report::WatchStatusReader::for_tests();
         let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         // Leak the sender so the receiver stays live for the router's
         // lifetime — tests never signal shutdown.
@@ -761,6 +748,8 @@ mod tests {
             attach_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             log_tap,
             logs,
+            completions,
+            watch_status,
             shutdown,
         }))
     }

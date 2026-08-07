@@ -143,6 +143,78 @@ pub(crate) struct ResolveRequest<'a> {
     pub force_refresh: bool,
 }
 
+/// A cloneable handle for resolving task-param completions without the
+/// runner: task configs are fixed at construction, the cache is shared, and
+/// the shell-out runs on the caller's task. This is to completions what
+/// [`LogReader`](crate::output::LogReader) is to logs — the server holds one
+/// and answers `POST /completions` with no runner round trip.
+#[derive(Clone)]
+pub struct CompletionResolver {
+    tasks: Arc<std::collections::HashMap<String, crate::config::Task>>,
+    cache: Arc<RwLock<CompletionCache>>,
+    base_dir: std::path::PathBuf,
+}
+
+impl CompletionResolver {
+    /// Build a resolver over a fixed task-config set.
+    pub fn new(
+        tasks: std::collections::HashMap<String, crate::config::Task>,
+        base_dir: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            tasks: Arc::new(tasks),
+            cache: Arc::new(RwLock::new(CompletionCache::default())),
+            base_dir,
+        }
+    }
+
+    /// An empty resolver for tests that need an `ApiState` without a runner.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self::new(std::collections::HashMap::new(), std::path::PathBuf::new())
+    }
+
+    /// Resolve candidate values for `param` on `task`: static `choices`
+    /// answer directly; a `completions` block shells out through
+    /// [`resolve`], with caching and failure logs.
+    pub async fn resolve_param(
+        &self,
+        task: &str,
+        param: &str,
+        partial: &HashMap<String, String>,
+        force_refresh: bool,
+    ) -> Result<Vec<String>, CompletionError> {
+        let Some(cfg) = self.tasks.get(task) else {
+            return Err(CompletionError {
+                message: format!("unknown task '{task}'"),
+                log_path: None,
+            });
+        };
+        let Some(p) = cfg.params.iter().find(|p| p.name == param) else {
+            return Err(CompletionError {
+                message: format!("task '{task}' has no param '{param}'"),
+                log_path: None,
+            });
+        };
+        let Some(completion_cfg) = p.completions.clone() else {
+            // Static choices fast-path: return them directly without any
+            // shell-out. The TUI form can still fuzzy-filter locally.
+            return Ok(p.choices.clone());
+        };
+        resolve(ResolveRequest {
+            cache: &self.cache,
+            task,
+            param,
+            completions: &completion_cfg,
+            base_dir: &self.base_dir,
+            task_env: &cfg.env,
+            partial,
+            force_refresh,
+        })
+        .await
+    }
+}
+
 /// Resolve candidate values for one param by running its `completions`
 /// command. See [`ResolveRequest`] for the field meanings.
 pub(crate) async fn resolve(req: ResolveRequest<'_>) -> Result<Vec<String>, CompletionError> {

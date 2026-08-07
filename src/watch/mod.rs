@@ -18,6 +18,7 @@
 //! This module deliberately knows nothing about the runner — see
 //! [`signal`] for why the two vocabularies are separate.
 
+pub(crate) mod report;
 pub(crate) mod signal;
 
 pub(crate) use signal::{WatchOutcome, WatchSignal};

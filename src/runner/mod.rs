@@ -6,7 +6,6 @@
 //! Communication uses channels: `mpsc` for commands in, `broadcast` for events out.
 
 mod attach;
-mod completions;
 mod events;
 mod graph;
 mod lazy;
@@ -46,6 +45,7 @@ pub(in crate::runner) use crate::state_store;
 pub use crate::state_store::{
     ParamInfo, ProcessStatus, StateReader, StateSnapshot, VerboseInfo, all_services_ready,
 };
+pub use crate::watch::report::{WatchDir, WatchReport, WatchReportItem};
 
 pub(crate) use crate::process::params::resolve_task_params;
 
@@ -179,16 +179,6 @@ pub enum RunnerCommand {
         name: Option<String>,
         reply: oneshot::Sender<Vec<ProcessStatus>>,
     },
-    /// Query the global file-watch state — registered inotify directories and
-    /// per-process patterns. Replies `None` when no watches are active.
-    WatchStatus {
-        reply: oneshot::Sender<Option<WatchReport>>,
-    },
-    /// Retry starting any Pending services/tasks whose deps are now
-    /// satisfied. Sent by [`Self::StartPending`] itself after a delay,
-    /// forming a soft poll loop that unblocks dependents as their deps
-    /// reach Ready.
-    StartPending,
     /// Request an interactive attach session for a service.
     /// Returns the PTY write handle and a live output receiver, or an error.
     Attach {
@@ -214,21 +204,6 @@ pub enum RunnerCommand {
         wait: bool,
         wait_timeout: Option<String>,
         reply: oneshot::Sender<CommandResult>,
-    },
-    /// Resolve candidate values for a single param of a task by running
-    /// its `completions` command. Used by the TUI form and by shell tab
-    /// completion.
-    ///
-    /// `partial` carries the user's already-entered param values for the
-    /// *other* params in the form — exposed to the completion command as
-    /// `DON_PARAM_<NAME>=<value>` env vars so one param's candidates can
-    /// depend on another. `force_refresh = true` bypasses the cache.
-    ResolveCompletions {
-        task: String,
-        param: String,
-        partial: HashMap<String, String>,
-        force_refresh: bool,
-        reply: oneshot::Sender<Result<Vec<String>, CompletionError>>,
     },
     /// Initiate graceful shutdown.
     Shutdown,
@@ -266,63 +241,6 @@ pub struct AttachSession {
     pub pty_input: mpsc::Sender<crate::output::PtyInput>,
     /// Live output receiver (preloaded with a screen repaint).
     pub output_rx: mpsc::Receiver<crate::output::SinkLine>,
-}
-
-/// A global snapshot of everything the file watcher is monitoring right now,
-/// independent of any single service. Returned by `GET /watch` / `don watch`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WatchReport {
-    /// The actual inotify registrations — the ground truth of what don is
-    /// watching at the OS level. Sorted by path.
-    pub directories: Vec<WatchDir>,
-    /// Per-item (service/task/build-graph) watch state and patterns, sorted by
-    /// name.
-    pub items: Vec<WatchReportItem>,
-    /// Workspace-wide `watch_ignore` globs that apply to every item.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub global_ignore: Vec<String>,
-    /// Count of notify backend errors observed since startup.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub notify_error_count: u64,
-    /// Count of runner-event broadcast-lag incidents (a non-zero value means an
-    /// process may be stuck mid-rebuild).
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub runner_event_lag_count: u64,
-    /// Most recent notify backend error, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_notify_error: Option<String>,
-}
-
-/// One inotify registration: a directory and the mode it was registered under.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WatchDir {
-    pub path: String,
-    /// `"recursive"` or `"non-recursive"`.
-    pub mode: String,
-}
-
-/// Per-process entry in a [`WatchReport`].
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WatchReportItem {
-    pub name: String,
-    /// `"service"`, `"task"`, or `"build_graph"`.
-    pub kind: String,
-    /// Watch state machine: `"idle"`, `"debouncing"`, or `"rebuilding"`.
-    pub state: String,
-    pub stale: bool,
-    pub debounce_ms: u64,
-    /// Absolute glob patterns that trigger a rebuild/rerun for this process.
-    pub patterns: Vec<String>,
-    /// Process-specific ignore globs (workspace-wide ignores live on the report).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignore_patterns: Vec<String>,
-    /// Last watch-registration error for this process, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-}
-
-fn is_zero_u64(value: &u64) -> bool {
-    *value == 0
 }
 
 /// An event broadcast from the runner for external consumers.
@@ -434,6 +352,10 @@ pub struct Runner {
     /// True once `run()`'s scheduler is live. Transitions before that
     /// (construction, setup) must not enqueue dependency sweeps.
     scheduler_live: bool,
+    /// A start-pending sweep is due. Set by fold transitions (see
+    /// `schedule_start_pending`), consumed at the top of the main loop —
+    /// the runner's own deferred tick, invisible to clients by construction.
+    start_pending_scheduled: bool,
 
     // Shutdown signal receiver — wakes the select loop when Ctrl+C is pressed.
     // `Option` because `run()` takes it out at the top to consume in the
@@ -496,10 +418,18 @@ pub struct Runner {
     /// The batcher task itself; joined (bounded) during shutdown.
     batcher_handle: Option<tokio::task::JoinHandle<()>>,
 
-    /// Per-param completion results cache. Populated as the TUI / CLI
-    /// resolves completions.
-    completion_cache:
-        std::sync::Arc<tokio::sync::RwLock<crate::param_completions::CompletionCache>>,
+    /// Task-param completion resolver, held only to be handed to the API
+    /// server at bind time — the runner itself never resolves completions.
+    completions: crate::param_completions::CompletionResolver,
+
+    /// Publisher for the watch manager's query sender; the paired
+    /// [`crate::watch::report::WatchStatusReader`] goes to the API server.
+    /// Outer `None` until watch setup decides; then `Some(None)` (nothing
+    /// to watch) or `Some(Some(sender))`.
+    watch_status_tx:
+        tokio::sync::watch::Sender<Option<Option<mpsc::Sender<crate::watch::WatchQuery>>>>,
+    /// The reader half, cloned out via [`Self::watch_status_reader`].
+    watch_status_reader: crate::watch::report::WatchStatusReader,
 
     /// Internal shutdown flag broadcast to detached control workers so they
     /// can force-kill promptly when don is exiting.
@@ -547,6 +477,11 @@ impl Runner {
         }
 
         let base_dir = setup::canonicalize_base_dir(&base_dir)?;
+        let (watch_status_tx, watch_status_reader) = crate::watch::report::status_channel();
+        let completions = crate::param_completions::CompletionResolver::new(
+            config.tasks.clone(),
+            base_dir.clone(),
+        );
         let don_dir = setup::ensure_don_dir(&base_dir)?;
         let don_pid_file = setup::acquire_don_pid_file(&don_dir).await?;
 
@@ -673,6 +608,7 @@ impl Runner {
             event_tx,
             state,
             scheduler_live: false,
+            start_pending_scheduled: false,
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
             watch: None,
@@ -684,9 +620,9 @@ impl Runner {
             batcher_tx,
             batch_outcome_rx,
             batcher_handle: Some(batcher_handle),
-            completion_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::param_completions::CompletionCache::default(),
-            )),
+            completions,
+            watch_status_tx,
+            watch_status_reader,
             shutdown_flag_tx,
             shutting_down: false,
             manifest_writer_tx: Some(manifest_writer_tx),
@@ -960,6 +896,18 @@ impl Runner {
         self.output_manager.log_reader()
     }
 
+    /// The task-param completion resolver; see
+    /// [`crate::param_completions::CompletionResolver`].
+    pub fn completion_resolver(&self) -> crate::param_completions::CompletionResolver {
+        self.completions.clone()
+    }
+
+    /// A read-only handle for the global watch report; see
+    /// [`crate::watch::report::WatchStatusReader`].
+    pub fn watch_status_reader(&self) -> crate::watch::report::WatchStatusReader {
+        self.watch_status_reader.clone()
+    }
+
     /// Handle to the server-side terminal-emulator thread, for the API
     /// server's attach-resize path.
     pub(crate) fn emulator_handle(&self) -> crate::output::emulator::EmulatorHandle {
@@ -1178,6 +1126,11 @@ impl Runner {
                 // reach. With nothing to watch the manager is dropped here,
                 // and a `Some` handle would address dead receivers.
                 if watch_mgr.has_watches() {
+                    // Publish the query sender for the server's WatchStatusReader
+                    // — GET /watch talks to the watcher directly from here on.
+                    let _ = self
+                        .watch_status_tx
+                        .send(Some(Some(watch_query_tx.clone())));
                     self.watch = Some(watch_link::WatchHandle::new(
                         watch_update_tx,
                         watch_query_tx,
@@ -1195,6 +1148,13 @@ impl Runner {
                 self.output_manager
                     .error_event(&format!("file watcher setup task failed: {join_err}"));
             }
+        }
+
+        // Watch setup has decided either way by now; if no query sender was
+        // published, tell WatchStatusReader holders "nothing to watch" so
+        // `don watch` answers immediately instead of waiting forever.
+        if self.watch.is_none() {
+            let _ = self.watch_status_tx.send(Some(None));
         }
 
         // Kick off batch builds (bazel) as a detached task. The runner
@@ -1277,6 +1237,14 @@ impl Runner {
                     }
                 }
 
+                // Deferred scheduling tick: fold transitions request a sweep
+                // rather than recursing into one mid-handler; it runs here,
+                // between messages, exactly once per batch of transitions.
+                if self.start_pending_scheduled {
+                    self.start_pending_scheduled = false;
+                    self.start_pending_processes().await;
+                }
+
                 tokio::select! {
                     Some(cmd) = self.cmd_rx.recv() => {
                         match cmd {
@@ -1287,10 +1255,6 @@ impl Runner {
                             RunnerCommand::Status { verbose, name, reply } => {
                                 let statuses = self.collect_status(verbose, name.as_deref()).await;
                                 let _ = reply.send(statuses);
-                            }
-                            RunnerCommand::WatchStatus { reply } => {
-                                let report = self.collect_watch_report().await;
-                                let _ = reply.send(report);
                             }
                             RunnerCommand::Start { name, reply } => {
                                 self.handle_start_service_cmd(&name, reply).await;
@@ -1324,9 +1288,6 @@ impl Runner {
                             RunnerCommand::TaskRerun { name } => {
                                 self.handle_task_rerun(&name).await;
                             }
-                            RunnerCommand::StartPending => {
-                                self.start_pending_processes().await;
-                            }
                             RunnerCommand::RunPendingTasks { reply } => {
                                 self.handle_run_pending_tasks(reply).await;
                             }
@@ -1339,22 +1300,6 @@ impl Runner {
                             } => {
                                 self.handle_run_task(&name, params, wait, wait_timeout, reply)
                                     .await;
-                            }
-                            RunnerCommand::ResolveCompletions {
-                                task,
-                                param,
-                                partial,
-                                force_refresh,
-                                reply,
-                            } => {
-                                self.handle_resolve_completions(
-                                    &task,
-                                    &param,
-                                    partial,
-                                    force_refresh,
-                                    reply,
-                                )
-                                .await;
                             }
                         }
                     }
