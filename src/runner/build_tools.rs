@@ -26,6 +26,7 @@ pub(crate) struct RebuildBatchOutcome {
     pub(crate) plain_rebuilds: Vec<String>,
 }
 
+#[derive(Clone)]
 pub(crate) struct GraphRequeryRequestItem {
     pub(crate) name: String,
     pub(crate) bazel: Option<crate::config::BazelConfig>,

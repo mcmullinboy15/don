@@ -75,6 +75,8 @@ impl WatchHandle {
 pub(in crate::runner) fn spawn(
     mut signal_rx: mpsc::UnboundedReceiver<WatchSignal>,
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
+    batcher_tx: mpsc::UnboundedSender<super::build_batcher::BatchRequest>,
+    requery_catalog: std::collections::HashMap<String, super::build_tools::GraphRequeryRequestItem>,
     mut events: broadcast::Receiver<RunnerEvent>,
     outcome_tx: mpsc::UnboundedSender<WatchOutcome>,
 ) -> JoinHandle<()> {
@@ -85,7 +87,30 @@ pub(in crate::runner) fn spawn(
                     // `None` means the watcher is gone; there is nothing left
                     // to translate in either direction.
                     let Some(signal) = signal else { return };
-                    if cmd_tx.send(command_for(signal)).is_err() {
+                    // Graph re-queries go straight to the batcher actor —
+                    // deciding what a BUILD-file change means is a per-item
+                    // config fact, precomputed into the catalog. Everything
+                    // else lands on runner state and goes through the fold.
+                    if let WatchSignal::BuildGraphChanged { name } = signal {
+                        let items: Vec<_> =
+                            if name == crate::watch::WORKSPACE_GRAPH_ITEM_NAME {
+                                requery_catalog.values().cloned().collect()
+                            } else {
+                                requery_catalog.get(&name).cloned().into_iter().collect()
+                            };
+                        for item in items {
+                            if batcher_tx
+                                .send(super::build_batcher::BatchRequest::QueueRequery { item })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(command) = command_for(signal)
+                        && cmd_tx.send(command).is_err()
+                    {
                         return;
                     }
                 }
@@ -114,13 +139,14 @@ pub(in crate::runner) fn spawn(
     })
 }
 
-/// The runner command a watch signal asks for.
-fn command_for(signal: WatchSignal) -> RunnerCommand {
+/// The runner command a watch signal asks for. `None` for the one signal
+/// with a non-runner recipient: graph changes go to the batcher actor.
+fn command_for(signal: WatchSignal) -> Option<RunnerCommand> {
     match signal {
-        WatchSignal::Rebuild { name } => RunnerCommand::Rebuild { name },
-        WatchSignal::TaskRerun { name } => RunnerCommand::TaskRerun { name },
-        WatchSignal::RebuildStale { name } => RunnerCommand::RebuildStale { name },
-        WatchSignal::BuildGraphChanged { name } => RunnerCommand::BuildGraphChanged { name },
+        WatchSignal::Rebuild { name } => Some(RunnerCommand::Rebuild { name }),
+        WatchSignal::TaskRerun { name } => Some(RunnerCommand::TaskRerun { name }),
+        WatchSignal::RebuildStale { name } => Some(RunnerCommand::RebuildStale { name }),
+        WatchSignal::BuildGraphChanged { .. } => None,
     }
 }
 
@@ -153,7 +179,6 @@ mod tests {
             RunnerCommand::Rebuild { name } => ("Rebuild", name),
             RunnerCommand::TaskRerun { name } => ("TaskRerun", name),
             RunnerCommand::RebuildStale { name } => ("RebuildStale", name),
-            RunnerCommand::BuildGraphChanged { name } => ("BuildGraphChanged", name),
             _ => ("other", ""),
         }
     }
@@ -190,26 +215,89 @@ mod tests {
                 },
                 want: ("RebuildStale", "api"),
             },
-            Case {
-                name: "build graph changed",
-                signal: WatchSignal::BuildGraphChanged {
-                    name: "api".to_string(),
-                },
-                want: ("BuildGraphChanged", "api"),
-            },
         ];
 
         for case in cases {
             let (signal_tx, signal_rx) = mpsc::unbounded_channel();
             let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let (batcher_tx, _batcher_rx) = mpsc::unbounded_channel();
             let (_event_tx, events) = broadcast::channel(16);
             let (outcome_tx, _outcome_rx) = mpsc::unbounded_channel();
-            let _handle = spawn(signal_rx, cmd_tx, events, outcome_tx);
+            let _handle = spawn(
+                signal_rx,
+                cmd_tx,
+                batcher_tx,
+                std::collections::HashMap::new(),
+                events,
+                outcome_tx,
+            );
 
             signal_tx.send(case.signal).unwrap();
             let got = cmd_rx.recv().await.unwrap();
             assert_eq!(describe(&got), case.want, "{}: wrong command", case.name);
         }
+    }
+
+    /// A graph change routes to the batcher actor, not the runner: the
+    /// catalog answers what to re-query, and the workspace marker fans out
+    /// to every catalogued item.
+    #[tokio::test]
+    async fn graph_changes_route_to_the_batcher() {
+        let item = |name: &str| super::super::build_tools::GraphRequeryRequestItem {
+            name: name.to_string(),
+            bazel: None,
+            watch_enabled: true,
+            working_dir: std::path::PathBuf::from("/tmp"),
+            ignore_patterns: Vec::new(),
+        };
+        let catalog: std::collections::HashMap<_, _> = [
+            ("api".to_string(), item("api")),
+            ("worker".to_string(), item("worker")),
+        ]
+        .into_iter()
+        .collect();
+
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (batcher_tx, mut batcher_rx) = mpsc::unbounded_channel();
+        let (_event_tx, events) = broadcast::channel(16);
+        let (outcome_tx, _outcome_rx) = mpsc::unbounded_channel();
+        let _handle = spawn(signal_rx, cmd_tx, batcher_tx, catalog, events, outcome_tx);
+
+        // A named item queues exactly its own re-query.
+        signal_tx
+            .send(WatchSignal::BuildGraphChanged {
+                name: "api".to_string(),
+            })
+            .unwrap();
+        let super::super::build_batcher::BatchRequest::QueueRequery { item } =
+            batcher_rx.recv().await.unwrap()
+        else {
+            panic!("expected a requery");
+        };
+        assert_eq!(item.name, "api");
+
+        // The workspace marker fans out to every catalogued item.
+        signal_tx
+            .send(WatchSignal::BuildGraphChanged {
+                name: crate::watch::WORKSPACE_GRAPH_ITEM_NAME.to_string(),
+            })
+            .unwrap();
+        let mut names = vec![];
+        for _ in 0..2 {
+            let super::super::build_batcher::BatchRequest::QueueRequery { item } =
+                batcher_rx.recv().await.unwrap()
+            else {
+                panic!("expected a requery");
+            };
+            names.push(item.name);
+        }
+        names.sort();
+        assert_eq!(names, vec!["api".to_string(), "worker".to_string()]);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "graph changes must not reach the runner"
+        );
     }
 
     #[tokio::test]
@@ -218,7 +306,17 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = broadcast::channel(16);
         let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel();
-        let _handle = spawn(signal_rx, cmd_tx, events, outcome_tx);
+        let _handle = {
+            let (batcher_tx, _batcher_rx) = mpsc::unbounded_channel();
+            spawn(
+                signal_rx,
+                cmd_tx,
+                batcher_tx,
+                std::collections::HashMap::new(),
+                events,
+                outcome_tx,
+            )
+        };
 
         // An event the watcher does not care about must not be forwarded —
         // otherwise every state change becomes lag it has to absorb.
@@ -246,7 +344,17 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = broadcast::channel(16);
         let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel();
-        let handle = spawn(signal_rx, cmd_tx, events, outcome_tx);
+        let handle = {
+            let (batcher_tx, _batcher_rx) = mpsc::unbounded_channel();
+            spawn(
+                signal_rx,
+                cmd_tx,
+                batcher_tx,
+                std::collections::HashMap::new(),
+                events,
+                outcome_tx,
+            )
+        };
 
         drop(event_tx);
 
@@ -273,7 +381,17 @@ mod tests {
                 })
                 .unwrap();
         }
-        let _handle = spawn(signal_rx, cmd_tx, events, outcome_tx);
+        let _handle = {
+            let (batcher_tx, _batcher_rx) = mpsc::unbounded_channel();
+            spawn(
+                signal_rx,
+                cmd_tx,
+                batcher_tx,
+                std::collections::HashMap::new(),
+                events,
+                outcome_tx,
+            )
+        };
 
         assert!(
             matches!(outcome_rx.recv().await, Some(WatchOutcome::Lagged(n)) if n > 0),

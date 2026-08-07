@@ -396,9 +396,6 @@ pub enum RunnerCommand {
         last_n: usize,
         reply: oneshot::Sender<Option<mpsc::Receiver<crate::output::SinkLine>>>,
     },
-    /// Build graph definition files changed (BUILD, package.json, etc.).
-    /// Triggers a re-query of the build tool to update watch patterns.
-    BuildGraphChanged { name: String },
     /// Retry starting any Pending services/tasks whose deps are now
     /// satisfied. Sent by [`Self::StartPending`] itself after a delay,
     /// forming a soft poll loop that unblocks dependents as their deps
@@ -1553,6 +1550,8 @@ impl Runner {
         let watch_link_handle = watch_link::spawn(
             watch_signal_rx,
             self.cmd_tx.clone(),
+            self.batcher_tx.clone(),
+            self.requery_catalog(),
             self.event_tx.subscribe(),
             watch_outcome_tx,
         );
@@ -1757,9 +1756,6 @@ impl Runner {
                             }
                             RunnerCommand::TaskRerun { name } => {
                                 self.handle_task_rerun(&name).await;
-                            }
-                            RunnerCommand::BuildGraphChanged { name } => {
-                                self.handle_build_graph_changed(&name).await;
                             }
                             RunnerCommand::StartPending => {
                                 self.start_pending_items().await;

@@ -302,80 +302,60 @@ impl Runner {
     /// Queues the item for a batched re-query instead of spawning immediately.
     /// This prevents redundant concurrent queries when a single BUILD file
     /// change affects multiple services.
-    pub(in crate::runner) async fn handle_build_graph_changed(&mut self, name: &str) {
-        // Re-query outcomes exist to feed the watcher updated patterns;
-        // without a watcher they'd be discarded on arrival, so don't queue.
-        if self.watch.is_none() {
-            return;
-        }
-        if name == crate::watch::WORKSPACE_GRAPH_ITEM_NAME {
-            let service_names: Vec<String> = self
-                .services
-                .iter()
-                .filter(|(_, rs)| rs.resolved.build_tool_watch_enabled())
-                .map(|(service_name, _)| service_name.clone())
-                .collect();
-            let task_names: Vec<String> = self
-                .tasks
-                .iter()
-                .filter(|(_, rt)| rt.config.build_tool_watch_enabled())
-                .map(|(task_name, _)| task_name.clone())
-                .collect();
-            for item_name in service_names.into_iter().chain(task_names) {
-                self.queue_build_graph_requery(&item_name);
+    /// Per-item build-graph re-query specs, precomputed from resolved
+    /// config for `watch_link`'s direct-to-batcher routing. Config is fixed
+    /// after construction, so the catalog cannot go stale.
+    pub(in crate::runner) fn requery_catalog(
+        &self,
+    ) -> std::collections::HashMap<String, GraphRequeryRequestItem> {
+        let mut catalog = std::collections::HashMap::new();
+        for name in self.services.keys().chain(self.tasks.keys()) {
+            let (bazel, watch_enabled, item_dir, ignore_patterns) =
+                if let Some(rs) = self.services.get(name) {
+                    if !rs.resolved.build_tool_watch_enabled() {
+                        continue;
+                    }
+                    (
+                        rs.resolved.bazel_config().cloned(),
+                        rs.resolved.build_tool_watch_enabled(),
+                        rs.resolved.dir.clone(),
+                        rs.resolved.ignore.clone(),
+                    )
+                } else if let Some(rt) = self.tasks.get(name) {
+                    if !rt.config.build_tool_watch_enabled() {
+                        continue;
+                    }
+                    (
+                        rt.config.bazel.clone(),
+                        rt.config.build_tool_watch_enabled(),
+                        rt.config.dir.clone(),
+                        rt.config.ignore.clone(),
+                    )
+                } else {
+                    continue;
+                };
+            if bazel.is_none() {
+                continue;
             }
-        } else {
-            self.queue_build_graph_requery(name);
+            let working_dir = working_dir_for(&self.base_dir, item_dir.as_deref());
+            let ignore_patterns = resolve_watch_ignore_patterns(
+                &working_dir,
+                &ignore_patterns,
+                &self.base_dir,
+                &self.config.watch_ignore,
+            );
+            catalog.insert(
+                name.clone(),
+                GraphRequeryRequestItem {
+                    name: name.clone(),
+                    bazel,
+                    watch_enabled,
+                    working_dir,
+                    ignore_patterns,
+                },
+            );
         }
-    }
-
-    /// Queue one item on the batcher's next re-query batch. The request item
-    /// is built here, at queue time, from resolved config — same values a
-    /// flush-time build would produce, since config is fixed.
-    fn queue_build_graph_requery(&self, name: &str) {
-        let (bazel, watch_enabled, item_dir, ignore_patterns) =
-            if let Some(rs) = self.services.get(name) {
-                if !rs.resolved.build_tool_watch_enabled() {
-                    return;
-                }
-                (
-                    rs.resolved.bazel_config().cloned(),
-                    rs.resolved.build_tool_watch_enabled(),
-                    rs.resolved.dir.clone(),
-                    rs.resolved.ignore.clone(),
-                )
-            } else if let Some(rt) = self.tasks.get(name) {
-                if !rt.config.build_tool_watch_enabled() {
-                    return;
-                }
-                (
-                    rt.config.bazel.clone(),
-                    rt.config.build_tool_watch_enabled(),
-                    rt.config.dir.clone(),
-                    rt.config.ignore.clone(),
-                )
-            } else {
-                return;
-            };
-        if bazel.is_none() {
-            return;
-        }
-        let working_dir = working_dir_for(&self.base_dir, item_dir.as_deref());
-        let ignore_patterns = resolve_watch_ignore_patterns(
-            &working_dir,
-            &ignore_patterns,
-            &self.base_dir,
-            &self.config.watch_ignore,
-        );
-        let _ = self.batcher_tx.send(BatchRequest::QueueRequery {
-            item: GraphRequeryRequestItem {
-                name: name.to_string(),
-                bazel,
-                watch_enabled,
-                working_dir,
-                ignore_patterns,
-            },
-        });
+        catalog
     }
 
     /// Runs the build (if any), stops the old process, starts a new one.
