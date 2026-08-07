@@ -4,7 +4,7 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::ports::{manifest_path, read_manifest};
-use don::runner::{Runner, RunnerCommand, TerminalCoordinator};
+use don::runner::{Runner, RunnerCommand};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -101,7 +101,7 @@ async fn make_runner_inner(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();

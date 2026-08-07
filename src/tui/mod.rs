@@ -67,7 +67,6 @@ use backend::FixedBottomBackend;
 use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot};
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
-use crate::terminal::TerminalRequest;
 use app::{App, AppInit, ViewMode, line_matches_log_popup};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
@@ -239,7 +238,6 @@ pub async fn run_tui(
     hidden_names: std::collections::HashSet<String>,
     auto_filter_on_failure_names: std::collections::HashSet<String>,
     cli_log_filter: Option<std::collections::HashSet<String>>,
-    mut terminal_request_rx: mpsc::Receiver<TerminalRequest>,
 ) -> Result<(), TuiError> {
     let controls = TuiControls {
         verbosity,
@@ -290,11 +288,8 @@ pub async fn run_tui(
     // task exits (crossterm EventStream error), we gate its select arm off
     // so the select loop doesn't busy-spin on a perpetually-ready None.
     let mut input_open = true;
-    // Same gating for the terminal-request channel, whose sender may drop.
-    let mut terminal_open = true;
 
-    // Terminal-side state — Some while the TUI owns the terminal, None
-    // while a foreground task does. We start in the active state.
+    // Terminal-side state — Some while the TUI owns the terminal.
     let mut active: Option<ActiveTerm> = Some(ActiveTerm::enter(&input_tx)?);
     // Snapshot of `LogStore::next_id` taken when we hand the terminal to a
     // foreground task. On resume we replay only entries with id ≥ this so
@@ -302,7 +297,6 @@ pub async fn run_tui(
     // Lines that arrived during the pause get rendered above the new
     // viewport via `insert_before`, preserving the foreground task's
     // output that's already in scrollback above them.
-    let mut paused_checkpoint: Option<u64> = None;
     if let Some(act) = active.as_mut() {
         // Seed the viewport so the terminal reserves the bottom region
         // before the first `insert_before` call. Raw `draw` (not the
@@ -470,61 +464,6 @@ pub async fn run_tui(
                     }
                     None => {
                         input_open = false;
-                    }
-                }
-            }
-            terminal_req = terminal_request_rx.recv(), if terminal_open => {
-                match terminal_req {
-                    Some(TerminalRequest::Acquire(ack)) => {
-                        if let Some(act) = active.take() {
-                            // Snapshot the log boundary so we know which
-                            // lines arrived during the pause. Lines already
-                            // in scrollback at this moment must NOT be
-                            // replayed — they'd appear above the foreground
-                            // task's output, which is jarring.
-                            paused_checkpoint = Some(store.next_id());
-                            act.tear_down().await?;
-                        }
-                        let _ = ack.send(());
-                    }
-                    Some(TerminalRequest::Release) if active.is_none() => {
-                        {
-                            // Don't clear the screen — the foreground task's
-                            // output stays in scrollback. Build a fresh
-                            // inline terminal anchored at the current cursor
-                            // row (the row right after the task's output)
-                            // via the DSR FixedBottomBackend issues during
-                            // construction.
-                            let mut act = ActiveTerm::enter(&input_tx)?;
-                            act.terminal.draw(|f| render::draw_bar(f, &app))?;
-                            cached_width = act.terminal.size()?.width.max(1);
-                            // Replay only lines that arrived during the
-                            // pause via `insert_before`. They land in
-                            // scrollback right after the foreground task's
-                            // output — the bar drifts down accordingly.
-                            let since = paused_checkpoint.take().unwrap_or(0);
-                            let mut replayed_any = false;
-                            for entry in store.iter_since(since) {
-                                if app.should_render_log(&entry.line.name, entry.line.is_lifecycle) {
-                                    insert_line(&mut act.terminal, &entry.line, cached_width)?;
-                                    replayed_any = true;
-                                }
-                            }
-                            if replayed_any {
-                                draw_inline_bar(&mut act.terminal, &app)?;
-                            }
-                            active = Some(act);
-                        }
-                    }
-                    Some(TerminalRequest::Release) => {
-                        // Already active — nothing to do. Lets the runner
-                        // be conservative with release calls in error paths.
-                    }
-                    None => {
-                        // Coordinator dropped — runner is gone. Gate this
-                        // arm off (a closed channel returns None instantly
-                        // forever); the loop exits via log_rx close.
-                        terminal_open = false;
                     }
                 }
             }

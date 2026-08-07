@@ -57,7 +57,7 @@ impl Harness {
             project_dir.to_path_buf(),
             None,
             shutdown_rx,
-            don::runner::TerminalCoordinator::detached(),
+            true,
         )
         .await
         .unwrap();

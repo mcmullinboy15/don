@@ -64,6 +64,11 @@ enum Commands {
         /// where the terminal doesn't reliably answer DSR cursor queries.
         #[arg(long)]
         no_tui: bool,
+        /// Internal: set by the fork-model parent so the runner child knows
+        /// an interactive client is attaching (disables headless task
+        /// overrides).
+        #[arg(long, hide = true)]
+        attached: bool,
         /// Restrict displayed log lines to the given comma-separated set of
         /// service/task names. Affects pipe-mode output and seeds the TUI
         /// filter on startup (overriding any `hidden = true` defaults).
@@ -306,6 +311,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             name: None,
             detached,
             no_tui,
+            attached,
             log_filter,
             no_daemon,
             with_ui,
@@ -335,6 +341,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
                     profile.as_deref(),
                     verbose,
                     no_tui,
+                    attached,
                     log_filter,
                     no_daemon,
                     with_ui,
@@ -1541,9 +1548,8 @@ async fn run_start_attached(
 ///
 /// Conservative: any config that fails to load or validate falls back to
 /// the in-process path, which reports the error exactly as it always has.
-/// Foreground (interactive) tasks also fall back — a background runner has
-/// no stdin to hand them, and the terminal handoff only exists in-process
-/// until attach bridging replaces it.
+/// Interactive (foreground) tasks are no obstacle — they run on
+/// runner-owned PTYs and clients bridge to them over the socket.
 fn should_auto_attach(config_path: &Path, no_tui: bool) -> bool {
     use std::io::IsTerminal;
     if no_tui || !std::io::stdout().is_terminal() {
@@ -1555,14 +1561,7 @@ fn should_auto_attach(config_path: &Path, no_tui: bool) -> bool {
     let Some(platform) = don::config::Platform::current() else {
         return false;
     };
-    if config.validate(platform).is_err() {
-        return false;
-    }
-    let has_foreground_tasks = config
-        .tasks
-        .values()
-        .any(|task| task.terminal.is_foreground());
-    !has_foreground_tasks
+    config.validate(platform).is_ok()
 }
 
 /// `don tui` — attach the full TUI to an already-running project.
@@ -1780,11 +1779,6 @@ async fn attach_tui_inner(
         }
     });
 
-    // Foreground-task terminal handoff has no meaning for a remote client
-    // (that becomes attach bridging); park the channel, sender held open so
-    // the arm stays quiet instead of spinning on a closed channel.
-    let (_terminal_request_tx, terminal_request_rx) = tokio::sync::mpsc::channel(1);
-
     don::run_tui(
         log_rx,
         client,
@@ -1799,7 +1793,6 @@ async fn attach_tui_inner(
         hidden_names,
         auto_filter_on_failure_names,
         cli_log_filter,
-        terminal_request_rx,
     )
     .await
     .map_err(|e| format!("tui error: {e}"))?;
@@ -2365,7 +2358,7 @@ fn spawn_runner_child(
     if verbose {
         cmd.arg("--verbose");
     }
-    cmd.arg("start").arg("--no-tui");
+    cmd.arg("start").arg("--no-tui").arg("--attached");
     if no_daemon {
         cmd.arg("--no-daemon");
     }
@@ -2480,11 +2473,13 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
     lines.join("\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_start(
     config_path: &std::path::Path,
     profile: Option<&str>,
     verbose: bool,
     no_tui: bool,
+    attached: bool,
     log_filter: Vec<String>,
     no_daemon: bool,
     with_ui: Option<u16>,
@@ -2694,12 +2689,6 @@ async fn run_start(
         let verbosity = output_manager.verbosity_control();
         let lifecycle_emitter = output_manager.clone_lifecycle_emitter();
 
-        // Channel that lets the runner ask the TUI to release/re-take the
-        // terminal when a foreground task is about to run.
-        let (terminal_request_tx, terminal_request_rx) = tokio::sync::mpsc::channel(8);
-        let terminal_coordinator =
-            don::runner::TerminalCoordinator::with_channel(terminal_request_tx);
-
         let service_names: Vec<String> = config
             .services
             .keys()
@@ -2792,7 +2781,9 @@ async fn run_start(
                         base,
                         profile.as_deref(),
                         shutdown_rx,
-                        terminal_coordinator,
+                        // A TUI is present and interactive tasks are
+                        // bridgeable, so headless overrides don't apply.
+                        false,
                     )
                     .await
                     .map_err(|e| format!("Error: {e}"))
@@ -2834,7 +2825,6 @@ async fn run_start(
                 hidden_names,
                 auto_filter_on_failure_names,
                 tui_log_filter,
-                terminal_request_rx,
             )
             .await;
             if result.is_err() {
@@ -2892,7 +2882,11 @@ async fn run_start(
                         base,
                         profile.as_deref(),
                         shutdown_rx,
-                        don::runner::TerminalCoordinator::detached(),
+                        // Headless unless the fork-model parent told us an
+                        // interactive client is attaching: with no TUI and
+                        // no attaching parent, nobody is there to drive an
+                        // interactive task, so `headless` overrides apply.
+                        !attached,
                     )
                     .await
                     .map_err(|e| format!("Error: {e}"))

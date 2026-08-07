@@ -274,24 +274,6 @@ pub(in crate::runner) fn kill_superseded_spawn(
                     .await;
             });
         }
-        TaskRunPrepared::ForegroundSpawned(spawn) => {
-            let super::task::ForegroundTaskSpawn {
-                mut handle,
-                rendered_cmdline: _,
-            } = *spawn;
-            emitter.service_event(
-                name,
-                &format!(
-                    "send SIGKILL to stale foreground task pgid {}",
-                    handle.pgid()
-                ),
-            );
-            tokio::spawn(async move {
-                let _ = handle
-                    .terminate(nix::sys::signal::Signal::SIGKILL, SUPERSEDED_KILL_GRACE)
-                    .await;
-            });
-        }
         // Nothing was spawned, so there is nothing to clean up.
         TaskRunPrepared::PendingRun { .. } | TaskRunPrepared::Skipped { .. } => {}
     }
@@ -526,7 +508,6 @@ mod tests {
             platform: crate::config::Platform::LinuxX86_64,
             emitter: output.clone_lifecycle_emitter(),
             global_watch_ignore: Vec::new(),
-            terminal_coordinator: super::super::TerminalCoordinator::detached(),
         };
         let names = ["build".to_string(), "migrate".to_string()];
         let mut supervisors = spawn_supervisors(names.iter(), &ctx, &internal_tx);

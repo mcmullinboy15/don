@@ -13,18 +13,6 @@ impl Runner {
             return;
         }
         self.shutting_down = true;
-        // A foreground task pauses the stdout/TUI sink while it owns the
-        // terminal, and normally releases it from `handle_task_exit` /
-        // `handle_task_done`. During shutdown those completion paths can be
-        // skipped — a run supervisor may be stopped before it reports
-        // `TaskRunPrepared`, or the foreground task gets SIGKILL'd at the
-        // end of this function and its `TaskExited` arrives after the main
-        // loop has already broken out. If we leave the pause engaged, every
-        // lifecycle event we emit below ("send SIGTERM…", "stopping…",
-        // "shutdown complete") and every service's own shutdown output is
-        // silently dropped by `stdout_sink_task`. Force-clear it up front so
-        // the user actually sees what shutdown is doing.
-        self.output_manager.resume_visible_output();
         let _ = self.event_tx.send(super::RunnerEvent::ShutdownStarted);
         let _ = self.shutdown_flag_tx.send(true);
         self.output_manager
@@ -499,24 +487,6 @@ impl Runner {
                 if let Some(worker) = output_worker {
                     Self::await_output_worker(worker).await;
                 }
-            }
-            TaskRunPrepared::ForegroundSpawned(spawn) => {
-                self.output_manager
-                    .service_event(&name, "run cancelled by shutdown");
-                let crate::runner::task::ForegroundTaskSpawn {
-                    mut handle,
-                    rendered_cmdline: _rendered_cmdline,
-                } = *spawn;
-                self.output_manager.service_event(
-                    &name,
-                    &format!("send SIGKILL to foreground task pgid {}", handle.pgid()),
-                );
-                let _ = handle
-                    .terminate(
-                        nix::sys::signal::Signal::SIGKILL,
-                        std::time::Duration::from_millis(500),
-                    )
-                    .await;
             }
             TaskRunPrepared::PendingRun { .. } | TaskRunPrepared::Skipped { .. } => {}
         }

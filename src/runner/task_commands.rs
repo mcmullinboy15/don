@@ -35,9 +35,6 @@ impl Runner {
             });
         };
 
-        if task_cfg.terminal.is_foreground() {
-            self.output_manager.pause_visible_output();
-        }
         let queued = handle.request(task_supervisor::RunRequest {
             task_cfg: Box::new(task_cfg),
             params,
@@ -70,19 +67,12 @@ impl Runner {
         }
         if self.shutting_down {
             self.stop_late_task_start(name.to_string(), result).await;
-            if task_cfg.terminal.is_foreground() {
-                self.output_manager.resume_visible_output();
-                // Release the TUI even though we're shutting down — the
-                // worker had already paused it before the foreground spawn.
-                self.terminal_coordinator.release().await;
-            }
             return;
         }
         match result {
             Ok(TaskRunPrepared::PendingRun { message }) => {
                 self.settle_task_without_spawn(
                     name,
-                    task_cfg,
                     intent,
                     task_supervisor::NoSpawnOutcome::pending_run(message),
                 )
@@ -91,7 +81,6 @@ impl Runner {
             Ok(TaskRunPrepared::Skipped { message }) => {
                 self.settle_task_without_spawn(
                     name,
-                    task_cfg,
                     intent,
                     task_supervisor::NoSpawnOutcome::skipped(message),
                 )
@@ -119,34 +108,21 @@ impl Runner {
                     &format!("process spawned (pid {})", spawn.handle.pgid()),
                 );
                 emitter.service_event(name, &format!("spawn {}", spawn.rendered_cmdline));
+                // An interactive task waits for a user on its PTY; say how
+                // to reach it, loudly enough to act on.
+                if task_cfg.terminal.is_foreground() {
+                    emitter.service_event(
+                        name,
+                        &format!("waiting for input — run 'don attach {name}'"),
+                    );
+                }
                 let done_tx = self.begin_task_run(name, intent, Some("running..."));
                 self.wire_task_output_and_wait(name, *spawn, task_cfg, done_tx)
-                    .await;
-            }
-            Ok(TaskRunPrepared::ForegroundSpawned(spawn)) => {
-                // Same duplicate guard as the background arm — plus giving
-                // the terminal back, since the worker paused it pre-spawn.
-                if self.tasks.get(name).is_some_and(|rt| rt.pgid.is_some()) {
-                    let emitter = self.output_manager.clone_lifecycle_emitter();
-                    task_supervisor::kill_superseded_spawn(
-                        &emitter,
-                        name,
-                        TaskRunPrepared::ForegroundSpawned(spawn),
-                    );
-                    self.output_manager.resume_visible_output();
-                    self.terminal_coordinator.release().await;
-                    return;
-                }
-                // No spawn/running lines: a foreground task owns the terminal
-                // and its own output is the only thing worth showing there.
-                let done_tx = self.begin_task_run(name, intent, None);
-                self.wire_foreground_task_and_wait(name, *spawn, task_cfg, done_tx)
                     .await;
             }
             Err(message) => {
                 self.settle_task_without_spawn(
                     name,
-                    task_cfg,
                     intent,
                     task_supervisor::NoSpawnOutcome::failed(message),
                 )
@@ -193,13 +169,9 @@ impl Runner {
     async fn settle_task_without_spawn(
         &mut self,
         name: &str,
-        task_cfg: &crate::config::Task,
         intent: TaskRunIntent,
         outcome: task_supervisor::NoSpawnOutcome,
     ) {
-        if task_cfg.terminal.is_foreground() {
-            self.output_manager.resume_visible_output();
-        }
         if let Some(needs_run_now) = outcome.needs_run_now()
             && let Some(rt) = self.tasks.get_mut(name)
         {
@@ -309,43 +281,6 @@ impl Runner {
             let start = std::time::Instant::now();
             let result = task::wait_for_task(&mut handle, timeout.as_deref()).await;
             outcome.finish(result, start.elapsed()).await;
-        });
-    }
-
-    async fn wire_foreground_task_and_wait(
-        &mut self,
-        name: &str,
-        spawn: task::ForegroundTaskSpawn,
-        task_cfg: &crate::config::Task,
-        done_tx: Option<mpsc::Sender<ItemDone>>,
-    ) {
-        let task::ForegroundTaskSpawn {
-            mut handle,
-            rendered_cmdline: _rendered_cmdline,
-        } = spawn;
-
-        let pgid = handle.pgid();
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.pgid = Some(pgid);
-        }
-
-        let timeout = task_cfg.timeout.clone();
-        let terminal_coordinator = self.terminal_coordinator.clone();
-        let outcome = self.task_run_outcome(name, task_cfg, pgid, done_tx);
-
-        tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            let result = task::wait_for_foreground_task(&mut handle, timeout.as_deref()).await;
-            let elapsed = start.elapsed();
-            drop(handle);
-            // Hand the terminal back to the TUI now that the child has
-            // released it. Drop happened above; tcsetpgrp/tcsetattr already
-            // restored pgrp + termios. This is the one thing the foreground
-            // path does that the background path must not, so it stays here
-            // rather than moving into the shared outcome.
-            terminal_coordinator.release().await;
-
-            outcome.finish(result, elapsed).await;
         });
     }
 

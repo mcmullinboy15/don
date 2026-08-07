@@ -40,7 +40,6 @@ mod watch_link;
 pub(crate) mod service;
 pub(crate) mod task;
 
-pub use crate::terminal::{TerminalCoordinator, TerminalRequest};
 pub(crate) use params::resolve_task_params;
 pub use profile::resolve_profile_items;
 pub use state_store::{StateReader, StateSnapshot};
@@ -932,10 +931,6 @@ pub struct Runner {
     /// to keep final shutdown output ordered after all cleanup work.
     shutting_down: bool,
 
-    /// Coordinates terminal handoff with the TUI for foreground tasks.
-    /// Detached in non-TUI runs.
-    pub(crate) terminal_coordinator: TerminalCoordinator,
-
     /// Sends manifest snapshots / removals to the serialized writer task that
     /// owns `.don/ports.json` filesystem I/O. `None` after shutdown flush.
     manifest_writer_tx: Option<mpsc::UnboundedSender<runtime_ports::ManifestWrite>>,
@@ -956,7 +951,7 @@ impl Runner {
         base_dir: PathBuf,
         profile: Option<&str>,
         shutdown_rx: mpsc::Receiver<()>,
-        terminal_coordinator: TerminalCoordinator,
+        headless: bool,
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (internal_tx, internal_rx) = mpsc::channel(64);
@@ -986,7 +981,6 @@ impl Runner {
         let active_items = setup::resolve_active_items(&config, platform, profile)?;
         let active_services = setup::filter_active_services(&config, active_items.as_ref());
         let active_tasks = setup::filter_active_tasks(&config, active_items.as_ref());
-        let headless = terminal_coordinator.is_detached();
 
         setup::prune_download_cache(&config, platform, &don_dir, &output_manager);
 
@@ -1074,7 +1068,6 @@ impl Runner {
                 platform,
                 emitter: output_manager.clone_lifecycle_emitter(),
                 global_watch_ignore: config.watch_ignore.clone(),
-                terminal_coordinator: terminal_coordinator.clone(),
             },
             &internal_tx,
         );
@@ -1118,7 +1111,6 @@ impl Runner {
             )),
             shutdown_flag_tx,
             shutting_down: false,
-            terminal_coordinator,
             manifest_writer_tx: Some(manifest_writer_tx),
             manifest_writer_handle: Some(manifest_writer_handle),
         };
@@ -2325,7 +2317,7 @@ mod tests {
             temp.path().to_path_buf(),
             None,
             shutdown_rx,
-            TerminalCoordinator::detached(),
+            true,
         )
         .await
         .unwrap();
@@ -2422,7 +2414,7 @@ mod tests {
             temp.to_path_buf(),
             None,
             shutdown_rx,
-            TerminalCoordinator::detached(),
+            true,
         )
         .await
         .unwrap();

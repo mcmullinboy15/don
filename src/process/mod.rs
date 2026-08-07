@@ -16,7 +16,6 @@ pub use identity::ProcessIdentity;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use std::collections::HashMap;
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
@@ -63,25 +62,6 @@ pub struct ProcessHandle {
     pty_write: Option<pty_process::OwnedWritePty>,
     /// Path to the PGID file. Cleaned up on drop.
     pgid_file_path: Option<PathBuf>,
-}
-
-/// A handle to a foreground process that temporarily owns the user's terminal.
-pub struct ForegroundProcessHandle {
-    /// The process group ID. Equal to the child's PID.
-    pgid: i32,
-    /// The foreground child process.
-    child: tokio::process::Child,
-    /// Restores terminal ownership and screen state when the child is done.
-    _terminal: TerminalGuard,
-}
-
-/// Terminal screen used by a foreground process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForegroundScreen {
-    /// Use the current terminal screen.
-    Main,
-    /// Enter alternate screen while the process runs.
-    Alternate,
 }
 
 /// Configuration for spawning a process.
@@ -135,9 +115,6 @@ pub enum ProcessError {
     /// Process did not exit even after SIGKILL (e.g., stuck in uninterruptible sleep).
     #[error("process pgid {pgid} did not exit after SIGKILL (possibly in uninterruptible sleep)")]
     Unkillable { pgid: i32 },
-    /// Foreground terminal setup failed.
-    #[error("foreground terminal error: {0}")]
-    ForegroundTerminal(String),
     /// I/O error during process management.
     #[error("process I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -374,180 +351,6 @@ impl Drop for ProcessHandle {
     }
 }
 
-impl ForegroundProcessHandle {
-    /// The process group ID of this child.
-    pub fn pgid(&self) -> i32 {
-        self.pgid
-    }
-
-    /// Wait for the foreground child to exit.
-    pub async fn wait(&mut self) -> Result<ExitStatus, ProcessError> {
-        self.child.wait().await.map_err(ProcessError::Io)
-    }
-
-    /// Send a signal to the entire process group.
-    pub fn signal(&self, sig: Signal) -> Result<(), ProcessError> {
-        killpg(Pid::from_raw(self.pgid), sig).map_err(|source| ProcessError::Signal {
-            pgid: self.pgid,
-            signal: signal_name(sig),
-            source,
-        })
-    }
-
-    /// Send a signal to the process group, wait up to `timeout` for exit,
-    /// then send SIGKILL if the process hasn't exited.
-    pub async fn terminate(
-        &mut self,
-        sig: Signal,
-        timeout: std::time::Duration,
-    ) -> Result<ExitStatus, ProcessError> {
-        if let Err(e) = self.signal(sig)
-            && !matches!(
-                e,
-                ProcessError::Signal {
-                    source: nix::Error::ESRCH,
-                    ..
-                }
-            )
-        {
-            return Err(e);
-        }
-
-        match tokio::time::timeout(timeout, self.child.wait()).await {
-            Ok(result) => result.map_err(ProcessError::Io),
-            Err(_elapsed) => {
-                if let Err(e) = self.signal(Signal::SIGKILL)
-                    && !matches!(
-                        e,
-                        ProcessError::Signal {
-                            source: nix::Error::ESRCH,
-                            ..
-                        }
-                    )
-                {
-                    return Err(e);
-                }
-                match tokio::time::timeout(std::time::Duration::from_millis(500), self.child.wait())
-                    .await
-                {
-                    Ok(result) => result.map_err(ProcessError::Io),
-                    Err(_) => Err(ProcessError::Unkillable { pgid: self.pgid }),
-                }
-            }
-        }
-    }
-}
-
-struct TerminalGuard {
-    fd: libc::c_int,
-    original_pgrp: libc::pid_t,
-    original_termios: Option<libc::termios>,
-    alternate_screen: bool,
-}
-
-impl TerminalGuard {
-    fn enter(screen: ForegroundScreen) -> Result<Self, ProcessError> {
-        let fd = libc::STDIN_FILENO;
-        // Safety: isatty only reads fd metadata.
-        let is_tty = unsafe { libc::isatty(fd) } == 1;
-        if !is_tty {
-            return Err(ProcessError::ForegroundTerminal(
-                "foreground tasks require an interactive terminal".to_string(),
-            ));
-        }
-
-        // Safety: tcgetpgrp reads the foreground pgroup for a valid terminal fd.
-        let original_pgrp = unsafe { libc::tcgetpgrp(fd) };
-        if original_pgrp < 0 {
-            return Err(ProcessError::ForegroundTerminal(format!(
-                "tcgetpgrp failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-
-        let mut termios = MaybeUninit::<libc::termios>::uninit();
-        // Safety: termios points to valid uninitialised storage for tcgetattr.
-        let original_termios = if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } == 0 {
-            // Safety: tcgetattr returned success and initialised termios.
-            Some(unsafe { termios.assume_init() })
-        } else {
-            None
-        };
-
-        let alternate_screen = matches!(screen, ForegroundScreen::Alternate);
-        if alternate_screen {
-            crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
-                .map_err(|e| {
-                    ProcessError::ForegroundTerminal(format!("enter alternate screen failed: {e}"))
-                })?;
-        }
-
-        Ok(Self {
-            fd,
-            original_pgrp,
-            original_termios,
-            alternate_screen,
-        })
-    }
-
-    fn make_foreground(&self, pgid: i32) -> Result<(), ProcessError> {
-        // Safety: tcsetpgrp updates terminal foreground ownership for a valid tty fd.
-        if unsafe { libc::tcsetpgrp(self.fd, pgid) } != 0 {
-            return Err(ProcessError::ForegroundTerminal(format!(
-                "tcsetpgrp failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        // Restoring the terminal happens from a background process group (the
-        // foreground task owns the tty). tcsetpgrp and tcsetattr from a bg
-        // pgrp send SIGTTOU to all members of the calling pgrp, whose default
-        // action is to STOP the process — leaving don suspended right after
-        // every foreground task. Ignore SIGTTOU around the restoration calls
-        // and put the disposition back when we're done.
-        let saved_sigttou = ignore_signal(libc::SIGTTOU);
-        // Safety: best-effort terminal restoration for the saved tty fd.
-        let _ = unsafe { libc::tcsetpgrp(self.fd, self.original_pgrp) };
-        if let Some(termios) = self.original_termios.as_ref() {
-            // Safety: termios was captured by tcgetattr for this fd.
-            let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, termios) };
-        }
-        restore_signal(libc::SIGTTOU, saved_sigttou);
-        if self.alternate_screen {
-            let _ =
-                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        }
-    }
-}
-
-/// Set `signum`'s disposition to SIG_IGN and return the previous sigaction
-/// so it can be put back via [`restore_signal`].
-fn ignore_signal(signum: libc::c_int) -> libc::sigaction {
-    // Safety: sigaction reads/writes a struct sigaction we own; SIG_IGN is a
-    // valid handler value.
-    unsafe {
-        let mut prev: libc::sigaction = std::mem::zeroed();
-        let mut new: libc::sigaction = std::mem::zeroed();
-        new.sa_sigaction = libc::SIG_IGN;
-        libc::sigemptyset(&mut new.sa_mask);
-        libc::sigaction(signum, &new, &mut prev);
-        prev
-    }
-}
-
-/// Restore a signal disposition saved by [`ignore_signal`].
-fn restore_signal(signum: libc::c_int, prev: libc::sigaction) {
-    // Safety: prev was produced by sigaction in `ignore_signal`.
-    unsafe {
-        libc::sigaction(signum, &prev, std::ptr::null_mut());
-    }
-}
-
 /// Spawn a child process in its own process group.
 ///
 /// 1. Tries PTY allocation first (for terminal-like behavior).
@@ -588,68 +391,6 @@ pub async fn spawn_process(
     } else {
         spawn_pipe_handle(&config).await
     }
-}
-
-/// Spawn a process that owns the user's foreground terminal until it exits.
-///
-/// The child inherits stdin/stdout/stderr, runs in its own process group,
-/// and becomes the terminal's foreground process group. Dropping the returned
-/// handle restores the parent process group and terminal attributes.
-pub async fn spawn_foreground_process(
-    config: SpawnConfig<'_>,
-    screen: ForegroundScreen,
-) -> Result<ForegroundProcessHandle, ProcessError> {
-    let terminal = TerminalGuard::enter(screen)?;
-    let (prog, prog_args) = listen_pid_shim(&config);
-    let mut cmd = tokio::process::Command::new(prog);
-    cmd.args(&prog_args);
-    cmd.stdin(std::process::Stdio::inherit());
-    cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
-    cmd.kill_on_drop(true);
-    cmd.env_clear().envs(&config.env);
-
-    if let Some(dir) = config.dir {
-        cmd.current_dir(dir);
-    }
-
-    let listen_fds = config.listen_fds.clone();
-    // Safety: setpgid, dup/fcntl/close via place_fds_for_exec, and prctl are
-    // async-signal-safe. Runs in the child between fork and exec.
-    unsafe {
-        cmd.pre_exec(move || {
-            #[cfg(target_os = "linux")]
-            {
-                if libc::prctl(
-                    libc::PR_SET_PDEATHSIG,
-                    libc::SIGKILL as libc::c_ulong,
-                    0,
-                    0,
-                    0,
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            socket::place_fds_for_exec(&listen_fds)?;
-            nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                .map_err(std::io::Error::other)?;
-            Ok(())
-        });
-    }
-
-    let child = cmd.spawn().map_err(|source| ProcessError::Spawn {
-        cmd: config.cmd.to_string(),
-        source,
-    })?;
-    let pgid = child_pgid(&child, config.cmd)?;
-    write_pgid_file(config.pgid_file_path.as_deref(), pgid).await?;
-    terminal.make_foreground(pgid)?;
-    Ok(ForegroundProcessHandle {
-        pgid,
-        child,
-        _terminal: terminal,
-    })
 }
 
 /// Build a ProcessHandle + ChildOutput from a pipe-mode spawn.

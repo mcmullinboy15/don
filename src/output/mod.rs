@@ -279,31 +279,6 @@ impl VerbosityControl {
     }
 }
 
-#[derive(Clone, Debug)]
-struct StdoutPauseControl {
-    paused: Arc<AtomicBool>,
-}
-
-impl StdoutPauseControl {
-    fn new() -> Self {
-        Self {
-            paused: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
-    }
-
-    fn pause(&self) {
-        self.paused.store(true, Ordering::Relaxed);
-    }
-
-    fn resume(&self) {
-        self.paused.store(false, Ordering::Relaxed);
-    }
-}
-
 /// Allowlist applied at the stdout sink so pipe-mode runs can scope output
 /// to a subset of services without a TUI filter modal. When the inner
 /// `OnceLock` is unset, no filter is active and everything passes.
@@ -680,9 +655,6 @@ pub struct OutputManager {
     /// Shared runtime verbose mode — enables extra diagnostic lifecycle events
     /// and timestamps on stdout/TUI log lines.
     verbosity: VerbosityControl,
-    /// Global mute for visible stdout/TUI output while a foreground task owns
-    /// the terminal. Ring buffers and file sinks continue to receive output.
-    stdout_pause: StdoutPauseControl,
     /// Handle to the server-side terminal-emulator thread. Screens register
     /// per PTY-backed spawn; see [`emulator`].
     emulator: emulator::EmulatorHandle,
@@ -856,7 +828,6 @@ impl OutputManager {
         let color_map = assign_colors(&names);
         let max_name_len = names.iter().map(|n| n.len()).max().unwrap_or(0).max(5);
         let verbosity = VerbosityControl::new(verbose);
-        let stdout_pause = StdoutPauseControl::new();
         let log_filter = LogFilterControl::default();
         let emulator = emulator::spawn_emulator_thread();
 
@@ -867,7 +838,6 @@ impl OutputManager {
             stdout_rx,
             target,
             verbosity.clone(),
-            stdout_pause.clone(),
             log_filter.clone(),
             log_tap.clone(),
         ));
@@ -939,7 +909,6 @@ impl OutputManager {
             stdout_sink,
             writer_handles,
             verbosity,
-            stdout_pause,
             emulator,
             log_filter,
             bazel_prefix: None,
@@ -1212,19 +1181,6 @@ impl OutputManager {
         self.verbosity.clone()
     }
 
-    /// Pause all visible output routed through Don's stdout/TUI sink.
-    ///
-    /// Service ring buffers and file sinks continue to receive output. This
-    /// is used while a foreground task owns the user's terminal.
-    pub fn pause_visible_output(&self) {
-        self.stdout_pause.pause();
-    }
-
-    /// Resume visible output after a foreground task releases the terminal.
-    pub fn resume_visible_output(&self) {
-        self.stdout_pause.resume();
-    }
-
     /// Get a cloneable output handle scoped to one registered item.
     ///
     /// Returns `None` for an unregistered name — every service and task is
@@ -1235,7 +1191,6 @@ impl OutputManager {
             name: name.to_string(),
             state: Arc::clone(self.services.get(name)?),
             events: self.clone_lifecycle_emitter(),
-            stdout_pause: self.stdout_pause.clone(),
             emulator: self.emulator.clone(),
         })
     }
@@ -1417,7 +1372,6 @@ pub struct ItemOutput {
     name: String,
     state: Arc<Mutex<ServiceOutputState>>,
     events: LifecycleEmitter,
-    stdout_pause: StdoutPauseControl,
     emulator: emulator::EmulatorHandle,
 }
 
@@ -1463,17 +1417,6 @@ impl ItemOutput {
         if !state.sinks.iter().any(|sink| sink.same_channel(&feed)) {
             state.sinks.push(feed);
         }
-    }
-
-    /// Mute visible stdout/TUI output while this item owns the terminal.
-    /// Ring buffers and file sinks keep receiving output.
-    pub fn pause_visible_output(&self) {
-        self.stdout_pause.pause();
-    }
-
-    /// Unmute after a foreground run releases the terminal.
-    pub fn resume_visible_output(&self) {
-        self.stdout_pause.resume();
     }
 
     /// Emit a `[don]` event tagged with this item's name.
@@ -1597,7 +1540,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut rx: mpsc::UnboundedReceiver<SinkLine>,
     mut target: StdoutTarget<W>,
     verbosity: VerbosityControl,
-    pause: StdoutPauseControl,
     filter: LogFilterControl,
     tap: MergedLogTap,
 ) {
@@ -1615,11 +1557,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     let mut cr_flushed: HashSet<Bytes> = HashSet::new();
 
     while let Some(msg) = rx.recv().await {
-        if pause.is_paused() {
-            accumulators.remove(&msg.prefix);
-            cr_flushed.remove(&msg.prefix);
-            continue;
-        }
         // Drop messages whose source service isn't in the active allowlist.
         // Wipe any partial accumulator for that prefix too — carrying half a
         // line across a filter change would replay it the next time the
@@ -2322,24 +2259,6 @@ mod tests {
                     .unwrap();
             }
         }
-
-        // The pause control must be shared, not snapshotted: a supervisor
-        // muting the terminal for a foreground run has to mute everyone's
-        // output, including lines the manager itself emits. Asserted against
-        // the control rather than the captured bytes on purpose — whether a
-        // line already in the channel gets dropped is up to `stdout_sink_task`
-        // and racy to observe, whereas "both see one flag" is the invariant
-        // this handle is responsible for.
-        let alpha = mgr.item_output("alpha").unwrap();
-        let clone = alpha.clone();
-        assert!(!mgr.stdout_pause.is_paused());
-        alpha.pause_visible_output();
-        assert!(mgr.stdout_pause.is_paused(), "handle must mute the manager");
-        clone.resume_visible_output();
-        assert!(
-            !mgr.stdout_pause.is_paused(),
-            "and a clone of the handle must un-mute it"
-        );
 
         mgr.shutdown().await;
 

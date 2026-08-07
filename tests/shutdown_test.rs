@@ -5,7 +5,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, RunnerCommand, RunnerEvent, ServiceState, TerminalCoordinator};
+use don::runner::{Runner, RunnerCommand, RunnerEvent, ServiceState};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -118,7 +118,7 @@ async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
@@ -167,7 +167,7 @@ async fn make_runner(
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
@@ -180,55 +180,6 @@ async fn make_runner(
 }
 
 // --- Tests ---
-
-/// Foreground tasks pause the global stdout/TUI sink while they own the
-/// terminal. If shutdown begins before the pause is released — e.g. the
-/// task's run_worker is aborted before `TaskRunPrepared` arrives, or the
-/// foreground task gets SIGKILL'd at the end of shutdown and its
-/// `TaskExited` lands after the main loop has broken out — every lifecycle
-/// event we emit during shutdown is silently dropped. `initiate_shutdown`
-/// must force-clear the pause so the user actually sees what's happening.
-#[test]
-fn shutdown_clears_leaked_visible_output_pause() {
-    run_with_timeout(Duration::from_secs(15), async {
-        let dir = TempDir::new("shutdown-clear-pause");
-        let toml = ConfigBuilder::new()
-            .add_custom_service("api", "sleep", &["60"])
-            .log("ignore")
-            .ready_exec("true", &[])
-            .done()
-            .build();
-
-        // Engage the pause before the runner takes ownership of the
-        // OutputManager — same end state as a foreground task that grabbed
-        // the terminal and never got to release it.
-        let (shutdown_tx, handle, buf) = spawn_runner_with(&toml, dir.path(), |om| {
-            om.pause_visible_output();
-        })
-        .await;
-
-        // Can't wait for "all services running" through the buffer — it's
-        // currently muted. Sleep long enough for the service to boot.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let _ = shutdown_tx.send(()).await;
-        handle.await.unwrap();
-
-        let output = read_buf(&buf);
-        assert!(
-            output.contains("shutting down gracefully"),
-            "shutdown banner should be visible after pause is cleared. output: {output:?}"
-        );
-        assert!(
-            output.contains("api: send SIGTERM to pgid"),
-            "per-service signal lifecycle event should be visible. output: {output:?}"
-        );
-        assert!(
-            output.contains("shutdown complete"),
-            "shutdown complete should be visible. output: {output:?}"
-        );
-    });
-}
 
 /// Lifecycle events ("send SIGTERM…", "stopping…") share the stdout sink
 /// with regular service output. If a noisy service spams during shutdown
