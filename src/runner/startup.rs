@@ -3,11 +3,7 @@ use super::build_tools::{
 };
 use super::graph::{dep_name_map, topological_sort};
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::task_worker::TaskRunMode;
-use super::{
-    ProcessKind, Runner, RunnerInternalCommand, RuntimeService, ServiceState, TaskRunIntent,
-    TaskState,
-};
+use super::{ProcessKind, Runner, RunnerInternalCommand, RuntimeService, ServiceState, TaskState};
 use crate::config::Dependency;
 use crate::signals::shutdown_requested;
 use std::collections::HashMap;
@@ -623,39 +619,10 @@ impl Runner {
             if !is_pending_task {
                 continue;
             }
-
-            let Some((task_cfg, needs_startup_evaluation)) = self
-                .tasks
-                .get(&name)
-                .map(|rt| (rt.config.clone(), !rt.dependency_evaluated))
-            else {
-                continue;
-            };
-
+            // The run itself is the supervisor's: its gate is open, and it
+            // issues its own startup evaluation — the skip-if-unchanged,
+            // auto_run and params policy already lives in the worker.
             self.report_skipped_non_blocking_dependencies(&name, &skipped);
-            if needs_startup_evaluation {
-                // Only a *blocking* dependent makes a manual task worth
-                // parking for. A non-blocking dependent is happy either way,
-                // so counting it would park the task as "required by
-                // dependents" and then block the very dependent that didn't
-                // care.
-                let has_dependents = dep_map
-                    .values()
-                    .any(|deps| deps.iter().any(|dep| dep.blocking && dep.name == name));
-                if let Err(e) = self.spawn_task_worker(
-                    &name,
-                    task_cfg,
-                    HashMap::new(),
-                    TaskRunMode::Startup { has_dependents },
-                    TaskRunIntent::Scheduled,
-                ) {
-                    self.set_task_state(&name, TaskState::Failed);
-                    self.output_manager
-                        .service_error_event(&name, &e.to_string());
-                }
-            } else {
-                self.handle_task_rerun(&name).await;
-            }
         }
     }
 

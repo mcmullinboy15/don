@@ -587,6 +587,18 @@ impl Runner {
 
         // One supervisor per task, started before the runner exists so the
         // registry is immutable and can be shared without a lock.
+        // Which names some *blocking* dependent is waiting on. Computed once:
+        // group refs are already expanded by `build_runtime_maps`, and the
+        // bazel re-resolution later re-expands to the same set, so this
+        // cannot go stale.
+        let blocking_dependents: std::collections::HashSet<String> = services
+            .values()
+            .flat_map(|rs| rs.resolved.depends_on.iter())
+            .chain(tasks.values().flat_map(|rt| rt.config.depends_on.iter()))
+            .filter(|dep| dep.blocking)
+            .map(|dep| dep.name.clone())
+            .collect();
+
         let task_supervisors = task_supervisor::spawn_supervisors(
             tasks.keys(),
             &task_worker::TaskWorkerContext {
@@ -597,7 +609,14 @@ impl Runner {
                 endpoints: endpoints.reader(),
             },
             &|name| output_manager.process_output(name),
+            &|name| {
+                tasks.get(name).map(|rt| task_supervisor::StartupConfig {
+                    task_cfg: Box::new(rt.config.clone()),
+                    has_dependents: blocking_dependents.contains(name),
+                })
+            },
             &report_tx,
+            &mut gate_readers,
         );
 
         let (manifest_writer_tx, manifest_writer_handle) = runtime_ports::spawn_manifest_writer(

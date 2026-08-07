@@ -57,12 +57,35 @@ pub(crate) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     ctx: &super::task_worker::TaskWorkerContext,
     outputs: &dyn Fn(&str) -> Option<crate::output::ProcessOutput>,
+    config: &dyn Fn(&str) -> Option<StartupConfig>,
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
+    gates: &mut std::collections::HashMap<String, crate::gate::GateReader>,
 ) -> TaskSupervisors {
     TaskSupervisors::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
-        supervise(name, rx, ctx.clone(), output, report_tx.clone(), busy)
+        let startup = config(&name);
+        let gate = gates.remove(&name);
+        supervise(
+            name,
+            rx,
+            ctx.clone(),
+            output,
+            report_tx.clone(),
+            busy,
+            startup,
+            gate,
+        )
     })
+}
+
+/// What a task needs to issue its own startup run when permitted.
+pub(crate) struct StartupConfig {
+    pub(crate) task_cfg: Box<crate::config::Task>,
+    /// Whether any *blocking* dependent is waiting on this task. A
+    /// non-blocking dependent is happy either way, so counting it would park
+    /// a manual task as "required by dependents" and then block the very
+    /// dependent that did not care. Fixed at construction, like the name set.
+    pub(crate) has_dependents: bool,
 }
 
 /// Drive one task's runs, strictly in order.
@@ -80,6 +103,8 @@ async fn supervise(
     output: Option<crate::output::ProcessOutput>,
     report_tx: mpsc::UnboundedSender<super::ProcessReport>,
     busy: Arc<AtomicBool>,
+    startup: Option<StartupConfig>,
+    mut gate: Option<crate::gate::GateReader>,
 ) {
     let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<RunRequest> = None;
@@ -91,12 +116,51 @@ async fn supervise(
             None => {
                 // Idle only here: everywhere else there is work in hand.
                 busy.store(false, Ordering::Relaxed);
-                match rx.recv().await {
+                // Level read, exactly as the service side: permission means
+                // "your dependencies are satisfied", and the *decision* to
+                // run — skip-if-unchanged, auto_run, params — belongs to the
+                // worker below, which already owns it.
+                let permitted = gate
+                    .as_mut()
+                    .and_then(|gate| gate.take())
+                    .zip(startup.as_ref())
+                    .map(|(_, startup)| RunRequest {
+                        task_cfg: startup.task_cfg.clone(),
+                        params: std::collections::HashMap::new(),
+                        mode: super::task_worker::TaskRunMode::Startup {
+                            has_dependents: startup.has_dependents,
+                        },
+                        intent: super::TaskRunIntent::Scheduled,
+                    });
+                match permitted {
                     Some(request) => {
                         busy.store(true, Ordering::Relaxed);
                         request
                     }
-                    None => return,
+                    None => {
+                        tokio::select! {
+                            received = rx.recv() => match received {
+                                Some(request) => {
+                                    busy.store(true, Ordering::Relaxed);
+                                    // A mailbox run supersedes any standing
+                                    // permission; spending it here keeps the
+                                    // task from running twice.
+                                    if let Some(gate) = gate.as_mut() {
+                                        gate.burn();
+                                    }
+                                    request
+                                }
+                                None => return,
+                            },
+                            // Permission changed; loop back to the level read.
+                            changed = wait_gate(&mut gate), if gate.is_some() => {
+                                if changed.is_none() {
+                                    gate = None;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
         };
@@ -252,6 +316,15 @@ async fn supervise(
             output.clear_attach().await;
         }
         outcome.finish(result, start.elapsed()).await;
+    }
+}
+
+/// Wait on a gate slot, parking forever when there is none — so an absent
+/// gate never completes and never consumes its `select!` branch.
+async fn wait_gate(gate: &mut Option<crate::gate::GateReader>) -> Option<()> {
+    match gate.as_mut() {
+        Some(gate) => gate.changed().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -607,7 +680,15 @@ mod tests {
         };
         let names = ["build".to_string(), "migrate".to_string()];
         let (report_tx, _report_rx) = mpsc::unbounded_channel();
-        let mut supervisors = spawn_supervisors(names.iter(), &ctx, &|_| None, &report_tx);
+        let mut gates = std::collections::HashMap::new();
+        let mut supervisors = spawn_supervisors(
+            names.iter(),
+            &ctx,
+            &|_| None,
+            &|_| None,
+            &report_tx,
+            &mut gates,
+        );
         let registry = supervisors.registry().clone();
 
         assert!(registry.get("build").is_some());
