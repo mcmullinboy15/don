@@ -135,7 +135,7 @@ impl Runner {
         let name_owned = name.to_string();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-            let _ = report_tx.send(super::ItemReport::RestartDue {
+            let _ = report_tx.send(super::ProcessReport::RestartDue {
                 name: name_owned,
                 attempt,
             });

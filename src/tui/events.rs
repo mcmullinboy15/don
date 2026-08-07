@@ -6,7 +6,7 @@
 
 use crossterm::event::KeyEvent;
 
-use crate::client::{CompletionError, ItemStatus};
+use crate::client::{CompletionError, ProcessStatus};
 
 /// Event delivered from the input task to the main TUI loop.
 #[derive(Debug, Clone)]
@@ -35,7 +35,7 @@ pub(crate) enum AppEvent {
     /// lag. Injected through the input channel so it applies in order with
     /// user input rather than racing the render loop.
     StateResync {
-        items: Vec<ItemStatus>,
+        processes: Vec<ProcessStatus>,
         startup_complete: bool,
     },
 }

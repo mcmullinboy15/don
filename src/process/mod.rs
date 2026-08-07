@@ -3,25 +3,25 @@
 //! health monitor, ready resolution, and the vocabulary they speak.
 //!
 //! The edge is deliberate and greppable: **this module imports nothing from
-//! `crate::runner`.** Items produce reports; the runner folds them and
+//! `crate::runner`.** Processes produce reports; the runner folds them and
 //! decides what starts next. Commands flow down, reports flow up, and the
-//! scheduler never reaches into an item's internals.
+//! scheduler never reaches into an process's internals.
 
 pub(crate) mod health;
 pub(crate) mod paths;
 pub(crate) mod ready;
 pub(crate) mod registry;
-pub(crate) mod service_process;
+pub(crate) mod service;
 pub(crate) mod service_supervisor;
 pub(crate) mod service_worker;
 pub mod state;
-pub(crate) mod task_process;
+pub(crate) mod task;
 pub(crate) mod task_supervisor;
 pub(crate) mod task_worker;
 
-pub use state::{ServiceState, TaskItemState};
+pub use state::{ServiceState, TaskState};
 
-pub(crate) use state::{NodeKind, ServiceHandleIdentity};
+pub(crate) use state::{ProcessKind, ServiceHandleIdentity};
 use tokio::sync::oneshot;
 
 pub(crate) enum ServiceStartIntent {
@@ -53,16 +53,16 @@ pub(crate) struct TaskExit {
 }
 
 /// Runner-private messages emitted by detached workers.
-/// What an item tells the scheduler, on the lossless report channel.
+/// What an process tells the scheduler, on the lossless report channel.
 ///
-/// This is the up-direction of the supervisor architecture: items report,
+/// This is the up-direction of the supervisor architecture: processes report,
 /// the runner folds. It is `mpsc`, not `broadcast`, because the scheduler
 /// must never miss one — lossy observation is for peers and edges, which
-/// resync from the snapshot. Starts with lazy demand; per-item lifecycle
+/// resync from the snapshot. Starts with lazy demand; per-process lifecycle
 /// reports (exit, transitions) migrate here as supervisors absorb them.
-pub(crate) enum ItemReport {
+pub(crate) enum ProcessReport {
     /// A lazy service's proxy saw its first connection. Demand originates
-    /// inside the item, but the *reaction* belongs to the scheduler: a lazy
+    /// inside the process, but the *reaction* belongs to the scheduler: a lazy
     /// service has dependencies, and starting it is a scheduling decision
     /// like any other.
     Demand { name: String },

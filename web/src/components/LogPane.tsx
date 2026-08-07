@@ -23,7 +23,7 @@ export function LogPane({ projectId, name }: Props) {
   const [following, setFollowing] = useState(true);
   const viewport = useRef<HTMLDivElement>(null);
 
-  // Reset when switching between items, or the new stream appends to the old.
+  // Reset when switching between processes, or the new stream appends to the old.
   useEffect(() => {
     setLines([]);
     setFollowing(true);

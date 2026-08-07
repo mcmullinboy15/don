@@ -1,5 +1,5 @@
 use super::support::format_duration;
-use super::{CommandError, CommandResult, Runner, RunnerEvent, TaskExit, TaskItemState};
+use super::{CommandError, CommandResult, Runner, RunnerEvent, TaskExit, TaskState};
 
 impl Runner {
     pub(in crate::runner) fn handle_task_exit(&mut self, exit: TaskExit) {
@@ -37,7 +37,7 @@ impl Runner {
                 rt.mark_success();
                 rt.last_run = last_run;
             }
-            self.set_task_state(name, TaskItemState::Completed);
+            self.set_task_state(name, TaskState::Completed);
             let msg = if timing.is_empty() {
                 "complete".to_string()
             } else {
@@ -49,7 +49,7 @@ impl Runner {
                 rt.set_needs_run_now(true);
                 rt.last_run = last_run;
             }
-            self.set_task_state(name, TaskItemState::Failed);
+            self.set_task_state(name, TaskState::Failed);
             if let Some(ref err_msg) = message {
                 let msg = if timing.is_empty() {
                     format!("failed ({err_msg})")

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import { useStatus } from "../hooks";
-import type { Item, PortManifest, Project } from "../types";
+import type { Process, PortManifest, Project } from "../types";
 import { LogPane } from "./LogPane";
 import { RunTaskDialog } from "./RunTaskDialog";
 import { StatePill } from "./StatePill";
@@ -12,29 +12,29 @@ interface Props {
 }
 
 /** Services a control action can be applied to, given the current state. */
-function actions(item: Item): { start: boolean; stop: boolean; restart: boolean } {
-  if (item.kind !== "service") {
+function actions(process: Process): { start: boolean; stop: boolean; restart: boolean } {
+  if (process.kind !== "service") {
     return { start: false, stop: false, restart: false };
   }
-  const stopped = item.state === "stopped" || item.state === "failed";
+  const stopped = process.state === "stopped" || process.state === "failed";
   return { start: stopped, stop: !stopped, restart: !stopped };
 }
 
 export function ProjectView({ project, onBack }: Props) {
-  const { items, loading, error, refresh } = useStatus(project.id);
+  const { processes, loading, error, refresh } = useStatus(project.id);
   const [selected, setSelected] = useState<string | null>(null);
   const [ports, setPorts] = useState<PortManifest | null>(null);
-  const [runTask, setRunTask] = useState<Item | null>(null);
+  const [runTask, setRunTask] = useState<Process | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
     api.ports(project.id).then(setPorts).catch(() => setPorts(null));
   }, [project.id]);
 
-  // Default the log pane to the first item so the page is useful immediately.
+  // Default the log pane to the first process so the page is useful immediately.
   useEffect(() => {
-    if (!selected && items.length > 0) setSelected(items[0]?.name ?? null);
-  }, [items, selected]);
+    if (!selected && processes.length > 0) setSelected(processes[0]?.name ?? null);
+  }, [processes, selected]);
 
   async function act(action: () => Promise<void>) {
     setActionError(null);
@@ -48,8 +48,8 @@ export function ProjectView({ project, onBack }: Props) {
     }
   }
 
-  const pendingRun = items.filter(
-    (item) => item.kind === "task" && item.state === "pending_run",
+  const pendingRun = processes.filter(
+    (process) => process.kind === "task" && process.state === "pending_run",
   );
 
   return (
@@ -79,42 +79,42 @@ export function ProjectView({ project, onBack }: Props) {
       {actionError && <p className="error">{actionError}</p>}
 
       <div className="columns">
-        <section className="items">
-          {loading && items.length === 0 && <p className="muted">loading…</p>}
+        <section className="processes">
+          {loading && processes.length === 0 && <p className="muted">loading…</p>}
           <table>
             <tbody>
-              {items.map((item) => {
-                const can = actions(item);
-                const params = item.verbose?.params ?? [];
+              {processes.map((process) => {
+                const can = actions(process);
+                const params = process.verbose?.params ?? [];
                 return (
                   <tr
-                    key={item.name}
-                    className={selected === item.name ? "selected" : undefined}
-                    onClick={() => setSelected(item.name)}
+                    key={process.name}
+                    className={selected === process.name ? "selected" : undefined}
+                    onClick={() => setSelected(process.name)}
                   >
-                    <td className="item-name">
-                      <span className={`kind kind-${item.kind}`}>
-                        {item.kind === "service" ? "svc" : "task"}
+                    <td className="process-name">
+                      <span className={`kind kind-${process.kind}`}>
+                        {process.kind === "service" ? "svc" : "task"}
                       </span>
-                      {item.name}
-                      {item.failed_dependencies &&
-                        item.failed_dependencies.length > 0 && (
+                      {process.name}
+                      {process.failed_dependencies &&
+                        process.failed_dependencies.length > 0 && (
                           <span className="muted">
                             {" "}
-                            ← {item.failed_dependencies.join(", ")}
+                            ← {process.failed_dependencies.join(", ")}
                           </span>
                         )}
                     </td>
                     <td>
-                      <StatePill item={item} />
+                      <StatePill process={process} />
                     </td>
-                    <td className="item-actions">
+                    <td className="process-actions">
                       {can.start && (
                         <button
                           className="ghost"
                           onClick={(e) => {
                             e.stopPropagation();
-                            act(() => api.start(project.id, item.name));
+                            act(() => api.start(project.id, process.name));
                           }}
                         >
                           start
@@ -125,7 +125,7 @@ export function ProjectView({ project, onBack }: Props) {
                           className="ghost"
                           onClick={(e) => {
                             e.stopPropagation();
-                            act(() => api.restart(project.id, item.name));
+                            act(() => api.restart(project.id, process.name));
                           }}
                         >
                           restart
@@ -136,21 +136,21 @@ export function ProjectView({ project, onBack }: Props) {
                           className="ghost"
                           onClick={(e) => {
                             e.stopPropagation();
-                            act(() => api.stop(project.id, item.name));
+                            act(() => api.stop(project.id, process.name));
                           }}
                         >
                           stop
                         </button>
                       )}
-                      {item.kind === "task" && (
+                      {process.kind === "task" && (
                         <button
                           className="ghost"
                           onClick={(e) => {
                             e.stopPropagation();
                             // Params are collected in a dialog only when the
                             // task declares some; otherwise run straight away.
-                            if (params.length > 0) setRunTask(item);
-                            else act(() => api.run(project.id, item.name, {}));
+                            if (params.length > 0) setRunTask(process);
+                            else act(() => api.run(project.id, process.name, {}));
                           }}
                         >
                           run

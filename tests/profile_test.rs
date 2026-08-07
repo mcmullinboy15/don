@@ -5,7 +5,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, resolve_profile_items};
+use don::runner::{Runner, resolve_profile_processes};
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
-// --- Unit tests for resolve_profile_items ---
+// --- Unit tests for resolve_profile_processes ---
 
 #[test]
 fn resolve_profile_transitive_deps() {
@@ -167,7 +167,7 @@ fn resolve_profile_transitive_deps() {
     for case in cases {
         let config: Config = case.toml.parse().unwrap();
         let profile = config.profiles.get(case.profile_name).unwrap();
-        let result = resolve_profile_items(&config, profile);
+        let result = resolve_profile_processes(&config, profile);
         let mut result_sorted: Vec<String> = result.into_iter().collect();
         result_sorted.sort();
         let mut expected_sorted: Vec<String> =
@@ -401,12 +401,12 @@ fn profile_excluded_services_absent_from_status() {
 
         // Check status via API — worker should not appear.
         let client = don::client::Client::new(dir.path());
-        let items = client.status(false, None).await.unwrap();
-        let names: Vec<String> = items
+        let statuses = client.status(false, None).await.unwrap();
+        let names: Vec<String> = statuses
             .iter()
             .map(|i| match i {
-                don::runner::ItemStatus::Service { name, .. } => name.clone(),
-                don::runner::ItemStatus::Task { name, .. } => name.clone(),
+                don::runner::ProcessStatus::Service { name, .. } => name.clone(),
+                don::runner::ProcessStatus::Task { name, .. } => name.clone(),
             })
             .collect();
         assert!(

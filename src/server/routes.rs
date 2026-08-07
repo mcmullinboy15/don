@@ -1,7 +1,7 @@
 //! HTTP endpoints for the unix socket API.
 
 use super::ApiState;
-use crate::runner::{CommandError, CompletionError, ItemStatus, RunnerCommand, WatchReport};
+use crate::runner::{CommandError, CompletionError, ProcessStatus, RunnerCommand, WatchReport};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -43,7 +43,7 @@ struct StatusQuery {
     #[serde(default)]
     verbose: bool,
     /// Restrict the response to a single service/task and include its full
-    /// resolved watch path list. Omit to list all items (path list elided).
+    /// resolved watch path list. Omit to list all processes (path list elided).
     #[serde(default)]
     name: Option<String>,
 }
@@ -61,16 +61,16 @@ async fn get_status(
 ) -> Response {
     if !query.verbose {
         let snapshot = state.state.snapshot();
-        let items = match query.name {
+        let processes = match query.name {
             Some(want) => snapshot
-                .items
+                .processes
                 .iter()
-                .filter(|item| item_name(item) == want)
+                .filter(|process| process_name(process) == want)
                 .cloned()
                 .collect(),
-            None => snapshot.items.clone(),
+            None => snapshot.processes.clone(),
         };
-        return Json(StatusResponse { items }).into_response();
+        return Json(StatusResponse { processes }).into_response();
     }
     let (tx, rx) = oneshot::channel();
     if state
@@ -85,20 +85,23 @@ async fn get_status(
         return runner_unavailable();
     }
     match rx.await {
-        Ok(statuses) => Json(StatusResponse { items: statuses }).into_response(),
+        Ok(statuses) => Json(StatusResponse {
+            processes: statuses,
+        })
+        .into_response(),
         Err(_) => runner_unavailable(),
     }
 }
 
 #[derive(Serialize)]
 struct StatusResponse {
-    items: Vec<ItemStatus>,
+    processes: Vec<ProcessStatus>,
 }
 
 /// The name of a service or task, for filtering a snapshot by `?name=`.
-fn item_name(item: &ItemStatus) -> &str {
-    match item {
-        ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name,
+fn process_name(process: &ProcessStatus) -> &str {
+    match process {
+        ProcessStatus::Service { name, .. } | ProcessStatus::Task { name, .. } => name,
     }
 }
 
@@ -110,7 +113,7 @@ fn item_name(item: &ItemStatus) -> &str {
 /// spurious failure this exists to prevent.
 const STARTUP_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Block until the runner has decided every item, or the deadline passes.
+/// Block until the runner has decided every process, or the deadline passes.
 ///
 /// Safe to await here: this runs in the per-request axum task, not the
 /// runner's command loop, so waiting costs this one client and nothing else.
@@ -123,7 +126,7 @@ async fn await_startup_settled(state: &ApiState) -> bool {
 
 #[derive(Serialize)]
 struct ReadyResponse {
-    /// Whether the initial startup sweep has decided every item.
+    /// Whether the initial startup sweep has decided every process.
     startup_complete: bool,
     /// The runner's crate version. A long-lived runner can outlive a `don`
     /// upgrade; clients compare and warn instead of misbehaving quietly.
@@ -145,7 +148,7 @@ async fn get_ready(State(state): State<Arc<ApiState>>) -> Response {
 
 /// `GET /events` — stream runner state changes as newline-delimited JSON.
 ///
-/// The first record is always `{"type":"snapshot","items":[...],
+/// The first record is always `{"type":"snapshot","processes":[...],
 /// "startup_complete":bool}` — the full current state, so a client that
 /// connects (or reconnects) starts consistent instead of stale-until-the-
 /// next-event. Existing consumers that switch on `type` ignore it.
@@ -165,7 +168,7 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
     let snapshot = state.state.snapshot();
     let preamble = serde_json::json!({
         "type": "snapshot",
-        "items": snapshot.items,
+        "processes": snapshot.processes,
         "startup_complete": snapshot.startup_complete,
     });
 
@@ -182,7 +185,7 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
         }
         loop {
             let value = tokio::select! {
-                item = events_rx.recv() => match item {
+                process = events_rx.recv() => match process {
                     Ok(event) => serde_json::to_value(&event).unwrap_or_else(|_| {
                         serde_json::json!({ "type": "error", "message": "event serialization failed" })
                     }),
@@ -232,7 +235,7 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
     }
 }
 
-/// `GET /watch` — global file-watch state (inotify dirs + per-item patterns).
+/// `GET /watch` — global file-watch state (inotify dirs + per-process patterns).
 async fn get_watch(State(state): State<Arc<ApiState>>) -> Response {
     let (tx, rx) = oneshot::channel();
     if state
@@ -377,11 +380,11 @@ async fn get_logs(
 }
 
 /// `GET /logs?follow=true` — stream the merged, formatted log stream: every
-/// item plus `[don]` lifecycle events, in arrival order, exactly what the
+/// process plus `[don]` lifecycle events, in arrival order, exactly what the
 /// terminal sees. NDJSON, one record per line:
 ///
 /// - `{"name":"api","lifecycle":false,"line":"..."}` — a log line. `name`
-///   is the owning item; `lifecycle` is true for `[don]` events. `line` is
+///   is the owning process; `lifecycle` is true for `[don]` events. `line` is
 ///   the formatted bytes (ANSI colors included) as lossy UTF-8, no trailing
 ///   newline.
 /// - `{"lagged":n}` — this follower fell `n` lines behind and they are
@@ -435,7 +438,7 @@ async fn get_all_logs(
         }
         loop {
             let chunk = tokio::select! {
-                item = tap.recv() => match item {
+                process = tap.recv() => match process {
                     Ok(line) => {
                         // Already sent in the preload — the subscription
                         // opened before the snapshot, so the overlap window
@@ -797,14 +800,14 @@ mod tests {
 
     fn snapshot() -> StateSnapshot {
         StateSnapshot {
-            items: vec![
-                ItemStatus::Service {
+            processes: vec![
+                ProcessStatus::Service {
                     name: "api".to_string(),
                     state: ServiceState::Ready,
                     failed_dependencies: Vec::new(),
                     verbose: None,
                 },
-                ItemStatus::Service {
+                ProcessStatus::Service {
                     name: "web".to_string(),
                     state: ServiceState::Starting,
                     failed_dependencies: Vec::new(),
@@ -824,34 +827,34 @@ mod tests {
             name: &'static str,
             uri: &'static str,
             want_status: StatusCode,
-            /// Item names expected in `items`, in order. Empty for `/ready`.
-            want_items: Vec<&'static str>,
+            /// Process names expected in `processes`, in order. Empty for `/ready`.
+            want_processes: Vec<&'static str>,
         }
 
         let cases = vec![
             Case {
-                name: "status lists every item",
+                name: "status lists every process",
                 uri: "/status",
                 want_status: StatusCode::OK,
-                want_items: vec!["api", "web"],
+                want_processes: vec!["api", "web"],
             },
             Case {
                 name: "status filters by name",
                 uri: "/status?name=web",
                 want_status: StatusCode::OK,
-                want_items: vec!["web"],
+                want_processes: vec!["web"],
             },
             Case {
                 name: "an unknown name is an empty list, not an error",
                 uri: "/status?name=nope",
                 want_status: StatusCode::OK,
-                want_items: vec![],
+                want_processes: vec![],
             },
             Case {
                 name: "ready reports the startup flag",
                 uri: "/ready",
                 want_status: StatusCode::OK,
-                want_items: vec![],
+                want_processes: vec![],
             },
             // Verbose still needs the runner — it resolves ready checks and
             // queries the watch manager, neither of which is in the snapshot.
@@ -859,7 +862,7 @@ mod tests {
                 name: "verbose status still goes through the runner",
                 uri: "/status?verbose=true",
                 want_status: StatusCode::SERVICE_UNAVAILABLE,
-                want_items: vec![],
+                want_processes: vec![],
             },
         ];
 
@@ -868,13 +871,13 @@ mod tests {
             let (status, body) = get(router_without_a_runner(reader), case.uri).await;
             assert_eq!(status, case.want_status, "{}: status code", case.name);
             if case.want_status == StatusCode::OK && case.uri.starts_with("/status") {
-                let names: Vec<&str> = body["items"]
+                let names: Vec<&str> = body["processes"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|item| item["name"].as_str().unwrap())
+                    .map(|process| process["name"].as_str().unwrap())
                     .collect();
-                assert_eq!(names, case.want_items, "{}: items", case.name);
+                assert_eq!(names, case.want_processes, "{}: processes", case.name);
             }
             if case.uri == "/ready" {
                 assert_eq!(body["startup_complete"], true, "{}: flag", case.name);
@@ -891,9 +894,9 @@ mod tests {
         let router = router_without_a_runner(reader);
 
         let (_, before) = get(router.clone(), "/status?name=web").await;
-        assert_eq!(before["items"][0]["state"], "starting");
+        assert_eq!(before["processes"][0]["state"], "starting");
 
-        writer.publish_items(vec![ItemStatus::Service {
+        writer.publish_processes(vec![ProcessStatus::Service {
             name: "web".to_string(),
             state: ServiceState::Ready,
             failed_dependencies: Vec::new(),
@@ -901,6 +904,6 @@ mod tests {
         }]);
 
         let (_, after) = get(router, "/status?name=web").await;
-        assert_eq!(after["items"][0]["state"], "ready");
+        assert_eq!(after["processes"][0]["state"], "ready");
     }
 }

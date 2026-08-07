@@ -20,7 +20,7 @@
 //!
 //! # What goes in the snapshot
 //!
-//! Only the cheap projection: the non-verbose [`ItemStatus`] values, plus
+//! Only the cheap projection: the non-verbose [`ProcessStatus`] values, plus
 //! whether the initial startup sweep has finished. Verbose status stays a
 //! command — it needs a round trip to the watch manager and a ready-check
 //! resolution per service, which must not run on every state transition.
@@ -33,7 +33,7 @@
 //! every writer. Returning an `Arc` makes that unrepresentable instead of
 //! documenting against it.
 
-use super::ItemStatus;
+use super::ProcessStatus;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -45,11 +45,11 @@ use tokio::sync::watch;
 pub struct StateSnapshot {
     /// Every active service and task with its current state, in the same shape
     /// and order `GET /status` returns for a non-verbose query.
-    pub items: Vec<ItemStatus>,
-    /// Whether the runner's initial startup sweep has decided every item.
+    pub processes: Vec<ProcessStatus>,
+    /// Whether the runner's initial startup sweep has decided every process.
     ///
     /// `false` until then. Callers that need the runner's answer *about an
-    /// item* — rather than its answer about what it is currently doing —
+    /// process* — rather than its answer about what it is currently doing —
     /// should wait for `true` first.
     pub startup_complete: bool,
 }
@@ -65,27 +65,27 @@ pub(crate) struct StateWriter {
 }
 
 impl StateWriter {
-    /// Replace the published item list, preserving `startup_complete`.
-    pub(crate) fn publish_items(&self, items: Vec<ItemStatus>) {
+    /// Replace the published process list, preserving `startup_complete`.
+    pub(crate) fn publish_processes(&self, processes: Vec<ProcessStatus>) {
         // Read and drop the borrow before sending: holding a `Ref` across
         // `send_replace` would deadlock against its own write lock.
         let startup_complete = self.tx.borrow().startup_complete;
         self.tx.send_replace(Arc::new(StateSnapshot {
-            items,
+            processes,
             startup_complete,
         }));
     }
 
-    /// Mark the initial startup sweep as finished (or not), preserving items.
+    /// Mark the initial startup sweep as finished (or not), preserving processes.
     pub(crate) fn set_startup_complete(&self, startup_complete: bool) {
         let current = self.tx.borrow();
         if current.startup_complete == startup_complete {
             return;
         }
-        let items = current.items.clone();
+        let processes = current.processes.clone();
         drop(current);
         self.tx.send_replace(Arc::new(StateSnapshot {
-            items,
+            processes,
             startup_complete,
         }));
     }
@@ -123,7 +123,7 @@ impl StateReader {
         Some(self.rx.borrow_and_update().clone())
     }
 
-    /// Wait until the runner's initial startup sweep has decided every item.
+    /// Wait until the runner's initial startup sweep has decided every process.
     ///
     /// Returns `false` if the runner went away first. Await this from your own
     /// task — never from the runner's command loop, which is what would have
@@ -153,8 +153,8 @@ mod tests {
     use super::*;
     use crate::runner::ServiceState;
 
-    fn service(name: &str, state: ServiceState) -> ItemStatus {
-        ItemStatus::Service {
+    fn service(name: &str, state: ServiceState) -> ProcessStatus {
+        ProcessStatus::Service {
             name: name.to_string(),
             state,
             failed_dependencies: Vec::new(),
@@ -163,8 +163,8 @@ mod tests {
     }
 
     fn state_of(snapshot: &StateSnapshot, want: &str) -> Option<ServiceState> {
-        snapshot.items.iter().find_map(|item| match item {
-            ItemStatus::Service { name, state, .. } if name == want => Some(*state),
+        snapshot.processes.iter().find_map(|process| match process {
+            ProcessStatus::Service { name, state, .. } if name == want => Some(*state),
             _ => None,
         })
     }
@@ -173,13 +173,13 @@ mod tests {
     fn publish_and_startup_flag_are_independent() {
         struct Case {
             name: &'static str,
-            /// Each step either publishes items or sets the startup flag.
+            /// Each step either publishes processes or sets the startup flag.
             steps: Vec<Step>,
             want_state: Option<ServiceState>,
             want_startup_complete: bool,
         }
         enum Step {
-            Items(Vec<ItemStatus>),
+            Processes(Vec<ProcessStatus>),
             Startup(bool),
         }
 
@@ -191,15 +191,18 @@ mod tests {
                 want_startup_complete: false,
             },
             Case {
-                name: "publishing items leaves the startup flag alone",
-                steps: vec![Step::Items(vec![service("api", ServiceState::Starting)])],
+                name: "publishing processes leaves the startup flag alone",
+                steps: vec![Step::Processes(vec![service(
+                    "api",
+                    ServiceState::Starting,
+                )])],
                 want_state: Some(ServiceState::Starting),
                 want_startup_complete: false,
             },
             Case {
-                name: "setting the startup flag preserves items",
+                name: "setting the startup flag preserves processes",
                 steps: vec![
-                    Step::Items(vec![service("api", ServiceState::Ready)]),
+                    Step::Processes(vec![service("api", ServiceState::Ready)]),
                     Step::Startup(true),
                 ],
                 want_state: Some(ServiceState::Ready),
@@ -209,7 +212,7 @@ mod tests {
                 name: "publishing after settling preserves the startup flag",
                 steps: vec![
                     Step::Startup(true),
-                    Step::Items(vec![service("api", ServiceState::Stopped)]),
+                    Step::Processes(vec![service("api", ServiceState::Stopped)]),
                 ],
                 want_state: Some(ServiceState::Stopped),
                 want_startup_complete: true,
@@ -217,8 +220,8 @@ mod tests {
             Case {
                 name: "later publishes win",
                 steps: vec![
-                    Step::Items(vec![service("api", ServiceState::Starting)]),
-                    Step::Items(vec![service("api", ServiceState::Ready)]),
+                    Step::Processes(vec![service("api", ServiceState::Starting)]),
+                    Step::Processes(vec![service("api", ServiceState::Ready)]),
                 ],
                 want_state: Some(ServiceState::Ready),
                 want_startup_complete: false,
@@ -229,7 +232,7 @@ mod tests {
             let (writer, reader) = channel(StateSnapshot::default());
             for step in case.steps {
                 match step {
-                    Step::Items(items) => writer.publish_items(items),
+                    Step::Processes(processes) => writer.publish_processes(processes),
                     Step::Startup(value) => writer.set_startup_complete(value),
                 }
             }
@@ -251,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn readers_see_updates_published_before_they_subscribed() {
         let (writer, _reader) = channel(StateSnapshot::default());
-        writer.publish_items(vec![service("api", ServiceState::Ready)]);
+        writer.publish_processes(vec![service("api", ServiceState::Ready)]);
         // A reader created after the fact still starts from current state,
         // which is what makes `snapshot()` safe to call at any point in a
         // component's lifetime.
@@ -267,7 +270,7 @@ mod tests {
         // that never catches up.
         let (writer, reader) = channel(StateSnapshot::default());
         drop(reader);
-        writer.publish_items(vec![service("api", ServiceState::Failed)]);
+        writer.publish_processes(vec![service("api", ServiceState::Failed)]);
         writer.set_startup_complete(true);
 
         let fresh = writer.reader();
@@ -279,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn changed_wakes_on_publish_and_ends_when_the_writer_drops() {
         let (writer, mut reader) = channel(StateSnapshot::default());
-        writer.publish_items(vec![service("api", ServiceState::Starting)]);
+        writer.publish_processes(vec![service("api", ServiceState::Starting)]);
         let snapshot = reader.changed().await.expect("a published snapshot");
         assert_eq!(state_of(&snapshot, "api"), Some(ServiceState::Starting));
 

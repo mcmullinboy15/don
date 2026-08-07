@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { Item, RunnerEvent } from "./types";
+import type { Process, RunnerEvent } from "./types";
 
 /**
  * Subscribe to an SSE endpoint, calling `onMessage` for each parsed payload.
@@ -35,7 +35,7 @@ export function useEventSource<T>(
 }
 
 export interface StatusState {
-  items: Item[];
+  processes: Process[];
   loading: boolean;
   error: string | null;
   refresh: () => void;
@@ -50,7 +50,7 @@ export interface StatusState {
  * refetch instead of being patched in.
  */
 export function useStatus(projectId: string | null): StatusState {
-  const [items, setItems] = useState<Item[]>([]);
+  const [processes, setProcesses] = useState<Process[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -59,7 +59,7 @@ export function useStatus(projectId: string | null): StatusState {
     api
       .status(projectId)
       .then((next) => {
-        setItems(next);
+        setProcesses(next);
         setError(null);
       })
       .catch((e: Error) => setError(e.message))
@@ -76,25 +76,25 @@ export function useStatus(projectId: string | null): StatusState {
       switch (event.type) {
         case "service_state_changed":
         case "task_state_changed":
-          setItems((current) =>
-            current.map((item) => {
-              if (item.name !== event.name) return item;
-              if (item.kind === "service" && event.type === "service_state_changed") {
+          setProcesses((current) =>
+            current.map((process) => {
+              if (process.name !== event.name) return process;
+              if (process.kind === "service" && event.type === "service_state_changed") {
                 return {
-                  ...item,
+                  ...process,
                   state: event.state,
                   failed_dependencies: event.failed_dependencies,
                 };
               }
-              if (item.kind === "task" && event.type === "task_state_changed") {
+              if (process.kind === "task" && event.type === "task_state_changed") {
                 return {
-                  ...item,
+                  ...process,
                   state: event.state,
-                  last_run: event.last_run ?? item.last_run,
+                  last_run: event.last_run ?? process.last_run,
                   failed_dependencies: event.failed_dependencies,
                 };
               }
-              return item;
+              return process;
             }),
           );
           break;
@@ -118,7 +118,7 @@ export function useStatus(projectId: string | null): StatusState {
     onEvent,
   );
 
-  return { items, loading, error, refresh };
+  return { processes, loading, error, refresh };
 }
 
 /** The current route, derived from the URL hash. */

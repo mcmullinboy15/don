@@ -1,4 +1,4 @@
-//! The item state vocabulary — what a service or task can be, shared by
+//! The process state vocabulary — what a service or task can be, shared by
 //! the supervisors that produce transitions and the scheduler that folds
 //! them. Re-exported from `crate::runner` for the public API.
 
@@ -74,7 +74,7 @@ impl ServiceState {
                 | (Self::Stopped, Self::Pending)
                 | (Self::Failed, Self::Pending)
                 | (Self::DependencyFailed, Self::Pending)
-                // A pending item gets marked DependencyFailed when a dep blew up.
+                // A pending process gets marked DependencyFailed when a dep blew up.
                 | (Self::Pending, Self::DependencyFailed)
         )
     }
@@ -83,7 +83,7 @@ impl ServiceState {
 /// The state of a task in the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskItemState {
+pub enum TaskState {
     Pending,
     /// Waiting on the startup-phase batch build. Transitions to Pending on
     /// success or Failed on build error.
@@ -100,9 +100,9 @@ pub enum TaskItemState {
     PendingRun,
 }
 
-/// An item in the dependency graph — either a service or a task.
+/// An process in the dependency graph — either a service or a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeKind {
+pub(crate) enum ProcessKind {
     Service,
     Task,
 }

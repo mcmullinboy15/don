@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use don::TaskRunInfo;
 use don::client::{Client, ClientError, RunTaskOptions};
-use don::runner::{ItemStatus, ServiceState, TaskItemState};
+use don::runner::{ProcessStatus, ServiceState, TaskState};
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -143,7 +143,7 @@ enum Commands {
         /// Emit machine-readable JSON instead of the table: an object with a
         /// top-level `ready` bool (true when every service is Ready or Lazy),
         /// a `tasks_pending_run` count (tasks parked awaiting a manual run —
-        /// the headless equivalent of the TUI's `*` flag), and an `items`
+        /// the headless equivalent of the TUI's `*` flag), and an `processes`
         /// array. Useful for scripts and agents polling for stack readiness.
         #[arg(long)]
         json: bool,
@@ -155,7 +155,7 @@ enum Commands {
         json: bool,
     },
     /// Show everything don is currently watching: the inotify directories it has
-    /// registered plus the per-item glob patterns that trigger reloads. Useful
+    /// registered plus the per-process glob patterns that trigger reloads. Useful
     /// for confirming a file actually falls under a watch — especially for
     /// build-tool services whose paths are resolved dynamically.
     Watch {
@@ -239,7 +239,7 @@ enum Commands {
     /// Internal: list names for shell completion scripts. Hidden from help.
     #[command(name = "__complete", hide = true)]
     Complete {
-        /// One of: services, tasks, items, profiles
+        /// One of: services, tasks, processes, profiles
         kind: String,
     },
 }
@@ -1150,17 +1150,17 @@ async fn wait_for_daemon_socket_gone(
 async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json: bool) -> i32 {
     let client = client_for(config_path);
     match client.status(verbose, name).await {
-        Ok(mut items) => {
+        Ok(mut processes) => {
             // A named query is filtered server-side; an empty result means the
             // name didn't match anything. Fetch the full list to offer a
             // did-you-mean before failing.
             if let Some(name) = name
-                && items.is_empty()
+                && processes.is_empty()
             {
                 let suggestion = match client.status(false, None).await {
                     Ok(all) => {
                         let available: std::collections::HashSet<&str> =
-                            all.iter().map(item_name).collect();
+                            all.iter().map(process_name).collect();
                         suggest_name_typo(name, &available)
                     }
                     Err(_) => String::new(),
@@ -1168,22 +1168,22 @@ async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json:
                 errln(format!("no service or task named '{name}'{suggestion}"));
                 return 1;
             }
-            items.sort_by(|a, b| {
+            processes.sort_by(|a, b| {
                 status_sort_bucket(a)
                     .cmp(&status_sort_bucket(b))
-                    .then_with(|| item_name(a).cmp(item_name(b)))
+                    .then_with(|| process_name(a).cmp(process_name(b)))
             });
             if json {
                 #[derive(serde::Serialize)]
                 struct StatusJson<'a> {
                     ready: bool,
                     tasks_pending_run: usize,
-                    items: &'a [ItemStatus],
+                    processes: &'a [ProcessStatus],
                 }
                 let payload = StatusJson {
-                    ready: don::runner::all_services_ready(&items),
-                    tasks_pending_run: count_tasks_pending_run(&items),
-                    items: &items,
+                    ready: don::runner::all_services_ready(&processes),
+                    tasks_pending_run: count_tasks_pending_run(&processes),
+                    processes: &processes,
                 };
                 return match serde_json::to_string_pretty(&payload) {
                     Ok(s) => {
@@ -1196,7 +1196,7 @@ async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json:
                     }
                 };
             }
-            print_status_table(&items, verbose, name.is_some());
+            print_status_table(&processes, verbose, name.is_some());
             0
         }
         Err(e) => {
@@ -1330,9 +1330,9 @@ fn print_watch_report(report: &don::WatchReport) {
 /// last. Putting `DependencyFailed` *below* `Failed` surfaces the actual
 /// culprit — the thing the user needs to look at — above everything that
 /// merely got stranded.
-fn status_sort_bucket(item: &ItemStatus) -> u8 {
+fn status_sort_bucket(item: &ProcessStatus) -> u8 {
     match item {
-        ItemStatus::Service { state, .. } => match state {
+        ProcessStatus::Service { state, .. } => match state {
             ServiceState::Failed | ServiceState::Unhealthy => 0,
             ServiceState::DependencyFailed => 1,
             ServiceState::Pending | ServiceState::Building | ServiceState::Starting => 2,
@@ -1342,33 +1342,33 @@ fn status_sort_bucket(item: &ItemStatus) -> u8 {
             ServiceState::Stopped => 6,
             ServiceState::Lazy => 7,
         },
-        ItemStatus::Task { state, .. } => match state {
-            TaskItemState::Failed => 0,
-            TaskItemState::DependencyFailed => 1,
-            TaskItemState::Pending | TaskItemState::Building | TaskItemState::Running => 2,
-            TaskItemState::PendingRun => 7,
-            TaskItemState::Completed => 8,
-            TaskItemState::Skipped => 9,
+        ProcessStatus::Task { state, .. } => match state {
+            TaskState::Failed => 0,
+            TaskState::DependencyFailed => 1,
+            TaskState::Pending | TaskState::Building | TaskState::Running => 2,
+            TaskState::PendingRun => 7,
+            TaskState::Completed => 8,
+            TaskState::Skipped => 9,
         },
     }
 }
 
-fn item_name(item: &ItemStatus) -> &str {
+fn process_name(item: &ProcessStatus) -> &str {
     match item {
-        ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name.as_str(),
+        ProcessStatus::Service { name, .. } | ProcessStatus::Task { name, .. } => name.as_str(),
     }
 }
 
 /// Count tasks parked in `PendingRun` — maintenance work awaiting a manual run.
 /// Mirrors the TUI's `*` flag so headless `--json` callers can detect it.
-fn count_tasks_pending_run(items: &[ItemStatus]) -> usize {
-    items
+fn count_tasks_pending_run(processes: &[ProcessStatus]) -> usize {
+    processes
         .iter()
-        .filter(|item| {
+        .filter(|process| {
             matches!(
-                item,
-                ItemStatus::Task {
-                    state: TaskItemState::PendingRun,
+                process,
+                ProcessStatus::Task {
+                    state: TaskState::PendingRun,
                     ..
                 }
             )
@@ -1566,7 +1566,7 @@ fn should_auto_attach(config_path: &Path, no_tui: bool) -> bool {
 
 /// `don tui` — attach the full TUI to an already-running project.
 ///
-/// A pure client of the socket API: the item set comes from `GET /status`
+/// A pure client of the socket API: the process set comes from `GET /status`
 /// (which doubles as the "is anything running?" check, answered before the
 /// terminal is touched), logs from the merged follow with history preload,
 /// events from `GET /events` (whose snapshot preamble makes the view
@@ -1601,19 +1601,19 @@ async fn attach_tui_inner(
     let base = base_dir(config_path);
     let client = Client::new(&base);
 
-    // Authoritative item set from the runner. Everything below intersects
-    // against it, so profile filtering and config drift can't invent items
+    // Authoritative process set from the runner. Everything below intersects
+    // against it, so profile filtering and config drift can't invent processes
     // the runner doesn't have.
-    let items = client
+    let processes = client
         .status(false, None)
         .await
         .map_err(|e| format!("cannot attach: {e}"))?;
     let mut service_names: Vec<String> = Vec::new();
     let mut task_names: Vec<String> = Vec::new();
-    for item in &items {
-        match item {
-            don::client::ItemStatus::Service { name, .. } => service_names.push(name.clone()),
-            don::client::ItemStatus::Task { name, .. } => task_names.push(name.clone()),
+    for process in &processes {
+        match process {
+            don::client::ProcessStatus::Service { name, .. } => service_names.push(name.clone()),
+            don::client::ProcessStatus::Task { name, .. } => task_names.push(name.clone()),
         }
     }
     let active: std::collections::HashSet<&String> =
@@ -1682,7 +1682,7 @@ async fn attach_tui_inner(
         Vec::new()
     };
 
-    let task_state = don::TaskState::new(base.join(".don").join("task-state"));
+    let task_state = don::TaskStateStore::new(base.join(".don").join("task-state"));
     let mut task_last_runs = std::collections::HashMap::new();
     for name in &task_names {
         if let Ok(Some(last_run)) = task_state.last_run(name).await {
@@ -1828,36 +1828,38 @@ async fn run_attach(config_path: &Path, name: &str) -> i32 {
     }
 }
 
-fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: bool) {
-    if items.is_empty() {
+fn print_status_table(processes: &[ProcessStatus], verbose: bool, show_watch_paths: bool) {
+    if processes.is_empty() {
         println!("(no services or tasks)");
         return;
     }
     // Compute column widths.
     let kind_w = "KIND".len().max(
-        items
+        processes
             .iter()
             .map(|i| match i {
-                ItemStatus::Service { .. } => "service".len(),
-                ItemStatus::Task { .. } => "task".len(),
+                ProcessStatus::Service { .. } => "service".len(),
+                ProcessStatus::Task { .. } => "task".len(),
             })
             .max()
             .unwrap_or(0),
     );
     let name_w = "NAME".len().max(
-        items
+        processes
             .iter()
             .map(|i| match i {
-                ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name.len(),
+                ProcessStatus::Service { name, .. } | ProcessStatus::Task { name, .. } => {
+                    name.len()
+                }
             })
             .max()
             .unwrap_or(0),
     );
 
     let state_w = "STATE".len().max(
-        items
+        processes
             .iter()
-            .map(item_state_label)
+            .map(process_state_label)
             .map(|label| label.len())
             .max()
             .unwrap_or(0),
@@ -1867,9 +1869,10 @@ fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: boo
         "{:<kind_w$}  {:<name_w$}  {:<state_w$}  LAST RUN  RESULT  DURATION",
         "KIND", "NAME", "STATE"
     );
-    for item in items {
-        let (kind, name, state_str, color, last_run, result, duration, verbose_info) = match item {
-            ItemStatus::Service {
+    for process in processes {
+        let (kind, name, state_str, color, last_run, result, duration, verbose_info) = match process
+        {
+            ProcessStatus::Service {
                 name,
                 state,
                 failed_dependencies,
@@ -1884,7 +1887,7 @@ fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: boo
                 "-".to_string(),
                 verbose.as_ref(),
             ),
-            ItemStatus::Task {
+            ProcessStatus::Task {
                 name,
                 state,
                 failed_dependencies,
@@ -1972,7 +1975,7 @@ fn format_duration_ms(duration_ms: u64) -> String {
     }
 }
 
-/// Print verbose details for a single item, indented under the status line.
+/// Print verbose details for a single process, indented under the status line.
 #[allow(clippy::print_stdout)]
 fn print_verbose_info(info: &don::runner::VerboseInfo, show_watch_paths: bool) {
     let dim = SetAttribute(Attribute::Dim);
@@ -2000,9 +2003,9 @@ fn print_verbose_info(info: &don::runner::VerboseInfo, show_watch_paths: bool) {
     if let Some(ref target) = info.bazel_target {
         println!("  {dim}bazel:{reset}  {target}");
     }
-    // When inspecting a single item, expand the full resolved watch path list
+    // When inspecting a single process, expand the full resolved watch path list
     // (these are dynamically resolved for build-tool services, so the count
-    // alone hides what's actually being watched). In the all-items view keep it
+    // alone hides what's actually being watched). In the all-processes view keep it
     // to a count so a large stack stays scannable.
     if show_watch_paths && !info.watch.is_empty() {
         println!(
@@ -2059,37 +2062,37 @@ fn service_state_color(s: ServiceState) -> Color {
     }
 }
 
-fn task_state_label(s: TaskItemState) -> &'static str {
+fn task_state_label(s: TaskState) -> &'static str {
     match s {
-        TaskItemState::Pending => "pending",
-        TaskItemState::Building => "building",
-        TaskItemState::Running => "running",
-        TaskItemState::Completed => "completed",
-        TaskItemState::Skipped => "skipped",
-        TaskItemState::Failed => "failed",
-        TaskItemState::DependencyFailed => "dep failed",
-        TaskItemState::PendingRun => "pending_run",
+        TaskState::Pending => "pending",
+        TaskState::Building => "building",
+        TaskState::Running => "running",
+        TaskState::Completed => "completed",
+        TaskState::Skipped => "skipped",
+        TaskState::Failed => "failed",
+        TaskState::DependencyFailed => "dep failed",
+        TaskState::PendingRun => "pending_run",
     }
 }
 
-fn task_state_color(s: TaskItemState) -> Color {
+fn task_state_color(s: TaskState) -> Color {
     match s {
-        TaskItemState::Completed | TaskItemState::Skipped => Color::Green,
-        TaskItemState::Running | TaskItemState::Pending | TaskItemState::Building => Color::Yellow,
-        TaskItemState::PendingRun => Color::Cyan,
-        TaskItemState::Failed => Color::Red,
-        TaskItemState::DependencyFailed => Color::DarkRed,
+        TaskState::Completed | TaskState::Skipped => Color::Green,
+        TaskState::Running | TaskState::Pending | TaskState::Building => Color::Yellow,
+        TaskState::PendingRun => Color::Cyan,
+        TaskState::Failed => Color::Red,
+        TaskState::DependencyFailed => Color::DarkRed,
     }
 }
 
-fn item_state_label(item: &ItemStatus) -> Cow<'static, str> {
-    match item {
-        ItemStatus::Service {
+fn process_state_label(process: &ProcessStatus) -> Cow<'static, str> {
+    match process {
+        ProcessStatus::Service {
             state,
             failed_dependencies,
             ..
         } => state_label(service_state_label(*state), failed_dependencies),
-        ItemStatus::Task {
+        ProcessStatus::Task {
             state,
             failed_dependencies,
             ..
@@ -2112,40 +2115,40 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
 
     // Acquire the PID file lock so we don't race with a running daemon.
     let don_pid_path = don_dir.join("don.pid");
-    let pid_lock = match don::sys::pid_file::PidFile::acquire(
-        don_pid_path.clone(),
-        std::process::id() as i32,
-    )
-    .await
-    {
-        Ok(lock) => lock,
-        Err(don::sys::pid_file::PidFileError::AlreadyLocked) => {
-            if !force {
-                println!("don daemon is running — nothing to clean up (use --force to kill it)");
-                return 0;
-            }
-            // --force: read the running daemon's PID and kill it.
-            errln("killing running don daemon...");
-            if let Err(e) = kill_running_daemon(&don_pid_path).await {
-                errln(format!("failed to kill daemon: {e}"));
-                return 1;
-            }
-            // Now re-acquire the lock.
-            match don::sys::pid_file::PidFile::acquire(don_pid_path, std::process::id() as i32)
-                .await
-            {
-                Ok(lock) => lock,
-                Err(e) => {
-                    errln(format!("failed to acquire pid lock after kill: {e}"));
+    let pid_lock =
+        match don::sys::pid_file::PidFile::acquire(don_pid_path.clone(), std::process::id() as i32)
+            .await
+        {
+            Ok(lock) => lock,
+            Err(don::sys::pid_file::PidFileError::AlreadyLocked) => {
+                if !force {
+                    println!(
+                        "don daemon is running — nothing to clean up (use --force to kill it)"
+                    );
+                    return 0;
+                }
+                // --force: read the running daemon's PID and kill it.
+                errln("killing running don daemon...");
+                if let Err(e) = kill_running_daemon(&don_pid_path).await {
+                    errln(format!("failed to kill daemon: {e}"));
                     return 1;
                 }
+                // Now re-acquire the lock.
+                match don::sys::pid_file::PidFile::acquire(don_pid_path, std::process::id() as i32)
+                    .await
+                {
+                    Ok(lock) => lock,
+                    Err(e) => {
+                        errln(format!("failed to acquire pid lock after kill: {e}"));
+                        return 1;
+                    }
+                }
             }
-        }
-        Err(e) => {
-            errln(format!("failed to acquire pid lock: {e}"));
-            return 1;
-        }
-    };
+            Err(e) => {
+                errln(format!("failed to acquire pid lock: {e}"));
+                return 1;
+            }
+        };
 
     // Load config to discover docker container names. If config doesn't
     // exist or is invalid, still clean up what we can (pid files and socket).
@@ -2518,23 +2521,23 @@ async fn run_start(
         .or_else(|| config.default_profile.clone());
     let profile_ref: Option<&str> = profile.as_deref();
 
-    // Resolve the active item set up front so the output manager and TUI
-    // only see items that will actually run. Without this, prefix padding
+    // Resolve the active process set up front so the output manager and TUI
+    // only see processes that will actually run. Without this, prefix padding
     // is sized for the longest name in the whole config, and the TUI
-    // service menu lists items the profile excludes. The runner re-runs
+    // service menu lists processes the profile excludes. The runner re-runs
     // this inside `Runner::new` to build its own filtered state.
-    let active_items: Option<std::collections::HashSet<String>> =
+    let active_processes: Option<std::collections::HashSet<String>> =
         if let Some(profile_name) = profile_ref {
             let prof = config
                 .profiles
                 .get(profile_name)
                 .ok_or_else(|| format!("Error: unknown profile '{profile_name}'"))?;
-            Some(don::runner::resolve_profile_items(&config, prof))
+            Some(don::runner::resolve_profile_processes(&config, prof))
         } else {
             None
         };
 
-    let is_active = |name: &str| active_items.as_ref().is_none_or(|s| s.contains(name));
+    let is_active = |name: &str| active_processes.as_ref().is_none_or(|s| s.contains(name));
     let has_foreground_tasks = config
         .tasks
         .iter()
@@ -2558,7 +2561,7 @@ async fn run_start(
 
     // Synthetic build-tool stream names should participate in the initial
     // output palette so color choice and prefix width depend only on the
-    // config-derived item set, not on later registration order.
+    // config-derived process set, not on later registration order.
     let service_kinds = || {
         config.services.values().flat_map(|svc| {
             std::iter::once(svc.kind.as_ref())
@@ -2601,7 +2604,7 @@ async fn run_start(
         }
     }
 
-    // Validate `--log-filter` against the active item set so typos surface
+    // Validate `--log-filter` against the active process set so typos surface
     // before the runner spawns anything. The synthetic `[don]` lifecycle
     // entry is implicitly allowed everywhere — `don::output` keeps it
     // visible regardless of the allowlist — so accepting "don" here is a
@@ -2707,7 +2710,7 @@ async fn run_start(
         // per-param completion requests.
         let task_configs: std::collections::HashMap<String, don::config::Task> =
             config.tasks.clone();
-        let task_state = don::TaskState::new(base.join(".don").join("task-state"));
+        let task_state = don::TaskStateStore::new(base.join(".don").join("task-state"));
         let mut task_last_runs = std::collections::HashMap::new();
         for name in &task_names {
             if let Ok(Some(last_run)) = task_state.last_run(name).await {
@@ -3053,10 +3056,12 @@ fn map_join_result<T>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{Cli, Commands, item_name, parse_task_args, split_run_flags, status_sort_bucket};
+    use super::{
+        Cli, Commands, parse_task_args, process_name, split_run_flags, status_sort_bucket,
+    };
     use clap::Parser;
     use don::config::{ParamKind, TaskParam};
-    use don::runner::{ItemStatus, ServiceState, TaskItemState};
+    use don::runner::{ProcessStatus, ServiceState, TaskState};
 
     fn p(name: &str) -> TaskParam {
         TaskParam {
@@ -3071,8 +3076,8 @@ mod tests {
         }
     }
 
-    fn service(name: &str, state: ServiceState) -> ItemStatus {
-        ItemStatus::Service {
+    fn service(name: &str, state: ServiceState) -> ProcessStatus {
+        ProcessStatus::Service {
             name: name.to_string(),
             state,
             failed_dependencies: Vec::new(),
@@ -3080,8 +3085,8 @@ mod tests {
         }
     }
 
-    fn task(name: &str, state: TaskItemState) -> ItemStatus {
-        ItemStatus::Task {
+    fn task(name: &str, state: TaskState) -> ProcessStatus {
+        ProcessStatus::Task {
             name: name.to_string(),
             state,
             failed_dependencies: Vec::new(),
@@ -3122,18 +3127,18 @@ mod tests {
 
     #[test]
     fn count_tasks_pending_run_counts_only_pending_tasks() {
-        let items = vec![
+        let processes = vec![
             service("svc-ready", ServiceState::Ready),
-            task("task-pending-a", TaskItemState::PendingRun),
-            task("task-pending-b", TaskItemState::PendingRun),
-            task("task-completed", TaskItemState::Completed),
-            task("task-failed", TaskItemState::Failed),
+            task("task-pending-a", TaskState::PendingRun),
+            task("task-pending-b", TaskState::PendingRun),
+            task("task-completed", TaskState::Completed),
+            task("task-failed", TaskState::Failed),
         ];
-        assert_eq!(super::count_tasks_pending_run(&items), 2);
+        assert_eq!(super::count_tasks_pending_run(&processes), 2);
 
         let none = vec![
             service("svc-ready", ServiceState::Ready),
-            task("task-completed", TaskItemState::Completed),
+            task("task-completed", TaskState::Completed),
         ];
         assert_eq!(super::count_tasks_pending_run(&none), 0);
 
@@ -3144,13 +3149,13 @@ mod tests {
     fn status_sort_prioritizes_actionable_states() {
         struct Case {
             name: &'static str,
-            items: Vec<ItemStatus>,
+            processes: Vec<ProcessStatus>,
             want: Vec<&'static str>,
         }
 
         let cases = vec![Case {
             name: "mixed services and tasks",
-            items: vec![
+            processes: vec![
                 service("svc-ready", ServiceState::Ready),
                 service("svc-building", ServiceState::Building),
                 service("svc-running", ServiceState::Running),
@@ -3159,12 +3164,12 @@ mod tests {
                 service("svc-failed", ServiceState::Failed),
                 service("svc-dep", ServiceState::DependencyFailed),
                 service("svc-stopping", ServiceState::Stopping),
-                task("task-skipped", TaskItemState::Skipped),
-                task("task-completed", TaskItemState::Completed),
-                task("task-building", TaskItemState::Building),
-                task("task-pending-run", TaskItemState::PendingRun),
-                task("task-failed", TaskItemState::Failed),
-                task("task-dep", TaskItemState::DependencyFailed),
+                task("task-skipped", TaskState::Skipped),
+                task("task-completed", TaskState::Completed),
+                task("task-building", TaskState::Building),
+                task("task-pending-run", TaskState::PendingRun),
+                task("task-failed", TaskState::Failed),
+                task("task-dep", TaskState::DependencyFailed),
             ],
             want: vec![
                 "svc-failed",
@@ -3185,12 +3190,12 @@ mod tests {
         }];
 
         for mut case in cases {
-            case.items.sort_by(|a, b| {
+            case.processes.sort_by(|a, b| {
                 status_sort_bucket(a)
                     .cmp(&status_sort_bucket(b))
-                    .then_with(|| item_name(a).cmp(item_name(b)))
+                    .then_with(|| process_name(a).cmp(process_name(b)))
             });
-            let got: Vec<&str> = case.items.iter().map(item_name).collect();
+            let got: Vec<&str> = case.processes.iter().map(process_name).collect();
             assert_eq!(got, case.want, "case: {}", case.name);
         }
     }

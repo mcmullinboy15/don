@@ -1,6 +1,6 @@
-//! Server-side terminal emulation for PTY-backed items.
+//! Server-side terminal emulation for PTY-backed processes.
 //!
-//! One screen per PTY-backed item, fed continuously from process start — a
+//! One screen per PTY-backed process, fed continuously from process start — a
 //! correct screen requires having seen the setup sequences, so feeding
 //! cannot begin lazily on attach. The PTY byte stream forks: raw chunks go
 //! here (the bridge view) and through the existing sanitize pipeline into
@@ -21,11 +21,11 @@ use tokio::sync::{mpsc, oneshot};
 
 /// What the emulator thread can be asked to do.
 pub(crate) enum EmulatorRequest {
-    /// (Re)create the screen for an item — a fresh spawn starts blank.
+    /// (Re)create the screen for a process — a fresh spawn starts blank.
     Register { name: String, cols: u16, rows: u16 },
-    /// Feed output bytes into the item's screen.
+    /// Feed output bytes into the process's screen.
     Feed { name: String, bytes: Vec<u8> },
-    /// Resize the item's grid.
+    /// Resize the process's grid.
     Resize { name: String, cols: u16, rows: u16 },
     /// Render the current grid as an ANSI repaint frame.
     Repaint {
@@ -34,7 +34,7 @@ pub(crate) enum EmulatorRequest {
     },
 }
 
-/// A coherent ANSI rendering of an item's current screen: clear, every row
+/// A coherent ANSI rendering of a process's current screen: clear, every row
 /// with its styles, then cursor position and visibility. Writing this to a
 /// blank terminal reproduces the grid.
 #[derive(Debug, Clone)]
@@ -50,7 +50,7 @@ pub struct EmulatorHandle {
 }
 
 impl EmulatorHandle {
-    /// (Re)register an item's screen at the given size.
+    /// (Re)register a process's screen at the given size.
     pub(crate) fn register(&self, name: &str, cols: u16, rows: u16) {
         let _ = self.tx.send(EmulatorRequest::Register {
             name: name.to_string(),
@@ -59,7 +59,7 @@ impl EmulatorHandle {
         });
     }
 
-    /// Resize an item's screen.
+    /// Resize a process's screen.
     pub(crate) fn resize(&self, name: &str, cols: u16, rows: u16) {
         let _ = self.tx.send(EmulatorRequest::Resize {
             name: name.to_string(),
@@ -68,7 +68,7 @@ impl EmulatorHandle {
         });
     }
 
-    /// Render an item's current screen. `None` when the item has no screen
+    /// Render a process's current screen. `None` when the process has no screen
     /// (never registered, or the emulator backend failed) or the thread is
     /// gone.
     pub(crate) async fn repaint(&self, name: &str) -> Option<RepaintFrame> {
@@ -82,7 +82,7 @@ impl EmulatorHandle {
         reply_rx.await.ok().flatten()
     }
 
-    /// The raw feed sender, for wiring into an item's sink list.
+    /// The raw feed sender, for wiring into a process's sink list.
     pub(crate) fn feed_sender(&self) -> mpsc::UnboundedSender<EmulatorRequest> {
         self.tx.clone()
     }

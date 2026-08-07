@@ -6,12 +6,12 @@
 //! report channel, is what deleted the old generation counters: a
 //! completion can only arrive after its own prepared report and before
 //! anything a later run produces. What remains in `task_commands` is the
-//! part only the runner may do: transition item state, which drives the
-//! cross-item dependency scheduler.
+//! part only the runner may do: transition process state, which drives the
+//! cross-process dependency scheduler.
 
 use super::TaskExit;
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use crate::task_state::{TaskRunInfo, TaskState};
+use crate::task_state::{TaskRunInfo, TaskStateStore};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,8 +58,8 @@ pub(crate) enum TaskRunReport {
 pub(crate) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     ctx: &super::task_worker::TaskWorkerContext,
-    outputs: &dyn Fn(&str) -> Option<crate::output::ItemOutput>,
-    report_tx: &mpsc::UnboundedSender<super::ItemReport>,
+    outputs: &dyn Fn(&str) -> Option<crate::output::ProcessOutput>,
+    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
 ) -> TaskSupervisors {
     TaskSupervisors::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
@@ -79,8 +79,8 @@ async fn supervise(
     name: String,
     mut rx: mpsc::UnboundedReceiver<RunRequest>,
     ctx: super::task_worker::TaskWorkerContext,
-    output: Option<crate::output::ItemOutput>,
-    report_tx: mpsc::UnboundedSender<super::ItemReport>,
+    output: Option<crate::output::ProcessOutput>,
+    report_tx: mpsc::UnboundedSender<super::ProcessReport>,
     busy: Arc<AtomicBool>,
 ) {
     let service_writer = output.as_ref().map(|output| output.writer());
@@ -155,7 +155,7 @@ async fn supervise(
                 None,
             ),
             Ok(super::task_worker::TaskRunPrepared::Spawned(spawn)) => {
-                let super::task_process::TaskSpawn {
+                let super::task::TaskSpawn {
                     mut handle,
                     child_output,
                     rendered_cmdline,
@@ -210,7 +210,7 @@ async fn supervise(
         });
 
         if report_tx
-            .send(super::ItemReport::TaskRunPrepared {
+            .send(super::ProcessReport::TaskRunPrepared {
                 name: name.clone(),
                 task_cfg: task_cfg.clone(),
                 intent,
@@ -231,7 +231,7 @@ async fn supervise(
         let Some(outcome) = outcome else { continue };
         let timeout = task_cfg.timeout.clone();
         let start = std::time::Instant::now();
-        let wait = super::task_process::wait_for_task(&mut handle, timeout.as_deref());
+        let wait = super::task::wait_for_task(&mut handle, timeout.as_deref());
         tokio::pin!(wait);
         let result = loop {
             tokio::select! {
@@ -287,7 +287,7 @@ pub(crate) enum Report {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoSpawnOutcome {
     /// Lifecycle state the task enters.
-    pub(crate) state: super::TaskItemState,
+    pub(crate) state: super::TaskState,
     /// What the dependency scheduler is told. A skipped or deferred task is
     /// still a *success* — it didn't fail, it just didn't run.
     pub(crate) success: bool,
@@ -299,7 +299,7 @@ impl NoSpawnOutcome {
     /// The task can't run yet and is waiting on something.
     pub(crate) fn pending_run(message: String) -> Self {
         Self {
-            state: super::TaskItemState::PendingRun,
+            state: super::TaskState::PendingRun,
             success: true,
             message,
             report: Report::Info,
@@ -309,7 +309,7 @@ impl NoSpawnOutcome {
     /// The task's watched inputs were unchanged, so it didn't need to run.
     pub(crate) fn skipped(message: String) -> Self {
         Self {
-            state: super::TaskItemState::Skipped,
+            state: super::TaskState::Skipped,
             success: true,
             message,
             report: Report::Debug,
@@ -319,7 +319,7 @@ impl NoSpawnOutcome {
     /// Preparing the run failed before anything was spawned.
     pub(crate) fn failed(message: String) -> Self {
         Self {
-            state: super::TaskItemState::Failed,
+            state: super::TaskState::Failed,
             success: false,
             message,
             report: Report::Error,
@@ -335,8 +335,8 @@ impl NoSpawnOutcome {
     /// startup sweep would see nothing outstanding and skip it.
     pub(crate) fn needs_run_now(&self) -> Option<bool> {
         match self.state {
-            super::TaskItemState::PendingRun | super::TaskItemState::Failed => Some(true),
-            super::TaskItemState::Skipped => Some(false),
+            super::TaskState::PendingRun | super::TaskState::Failed => Some(true),
+            super::TaskState::Skipped => Some(false),
             _ => None,
         }
     }
@@ -364,9 +364,9 @@ const SUPERSEDED_KILL_GRACE: Duration = Duration::from_millis(500);
 /// from a race it could not prevent.
 ///
 /// Detached on purpose: the caller is on the runner's command loop, and
-/// waiting out a grace period there would stall every other item.
+/// waiting out a grace period there would stall every other process.
 ///
-/// Takes the untagged emitter rather than an `ItemOutput` so the kill can
+/// Takes the untagged emitter rather than an `ProcessOutput` so the kill can
 /// never be gated on a name lookup succeeding — failing to log is a cosmetic
 /// problem, failing to kill leaks a process nothing will ever reap.
 pub(crate) fn kill_superseded_spawn(
@@ -378,7 +378,7 @@ pub(crate) fn kill_superseded_spawn(
 
     match prepared {
         TaskRunPrepared::Spawned(spawn) => {
-            let super::task_process::TaskSpawn {
+            let super::task::TaskSpawn {
                 mut handle,
                 child_output,
                 rendered_cmdline: _,
@@ -413,9 +413,9 @@ pub(crate) struct TaskRunOutcome {
     pub(crate) global_watch_ignore: Vec<String>,
     /// Process group of the run that just ended.
     pub(crate) pgid: i32,
-    /// Exit reports for non-scheduled runs travel on the items' lossless
+    /// Exit reports for non-scheduled runs travel on the processes' lossless
     /// report channel, like service exits.
-    pub(crate) report_tx: mpsc::UnboundedSender<super::ItemReport>,
+    pub(crate) report_tx: mpsc::UnboundedSender<super::ProcessReport>,
     /// Whether this run was triggered by a file watch, which decides if a
     /// `TaskRerunComplete` event is broadcast when it lands.
     pub(crate) rerun: bool,
@@ -435,7 +435,7 @@ impl TaskRunOutcome {
     /// so the task is not skipped next time.
     pub(crate) async fn finish(
         self,
-        result: Result<std::process::ExitStatus, super::task_process::TaskError>,
+        result: Result<std::process::ExitStatus, super::task::TaskError>,
         elapsed: Duration,
     ) {
         let (success, exit_code, message) = match result {
@@ -449,7 +449,7 @@ impl TaskRunOutcome {
         let last_run =
             TaskRunInfo::finished_now(success, Some(elapsed), exit_code, message.clone());
 
-        let task_state = TaskState::new(self.base_dir.join(".don").join("task-state"));
+        let task_state = TaskStateStore::new(self.base_dir.join(".don").join("task-state"));
         if success {
             let task_dir = working_dir_for(&self.base_dir, self.task_cfg.dir.as_deref());
             let ignore_patterns = resolve_watch_ignore_patterns(
@@ -471,15 +471,17 @@ impl TaskRunOutcome {
             let _ = task_state.record_run(&self.name, &last_run).await;
         }
 
-        let _ = self.report_tx.send(super::ItemReport::TaskExited(TaskExit {
-            name: self.name,
-            pgid: self.pgid,
-            success,
-            message,
-            elapsed: Some(elapsed),
-            last_run: Some(last_run),
-            rerun: self.rerun,
-        }));
+        let _ = self
+            .report_tx
+            .send(super::ProcessReport::TaskExited(TaskExit {
+                name: self.name,
+                pgid: self.pgid,
+                success,
+                message,
+                elapsed: Some(elapsed),
+                last_run: Some(last_run),
+                rerun: self.rerun,
+            }));
     }
 }
 
@@ -498,7 +500,7 @@ mod tests {
     fn outcome(
         name: &str,
         base_dir: &std::path::Path,
-        report_tx: mpsc::UnboundedSender<super::super::ItemReport>,
+        report_tx: mpsc::UnboundedSender<super::super::ProcessReport>,
         rerun: bool,
     ) -> TaskRunOutcome {
         TaskRunOutcome {
@@ -514,12 +516,12 @@ mod tests {
 
     #[test]
     fn no_spawn_outcomes_classify_consistently() {
-        use super::super::TaskItemState;
+        use super::super::TaskState;
 
         struct Case {
             label: &'static str,
             outcome: NoSpawnOutcome,
-            want_state: TaskItemState,
+            want_state: TaskState,
             want_success: bool,
             want_report: Report,
             want_needs: Option<bool>,
@@ -529,7 +531,7 @@ mod tests {
             Case {
                 label: "deferred",
                 outcome: NoSpawnOutcome::pending_run("waiting on deps".to_string()),
-                want_state: TaskItemState::PendingRun,
+                want_state: TaskState::PendingRun,
                 // Not a failure: it just hasn't run yet.
                 want_success: true,
                 want_report: Report::Info,
@@ -538,7 +540,7 @@ mod tests {
             Case {
                 label: "skipped",
                 outcome: NoSpawnOutcome::skipped("no changes".to_string()),
-                want_state: TaskItemState::Skipped,
+                want_state: TaskState::Skipped,
                 want_success: true,
                 // Verbose-only: nobody asked for a no-op to be announced.
                 want_report: Report::Debug,
@@ -547,7 +549,7 @@ mod tests {
             Case {
                 label: "prepare failed",
                 outcome: NoSpawnOutcome::failed("bad param".to_string()),
-                want_state: TaskItemState::Failed,
+                want_state: TaskState::Failed,
                 want_success: false,
                 want_report: Report::Error,
                 // A failed run hasn't run, whoever asked for it — so the
@@ -696,7 +698,7 @@ mod tests {
                 .finish(Ok(case.status), Duration::from_millis(5))
                 .await;
 
-            let Ok(super::super::ItemReport::TaskExited(exit)) = report_rx.try_recv() else {
+            let Ok(super::super::ProcessReport::TaskExited(exit)) = report_rx.try_recv() else {
                 panic!("{}: expected a TaskExited", case.name);
             };
             assert_eq!(exit.name, "build", "{}", case.name);
@@ -726,7 +728,7 @@ mod tests {
                 .finish(Ok(status), Duration::from_millis(1))
                 .await;
 
-            let state = TaskState::new(temp.path().join(".don").join("task-state"));
+            let state = TaskStateStore::new(temp.path().join(".don").join("task-state"));
             assert_eq!(
                 state.has_success("build").await.unwrap(),
                 want_success,

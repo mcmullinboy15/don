@@ -76,7 +76,7 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
 /// gets a 409 instead of actually starting the task. Waiting for the task's
 /// settled state (`skipped` for an `auto_run = false` task that has nothing to
 /// do) makes the run deterministic without guessing at a sleep duration.
-async fn wait_for_item_state(
+async fn wait_for_process_state(
     socket_path: &Path,
     name: &str,
     state: &str,
@@ -87,10 +87,10 @@ async fn wait_for_item_state(
         let (status, body) = request(socket_path, "GET", "/status").await;
         if status == 200
             && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body)
-            && let Some(items) = parsed.get("items").and_then(|i| i.as_array())
-            && items.iter().any(|item| {
-                item.get("name").and_then(|n| n.as_str()) == Some(name)
-                    && item.get("state").and_then(|s| s.as_str()) == Some(state)
+            && let Some(processes) = parsed.get("processes").and_then(|i| i.as_array())
+            && processes.iter().any(|process| {
+                process.get("name").and_then(|n| n.as_str()) == Some(name)
+                    && process.get("state").and_then(|s| s.as_str()) == Some(state)
             })
         {
             return true;
@@ -182,7 +182,7 @@ async fn spawn_runner(
 // --- Integration tests ---
 
 #[test]
-fn integration_status_endpoint_returns_items() {
+fn integration_status_endpoint_returns_processes() {
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("server-status");
         let toml = ConfigBuilder::new()
@@ -197,7 +197,7 @@ fn integration_status_endpoint_returns_items() {
 
         let (status, body) = request(&socket, "GET", "/status").await;
         assert_eq!(status, 200, "body: {body}");
-        assert!(body.contains("\"items\""), "body: {body}");
+        assert!(body.contains("\"processes\""), "body: {body}");
         assert!(body.contains("\"name\":\"keeper\""), "body: {body}");
         assert!(body.contains("\"kind\":\"service\""), "body: {body}");
 
@@ -267,7 +267,7 @@ fn integration_verbose_status_summarizes_watch_paths() {
 }
 
 #[test]
-fn integration_verbose_status_single_item_lists_watch_paths() {
+fn integration_verbose_status_single_process_lists_watch_paths() {
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("server-status-watch-single");
         let toml = ConfigBuilder::new()
@@ -298,7 +298,7 @@ fn integration_verbose_status_single_item_lists_watch_paths() {
         // A name that matches nothing is an empty list, not an error.
         let (status, body) = request(&socket, "GET", "/status?verbose=true&name=nope").await;
         assert_eq!(status, 200, "body: {body}");
-        assert!(body.contains("\"items\":[]"), "body: {body}");
+        assert!(body.contains("\"processes\":[]"), "body: {body}");
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
@@ -610,7 +610,7 @@ fn integration_run_task_wait_endpoint_returns_after_success() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
 
         assert!(
-            wait_for_item_state(&socket, "once", "skipped", Duration::from_secs(3)).await,
+            wait_for_process_state(&socket, "once", "skipped", Duration::from_secs(3)).await,
             "task should settle as skipped before the manual run"
         );
 
@@ -644,7 +644,7 @@ fn integration_run_task_wait_endpoint_maps_task_failure_to_422() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
 
         assert!(
-            wait_for_item_state(&socket, "fail", "skipped", Duration::from_secs(3)).await,
+            wait_for_process_state(&socket, "fail", "skipped", Duration::from_secs(3)).await,
             "task should settle as skipped before the manual run"
         );
 
@@ -685,7 +685,7 @@ fn integration_run_task_wait_timeout_returns_408_without_stopping_task() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
 
         assert!(
-            wait_for_item_state(&socket, "slow", "skipped", Duration::from_secs(3)).await,
+            wait_for_process_state(&socket, "slow", "skipped", Duration::from_secs(3)).await,
             "task should settle as skipped before the manual run"
         );
 

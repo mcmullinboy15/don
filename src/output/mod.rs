@@ -77,7 +77,7 @@ pub enum PtyInput {
 /// half for the process's whole lifetime; everything that wants to write —
 /// attach bridges, the OSC scanner, resize — holds a sender. The gate (and
 /// with it the PTY master's write side) ends when the last sender drops:
-/// the item's stored sender on exit, the scanner with its sink, and each
+/// the process's stored sender on exit, the scanner with its sink, and each
 /// bridge on disconnect.
 pub(crate) fn spawn_pty_gate(mut pty_write: pty_process::OwnedWritePty) -> mpsc::Sender<PtyInput> {
     let (tx, mut rx) = mpsc::channel::<PtyInput>(64);
@@ -100,7 +100,7 @@ pub(crate) fn spawn_pty_gate(mut pty_write: pty_process::OwnedWritePty) -> mpsc:
 }
 
 /// Handle to an active OSC response scanner. Exists for its [`Drop`]: a
-/// restart replaces the item's handle, and dropping the old one removes its
+/// restart replaces the process's handle, and dropping the old one removes its
 /// sink and releases its gate sender.
 pub struct OscSinkHandle {
     /// Our copy of the sender. Dropping it *and* removing the service's copy
@@ -178,7 +178,7 @@ pub(crate) enum SinkHandle {
     BoundedDrop(mpsc::Sender<SinkLine>),
     /// Feeds the server-side terminal emulator (see [`emulator`]). Carries
     /// only the raw bytes; the emulator thread keys screens by the line's
-    /// item name.
+    /// process name.
     Emulator(mpsc::UnboundedSender<emulator::EmulatorRequest>),
 }
 
@@ -1044,7 +1044,7 @@ impl OutputManager {
 
     /// Add an attach sink preloaded with a screen repaint frame instead of a
     /// ring-buffer snapshot. The bridge writes the frame verbatim, so the
-    /// client's terminal shows the item's current grid before live bytes
+    /// client's terminal shows the process's current grid before live bytes
     /// resume — no raw-byte replay.
     pub(crate) async fn add_attach_sink(
         &self,
@@ -1068,7 +1068,7 @@ impl OutputManager {
         Some(rx)
     }
 
-    /// Render an item's current screen; `None` when it has no screen.
+    /// Render an process's current screen; `None` when it has no screen.
     pub(crate) async fn emulator_repaint(&self, name: &str) -> Option<emulator::RepaintFrame> {
         self.emulator.repaint(name).await
     }
@@ -1181,13 +1181,13 @@ impl OutputManager {
         self.verbosity.clone()
     }
 
-    /// Get a cloneable output handle scoped to one registered item.
+    /// Get a cloneable output handle scoped to one registered process.
     ///
     /// Returns `None` for an unregistered name — every service and task is
     /// registered at construction, so `None` means a genuine name mismatch,
     /// not a timing window.
-    pub fn item_output(&self, name: &str) -> Option<ItemOutput> {
-        Some(ItemOutput {
+    pub fn process_output(&self, name: &str) -> Option<ProcessOutput> {
+        Some(ProcessOutput {
             name: name.to_string(),
             state: Arc::clone(self.services.get(name)?),
             events: self.clone_lifecycle_emitter(),
@@ -1356,32 +1356,32 @@ impl OutputManager {
     }
 }
 
-/// Everything one item needs to do its own output, in a cloneable handle.
+/// Everything one process needs to do its own output, in a cloneable handle.
 ///
 /// [`OutputManager`] is deliberately not `Clone` — it owns the writer task
 /// handles that `shutdown` must join, so exactly one thing may own it. But a
-/// per-item supervisor still has to write its child's output, attach an OSC
+/// per-process supervisor still has to write its child's output, attach an OSC
 /// sink, mute the terminal for a foreground run, and emit its own lifecycle
 /// events. This hands out that slice, scoped to a single name.
 ///
-/// "Item" rather than "service" because tasks use the same machinery — and so
+/// "Process" rather than "service" because tasks use the same machinery — and so
 /// does the synthetic `bazel` stream. The name is whatever the
 /// stream was registered under.
 #[derive(Clone)]
-pub struct ItemOutput {
+pub struct ProcessOutput {
     name: String,
     state: Arc<Mutex<ServiceOutputState>>,
     events: LifecycleEmitter,
     emulator: emulator::EmulatorHandle,
 }
 
-impl ItemOutput {
+impl ProcessOutput {
     /// The name this handle is scoped to.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// A writer for piping this item's child process output.
+    /// A writer for piping this process's child process output.
     ///
     /// Several may exist at once (a restart creates a new one before the old
     /// reader has finished draining); they share one ring buffer.
@@ -1408,7 +1408,7 @@ impl ItemOutput {
         }
     }
 
-    /// (Re)register this item's server-side screen and route its output
+    /// (Re)register this process's server-side screen and route its output
     /// bytes into the emulator. See [`OutputManager::register_emulator`].
     pub async fn register_emulator(&self, cols: u16, rows: u16) {
         self.emulator.register(&self.name, cols, rows);
@@ -1419,17 +1419,17 @@ impl ItemOutput {
         }
     }
 
-    /// Emit a `[don]` event tagged with this item's name.
+    /// Emit a `[don]` event tagged with this process's name.
     pub fn event(&self, message: &str) {
         self.events.service_event(&self.name, message);
     }
 
-    /// Emit a `[don]` error event tagged with this item's name.
+    /// Emit a `[don]` error event tagged with this process's name.
     pub fn error_event(&self, message: &str) {
         self.events.service_error_event(&self.name, message);
     }
 
-    /// Emit a `[don]` event tagged with this item's name, verbose mode only.
+    /// Emit a `[don]` event tagged with this process's name, verbose mode only.
     pub fn debug_event(&self, message: &str) {
         self.events.service_debug_event(&self.name, message);
     }
@@ -2236,11 +2236,11 @@ mod tests {
             .unwrap();
 
         for case in cases {
-            let output = mgr.item_output(case.name);
+            let output = mgr.process_output(case.name);
             assert_eq!(
                 output.is_some(),
                 case.registered,
-                "{}: registered items get a handle and nothing else does",
+                "{}: registered processes get a handle and nothing else does",
                 case.name
             );
             if let Some(output) = output {

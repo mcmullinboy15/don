@@ -15,8 +15,7 @@
 //! [`RunnerEvent`]: super::RunnerEvent
 
 use super::{
-    CommandResult, ServiceHandleIdentity, ServiceState, ServiceStopAction, TaskItemState,
-    TaskRunWaiter,
+    CommandResult, ServiceHandleIdentity, ServiceState, ServiceStopAction, TaskRunWaiter, TaskState,
 };
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
@@ -118,7 +117,7 @@ pub(crate) struct RuntimeService {
     /// pending restart for that cycle should be skipped.
     pub rebuild_stale: bool,
     /// A build completed successfully but its restart was skipped because the
-    /// item went stale (a watched file changed mid-build), so the running
+    /// process went stale (a watched file changed mid-build), so the running
     /// process is now *behind* the latest built artifact. The follow-up
     /// rebuild cycle must restart even if the build tool reports "up to date" —
     /// up-to-date is measured against the last *build*, not against the
@@ -228,7 +227,7 @@ impl RuntimeService {
 pub(crate) struct RuntimeTask {
     /// Lifecycle state. Private so every mutation routes through
     /// [`set_state`](Self::set_state) and gets broadcast.
-    state: TaskItemState,
+    state: TaskState,
     /// Direct dependencies that caused the current `DependencyFailed` state.
     /// Cleared on every transition out of that state.
     failed_dependencies: Vec<String>,
@@ -279,7 +278,7 @@ pub(crate) struct RuntimeTask {
 impl RuntimeTask {
     pub(crate) fn new(
         config: crate::config::task::Task,
-        initial_state: TaskItemState,
+        initial_state: TaskState,
         has_success: bool,
         last_run: Option<crate::task_state::TaskRunInfo>,
     ) -> Self {
@@ -302,7 +301,7 @@ impl RuntimeTask {
         }
     }
 
-    pub(crate) fn state(&self) -> TaskItemState {
+    pub(crate) fn state(&self) -> TaskState {
         self.state
     }
 
@@ -312,11 +311,10 @@ impl RuntimeTask {
 
     /// Atomically enter `DependencyFailed` with the supplied root causes.
     pub(crate) fn mark_dependency_failed(&mut self, dependencies: Vec<String>) -> bool {
-        if self.state == TaskItemState::DependencyFailed && self.failed_dependencies == dependencies
-        {
+        if self.state == TaskState::DependencyFailed && self.failed_dependencies == dependencies {
             return false;
         }
-        self.state = TaskItemState::DependencyFailed;
+        self.state = TaskState::DependencyFailed;
         self.failed_dependencies = dependencies;
         true
     }
@@ -325,12 +323,12 @@ impl RuntimeTask {
     /// actually changed — the caller **must** broadcast a
     /// `RunnerEvent::TaskStateChanged` for that value.
     #[must_use = "state changes must be broadcast via RunnerEvent::TaskStateChanged — use Runner::set_task_state or forward the returned state to event_tx.send"]
-    pub(crate) fn set_state(&mut self, new_state: TaskItemState) -> Option<TaskItemState> {
+    pub(crate) fn set_state(&mut self, new_state: TaskState) -> Option<TaskState> {
         if self.state == new_state {
             return None;
         }
         self.state = new_state;
-        if new_state != TaskItemState::DependencyFailed {
+        if new_state != TaskState::DependencyFailed {
             self.failed_dependencies.clear();
         }
         Some(new_state)
@@ -348,10 +346,10 @@ impl RuntimeTask {
     }
 
     pub(crate) fn dependency_satisfied(&self) -> bool {
-        if matches!(self.state, TaskItemState::DependencyFailed) {
+        if matches!(self.state, TaskState::DependencyFailed) {
             return false;
         }
-        if !self.dependency_evaluated && self.state == TaskItemState::Pending {
+        if !self.dependency_evaluated && self.state == TaskState::Pending {
             return false;
         }
         if !self.has_success {
@@ -370,18 +368,18 @@ impl RuntimeTask {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{RuntimeTask, TaskItemState};
+    use super::{RuntimeTask, TaskState};
 
     /// The dependency gate reads `needs_run_now`: a task with a successful
     /// history but an outstanding run is *not* satisfied, so dependents wait
     /// rather than starting against stale output. This is the runner half of
     /// the background-failure bug the task supervisor's `NoSpawnOutcome`
-    /// classifier tests pin from the item side.
+    /// classifier tests pin from the process side.
     #[test]
     fn an_outstanding_run_blocks_dependents_despite_a_successful_history() {
         let config: crate::config::Config = "[tasks.build]\ncmd = \"true\"\n".parse().unwrap();
         let task = config.tasks.get("build").unwrap().clone();
-        let mut rt = RuntimeTask::new(task, TaskItemState::Completed, true, None);
+        let mut rt = RuntimeTask::new(task, TaskState::Completed, true, None);
         assert!(rt.dependency_satisfied(), "a completed task satisfies deps");
         rt.set_needs_run_now(true);
         assert!(

@@ -3,7 +3,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{ItemStatus, Runner, RunnerCommand, ServiceState};
+use don::runner::{ProcessStatus, Runner, RunnerCommand, ServiceState};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -1136,7 +1136,7 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
             reached_ready = statuses.iter().any(|item| {
                 matches!(
                     item,
-                    ItemStatus::Service {
+                    ProcessStatus::Service {
                         name,
                         state: ServiceState::Ready,
                         ..
@@ -1409,7 +1409,7 @@ fn integration_restart_crashed_service_without_ready_check() {
             reached_ready = statuses.iter().any(|item| {
                 matches!(
                     item,
-                    ItemStatus::Service {
+                    ProcessStatus::Service {
                         name,
                         state: ServiceState::Ready,
                         ..
@@ -1487,7 +1487,7 @@ fn integration_non_blocking_dependency_failure_does_not_block_dependent() {
         assert!(
             statuses.iter().any(|item| matches!(
                 item,
-                ItemStatus::Service {
+                ProcessStatus::Service {
                     state: ServiceState::Ready | ServiceState::Running,
                     ..
                 }
@@ -1709,7 +1709,7 @@ while True: time.sleep(60)\n\
         assert!(
             statuses.iter().any(|item| matches!(
                 item,
-                ItemStatus::Service {
+                ProcessStatus::Service {
                     state: ServiceState::DependencyFailed,
                     failed_dependencies,
                     ..
@@ -1756,7 +1756,7 @@ while True: time.sleep(60)\n\
         assert!(
             statuses.iter().any(|item| matches!(
                 item,
-                ItemStatus::Service {
+                ProcessStatus::Service {
                     state: ServiceState::Ready,
                     failed_dependencies,
                     ..
@@ -1841,7 +1841,7 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
             cleared_recovered_root = statuses.iter().any(|item| {
                 matches!(
                     item,
-                    ItemStatus::Service {
+                    ProcessStatus::Service {
                         state: ServiceState::Pending,
                         failed_dependencies,
                         ..
@@ -1880,7 +1880,7 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
             refreshed = statuses.iter().any(|item| {
                 matches!(
                     item,
-                    ItemStatus::Service {
+                    ProcessStatus::Service {
                         state: ServiceState::DependencyFailed,
                         failed_dependencies,
                         ..
@@ -1940,7 +1940,7 @@ fn integration_task_watch_skip() {
 
             std::fs::write(dir.path().join("data.sql"), "CREATE TABLE test;").unwrap();
 
-            let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
+            let task_state = don::TaskStateStore::new(dir.path().join(".don").join("task-state"));
             let patterns = vec![format!("{}/*.sql", dir.path().display())];
             task_state
                 .record_success("migrate", &patterns, &[], None)
@@ -1977,7 +1977,7 @@ fn integration_task_global_watch_ignore_skip() {
         std::fs::create_dir_all(&generated_dir).unwrap();
         std::fs::write(generated_dir.join("data.sql"), "CREATE TABLE test;").unwrap();
 
-        let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
+        let task_state = don::TaskStateStore::new(dir.path().join(".don").join("task-state"));
         let patterns = vec![format!("{}/**/*.sql", dir.path().display())];
         let ignore_patterns = vec![format!("{}/generated/**", dir.path().display())];
         task_state
@@ -2014,7 +2014,7 @@ fn integration_task_watch_run_on_change() {
 
         std::fs::write(dir.path().join("data.sql"), "CREATE TABLE test;").unwrap();
 
-        let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
+        let task_state = don::TaskStateStore::new(dir.path().join(".don").join("task-state"));
         let patterns = vec![format!("{}/*.sql", dir.path().display())];
         task_state
             .record_success("migrate", &patterns, &[], None)

@@ -1,4 +1,4 @@
-use super::{ItemStatus, Runner, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
+use super::{ProcessStatus, Runner, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
 
 impl Runner {
     pub(in crate::runner) async fn fetch_watch_snapshot(
@@ -8,7 +8,7 @@ impl Runner {
     }
 
     /// Build a global [`WatchReport`] of every active inotify registration and
-    /// per-item watch pattern. Returns `None` when no watches are active (no
+    /// per-process watch pattern. Returns `None` when no watches are active (no
     /// service/task declared watch patterns, or the watcher is unreachable).
     pub(in crate::runner) async fn collect_watch_report(&self) -> Option<WatchReport> {
         let snapshot = self.fetch_watch_snapshot().await?;
@@ -26,15 +26,15 @@ impl Runner {
         let mut items: Vec<WatchReportItem> = snapshot
             .items
             .iter()
-            .map(|(name, item)| WatchReportItem {
+            .map(|(name, process)| WatchReportItem {
                 name: name.clone(),
-                kind: item.kind.to_string(),
-                state: item.state.to_string(),
-                stale: item.stale,
-                debounce_ms: item.debounce_ms,
-                patterns: item.patterns.clone(),
-                ignore_patterns: item.ignore_patterns.clone(),
-                last_error: item.last_error.clone(),
+                kind: process.kind.to_string(),
+                state: process.state.to_string(),
+                stale: process.stale,
+                debounce_ms: process.debounce_ms,
+                patterns: process.patterns.clone(),
+                ignore_patterns: process.ignore_patterns.clone(),
+                last_error: process.last_error.clone(),
             })
             .collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -49,7 +49,7 @@ impl Runner {
         })
     }
 
-    /// The cheap, allocation-only projection of every item's state.
+    /// The cheap, allocation-only projection of every process's state.
     ///
     /// Synchronous by construction: it touches nothing but the runner's own
     /// maps. That is what lets it be republished on every state transition and
@@ -59,13 +59,13 @@ impl Runner {
     pub(in crate::runner) fn status_projection(
         &self,
         detail_name: Option<&str>,
-    ) -> Vec<ItemStatus> {
+    ) -> Vec<ProcessStatus> {
         let mut statuses = Vec::new();
         for (name, rs) in &self.services {
             if detail_name.is_some_and(|want| want != name) {
                 continue;
             }
-            statuses.push(ItemStatus::Service {
+            statuses.push(ProcessStatus::Service {
                 name: name.clone(),
                 state: rs.state(),
                 failed_dependencies: rs.failed_dependencies().to_vec(),
@@ -76,7 +76,7 @@ impl Runner {
             if detail_name.is_some_and(|want| want != name) {
                 continue;
             }
-            statuses.push(ItemStatus::Task {
+            statuses.push(ProcessStatus::Task {
                 name: name.clone(),
                 state: rt.state(),
                 failed_dependencies: rt.failed_dependencies().to_vec(),
@@ -87,10 +87,10 @@ impl Runner {
         statuses
     }
 
-    /// Collect status of all items.
+    /// Collect status of all processes.
     ///
     /// When `detail_name` is `Some`, only that single service/task is returned
-    /// and its fully-resolved `watch` path list is included. The all-items view
+    /// and its fully-resolved `watch` path list is included. The all-processes view
     /// (`detail_name == None`) deliberately omits the path list — for a
     /// build-tool stack it can be hundreds of resolved paths per service, so the
     /// default verbose view reports only the count and callers drill in by name.
@@ -102,7 +102,7 @@ impl Runner {
         &self,
         verbose: bool,
         detail_name: Option<&str>,
-    ) -> Vec<ItemStatus> {
+    ) -> Vec<ProcessStatus> {
         if !verbose {
             return self.status_projection(detail_name);
         }
@@ -162,12 +162,12 @@ impl Runner {
                         ));
                     }
                 }
-                if let Some(item) = watch_item {
-                    if let Some(ref last_error) = item.last_error {
+                if let Some(process) = watch_item {
+                    if let Some(ref last_error) = process.last_error {
                         watch_notes.push(last_error.clone());
                     }
                 } else if !watch.is_empty() && watch_snapshot_available {
-                    watch_notes.push("watch item missing from watch manager".to_string());
+                    watch_notes.push("watch process missing from watch manager".to_string());
                 } else if !watch.is_empty() {
                     watch_notes.push("watch manager unavailable".to_string());
                 }
@@ -176,8 +176,8 @@ impl Runner {
                     // Services have no params; only tasks are run with values.
                     params: Vec::new(),
                     watch_count: watch.len(),
-                    // Full path list only on a single-item drill-in; see
-                    // `collect_status` doc for why the all-items view omits it.
+                    // Full path list only on a single-process drill-in; see
+                    // `collect_status` doc for why the all-processes view omits it.
                     watch: if detail_name.is_some() {
                         watch
                     } else {
@@ -237,16 +237,16 @@ impl Runner {
                     bazel_target: resolved.bazel_config().map(|b| b.target.clone()),
                     ready,
                     cmd,
-                    watch_state: watch_item.map(|item| {
+                    watch_state: watch_item.map(|process| {
                         format!(
                             "{} state={} stale={} debounce={}ms",
-                            item.kind, item.state, item.stale, item.debounce_ms
+                            process.kind, process.state, process.stale, process.debounce_ms
                         )
                     }),
                     watch_notes,
                 })
             };
-            statuses.push(ItemStatus::Service {
+            statuses.push(ProcessStatus::Service {
                 name: name.clone(),
                 state: rs.state(),
                 failed_dependencies: rs.failed_dependencies().to_vec(),
@@ -289,20 +289,20 @@ impl Runner {
                         ));
                     }
                 }
-                if let Some(item) = watch_item {
-                    if let Some(ref last_error) = item.last_error {
+                if let Some(process) = watch_item {
+                    if let Some(ref last_error) = process.last_error {
                         watch_notes.push(last_error.clone());
                     }
                 } else if !watch.is_empty() && watch_snapshot_available {
-                    watch_notes.push("watch item missing from watch manager".to_string());
+                    watch_notes.push("watch process missing from watch manager".to_string());
                 } else if !watch.is_empty() {
                     watch_notes.push("watch manager unavailable".to_string());
                 }
                 Some(VerboseInfo {
                     depends_on: task.depends_on.clone(),
                     watch_count: watch.len(),
-                    // Full path list only on a single-item drill-in; see
-                    // `collect_status` doc for why the all-items view omits it.
+                    // Full path list only on a single-process drill-in; see
+                    // `collect_status` doc for why the all-processes view omits it.
                     watch: if detail_name.is_some() {
                         watch
                     } else {
@@ -319,16 +319,16 @@ impl Runner {
                         .collect(),
                     ready: None,
                     cmd: Some(cmd_str),
-                    watch_state: watch_item.map(|item| {
+                    watch_state: watch_item.map(|process| {
                         format!(
                             "{} state={} stale={} debounce={}ms",
-                            item.kind, item.state, item.stale, item.debounce_ms
+                            process.kind, process.state, process.stale, process.debounce_ms
                         )
                     }),
                     watch_notes,
                 })
             };
-            statuses.push(ItemStatus::Task {
+            statuses.push(ProcessStatus::Task {
                 name: name.clone(),
                 state: rt.state(),
                 failed_dependencies: rt.failed_dependencies().to_vec(),

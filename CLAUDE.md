@@ -215,10 +215,10 @@ src/
     platform.rs             # Platform enum, deserialization
     download.rs             # DownloadConfig, PlatformDownload, cache paths
     types.rs                # Shared types: Command, ReadyCheck, ShutdownConfig, LogConfig
-  command.rs                # CommandError / CommandResult — shared reply vocabulary (item + runner)
-  item/
-    mod.rs                  # per-item mechanism root; the edge rule: imports nothing from runner/
-    registry.rs             # ItemRegistry — addressed, send-only handles to supervisors
+  command.rs                # CommandError / CommandResult — shared reply vocabulary (process + runner)
+  process/
+    mod.rs                  # per-process mechanism root; the edge rule: imports nothing from runner/
+    registry.rs             # ProcessRegistry — addressed, send-only handles to supervisors
     service_supervisor.rs   # service lifecycle owner: spawn → ready → reap, stop, restart
     service_process.rs      # service spawn/stop mechanics (process + docker)
     service_worker.rs       # service start preparation (build, ports, env, proxy)
@@ -227,10 +227,10 @@ src/
     task_worker.rs          # task run preparation (params, hashing, spawn)
     health.rs               # health monitor loop
     ready.rs                # ready-check resolution against live runtime ports
-    state.rs                # ServiceState / TaskItemState machines, NodeKind
+    state.rs                # ServiceState / TaskState machines, ProcessKind
     paths.rs                # watch-path staleness checks
   runner/
-    mod.rs                  # scheduler — dependency graph, startup/shutdown order, folds ItemReports
+    mod.rs                  # scheduler — dependency graph, startup/shutdown order, folds ProcessReports
     state_store.rs          # runner-written / world-readable state projection
   sys/
     mod.rs                  # process group management, PTY spawning, identity tracking
@@ -269,7 +269,7 @@ Lean hard towards small, focused modules. Each file should do one thing. If a fi
 
 - Default to `pub(crate)`. Only make something `pub` if it's part of the library's external API — something another Rust crate consuming `don` would need.
 - Every `pub` item must have a doc comment explaining what it does, when to use it, and any important invariants.
-- Re-export the public API from `lib.rs` so consumers get a clean `don::Config`, `don::TaskState`, etc. without reaching into submodules.
+- Re-export the public API from `lib.rs` so consumers get a clean `don::Config`, `don::runner::ProcessStatus`, etc. without reaching into submodules.
 - Internal helpers, intermediate types, and implementation details stay `pub(crate)` or private.
 
 **Module boundaries:**
@@ -289,7 +289,7 @@ Modules communicate via **tokio channels**, not shared mutable state:
 
 **No `Arc<Mutex<_>>` for shared state.** The runner owns all service state in a plain `HashMap<String, ServiceState>` and is the only thing that may mutate it. This avoids deadlocks and contention.
 
-**Reading that state does not go through the command channel.** A status query is the one thing that should never queue behind whatever the runner is currently doing. `runner/state_store.rs` publishes a cheap projection — every item's `ItemStatus`, plus `startup_complete` — through a `watch`, and splits the handle by type so single-writer is enforced by ownership rather than by discipline:
+**Reading that state does not go through the command channel.** A status query is the one thing that should never queue behind whatever the runner is currently doing. `runner/state_store.rs` publishes a cheap projection — every process's `ProcessStatus`, plus `startup_complete` — through a `watch`, and splits the handle by type so single-writer is enforced by ownership rather than by discipline:
 
 - `StateWriter` is **not** `Clone` and is moved into the runner at construction, so no other component can obtain one.
 - `StateReader` is `Clone` and exposes reads only. The server, the TUI and the web UI hold one.
@@ -311,7 +311,7 @@ enum RunnerCommand {
     Restart { name: String, reply: oneshot::Sender<CommandResult> },
     Rebuild { name: String },           // file watch triggered
     TaskRerun { name: String },         // file watch triggered
-    Status { reply: oneshot::Sender<Vec<ItemStatus>> },
+    Status { reply: oneshot::Sender<Vec<ProcessStatus>> },
     Logs { name: String, last_n: usize, reply: oneshot::Sender<Option<String>> },
     StartPending,                       // deferred retry for unsatisfied deps
     Shutdown,

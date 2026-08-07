@@ -1,6 +1,6 @@
 //! Runtime service-port reference expansion for inline environment values.
 //!
-//! `$(service.key)` references are resolved immediately before an item starts,
+//! `$(service.key)` references are resolved immediately before an process starts,
 //! after its dependencies have published their effective runtime ports.
 //! `$$(...)` escapes the syntax and produces a literal `$(...)`.
 //!

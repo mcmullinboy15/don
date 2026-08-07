@@ -1,23 +1,26 @@
 use crate::config::{Config, Platform};
 use std::collections::HashSet;
 
-/// Resolve a profile into the full set of items (services + tasks) to run,
+/// Resolve a profile into the full set of processes (services + tasks) to run,
 /// including transitive dependencies. Starting with the profile's explicit
 /// services and tasks, walks `depends_on` recursively to include everything
 /// needed.
-pub fn resolve_profile_items(config: &Config, profile: &crate::config::Profile) -> HashSet<String> {
-    resolve_profile_items_inner(config, profile, None)
+pub fn resolve_profile_processes(
+    config: &Config,
+    profile: &crate::config::Profile,
+) -> HashSet<String> {
+    resolve_profile_processes_inner(config, profile, None)
 }
 
-pub(in crate::runner) fn resolve_profile_items_for_platform(
+pub(in crate::runner) fn resolve_profile_processes_for_platform(
     config: &Config,
     profile: &crate::config::Profile,
     platform: Platform,
 ) -> HashSet<String> {
-    resolve_profile_items_inner(config, profile, Some(platform))
+    resolve_profile_processes_inner(config, profile, Some(platform))
 }
 
-fn resolve_profile_items_inner(
+fn resolve_profile_processes_inner(
     config: &Config,
     profile: &crate::config::Profile,
     platform: Option<Platform>,

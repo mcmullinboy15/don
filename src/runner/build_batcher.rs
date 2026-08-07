@@ -36,7 +36,7 @@ use super::build_tools::{
     RebuildBatchRequest, run_graph_requery_worker, run_rebuild_batch_worker,
 };
 use super::state_store::StateReader;
-use super::{ItemStatus, ServiceState};
+use super::{ProcessStatus, ServiceState};
 use crate::build_tool::manager::{BatchDue, BuildBatcher};
 use crate::output::LifecycleEmitter;
 
@@ -203,11 +203,11 @@ async fn run(
 /// retried once they reach a settled state. (This is what keeps a file
 /// edited mid-build from being lost.)
 fn coming_up(state: &StateReader, name: &str) -> bool {
-    state.snapshot().items.iter().any(|item| {
+    state.snapshot().processes.iter().any(|status| {
         matches!(
-            item,
-            ItemStatus::Service { name: item_name, state, .. }
-                if item_name == name
+            status,
+            ProcessStatus::Service { name: process_name, state, .. }
+                if process_name == name
                     && matches!(
                         state,
                         ServiceState::Building
@@ -339,10 +339,10 @@ mod tests {
         output_manager.clone_lifecycle_emitter()
     }
 
-    fn service_items(states: &[(&str, ServiceState)]) -> Vec<ItemStatus> {
+    fn service_statuses(states: &[(&str, ServiceState)]) -> Vec<ProcessStatus> {
         states
             .iter()
-            .map(|(name, state)| ItemStatus::Service {
+            .map(|(name, state)| ProcessStatus::Service {
                 name: name.to_string(),
                 state: *state,
                 failed_dependencies: Vec::new(),
@@ -352,7 +352,7 @@ mod tests {
     }
 
     async fn spawn_actor(
-        initial: Vec<ItemStatus>,
+        initial: Vec<ProcessStatus>,
     ) -> (
         StateWriter,
         mpsc::UnboundedSender<BatchRequest>,
@@ -360,7 +360,7 @@ mod tests {
         tokio::task::JoinHandle<()>,
     ) {
         let (writer, reader) = state_store::channel(StateSnapshot::default());
-        writer.publish_items(initial);
+        writer.publish_processes(initial);
         let emitter = test_emitter().await;
         let (tx, outcome_rx, handle) = spawn(reader, emitter);
         (writer, tx, outcome_rx, handle)
@@ -380,7 +380,7 @@ mod tests {
     /// window closes.
     #[tokio::test(start_paused = true)]
     async fn a_burst_of_rebuild_requests_becomes_one_batch() {
-        let (_writer, tx, mut outcome_rx, handle) = spawn_actor(service_items(&[
+        let (_writer, tx, mut outcome_rx, handle) = spawn_actor(service_statuses(&[
             ("api", ServiceState::Ready),
             ("web", ServiceState::Ready),
         ]))
@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn rebuild_during_build_is_deferred_not_dropped() {
         let (writer, tx, mut outcome_rx, handle) =
-            spawn_actor(service_items(&[("api", ServiceState::Building)])).await;
+            spawn_actor(service_statuses(&[("api", ServiceState::Building)])).await;
 
         queue(&tx, "api");
 
@@ -431,7 +431,7 @@ mod tests {
         );
 
         // Once the service settles, the deferred rebuild fires.
-        writer.publish_items(service_items(&[("api", ServiceState::Ready)]));
+        writer.publish_processes(service_statuses(&[("api", ServiceState::Ready)]));
         let outcome = tokio::time::timeout(Duration::from_secs(5), outcome_rx.recv())
             .await
             .expect("deferred rebuild should fire once the service is up")
@@ -448,7 +448,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn force_rebuild_is_refused_while_a_batch_runs() {
         let (_writer, tx, mut outcome_rx, handle) =
-            spawn_actor(service_items(&[("api", ServiceState::Ready)])).await;
+            spawn_actor(service_statuses(&[("api", ServiceState::Ready)])).await;
 
         // Occupy the slot: a forced rebuild spawns immediately.
         let (first_tx, first_rx) = oneshot::channel();

@@ -2,9 +2,9 @@
 
 use super::{CommandError, Runner};
 use crate::config::ReadyCheck;
-use crate::item::ready::{port_replacements_for, resolve_ready_check};
 use crate::output::LifecycleEmitter;
 use crate::ports::{DockerPort, PortManifest, ProxyPort, ServicePorts};
+use crate::process::ready::{port_replacements_for, resolve_ready_check};
 use crate::proxy::ProxyBindingMode;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -59,7 +59,7 @@ impl Runner {
     /// Render `$(service.key)` references in inline environment values.
     pub(in crate::runner) fn render_runtime_env(
         &self,
-        item_name: &str,
+        process_name: &str,
         env: &mut HashMap<String, String>,
     ) -> Result<(), CommandError> {
         let references = self.runtime_port_references();
@@ -70,7 +70,7 @@ impl Runner {
             *value =
                 super::env_refs::render(value, &references, &known_services).map_err(|error| {
                     CommandError::Failed {
-                        name: item_name.to_string(),
+                        name: process_name.to_string(),
                         message: format!("invalid runtime port reference in env.{key}: {error}"),
                     }
                 })?;

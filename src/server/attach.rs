@@ -33,7 +33,7 @@ pub(crate) struct ResizeBody {
     session: Option<u64>,
 }
 
-/// The effective size for an item: the smallest attached client wins each
+/// The effective size for an process: the smallest attached client wins each
 /// dimension, so every client sees the whole grid (tmux-style letterboxing).
 fn effective_size(sizes: &std::collections::HashMap<u64, (u16, u16)>) -> Option<(u16, u16)> {
     let cols = sizes.values().map(|(c, _)| *c).min()?;

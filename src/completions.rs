@@ -23,7 +23,7 @@ pub enum CompleteKind {
     /// Task names only.
     Tasks,
     /// Services + tasks merged (for `logs`, `attach`).
-    Items,
+    Processes,
     /// Profile names only.
     Profiles,
     /// Param flag names declared on a specific task (for
@@ -37,7 +37,7 @@ impl FromStr for CompleteKind {
         match s {
             "services" => Ok(Self::Services),
             "tasks" => Ok(Self::Tasks),
-            "items" => Ok(Self::Items),
+            "processes" => Ok(Self::Processes),
             "profiles" => Ok(Self::Profiles),
             other => {
                 if let Some(task) = other.strip_prefix("task-params:") {
@@ -68,7 +68,7 @@ fn collect_names(config: &Config, kind: CompleteKind) -> Vec<String> {
     let mut names: Vec<String> = match kind {
         CompleteKind::Services => config.services.keys().cloned().collect(),
         CompleteKind::Tasks => config.tasks.keys().cloned().collect(),
-        CompleteKind::Items => config
+        CompleteKind::Processes => config
             .services
             .keys()
             .chain(config.tasks.keys())
@@ -113,7 +113,7 @@ fn postlude_for(shell: Shell) -> Option<&'static str> {
 }
 
 /// Wraps the clap-generated `_don` completer with a preflight that emits
-/// service/task/item names for positional args. Falls through to `_don` for
+/// service/task/process names for positional args. Falls through to `_don` for
 /// flag names and non-positional contexts.
 const BASH_POSTLUDE: &str = r#"
 # --- dynamic completion postlude (see `don completions bash`) ---
@@ -131,7 +131,7 @@ _don_dynamic_kind() {
     case "$subcmd" in
         start|stop|restart) echo services ;;
         run) echo tasks ;;
-        logs|attach) echo items ;;
+        logs|attach) echo processes ;;
     esac
 }
 
@@ -241,7 +241,7 @@ _don_with_dynamic() {
     case "$subcmd" in
         start|stop|restart) kind=services ;;
         run) kind=tasks ;;
-        logs|attach) kind=items ;;
+        logs|attach) kind=processes ;;
         *) kind="" ;;
     esac
     if [[ -n "$kind" && "$cur" != -* ]]; then
@@ -268,7 +268,7 @@ complete -c don -n '__fish_seen_subcommand_from start stop restart' \
 complete -c don -n '__fish_seen_subcommand_from run' \
     -f -a '(command don __complete tasks 2>/dev/null)'
 complete -c don -n '__fish_seen_subcommand_from logs attach' \
-    -f -a '(command don __complete items 2>/dev/null)'
+    -f -a '(command don __complete processes 2>/dev/null)'
 
 # `don run <task> --<TAB>` → complete that task's param flags.
 function __don_task_params_for_run
@@ -344,8 +344,8 @@ mod tests {
                 want: &["migrate", "seed"],
             },
             CollectCase {
-                name: "items merges services and tasks",
-                kind: CompleteKind::Items,
+                name: "processes merges services and tasks",
+                kind: CompleteKind::Processes,
                 services: &["api"],
                 tasks: &["migrate"],
                 profiles: &[],

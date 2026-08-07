@@ -36,8 +36,8 @@ pub enum ServerError {
 }
 
 /// Map of active attach resize channels: service name → sender.
-/// Per-item attach sessions: each client's requested terminal size plus a
-/// sender into the item's PTY input gate. The effective PTY/grid size is
+/// Per-process attach sessions: each client's requested terminal size plus a
+/// sender into the process's PTY input gate. The effective PTY/grid size is
 /// `min(cols) x min(rows)` over the attached clients (tmux-style), recomputed
 /// on attach, resize, and detach. Zero clients: the last size is retained so
 /// a running program sees no SIGWINCH churn.
@@ -63,7 +63,7 @@ pub(crate) struct ApiState {
     /// their own task — safe precisely because they are not the runner's
     /// command loop.
     pub state: crate::runner::StateReader,
-    /// Active attach sessions per item — see [`NameSessions`].
+    /// Active attach sessions per process — see [`NameSessions`].
     pub attach_sessions: std::sync::Arc<tokio::sync::Mutex<SessionMap>>,
     /// Handle to the server-side terminal-emulator thread — resize
     /// requests keep the emulated grid in step with the attached client.

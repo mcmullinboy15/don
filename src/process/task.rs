@@ -1,7 +1,7 @@
 //! Task execution — run one-shot commands with skip detection and timeout.
 //!
 //! Tasks are short-lived: no PID files, no ready checks. They check
-//! `TaskState::needs_run()`, spawn the command, and report success/failure.
+//! `TaskStateStore::needs_run()`, spawn the command, and report success/failure.
 
 use nix::sys::signal::Signal;
 use tokio::time;

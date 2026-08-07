@@ -6,8 +6,8 @@ use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ServiceStartMode;
 use super::task_worker::TaskRunMode;
 use super::{
-    NodeKind, Runner, RunnerCommand, RunnerInternalCommand, RuntimeService, ServiceState,
-    TaskItemState, TaskRunIntent,
+    ProcessKind, Runner, RunnerCommand, RunnerInternalCommand, RuntimeService, ServiceState,
+    TaskRunIntent, TaskState,
 };
 use crate::config::Dependency;
 use crate::signals::shutdown_requested;
@@ -36,10 +36,10 @@ fn format_non_blocking_dependencies(dependencies: &[String]) -> String {
 impl Runner {
     /// Apply the outcome of the detached batch-build chain: mutate the
     /// runtime state (watch paths, binary paths, `batch_built` flag) and
-    /// transition `Building` items to `Pending` (on success) or `Failed`
+    /// transition `Building` processes to `Pending` (on success) or `Failed`
     /// (on build failure). The caller is responsible for dropping its
     /// cached batch-build handle. State transitions schedule the normal
-    /// pending-item sweep so newly-unblocked items start.
+    /// pending-process sweep so newly-unblocked processes start.
     pub(in crate::runner) fn apply_batch_build_outcome(&mut self, outcome: BatchBuildOutcome) {
         for warning in &outcome.warnings {
             self.output_manager.error_event(warning);
@@ -47,12 +47,12 @@ impl Runner {
 
         for (name, kind, paths) in outcome.resolved_watches {
             match kind {
-                NodeKind::Service => {
+                ProcessKind::Service => {
                     if let Some(rs) = self.services.get_mut(&name) {
                         rs.resolved_watch_paths = paths;
                     }
                 }
-                NodeKind::Task => {
+                ProcessKind::Task => {
                     if let Some(rt) = self.tasks.get_mut(&name) {
                         rt.resolved_watch_paths = paths;
                     }
@@ -95,7 +95,7 @@ impl Runner {
                 continue;
             }
             if self.tasks.contains_key(&name) {
-                self.set_task_state(&name, TaskItemState::Pending);
+                self.set_task_state(&name, TaskState::Pending);
             }
         }
 
@@ -106,7 +106,7 @@ impl Runner {
                 self.set_service_state(&name, ServiceState::Failed);
             }
             if self.tasks.contains_key(&name) {
-                self.set_task_state(&name, TaskItemState::Failed);
+                self.set_task_state(&name, TaskState::Failed);
             }
         }
     }
@@ -114,7 +114,7 @@ impl Runner {
     fn collect_batch_build_item_by_name(&self, name: &str) -> Option<BatchBuildItem> {
         if let Some(rs) = self.services.get(name) {
             if rs.resolved.is_build_tool_managed() {
-                return Some(self.build_batch_item(name, NodeKind::Service, rs));
+                return Some(self.build_batch_item(name, ProcessKind::Service, rs));
             }
             return None;
         }
@@ -130,7 +130,7 @@ impl Runner {
         );
         Some(BatchBuildItem {
             name: name.to_string(),
-            kind: NodeKind::Task,
+            kind: ProcessKind::Task,
             bazel: rt.config.bazel.clone(),
             watch_enabled: rt.config.build_tool_watch_enabled(),
             working_dir,
@@ -138,8 +138,8 @@ impl Runner {
         })
     }
 
-    pub(in crate::runner) fn spawn_startup_batch_build(&mut self, items: Vec<BatchBuildItem>) {
-        if items.is_empty() {
+    pub(in crate::runner) fn spawn_startup_batch_build(&mut self, processes: Vec<BatchBuildItem>) {
+        if processes.is_empty() {
             return;
         }
 
@@ -158,7 +158,7 @@ impl Runner {
         );
         let handle = tokio::spawn(async move {
             let outcome = run_batch_build_chain(
-                items,
+                processes,
                 base_dir,
                 emitter,
                 watch_update_tx,
@@ -172,7 +172,7 @@ impl Runner {
         self.batch_build_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
     }
 
-    pub(in crate::runner) fn spawn_lazy_build(&mut self, name: &str, item: BatchBuildItem) {
+    pub(in crate::runner) fn spawn_lazy_build(&mut self, name: &str, process: BatchBuildItem) {
         let generation = match self.services.get_mut(name) {
             Some(rs) => {
                 rs.lazy_build_token = rs.lazy_build_token.saturating_add(1);
@@ -196,7 +196,7 @@ impl Runner {
         let svc_name = name.to_string();
         let handle = tokio::spawn(async move {
             let outcome = run_batch_build_chain(
-                vec![item],
+                vec![process],
                 base_dir,
                 emitter,
                 watch_update_tx,
@@ -224,36 +224,38 @@ impl Runner {
         let mut replay_batch = Vec::new();
 
         for replay in replay_items {
-            let Some(item) = self.collect_batch_build_item_by_name(&replay.name) else {
+            let Some(process) = self.collect_batch_build_item_by_name(&replay.name) else {
                 continue;
             };
             let message = match (replay.source_changed, replay.graph_changed, replay.kind) {
-                (true, true, NodeKind::Service) => {
+                (true, true, ProcessKind::Service) => {
                     "files changed during build — rebuilding before start"
                 }
-                (true, false, NodeKind::Service) => {
+                (true, false, ProcessKind::Service) => {
                     "source files changed during build — rebuilding before start"
                 }
-                (false, true, NodeKind::Service) => {
+                (false, true, ProcessKind::Service) => {
                     "build graph changed during build — rebuilding before start"
                 }
-                (true, true, NodeKind::Task) => {
+                (true, true, ProcessKind::Task) => {
                     "files changed during build — re-running build before start"
                 }
-                (true, false, NodeKind::Task) => {
+                (true, false, ProcessKind::Task) => {
                     "source files changed during build — re-running build before start"
                 }
-                (false, true, NodeKind::Task) => {
+                (false, true, ProcessKind::Task) => {
                     "build graph changed during build — re-running build before start"
                 }
                 (false, false, _) => continue,
             };
             self.output_manager.service_event(&replay.name, message);
             match replay.kind {
-                NodeKind::Service => self.set_service_state(&replay.name, ServiceState::Building),
-                NodeKind::Task => self.set_task_state(&replay.name, TaskItemState::Building),
+                ProcessKind::Service => {
+                    self.set_service_state(&replay.name, ServiceState::Building)
+                }
+                ProcessKind::Task => self.set_task_state(&replay.name, TaskState::Building),
             }
-            replay_batch.push(item);
+            replay_batch.push(process);
         }
 
         self.spawn_startup_batch_build(replay_batch);
@@ -263,7 +265,7 @@ impl Runner {
         &mut self,
         replay: &BatchBuildReplayItem,
     ) -> bool {
-        let Some(item) = self.collect_batch_build_item_by_name(&replay.name) else {
+        let Some(process) = self.collect_batch_build_item_by_name(&replay.name) else {
             return false;
         };
         let message = match (replay.source_changed, replay.graph_changed) {
@@ -274,7 +276,7 @@ impl Runner {
         };
         self.output_manager.service_event(&replay.name, message);
         self.set_service_state(&replay.name, ServiceState::Building);
-        self.spawn_lazy_build(&replay.name, item);
+        self.spawn_lazy_build(&replay.name, process);
         true
     }
 
@@ -307,10 +309,10 @@ impl Runner {
             // forever.
             return matches!(
                 rt.state(),
-                TaskItemState::Failed
-                    | TaskItemState::DependencyFailed
-                    | TaskItemState::PendingRun
-                    | TaskItemState::Skipped
+                TaskState::Failed
+                    | TaskState::DependencyFailed
+                    | TaskState::PendingRun
+                    | TaskState::Skipped
             );
         }
         false
@@ -329,7 +331,7 @@ impl Runner {
         !dep.blocking && self.is_dep_settled(&dep.name)
     }
 
-    /// Announce the non-blocking dependencies this item is not waiting for.
+    /// Announce the non-blocking dependencies this process is not waiting for.
     fn report_skipped_non_blocking_dependencies(&self, name: &str, skipped: &[String]) {
         if skipped.is_empty() {
             return;
@@ -365,21 +367,18 @@ impl Runner {
             );
         }
         if let Some(rt) = self.tasks.get(dep) {
-            return matches!(
-                rt.state(),
-                TaskItemState::Failed | TaskItemState::DependencyFailed
-            );
+            return matches!(rt.state(), TaskState::Failed | TaskState::DependencyFailed);
         }
         false
     }
 
-    /// Ask the runner loop to re-check `Pending` items on its own task.
+    /// Ask the runner loop to re-check `Pending` processes on its own task.
     pub(in crate::runner) fn schedule_start_pending(&self) {
         let _ = self.cmd_tx.send(RunnerCommand::StartPending);
     }
 
     /// Resolve failed direct dependencies to their root failures. An
-    /// intermediate `DependencyFailed` item contributes the roots it already
+    /// intermediate `DependencyFailed` process contributes the roots it already
     /// recorded, so a chain such as api -> worker -> db reports `db`.
     ///
     /// Non-blocking edges are ignored: their whole point is that a failure on
@@ -396,8 +395,8 @@ impl Runner {
                 }
             } else if let Some(rt) = self.tasks.get(dependency) {
                 match rt.state() {
-                    TaskItemState::Failed => Some(std::slice::from_ref(dependency)),
-                    TaskItemState::DependencyFailed => Some(rt.failed_dependencies()),
+                    TaskState::Failed => Some(std::slice::from_ref(dependency)),
+                    TaskState::DependencyFailed => Some(rt.failed_dependencies()),
                     _ => None,
                 }
             } else {
@@ -418,7 +417,7 @@ impl Runner {
         roots
     }
 
-    /// Refresh dependency-failure causes and return recovered items to the
+    /// Refresh dependency-failure causes and return recovered processes to the
     /// pending scheduler. Iterating in topological order lets a root-cause
     /// update flow through every descendant in one sweep.
     fn reconcile_dependency_failures(
@@ -430,9 +429,9 @@ impl Runner {
             let service_state = self.services.get(name).map(RuntimeService::state);
             let task_state = self.tasks.get(name).map(|rt| rt.state());
             let is_pending = service_state == Some(ServiceState::Pending)
-                || task_state == Some(TaskItemState::Pending);
+                || task_state == Some(TaskState::Pending);
             let is_dependency_failed = service_state == Some(ServiceState::DependencyFailed)
-                || task_state == Some(TaskItemState::DependencyFailed);
+                || task_state == Some(TaskState::DependencyFailed);
             if !is_pending && !is_dependency_failed {
                 continue;
             }
@@ -467,7 +466,7 @@ impl Runner {
                     // ones on a dependency that has settled either way.
                     self.set_service_state(name, ServiceState::Pending);
                 } else {
-                    self.set_task_state(name, TaskItemState::Pending);
+                    self.set_task_state(name, TaskState::Pending);
                 }
                 self.output_manager
                     .service_debug_event(name, "dependency recovered; re-queued");
@@ -479,7 +478,7 @@ impl Runner {
     /// standalone [`run_batch_build_chain`] needs. Taken at startup before
     /// the detached task runs so the task doesn't touch `self`.
     pub(in crate::runner) fn collect_batch_build_items(&self) -> Vec<BatchBuildItem> {
-        let mut items: Vec<BatchBuildItem> = Vec::new();
+        let mut processes: Vec<BatchBuildItem> = Vec::new();
 
         for (name, rs) in &self.services {
             if !rs.resolved.is_build_tool_managed() {
@@ -492,7 +491,7 @@ impl Runner {
             if rs.resolved.lazy {
                 continue;
             }
-            items.push(self.build_batch_item(name, NodeKind::Service, rs));
+            processes.push(self.build_batch_item(name, ProcessKind::Service, rs));
         }
         for (name, rt) in &self.tasks {
             if rt.config.bazel.is_none() {
@@ -505,9 +504,9 @@ impl Runner {
                 &self.base_dir,
                 &self.config.watch_ignore,
             );
-            items.push(BatchBuildItem {
+            processes.push(BatchBuildItem {
                 name: name.clone(),
-                kind: NodeKind::Task,
+                kind: ProcessKind::Task,
                 bazel: rt.config.bazel.clone(),
                 watch_enabled: rt.config.build_tool_watch_enabled(),
                 working_dir,
@@ -515,7 +514,7 @@ impl Runner {
             });
         }
 
-        items
+        processes
     }
 
     /// Snapshot a single service into a [`BatchBuildItem`] for the JIT
@@ -525,7 +524,7 @@ impl Runner {
     pub(in crate::runner) fn build_batch_item(
         &self,
         name: &str,
-        kind: NodeKind,
+        kind: ProcessKind,
         rs: &RuntimeService,
     ) -> BatchBuildItem {
         let working_dir = working_dir_for(&self.base_dir, rs.resolved.dir.as_deref());
@@ -550,7 +549,7 @@ impl Runner {
     /// This is the only dependency scheduler. Initial services begin in
     /// `Pending`, while lazy services enter `Pending` on their first proxy
     /// connection; both are claimed and launched by this same sweep.
-    pub(in crate::runner) async fn start_pending_items(&mut self) {
+    pub(in crate::runner) async fn start_pending_processes(&mut self) {
         let dep_map = self.build_dep_map();
         let order = match topological_sort(&dep_name_map(&dep_map)) {
             Ok(o) => o,
@@ -561,7 +560,7 @@ impl Runner {
 
         let ready: Vec<String> = order
             .iter()
-            .filter(|name| self.is_item_pending(name))
+            .filter(|name| self.is_process_pending(name))
             .filter(|name| {
                 dep_map
                     .get(name.as_str())
@@ -580,7 +579,7 @@ impl Runner {
             }
 
             // Non-blocking dependencies we are deliberately not waiting on.
-            // Reported at the moment the item actually starts, so a start
+            // Reported at the moment the process actually starts, so a start
             // that follows a visible failure doesn't look like don ignored
             // the dependency graph.
             let skipped = dep_map
@@ -595,7 +594,7 @@ impl Runner {
             let is_pending_task = self
                 .tasks
                 .get(&name)
-                .is_some_and(|rt| rt.state() == TaskItemState::Pending);
+                .is_some_and(|rt| rt.state() == TaskState::Pending);
 
             if is_pending_svc {
                 // A build-tool-managed lazy service takes a JIT build detour.
@@ -644,7 +643,7 @@ impl Runner {
                     TaskRunMode::Startup { has_dependents },
                     TaskRunIntent::Scheduled,
                 ) {
-                    self.set_task_state(&name, TaskItemState::Failed);
+                    self.set_task_state(&name, TaskState::Failed);
                     self.output_manager
                         .service_error_event(&name, &e.to_string());
                 }
@@ -654,7 +653,7 @@ impl Runner {
         }
     }
 
-    fn is_item_pending(&self, name: &str) -> bool {
+    fn is_process_pending(&self, name: &str) -> bool {
         self.services
             .get(name)
             .is_some_and(|rs| rs.state() == ServiceState::Pending)
@@ -665,11 +664,11 @@ impl Runner {
                 // supervisor has emitted the prepared run (busy dropped) but
                 // the runner hasn't wired it yet (state still Pending). A
                 // sweep landing there used to re-request and double-spawn.
-                .is_some_and(|rt| rt.state() == TaskItemState::Pending && !rt.run_requested)
+                .is_some_and(|rt| rt.state() == TaskState::Pending && !rt.run_requested)
                 && !self.task_supervisors.registry().is_busy(name)
     }
 
-    /// Whether every item participating in initial startup has settled.
+    /// Whether every process participating in initial startup has settled.
     /// Lazy services are listeners, not startup work, even if a connection
     /// happens to request one while the initial graph is still progressing.
     pub(in crate::runner) fn initial_startup_settled(&self) -> bool {
@@ -686,7 +685,7 @@ impl Runner {
         let task_work = self.tasks.values().any(|rt| {
             matches!(
                 rt.state(),
-                TaskItemState::Pending | TaskItemState::Building | TaskItemState::Running
+                TaskState::Pending | TaskState::Building | TaskState::Running
             )
         });
 

@@ -33,7 +33,7 @@ use super::app::{App, OverlayItem, StatusCounts, TaskStatusItem, ViewMode};
 use super::failure_summary;
 use super::filter::{FilterFocus, FilterRow, FilterState};
 use super::status_table::{StatusTableView, draw_status_table};
-use crate::client::{ServiceState, TaskItemState};
+use crate::client::{ServiceState, TaskState};
 use crate::task_state::TaskRunInfo;
 
 /// Total rows the inline viewport reserves: 1 blank buffer row + 3 rows
@@ -920,16 +920,16 @@ fn service_state_label(state: ServiceState, failed_dependencies: &[String]) -> C
     }
 }
 
-fn task_state_label(state: TaskItemState, failed_dependencies: &[String]) -> Cow<'static, str> {
+fn task_state_label(state: TaskState, failed_dependencies: &[String]) -> Cow<'static, str> {
     match state {
-        TaskItemState::Pending => Cow::Borrowed("pending"),
-        TaskItemState::Building => Cow::Borrowed("building"),
-        TaskItemState::Running => Cow::Borrowed("running"),
-        TaskItemState::Completed => Cow::Borrowed("completed"),
-        TaskItemState::Skipped => Cow::Borrowed("skipped"),
-        TaskItemState::Failed => Cow::Borrowed("failed"),
-        TaskItemState::DependencyFailed => dependency_failed_label(failed_dependencies),
-        TaskItemState::PendingRun => Cow::Borrowed("pending run"),
+        TaskState::Pending => Cow::Borrowed("pending"),
+        TaskState::Building => Cow::Borrowed("building"),
+        TaskState::Running => Cow::Borrowed("running"),
+        TaskState::Completed => Cow::Borrowed("completed"),
+        TaskState::Skipped => Cow::Borrowed("skipped"),
+        TaskState::Failed => Cow::Borrowed("failed"),
+        TaskState::DependencyFailed => dependency_failed_label(failed_dependencies),
+        TaskState::PendingRun => Cow::Borrowed("pending run"),
     }
 }
 
@@ -958,13 +958,13 @@ fn service_state_color(state: ServiceState) -> Color {
     }
 }
 
-fn task_state_color(state: TaskItemState) -> Color {
+fn task_state_color(state: TaskState) -> Color {
     match state {
-        TaskItemState::Completed | TaskItemState::Skipped => Color::Green,
-        TaskItemState::Running | TaskItemState::Pending | TaskItemState::Building => Color::Yellow,
-        TaskItemState::PendingRun => Color::Cyan,
-        TaskItemState::Failed => Color::Red,
-        TaskItemState::DependencyFailed => Color::Rgb(150, 60, 60),
+        TaskState::Completed | TaskState::Skipped => Color::Green,
+        TaskState::Running | TaskState::Pending | TaskState::Building => Color::Yellow,
+        TaskState::PendingRun => Color::Cyan,
+        TaskState::Failed => Color::Red,
+        TaskState::DependencyFailed => Color::Rgb(150, 60, 60),
     }
 }
 
@@ -1436,7 +1436,7 @@ mod tests {
         });
         app.apply_task_state(
             "configure-everything".to_string(),
-            TaskItemState::DependencyFailed,
+            TaskState::DependencyFailed,
             None,
             vec!["configure-kafka-topics".to_string()],
         );
@@ -1548,7 +1548,7 @@ mod tests {
     fn task_table_row_shows_last_run_result_and_duration() {
         let item = TaskStatusItem {
             name: "lint".to_string(),
-            state: TaskItemState::Completed,
+            state: TaskState::Completed,
             failed_dependencies: Vec::new(),
             last_run: Some(TaskRunInfo {
                 finished_at_unix_secs: 0,

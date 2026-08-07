@@ -19,14 +19,14 @@ fn resolve_glob_pattern(base_dir: &Path, pattern: &str) -> String {
 }
 
 pub(crate) fn resolve_watch_ignore_patterns(
-    item_base_dir: &Path,
+    process_base_dir: &Path,
     item_ignore_patterns: &[String],
     workspace_base_dir: &Path,
     global_watch_ignore: &[String],
 ) -> Vec<String> {
     let mut patterns: Vec<String> = item_ignore_patterns
         .iter()
-        .map(|pattern| resolve_glob_pattern(item_base_dir, pattern))
+        .map(|pattern| resolve_glob_pattern(process_base_dir, pattern))
         .collect();
     patterns.extend(
         global_watch_ignore

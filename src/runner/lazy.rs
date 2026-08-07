@@ -5,13 +5,13 @@
 //! scheduler owns it just like any other service.
 
 use super::build_tools::BatchBuildOutcome;
-use super::{NodeKind, Runner, ServiceState};
+use super::{ProcessKind, Runner, ServiceState};
 
 impl Runner {
     /// Record the first proxy connection for a lazy service.
     ///
     /// Moving to `Pending` is the request: no parallel name set is needed, and
-    /// the normal pending-item scheduler can wait, cascade dependency failure,
+    /// the normal pending-process scheduler can wait, cascade dependency failure,
     /// and start the service when its dependencies become ready.
     pub(in crate::runner) fn handle_lazy_connection(&mut self, name: &str) {
         let deps = match self.services.get(name) {
@@ -66,14 +66,14 @@ impl Runner {
             return false;
         }
 
-        let item = match self.services.get(name) {
-            Some(rs) => self.build_batch_item(name, NodeKind::Service, rs),
+        let process = match self.services.get(name) {
+            Some(rs) => self.build_batch_item(name, ProcessKind::Service, rs),
             None => return false,
         };
         self.output_manager
             .service_event(name, "dependencies ready — building before start");
         self.set_service_state(name, ServiceState::Building);
-        self.spawn_lazy_build(name, item);
+        self.spawn_lazy_build(name, process);
         true
     }
 
@@ -100,8 +100,8 @@ impl Runner {
         }
         let replay_items = outcome.replay_items.clone();
         self.apply_batch_build_outcome(outcome);
-        if let Some(item) = replay_items.iter().find(|item| item.name == name) {
-            self.schedule_lazy_build_replay(item);
+        if let Some(process) = replay_items.iter().find(|process| process.name == name) {
+            self.schedule_lazy_build_replay(process);
         }
     }
 }

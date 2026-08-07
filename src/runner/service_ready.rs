@@ -7,7 +7,7 @@ impl Runner {
     /// and the health monitor; this side keeps the shadows attach and
     /// status read, makes the state transition, and remembers whether the
     /// start answers the dependency sweep. The ready outcome arrives later
-    /// as [`super::ItemReport::ServiceReady`], on the same channel as the
+    /// as [`super::ProcessReport::ServiceReady`], on the same channel as the
     /// wired report and from the same producer, so it can never be folded
     /// before this bookkeeping runs.
     pub(in crate::runner) async fn handle_service_wired(

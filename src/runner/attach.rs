@@ -80,8 +80,8 @@ impl Runner {
                 message: "no attachable process (not running, or no PTY)".to_string(),
             })?;
 
-        // Preload the client with a coherent repaint of the item's current
-        // screen, then stream live bytes — never a raw-byte replay. Items
+        // Preload the client with a coherent repaint of the process's current
+        // screen, then stream live bytes — never a raw-byte replay. Processes
         // whose screen never registered (emulator backend unavailable) fall
         // back to the last ring-buffer lines.
         let output_rx = match self.output_manager.emulator_repaint(name).await {

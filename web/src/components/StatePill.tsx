@@ -1,16 +1,16 @@
-import type { Item } from "../types";
+import type { Process } from "../types";
 
 /**
  * Group every state into one of four visual buckets.
  *
  * The point of the grid is answering "is anything wrong?" at a glance, so the
  * colour carries meaning and the label carries the detail. `dependency_failed`
- * reads as a warning rather than an error: the item didn't break, something it
+ * reads as a warning rather than an error: the process didn't break, something it
  * needed did, and the actual culprit is highlighted separately.
  */
-function tone(item: Item): "good" | "busy" | "bad" | "idle" {
-  if (item.kind === "service") {
-    switch (item.state) {
+function tone(process: Process): "good" | "busy" | "bad" | "idle" {
+  if (process.kind === "service") {
+    switch (process.state) {
       case "ready":
       case "lazy":
         return "good";
@@ -28,7 +28,7 @@ function tone(item: Item): "good" | "busy" | "bad" | "idle" {
         return "idle";
     }
   }
-  switch (item.state) {
+  switch (process.state) {
     case "completed":
       return "good";
     case "pending":
@@ -44,19 +44,19 @@ function tone(item: Item): "good" | "busy" | "bad" | "idle" {
 }
 
 /** Human-readable state text. */
-function label(item: Item): string {
-  if (item.kind === "service" && item.state === "dependencyfailed") {
+function label(process: Process): string {
+  if (process.kind === "service" && process.state === "dependencyfailed") {
     return "dep failed";
   }
-  return item.state.replace(/_/g, " ");
+  return process.state.replace(/_/g, " ");
 }
 
-export function StatePill({ item }: { item: Item }) {
+export function StatePill({ process }: { process: Process }) {
   return (
-    <span className={`pill pill-${tone(item)}`}>
-      {label(item)}
+    <span className={`pill pill-${tone(process)}`}>
+      {label(process)}
       {/* Tasks parked awaiting a manual trigger, matching the TUI's `*`. */}
-      {item.kind === "task" && item.state === "pending_run" && (
+      {process.kind === "task" && process.state === "pending_run" && (
         <span className="pill-flag" title="waiting for a manual run">
           *
         </span>

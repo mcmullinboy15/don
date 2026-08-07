@@ -353,7 +353,7 @@ impl Runner {
         // has run; both supervisor sets are idle (or their waits have
         // completed against killed processes) and can end now.
         // Abort-all-then-await keeps the 1s bound paid once, not once per
-        // item.
+        // process.
         let supervisors = self.service_starts.abort_all();
         for (_, handle) in supervisors {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
@@ -393,7 +393,7 @@ impl Runner {
         // those. Everything else is bookkeeping nobody needs mid-teardown.
         while let Ok(report) = self.report_rx.try_recv() {
             match report {
-                super::ItemReport::ServiceStartPrepared {
+                super::ProcessReport::ServiceStartPrepared {
                     name,
                     context,
                     result,
@@ -401,7 +401,7 @@ impl Runner {
                 } => {
                     self.stop_late_service_start(name, context, result).await;
                 }
-                super::ItemReport::TaskRunPrepared { name, result, .. } => {
+                super::ProcessReport::TaskRunPrepared { name, result, .. } => {
                     self.stop_late_task_start(name, result).await;
                 }
                 _ => {}

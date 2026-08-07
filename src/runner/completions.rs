@@ -326,8 +326,9 @@ pub(crate) fn parse_output(bytes: &[u8], parse: CompletionParse) -> Result<Vec<S
                 .as_array()
                 .ok_or_else(|| "expected top-level JSON array".to_string())?;
             arr.iter()
-                .map(|item| {
-                    item.as_str()
+                .map(|process| {
+                    process
+                        .as_str()
                         .map(|s| s.to_string())
                         .ok_or_else(|| "JSON array must contain strings".to_string())
                 })

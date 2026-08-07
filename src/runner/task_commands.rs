@@ -1,8 +1,8 @@
 use super::task_supervisor;
 use super::task_worker::TaskRunMode;
 use super::{
-    CommandError, CommandResult, Runner, RunnerEvent, RunnerInternalCommand, TaskItemState,
-    TaskRunIntent, TaskRunWaiter, resolve_task_params,
+    CommandError, CommandResult, Runner, RunnerEvent, RunnerInternalCommand, TaskRunIntent,
+    TaskRunWaiter, TaskState, resolve_task_params,
 };
 use crate::config::TaskAutoRun;
 use crate::duration::parse_duration;
@@ -135,7 +135,7 @@ impl Runner {
                 if let Some(message) = running_message {
                     self.output_manager.service_event(name, message);
                 }
-                self.set_task_state(name, TaskItemState::Running);
+                self.set_task_state(name, TaskState::Running);
             }
             TaskRunIntent::Background => {}
         }
@@ -146,8 +146,8 @@ impl Runner {
     /// `PendingRun`, `Skipped` and a preparation failure differ only in the
     /// state they land in, what they tell the dependency scheduler, and how
     /// loudly they say so — all of which live on the outcome. What stays here
-    /// is the part only the runner may do: transition item state, which wakes
-    /// the cross-item dependency sweep.
+    /// is the part only the runner may do: transition process state, which wakes
+    /// the cross-process dependency sweep.
     async fn settle_task_without_spawn(
         &mut self,
         name: &str,
@@ -241,7 +241,7 @@ impl Runner {
             });
         }
 
-        if matches!(state, TaskItemState::Running | TaskItemState::Building)
+        if matches!(state, TaskState::Running | TaskState::Building)
             && let Some(pgid) = pgid
         {
             self.stop_task_pgid(name, pgid).await?;
@@ -282,7 +282,7 @@ impl Runner {
         if self
             .tasks
             .get(name)
-            .is_some_and(|rt| rt.state() == TaskItemState::Building)
+            .is_some_and(|rt| rt.state() == TaskState::Building)
         {
             let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
                 name: name.to_string(),
@@ -302,7 +302,7 @@ impl Runner {
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.set_needs_run_now(true);
             }
-            self.set_task_state(name, TaskItemState::PendingRun);
+            self.set_task_state(name, TaskState::PendingRun);
             let message = match task_cfg.auto_run {
                 TaskAutoRun::Always => "files changed (pending)",
                 TaskAutoRun::Never => "files changed (pending — auto_run = false)",
@@ -323,7 +323,7 @@ impl Runner {
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.set_needs_run_now(true);
             }
-            self.set_task_state(name, TaskItemState::PendingRun);
+            self.set_task_state(name, TaskState::PendingRun);
             self.output_manager.service_event(
                 name,
                 "files changed (pending — task has params, run manually)",
@@ -366,7 +366,7 @@ impl Runner {
                 rt.last_params = params.clone();
                 rt.set_needs_run_now(true);
             }
-            self.set_task_state(name, TaskItemState::PendingRun);
+            self.set_task_state(name, TaskState::PendingRun);
             self.output_manager
                 .service_event(name, "pending — another foreground task owns the terminal");
             if let Some(reply) = wait_reply {
@@ -398,7 +398,7 @@ impl Runner {
         }
 
         self.output_manager.service_event(name, start_message);
-        self.set_task_state(name, TaskItemState::Running);
+        self.set_task_state(name, TaskState::Running);
 
         self.output_manager
             .service_debug_event(name, "spawning process...");
@@ -415,7 +415,7 @@ impl Runner {
                 }
             }
             Err(e) => {
-                self.set_task_state(name, TaskItemState::Failed);
+                self.set_task_state(name, TaskState::Failed);
                 self.output_manager
                     .service_error_event(name, &format!("failed to start: {e}"));
                 if let Some((reply, _)) = wait_reply {
@@ -494,7 +494,7 @@ impl Runner {
         self.tasks.iter().any(|(task_name, rt)| {
             task_name != name
                 && rt.config.terminal.is_foreground()
-                && rt.state() == TaskItemState::Running
+                && rt.state() == TaskState::Running
         })
     }
 
@@ -506,7 +506,7 @@ impl Runner {
         let pending: Vec<(String, crate::config::Task)> = self
             .tasks
             .iter()
-            .filter(|(_, rt)| rt.state() == TaskItemState::PendingRun)
+            .filter(|(_, rt)| rt.state() == TaskState::PendingRun)
             .map(|(name, rt)| (name.clone(), rt.config.clone()))
             .collect();
 
@@ -582,8 +582,7 @@ impl Runner {
         // Reject while already in flight — otherwise we'd race two spawns of
         // the same task and the output would interleave unpredictably.
         let already_in_flight = self.tasks.get(name).is_some_and(|rt| {
-            matches!(rt.state(), TaskItemState::Running | TaskItemState::Building)
-                || rt.run_requested
+            matches!(rt.state(), TaskState::Running | TaskState::Building) || rt.run_requested
         }) || self.task_supervisors.registry().is_busy(name);
         if already_in_flight {
             let _ = reply.send(Err(CommandError::InvalidState {

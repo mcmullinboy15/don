@@ -1165,9 +1165,9 @@ impl WatchManager {
                         // the owner re-queries the build tool asynchronously.
                         // Extract the service/task name by stripping "__graph" suffix.
                         item.state = WatchState::Idle;
-                        let item_name = build_graph_command_name(&name);
+                        let process_name = build_graph_command_name(&name);
                         (
-                            WatchSignal::BuildGraphChanged { name: item_name },
+                            WatchSignal::BuildGraphChanged { name: process_name },
                             "BuildGraphChanged",
                         )
                     }
@@ -2890,8 +2890,8 @@ bazel.target = "//services/api:api"
                     }
                     WatchItemKind::BuildGraph => {
                         item.state = WatchState::Idle;
-                        let item_name = build_graph_command_name(&name);
-                        WatchSignal::BuildGraphChanged { name: item_name }
+                        let process_name = build_graph_command_name(&name);
+                        WatchSignal::BuildGraphChanged { name: process_name }
                     }
                 };
                 let _ = cmd_tx.send(cmd);

@@ -85,7 +85,7 @@ button.ghost:hover {
 
 .page-header {
   display: flex;
-  align-items: center;
+  align-processes: center;
   gap: 1rem;
   margin-bottom: 1.5rem;
 }
@@ -111,7 +111,7 @@ button.ghost:hover {
   display: grid;
   grid-template-columns: minmax(340px, 2fr) 3fr;
   gap: 1.25rem;
-  align-items: start;
+  align-processes: start;
 }
 
 @media (max-width: 900px) {
@@ -135,7 +135,7 @@ button.ghost:hover {
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
-  align-items: flex-start;
+  align-processes: flex-start;
   width: 100%;
   text-align: left;
   background: var(--surface);
@@ -161,49 +161,49 @@ button.ghost:hover {
   text-align: center;
 }
 
-/* --- item table --- */
+/* --- process table --- */
 
-.items {
+.processes {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
 }
 
-.items table {
+.processes table {
   width: 100%;
   border-collapse: collapse;
 }
 
-.items tr {
+.processes tr {
   cursor: pointer;
   border-bottom: 1px solid var(--border);
 }
 
-.items tr:last-child {
+.processes tr:last-child {
   border-bottom: none;
 }
 
-.items tr:hover {
+.processes tr:hover {
   background: var(--surface-hi);
 }
 
-.items tr.selected {
+.processes tr.selected {
   background: var(--surface-hi);
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
-.items td {
+.processes td {
   padding: 0.5rem 0.75rem;
   vertical-align: middle;
 }
 
-.item-name {
+.process-name {
   font-family: var(--mono);
   font-size: 0.9rem;
 }
 
-.item-actions {
+.process-actions {
   text-align: right;
   white-space: nowrap;
 }
@@ -296,7 +296,7 @@ button.ghost:hover {
 
 .logs-header {
   display: flex;
-  align-items: center;
+  align-processes: center;
   justify-content: space-between;
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
@@ -335,7 +335,7 @@ button.ghost:hover {
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
   display: grid;
-  place-items: center;
+  place-processes: center;
   padding: 1rem;
 }
 

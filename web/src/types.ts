@@ -25,8 +25,8 @@ export type ServiceState =
   | "failed"
   | "dependencyfailed";
 
-/** Task states, from `runner::TaskItemState`. */
-export type TaskState =
+/** Task states, from `runner::TaskState`. */
+export type TaskStateStore =
   | "pending"
   | "building"
   | "running"
@@ -73,8 +73,8 @@ export interface TaskRunInfo {
   message?: string;
 }
 
-/** One row of `GET /status` (`runner::ItemStatus`). */
-export type Item =
+/** One row of `GET /status` (`runner::ProcessStatus`). */
+export type Process =
   | {
       kind: "service";
       name: string;
@@ -85,7 +85,7 @@ export type Item =
   | {
       kind: "task";
       name: string;
-      state: TaskState;
+      state: TaskStateStore;
       failed_dependencies?: string[];
       last_run?: TaskRunInfo;
       verbose?: VerboseInfo;
@@ -103,7 +103,7 @@ export type RunnerEvent =
   | {
       type: "task_state_changed";
       name: string;
-      state: TaskState;
+      state: TaskStateStore;
       last_run: TaskRunInfo | null;
       failed_dependencies: string[];
     }

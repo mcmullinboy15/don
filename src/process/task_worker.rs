@@ -1,8 +1,8 @@
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ensure_download_for_config_worker;
-use super::task_process as task;
+use super::task;
 use crate::config::{Platform, TaskAutoRun};
-use crate::task_state::{TaskHashProgress, TaskState};
+use crate::task_state::{TaskHashProgress, TaskStateStore};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -83,7 +83,7 @@ struct StartupTaskInputs {
     needs_watch_run: bool,
     /// Whether the task has at least one recorded successful run.
     has_success: bool,
-    /// Whether any other item depends on this task.
+    /// Whether any other process depends on this task.
     has_dependents: bool,
 }
 
@@ -193,7 +193,7 @@ pub(crate) async fn run_task_worker(
             &base_dir,
             &global_watch_ignore,
         );
-        let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
+        let task_state = TaskStateStore::new(base_dir.join(".don").join("task-state"));
         let needs_watch_run = if has_watch {
             let check_started = Instant::now();
             emitter.service_debug_event(

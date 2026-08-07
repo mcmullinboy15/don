@@ -1,5 +1,5 @@
 //! The command/reply vocabulary shared by the client, server, runner, and
-//! item supervisors. Lives at the crate root so `crate::item` can carry
+//! process supervisors. Lives at the crate root so `crate::process` can carry
 //! reply channels without importing the runner.
 
 /// Result of a user-initiated command (Start/Stop/Restart).

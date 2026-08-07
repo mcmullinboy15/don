@@ -6,7 +6,7 @@
  * on the same machine.
  */
 
-import type { Item, PortManifest, Project } from "./types";
+import type { Process, PortManifest, Project } from "./types";
 
 /** An API call that came back non-2xx, carrying the server's message. */
 export class ApiError extends Error {
@@ -52,8 +52,8 @@ export const api = {
     request<{ projects: Project[] }>("/projects").then((r) => r.projects),
 
   status: (projectId: string) =>
-    request<{ items: Item[] }>(`/projects/${projectId}/status?verbose=true`).then(
-      (r) => r.items,
+    request<{ processes: Process[] }>(`/projects/${projectId}/status?verbose=true`).then(
+      (r) => r.processes,
     ),
 
   ports: (projectId: string) =>

@@ -13,7 +13,7 @@ use super::failure_summary::{self, FailureSummaryItem};
 use super::filter::FilterState;
 use super::form::FormState;
 use super::status_table::{StatusTableState, retain_fuzzy_matches};
-use crate::client::{ServiceState, TaskItemState};
+use crate::client::{ServiceState, TaskState};
 use crate::config::Task;
 use crate::output::{FormattedLogLine, LIFECYCLE_EVENT_NAME};
 use crate::task_state::TaskRunInfo;
@@ -61,7 +61,7 @@ pub(crate) struct OverlayItem {
 #[derive(Debug, Clone)]
 pub(crate) struct TaskStatusItem {
     pub(crate) name: String,
-    pub(crate) state: TaskItemState,
+    pub(crate) state: TaskState,
     pub(crate) failed_dependencies: Vec<String>,
     pub(crate) last_run: Option<TaskRunInfo>,
     pub(crate) has_params: bool,
@@ -88,18 +88,18 @@ impl TaskStatusItem {
     }
 
     pub(crate) fn runnable(&self) -> bool {
-        !matches!(self.state, TaskItemState::Running | TaskItemState::Building)
+        !matches!(self.state, TaskState::Running | TaskState::Building)
     }
 
     fn sort_bucket(&self) -> u8 {
         match self.state {
-            TaskItemState::Failed => 0,
-            TaskItemState::DependencyFailed => 1,
-            TaskItemState::PendingRun => 2,
-            TaskItemState::Running | TaskItemState::Building => 3,
-            TaskItemState::Pending => 4,
-            TaskItemState::Completed => 5,
-            TaskItemState::Skipped => 6,
+            TaskState::Failed => 0,
+            TaskState::DependencyFailed => 1,
+            TaskState::PendingRun => 2,
+            TaskState::Running | TaskState::Building => 3,
+            TaskState::Pending => 4,
+            TaskState::Completed => 5,
+            TaskState::Skipped => 6,
         }
     }
 }
@@ -154,7 +154,7 @@ impl StatusCounts {
     /// rejoins the count.
     pub(crate) fn from_state(
         services: &HashMap<String, ServiceState>,
-        tasks: &HashMap<String, TaskItemState>,
+        tasks: &HashMap<String, TaskState>,
     ) -> Self {
         let mut counts = Self::default();
         for state in services.values() {
@@ -180,9 +180,9 @@ impl StatusCounts {
         }
         for state in tasks.values() {
             match state {
-                TaskItemState::PendingRun => counts.tasks_pending_run += 1,
-                TaskItemState::Running => counts.tasks_running += 1,
-                TaskItemState::Failed | TaskItemState::DependencyFailed => counts.tasks_failed += 1,
+                TaskState::PendingRun => counts.tasks_pending_run += 1,
+                TaskState::Running => counts.tasks_running += 1,
+                TaskState::Failed | TaskState::DependencyFailed => counts.tasks_failed += 1,
                 _ => {}
             }
         }
@@ -222,7 +222,7 @@ pub(crate) struct App {
     /// in `ServiceState::Pending` so the bar shows `0/N ready` from frame 1.
     pub(crate) services_state: HashMap<String, ServiceState>,
     pub(crate) service_pids: HashMap<String, Option<i32>>,
-    pub(crate) tasks_state: HashMap<String, TaskItemState>,
+    pub(crate) tasks_state: HashMap<String, TaskState>,
     failed_dependencies: HashMap<String, Vec<String>>,
     pub(crate) tasks_last_run: HashMap<String, TaskRunInfo>,
     pub(crate) update_badge: Option<UpdateBadge>,
@@ -280,9 +280,9 @@ impl App {
             .collect();
         let service_pids: HashMap<String, Option<i32>> =
             service_names.iter().map(|n| (n.clone(), None)).collect();
-        let tasks_state: HashMap<String, TaskItemState> = task_names
+        let tasks_state: HashMap<String, TaskState> = task_names
             .iter()
-            .map(|n| (n.clone(), TaskItemState::Pending))
+            .map(|n| (n.clone(), TaskState::Pending))
             .collect();
 
         let mut all_filter_names = service_names;
@@ -482,11 +482,11 @@ impl App {
     pub(crate) fn apply_task_state(
         &mut self,
         name: String,
-        state: TaskItemState,
+        state: TaskState,
         last_run: Option<TaskRunInfo>,
         failed_dependencies: Vec<String>,
     ) -> bool {
-        let filter_changed = state == TaskItemState::Failed
+        let filter_changed = state == TaskState::Failed
             && self.auto_filter_on_failure_names.contains(&name)
             && self.filter.select_name(&name);
         self.tasks_state.insert(name.clone(), state);
@@ -511,9 +511,9 @@ impl App {
     /// failure is edge-triggered, and re-firing it here for every service that
     /// is already failed would yank the user's filter out from under them.
     pub(crate) fn resync_from(&mut self, snapshot: &crate::client::StateSnapshot) {
-        for item in &snapshot.items {
-            match item {
-                crate::client::ItemStatus::Service {
+        for status in &snapshot.processes {
+            match status {
+                crate::client::ProcessStatus::Service {
                     name,
                     state,
                     failed_dependencies,
@@ -529,7 +529,7 @@ impl App {
                     self.services_state.insert(name.clone(), *state);
                     self.apply_failed_dependencies(name.clone(), failed_dependencies.clone());
                 }
-                crate::client::ItemStatus::Task {
+                crate::client::ProcessStatus::Task {
                     name,
                     state,
                     failed_dependencies,
@@ -673,7 +673,7 @@ mod tests {
         entries.iter().map(|(n, s)| (n.to_string(), *s)).collect()
     }
 
-    fn tasks(entries: &[(&str, TaskItemState)]) -> HashMap<String, TaskItemState> {
+    fn tasks(entries: &[(&str, TaskState)]) -> HashMap<String, TaskState> {
         entries.iter().map(|(n, s)| (n.to_string(), *s)).collect()
     }
 
@@ -703,16 +703,16 @@ mod tests {
         app.apply_service_runtime(name.to_string(), state, pid, Vec::new())
     }
 
-    fn apply_task(app: &mut App, name: &str, state: TaskItemState) -> bool {
+    fn apply_task(app: &mut App, name: &str, state: TaskState) -> bool {
         app.apply_task_state(name.to_string(), state, None, Vec::new())
     }
 
     #[test]
     fn resync_from_replaces_drifted_state() {
-        use crate::client::{ItemStatus, StateSnapshot};
+        use crate::client::{ProcessStatus, StateSnapshot};
 
-        fn snapshot_service(name: &str, state: ServiceState) -> ItemStatus {
-            ItemStatus::Service {
+        fn snapshot_service(name: &str, state: ServiceState) -> ProcessStatus {
+            ProcessStatus::Service {
                 name: name.to_string(),
                 state,
                 failed_dependencies: Vec::new(),
@@ -724,7 +724,7 @@ mod tests {
             name: &'static str,
             /// State the app believes, applied from events before the lag.
             before: Vec<(&'static str, ServiceState, Option<i32>)>,
-            snapshot: Vec<ItemStatus>,
+            snapshot: Vec<ProcessStatus>,
             want_states: Vec<(&'static str, ServiceState)>,
             want_pids: Vec<(&'static str, Option<i32>)>,
             want_counts_ready: usize,
@@ -773,7 +773,7 @@ mod tests {
             }
 
             app.resync_from(&StateSnapshot {
-                items: case.snapshot,
+                processes: case.snapshot,
                 startup_complete: true,
             });
 
@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn resync_does_not_fire_the_auto_filter_on_already_failed_items() {
-        use crate::client::{ItemStatus, StateSnapshot};
+        use crate::client::{ProcessStatus, StateSnapshot};
 
         // Auto-filter-on-failure is edge-triggered. Resyncing is not an edge:
         // re-selecting every already-failed service would yank the user's
@@ -816,7 +816,7 @@ mod tests {
         let before = app.filter.clone();
 
         app.resync_from(&StateSnapshot {
-            items: vec![ItemStatus::Service {
+            processes: vec![ProcessStatus::Service {
                 name: "api".to_string(),
                 state: ServiceState::Failed,
                 failed_dependencies: Vec::new(),
@@ -838,7 +838,7 @@ mod tests {
         struct Case {
             name: &'static str,
             services: Vec<(&'static str, ServiceState)>,
-            tasks: Vec<(&'static str, TaskItemState)>,
+            tasks: Vec<(&'static str, TaskState)>,
             want: StatusCounts,
         }
 
@@ -876,11 +876,11 @@ mod tests {
                     ("cache", ServiceState::Lazy),
                 ],
                 tasks: vec![
-                    ("migrate", TaskItemState::PendingRun),
-                    ("seed", TaskItemState::Completed),
-                    ("backup", TaskItemState::PendingRun),
-                    ("build", TaskItemState::Running),
-                    ("lint", TaskItemState::Failed),
+                    ("migrate", TaskState::PendingRun),
+                    ("seed", TaskState::Completed),
+                    ("backup", TaskState::PendingRun),
+                    ("build", TaskState::Running),
+                    ("lint", TaskState::Failed),
                 ],
                 want: StatusCounts {
                     services_total: 3, // cache (Lazy) doesn't count
@@ -1032,7 +1032,7 @@ mod tests {
         app.filter.toggle_highlighted(); // clear all
         app.filter.commit();
 
-        let changed = apply_task(&mut app, "lint", TaskItemState::Failed);
+        let changed = apply_task(&mut app, "lint", TaskState::Failed);
 
         assert!(changed);
         assert!(app.should_render_log("lint", false));
@@ -1142,7 +1142,7 @@ mod tests {
         struct Case {
             name: &'static str,
             services: Vec<(&'static str, ServiceState)>,
-            tasks: Vec<(&'static str, TaskItemState)>,
+            tasks: Vec<(&'static str, TaskState)>,
             want: Vec<&'static str>,
         }
 
@@ -1159,12 +1159,12 @@ mod tests {
                 ("svc-stopping", ServiceState::Stopping),
             ],
             tasks: vec![
-                ("task-skipped", TaskItemState::Skipped),
-                ("task-completed", TaskItemState::Completed),
-                ("task-building", TaskItemState::Building),
-                ("task-pending-run", TaskItemState::PendingRun),
-                ("task-failed", TaskItemState::Failed),
-                ("task-dep", TaskItemState::DependencyFailed),
+                ("task-skipped", TaskState::Skipped),
+                ("task-completed", TaskState::Completed),
+                ("task-building", TaskState::Building),
+                ("task-pending-run", TaskState::PendingRun),
+                ("task-failed", TaskState::Failed),
+                ("task-dep", TaskState::DependencyFailed),
             ],
             want: vec![
                 "svc-failed",
@@ -1267,10 +1267,10 @@ mod tests {
                 "running".into(),
             ],
         );
-        apply_task(&mut app, "completed", TaskItemState::Completed);
-        apply_task(&mut app, "failed", TaskItemState::Failed);
-        apply_task(&mut app, "pending-run", TaskItemState::PendingRun);
-        apply_task(&mut app, "running", TaskItemState::Running);
+        apply_task(&mut app, "completed", TaskState::Completed);
+        apply_task(&mut app, "failed", TaskState::Failed);
+        apply_task(&mut app, "pending-run", TaskState::PendingRun);
+        apply_task(&mut app, "running", TaskState::Running);
         app.tasks_last_run.insert(
             "completed".into(),
             TaskRunInfo {

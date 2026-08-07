@@ -7,7 +7,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, RunnerCommand, RunnerEvent, TaskItemState};
+use don::runner::{Runner, RunnerCommand, RunnerEvent, TaskState};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::collections::HashMap;
@@ -102,7 +102,7 @@ async fn make_runner(
 async fn wait_for_task_state(
     events: &mut broadcast::Receiver<RunnerEvent>,
     task_name: &str,
-    target: TaskItemState,
+    target: TaskState,
 ) -> bool {
     loop {
         match events.recv().await {
@@ -199,7 +199,7 @@ default = "100"
 
         // Wait for completion.
         assert!(
-            wait_for_task_state(&mut events, "sync", TaskItemState::Completed).await,
+            wait_for_task_state(&mut events, "sync", TaskState::Completed).await,
             "task didn't reach Completed"
         );
 
@@ -269,7 +269,7 @@ default = "100"
         reply_rx.await.unwrap().unwrap();
 
         assert!(
-            wait_for_task_state(&mut events, "sync", TaskItemState::Completed).await,
+            wait_for_task_state(&mut events, "sync", TaskState::Completed).await,
             "task didn't reach Completed"
         );
 
@@ -333,7 +333,7 @@ auto_run = false
         reply_rx.await.unwrap().unwrap();
 
         assert!(
-            wait_for_task_state(&mut events, "plain", TaskItemState::Completed).await,
+            wait_for_task_state(&mut events, "plain", TaskState::Completed).await,
             "task didn't complete"
         );
         let captured = std::fs::read_to_string(&out_path).unwrap();
@@ -380,11 +380,11 @@ auto_run = false
                 .unwrap();
             reply_rx.await.unwrap().unwrap();
             assert!(
-                wait_for_task_state(&mut events, "plain", TaskItemState::Running).await,
+                wait_for_task_state(&mut events, "plain", TaskState::Running).await,
                 "task didn't reach Running"
             );
             assert!(
-                wait_for_task_state(&mut events, "plain", TaskItemState::Completed).await,
+                wait_for_task_state(&mut events, "plain", TaskState::Completed).await,
                 "task didn't reach Completed"
             );
         }
@@ -546,7 +546,7 @@ auto_run = false
             })
             .unwrap();
         assert!(
-            wait_for_task_state(&mut events, "long", TaskItemState::Running).await,
+            wait_for_task_state(&mut events, "long", TaskState::Running).await,
             "task did not start"
         );
 
@@ -613,7 +613,7 @@ required = true
             .unwrap();
         reply_rx.await.unwrap().unwrap();
         assert!(
-            wait_for_task_state(&mut events, "sync", TaskItemState::Running).await,
+            wait_for_task_state(&mut events, "sync", TaskState::Running).await,
             "task didn't reach Running"
         );
         assert!(
@@ -781,8 +781,8 @@ name = "x"
                     if name == "interactive" =>
                 {
                     match state {
-                        TaskItemState::Skipped => saw_skipped = true,
-                        TaskItemState::Running | TaskItemState::Completed => saw_run = true,
+                        TaskState::Skipped => saw_skipped = true,
+                        TaskState::Running | TaskState::Completed => saw_run = true,
                         _ => {}
                     }
                 }

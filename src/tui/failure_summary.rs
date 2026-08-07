@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
-use crate::client::{ServiceState, TaskItemState};
+use crate::client::{ServiceState, TaskState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FailureKind {
@@ -39,22 +39,19 @@ pub(crate) struct FailureSummaryItem {
 
 pub(crate) fn has_failures(
     services: &HashMap<String, ServiceState>,
-    tasks: &HashMap<String, TaskItemState>,
+    tasks: &HashMap<String, TaskState>,
 ) -> bool {
     services
         .values()
         .any(|state| matches!(state, ServiceState::Failed | ServiceState::DependencyFailed))
-        || tasks.values().any(|state| {
-            matches!(
-                state,
-                TaskItemState::Failed | TaskItemState::DependencyFailed
-            )
-        })
+        || tasks
+            .values()
+            .any(|state| matches!(state, TaskState::Failed | TaskState::DependencyFailed))
 }
 
 pub(crate) fn collect(
     services: &HashMap<String, ServiceState>,
-    tasks: &HashMap<String, TaskItemState>,
+    tasks: &HashMap<String, TaskState>,
     failed_dependencies: &HashMap<String, Vec<String>>,
 ) -> Vec<FailureSummaryItem> {
     let mut items = Vec::new();
@@ -73,8 +70,8 @@ pub(crate) fn collect(
     }));
     items.extend(tasks.iter().filter_map(|(name, state)| {
         let state = match state {
-            TaskItemState::Failed => FailureState::Failed,
-            TaskItemState::DependencyFailed => FailureState::DependencyFailed,
+            TaskState::Failed => FailureState::Failed,
+            TaskState::DependencyFailed => FailureState::DependencyFailed,
             _ => return None,
         };
         Some(summary_item(
@@ -189,8 +186,8 @@ mod tests {
             ("web".to_string(), ServiceState::Ready),
         ]);
         let tasks = HashMap::from([
-            ("bootstrap".to_string(), TaskItemState::Failed),
-            ("seed".to_string(), TaskItemState::DependencyFailed),
+            ("bootstrap".to_string(), TaskState::Failed),
+            ("seed".to_string(), TaskState::DependencyFailed),
         ]);
         let dependencies = HashMap::from([
             ("api".to_string(), vec!["bootstrap".to_string()]),

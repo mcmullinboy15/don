@@ -1,4 +1,4 @@
-use super::service_process as service;
+use super::service;
 use tokio::sync::{mpsc, oneshot};
 
 /// Render an unexpected-exit lifecycle message from the reaped status.
@@ -42,7 +42,7 @@ pub(crate) fn unhealthy_restart_backoff_secs(attempt: u32) -> u64 {
 pub(crate) async fn run_health_monitor(
     name: String,
     ready: crate::config::ReadyCheck,
-    report_tx: mpsc::UnboundedSender<super::ItemReport>,
+    report_tx: mpsc::UnboundedSender<super::ProcessReport>,
     mut cancel: oneshot::Receiver<()>,
 ) {
     let interval_str = ready.monitor_interval.as_str();
@@ -65,7 +65,7 @@ pub(crate) async fn run_health_monitor(
                 consecutive_failures = 0;
                 if currently_unhealthy {
                     currently_unhealthy = false;
-                    let _ = report_tx.send(super::ItemReport::HealthChanged {
+                    let _ = report_tx.send(super::ProcessReport::HealthChanged {
                         name: name.clone(),
                         healthy: true,
                     });
@@ -75,7 +75,7 @@ pub(crate) async fn run_health_monitor(
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 if !currently_unhealthy && consecutive_failures >= unhealthy_after {
                     currently_unhealthy = true;
-                    let _ = report_tx.send(super::ItemReport::HealthChanged {
+                    let _ = report_tx.send(super::ProcessReport::HealthChanged {
                         name: name.clone(),
                         healthy: false,
                     });

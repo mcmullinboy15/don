@@ -407,16 +407,16 @@ pub async fn run_tui(
                     Some(EventStreamItem::Event(event)) => {
                         Some(apply_runner_event(event, &mut app))
                     }
-                    Some(EventStreamItem::Snapshot { items, startup_complete }) => {
+                    Some(EventStreamItem::Snapshot { processes, startup_complete }) => {
                         // The stream's opening record — the authoritative
                         // state at connect time. Later events are newer or
                         // equal, so applying them after this is safe.
-                        app.resync_from(&StateSnapshot { items, startup_complete });
+                        app.resync_from(&StateSnapshot { processes, startup_complete });
                         Some(false)
                     }
                     Some(EventStreamItem::Lagged(_)) => {
                         // Transitions were dropped, so the incremental view
-                        // is wrong about an unknown set of items and would
+                        // is wrong about an unknown set of processes and would
                         // stay wrong. Refetch the projection off-loop and
                         // inject it as an input event — awaiting here would
                         // wedge rendering behind a slow server.
@@ -769,11 +769,11 @@ fn handle_app_event(
             }
         }
         AppEvent::StateResync {
-            items,
+            processes,
             startup_complete,
         } => {
             app.resync_from(&StateSnapshot {
-                items,
+                processes,
                 startup_complete,
             });
             if let Some(m) = modal.as_mut() {
@@ -1376,13 +1376,13 @@ fn spawn_state_resync(client: &std::sync::Arc<Client>) {
     };
     let client = client.clone();
     tokio::spawn(async move {
-        let Ok(items) = client.status(false, None).await else {
+        let Ok(processes) = client.status(false, None).await else {
             return;
         };
         let startup_complete = client.ready().await.unwrap_or(false);
         let _ = input_tx
             .send(AppEvent::StateResync {
-                items,
+                processes,
                 startup_complete,
             })
             .await;

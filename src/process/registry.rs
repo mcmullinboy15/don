@@ -1,4 +1,4 @@
-//! The shape shared by every per-item supervisor.
+//! The shape shared by every per-process supervisor.
 //!
 //! Services and tasks both ended up with the same three pieces — a mailbox, a
 //! busy flag, and a join handle — differing only in the message they carry.
@@ -6,17 +6,17 @@
 //!
 //! The split is by **capability**, and it is the point of the module:
 //!
-//! - [`ItemRegistry`] is clone-able and send-only. It addresses an item and
+//! - [`ProcessRegistry`] is clone-able and send-only. It addresses an process and
 //!   has no method that creates or destroys one, so handing it to the file
-//!   watcher or the API widens what can ask an item to do something without
-//!   widening what can change the set of items.
+//!   watcher or the API widens what can ask an process to do something without
+//!   widening what can change the set of processes.
 //! - [`Supervisors`] holds the join handles, so *ending* a supervisor stays
-//!   with whoever owns the item set.
+//!   with whoever owns the process set.
 //!
 //! The registry is a plain `Arc<HashMap<_, _>>` with no lock, and it can be
-//! because the item set is fixed at construction (see
+//! because the process set is fixed at construction (see
 //! `setup::build_runtime_maps`). There is no insert and no remove, so there is
-//! nothing to synchronise. If items ever became dynamic this needs the
+//! nothing to synchronise. If processes ever became dynamic this needs the
 //! [`StateWriter`]/[`StateReader`] treatment rather than a mutex.
 //!
 //! [`StateWriter`]: super::state_store::StateWriter
@@ -27,15 +27,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
-/// Send-only handle to one item's supervisor.
-pub(crate) struct ItemHandle<M> {
+/// Send-only handle to one process's supervisor.
+pub(crate) struct ProcessHandle<M> {
     tx: mpsc::UnboundedSender<M>,
     busy: Arc<AtomicBool>,
 }
 
 // Derived `Clone` would demand `M: Clone`, which is wrong — the handle clones
 // a sender, never a message.
-impl<M> Clone for ItemHandle<M> {
+impl<M> Clone for ProcessHandle<M> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
@@ -44,12 +44,12 @@ impl<M> Clone for ItemHandle<M> {
     }
 }
 
-impl<M> ItemHandle<M> {
+impl<M> ProcessHandle<M> {
     /// Queue work. Fails only once the supervisor is gone (shutdown).
     ///
-    /// Marks the item busy before sending, not after the supervisor picks the
+    /// Marks the process busy before sending, not after the supervisor picks the
     /// request up — otherwise a caller could queue work and immediately be
-    /// told the item is idle.
+    /// told the process is idle.
     pub(crate) fn request(&self, message: M) -> bool {
         self.busy.store(true, Ordering::Relaxed);
         let sent = self.tx.send(message).is_ok();
@@ -65,12 +65,12 @@ impl<M> ItemHandle<M> {
     }
 }
 
-/// Every item's mailbox, addressable by name.
-pub(crate) struct ItemRegistry<M> {
-    handles: Arc<HashMap<String, ItemHandle<M>>>,
+/// Every process's mailbox, addressable by name.
+pub(crate) struct ProcessRegistry<M> {
+    handles: Arc<HashMap<String, ProcessHandle<M>>>,
 }
 
-impl<M> Clone for ItemRegistry<M> {
+impl<M> Clone for ProcessRegistry<M> {
     fn clone(&self) -> Self {
         Self {
             handles: Arc::clone(&self.handles),
@@ -78,16 +78,16 @@ impl<M> Clone for ItemRegistry<M> {
     }
 }
 
-impl<M> ItemRegistry<M> {
-    /// The mailbox for `name`, or `None` if it isn't an item of this kind.
-    pub(crate) fn get(&self, name: &str) -> Option<&ItemHandle<M>> {
+impl<M> ProcessRegistry<M> {
+    /// The mailbox for `name`, or `None` if it isn't an process of this kind.
+    pub(crate) fn get(&self, name: &str) -> Option<&ProcessHandle<M>> {
         self.handles.get(name)
     }
 
     /// Whether `name` has work queued or in progress. `false` for an unknown
     /// name, which is what callers asking "may I start this?" want.
     pub(crate) fn is_busy(&self, name: &str) -> bool {
-        self.get(name).is_some_and(ItemHandle::is_busy)
+        self.get(name).is_some_and(ProcessHandle::is_busy)
     }
 
     /// Names with work queued or in progress.
@@ -101,7 +101,7 @@ impl<M> ItemRegistry<M> {
 
 /// The owner half: the supervisor tasks themselves.
 pub(crate) struct Supervisors<M> {
-    registry: ItemRegistry<M>,
+    registry: ProcessRegistry<M>,
     joins: Vec<(String, tokio::task::JoinHandle<()>)>,
 }
 
@@ -125,33 +125,33 @@ impl<M: Send + 'static> Supervisors<M> {
             let (tx, rx) = mpsc::unbounded_channel();
             let busy = Arc::new(AtomicBool::new(false));
             let join = tokio::spawn(body(name.clone(), rx, Arc::clone(&busy)));
-            handles.insert(name.clone(), ItemHandle { tx, busy });
+            handles.insert(name.clone(), ProcessHandle { tx, busy });
             joins.push((name.clone(), join));
         }
         Self {
-            registry: ItemRegistry {
+            registry: ProcessRegistry {
                 handles: Arc::new(handles),
             },
             joins,
         }
     }
 
-    /// The addressing half, for handing to anything that needs to ask an item
+    /// The addressing half, for handing to anything that needs to ask an process
     /// to do something.
-    pub(crate) fn registry(&self) -> &ItemRegistry<M> {
+    pub(crate) fn registry(&self) -> &ProcessRegistry<M> {
         &self.registry
     }
 
     /// Cancel every supervisor, returning the handles to await.
     ///
     /// Deliberately *not* an `async fn` that also waits: shutdown has to fire
-    /// every abort before waiting on any of them, or a project with N items
+    /// every abort before waiting on any of them, or a project with N processes
     /// pays the timeout N times over instead of once. Every teardown loop in
     /// `shutdown.rs` has that shape.
     ///
     /// Nothing needs to drop the registry first: the receiver lives inside the
     /// supervisor future, so aborting it drops the receiver, and every
-    /// outstanding [`ItemHandle`] — including clones held elsewhere — starts
+    /// outstanding [`ProcessHandle`] — including clones held elsewhere — starts
     /// reporting failure from `request`.
     pub(crate) fn abort_all(&mut self) -> Vec<(String, tokio::task::JoinHandle<()>)> {
         let joins = std::mem::take(&mut self.joins);

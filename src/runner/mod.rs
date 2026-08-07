@@ -30,26 +30,26 @@ mod support;
 mod task_commands;
 mod watch_link;
 
-// The per-item mechanism — supervisors, spawn/stop workers, health monitor,
-// ready resolution — lives in `crate::item` and imports nothing from here.
+// The per-process mechanism — supervisors, spawn/stop workers, health monitor,
+// ready resolution — lives in `crate::process` and imports nothing from here.
 // These aliases keep the runner's internal paths stable and the shared state
 // vocabulary on its public `don::runner::…` path.
 pub use crate::command::{CommandError, CommandResult};
-pub(crate) use crate::item::{ItemReport, NodeKind};
-pub(in crate::runner) use crate::item::{
+pub(crate) use crate::process::{ProcessKind, ProcessReport};
+pub(in crate::runner) use crate::process::{
     ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, health, paths,
     service_supervisor, service_worker, task_supervisor, task_worker,
 };
-pub use crate::item::{ServiceState, TaskItemState};
+pub use crate::process::{ServiceState, TaskState};
 
 pub(crate) use params::resolve_task_params;
-pub use profile::resolve_profile_items;
+pub use profile::resolve_profile_processes;
 pub use state_store::{StateReader, StateSnapshot};
 
 use crate::config::{Config, Platform, ShutdownConfig};
 use crate::output::OutputManager;
-use crate::sys::pid_file::PidFile;
 use crate::proxy::ConnectionPolicy;
+use crate::sys::pid_file::PidFile;
 use crate::watch::WatchManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -194,14 +194,14 @@ pub enum RunnerCommand {
     /// Re-run a task triggered by a file watch event.
     TaskRerun { name: String },
     /// Query the status of all services and tasks. When `name` is `Some`, only
-    /// that item is returned, with its full resolved watch path list included.
+    /// that process is returned, with its full resolved watch path list included.
     Status {
         verbose: bool,
         name: Option<String>,
-        reply: oneshot::Sender<Vec<ItemStatus>>,
+        reply: oneshot::Sender<Vec<ProcessStatus>>,
     },
     /// Query the global file-watch state — registered inotify directories and
-    /// per-item patterns. Replies `None` when no watches are active.
+    /// per-process patterns. Replies `None` when no watches are active.
     WatchStatus {
         reply: oneshot::Sender<Option<WatchReport>>,
     },
@@ -303,14 +303,14 @@ pub struct AttachSession {
     pub output_rx: mpsc::Receiver<crate::output::SinkLine>,
 }
 
-/// Status of a single item (service or task) for status queries.
+/// Status of a single process (service or task) for status queries.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub enum ItemStatus {
+pub enum ProcessStatus {
     Service {
         name: String,
         state: ServiceState,
-        /// Root service/task failures blocking this item.
+        /// Root service/task failures blocking this process.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         failed_dependencies: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,8 +318,8 @@ pub enum ItemStatus {
     },
     Task {
         name: String,
-        state: TaskItemState,
-        /// Root service/task failures blocking this item.
+        state: TaskState,
+        /// Root service/task failures blocking this process.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         failed_dependencies: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -391,7 +391,7 @@ impl ParamInfo {
 /// Extended information for verbose status display.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VerboseInfo {
-    /// Services/tasks this item depends on. Non-blocking (ordering-only)
+    /// Services/tasks this process depends on. Non-blocking (ordering-only)
     /// edges serialize as `{ name, blocking = false }`, blocking ones as a
     /// string.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -399,7 +399,7 @@ pub struct VerboseInfo {
     /// File watch patterns (explicit or resolved from build tool).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch: Vec<String>,
-    /// Number of file watch patterns resolved for this item.
+    /// Number of file watch patterns resolved for this process.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub watch_count: usize,
     /// Proxy entries, each formatted as `"addr (env=NAME)"` or
@@ -426,10 +426,10 @@ pub struct VerboseInfo {
     /// Run command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
-    /// Live watch-manager state for this item, if available.
+    /// Live watch-manager state for this process, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watch_state: Option<String>,
-    /// Extra watch diagnostics for this item.
+    /// Extra watch diagnostics for this process.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch_notes: Vec<String>,
 }
@@ -455,7 +455,7 @@ pub struct WatchReport {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub notify_error_count: u64,
     /// Count of runner-event broadcast-lag incidents (a non-zero value means an
-    /// item may be stuck mid-rebuild).
+    /// process may be stuck mid-rebuild).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub runner_event_lag_count: u64,
     /// Most recent notify backend error, if any.
@@ -471,7 +471,7 @@ pub struct WatchDir {
     pub mode: String,
 }
 
-/// Per-item entry in a [`WatchReport`].
+/// Per-process entry in a [`WatchReport`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WatchReportItem {
     pub name: String,
@@ -481,12 +481,12 @@ pub struct WatchReportItem {
     pub state: String,
     pub stale: bool,
     pub debounce_ms: u64,
-    /// Absolute glob patterns that trigger a rebuild/rerun for this item.
+    /// Absolute glob patterns that trigger a rebuild/rerun for this process.
     pub patterns: Vec<String>,
-    /// Item-specific ignore globs (workspace-wide ignores live on the report).
+    /// Process-specific ignore globs (workspace-wide ignores live on the report).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_patterns: Vec<String>,
-    /// Last watch-registration error for this item, if any.
+    /// Last watch-registration error for this process, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -495,21 +495,21 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
-/// Whether every service in `items` has reached an available state — `Ready`
+/// Whether every service in `processes` has reached an available state — `Ready`
 /// (passed its ready check) or `Lazy` (proxy bound, will spawn on first
 /// connection). Tasks are ignored: they are one-shot and do not gate stack
-/// readiness. An item set with no services is considered ready.
+/// readiness. An process set with no services is considered ready.
 ///
 /// This is the bool surfaced by `don status --json`, so scripts and agents can
 /// poll "is the whole stack up?" without parsing the human-readable table.
 /// Status only ever reports the active set (the started profile's subset), so
 /// services excluded by a profile do not drag this to `false`.
-pub fn all_services_ready(items: &[ItemStatus]) -> bool {
-    items.iter().all(|item| match item {
-        ItemStatus::Service { state, .. } => {
+pub fn all_services_ready(processes: &[ProcessStatus]) -> bool {
+    processes.iter().all(|process| match process {
+        ProcessStatus::Service { state, .. } => {
             matches!(state, ServiceState::Ready | ServiceState::Lazy)
         }
-        ItemStatus::Task { .. } => true,
+        ProcessStatus::Task { .. } => true,
     })
 }
 
@@ -535,7 +535,7 @@ pub enum RunnerEvent {
     /// A task changed state.
     TaskStateChanged {
         name: String,
-        state: TaskItemState,
+        state: TaskState,
         last_run: Option<crate::task_state::TaskRunInfo>,
         /// Root service/task failures when `state` is `DependencyFailed`.
         failed_dependencies: Vec<String>,
@@ -544,7 +544,7 @@ pub enum RunnerEvent {
     RebuildComplete { name: String, success: bool },
     /// A task re-run completed (file watch triggered).
     TaskRerunComplete { name: String, success: bool },
-    /// The initial startup sweep has decided every item — nothing is left
+    /// The initial startup sweep has decided every process — nothing is left
     /// merely being *considered*. Fires once per run.
     StartupSettled,
     /// Graceful shutdown has started.
@@ -591,9 +591,9 @@ pub struct Runner {
     /// Consolidated per-task runtime state.
     tasks: HashMap<String, RuntimeTask>,
 
-    /// The items' lossless report channel — see [`ItemReport`].
-    report_tx: mpsc::UnboundedSender<ItemReport>,
-    report_rx: mpsc::UnboundedReceiver<ItemReport>,
+    /// The processes' lossless report channel — see [`ProcessReport`].
+    report_tx: mpsc::UnboundedSender<ProcessReport>,
+    report_rx: mpsc::UnboundedReceiver<ProcessReport>,
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -611,13 +611,13 @@ pub struct Runner {
     /// The write half of the globally-readable state projection.
     ///
     /// Republished on every state transition, so other components can read
-    /// item state — and whether the initial startup sweep has settled —
+    /// process state — and whether the initial startup sweep has settled —
     /// without a command round trip. Not `Clone`: the runner is the only
     /// writer, and [`state_store`] enforces that by ownership rather than by
     /// convention.
     state: state_store::StateWriter,
 
-    /// Item-completion sender shared by dependency-scheduled starts and config
+    /// Process-completion sender shared by dependency-scheduled starts and config
     /// reload paths. Ready-check and task-completion callbacks send here.
     /// True once `run()`'s scheduler is live. Transitions before that
     /// (construction, setup) must not enqueue dependency sweeps.
@@ -743,9 +743,9 @@ impl Runner {
         }
         let docker_client = setup::connect_docker_if_needed(&config, platform)?;
 
-        let active_items = setup::resolve_active_items(&config, platform, profile)?;
-        let active_services = setup::filter_active_services(&config, active_items.as_ref());
-        let active_tasks = setup::filter_active_tasks(&config, active_items.as_ref());
+        let active_processes = setup::resolve_active_processes(&config, platform, profile)?;
+        let active_services = setup::filter_active_services(&config, active_processes.as_ref());
+        let active_tasks = setup::filter_active_tasks(&config, active_processes.as_ref());
 
         setup::prune_download_cache(&config, platform, &don_dir, &output_manager);
 
@@ -818,7 +818,7 @@ impl Runner {
                 emitter: output_manager.clone_lifecycle_emitter(),
                 shutdown: config.shutdown.clone(),
             },
-            &|name| output_manager.item_output(name),
+            &|name| output_manager.process_output(name),
             &report_tx,
             &mut proxies,
         );
@@ -833,7 +833,7 @@ impl Runner {
                 emitter: output_manager.clone_lifecycle_emitter(),
                 global_watch_ignore: config.watch_ignore.clone(),
             },
-            &|name| output_manager.item_output(name),
+            &|name| output_manager.process_output(name),
             &report_tx,
         );
 
@@ -879,7 +879,7 @@ impl Runner {
             manifest_writer_tx: Some(manifest_writer_tx),
             manifest_writer_handle: Some(manifest_writer_handle),
         };
-        // Seed the projection before anyone can read it. The item set is fixed
+        // Seed the projection before anyone can read it. The process set is fixed
         // at construction (see `setup::build_runtime_maps`), so from here on
         // every change is a state transition and republishing on those alone
         // is complete.
@@ -892,7 +892,7 @@ impl Runner {
     /// emit a [`RunnerEvent`] — a client can resync from one after missing the
     /// other and get a consistent answer.
     fn publish_state(&self) {
-        self.state.publish_items(self.status_projection(None));
+        self.state.publish_processes(self.status_projection(None));
     }
 
     /// Get a sender for sending commands to this runner.
@@ -1040,7 +1040,7 @@ impl Runner {
     }
 
     /// Transition a task to a new state and broadcast the change.
-    pub(crate) fn set_task_state(&mut self, name: &str, new_state: TaskItemState) {
+    pub(crate) fn set_task_state(&mut self, name: &str, new_state: TaskState) {
         let previous_state = self.tasks.get(name).map(RuntimeTask::state);
         let changed = self
             .tasks
@@ -1051,15 +1051,15 @@ impl Runner {
             if self.scheduler_live
                 && (matches!(
                     state,
-                    TaskItemState::Pending
-                        | TaskItemState::PendingRun
-                        | TaskItemState::Completed
-                        | TaskItemState::Skipped
-                        | TaskItemState::Failed
-                        | TaskItemState::DependencyFailed
+                    TaskState::Pending
+                        | TaskState::PendingRun
+                        | TaskState::Completed
+                        | TaskState::Skipped
+                        | TaskState::Failed
+                        | TaskState::DependencyFailed
                 ) || matches!(
                     previous_state,
-                    Some(TaskItemState::Failed | TaskItemState::DependencyFailed)
+                    Some(TaskState::Failed | TaskState::DependencyFailed)
                 ))
             {
                 self.schedule_start_pending();
@@ -1077,18 +1077,18 @@ impl Runner {
         let Some(rt) = self.tasks.get_mut(name) else {
             return false;
         };
-        let state_changed = rt.state() != TaskItemState::DependencyFailed;
+        let state_changed = rt.state() != TaskState::DependencyFailed;
         if !rt.mark_dependency_failed(dependencies) {
             return false;
         }
-        self.broadcast_task_state(name, TaskItemState::DependencyFailed);
+        self.broadcast_task_state(name, TaskState::DependencyFailed);
         if state_changed && self.scheduler_live {
             self.schedule_start_pending();
         }
         state_changed
     }
 
-    fn broadcast_task_state(&self, name: &str, state: TaskItemState) {
+    fn broadcast_task_state(&self, name: &str, state: TaskState) {
         let Some(rt) = self.tasks.get(name) else {
             return;
         };
@@ -1162,7 +1162,7 @@ impl Runner {
         self.server_shutdown_tx = Some(shutdown_tx);
     }
 
-    /// A read-only view of every item's state, updated on each transition.
+    /// A read-only view of every process's state, updated on each transition.
     ///
     /// Reads never queue behind the runner's command loop, so this is the
     /// right way to answer "what is running?" — reserve the [`Status`] command
@@ -1233,7 +1233,7 @@ impl Runner {
     ///
     /// This is the main entry point. It:
     /// 1. Builds a topological sort of the dependency graph.
-    /// 2. Starts items in parallel as their dependencies become satisfied.
+    /// 2. Starts processes in parallel as their dependencies become satisfied.
     /// 3. Processes commands from the mpsc channel.
     /// 4. Handles shutdown signals.
     pub async fn run(mut self) -> Result<(), RunnerError> {
@@ -1383,16 +1383,18 @@ impl Runner {
         // connection-triggered lazy starts, and non-build-tool services all
         // stay responsive while bazel crunches. On completion the task posts
         // `RunnerInternalCommand::BatchBuildComplete`, which transitions `Building`
-        // items to `Pending`/`Failed` and triggers the ready-item sweep.
+        // processes to `Pending`/`Failed` and triggers the ready-process sweep.
         //
         // The handle is stored as `AbortOnDrop` on `self` so `Shutdown` drops
         // the in-flight `Child`, whose `kill_on_drop(true)` sends SIGKILL to
         // the bazel client.
         let batch_items = self.collect_batch_build_items();
-        for item in &batch_items {
-            match item.kind {
-                NodeKind::Service => self.set_service_state(&item.name, ServiceState::Building),
-                NodeKind::Task => self.set_task_state(&item.name, TaskItemState::Building),
+        for process in &batch_items {
+            match process.kind {
+                ProcessKind::Service => {
+                    self.set_service_state(&process.name, ServiceState::Building)
+                }
+                ProcessKind::Task => self.set_task_state(&process.name, TaskState::Building),
             }
         }
         if !batch_items.is_empty() {
@@ -1407,10 +1409,10 @@ impl Runner {
         // sender on `self` so services requested later use the same path.
         self.scheduler_live = true;
 
-        // Initial non-lazy items already occupy Pending. A lazy connection
+        // Initial non-lazy processes already occupy Pending. A lazy connection
         // performs the same state transition and can join this scheduler at
         // any point, including while this first sweep is running.
-        self.start_pending_items().await;
+        self.start_pending_processes().await;
         let mut startup_complete = false;
 
         // Main loop: wait for completions, commands, and signals.
@@ -1520,7 +1522,7 @@ impl Runner {
                                 self.handle_task_rerun(&name).await;
                             }
                             RunnerCommand::StartPending => {
-                                self.start_pending_items().await;
+                                self.start_pending_processes().await;
                             }
                             RunnerCommand::RunPendingTasks { reply } => {
                                 self.handle_run_pending_tasks(reply).await;
@@ -1595,20 +1597,20 @@ impl Runner {
                             // Only the first connection acts: it moves Lazy →
                             // Pending, and the normal dependency scheduler
                             // owns the service from there.
-                            ItemReport::Demand { name } => self.handle_lazy_connection(&name),
-                            ItemReport::ServiceExited { name, pgid, status } => {
+                            ProcessReport::Demand { name } => self.handle_lazy_connection(&name),
+                            ProcessReport::ServiceExited { name, pgid, status } => {
                                 self.handle_service_exited(&name, pgid, status).await;
                             }
-                            ItemReport::RestartDue { name, attempt } => {
+                            ProcessReport::RestartDue { name, attempt } => {
                                 self.handle_auto_restart(&name, attempt).await;
                             }
-                            ItemReport::HealthChanged { name, healthy } => {
+                            ProcessReport::HealthChanged { name, healthy } => {
                                 self.handle_service_health_changed(&name, healthy).await;
                             }
-                            ItemReport::TaskExited(exit) => {
+                            ProcessReport::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
                             }
-                            ItemReport::ServiceStartPrepared {
+                            ProcessReport::ServiceStartPrepared {
                                 name,
                                 context,
                                 intent,
@@ -1617,7 +1619,7 @@ impl Runner {
                                 self.handle_service_start_prepared(&name, context, intent, result)
                                     .await;
                             }
-                            ItemReport::ServiceReady {
+                            ProcessReport::ServiceReady {
                                 name,
                                 success,
                                 message,
@@ -1626,10 +1628,10 @@ impl Runner {
                                 self.handle_service_ready_report(&name, success, message, had_check)
                                     .await;
                             }
-                            ItemReport::ServiceStopComplete { name, op_id, result } => {
+                            ProcessReport::ServiceStopComplete { name, op_id, result } => {
                                 self.handle_service_stop_complete(&name, op_id, result).await;
                             }
-                            ItemReport::TaskRunPrepared {
+                            ProcessReport::TaskRunPrepared {
                                 name,
                                 task_cfg,
                                 intent,
@@ -1727,16 +1729,16 @@ mod tests {
 
     #[test]
     fn all_services_ready_table() {
-        fn svc(state: ServiceState) -> ItemStatus {
-            ItemStatus::Service {
+        fn svc(state: ServiceState) -> ProcessStatus {
+            ProcessStatus::Service {
                 name: "s".to_string(),
                 state,
                 failed_dependencies: Vec::new(),
                 verbose: None,
             }
         }
-        fn task(state: TaskItemState) -> ItemStatus {
-            ItemStatus::Task {
+        fn task(state: TaskState) -> ProcessStatus {
+            ProcessStatus::Task {
                 name: "t".to_string(),
                 state,
                 failed_dependencies: Vec::new(),
@@ -1747,53 +1749,53 @@ mod tests {
 
         struct Case {
             name: &'static str,
-            items: Vec<ItemStatus>,
+            processes: Vec<ProcessStatus>,
             want: bool,
         }
         let cases = vec![
             Case {
                 name: "empty is ready",
-                items: vec![],
+                processes: vec![],
                 want: true,
             },
             Case {
                 name: "all ready",
-                items: vec![svc(ServiceState::Ready), svc(ServiceState::Ready)],
+                processes: vec![svc(ServiceState::Ready), svc(ServiceState::Ready)],
                 want: true,
             },
             Case {
                 name: "lazy counts as available",
-                items: vec![svc(ServiceState::Lazy), svc(ServiceState::Ready)],
+                processes: vec![svc(ServiceState::Lazy), svc(ServiceState::Ready)],
                 want: true,
             },
             Case {
                 name: "running is not yet ready",
-                items: vec![svc(ServiceState::Ready), svc(ServiceState::Running)],
+                processes: vec![svc(ServiceState::Ready), svc(ServiceState::Running)],
                 want: false,
             },
             Case {
                 name: "failed is not ready",
-                items: vec![svc(ServiceState::Failed)],
+                processes: vec![svc(ServiceState::Failed)],
                 want: false,
             },
             Case {
                 name: "stopped is not ready",
-                items: vec![svc(ServiceState::Stopped)],
+                processes: vec![svc(ServiceState::Stopped)],
                 want: false,
             },
             Case {
                 name: "tasks do not gate readiness",
-                items: vec![svc(ServiceState::Ready), task(TaskItemState::Failed)],
+                processes: vec![svc(ServiceState::Ready), task(TaskState::Failed)],
                 want: true,
             },
             Case {
                 name: "task-only set is ready",
-                items: vec![task(TaskItemState::Completed)],
+                processes: vec![task(TaskState::Completed)],
                 want: true,
             },
         ];
         for c in cases {
-            assert_eq!(all_services_ready(&c.items), c.want, "case: {}", c.name);
+            assert_eq!(all_services_ready(&c.processes), c.want, "case: {}", c.name);
         }
     }
 
@@ -1805,13 +1807,13 @@ mod tests {
         ];
 
         for json in cases {
-            let status: ItemStatus = serde_json::from_str(json).unwrap();
+            let status: ProcessStatus = serde_json::from_str(json).unwrap();
             let failed_dependencies = match status {
-                ItemStatus::Service {
+                ProcessStatus::Service {
                     failed_dependencies,
                     ..
                 }
-                | ItemStatus::Task {
+                | ProcessStatus::Task {
                     failed_dependencies,
                     ..
                 } => failed_dependencies,
@@ -1933,7 +1935,7 @@ mod tests {
             .expect("timeout waiting for unhealthy event")
             .expect("monitor channel closed unexpectedly");
         match msg {
-            ItemReport::HealthChanged { name, healthy } => {
+            ProcessReport::HealthChanged { name, healthy } => {
                 assert_eq!(name, "svc");
                 assert!(!healthy, "expected unhealthy event first");
             }
@@ -1968,7 +1970,7 @@ mod tests {
             .expect("timeout waiting for recovery event")
             .expect("monitor channel closed unexpectedly");
         match msg {
-            ItemReport::HealthChanged { name, healthy } => {
+            ProcessReport::HealthChanged { name, healthy } => {
                 assert_eq!(name, "svc");
                 assert!(healthy, "expected recovery event after rebind");
             }
@@ -2240,7 +2242,7 @@ mod tests {
         let (mut runner, _shutdown_tx) = runner_from_toml(toml, temp.path()).await;
 
         runner.set_service_state("db", ServiceState::Failed);
-        runner.start_pending_items().await;
+        runner.start_pending_processes().await;
 
         // The whole blocking chain collapses to the root cause.
         for name in ["worker", "api"] {
@@ -2261,7 +2263,7 @@ mod tests {
 
         // Recovery: the root becoming satisfied re-queues the descendants.
         runner.set_service_state("db", ServiceState::Ready);
-        runner.start_pending_items().await;
+        runner.start_pending_processes().await;
         for name in ["worker", "api"] {
             assert_ne!(
                 runner.services.get(name).unwrap().state(),
@@ -2424,7 +2426,7 @@ mod tests {
                 replay_items: Vec::new(),
             },
         );
-        runner.start_pending_items().await;
+        runner.start_pending_processes().await;
 
         let service = runner.services.get("api").unwrap();
         assert_eq!(service.state(), ServiceState::Pending);
@@ -2575,7 +2577,7 @@ mod tests {
     }
 
     /// Regression: a watched file changes *during* a bazel build. The build
-    /// that completes is correct, but its restart is deferred because the item
+    /// that completes is correct, but its restart is deferred because the process
     /// went stale. The follow-up cycle then finds bazel "up to date" — and must
     /// still restart, because up-to-date is measured against the last *build*,
     /// not against the *running process*. Without the fix the service keeps
@@ -3099,12 +3101,12 @@ mod tests {
                 hidden: false,
                 auto_filter_on_failure: None,
             },
-            TaskItemState::Pending,
+            TaskState::Pending,
             false,
             None,
         );
 
-        assert_eq!(rt.state(), TaskItemState::Pending);
+        assert_eq!(rt.state(), TaskState::Pending);
         assert!(rt.pgid.is_none());
         assert_eq!(rt.attach_count, 0);
         assert!(rt.resolved_watch_paths.is_empty());
@@ -3112,10 +3114,7 @@ mod tests {
 
         assert!(rt.mark_dependency_failed(vec!["setup".to_string()]));
         assert_eq!(rt.failed_dependencies(), ["setup"]);
-        assert_eq!(
-            rt.set_state(TaskItemState::Pending),
-            Some(TaskItemState::Pending)
-        );
+        assert_eq!(rt.set_state(TaskState::Pending), Some(TaskState::Pending));
         assert!(rt.failed_dependencies().is_empty());
     }
 
@@ -3225,7 +3224,7 @@ mod tests {
                 expected: workspace.clone(),
             },
             Case {
-                name: "falls back to item dir without workspace marker",
+                name: "falls back to process dir without workspace marker",
                 working_dir: no_workspace.clone(),
                 expected: no_workspace.clone(),
             },

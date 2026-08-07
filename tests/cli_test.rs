@@ -180,11 +180,11 @@ fn cli_status_json_against_running_daemon() {
         // The keeper service has a passing ready check, so the stack is ready.
         assert_eq!(parsed["ready"], serde_json::json!(true), "stdout: {stdout}");
 
-        let items = parsed["items"].as_array().expect("items array");
-        let keeper = items
+        let processes = parsed["processes"].as_array().expect("processes array");
+        let keeper = processes
             .iter()
             .find(|i| i["name"] == serde_json::json!("keeper"))
-            .expect("keeper item present");
+            .expect("keeper process present");
         assert_eq!(keeper["kind"], serde_json::json!("service"));
         assert_eq!(keeper["state"], serde_json::json!("ready"));
 
@@ -319,9 +319,12 @@ fn cli_stop_and_restart_flow() {
         // status should show stopped
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = Client::new(dir.path());
-        let items = client.status(false, None).await.unwrap();
-        let joined = format!("{items:?}");
-        assert!(joined.to_lowercase().contains("stopped"), "items: {joined}");
+        let statuses = client.status(false, None).await.unwrap();
+        let joined = format!("{statuses:?}");
+        assert!(
+            joined.to_lowercase().contains("stopped"),
+            "statuses: {joined}"
+        );
 
         // restart keeper
         let cp = config_path.clone();

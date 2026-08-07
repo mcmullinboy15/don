@@ -14,7 +14,7 @@ use serde::Deserialize;
 // types live there, but the *dependency* reads `crate::client`, which is
 // the module edge the TUI separation enforces.
 pub use crate::runner::{
-    CompletionError, ItemStatus, RunnerEvent, ServiceState, StateSnapshot, TaskItemState,
+    CompletionError, ProcessStatus, RunnerEvent, ServiceState, StateSnapshot, TaskState,
 };
 
 /// One parsed record from `GET /events`.
@@ -24,7 +24,7 @@ pub enum EventStreamItem {
     /// reconnecting) client starts consistent instead of
     /// stale-until-the-next-event.
     Snapshot {
-        items: Vec<ItemStatus>,
+        processes: Vec<ProcessStatus>,
         startup_complete: bool,
     },
     /// A runner event, exactly as broadcast.
@@ -82,7 +82,7 @@ pub enum ClientError {
 /// Deserialised body of `GET /status`.
 #[derive(Debug, Deserialize)]
 pub struct StatusResponse {
-    pub items: Vec<ItemStatus>,
+    pub processes: Vec<ProcessStatus>,
 }
 
 /// Deserialised body of `GET /watch`.
@@ -109,7 +109,7 @@ pub struct LogsResponse {
 pub enum LogStreamEvent {
     /// A formatted log line, ANSI colors included, no trailing newline.
     Line {
-        /// Owning item name; `[don]` lifecycle events carry their own
+        /// Owning process name; `[don]` lifecycle events carry their own
         /// sentinel name (see [`crate::output::LIFECYCLE_EVENT_NAME`]).
         name: String,
         /// True for `[don]`-prefixed lifecycle events.
@@ -132,7 +132,7 @@ pub struct RunTaskOptions {
 /// Deserialised body of `GET /ready`.
 #[derive(Debug, Deserialize)]
 pub struct ReadyInfo {
-    /// Whether the initial startup sweep has decided every item.
+    /// Whether the initial startup sweep has decided every process.
     pub startup_complete: bool,
     /// The runner's crate version. `None` from a runner that predates the
     /// field.
@@ -172,13 +172,13 @@ impl Client {
     ///
     /// When `name` is `Some`, the response is restricted to that single
     /// service/task and includes its full resolved watch path list (the
-    /// all-items view omits the path list — see the server's `collect_status`).
+    /// all-processes view omits the path list — see the server's `collect_status`).
     /// A name that matches nothing yields an empty list, not an error.
     pub async fn status(
         &self,
         verbose: bool,
         name: Option<&str>,
-    ) -> Result<Vec<ItemStatus>, ClientError> {
+    ) -> Result<Vec<ProcessStatus>, ClientError> {
         let mut path = String::from("/status");
         let mut sep = '?';
         if verbose {
@@ -193,10 +193,10 @@ impl Client {
         let (status, body) = self.request("GET", &path, false).await?;
         ensure_ok(status, &body)?;
         let parsed: StatusResponse = serde_json::from_slice(&body)?;
-        Ok(parsed.items)
+        Ok(parsed.processes)
     }
 
-    /// `GET /watch` — global file-watch state (inotify dirs + per-item
+    /// `GET /watch` — global file-watch state (inotify dirs + per-process
     /// patterns). `Ok(None)` means no watches are active.
     pub async fn watch(&self) -> Result<Option<crate::runner::WatchReport>, ClientError> {
         let (status, body) = self.request("GET", "/watch", false).await?;
@@ -375,7 +375,7 @@ impl Client {
         self.follow_ndjson(&path, on_line).await
     }
 
-    /// `GET /logs?follow=true` — stream the merged log stream: every item
+    /// `GET /logs?follow=true` — stream the merged log stream: every process
     /// plus `[don]` lifecycle events, in arrival order, with the metadata
     /// a renderer needs to filter and color. Returns when the server closes
     /// the stream or the callback returns `Err`.
@@ -404,20 +404,20 @@ impl Client {
                 Ok(value) => value,
                 Err(_) => return Ok(()),
             };
-            let item = match value.get("type").and_then(|t| t.as_str()) {
+            let process = match value.get("type").and_then(|t| t.as_str()) {
                 Some("lagged") => EventStreamItem::Lagged(
                     value.get("skipped").and_then(|n| n.as_u64()).unwrap_or(0),
                 ),
                 Some("snapshot") => {
                     #[derive(Deserialize)]
                     struct Snapshot {
-                        items: Vec<ItemStatus>,
+                        processes: Vec<ProcessStatus>,
                         #[serde(default)]
                         startup_complete: bool,
                     }
                     match serde_json::from_value::<Snapshot>(value) {
                         Ok(snapshot) => EventStreamItem::Snapshot {
-                            items: snapshot.items,
+                            processes: snapshot.processes,
                             startup_complete: snapshot.startup_complete,
                         },
                         Err(_) => return Ok(()),
@@ -428,7 +428,7 @@ impl Client {
                     Err(_) => return Ok(()),
                 },
             };
-            on_event(item)
+            on_event(process)
         })
         .await
     }

@@ -1,6 +1,6 @@
 //! Per-service start supervision.
 //!
-//! The mirror of [`super::task_supervisor`] for the other item kind, and it
+//! The mirror of [`super::task_supervisor`] for the other process kind, and it
 //! exists for the same reason: preparing a start is slow (downloads, builds,
 //! docker pulls, port allocation) so it has always been detached, and
 //! detaching onto a shared completion channel is what forced the runner to
@@ -15,17 +15,17 @@
 //! The supervisor owns its service's process from wire to reap — prepare,
 //! spawn, output reader, OSC sink, crash detection, stop-with-drain — and
 //! its proxy, whose listeners span process generations. The runner keeps
-//! what is genuinely cross-item: scheduling, state folds, ready resolution
+//! what is genuinely cross-process: scheduling, state folds, ready resolution
 //! and completion (which cross channels — see the plan's ordering note),
 //! restart policy, and shutdown sequencing. Proxy *decisions* likewise stay
 //! with the runner and arrive as [`ProxyDirective`]s.
 
 use super::ServiceStartIntent;
-use super::service_process as service;
+use super::service;
 use super::service_worker::ServiceStartContext;
 use super::service_worker::{ServiceStartMode, start_service_worker};
 use crate::config::ShutdownConfig;
-use crate::output::{ItemOutput, LifecycleEmitter};
+use crate::output::{LifecycleEmitter, ProcessOutput};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,7 +81,7 @@ pub(crate) struct ProxyAssets {
     pub(crate) proxy: crate::proxy::ServiceProxy,
     /// The receiving half of the proxy's lazy trigger channel — `Some` only
     /// for lazy services. The supervisor forwards each trigger as
-    /// [`super::ItemReport::Demand`].
+    /// [`super::ProcessReport::Demand`].
     pub(crate) demand_rx: Option<mpsc::Receiver<String>>,
 }
 
@@ -157,8 +157,8 @@ pub(crate) type ServiceStarts = super::registry::Supervisors<ServiceCommand>;
 pub(crate) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     env: &StartEnv,
-    outputs: &dyn Fn(&str) -> Option<ItemOutput>,
-    report_tx: &mpsc::UnboundedSender<super::ItemReport>,
+    outputs: &dyn Fn(&str) -> Option<ProcessOutput>,
+    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     proxies: &mut std::collections::HashMap<String, ProxyAssets>,
 ) -> ServiceStarts {
     ServiceStarts::spawn_all(names, |name, rx, busy| {
@@ -218,8 +218,8 @@ async fn supervise(
     name: String,
     mut rx: mpsc::UnboundedReceiver<ServiceCommand>,
     env: StartEnv,
-    output: Option<ItemOutput>,
-    report_tx: mpsc::UnboundedSender<super::ItemReport>,
+    output: Option<ProcessOutput>,
+    report_tx: mpsc::UnboundedSender<super::ProcessReport>,
     busy: Arc<AtomicBool>,
     proxy_assets: Option<ProxyAssets>,
 ) {
@@ -279,7 +279,7 @@ async fn supervise(
                         ready_pending = None;
                         if let Some(outcome) = outcome
                             && report_tx
-                                .send(super::ItemReport::ServiceReady {
+                                .send(super::ProcessReport::ServiceReady {
                                     name: name.clone(),
                                     success: outcome.success,
                                     message: outcome.message,
@@ -296,7 +296,7 @@ async fn supervise(
                     demand = wait_demand(&mut demand_rx), if demand_rx.is_some() => {
                         match demand {
                             Some(_) => {
-                                let _ = report_tx.send(super::ItemReport::Demand {
+                                let _ = report_tx.send(super::ProcessReport::Demand {
                                     name: name.clone(),
                                 });
                             }
@@ -361,7 +361,7 @@ async fn supervise(
                 match request.notify {
                     StopNotify::Internal { op_id } => {
                         if report_tx
-                            .send(super::ItemReport::ServiceStopComplete {
+                            .send(super::ProcessReport::ServiceStopComplete {
                                 name: name.clone(),
                                 op_id,
                                 result,
@@ -390,7 +390,7 @@ async fn supervise(
         if let Some(p) = proxy.as_mut() {
             if fresh_backend_ports && let Err(error) = p.reallocate_ephemeral_ports().await {
                 if report_tx
-                    .send(super::ItemReport::ServiceStartPrepared {
+                    .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
                         context,
                         intent,
@@ -482,7 +482,7 @@ async fn supervise(
                     Err(message) => (Err(message), None),
                 };
                 if report_tx
-                    .send(super::ItemReport::ServiceStartPrepared {
+                    .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
                         context,
                         intent,
@@ -504,7 +504,7 @@ async fn supervise(
                     }
                     Some((None, _exit_rx, _cancel_rx))
                         if report_tx
-                            .send(super::ItemReport::ServiceReady {
+                            .send(super::ProcessReport::ServiceReady {
                                 name: name.clone(),
                                 success: true,
                                 message: None,
@@ -589,7 +589,7 @@ async fn await_reader(handle: tokio::task::JoinHandle<()>) {
 /// and hold the handle.
 #[allow(clippy::too_many_arguments)]
 async fn wire_spawn(
-    output: Option<&ItemOutput>,
+    output: Option<&ProcessOutput>,
     service_writer: Option<&crate::output::ServiceWriter>,
     start_result: service::StartResult,
     proxy: Option<&crate::proxy::ServiceProxy>,
@@ -728,7 +728,7 @@ fn spawn_ready_racer(
     ready: crate::config::ReadyCheck,
     exit_rx: tokio::sync::oneshot::Receiver<()>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
-    report_tx: &mpsc::UnboundedSender<super::ItemReport>,
+    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
 ) -> tokio::sync::oneshot::Receiver<ReadyOutcome> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let monitor_cancel_rx = ready.monitor.then_some(cancel_rx);
@@ -769,7 +769,7 @@ fn spawn_ready_racer(
 async fn reap_and_report(
     name: &str,
     held: &mut Option<service::ServiceHandle>,
-    report_tx: &mpsc::UnboundedSender<super::ItemReport>,
+    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
 ) {
     if !matches!(held.as_ref(), Some(service::ServiceHandle::Process(_))) {
         return;
@@ -780,7 +780,7 @@ async fn reap_and_report(
     let pgid = proc.pgid();
     // The reader already hit end-of-stream, so this wait returns promptly.
     let status = proc.wait().await.ok();
-    let _ = report_tx.send(super::ItemReport::ServiceExited {
+    let _ = report_tx.send(super::ProcessReport::ServiceExited {
         name: name.to_string(),
         pgid,
         status,
@@ -815,7 +815,7 @@ mod tests {
 
     struct Harness {
         tx: mpsc::UnboundedSender<ServiceCommand>,
-        report_rx: mpsc::UnboundedReceiver<super::super::ItemReport>,
+        report_rx: mpsc::UnboundedReceiver<super::super::ProcessReport>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -1013,7 +1013,7 @@ mod tests {
             .expect("demand should be forwarded")
             .expect("report channel open");
         match report {
-            super::super::ItemReport::Demand { name } => assert_eq!(name, "svc"),
+            super::super::ProcessReport::Demand { name } => assert_eq!(name, "svc"),
             _ => panic!("expected a demand report"),
         }
 

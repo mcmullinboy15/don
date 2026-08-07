@@ -1,4 +1,4 @@
-use super::NodeKind;
+use super::ProcessKind;
 use super::paths::any_glob_path_changed_since;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,7 +45,7 @@ pub(crate) struct GraphRequeryOutcomeItem {
 #[derive(Clone)]
 pub(crate) struct BatchBuildReplayItem {
     pub(crate) name: String,
-    pub(crate) kind: NodeKind,
+    pub(crate) kind: ProcessKind,
     pub(crate) source_changed: bool,
     pub(crate) graph_changed: bool,
 }
@@ -56,7 +56,7 @@ pub(crate) struct BatchBuildReplayItem {
 #[derive(Clone)]
 pub(crate) struct BatchBuildItem {
     pub(crate) name: String,
-    pub(crate) kind: NodeKind,
+    pub(crate) kind: ProcessKind,
     pub(crate) bazel: Option<crate::config::BazelConfig>,
     /// Whether build-tool-resolved source and graph paths should be watched.
     pub(crate) watch_enabled: bool,
@@ -72,7 +72,7 @@ pub(crate) struct BatchBuildItem {
 pub(crate) struct BatchBuildOutcome {
     /// Per-item resolved watch paths — applied to `resolved_watch_paths` on
     /// the runtime service/task entry.
-    pub(crate) resolved_watches: Vec<(String, NodeKind, Vec<String>)>,
+    pub(crate) resolved_watches: Vec<(String, ProcessKind, Vec<String>)>,
     /// Non-fatal warnings (query failures, binary-path cquery failures).
     pub(crate) warnings: Vec<String>,
     /// Names whose batch build succeeded — transition `Building` → `Pending`.
@@ -417,8 +417,8 @@ pub(crate) async fn run_batch_build_chain(
             && let Some(ref tx) = watch_update_tx
         {
             let watch_kind = match item.kind {
-                NodeKind::Service => crate::watch::WatchItemKind::Service,
-                NodeKind::Task => crate::watch::WatchItemKind::Task,
+                ProcessKind::Service => crate::watch::WatchItemKind::Service,
+                ProcessKind::Task => crate::watch::WatchItemKind::Task,
             };
             send_watch_update(
                 tx,
@@ -557,7 +557,9 @@ pub(crate) async fn run_batch_build_chain(
     let bazel_services_to_resolve: Vec<&BatchBuildItem> = items
         .iter()
         .filter(|i| {
-            i.kind == NodeKind::Service && i.bazel.is_some() && outcome.succeeded.contains(&i.name)
+            i.kind == ProcessKind::Service
+                && i.bazel.is_some()
+                && outcome.succeeded.contains(&i.name)
         })
         .collect();
 
@@ -699,7 +701,7 @@ mod tests {
     fn bazel_item(name: &str, watch_enabled: bool) -> BatchBuildItem {
         BatchBuildItem {
             name: name.to_string(),
-            kind: NodeKind::Service,
+            kind: ProcessKind::Service,
             bazel: Some(BazelConfig {
                 target: format!("//services/{name}:{name}"),
                 watch: watch_enabled,
