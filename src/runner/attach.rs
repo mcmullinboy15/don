@@ -157,15 +157,18 @@ impl Runner {
             message: "no PTY available (spawned in pipe mode)".to_string(),
         })?;
 
-        // Set up follow sink for live output (256 lines of headroom).
-        let output_rx = self
-            .output_manager
-            .add_follow_sink(name, 50, 256)
-            .await
-            .ok_or_else(|| CommandError::Failed {
-                name: name.to_string(),
-                message: "failed to create output sink".to_string(),
-            })?;
+        // Preload the client with a coherent repaint of the item's current
+        // screen, then stream live bytes — never a raw-byte replay. Items
+        // whose screen never registered (emulator backend unavailable) fall
+        // back to the last ring-buffer lines.
+        let output_rx = match self.output_manager.emulator_repaint(name).await {
+            Some(frame) => self.output_manager.add_attach_sink(name, frame, 256).await,
+            None => self.output_manager.add_follow_sink(name, 50, 256).await,
+        }
+        .ok_or_else(|| CommandError::Failed {
+            name: name.to_string(),
+            message: "failed to create output sink".to_string(),
+        })?;
 
         // Pause prefixed stdout for this service.
         self.output_manager.pause_stdout_sink(name).await;

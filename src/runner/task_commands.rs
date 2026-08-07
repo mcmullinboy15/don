@@ -274,6 +274,9 @@ impl Runner {
         // half unconditionally so an unregistered name still closes it.
         let pty_write = handle.take_pty_write();
         if let (Some(output), Some(pty)) = (output.as_ref(), pty_write) {
+            // Feed the server-side screen from process start so an attach
+            // gets a coherent repaint. Matches the PTY's initial 80x24.
+            output.register_emulator(80, 24).await;
             let osc_handle = output.add_osc_sink(pty).await;
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.osc_sink = Some(osc_handle);

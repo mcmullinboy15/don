@@ -25,6 +25,7 @@ axum = "0.8"
 bollard = "0.21"
 bytes = "1"
 crossterm = { version = "0.29", features = ["event-stream"] }
+libghostty-vt = "0.2.1"
 bzip2 = "0.6"
 flate2 = "1"
 clap = { version = "4", features = ["derive", "env"] }

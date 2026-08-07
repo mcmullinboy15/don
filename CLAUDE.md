@@ -13,6 +13,11 @@ cargo test           # run all tests
 cargo clippy         # lint
 ```
 
+Building also requires **Zig 0.15.2** (exactly — ghostty pins it) on `PATH`:
+`libghostty-vt-sys` compiles ghostty's VT core with `zig build` at build
+time. Install from <https://ziglang.org/download/>; a version mismatch fails
+the build with a clear message from ghostty's build script.
+
 The web UI bundle is a build artifact and is **not** committed — it's
 gitignored, built by CI, and shipped inside the published crate via the
 `include` list in `Cargo.toml`. Build it once after cloning or the binary has

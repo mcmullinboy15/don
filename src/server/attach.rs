@@ -99,8 +99,9 @@ pub(crate) async fn attach_handler(
     let pty_write = session.pty_write;
     let output_rx = session.output_rx;
 
-    // Apply initial resize.
+    // Apply initial resize — the PTY and the emulated grid move together.
     let _ = pty_write.resize(pty_process::Size::new(params.rows, params.cols));
+    state.emulator.resize(&name, params.cols, params.rows);
 
     // Register resize channel.
     let (resize_tx, resize_rx) = mpsc::channel::<(u16, u16)>(4);
@@ -162,6 +163,7 @@ pub(crate) async fn resize_handler(
     match map.get(&name) {
         Some(tx) => {
             let _ = tx.try_send((body.cols, body.rows));
+            state.emulator.resize(&name, body.cols, body.rows);
             StatusCode::NO_CONTENT.into_response()
         }
         None => (

@@ -42,6 +42,12 @@ jobs:
       # The bundle is embedded in the binary and ships in the crate (see the
       # `include` list in Cargo.toml) but isn't committed, so it has to be
       # built here. Without this, crates.io would get a don with no web UI.
+      # cargo publish verifies the crate by building it, which needs Zig
+      # for libghostty-vt-sys.
+      - name: Install Zig (required by libghostty-vt-sys)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

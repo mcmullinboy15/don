@@ -5,6 +5,10 @@
 # it isn't in git. Every machine that compiles a shipping binary has to build
 # it first — this is that step for release builds. CI and `cargo publish`
 # have their own equivalents.
+- name: Install Zig (required by libghostty-vt-sys)
+  uses: mlugg/setup-zig@v2
+  with:
+    version: 0.15.2
 - name: Set up Node for the web UI bundle
   uses: actions/setup-node@v4
   with:

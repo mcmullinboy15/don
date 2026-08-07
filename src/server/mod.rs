@@ -56,6 +56,9 @@ pub(crate) struct ApiState {
     /// Resize channels for active attach sessions. The attach bridge task
     /// registers its receiver here; the resize HTTP handler sends through it.
     pub attach_resize_txs: std::sync::Arc<tokio::sync::Mutex<ResizeMap>>,
+    /// Handle to the server-side terminal-emulator thread — resize
+    /// requests keep the emulated grid in step with the attached client.
+    pub emulator: crate::output::emulator::EmulatorHandle,
     /// Merged formatted log stream, used by `GET /logs?follow=true`.
     /// Subscribing per-request keeps followers independent: a slow client
     /// lags its own receiver and nobody else's.
@@ -117,6 +120,7 @@ pub async fn serve_api(
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     event_tx: broadcast::Sender<RunnerEvent>,
     state: crate::runner::StateReader,
+    emulator: crate::output::emulator::EmulatorHandle,
     log_tap: crate::output::MergedLogTap,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
@@ -125,6 +129,7 @@ pub async fn serve_api(
         cmd_tx,
         event_tx,
         state,
+        emulator,
         attach_resize_txs: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
@@ -159,6 +164,7 @@ pub fn serve_for_runner(
     let cmd_tx = runner.command_sender();
     let event_tx = runner.subscribe_sender();
     let state = runner.state_reader();
+    let emulator = runner.emulator_handle();
     let log_tap = runner.log_stream_sender();
     let path = socket_path.to_path_buf();
     let display = socket_path.display().to_string();
@@ -174,6 +180,7 @@ pub fn serve_for_runner(
             cmd_tx,
             event_tx,
             state,
+            emulator,
             log_tap,
             shutdown_rx,
         )

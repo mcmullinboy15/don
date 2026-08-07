@@ -564,7 +564,13 @@ async fn wire_spawn(
         service::ServiceHandle::Docker(_) => None,
     };
     let osc_sink = match (pty, output) {
-        (Some(pty), Some(output)) => Some(output.add_osc_sink(pty).await),
+        (Some(pty), Some(output)) => {
+            // Feed the server-side screen from process start — a correct
+            // repaint on attach requires having seen the setup sequences.
+            // Matches the PTY's initial 80x24 size.
+            output.register_emulator(80, 24).await;
+            Some(output.add_osc_sink(pty).await)
+        }
         _ => None,
     };
 

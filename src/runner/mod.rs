@@ -1393,6 +1393,12 @@ impl Runner {
         self.output_manager.log_stream_sender()
     }
 
+    /// Handle to the server-side terminal-emulator thread, for the API
+    /// server's attach-resize path.
+    pub(crate) fn emulator_handle(&self) -> crate::output::emulator::EmulatorHandle {
+        self.output_manager.emulator_handle()
+    }
+
     /// The event sender, for a server that hands out a subscription per
     /// connection rather than holding one.
     pub fn subscribe_sender(&self) -> broadcast::Sender<RunnerEvent> {

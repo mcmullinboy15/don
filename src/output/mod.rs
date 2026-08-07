@@ -9,6 +9,7 @@
 //! ring buffer and fans out to the service's current sinks. The ring buffer persists
 //! across restarts, and [`ServiceWriter`] is cloneable for reuse.
 
+pub(crate) mod emulator;
 pub(crate) mod osc;
 pub(crate) mod ring_buffer;
 pub(crate) mod sanitize;
@@ -165,6 +166,10 @@ pub struct SinkLine {
 pub(crate) enum SinkHandle {
     Unbounded(mpsc::UnboundedSender<SinkLine>),
     BoundedDrop(mpsc::Sender<SinkLine>),
+    /// Feeds the server-side terminal emulator (see [`emulator`]). Carries
+    /// only the raw bytes; the emulator thread keys screens by the line's
+    /// item name.
+    Emulator(mpsc::UnboundedSender<emulator::EmulatorRequest>),
 }
 
 impl SinkHandle {
@@ -174,6 +179,12 @@ impl SinkHandle {
         match self {
             Self::Unbounded(tx) => tx.send(msg).map_err(|_| ()),
             Self::BoundedDrop(tx) => tx.try_send(msg).map_err(|_| ()),
+            Self::Emulator(tx) => tx
+                .send(emulator::EmulatorRequest::Feed {
+                    name: msg.name,
+                    bytes: msg.line.to_vec(),
+                })
+                .map_err(|_| ()),
         }
     }
 
@@ -181,6 +192,7 @@ impl SinkHandle {
         match self {
             Self::Unbounded(tx) => tx.is_closed(),
             Self::BoundedDrop(tx) => tx.is_closed(),
+            Self::Emulator(tx) => tx.is_closed(),
         }
     }
 
@@ -188,6 +200,7 @@ impl SinkHandle {
         match (self, other) {
             (Self::Unbounded(a), Self::Unbounded(b)) => a.same_channel(b),
             (Self::BoundedDrop(a), Self::BoundedDrop(b)) => a.same_channel(b),
+            (Self::Emulator(a), Self::Emulator(b)) => a.same_channel(b),
             _ => false,
         }
     }
@@ -660,6 +673,9 @@ pub struct OutputManager {
     /// Global mute for visible stdout/TUI output while a foreground task owns
     /// the terminal. Ring buffers and file sinks continue to receive output.
     stdout_pause: StdoutPauseControl,
+    /// Handle to the server-side terminal-emulator thread. Screens register
+    /// per PTY-backed spawn; see [`emulator`].
+    emulator: emulator::EmulatorHandle,
     /// Allowlist applied to stdout-bound lines. None until
     /// [`Self::set_log_filter`] is called; once set, only lines whose name
     /// is in the allowlist (or empty, for `[don]` lifecycle events) reach
@@ -832,6 +848,7 @@ impl OutputManager {
         let verbosity = VerbosityControl::new(verbose);
         let stdout_pause = StdoutPauseControl::new();
         let log_filter = LogFilterControl::default();
+        let emulator = emulator::spawn_emulator_thread();
 
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
@@ -913,6 +930,7 @@ impl OutputManager {
             writer_handles,
             verbosity,
             stdout_pause,
+            emulator,
             log_filter,
             bazel_prefix: None,
             log_tap,
@@ -1045,6 +1063,42 @@ impl OutputManager {
         Some(rx)
     }
 
+    /// Add an attach sink preloaded with a screen repaint frame instead of a
+    /// ring-buffer snapshot. The bridge writes the frame verbatim, so the
+    /// client's terminal shows the item's current grid before live bytes
+    /// resume — no raw-byte replay.
+    pub(crate) async fn add_attach_sink(
+        &self,
+        name: &str,
+        repaint: emulator::RepaintFrame,
+        live_capacity: usize,
+    ) -> Option<mpsc::Receiver<SinkLine>> {
+        let state_arc = self.services.get(name)?.clone();
+        let capacity = live_capacity.max(2);
+        let (tx, rx) = mpsc::channel::<SinkLine>(capacity);
+        let mut state = state_arc.lock().await;
+        let sink_line = SinkLine {
+            prefix: Bytes::new(),
+            line: Bytes::from(repaint.bytes),
+            name: state.name.clone(),
+            is_lifecycle: false,
+        };
+        // Channel is empty and capacity >= 2, so this cannot fail.
+        let _ = tx.try_send(sink_line);
+        state.sinks.push(SinkHandle::BoundedDrop(tx));
+        Some(rx)
+    }
+
+    /// Render an item's current screen; `None` when it has no screen.
+    pub(crate) async fn emulator_repaint(&self, name: &str) -> Option<emulator::RepaintFrame> {
+        self.emulator.repaint(name).await
+    }
+
+    /// A handle to the emulator thread, for the server's resize path.
+    pub(crate) fn emulator_handle(&self) -> emulator::EmulatorHandle {
+        self.emulator.clone()
+    }
+
     /// Add an OSC response sink to a service. The sink scans each chunk for
     /// terminal queries (OSC 10/11, cursor position) and writes responses
     /// directly to the PTY write handle.
@@ -1172,6 +1226,7 @@ impl OutputManager {
             state: Arc::clone(self.services.get(name)?),
             events: self.clone_lifecycle_emitter(),
             stdout_pause: self.stdout_pause.clone(),
+            emulator: self.emulator.clone(),
         })
     }
 
@@ -1353,6 +1408,7 @@ pub struct ItemOutput {
     state: Arc<Mutex<ServiceOutputState>>,
     events: LifecycleEmitter,
     stdout_pause: StdoutPauseControl,
+    emulator: emulator::EmulatorHandle,
 }
 
 impl ItemOutput {
@@ -1385,6 +1441,17 @@ impl ItemOutput {
             handle: Some(handle),
             join: Some(join),
             service_state: Arc::clone(&self.state),
+        }
+    }
+
+    /// (Re)register this item's server-side screen and route its output
+    /// bytes into the emulator. See [`OutputManager::register_emulator`].
+    pub async fn register_emulator(&self, cols: u16, rows: u16) {
+        self.emulator.register(&self.name, cols, rows);
+        let feed = SinkHandle::Emulator(self.emulator.feed_sender());
+        let mut state = self.state.lock().await;
+        if !state.sinks.iter().any(|sink| sink.same_channel(&feed)) {
+            state.sinks.push(feed);
         }
     }
 

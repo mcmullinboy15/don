@@ -11,12 +11,21 @@ Don reads a `don.toml` in your project root and orchestrates your entire dev sta
 ## Install
 
 ```sh
-# From source
+# From source (requires Zig 0.15.2 — see below)
 cargo install --path .
 
 # Or via Homebrew
 brew install pjtatlow/tap/don
 ```
+
+Building from source requires **Zig 0.15.2** on your `PATH` in addition to
+the Rust toolchain: don embeds ghostty's terminal-emulation core
+([`libghostty-vt`](https://crates.io/crates/libghostty-vt)) for server-side
+attach screens, and its build compiles ghostty with `zig build` — there are
+no prebuilt libraries. Ghostty pins the Zig version exactly, so a newer Zig
+will refuse to build. Grab the matching tarball from
+[ziglang.org/download](https://ziglang.org/download/). Prebuilt binaries
+(Homebrew, GitHub releases) don't need Zig.
 
 ## Quick Start
 

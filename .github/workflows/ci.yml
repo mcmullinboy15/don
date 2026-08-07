@@ -43,6 +43,15 @@ jobs:
           rustc --version
           cargo --version
 
+      # libghostty-vt-sys compiles ghostty's VT core with `zig build` at
+      # build time — no prebuilt libraries exist. Ghostty pins the Zig
+      # version exactly; keep this in step with what the pinned
+      # libghostty-vt release requires.
+      - name: Install Zig (required by libghostty-vt-sys)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
       # The Go preset integration tests spawn a real `go` toolchain. The Ubuntu
       # runner image ships one, but the macOS image does not — install it
       # explicitly so both platforms exercise the same tests.
