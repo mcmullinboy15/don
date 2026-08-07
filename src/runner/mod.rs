@@ -474,6 +474,8 @@ pub(in crate::runner) enum ItemReport {
     /// the monitor itself dies with custody (its cancel lives in the
     /// supervisor), so it cannot outlive its process by more than a probe.
     HealthChanged { name: String, healthy: bool },
+    /// A task process exited after an explicit run/restart.
+    TaskExited(TaskExit),
 }
 
 enum RunnerInternalCommand {
@@ -484,8 +486,6 @@ enum RunnerInternalCommand {
         intent: TaskRunIntent,
         result: Result<TaskRunPrepared, String>,
     },
-    /// A task process exited after an explicit run/restart.
-    TaskExited(TaskExit),
     /// A manually-triggered task wait exceeded its requested wait deadline.
     TaskRunWaitTimedOut {
         name: String,
@@ -1824,9 +1824,6 @@ impl Runner {
                                 self.handle_service_rebuild_prepared(&name, op_id, result)
                                     .await;
                             }
-                            RunnerInternalCommand::TaskExited(exit) => {
-                                self.handle_task_exit(exit);
-                            }
                             RunnerInternalCommand::TaskRunWaitTimedOut {
                                 name,
                                 generation,
@@ -1881,6 +1878,9 @@ impl Runner {
                             }
                             ItemReport::HealthChanged { name, healthy } => {
                                 self.handle_service_health_changed(&name, healthy).await;
+                            }
+                            ItemReport::TaskExited(exit) => {
+                                self.handle_task_exit(exit);
                             }
                         }
                     }

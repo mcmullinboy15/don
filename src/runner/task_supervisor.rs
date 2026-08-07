@@ -295,7 +295,9 @@ pub(in crate::runner) struct TaskRunOutcome {
     /// waiting on it. `None` for a watch rerun or a background `don run`,
     /// which report through the runner's internal channel instead.
     pub(in crate::runner) done_tx: Option<mpsc::Sender<ItemDone>>,
-    pub(in crate::runner) internal_tx: mpsc::Sender<RunnerInternalCommand>,
+    /// Exit reports for non-scheduled runs travel on the items' lossless
+    /// report channel, like service exits.
+    pub(in crate::runner) report_tx: mpsc::UnboundedSender<super::ItemReport>,
     /// Whether this run was triggered by a file watch, which decides if a
     /// `TaskRerunComplete` event is broadcast when it lands.
     pub(in crate::runner) rerun: bool,
@@ -367,18 +369,15 @@ impl TaskRunOutcome {
                     .await;
             }
             None => {
-                let _ = self
-                    .internal_tx
-                    .send(RunnerInternalCommand::TaskExited(TaskExit {
-                        name: self.name,
-                        pgid: self.pgid,
-                        success,
-                        message,
-                        elapsed: Some(elapsed),
-                        last_run: Some(last_run),
-                        rerun: self.rerun,
-                    }))
-                    .await;
+                let _ = self.report_tx.send(super::ItemReport::TaskExited(TaskExit {
+                    name: self.name,
+                    pgid: self.pgid,
+                    success,
+                    message,
+                    elapsed: Some(elapsed),
+                    last_run: Some(last_run),
+                    rerun: self.rerun,
+                }));
             }
         }
     }
@@ -400,7 +399,7 @@ mod tests {
         name: &str,
         base_dir: &std::path::Path,
         done_tx: Option<mpsc::Sender<ItemDone>>,
-        internal_tx: mpsc::Sender<RunnerInternalCommand>,
+        report_tx: mpsc::UnboundedSender<super::super::ItemReport>,
         rerun: bool,
     ) -> TaskRunOutcome {
         TaskRunOutcome {
@@ -410,7 +409,7 @@ mod tests {
             global_watch_ignore: Vec::new(),
             pgid: 4242,
             done_tx,
-            internal_tx,
+            report_tx,
             rerun,
         }
     }
@@ -624,18 +623,12 @@ mod tests {
         for case in cases {
             let temp = tempfile::tempdir().unwrap();
             let (done_tx, mut done_rx) = mpsc::channel(4);
-            let (internal_tx, mut internal_rx) = mpsc::channel(4);
+            let (report_tx, mut report_rx) = mpsc::unbounded_channel();
             let scheduled = case.scheduled.then_some(done_tx);
 
-            outcome(
-                "build",
-                temp.path(),
-                scheduled,
-                internal_tx,
-                !case.scheduled,
-            )
-            .finish(Ok(case.status), Duration::from_millis(5))
-            .await;
+            outcome("build", temp.path(), scheduled, report_tx, !case.scheduled)
+                .finish(Ok(case.status), Duration::from_millis(5))
+                .await;
 
             if case.scheduled {
                 let done = done_rx.try_recv().expect("scheduled run answers done_tx");
@@ -643,12 +636,12 @@ mod tests {
                 assert_eq!(done.success, case.want_success, "{}", case.name);
                 assert_eq!(done.message.as_deref(), case.want_message, "{}", case.name);
                 assert!(
-                    internal_rx.try_recv().is_err(),
+                    report_rx.try_recv().is_err(),
                     "{}: must not also emit TaskExited",
                     case.name
                 );
             } else {
-                let Ok(RunnerInternalCommand::TaskExited(exit)) = internal_rx.try_recv() else {
+                let Ok(super::super::ItemReport::TaskExited(exit)) = report_rx.try_recv() else {
                     panic!("{}: expected a TaskExited", case.name);
                 };
                 assert_eq!(exit.name, "build", "{}", case.name);
@@ -674,8 +667,8 @@ mod tests {
             ("failure", ExitStatusExt::from_raw(1 << 8), false),
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let (internal_tx, _internal_rx) = mpsc::channel(4);
-            outcome("build", temp.path(), None, internal_tx, false)
+            let (report_tx, _report_rx) = mpsc::unbounded_channel();
+            outcome("build", temp.path(), None, report_tx, false)
                 .finish(Ok(status), Duration::from_millis(1))
                 .await;
 

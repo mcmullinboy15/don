@@ -22,6 +22,7 @@ pub(in crate::runner) struct ItemDone {
     pub(in crate::runner) task_run_generation: Option<u64>,
 }
 
+#[derive(Debug)]
 pub(in crate::runner) struct TaskExit {
     pub(in crate::runner) name: String,
     pub(in crate::runner) pgid: i32,

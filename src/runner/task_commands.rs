@@ -303,7 +303,7 @@ impl Runner {
             pgid,
             rerun: done_tx.is_none(),
             done_tx,
-            internal_tx: self.internal_tx.clone(),
+            report_tx: self.report_tx.clone(),
         }
     }
 

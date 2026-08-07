@@ -405,7 +405,6 @@ impl Runner {
                 }
                 RunnerInternalCommand::ServiceStopComplete { .. }
                 | RunnerInternalCommand::ServiceRebuildPrepared { .. }
-                | RunnerInternalCommand::TaskExited(_)
                 | RunnerInternalCommand::TaskRunWaitTimedOut { .. }
                 | RunnerInternalCommand::BatchBuildComplete(_)
                 | RunnerInternalCommand::LazyBuildComplete { .. }
