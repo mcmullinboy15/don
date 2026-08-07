@@ -1,4 +1,3 @@
-use super::service;
 use super::service_worker::{ServiceStartContext, ServiceStartMode, run_service_build_worker};
 use super::{
     CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
@@ -98,7 +97,7 @@ impl Runner {
         name: &str,
         context: Box<ServiceStartContext>,
         intent: ServiceStartIntent,
-        result: Result<Box<service::StartResult>, String>,
+        result: Result<Box<super::service_supervisor::ServiceWired>, String>,
     ) {
         if self.shutting_down {
             self.stop_late_service_start(name.to_string(), context, result)
@@ -112,12 +111,12 @@ impl Runner {
         let op_id = self.services.get(name).map_or(0, |rs| rs.start_generation);
 
         match result {
-            Ok(start_result) => match intent {
+            Ok(wired) => match intent {
                 ServiceStartIntent::Scheduled { done_tx } => {
                     self.wire_service_output_and_ready_check(
                         name,
                         op_id,
-                        *start_result,
+                        *wired,
                         &context.resolved,
                         Some(done_tx),
                     )
@@ -127,7 +126,7 @@ impl Runner {
                     self.wire_service_output_and_ready_check(
                         name,
                         op_id,
-                        *start_result,
+                        *wired,
                         &context.resolved,
                         None,
                     )
@@ -138,7 +137,7 @@ impl Runner {
                     self.wire_service_output_and_ready_check(
                         name,
                         op_id,
-                        *start_result,
+                        *wired,
                         &context.resolved,
                         None,
                     )

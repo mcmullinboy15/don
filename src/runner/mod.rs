@@ -522,7 +522,7 @@ enum RunnerInternalCommand {
         name: String,
         context: Box<ServiceStartContext>,
         intent: ServiceStartIntent,
-        result: Result<Box<service::StartResult>, String>,
+        result: Result<Box<service_supervisor::ServiceWired>, String>,
     },
     /// Completion from a detached rebuild worker for a single service.
     ServiceRebuildPrepared {

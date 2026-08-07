@@ -2,7 +2,6 @@ use super::graph::topological_sort;
 
 use super::task_worker::TaskRunPrepared;
 use super::{Runner, RunnerInternalCommand, ServiceState, ServiceStopAction};
-use crate::runner::service::stop_service;
 use crate::signals::force_shutdown_requested;
 use std::collections::{BTreeMap, HashMap};
 use tokio::task::JoinSet;
@@ -416,42 +415,36 @@ impl Runner {
         &mut self,
         name: String,
         context: Box<super::service_worker::ServiceStartContext>,
-        result: Result<Box<crate::runner::service::StartResult>, String>,
+        result: Result<Box<super::service_supervisor::ServiceWired>, String>,
     ) {
-        let Ok(start_result) = result else {
+        let Ok(_wired) = result else {
             return;
         };
         self.output_manager
             .service_event(&name, "start cancelled by shutdown");
-        let crate::runner::service::StartResult {
-            handle,
-            child_output,
-        } = *start_result;
-
-        let output_worker = self.output_manager.service_writer(&name).map(|writer| {
-            tokio::spawn(async move {
-                let _ = writer.process_stream(child_output).await;
-            })
-        });
+        // The supervisor wired this spawn and holds the process — ask it to
+        // stop. Its reader drains before the done-signal, so joining this
+        // covers the output too (what the old inline reader+stop did).
         let shutdown_config = context
             .resolved
             .shutdown
             .clone()
             .map(|shutdown| shutdown.merged_over(&self.config.shutdown))
             .unwrap_or_else(|| self.config.shutdown.clone());
-        let _ = stop_service(
-            handle,
-            Some(&shutdown_config),
-            force_shutdown_requested(),
-            true,
-            Some(super::service::StopDebug::new(
-                name.clone(),
-                self.output_manager.clone_lifecycle_emitter(),
-            )),
-        )
-        .await;
-        if let Some(worker) = output_worker {
-            Self::await_output_worker(worker).await;
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let sent = self.service_starts.registry().get(&name).is_some_and(|h| {
+            h.request(super::service_supervisor::ServiceCommand::Stop(
+                super::service_supervisor::StopRequest {
+                    config: shutdown_config,
+                    force: force_shutdown_requested(),
+                    wait_full_exit: false,
+                    interrupt: None,
+                    notify: super::service_supervisor::StopNotify::Done(done_tx),
+                },
+            ))
+        });
+        if sent {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(15), done_rx).await;
         }
     }
 

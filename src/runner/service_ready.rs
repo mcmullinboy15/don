@@ -1,6 +1,6 @@
 use super::events::ItemDone;
 use super::health::run_health_monitor;
-use super::service::{self, ServiceHandle};
+use super::service;
 use super::{NodeKind, Runner, RunnerEvent, RunnerInternalCommand, ServiceState};
 use tokio::sync::mpsc;
 
@@ -15,14 +15,17 @@ impl Runner {
         &mut self,
         name: &str,
         start_generation: u64,
-        start_result: service::StartResult,
+        wired: super::service_supervisor::ServiceWired,
         resolved: &crate::config::ResolvedService,
         done_tx: Option<mpsc::Sender<ItemDone>>,
     ) {
-        let docker_port_bindings = match &start_result.handle {
-            ServiceHandle::Docker(handle) => handle.port_bindings().to_vec(),
-            ServiceHandle::Process(_) => Vec::new(),
-        };
+        let super::service_supervisor::ServiceWired {
+            identity,
+            pgid: spawned_pgid,
+            docker_port_bindings,
+            osc_sink,
+            ready_exit_rx: exit_rx,
+        } = wired;
         for binding in docker_port_bindings
             .iter()
             .filter(|binding| binding.used_fallback())
@@ -48,47 +51,15 @@ impl Runner {
             }
         }
 
-        // One handle for every output operation this spawn needs; see the
-        // note in `wire_task_output_and_wait` for why it's taken up front.
-        let output = self.output_manager.item_output(name);
-        let mut spawned_pgid: Option<i32> = None;
-        // Everything the runner needs from the handle is extracted here;
-        // the handle itself goes to the service's supervisor (Adopt, below),
-        // which owns the process from wire to reap.
-        let mut handle = start_result.handle;
-        let identity = match &handle {
-            ServiceHandle::Process(proc) => {
-                spawned_pgid = Some(proc.pgid());
-                super::state::ServiceHandleIdentity::Process { pgid: proc.pgid() }
-            }
-            ServiceHandle::Docker(_) => super::state::ServiceHandleIdentity::Docker,
-        };
-        // Take the PTY write half for the OSC sink before custody transfers.
-        let pty = match &mut handle {
-            ServiceHandle::Process(process) => process.take_pty_write(),
-            ServiceHandle::Docker(_) => None,
-        };
         if let Some(rs) = self.services.get_mut(name) {
             rs.pgid = spawned_pgid;
             rs.docker_port_bindings = docker_port_bindings;
             rs.handle_identity = Some(identity);
+            rs.osc_sink = osc_sink;
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop
             // guard in `handle_service_exited`).
             rs.last_start = Some(std::time::Instant::now());
-
-            // Add OSC response sink if we have a PTY write handle.
-            if let Some(pty) = pty
-                && let Some(output) = output.as_ref()
-            {
-                rs.osc_sink = Some(output.add_osc_sink(pty).await);
-            }
-        }
-        // Hand the process to its owner. Enqueued before any Stop for this
-        // process can be (single runner task), so mailbox order is custody
-        // order.
-        if let Some(supervisor) = self.service_starts.registry().get(name) {
-            let _ = supervisor.request(super::service_supervisor::ServiceCommand::Adopt { handle });
         }
         if let Some(pgid) = spawned_pgid {
             self.output_manager
@@ -98,44 +69,9 @@ impl Runner {
         self.set_service_state(name, ServiceState::Running);
         self.refresh_runtime_port_manifest();
 
-        // Wire up output processing. We need to fan the EOF (= process died)
-        // out to two independent waiters: the ready check (cancels its
-        // retry loop), and the crash watcher (reports the exit upstream so
-        // the runner can reap the child and transition state).
-        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-        let (crash_exit_tx, crash_exit_rx) = tokio::sync::oneshot::channel();
-        let child_output = start_result.child_output;
-        let output_worker = output.map(|output| {
-            let svc_writer = output.writer();
-            tokio::spawn(async move {
-                let _ = svc_writer.process_stream(child_output).await;
-                let _ = exit_tx.send(());
-                let _ = crash_exit_tx.send(());
-            })
-        });
-        if let Some(rs) = self.services.get_mut(name) {
-            if let Some(old_worker) = rs.output_worker.take() {
-                old_worker.abort();
-            }
-            rs.output_worker = output_worker;
-        }
-
-        // Crash watcher — fires `ServiceExited` to the runner when the
-        // child's output stream EOFs. Skipped for Docker because the
-        // bollard log stream's EOF semantics aren't yet wired to a status
-        // code path. The pgid lets the handler ignore stale events that
-        // arrive after the service has already been respawned.
-        if let Some(pgid) = spawned_pgid {
-            // EOF goes to the service's own supervisor — the process's
-            // owner — which reaps and reports the exit upstream.
-            if let Some(handle) = self.service_starts.registry().get(name).cloned() {
-                tokio::spawn(async move {
-                    let _ = crash_exit_rx.await;
-                    let _ = handle
-                        .request(super::service_supervisor::ServiceCommand::ProcessEof { pgid });
-                });
-            }
-        }
+        // Output reader, OSC sink and crash watching all live with the
+        // supervisor now — `exit_rx` above is its end-of-stream fan-out for
+        // the ready check to race against.
 
         let name_owned = name.to_string();
         // Resolve ready checks only after the handle is stored: Docker's

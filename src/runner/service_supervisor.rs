@@ -40,20 +40,28 @@ pub(in crate::runner) struct StartRequest {
 pub(in crate::runner) enum ServiceCommand {
     /// Begin a start — or supersede the one being prepared.
     Start(StartRequest),
-    /// Take custody of a wired process. Sent by the runner right after it
-    /// wires output for a prepared start; from here to reap, the process
-    /// handle lives in this supervisor. The round-trip (supervisor →
-    /// prepared → runner wires → Adopt) is interim until wiring itself
-    /// moves in; its ordering is safe because the runner is one task, so
-    /// Adopt is always enqueued before any Stop for the same process.
-    Adopt { handle: service::ServiceHandle },
-    /// The process's output stream hit EOF — reap it and report the exit.
-    /// `pgid` says which process, so a notice that outlives its process
-    /// (EOF racing a restart) is ignored by custody, not by a counter.
-    ProcessEof { pgid: i32 },
     /// End the held process: graceful signal per the config, bounded wait,
     /// SIGKILL fallback — the body of the old runner-side stop worker.
+    /// The reply waits for the output reader to drain, so "stopped" can
+    /// never outrun the process's last lines.
     Stop(StopRequest),
+}
+
+/// What the runner receives for a spawned, wired start.
+///
+/// The supervisor keeps the process handle and the output reader; this is
+/// everything the runner's bookkeeping and ready-check paths need —
+/// extracted once, at wire time, by the owner.
+pub(in crate::runner) struct ServiceWired {
+    pub(in crate::runner) identity: super::state::ServiceHandleIdentity,
+    pub(in crate::runner) pgid: Option<i32>,
+    pub(in crate::runner) docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
+    /// OSC response sink handle, for the attach paths' take/restore dance.
+    pub(in crate::runner) osc_sink: Option<crate::output::OscSinkHandle>,
+    /// Resolves when the output reader ends (process died) — the ready
+    /// check races against it. Errs immediately when the service has no
+    /// registered output, which matches the old wiring's behavior.
+    pub(in crate::runner) ready_exit_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Parameters for [`ServiceCommand::Stop`].
@@ -166,25 +174,44 @@ async fn supervise(
     report_tx: mpsc::UnboundedSender<super::ItemReport>,
     busy: Arc<AtomicBool>,
 ) {
-    let service_writer = output.map(|output| output.writer());
+    let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<ServiceCommand> = None;
     let mut mailbox_closed = false;
-    // The process this supervisor currently owns, from Adopt to reap/stop.
+    // The process this supervisor currently owns, from wire to reap/stop.
     let mut held: Option<service::ServiceHandle> = None;
+    // The output reader for the held process, and its end-of-stream signal.
+    // Stop drains the reader before notifying; end-of-stream while idle is
+    // the crash path (reap + report).
+    let mut reader: Option<tokio::task::JoinHandle<()>> = None;
+    let mut reader_eof: Option<tokio::sync::oneshot::Receiver<()>> = None;
 
     loop {
         let command = match pending.take() {
             Some(command) => command,
-            None => {
+            None => loop {
                 busy.store(false, Ordering::Relaxed);
-                match rx.recv().await {
-                    Some(command) => {
+                tokio::select! {
+                    received = rx.recv() => match received {
+                        Some(command) => {
+                            busy.store(true, Ordering::Relaxed);
+                            break command;
+                        }
+                        None => return,
+                    },
+                    // The held process's output ended — it died. Reap and
+                    // report; this is the crash path, and watching our own
+                    // reader is what replaced the detached crash watcher.
+                    _ = wait_eof(&mut reader_eof), if reader_eof.is_some() => {
                         busy.store(true, Ordering::Relaxed);
-                        command
+                        reader_eof = None;
+                        if let Some(handle) = reader.take() {
+                            await_reader(handle).await;
+                        }
+                        reap_and_report(&name, &mut held, &report_tx).await;
+                        continue;
                     }
-                    None => return,
                 }
-            }
+            },
         };
         let StartRequest {
             context,
@@ -192,18 +219,8 @@ async fn supervise(
             intent,
         } = match command {
             ServiceCommand::Start(request) => request,
-            ServiceCommand::Adopt { handle } => {
-                // A stale held handle here would mean a process nobody ever
-                // reaped; custody hands over strictly stop/reap-then-adopt,
-                // so replace-and-drop is safe (drop does not kill).
-                held = Some(handle);
-                continue;
-            }
-            ServiceCommand::ProcessEof { pgid } => {
-                reap_if_current(&name, &mut held, pgid, &report_tx).await;
-                continue;
-            }
             ServiceCommand::Stop(request) => {
+                reader_eof = None;
                 let result = match held.take() {
                     Some(handle) => {
                         let debug = service::StopDebug::new(name.clone(), env.emitter.clone());
@@ -232,6 +249,12 @@ async fn supervise(
                     // reaped. Stopping something stopped succeeds.
                     None => Ok(()),
                 };
+                // The process is gone; its reader sees EOF and drains. Wait
+                // for that before notifying, so "stopped" never outruns the
+                // service's final output.
+                if let Some(handle) = reader.take() {
+                    await_reader(handle).await;
+                }
                 match request.notify {
                     StopNotify::Internal { op_id } => {
                         let sent = internal_tx
@@ -289,12 +312,29 @@ async fn supervise(
                 pending = Some(next);
             }
             None => {
+                // Wire the spawn here, as its owner: extract what the runner
+                // needs, keep the handle and the reader. A failed prepare
+                // passes through untouched.
+                let wired = match result {
+                    Ok(start_result) => Ok(Box::new(
+                        wire_spawn(
+                            output.as_ref(),
+                            service_writer.as_ref(),
+                            start_result,
+                            &mut held,
+                            &mut reader,
+                            &mut reader_eof,
+                        )
+                        .await,
+                    )),
+                    Err(message) => Err(message),
+                };
                 let sent = internal_tx
                     .send(RunnerInternalCommand::ServiceStartPrepared {
                         name: name.clone(),
                         context,
                         intent,
-                        result: result.map(Box::new),
+                        result: wired,
                     })
                     .await;
                 if sent.is_err() {
@@ -305,32 +345,111 @@ async fn supervise(
     }
 }
 
-/// Reap the held process if `pgid` names it, and report the exit.
-///
-/// A mismatched pgid means the EOF notice outlived its process — the run
-/// it belonged to was already stopped or replaced — and is dropped. This
-/// is the custody form of the old runner-side pgid currency check.
-async fn reap_if_current(
-    name: &str,
-    held: &mut Option<service::ServiceHandle>,
-    pgid: i32,
-    report_tx: &mpsc::UnboundedSender<super::ItemReport>,
-) {
-    let matches = matches!(
-        held.as_ref(),
-        Some(service::ServiceHandle::Process(p)) if p.pgid() == pgid
-    );
-    if !matches {
-        return;
-    }
-    let status = match held.take() {
-        Some(service::ServiceHandle::Process(mut proc)) => {
-            // The EOF notice only fires after the child's output closed, so
-            // this wait returns promptly.
-            proc.wait().await.ok()
+/// Await the end-of-stream signal without consuming the slot on `None`.
+async fn wait_eof(reader_eof: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    match reader_eof.as_mut() {
+        // Err means the reader dropped the sender without sending — same
+        // meaning: the stream is over.
+        Some(rx) => {
+            let _ = rx.await;
         }
+        None => std::future::pending().await,
+    }
+}
+
+/// Join the finished reader, bounded — a wedged sink must not hold the
+/// supervisor (and with it shutdown) hostage.
+async fn await_reader(handle: tokio::task::JoinHandle<()>) {
+    let mut handle = handle;
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
+        .await
+        .is_err()
+    {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+/// Take ownership of a fresh spawn: extract everything the runner's
+/// bookkeeping needs, start the output reader, and hold the handle.
+async fn wire_spawn(
+    output: Option<&ItemOutput>,
+    service_writer: Option<&crate::output::ServiceWriter>,
+    start_result: service::StartResult,
+    held: &mut Option<service::ServiceHandle>,
+    reader: &mut Option<tokio::task::JoinHandle<()>>,
+    reader_eof: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+) -> ServiceWired {
+    let service::StartResult {
+        mut handle,
+        child_output,
+    } = start_result;
+
+    let (identity, pgid) = match &handle {
+        service::ServiceHandle::Process(proc) => (
+            super::state::ServiceHandleIdentity::Process { pgid: proc.pgid() },
+            Some(proc.pgid()),
+        ),
+        service::ServiceHandle::Docker(_) => (super::state::ServiceHandleIdentity::Docker, None),
+    };
+    let docker_port_bindings = match &handle {
+        service::ServiceHandle::Docker(docker) => docker.port_bindings().to_vec(),
+        service::ServiceHandle::Process(_) => Vec::new(),
+    };
+    let pty = match &mut handle {
+        service::ServiceHandle::Process(process) => process.take_pty_write(),
+        service::ServiceHandle::Docker(_) => None,
+    };
+    let osc_sink = match (pty, output) {
+        (Some(pty), Some(output)) => Some(output.add_osc_sink(pty).await),
         _ => None,
     };
+
+    // Fan the reader's end out twice: once to the ready check (races its
+    // retry loop), once to this supervisor (the crash path). If there is no
+    // registered output, both fire immediately — which is what the old
+    // wiring did too.
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
+    *reader = service_writer.map(|writer| {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            let _ = writer.process_stream(child_output).await;
+            let _ = exit_tx.send(());
+            let _ = eof_tx.send(());
+        })
+    });
+    *reader_eof = Some(eof_rx);
+    *held = Some(handle);
+
+    ServiceWired {
+        identity,
+        pgid,
+        docker_port_bindings,
+        osc_sink,
+        ready_exit_rx: exit_rx,
+    }
+}
+
+/// Reap the held process after its output ended, and report the exit.
+///
+/// Docker containers are held but not reaped here — the bollard stream's
+/// EOF semantics aren't a death certificate, matching the old crash
+/// watcher's docker exclusion.
+async fn reap_and_report(
+    name: &str,
+    held: &mut Option<service::ServiceHandle>,
+    report_tx: &mpsc::UnboundedSender<super::ItemReport>,
+) {
+    if !matches!(held.as_ref(), Some(service::ServiceHandle::Process(_))) {
+        return;
+    }
+    let Some(service::ServiceHandle::Process(mut proc)) = held.take() else {
+        return;
+    };
+    let pgid = proc.pgid();
+    // The reader already hit end-of-stream, so this wait returns promptly.
+    let status = proc.wait().await.ok();
     let _ = report_tx.send(super::ItemReport::ServiceExited {
         name: name.to_string(),
         pgid,
