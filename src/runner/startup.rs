@@ -3,7 +3,6 @@ use super::build_tools::{
 };
 use super::graph::{dep_name_map, topological_sort};
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::service_worker::ServiceStartMode;
 use super::task_worker::TaskRunMode;
 use super::{
     ProcessKind, Runner, RunnerInternalCommand, RuntimeService, ServiceState, TaskRunIntent,
@@ -611,18 +610,13 @@ impl Runner {
             if is_pending_svc {
                 // A build-tool-managed lazy service takes a JIT build detour.
                 // Successful completion returns it to Pending, where this
-                // scheduler checks dependencies again before starting it.
+                // scheduler checks dependencies again before permitting it.
                 if self.start_lazy_build_if_needed(&name) {
                     continue;
                 }
                 self.report_skipped_non_blocking_dependencies(&name, &skipped);
-                self.output_manager
-                    .service_debug_event(&name, "start triggered (deps satisfied)");
-                if let Err(e) = self.queue_scheduled_service_start(&name, ServiceStartMode::Full) {
-                    self.set_service_state(&name, ServiceState::Failed);
-                    self.output_manager
-                        .service_error_event(&name, &e.to_string());
-                }
+                // The start itself is the supervisor's: its gate is open (set
+                // above), and it starts when it is also idle.
                 continue;
             }
 

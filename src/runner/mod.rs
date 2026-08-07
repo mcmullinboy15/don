@@ -1397,6 +1397,9 @@ impl Runner {
                             ProcessReport::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
                             }
+                            ProcessReport::ServiceStarting { name, epoch } => {
+                                self.handle_service_starting(&name, epoch);
+                            }
                             ProcessReport::ServiceStartPrepared {
                                 name,
                                 intent,

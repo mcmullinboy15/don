@@ -53,6 +53,29 @@ impl Runner {
         Ok(())
     }
 
+    /// A supervisor spent its start permission and is starting.
+    ///
+    /// The transition to `Starting` is what closes the gate, so this is the
+    /// runner's half of making a level-triggered grant single-use. A service
+    /// that has already left `Pending` — a manual start won the race, or
+    /// teardown began — ignores the ack; the supervisor's own idle-and-empty
+    /// check is the other half.
+    pub(in crate::runner) fn handle_service_starting(&mut self, name: &str, epoch: u64) {
+        let pending = self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.state() == ServiceState::Pending);
+        if !pending {
+            self.output_manager.service_debug_event(
+                name,
+                &format!("start permit (epoch {epoch}) arrived for a non-pending service"),
+            );
+            return;
+        }
+        self.set_service_state(name, ServiceState::Starting);
+        self.output_manager.service_event(name, "starting...");
+    }
+
     pub(in crate::runner) async fn handle_service_start_prepared(
         &mut self,
         name: &str,
@@ -266,22 +289,6 @@ impl Runner {
             // ports while connections draining to the old ones finish.
             true,
         )
-    }
-
-    pub(in crate::runner) fn queue_scheduled_service_start(
-        &mut self,
-        name: &str,
-        mode: ServiceStartMode,
-    ) -> Result<(), CommandError> {
-        if self.shutting_down {
-            return Err(CommandError::InvalidState {
-                name: name.to_string(),
-                message: "shutdown in progress".to_string(),
-            });
-        }
-        self.set_service_state(name, ServiceState::Starting);
-        self.output_manager.service_event(name, "starting...");
-        self.spawn_service_start_worker(name, mode, ServiceStartIntent::Scheduled, false)
     }
 
     pub(in crate::runner) async fn handle_start_service_cmd(

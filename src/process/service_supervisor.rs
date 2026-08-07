@@ -324,11 +324,30 @@ async fn supervise(
                 // process, which with the epoch is the whole anti-double-
                 // start argument.
                 if held.is_none()
-                    && let Some(gate) = gate.as_mut()
-                    && let Some(epoch) = gate.take()
+                    && let Some(reader) = gate.as_mut()
+                    && let Some(epoch) = reader.take()
                 {
                     env.emitter
-                        .service_debug_event(&name, &format!("start permitted (epoch {epoch})"));
+                        .service_debug_event(&name, "start triggered (deps satisfied)");
+                    // Tell the scheduler a start is under way, so it can fold
+                    // Pending -> Starting. Only this supervisor knows when a
+                    // grant is actually spent; closing the gate at publish
+                    // time would close it before anything consumed it.
+                    if report_tx
+                        .send(super::ProcessReport::ServiceStarting {
+                            name: name.clone(),
+                            epoch,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    busy.store(true, Ordering::Relaxed);
+                    break ServiceCommand::Start(StartRequest {
+                        mode: ServiceStartMode::Full,
+                        intent: super::ServiceStartIntent::Scheduled,
+                        fresh_backend_ports: false,
+                    });
                 }
                 tokio::select! {
                     received = rx.recv() => match received {

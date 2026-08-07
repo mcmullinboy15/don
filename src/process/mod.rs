@@ -85,6 +85,13 @@ pub(crate) enum ProcessReport {
     TaskExited(TaskExit),
     /// A service's supervisor settled a start request — wired (metadata
     /// only; custody stays with the supervisor) or failed to prepare.
+    /// A supervisor spent its start permission and is beginning a start.
+    ///
+    /// This is the ack that makes a level-triggered permission single-use
+    /// across the channel boundary: the runner folds it into `Starting`,
+    /// which closes the gate. `epoch` lets the fold ignore an ack for a
+    /// grant already superseded — the same role `op_id` plays for stops.
+    ServiceStarting { name: String, epoch: u64 },
     ServiceStartPrepared {
         name: String,
         intent: ServiceStartIntent,

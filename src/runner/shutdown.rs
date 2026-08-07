@@ -193,22 +193,35 @@ impl Runner {
         // (most dependent) to lowest (least dependent). A service handle is
         // the source of truth here: states like Unhealthy still have a live
         // process and must be signalled during shutdown.
+        //
+        // Services the shadow says are *not* live are collected separately
+        // and sent an unjoined Stop at the same depth. A supervisor spends
+        // its own start permission now, so the shadow can trail reality by a
+        // channel hop at exactly the moment teardown decides who to stop —
+        // and a supervisor holding nothing answers immediately, so telling
+        // everyone costs nothing. They stay out of the narration and the
+        // countdown: a service with no live process was never "stopping".
         let mut by_depth: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        let mut quiet_by_depth: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         for name in &order {
             let Some(service) = self.services.get(name) else {
                 continue;
             };
+            let depth = depths.get(name).copied().unwrap_or(0);
             if service.handle_identity.is_none() {
+                quiet_by_depth.entry(depth).or_default().push(name.clone());
                 continue;
             }
-            let depth = depths.get(name).copied().unwrap_or(0);
             by_depth.entry(depth).or_default().push(name.clone());
         }
 
         let mut remaining: usize = by_depth.values().map(|v| v.len()).sum();
 
         // Stop from highest depth to lowest (dependents first).
-        for (_depth, names) in by_depth.into_iter().rev() {
+        for (depth, names) in by_depth.into_iter().rev() {
+            for name in quiet_by_depth.remove(&depth).unwrap_or_default() {
+                self.send_unjoined_stop(&name);
+            }
             for name in &names {
                 self.set_service_state(name, ServiceState::Stopping);
                 self.output_manager
@@ -317,6 +330,13 @@ impl Runner {
             }
         }
 
+        // Depths with no live service never ran the loop above; catch their
+        // supervisors here so nothing is left unasked.
+        let leftover: Vec<String> = quiet_by_depth.into_values().flatten().collect();
+        for name in leftover {
+            self.send_unjoined_stop(&name);
+        }
+
         // Kill any still-running task process groups.
         let running_task_pgids: Vec<(String, i32)> = self
             .tasks
@@ -409,6 +429,27 @@ impl Runner {
             }
         }
         while self.internal_rx.try_recv().is_ok() {}
+    }
+
+    /// Ask a supervisor to stop whatever it holds, without waiting.
+    ///
+    /// For services the runner's shadow says are not running: it may have
+    /// spent a start permission the runner has not folded yet. Nothing is
+    /// joined and nothing is narrated — this is a safety net, not a step.
+    fn send_unjoined_stop(&self, name: &str) {
+        let shutdown_config = self.effective_shutdown_config(name);
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel();
+        if let Some(handle) = self.service_starts.registry().get(name) {
+            let _ = handle.request(super::service_supervisor::ServiceCommand::Stop(
+                super::service_supervisor::StopRequest {
+                    config: shutdown_config,
+                    force: force_shutdown_requested(),
+                    wait_full_exit: false,
+                    interrupt: None,
+                    notify: super::service_supervisor::StopNotify::Done(done_tx),
+                },
+            ));
+        }
     }
 
     pub(in crate::runner) async fn stop_late_service_start(
