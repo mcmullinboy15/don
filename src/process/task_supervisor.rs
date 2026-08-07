@@ -598,6 +598,12 @@ mod tests {
             platform: crate::config::Platform::LinuxX86_64,
             emitter: output.clone_lifecycle_emitter(),
             global_watch_ignore: Vec::new(),
+            endpoints: {
+                let (writer, reader) = crate::endpoints::channel();
+                // Keep the writer alive for the reader's lifetime.
+                std::mem::forget(writer);
+                reader
+            },
         };
         let names = ["build".to_string(), "migrate".to_string()];
         let (report_tx, _report_rx) = mpsc::unbounded_channel();

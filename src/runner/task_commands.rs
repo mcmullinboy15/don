@@ -21,12 +21,11 @@ impl Runner {
     pub(in crate::runner) fn spawn_task_worker(
         &mut self,
         name: &str,
-        mut task_cfg: crate::config::Task,
+        task_cfg: crate::config::Task,
         params: HashMap<String, String>,
         mode: TaskRunMode,
         intent: TaskRunIntent,
     ) -> Result<(), CommandError> {
-        crate::endpoints::render_env(&self.endpoints.snapshot(), name, &mut task_cfg.env)?;
         // The registry is built from the task map, so a hit here is proof the
         // task exists — no separate existence check needed.
         let Some(handle) = self.task_supervisors.registry().get(name).cloned() else {

@@ -25,6 +25,9 @@ pub(crate) struct TaskWorkerContext {
     pub(crate) platform: Platform,
     pub(crate) emitter: crate::output::LifecycleEmitter,
     pub(crate) global_watch_ignore: Vec<String>,
+    /// Where every service can be reached, for rendering this task's
+    /// `$(service.KEY)` env references at the moment it runs.
+    pub(crate) endpoints: crate::endpoints::EndpointReader,
 }
 
 fn format_hash_progress(progress: TaskHashProgress) -> String {
@@ -183,7 +186,14 @@ pub(crate) async fn run_task_worker(
         platform,
         emitter,
         global_watch_ignore,
+        endpoints,
     } = ctx;
+    // Resolve `$(service.KEY)` here rather than at request time, so a run
+    // picks up wherever its dependencies are reachable *now*.
+    let mut task_cfg = task_cfg.clone();
+    crate::endpoints::render_env(&endpoints.snapshot(), name, &mut task_cfg.env)
+        .map_err(|error| error.to_string())?;
+    let task_cfg = &task_cfg;
     if let TaskRunMode::Startup { has_dependents } = mode {
         let has_watch = !task_cfg.watch.is_empty();
         let watch_base = working_dir_for(&base_dir, task_cfg.dir.as_deref());

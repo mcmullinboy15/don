@@ -585,6 +585,7 @@ impl Runner {
                 platform,
                 emitter: output_manager.clone_lifecycle_emitter(),
                 global_watch_ignore: config.watch_ignore.clone(),
+                endpoints: endpoints.reader(),
             },
             &|name| output_manager.process_output(name),
             &report_tx,

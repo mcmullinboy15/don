@@ -208,6 +208,14 @@ impl EndpointWriter {
         self.update(name, |endpoints| endpoints.docker_live = false);
     }
 
+    /// Hand out another read-only view. Unlimited readers are fine; they
+    /// never block the writer.
+    pub(crate) fn reader(&self) -> EndpointReader {
+        EndpointReader {
+            rx: self.tx.subscribe(),
+        }
+    }
+
     /// The runner's own read, so it needn't hold a second handle.
     pub(crate) fn snapshot(&self) -> Arc<EndpointSnapshot> {
         self.tx.borrow().clone()
