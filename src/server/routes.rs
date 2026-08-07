@@ -353,20 +353,11 @@ async fn get_logs(
         return follow_logs(state, name, query.last).await;
     }
 
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(RunnerCommand::Logs {
-            name: name.clone(),
-            last_n: query.last,
-            reply: tx,
-        })
-        .is_err()
-    {
-        return runner_unavailable();
-    }
-    match rx.await {
-        Ok(Some(raw)) => {
+    // Straight off the ring buffer — no runner round trip, so reading logs
+    // never queues behind whatever the runner is currently doing.
+    match state.logs.read_logs(&name, query.last).await {
+        Some(raw) => {
+            let raw = String::from_utf8_lossy(&raw);
             let lines: Vec<String> = if raw.is_empty() {
                 Vec::new()
             } else {
@@ -374,8 +365,7 @@ async fn get_logs(
             };
             Json(LogsResponse { name, lines }).into_response()
         }
-        Ok(None) => not_found(&name),
-        Err(_) => runner_unavailable(),
+        None => not_found(&name),
     }
 }
 
@@ -498,22 +488,10 @@ async fn get_all_logs(
 }
 
 async fn follow_logs(state: Arc<ApiState>, name: String, last: usize) -> Response {
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(RunnerCommand::LogsFollow {
-            name: name.clone(),
-            last_n: last,
-            reply: tx,
-        })
-        .is_err()
-    {
-        return runner_unavailable();
-    }
-    let sink_rx = match rx.await {
-        Ok(Some(r)) => r,
-        Ok(None) => return not_found(&name),
-        Err(_) => return runner_unavailable(),
+    // 256-line buffer — slow HTTP clients will drop lines (and get pruned on
+    // disconnect) rather than blocking service output.
+    let Some(sink_rx) = state.logs.add_follow_sink(&name, last, 256).await else {
+        return not_found(&name);
     };
 
     // Build an NDJSON stream: one `{"line":"..."}\n` per SinkLine.
@@ -770,6 +748,7 @@ mod tests {
         drop(cmd_rx);
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
         let log_tap = crate::output::MergedLogTap::for_tests();
+        let logs = crate::output::LogReader::for_tests();
         let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         // Leak the sender so the receiver stays live for the router's
         // lifetime — tests never signal shutdown.
@@ -781,6 +760,7 @@ mod tests {
             emulator: crate::output::emulator::spawn_emulator_thread(),
             attach_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             log_tap,
+            logs,
             shutdown,
         }))
     }

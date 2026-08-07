@@ -211,20 +211,6 @@ pub enum RunnerCommand {
     WatchStatus {
         reply: oneshot::Sender<Option<WatchReport>>,
     },
-    /// Read the last N lines from a service or task's ring buffer.
-    /// Returns None if the name is unknown.
-    Logs {
-        name: String,
-        last_n: usize,
-        reply: oneshot::Sender<Option<String>>,
-    },
-    /// Subscribe to live log output. Returns a receiver preloaded with the
-    /// last N lines, then streaming new output. None if name is unknown.
-    LogsFollow {
-        name: String,
-        last_n: usize,
-        reply: oneshot::Sender<Option<mpsc::Receiver<crate::output::SinkLine>>>,
-    },
     /// Retry starting any Pending services/tasks whose deps are now
     /// satisfied. Sent by [`Self::StartPending`] itself after a delay,
     /// forming a soft poll loop that unblocks dependents as their deps
@@ -994,6 +980,12 @@ impl Runner {
         self.output_manager.log_stream_sender()
     }
 
+    /// A cloneable read-only handle to every process's buffered output; see
+    /// [`crate::output::LogReader`].
+    pub fn log_reader(&self) -> crate::output::LogReader {
+        self.output_manager.log_reader()
+    }
+
     /// Handle to the server-side terminal-emulator thread, for the API
     /// server's attach-resize path.
     pub(crate) fn emulator_handle(&self) -> crate::output::emulator::EmulatorHandle {
@@ -1325,22 +1317,6 @@ impl Runner {
                             RunnerCommand::WatchStatus { reply } => {
                                 let report = self.collect_watch_report().await;
                                 let _ = reply.send(report);
-                            }
-                            RunnerCommand::Logs { name, last_n, reply } => {
-                                let logs = self.output_manager
-                                    .read_logs(&name, last_n)
-                                    .await
-                                    .map(|b| String::from_utf8_lossy(&b).into_owned());
-                                let _ = reply.send(logs);
-                            }
-                            RunnerCommand::LogsFollow { name, last_n, reply } => {
-                                // 256-line buffer — slow HTTP clients will drop lines
-                                // (and get pruned on disconnect) rather than blocking
-                                // service output.
-                                let sink = self.output_manager
-                                    .add_follow_sink(&name, last_n, 256)
-                                    .await;
-                                let _ = reply.send(sink);
                             }
                             RunnerCommand::Start { name, reply } => {
                                 self.handle_start_service_cmd(&name, reply).await;

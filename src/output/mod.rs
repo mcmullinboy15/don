@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// Default ring buffer capacity per service (lines).
@@ -641,11 +641,117 @@ fn format_prefix(name: &str, color: Color, max_name_len: usize) -> Bytes {
     ))
 }
 
+/// Read the last N ring-buffer lines from one service's output state,
+/// joined by newlines (trailing newline stripped).
+async fn read_logs_from(state_arc: &Arc<Mutex<ServiceOutputState>>, n: usize) -> Bytes {
+    let state = state_arc.lock().await;
+    let parts: Vec<&[u8]> = state.ring_buffer.last_n(n).collect();
+    // Entries include `\n` delimiters — concatenate directly.
+    let mut result: Vec<u8> = Vec::new();
+    for part in &parts {
+        result.extend_from_slice(part);
+    }
+    // Strip trailing `\n` for clean output.
+    if result.last() == Some(&b'\n') {
+        result.pop();
+    }
+    Bytes::from(result)
+}
+
+/// Attach a follow sink to one service's output state: a freshly-created mpsc
+/// channel preloaded with the last N buffered lines, then registered as a
+/// sink. New lines are delivered until the receiver is dropped (or the client
+/// is too slow and the sink's buffer fills — it then gets disconnected).
+async fn follow_sink_from(
+    state_arc: Arc<Mutex<ServiceOutputState>>,
+    last_n: usize,
+    live_capacity: usize,
+) -> mpsc::Receiver<SinkLine> {
+    // Channel must hold the preloaded snapshot AND live headroom without
+    // blocking (or dropping the freshly-connected client immediately).
+    let capacity = last_n.saturating_add(live_capacity).max(1);
+    let (tx, rx) = mpsc::channel::<SinkLine>(capacity);
+    let mut state = state_arc.lock().await;
+    let svc_name = state.name.clone();
+    let prefix = state.prefix.clone();
+    // Preload last N ring buffer lines. Channel has `capacity` slots and
+    // is empty, so try_send is safe here.
+    for line in state.ring_buffer.last_n(last_n) {
+        // Ring-buffer entries keep their trailing `\n`, but `SinkLine.line`
+        // is contractually newline-free (the follow route embeds it in a
+        // JSON "line" value and the client adds its own newline). Strip it
+        // so the replayed snapshot doesn't render a blank line per entry.
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let sink_line = SinkLine {
+            prefix: prefix.clone(),
+            line: Bytes::copy_from_slice(line),
+            name: svc_name.clone(),
+            // Ring-buffer replays mostly carry raw service stdout. Even
+            // if a few lifecycle events are mixed in, marking them all
+            // as non-lifecycle is correct for follow consumers, which
+            // don't have a TUI filter to short-circuit anyway.
+            is_lifecycle: false,
+        };
+        if tx.try_send(sink_line).is_err() {
+            break;
+        }
+    }
+    state.sinks.push(SinkHandle::BoundedDrop(tx));
+    rx
+}
+
+/// A cloneable, read-only handle to every process's buffered output.
+///
+/// This is to logs what [`StateReader`](crate::state_store::StateReader) is
+/// to state: the server holds one and answers `GET /logs` (and the follow
+/// variant) without a runner round trip, so reading logs never queues behind
+/// whatever the runner is currently doing. The registry is republished
+/// through a `watch`, so a name registered late (the build-tool prefix) is
+/// visible to handles minted before it existed.
+#[derive(Clone)]
+pub struct LogReader {
+    services: watch::Receiver<Arc<HashMap<String, Arc<Mutex<ServiceOutputState>>>>>,
+}
+
+impl LogReader {
+    /// An empty reader for tests that need an `ApiState` without an
+    /// `OutputManager`. Every lookup answers `None`.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let (tx, rx) = watch::channel(Arc::new(HashMap::new()));
+        std::mem::forget(tx);
+        Self { services: rx }
+    }
+
+    /// Read the last N lines from a process's ring buffer, joined by
+    /// newlines. `None` if the name is not registered.
+    pub async fn read_logs(&self, name: &str, n: usize) -> Option<Bytes> {
+        let state_arc = self.services.borrow().get(name)?.clone();
+        Some(read_logs_from(&state_arc, n).await)
+    }
+
+    /// Attach a follow sink (see [`OutputManager::add_follow_sink`]).
+    /// `None` if the name is not registered.
+    pub async fn add_follow_sink(
+        &self,
+        name: &str,
+        last_n: usize,
+        live_capacity: usize,
+    ) -> Option<mpsc::Receiver<SinkLine>> {
+        let state_arc = self.services.borrow().get(name)?.clone();
+        Some(follow_sink_from(state_arc, last_n, live_capacity).await)
+    }
+}
+
 /// Manages output for all services — creates sinks, spawns writer tasks,
 /// and provides lifecycle event formatting.
 pub struct OutputManager {
     /// Per-service output state, retained for the lifetime of the program.
     services: HashMap<String, Arc<Mutex<ServiceOutputState>>>,
+    /// The same registry, republished for [`LogReader`] handles. Almost
+    /// always set once at construction; `register_service` republishes for
+    /// the rare late registration (the build-tool prefix).
+    services_watch: watch::Sender<Arc<HashMap<String, Arc<Mutex<ServiceOutputState>>>>>,
     /// The formatted `[don]` prefix, padded to align with service prefixes.
     don_prefix: String,
     /// Stdout sink sender — used for lifecycle events and service output.
@@ -903,8 +1009,10 @@ impl OutputManager {
             width = max_name_len,
         );
 
+        let (services_watch, _) = watch::channel(Arc::new(service_map.clone()));
         Ok(Self {
             services: service_map,
+            services_watch,
             don_prefix,
             stdout_sink,
             writer_handles,
@@ -1009,37 +1117,7 @@ impl OutputManager {
         live_capacity: usize,
     ) -> Option<mpsc::Receiver<SinkLine>> {
         let state_arc = self.services.get(name)?.clone();
-        // Channel must hold the preloaded snapshot AND live headroom without
-        // blocking (or dropping the freshly-connected client immediately).
-        let capacity = last_n.saturating_add(live_capacity).max(1);
-        let (tx, rx) = mpsc::channel::<SinkLine>(capacity);
-        let mut state = state_arc.lock().await;
-        let svc_name = state.name.clone();
-        let prefix = state.prefix.clone();
-        // Preload last N ring buffer lines. Channel has `capacity` slots and
-        // is empty, so try_send is safe here.
-        for line in state.ring_buffer.last_n(last_n) {
-            // Ring-buffer entries keep their trailing `\n`, but `SinkLine.line`
-            // is contractually newline-free (the follow route embeds it in a
-            // JSON "line" value and the client adds its own newline). Strip it
-            // so the replayed snapshot doesn't render a blank line per entry.
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
-            let sink_line = SinkLine {
-                prefix: prefix.clone(),
-                line: Bytes::copy_from_slice(line),
-                name: svc_name.clone(),
-                // Ring-buffer replays mostly carry raw service stdout. Even
-                // if a few lifecycle events are mixed in, marking them all
-                // as non-lifecycle is correct for follow consumers, which
-                // don't have a TUI filter to short-circuit anyway.
-                is_lifecycle: false,
-            };
-            if tx.try_send(sink_line).is_err() {
-                break;
-            }
-        }
-        state.sinks.push(SinkHandle::BoundedDrop(tx));
-        Some(rx)
+        Some(follow_sink_from(state_arc, last_n, live_capacity).await)
     }
 
     /// Add an attach sink preloaded with a screen repaint frame instead of a
@@ -1110,18 +1188,7 @@ impl OutputManager {
     /// Returns `None` if the service is not registered.
     pub async fn read_logs(&self, name: &str, n: usize) -> Option<Bytes> {
         let state_arc = self.services.get(name)?;
-        let state = state_arc.lock().await;
-        let parts: Vec<&[u8]> = state.ring_buffer.last_n(n).collect();
-        // Entries include `\n` delimiters — concatenate directly.
-        let mut result: Vec<u8> = Vec::new();
-        for part in &parts {
-            result.extend_from_slice(part);
-        }
-        // Strip trailing `\n` for clean output.
-        if result.last() == Some(&b'\n') {
-            result.pop();
-        }
-        Some(Bytes::from(result))
+        Some(read_logs_from(state_arc, n).await)
     }
 
     /// Register a service that wasn't known at OutputManager construction
@@ -1174,6 +1241,14 @@ impl OutputManager {
                 stdout_paused: false,
             })),
         );
+        let _ = self.services_watch.send(Arc::new(self.services.clone()));
+    }
+
+    /// Get a cloneable read-only handle to every process's buffered output.
+    pub fn log_reader(&self) -> LogReader {
+        LogReader {
+            services: self.services_watch.subscribe(),
+        }
     }
 
     /// Get a shared runtime controller for verbose logging.

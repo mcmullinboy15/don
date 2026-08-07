@@ -312,7 +312,6 @@ enum RunnerCommand {
     Rebuild { name: String },           // file watch triggered
     TaskRerun { name: String },         // file watch triggered
     Status { reply: oneshot::Sender<Vec<ProcessStatus>> },
-    Logs { name: String, last_n: usize, reply: oneshot::Sender<Option<String>> },
     StartPending,                       // deferred retry for unsatisfied deps
     Shutdown,
 }
