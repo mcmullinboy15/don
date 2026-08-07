@@ -153,7 +153,7 @@ impl Runner {
                     crate::docker::env_reference_values(&runtime.docker_port_bindings),
                 );
             }
-            if let Some(proxy) = runtime.proxy.as_ref() {
+            if let Some(proxy) = runtime.proxy_view.as_ref() {
                 extend_service_references(
                     &mut references,
                     service_name,
@@ -170,8 +170,8 @@ impl Runner {
     fn runtime_backend_env(&self, name: &str) -> HashMap<String, String> {
         self.services
             .get(name)
-            .and_then(|runtime| runtime.proxy.as_ref())
-            .map(|proxy| proxy.env_vars())
+            .and_then(|runtime| runtime.proxy_view.as_ref())
+            .map(|proxy| proxy.backend_env.clone())
             .unwrap_or_default()
     }
 
@@ -185,7 +185,7 @@ impl Runner {
                 &runtime.docker_port_bindings,
             ));
         }
-        if let Some(proxy) = runtime.proxy.as_ref() {
+        if let Some(proxy) = runtime.proxy_view.as_ref() {
             env.extend(proxy.public_env_vars());
         }
         env
@@ -197,8 +197,8 @@ impl Runner {
             return HashMap::new();
         };
 
-        if let Some(proxy) = runtime.proxy.as_ref() {
-            for binding in proxy.bindings() {
+        if let Some(proxy) = runtime.proxy_view.as_ref() {
+            for binding in &proxy.bindings {
                 let Ok(configured) = binding.configured_addr.parse::<SocketAddr>() else {
                     continue;
                 };
@@ -237,11 +237,11 @@ impl Runner {
         let mut services = BTreeMap::new();
         for (name, runtime) in &self.services {
             let proxy: Vec<ProxyPort> = runtime
-                .proxy
+                .proxy_view
                 .as_ref()
                 .map(|proxy| {
                     proxy
-                        .bindings()
+                        .bindings
                         .iter()
                         .map(|binding| {
                             let (mode, env, target) = match &binding.mode {

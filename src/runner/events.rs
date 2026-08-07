@@ -96,7 +96,7 @@ impl Runner {
             let is_lazy = self
                 .services
                 .get(&item.name)
-                .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
+                .is_some_and(|rs| rs.resolved.lazy && rs.proxy_view.is_some());
             if is_lazy {
                 // Route through the crash-loop guard: returns to `Lazy` and
                 // re-arms the proxy trigger normally, but gives up (leaving it

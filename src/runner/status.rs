@@ -183,7 +183,7 @@ impl Runner {
                     } else {
                         Vec::new()
                     },
-                    proxy: rs.proxy.as_ref().map_or_else(
+                    proxy: rs.proxy_view.as_ref().map_or_else(
                         || {
                             resolved
                                 .proxy
@@ -231,7 +231,7 @@ impl Runner {
                         _ => Vec::new(),
                     },
                     proxy_active_connections: rs
-                        .proxy
+                        .proxy_view
                         .as_ref()
                         .and_then(|proxy| proxy.active_forward_connections()),
                     bazel_target: resolved.bazel_config().map(|b| b.target.clone()),

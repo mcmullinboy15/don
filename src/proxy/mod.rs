@@ -168,6 +168,69 @@ pub(crate) struct ServiceProxy {
     policy: ConnectionPolicy,
 }
 
+/// The runner's read-only view of a service's proxy.
+///
+/// The live [`ServiceProxy`] belongs to the service's supervisor; everything
+/// the runner needs for status, port references and the ports manifest is
+/// here instead. `bindings` never changes after bind. `backend_env` and
+/// `policy` are shadows the runner refreshes itself: it is the only sender of
+/// policy changes, and every (re)spawn reports its backend env through the
+/// wired message — so the shadow is current wherever it is read.
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyView {
+    /// Configured-to-actual binding metadata, in declaration order.
+    pub(crate) bindings: Vec<ProxyBinding>,
+    /// Live count of Don-owned forward connections, shared with the accept
+    /// loops. `None` when the service has no env/forward entries.
+    active_forward_connections: Option<Arc<AtomicUsize>>,
+    /// Env-mode backend vars (e.g. `{"PORT": "49152"}`) as of the last
+    /// spawn — reallocation on restart makes these per-process values.
+    pub(crate) backend_env: HashMap<String, String>,
+    /// The connection policy the runner last commanded.
+    pub(crate) policy: ConnectionPolicy,
+}
+
+impl ProxyView {
+    /// Human-readable entries using the actual bound public addresses.
+    pub(crate) fn descriptions(&self) -> Vec<String> {
+        descriptions_for(&self.bindings)
+    }
+
+    /// Whether the proxy is refusing connections under the last policy.
+    pub(crate) fn is_refusing(&self) -> bool {
+        self.policy == ConnectionPolicy::Refuse
+    }
+
+    /// Active Don-owned proxy connections; `None` for listenfd-only proxies.
+    pub(crate) fn active_forward_connections(&self) -> Option<usize> {
+        self.active_forward_connections
+            .as_ref()
+            .map(|count| count.load(Ordering::Relaxed))
+    }
+
+    /// Public address env vars — see [`ServiceProxy::public_env_vars`].
+    pub(crate) fn public_env_vars(&self) -> HashMap<String, String> {
+        public_env_vars_for(&self.bindings)
+    }
+
+    /// Runtime reference values for other services' inline env expansion.
+    /// Values always describe public listener addresses, never env-mode
+    /// backend ports: `$(database.PORT)` resolves to the public port for
+    /// `proxy = { ..., env = "PORT" }`.
+    pub(crate) fn env_reference_values(&self) -> HashMap<String, String> {
+        env_reference_values_for(&self.bindings)
+    }
+
+    /// True if any proxy entry requires serial (no-overlap) restart. A fixed
+    /// `Forward` backend can't have two processes binding the same port at
+    /// once, so the old instance must fully exit before the new one starts.
+    pub(crate) fn requires_full_exit_on_restart(&self) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| matches!(binding.mode, ProxyBindingMode::Forward { .. }))
+    }
+}
+
 enum PendingListener {
     Forward {
         listener: TcpListener,
@@ -386,11 +449,6 @@ impl ServiceProxy {
         }
     }
 
-    /// Whether this proxy is currently refusing connections.
-    pub(crate) fn is_refusing(&self) -> bool {
-        self.policy == ConnectionPolicy::Refuse
-    }
-
     /// Set what happens to incoming connections. Returns whether the policy
     /// actually changed.
     ///
@@ -453,73 +511,19 @@ impl ServiceProxy {
     /// externally reachable listeners, which can differ from the configured
     /// addresses when fallback ports or explicit port 0 are used.
     pub(crate) fn public_env_vars(&self) -> HashMap<String, String> {
-        let mut vars = HashMap::new();
-
-        for (idx, binding) in self.bindings.iter().enumerate() {
-            let addr = binding.connect_addr();
-            vars.insert(format!("DON_PUBLIC_ADDR_{idx}"), addr.to_string());
-            vars.insert(format!("DON_PUBLIC_PORT_{idx}"), addr.port().to_string());
-
-            if idx == 0 {
-                vars.insert("DON_PUBLIC_ADDR".to_string(), addr.to_string());
-                vars.insert("DON_PUBLIC_PORT".to_string(), addr.port().to_string());
-            }
-
-            if let ProxyBindingMode::Env { env_name } = &binding.mode {
-                let suffix = sanitize_env_suffix(env_name);
-                if !suffix.is_empty() {
-                    vars.insert(format!("DON_PUBLIC_{suffix}"), addr.port().to_string());
-                    vars.insert(format!("DON_PUBLIC_{suffix}_ADDR"), addr.to_string());
-                    vars.insert(format!("DON_PUBLIC_{suffix}_PORT"), addr.port().to_string());
-                }
-            }
-        }
-
-        vars
+        public_env_vars_for(&self.bindings)
     }
 
-    /// Runtime reference values for other services' inline env expansion.
-    /// Values always describe public listener addresses, never env-mode
-    /// backend ports. For example, `$(database.PORT)` resolves to the public
-    /// port for `proxy = { ..., env = "PORT" }`.
-    pub(crate) fn env_reference_values(&self) -> HashMap<String, String> {
-        let mut vars = HashMap::new();
-
-        for (idx, binding) in self.bindings.iter().enumerate() {
-            let addr = binding.connect_addr();
-            vars.insert(format!("addr_{idx}"), addr.to_string());
-            vars.insert(format!("port_{idx}"), addr.port().to_string());
-            vars.insert(format!("ADDR_{idx}"), addr.to_string());
-            vars.insert(format!("PORT_{idx}"), addr.port().to_string());
-
-            if idx == 0 {
-                vars.insert("addr".to_string(), addr.to_string());
-                vars.insert("port".to_string(), addr.port().to_string());
-                vars.insert("ADDR".to_string(), addr.to_string());
-                vars.insert("PORT".to_string(), addr.port().to_string());
-            }
-
-            if let ProxyBindingMode::Env { env_name } = &binding.mode {
-                let suffix = sanitize_env_suffix(env_name);
-                if !suffix.is_empty() {
-                    vars.insert(suffix.clone(), addr.port().to_string());
-                    vars.insert(format!("{suffix}_ADDR"), addr.to_string());
-                    vars.insert(format!("{suffix}_PORT"), addr.port().to_string());
-                }
-            }
+    /// A [`ProxyView`] of this proxy's current metadata, for the runner's
+    /// bookkeeping while the proxy itself lives with the supervisor.
+    pub(crate) fn view(&self) -> ProxyView {
+        ProxyView {
+            bindings: self.bindings.clone(),
+            active_forward_connections: (!self.forward.is_empty())
+                .then(|| self.active_forward_connections.clone()),
+            backend_env: self.env_vars(),
+            policy: self.policy,
         }
-
-        vars
-    }
-
-    /// True if any proxy entry requires serial (no-overlap) restart. Fixed
-    /// `Forward` backends can't have two processes binding the same port at
-    /// once, so the caller must fully tear down the old instance before
-    /// starting the new one.
-    pub(crate) fn requires_full_exit_on_restart(&self) -> bool {
-        self.forward
-            .iter()
-            .any(|f| matches!(f.backend, ForwardBackend::Fixed(_)))
     }
 
     /// Socket-activation env vars for listenfd entries. Empty if the service
@@ -554,35 +558,11 @@ impl ServiceProxy {
             .collect()
     }
 
-    /// Cloneable configured-to-actual binding metadata in declaration order.
-    pub(crate) fn bindings(&self) -> &[ProxyBinding] {
-        &self.bindings
-    }
-
     /// Addresses Don is listening on, in original declaration order.
     pub(crate) fn listen_addrs(&self) -> Vec<SocketAddr> {
         self.bindings
             .iter()
             .map(|binding| binding.bound_addr)
-            .collect()
-    }
-
-    /// Human-readable entries using the actual bound public addresses, in
-    /// original declaration order.
-    pub(crate) fn descriptions(&self) -> Vec<String> {
-        self.bindings
-            .iter()
-            .map(|binding| match &binding.mode {
-                ProxyBindingMode::Env { env_name } => {
-                    format!("{} (env={env_name})", binding.bound_addr)
-                }
-                ProxyBindingMode::Forward { target } => {
-                    format!("{} → {target}", binding.bound_addr)
-                }
-                ProxyBindingMode::Listenfd => {
-                    format!("{} (listenfd)", binding.bound_addr)
-                }
-            })
             .collect()
     }
 
@@ -599,23 +579,6 @@ impl ServiceProxy {
                 )
             })
             .collect()
-    }
-
-    /// Active env/forward proxy connections owned by Don. Listenfd-mode
-    /// sockets are accepted by the child process, so Don cannot count them.
-    pub(crate) fn active_forward_connections(&self) -> Option<usize> {
-        if self.forward.is_empty() {
-            return None;
-        }
-        Some(self.active_forward_connections.load(Ordering::Relaxed))
-    }
-
-    /// Re-arm the lazy trigger for listenfd entries. Called after the service
-    /// stops and re-enters the `Lazy` state so the next queued connection
-    /// triggers another start cycle. Idempotent: the runner also derives this
-    /// policy from the service state.
-    pub(crate) fn rearm_lazy_watchers(&mut self) {
-        self.set_policy(ConnectionPolicy::LazyTrigger);
     }
 
     /// Shut down all proxy work — abort forwarding accept loops and the
@@ -693,6 +656,84 @@ fn should_fallback(
 fn fallback_addr(mut configured_addr: SocketAddr) -> SocketAddr {
     configured_addr.set_port(0);
     configured_addr
+}
+
+/// Public address env vars derived from binding metadata — the body of
+/// [`ServiceProxy::public_env_vars`] and [`ProxyView::public_env_vars`].
+fn public_env_vars_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+
+    for (idx, binding) in bindings.iter().enumerate() {
+        let addr = binding.connect_addr();
+        vars.insert(format!("DON_PUBLIC_ADDR_{idx}"), addr.to_string());
+        vars.insert(format!("DON_PUBLIC_PORT_{idx}"), addr.port().to_string());
+
+        if idx == 0 {
+            vars.insert("DON_PUBLIC_ADDR".to_string(), addr.to_string());
+            vars.insert("DON_PUBLIC_PORT".to_string(), addr.port().to_string());
+        }
+
+        if let ProxyBindingMode::Env { env_name } = &binding.mode {
+            let suffix = sanitize_env_suffix(env_name);
+            if !suffix.is_empty() {
+                vars.insert(format!("DON_PUBLIC_{suffix}"), addr.port().to_string());
+                vars.insert(format!("DON_PUBLIC_{suffix}_ADDR"), addr.to_string());
+                vars.insert(format!("DON_PUBLIC_{suffix}_PORT"), addr.port().to_string());
+            }
+        }
+    }
+
+    vars
+}
+
+/// Reference values (`$(service.PORT)` and friends) derived from binding
+/// metadata. Always public listener addresses, never env-mode backend ports.
+fn env_reference_values_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+
+    for (idx, binding) in bindings.iter().enumerate() {
+        let addr = binding.connect_addr();
+        vars.insert(format!("addr_{idx}"), addr.to_string());
+        vars.insert(format!("port_{idx}"), addr.port().to_string());
+        vars.insert(format!("ADDR_{idx}"), addr.to_string());
+        vars.insert(format!("PORT_{idx}"), addr.port().to_string());
+
+        if idx == 0 {
+            vars.insert("addr".to_string(), addr.to_string());
+            vars.insert("port".to_string(), addr.port().to_string());
+            vars.insert("ADDR".to_string(), addr.to_string());
+            vars.insert("PORT".to_string(), addr.port().to_string());
+        }
+
+        if let ProxyBindingMode::Env { env_name } = &binding.mode {
+            let suffix = sanitize_env_suffix(env_name);
+            if !suffix.is_empty() {
+                vars.insert(suffix.clone(), addr.port().to_string());
+                vars.insert(format!("{suffix}_ADDR"), addr.to_string());
+                vars.insert(format!("{suffix}_PORT"), addr.port().to_string());
+            }
+        }
+    }
+
+    vars
+}
+
+/// Human-readable listener entries derived from binding metadata.
+fn descriptions_for(bindings: &[ProxyBinding]) -> Vec<String> {
+    bindings
+        .iter()
+        .map(|binding| match &binding.mode {
+            ProxyBindingMode::Env { env_name } => {
+                format!("{} (env={env_name})", binding.bound_addr)
+            }
+            ProxyBindingMode::Forward { target } => {
+                format!("{} → {target}", binding.bound_addr)
+            }
+            ProxyBindingMode::Listenfd => {
+                format!("{} (listenfd)", binding.bound_addr)
+            }
+        })
+        .collect()
 }
 
 fn sanitize_env_suffix(name: &str) -> String {
@@ -1292,7 +1333,8 @@ mod tests {
                     && matches!(
                         &result,
                         Ok(proxy) if proxy
-                            .bindings()
+                            .view()
+                            .bindings
                             .first()
                             .is_some_and(|binding| binding.used_fallback)
                             != case.expect_fallback
@@ -1307,8 +1349,9 @@ mod tests {
                 let proxy = result.unwrap_or_else(|error| {
                     panic!("{}: expected bind success, got {error}", case.name)
                 });
-                let binding = proxy
-                    .bindings()
+                let view = proxy.view();
+                let binding = view
+                    .bindings
                     .first()
                     .unwrap_or_else(|| panic!("{}: missing binding metadata", case.name));
                 assert_eq!(
@@ -1376,7 +1419,8 @@ mod tests {
         let proxy = ServiceProxy::bind(&entries, true, None, "mixed", emitter)
             .await
             .unwrap();
-        let bindings = proxy.bindings();
+        let view = proxy.view();
+        let bindings = &view.bindings;
 
         assert_eq!(bindings.len(), 4);
         assert!(matches!(&bindings[0].mode, ProxyBindingMode::Listenfd));
@@ -1394,7 +1438,7 @@ mod tests {
             bindings.iter().map(|binding| binding.bound_addr).collect();
         assert_eq!(proxy.listen_addrs(), actual_addrs);
         assert_eq!(
-            proxy.descriptions(),
+            proxy.view().descriptions(),
             vec![
                 format!("{} (listenfd)", actual_addrs[0]),
                 format!("{} (env=api_port)", actual_addrs[1]),
@@ -1427,7 +1471,7 @@ mod tests {
             Some(&actual_addrs[1].to_string())
         );
 
-        let references = proxy.env_reference_values();
+        let references = proxy.view().env_reference_values();
         assert_eq!(references.get("addr"), Some(&actual_addrs[0].to_string()));
         assert_eq!(
             references.get("port_2"),
@@ -1449,7 +1493,7 @@ mod tests {
         );
         assert!(proxy.fallback_descriptions().is_empty());
 
-        let cloned = proxy.bindings().to_vec();
+        let cloned = proxy.view().bindings;
         drop(proxy);
         assert_eq!(cloned.len(), 4);
         assert_eq!(cloned[1].bound_addr, actual_addrs[1]);
@@ -1656,7 +1700,8 @@ mod tests {
             .await
             .unwrap();
             let addrs: Vec<SocketAddr> = proxy
-                .bindings()
+                .view()
+                .bindings
                 .iter()
                 .map(|binding| binding.bound_addr)
                 .collect();
@@ -1680,7 +1725,7 @@ mod tests {
                 "{}: entering refusal should report a change",
                 case.name
             );
-            assert!(proxy.is_refusing(), "{}", case.name);
+            assert!(proxy.view().is_refusing(), "{}", case.name);
 
             // Every listener refuses — parked connections and new ones alike.
             for (addr, mut early) in addrs.iter().zip(parked) {
@@ -1706,7 +1751,7 @@ mod tests {
                 ConnectionPolicy::Serve
             };
             assert!(proxy.set_policy(recovered), "{}", case.name);
-            assert!(!proxy.is_refusing(), "{}", case.name);
+            assert!(!proxy.view().is_refusing(), "{}", case.name);
             for addr in &addrs {
                 let mut after = tokio::net::TcpStream::connect(addr).await.unwrap();
                 assert!(
@@ -1739,7 +1784,8 @@ mod tests {
             .await
             .unwrap();
         let addrs: Vec<SocketAddr> = proxy
-            .bindings()
+            .view()
+            .bindings
             .iter()
             .map(|binding| binding.bound_addr)
             .collect();
@@ -1749,7 +1795,7 @@ mod tests {
         let mut buf = [0u8; 1];
         let mut refused = tokio::net::TcpStream::connect(addrs[0]).await.unwrap();
         assert_closed(&mut refused, &mut buf, "refused while failed").await;
-        proxy.rearm_lazy_watchers();
+        proxy.set_policy(ConnectionPolicy::LazyTrigger);
 
         // The second listener — the one that never fired — must trigger too.
         let _client = tokio::net::TcpStream::connect(addrs[1]).await.unwrap();

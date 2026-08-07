@@ -1173,12 +1173,21 @@ impl Runner {
             }
             _ => ConnectionPolicy::Serve,
         };
-        let Some(proxy) = self.services.get_mut(name).and_then(|rs| rs.proxy.as_mut()) else {
+        let Some(rs) = self.services.get_mut(name) else {
             return;
         };
-        let was_refusing = proxy.is_refusing();
-        if !proxy.set_policy(policy) {
+        let Some(view) = rs.proxy_view.as_mut() else {
             return;
+        };
+        // The runner is the only sender of policy changes, so its shadow is
+        // the authority on whether this is a change at all.
+        if view.policy == policy {
+            return;
+        }
+        let was_refusing = view.is_refusing();
+        view.policy = policy;
+        if let Some(proxy) = rs.proxy.as_mut() {
+            proxy.set_policy(policy);
         }
         // Only the refusal edge is worth a line, and it belongs in the normal
         // log: a dev staring at `ECONNRESET` in their browser shouldn't have
@@ -1500,6 +1509,7 @@ impl Runner {
                         &format!("proxy listening on {}", addrs.join(", ")),
                     );
                     if let Some(rs) = self.services.get_mut(name) {
+                        rs.proxy_view = Some(proxy.view());
                         rs.proxy = Some(proxy);
                     }
                     // Set lazy services to Lazy state (they won't enter the

@@ -247,7 +247,7 @@ impl Runner {
             let wait_full = self
                 .services
                 .get(name)
-                .and_then(|rs| rs.proxy.as_ref())
+                .and_then(|rs| rs.proxy_view.as_ref())
                 .is_some_and(|p| p.requires_full_exit_on_restart());
             let (reply_tx, _reply_rx) = oneshot::channel();
             self.send_service_stop(
@@ -329,7 +329,16 @@ impl Runner {
         }
         let realloc_result = if let Some(rs) = self.services.get_mut(name) {
             if let Some(ref mut proxy) = rs.proxy {
-                Some(proxy.reallocate_ephemeral_ports().await)
+                let result = proxy.reallocate_ephemeral_ports().await;
+                // The view's backend env is a shadow; refresh it so ready
+                // checks written against `${PORT}` resolve to the port the
+                // *new* process was told to bind.
+                if result.is_ok()
+                    && let Some(view) = rs.proxy_view.as_mut()
+                {
+                    view.backend_env = proxy.env_vars();
+                }
+                Some(result)
             } else {
                 None
             }
@@ -745,7 +754,7 @@ impl Runner {
         let is_lazy = self
             .services
             .get(name)
-            .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
+            .is_some_and(|rs| rs.resolved.lazy && rs.proxy_view.is_some());
         if is_lazy {
             // Route through the crash-loop guard so a lazy service that keeps
             // dying on launch is eventually left `Failed` with its proxy

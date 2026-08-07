@@ -223,7 +223,7 @@ impl Runner {
         let is_lazy = self
             .services
             .get(name)
-            .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
+            .is_some_and(|rs| rs.resolved.lazy && rs.proxy_view.is_some());
         if is_lazy {
             // A lazy service restarts on a proxy connection, not on the
             // backoff timer, so route its crash through the connection-aware
@@ -369,11 +369,11 @@ impl Runner {
             );
         } else {
             self.set_service_state(name, ServiceState::Lazy);
-            if let Some(rs) = self.services.get_mut(name)
-                && let Some(ref mut proxy) = rs.proxy
-            {
-                proxy.rearm_lazy_watchers();
-            }
+            // Re-arm the lazy trigger even if the state was already `Lazy`
+            // (in which case `set_service_state` no-ops and never syncs).
+            // `sync_proxy_policy` maps `Lazy` to the trigger policy and is
+            // idempotent, so this is safe to call unconditionally.
+            self.sync_proxy_policy(name);
             if let Some(msg) = message {
                 self.output_manager
                     .service_error_event(name, &format!("{msg} (will retry on next connection)"));

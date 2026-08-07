@@ -58,6 +58,10 @@ pub(crate) struct RuntimeService {
     /// TCP proxy listener — outlives restarts. Owns the bound public
     /// listeners for both env and listenfd mode entries.
     pub proxy: Option<crate::proxy::ServiceProxy>,
+    /// The runner's read-only view of the proxy: binding metadata for status,
+    /// port references and the ports manifest, plus the policy and
+    /// backend-env shadows the runner refreshes itself.
+    pub proxy_view: Option<crate::proxy::ProxyView>,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
     /// Bazel binary path resolved via `bazel cquery --output=files`.
@@ -132,6 +136,7 @@ impl RuntimeService {
             attach_lock: None,
             attach_waiter: None,
             proxy: None,
+            proxy_view: None,
             resolved_watch_paths: Vec::new(),
             bazel_binary_path: None,
             batch_built: false,
