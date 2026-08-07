@@ -2351,6 +2351,231 @@ mod tests {
     /// Build a runner with a single watch-enabled bazel service "api", for
     /// exercising the rebuild-batch completion paths directly. Returns the
     /// shutdown sender too so the runner's `shutdown_rx` stays open.
+    /// Build a runner from a config string, for exercising the scheduler's
+    /// decision functions directly.
+    async fn runner_from_toml(toml: &str, temp: &std::path::Path) -> (Runner, mpsc::Sender<()>) {
+        use crate::config::types::LogConfig;
+
+        let config: Config = toml.parse().unwrap();
+        let log = LogConfig::Stdout;
+        let names: Vec<(&str, &LogConfig)> = config
+            .services
+            .keys()
+            .chain(config.tasks.keys())
+            .map(|name| (name.as_str(), &log))
+            .collect();
+        let output_manager = crate::output::OutputManager::new(&names, tokio::io::sink())
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let runner = Runner::new(
+            config,
+            Platform::LinuxX86_64,
+            output_manager,
+            temp.to_path_buf(),
+            None,
+            shutdown_rx,
+            true,
+        )
+        .await
+        .unwrap();
+        (runner, shutdown_tx)
+    }
+
+    /// The dependency gate, stated as a table: a blocking edge opens only on
+    /// satisfaction; a non-blocking edge also opens once the dependency has
+    /// settled into a state nothing will move on its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dependency_gate_table() {
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+            blocking_open: bool,
+            non_blocking_open: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "ready satisfies both",
+                state: ServiceState::Ready,
+                blocking_open: true,
+                non_blocking_open: true,
+            },
+            Case {
+                name: "lazy counts as satisfied",
+                state: ServiceState::Lazy,
+                blocking_open: true,
+                non_blocking_open: true,
+            },
+            Case {
+                name: "unhealthy still satisfies (it is up)",
+                state: ServiceState::Unhealthy,
+                blocking_open: true,
+                non_blocking_open: true,
+            },
+            Case {
+                name: "running is not yet settled or satisfied",
+                state: ServiceState::Running,
+                blocking_open: false,
+                non_blocking_open: false,
+            },
+            Case {
+                name: "pending blocks everyone",
+                state: ServiceState::Pending,
+                blocking_open: false,
+                non_blocking_open: false,
+            },
+            Case {
+                name: "failed opens only ordering-only edges",
+                state: ServiceState::Failed,
+                blocking_open: false,
+                non_blocking_open: true,
+            },
+            Case {
+                name: "stopped opens only ordering-only edges",
+                state: ServiceState::Stopped,
+                blocking_open: false,
+                non_blocking_open: true,
+            },
+        ];
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = runner_from_toml(
+            "[services.dep]\nrun = { cmd = \"sleep\", args = [\"1\"] }\n",
+            temp.path(),
+        )
+        .await;
+
+        for case in cases {
+            runner.set_service_state("dep", case.state);
+            let blocking = crate::config::Dependency::blocking("dep");
+            let non_blocking = crate::config::Dependency {
+                name: "dep".to_string(),
+                blocking: false,
+            };
+            assert_eq!(
+                runner.is_dep_gate_open(&blocking),
+                case.blocking_open,
+                "{}: blocking edge",
+                case.name
+            );
+            assert_eq!(
+                runner.is_dep_gate_open(&non_blocking),
+                case.non_blocking_open,
+                "{}: non-blocking edge",
+                case.name
+            );
+        }
+    }
+
+    /// Failure blocking as the user sees it: a chain reports the ROOT cause,
+    /// non-blocking edges never cascade, and a recovered root returns its
+    /// descendants to the scheduler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_roots_collapse_and_recover() {
+        let temp = tempfile::tempdir().unwrap();
+        let toml = "\
+[services.db]\nrun = { cmd = \"sleep\", args = [\"1\"] }\n\
+[services.worker]\nrun = { cmd = \"sleep\", args = [\"1\"] }\ndepends_on = [\"db\"]\n\
+[services.api]\nrun = { cmd = \"sleep\", args = [\"1\"] }\ndepends_on = [\"worker\"]\n\
+[services.observer]\nrun = { cmd = \"sleep\", args = [\"1\"] }\ndepends_on = [{ name = \"worker\", blocking = false }]\n";
+        let (mut runner, _shutdown_tx) = runner_from_toml(toml, temp.path()).await;
+
+        runner.set_service_state("db", ServiceState::Failed);
+        runner.start_pending_items().await;
+
+        // The whole blocking chain collapses to the root cause.
+        for name in ["worker", "api"] {
+            let rs = runner.services.get(name).unwrap();
+            assert_eq!(rs.state(), ServiceState::DependencyFailed, "{name}: state");
+            assert_eq!(
+                rs.failed_dependencies(),
+                &["db".to_string()],
+                "{name}: roots collapse transitively to the first cause"
+            );
+        }
+        // A non-blocking edge never cascades.
+        assert_eq!(
+            runner.services.get("observer").unwrap().state(),
+            ServiceState::Pending,
+            "non-blocking dependents are not failed by their dependency"
+        );
+
+        // Recovery: the root becoming satisfied re-queues the descendants.
+        runner.set_service_state("db", ServiceState::Ready);
+        runner.start_pending_items().await;
+        for name in ["worker", "api"] {
+            assert_ne!(
+                runner.services.get(name).unwrap().state(),
+                ServiceState::DependencyFailed,
+                "{name}: returns to the scheduler once the root recovers"
+            );
+        }
+    }
+
+    /// Startup-settled as a table over the state space.
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_settled_table() {
+        struct Case {
+            name: &'static str,
+            service: ServiceState,
+            lazy: bool,
+            settled: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "pending is unsettled work",
+                service: ServiceState::Pending,
+                lazy: false,
+                settled: false,
+            },
+            Case {
+                name: "running means a ready check is still deciding",
+                service: ServiceState::Running,
+                lazy: false,
+                settled: false,
+            },
+            Case {
+                name: "ready settles",
+                service: ServiceState::Ready,
+                lazy: false,
+                settled: true,
+            },
+            Case {
+                name: "failed settles (loudly, but settled)",
+                service: ServiceState::Failed,
+                lazy: false,
+                settled: true,
+            },
+            Case {
+                name: "a lazy service pending its first connection settles",
+                service: ServiceState::Pending,
+                lazy: true,
+                settled: true,
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = runner_from_toml(
+                "[services.api]\nrun = { cmd = \"sleep\", args = [\"1\"] }\n",
+                temp.path(),
+            )
+            .await;
+            if let Some(rs) = runner.services.get_mut("api") {
+                rs.resolved.lazy = case.lazy;
+            }
+            runner.set_service_state("api", case.service);
+            assert_eq!(
+                runner.initial_startup_settled(),
+                case.settled,
+                "case '{}'",
+                case.name
+            );
+        }
+    }
+
     async fn single_bazel_runner(temp: &std::path::Path) -> (Runner, mpsc::Sender<()>) {
         use crate::config::service::{Service, ServiceKind};
         use crate::config::types::{BazelConfig, LogConfig, LogFilterConfig};

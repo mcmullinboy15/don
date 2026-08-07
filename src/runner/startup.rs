@@ -559,7 +559,7 @@ impl Runner {
 
         self.reconcile_dependency_failures(&dep_map, &order);
 
-        let mut ready: Vec<String> = order
+        let ready: Vec<String> = order
             .iter()
             .filter(|name| self.is_item_pending(name))
             .filter(|name| {
@@ -569,16 +569,6 @@ impl Runner {
             })
             .cloned()
             .collect();
-
-        // Foreground tasks own the terminal exclusively. If one is ready,
-        // claim only it in this sweep; its completion schedules the next one.
-        if let Some(foreground_name) = ready.iter().find(|name| {
-            self.tasks
-                .get(name.as_str())
-                .is_some_and(|rt| rt.config.terminal.is_foreground())
-        }) {
-            ready = vec![foreground_name.clone()];
-        }
 
         if !self.scheduler_live {
             return;
