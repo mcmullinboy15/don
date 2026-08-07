@@ -90,24 +90,28 @@ impl GateWriter {
     /// Publish one process's permission.
     ///
     /// Opening an already-open gate is a no-op: the epoch is preserved, so a
-    /// supervisor that has already spent it does not start again.
-    pub(crate) fn set(&mut self, name: &str, allow: bool) {
+    /// supervisor that has already spent it does not start again. Returns
+    /// whether this call *newly* granted permission, so a caller can hang
+    /// edge-triggered work off the grant.
+    pub(crate) fn set(&mut self, name: &str, allow: bool) -> bool {
         if !self.armed {
-            return;
+            return false;
         }
         let Some(tx) = self.txs.get(name) else {
-            return;
+            return false;
         };
         let current = *tx.borrow();
         match (current, allow) {
-            (Gate::Open { .. }, true) | (Gate::Blocked, false) => {}
+            (Gate::Open { .. }, true) | (Gate::Blocked, false) => false,
             (Gate::Blocked, true) => {
                 let epoch = self.epochs.entry(name.to_string()).or_default();
                 *epoch += 1;
                 tx.send_replace(Gate::Open { epoch: *epoch });
+                true
             }
             (Gate::Open { .. }, false) => {
                 tx.send_replace(Gate::Blocked);
+                false
             }
         }
     }
@@ -290,6 +294,16 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn set_reports_only_the_granting_edge() {
+        let (mut writer, _reader) = one("api");
+        assert!(writer.set("api", true), "blocked -> open is the grant");
+        assert!(!writer.set("api", true), "republishing is not a new grant");
+        assert!(!writer.set("api", false), "revoking is not a grant");
+        assert!(writer.set("api", true), "reopening is a new grant");
+        assert!(!writer.set("ghost", true), "unknown names grant nothing");
     }
 
     #[test]

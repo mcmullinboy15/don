@@ -6,7 +6,7 @@ use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::{ProcessKind, Runner, RunnerInternalCommand, RuntimeService, ServiceState, TaskState};
 use crate::config::Dependency;
 use crate::signals::shutdown_requested;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn push_unique_name(names: &mut Vec<String>, name: &str) {
     if !names.iter().any(|existing| existing == name) {
@@ -371,8 +371,8 @@ impl Runner {
 
     /// Mark a start-pending sweep as due. Consumed at the top of the main
     /// loop, so a burst of transitions coalesces into one sweep.
-    pub(in crate::runner) fn schedule_start_pending(&mut self) {
-        self.start_pending_scheduled = true;
+    pub(in crate::runner) fn schedule_gate_recompute(&mut self) {
+        self.gate_recompute_scheduled = true;
     }
 
     /// Resolve failed direct dependencies to their root failures. An
@@ -542,12 +542,16 @@ impl Runner {
         }
     }
 
-    /// Start every Pending service or task whose dependencies are satisfied.
+    /// Decide which processes may run, and publish that.
     ///
-    /// This is the only dependency scheduler. Initial services begin in
-    /// `Pending`, while lazy services enter `Pending` on their first proxy
-    /// connection; both are claimed and launched by this same sweep.
-    pub(in crate::runner) async fn start_pending_processes(&mut self) {
+    /// This is the whole of the scheduler: resolve dependency failures to
+    /// their roots, work out whose dependencies are satisfied, and set every
+    /// gate accordingly. It starts nothing — a supervisor spends its own
+    /// permission when it is also idle.
+    ///
+    /// Initial services begin in `Pending`; lazy services enter `Pending` on
+    /// their first proxy connection. Both are permitted by this same pass.
+    pub(in crate::runner) async fn publish_start_gates(&mut self) {
         let dep_map = self.build_dep_map();
         let order = match topological_sort(&dep_name_map(&dep_map)) {
             Ok(o) => o,
@@ -570,59 +574,36 @@ impl Runner {
         // Publish permission for *every* process, not only the newly-ready
         // ones: a gate is a level, so "you may not run" has to be said out
         // loud. Teardown revokes everything regardless of readiness.
+        //
+        // Nothing is started here. A supervisor spends its own permission —
+        // this is the whole of the scheduler's output.
+        // A build-tool-managed lazy service takes a JIT build detour before it
+        // may run at all. Starting one moves the service to Building, so it
+        // must not also be permitted; the build's completion returns it to
+        // Pending, where the next pass considers it again.
+        let mut building: HashSet<String> = HashSet::new();
+        for name in &ready {
+            if self.start_lazy_build_if_needed(name) {
+                building.insert(name.clone());
+            }
+        }
+
         let blocked_by_shutdown = self.shutting_down || shutdown_requested();
         for name in &order {
-            let allow = !blocked_by_shutdown && ready.contains(name);
-            self.start_gates.set(name, allow);
-        }
-
-        if !self.scheduler_live {
-            return;
-        }
-
-        for name in ready {
-            if shutdown_requested() {
-                return;
+            let allow =
+                !blocked_by_shutdown && ready.contains(name) && !building.contains(name.as_str());
+            if !self.start_gates.set(name, allow) {
+                continue;
             }
-
-            // Non-blocking dependencies we are deliberately not waiting on.
-            // Reported at the moment the process actually starts, so a start
-            // that follows a visible failure doesn't look like don ignored
-            // the dependency graph.
+            // Granted just now: say which non-blocking dependencies we are
+            // deliberately not waiting on, so a start that follows a visible
+            // failure doesn't look like don ignored the dependency graph.
+            // On the grant edge, so a re-published level cannot repeat it.
             let skipped = dep_map
-                .get(&name)
+                .get(name.as_str())
                 .map(|deps| self.skipped_non_blocking_dependencies(deps))
                 .unwrap_or_default();
-
-            let is_pending_svc = self
-                .services
-                .get(&name)
-                .is_some_and(|rs| rs.state() == ServiceState::Pending);
-            let is_pending_task = self
-                .tasks
-                .get(&name)
-                .is_some_and(|rt| rt.state() == TaskState::Pending);
-
-            if is_pending_svc {
-                // A build-tool-managed lazy service takes a JIT build detour.
-                // Successful completion returns it to Pending, where this
-                // scheduler checks dependencies again before permitting it.
-                if self.start_lazy_build_if_needed(&name) {
-                    continue;
-                }
-                self.report_skipped_non_blocking_dependencies(&name, &skipped);
-                // The start itself is the supervisor's: its gate is open (set
-                // above), and it starts when it is also idle.
-                continue;
-            }
-
-            if !is_pending_task {
-                continue;
-            }
-            // The run itself is the supervisor's: its gate is open, and it
-            // issues its own startup evaluation — the skip-if-unchanged,
-            // auto_run and params policy already lives in the worker.
-            self.report_skipped_non_blocking_dependencies(&name, &skipped);
+            self.report_skipped_non_blocking_dependencies(name, &skipped);
         }
     }
 

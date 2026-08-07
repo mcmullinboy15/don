@@ -334,19 +334,13 @@ pub struct Runner {
     /// writer, and [`state_store`] enforces that by ownership rather than by
     /// convention.
     state: state_store::StateWriter,
-
-    /// Process-completion sender shared by dependency-scheduled starts and config
-    /// reload paths. Ready-check and task-completion callbacks send here.
-    /// True once `run()`'s scheduler is live. Transitions before that
-    /// (construction, setup) must not enqueue dependency sweeps.
-    scheduler_live: bool,
     /// Per-process permission to run — the scheduler's whole output. See
     /// [`crate::gate`].
     start_gates: crate::gate::GateWriter,
     /// A start-pending sweep is due. Set by fold transitions (see
-    /// `schedule_start_pending`), consumed at the top of the main loop —
+    /// `schedule_gate_recompute`), consumed at the top of the main loop —
     /// the runner's own deferred tick, invisible to clients by construction.
-    start_pending_scheduled: bool,
+    gate_recompute_scheduled: bool,
 
     // Shutdown signal receiver — wakes the select loop when Ctrl+C is pressed.
     // `Option` because `run()` takes it out at the top to consume in the
@@ -641,9 +635,8 @@ impl Runner {
             internal_rx,
             event_tx,
             state,
-            scheduler_live: false,
             start_gates,
-            start_pending_scheduled: false,
+            gate_recompute_scheduled: false,
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
             watch: None,
@@ -695,10 +688,9 @@ impl Runner {
         if let Some(state) = changed {
             self.sync_proxy_policy(name);
             self.broadcast_service_state(name, state);
-            if self.scheduler_live
-                && (matches!(
-                    state,
-                    ServiceState::Pending
+            if (matches!(
+                state,
+                ServiceState::Pending
                         | ServiceState::Lazy
                         | ServiceState::Ready
                         // Stopped opens a non-blocking dependency's gate, so
@@ -706,12 +698,11 @@ impl Runner {
                         | ServiceState::Stopped
                         | ServiceState::Failed
                         | ServiceState::DependencyFailed
-                ) || matches!(
-                    previous_state,
-                    Some(ServiceState::Failed | ServiceState::DependencyFailed)
-                ))
-            {
-                self.schedule_start_pending();
+            ) || matches!(
+                previous_state,
+                Some(ServiceState::Failed | ServiceState::DependencyFailed)
+            )) {
+                self.schedule_gate_recompute();
             }
         }
     }
@@ -805,8 +796,8 @@ impl Runner {
         }
         self.sync_proxy_policy(name);
         self.broadcast_service_state(name, ServiceState::DependencyFailed);
-        if state_changed && self.scheduler_live {
-            self.schedule_start_pending();
+        if state_changed {
+            self.schedule_gate_recompute();
         }
         state_changed
     }
@@ -833,21 +824,19 @@ impl Runner {
             .and_then(|rt| rt.set_state(new_state));
         if let Some(state) = changed {
             self.broadcast_task_state(name, state);
-            if self.scheduler_live
-                && (matches!(
-                    state,
-                    TaskState::Pending
-                        | TaskState::PendingRun
-                        | TaskState::Completed
-                        | TaskState::Skipped
-                        | TaskState::Failed
-                        | TaskState::DependencyFailed
-                ) || matches!(
-                    previous_state,
-                    Some(TaskState::Failed | TaskState::DependencyFailed)
-                ))
-            {
-                self.schedule_start_pending();
+            if (matches!(
+                state,
+                TaskState::Pending
+                    | TaskState::PendingRun
+                    | TaskState::Completed
+                    | TaskState::Skipped
+                    | TaskState::Failed
+                    | TaskState::DependencyFailed
+            ) || matches!(
+                previous_state,
+                Some(TaskState::Failed | TaskState::DependencyFailed)
+            )) {
+                self.schedule_gate_recompute();
             }
         }
     }
@@ -867,8 +856,8 @@ impl Runner {
             return false;
         }
         self.broadcast_task_state(name, TaskState::DependencyFailed);
-        if state_changed && self.scheduler_live {
-            self.schedule_start_pending();
+        if state_changed {
+            self.schedule_gate_recompute();
         }
         state_changed
     }
@@ -1249,13 +1238,14 @@ impl Runner {
 
         // Channel for dependency-scheduled completion notifications. Store the
         // sender on `self` so services requested later use the same path.
-        self.scheduler_live = true;
+        // From here on, decisions are published. Before it, `GateWriter`
+        // swallows them — construction and setup cannot grant permission.
         self.start_gates.arm();
 
         // Initial non-lazy processes already occupy Pending. A lazy connection
         // performs the same state transition and can join this scheduler at
         // any point, including while this first sweep is running.
-        self.start_pending_processes().await;
+        self.publish_start_gates().await;
         let mut startup_complete = false;
 
         // Main loop: wait for completions, commands, and signals.
@@ -1304,9 +1294,9 @@ impl Runner {
                 // Deferred scheduling tick: fold transitions request a sweep
                 // rather than recursing into one mid-handler; it runs here,
                 // between messages, exactly once per batch of transitions.
-                if self.start_pending_scheduled {
-                    self.start_pending_scheduled = false;
-                    self.start_pending_processes().await;
+                if self.gate_recompute_scheduled {
+                    self.gate_recompute_scheduled = false;
+                    self.publish_start_gates().await;
                 }
 
                 tokio::select! {
@@ -2050,7 +2040,7 @@ mod tests {
         let (mut runner, _shutdown_tx) = runner_from_toml(toml, temp.path()).await;
 
         runner.set_service_state("db", ServiceState::Failed);
-        runner.start_pending_processes().await;
+        runner.publish_start_gates().await;
 
         // The whole blocking chain collapses to the root cause.
         for name in ["worker", "api"] {
@@ -2071,7 +2061,7 @@ mod tests {
 
         // Recovery: the root becoming satisfied re-queues the descendants.
         runner.set_service_state("db", ServiceState::Ready);
-        runner.start_pending_processes().await;
+        runner.publish_start_gates().await;
         for name in ["worker", "api"] {
             assert_ne!(
                 runner.services.get(name).unwrap().state(),
@@ -2234,7 +2224,7 @@ mod tests {
                 replay_items: Vec::new(),
             },
         );
-        runner.start_pending_processes().await;
+        runner.publish_start_gates().await;
 
         let service = runner.services.get("api").unwrap();
         assert_eq!(service.state(), ServiceState::Pending);
