@@ -69,21 +69,26 @@ impl Runner {
                 name: name.to_string(),
             });
         };
+        let op_id = match self.services.get_mut(name) {
+            Some(rs) => {
+                rs.start_generation = rs.start_generation.saturating_add(1);
+                rs.start_generation
+            }
+            None => 0,
+        };
         if !handle.request(super::service_supervisor::ServiceCommand::Start(
             super::service_supervisor::StartRequest {
                 context: Box::new(context),
                 mode,
                 intent,
                 fresh_backend_ports,
+                op_id,
             },
         )) {
             return Err(CommandError::Failed {
                 name: name.to_string(),
                 message: "service supervisor is shutting down".to_string(),
             });
-        }
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.start_generation = rs.start_generation.saturating_add(1);
         }
         Ok(())
     }
@@ -102,42 +107,20 @@ impl Runner {
         }
         // The supervisor only reports the start it is committed to, so the
         // service's current generation *is* this start's. Downstream still
-        // needs it: the ready check and the dependency sweep both use it to
-        // recognise their own start later.
+        // needs it: the dependency sweep uses it to recognise its own start.
         let op_id = self.services.get(name).map_or(0, |rs| rs.start_generation);
 
         match result {
             Ok(wired) => match intent {
                 ServiceStartIntent::Scheduled { done_tx } => {
-                    self.wire_service_output_and_ready_check(
-                        name,
-                        op_id,
-                        *wired,
-                        &context.resolved,
-                        Some(done_tx),
-                    )
-                    .await;
+                    self.handle_service_wired(name, *wired, Some(done_tx)).await;
                 }
                 ServiceStartIntent::Reply { reply } => {
-                    self.wire_service_output_and_ready_check(
-                        name,
-                        op_id,
-                        *wired,
-                        &context.resolved,
-                        None,
-                    )
-                    .await;
+                    self.handle_service_wired(name, *wired, None).await;
                     let _ = reply.send(Ok(()));
                 }
                 ServiceStartIntent::Background => {
-                    self.wire_service_output_and_ready_check(
-                        name,
-                        op_id,
-                        *wired,
-                        &context.resolved,
-                        None,
-                    )
-                    .await;
+                    self.handle_service_wired(name, *wired, None).await;
                 }
             },
             Err(message) => {

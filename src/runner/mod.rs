@@ -482,6 +482,16 @@ pub(in crate::runner) enum ItemReport {
         intent: ServiceStartIntent,
         result: Result<Box<service_supervisor::ServiceWired>, String>,
     },
+    /// A service's ready check settled — or reported immediately when no
+    /// check is configured (`had_check: false`). Forwarded by the
+    /// supervisor loop, so it always trails its own prepared report.
+    ServiceReady {
+        name: String,
+        op_id: u64,
+        success: bool,
+        message: Option<String>,
+        had_check: bool,
+    },
     /// A service's supervisor finished executing a stop.
     ServiceStopComplete {
         name: String,
@@ -511,13 +521,6 @@ enum RunnerInternalCommand {
         name: String,
         generation: u64,
         outcome: BatchBuildOutcome,
-    },
-    /// Ready-check completed for a manual-start or rebuild spawn.
-    ReadyCheckComplete {
-        name: String,
-        generation: u64,
-        success: bool,
-        message: Option<String>,
     },
     /// Completion from a detached rebuild worker for a single service.
     ServiceRebuildPrepared {
@@ -1808,20 +1811,7 @@ impl Runner {
                                 timeout,
                             } => {
                                 self.handle_task_run_wait_timeout(&name, generation, &timeout);
-                            }                            RunnerInternalCommand::ReadyCheckComplete {
-                                name,
-                                generation,
-                                success,
-                                message,
-                            } => {
-                                self.handle_ready_check_complete(
-                                    &name,
-                                    generation,
-                                    success,
-                                    message,
-                                );
-                            }
-                            RunnerInternalCommand::BatchBuildComplete(outcome) => {
+                            }                            RunnerInternalCommand::BatchBuildComplete(outcome) => {
                                 // Drop the abort-on-drop handle: the task is done,
                                 // and leaving the handle live would abort after the
                                 // task has already returned (harmless but noisy).
@@ -1868,6 +1858,18 @@ impl Runner {
                             } => {
                                 self.handle_service_start_prepared(&name, context, intent, result)
                                     .await;
+                            }
+                            ItemReport::ServiceReady {
+                                name,
+                                op_id,
+                                success,
+                                message,
+                                had_check,
+                            } => {
+                                self.handle_service_ready_report(
+                                    &name, op_id, success, message, had_check,
+                                )
+                                .await;
                             }
                             ItemReport::ServiceStopComplete { name, op_id, result } => {
                                 self.handle_service_stop_complete(&name, op_id, result).await;

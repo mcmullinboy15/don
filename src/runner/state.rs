@@ -53,6 +53,10 @@ pub(crate) struct RuntimeService {
     /// PTY (docker, pipe mode) or no live process. Cleared wherever
     /// `osc_sink` is.
     pub pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
+    /// Where the current scheduled start's ready outcome answers the
+    /// dependency sweep. `Some` only between a scheduled start's wiring and
+    /// its ready report; manual/rebuild starts leave it `None`.
+    pub(in crate::runner) pending_done: Option<tokio::sync::mpsc::Sender<super::ItemDone>>,
     /// Number of clients currently attached. Attach is multi-client
     /// (tmux-style shared input); the count drives the stdout-sink pause
     /// (paused while any client is attached) and the lifecycle events.
@@ -133,6 +137,7 @@ impl RuntimeService {
             output_worker: None,
             osc_sink: None,
             pty_input: None,
+            pending_done: None,
             attach_count: 0,
             proxy_view: None,
             resolved_watch_paths: Vec::new(),

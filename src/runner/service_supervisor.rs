@@ -35,6 +35,10 @@ pub(in crate::runner) struct StartRequest {
     pub(in crate::runner) context: Box<ServiceStartContext>,
     pub(in crate::runner) mode: ServiceStartMode,
     pub(in crate::runner) intent: ServiceStartIntent,
+    /// The runner's start generation for this request, echoed in every
+    /// report about the run so the fold's interim currency guards keep
+    /// working until the generations die.
+    pub(in crate::runner) op_id: u64,
     /// Allocate new ephemeral backend ports before spawning. Set on the
     /// restart path so the new process binds a fresh port while draining
     /// connections to the old one finish undisturbed.
@@ -100,15 +104,6 @@ pub(in crate::runner) struct ServiceWired {
     /// pipe-mode spawns. Attach bridges clone it; the runner's copy is
     /// cleared on exit so the gate (and the PTY write half) can end.
     pub(in crate::runner) pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
-    /// Resolves when the output reader ends (process died) — the ready
-    /// check races against it. Errs immediately when the service has no
-    /// registered output, which matches the old wiring's behavior.
-    pub(in crate::runner) ready_exit_rx: tokio::sync::oneshot::Receiver<()>,
-    /// Cancellation for the health monitor this spawn may start. The
-    /// supervisor holds the sender and drops it on Stop or process death,
-    /// so monitor lifetime is tied to custody rather than to per-site
-    /// bookkeeping discipline.
-    pub(in crate::runner) monitor_cancel_rx: tokio::sync::oneshot::Receiver<()>,
     /// The proxy's env-mode backend vars this spawn was launched with —
     /// `Some` iff the service has a proxy. The runner refreshes its
     /// `ProxyView` shadow from this, so ready checks written against
@@ -249,6 +244,11 @@ async fn supervise(
     let mut reader_eof: Option<tokio::sync::oneshot::Receiver<()>> = None;
     // Dropping this ends the held process's health monitor, if one ran.
     let mut monitor_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
+    // The in-flight ready racer's outcome, forwarded by THIS loop onto the
+    // report channel so it always trails its own prepared report (single
+    // producer, one channel). Cleared on Start/Stop so a superseded run's
+    // outcome can never be forwarded after a newer prepared.
+    let mut ready_pending: Option<tokio::sync::oneshot::Receiver<ReadyOutcome>> = None;
 
     loop {
         let command = match pending.take() {
@@ -276,6 +276,25 @@ async fn supervise(
                         reap_and_report(&name, &mut held, &report_tx).await;
                         continue;
                     }
+                    // The ready racer settled — forward through this loop
+                    // so the outcome trails its own prepared report.
+                    outcome = wait_ready(&mut ready_pending), if ready_pending.is_some() => {
+                        ready_pending = None;
+                        if let Some(outcome) = outcome
+                            && report_tx
+                                .send(super::ItemReport::ServiceReady {
+                                    name: name.clone(),
+                                    op_id: outcome.op_id,
+                                    success: outcome.success,
+                                    message: outcome.message,
+                                    had_check: outcome.had_check,
+                                })
+                                .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     // The lazy proxy saw a connection: demand. The runner
                     // gates on service state, so duplicates are harmless.
                     demand = wait_demand(&mut demand_rx), if demand_rx.is_some() => {
@@ -299,6 +318,7 @@ async fn supervise(
             mode,
             intent,
             fresh_backend_ports,
+            op_id,
         } = match command {
             ServiceCommand::Start(request) => request,
             ServiceCommand::Proxy(directive) => {
@@ -308,6 +328,7 @@ async fn supervise(
             ServiceCommand::Stop(request) => {
                 reader_eof = None;
                 monitor_cancel = None;
+                ready_pending = None;
                 let result = match held.take() {
                     Some(handle) => {
                         let debug = service::StopDebug::new(name.clone(), env.emitter.clone());
@@ -362,6 +383,11 @@ async fn supervise(
                 continue;
             }
         };
+
+        // A new start supersedes the previous run's in-flight ready
+        // outcome; forwarding it after this run's prepared report would be
+        // exactly the stale-completion race this loop exists to prevent.
+        ready_pending = None;
 
         // The proxy's per-spawn contribution: fresh ephemeral backend ports
         // on restart, the backend/public env vars, and the listenfd sockets
@@ -435,9 +461,9 @@ async fn supervise(
                 // Wire the spawn here, as its owner: extract what the runner
                 // needs, keep the handle and the reader. A failed prepare
                 // passes through untouched.
-                let wired = match result {
-                    Ok(start_result) => Ok(Box::new(
-                        wire_spawn(
+                let (wired, ready_parts) = match result {
+                    Ok(start_result) => {
+                        let (wired, exit_rx, cancel_rx) = wire_spawn(
                             output.as_ref(),
                             service_writer.as_ref(),
                             start_result,
@@ -447,9 +473,18 @@ async fn supervise(
                             &mut reader_eof,
                             &mut monitor_cancel,
                         )
-                        .await,
-                    )),
-                    Err(message) => Err(message),
+                        .await;
+                        // Resolution reads this spawn's live proxy and docker
+                        // state — authoritative only after the spawn, which is
+                        // why it happens here and not at queue time.
+                        let ready = resolve_supervisor_ready(
+                            &context.resolved,
+                            proxy.as_ref(),
+                            &wired.docker_port_bindings,
+                        );
+                        (Ok(Box::new(wired)), Some((ready, exit_rx, cancel_rx)))
+                    }
+                    Err(message) => (Err(message), None),
                 };
                 if report_tx
                     .send(super::ItemReport::ServiceStartPrepared {
@@ -461,6 +496,31 @@ async fn supervise(
                     .is_err()
                 {
                     return;
+                }
+                // Start the ready check — or, with none configured, report
+                // ready now. Both flow after the prepared report above on
+                // the same channel from this same loop, so the fold always
+                // sees prepared first.
+                match ready_parts {
+                    Some((Some(ready), exit_rx, cancel_rx)) => {
+                        ready_pending = Some(spawn_ready_racer(
+                            &name, op_id, ready, exit_rx, cancel_rx, &report_tx,
+                        ));
+                    }
+                    Some((None, _exit_rx, _cancel_rx))
+                        if report_tx
+                            .send(super::ItemReport::ServiceReady {
+                                name: name.clone(),
+                                op_id,
+                                success: true,
+                                message: None,
+                                had_check: false,
+                            })
+                            .is_err() =>
+                    {
+                        return;
+                    }
+                    Some((None, ..)) | None => {}
                 }
             }
         }
@@ -543,7 +603,11 @@ async fn wire_spawn(
     reader: &mut Option<tokio::task::JoinHandle<()>>,
     reader_eof: &mut Option<tokio::sync::oneshot::Receiver<()>>,
     monitor_cancel: &mut Option<tokio::sync::oneshot::Sender<()>>,
-) -> ServiceWired {
+) -> (
+    ServiceWired,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
     let service::StartResult {
         mut handle,
         child_output,
@@ -605,16 +669,105 @@ async fn wire_spawn(
         p.set_backend();
     }
 
-    ServiceWired {
-        identity,
-        pgid,
-        docker_port_bindings,
-        osc_sink,
-        pty_input,
-        ready_exit_rx: exit_rx,
-        monitor_cancel_rx: cancel_rx,
-        proxy_backend_env: proxy.map(|p| p.env_vars()),
+    (
+        ServiceWired {
+            identity,
+            pgid,
+            docker_port_bindings,
+            osc_sink,
+            pty_input,
+            proxy_backend_env: proxy.map(|p| p.env_vars()),
+        },
+        exit_rx,
+        cancel_rx,
+    )
+}
+
+/// What the ready racer settles into, forwarded by the supervisor loop.
+struct ReadyOutcome {
+    op_id: u64,
+    success: bool,
+    message: Option<String>,
+    had_check: bool,
+}
+
+/// Await the racer's outcome without consuming the slot on `None`.
+async fn wait_ready(
+    ready_pending: &mut Option<tokio::sync::oneshot::Receiver<ReadyOutcome>>,
+) -> Option<ReadyOutcome> {
+    match ready_pending.as_mut() {
+        Some(rx) => rx.await.ok(),
+        None => std::future::pending().await,
     }
+}
+
+/// Resolve this spawn's ready check against its live proxy and docker
+/// state — the same algorithm the runner's status path runs over shadows.
+fn resolve_supervisor_ready(
+    resolved: &crate::config::ResolvedService,
+    proxy: Option<&crate::proxy::ServiceProxy>,
+    docker_bindings: &[crate::docker::DockerPortBinding],
+) -> Option<crate::config::ReadyCheck> {
+    let backend_env = proxy.map(|p| p.env_vars()).unwrap_or_default();
+    let mut public_env = crate::docker::public_env_vars(docker_bindings);
+    if let Some(p) = proxy {
+        public_env.extend(p.public_env_vars());
+    }
+    let replacements = super::runtime_ports::port_replacements_for(
+        proxy.map(|p| p.bindings()).unwrap_or(&[]),
+        docker_bindings,
+    );
+    super::runtime_ports::resolve_ready_check(
+        resolved.ready.as_ref(),
+        &resolved.env,
+        &backend_env,
+        &public_env,
+        &replacements,
+    )
+}
+
+/// Run the ready check racing this spawn's end-of-stream, then start the
+/// health monitor on success (its cancel sender lives with the supervisor,
+/// so monitor lifetime stays tied to custody). The outcome goes back to the
+/// supervisor loop, which forwards it on the report channel.
+fn spawn_ready_racer(
+    name: &str,
+    op_id: u64,
+    ready: crate::config::ReadyCheck,
+    exit_rx: tokio::sync::oneshot::Receiver<()>,
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    report_tx: &mpsc::UnboundedSender<super::ItemReport>,
+) -> tokio::sync::oneshot::Receiver<ReadyOutcome> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let monitor_cancel_rx = ready.monitor.then_some(cancel_rx);
+    let monitor_report_tx = report_tx.clone();
+    let name = name.to_string();
+    tokio::spawn(async move {
+        let result = tokio::select! {
+            result = service::run_ready_check(&ready) => result,
+            _ = exit_rx => Err(service::ServiceError::ProcessExitedDuringReadyCheck),
+        };
+        let success = result.is_ok();
+        if success && let Some(cancel_rx) = monitor_cancel_rx {
+            let monitor_name = name.clone();
+            tokio::spawn(async move {
+                super::health::run_health_monitor(
+                    monitor_name,
+                    ready,
+                    monitor_report_tx,
+                    cancel_rx,
+                )
+                .await;
+            });
+        }
+        let _ = ready_tx.send(ReadyOutcome {
+            op_id,
+            success,
+            message: result.err().map(|e| e.to_string()),
+            had_check: true,
+        });
+    });
+    ready_rx
 }
 
 /// Reap the held process after its output ended, and report the exit.

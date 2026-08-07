@@ -558,6 +558,11 @@ impl ServiceProxy {
             .collect()
     }
 
+    /// Configured-to-actual binding metadata in declaration order.
+    pub(crate) fn bindings(&self) -> &[ProxyBinding] {
+        &self.bindings
+    }
+
     /// Addresses Don is listening on, in original declaration order.
     pub(crate) fn listen_addrs(&self) -> Vec<SocketAddr> {
         self.bindings

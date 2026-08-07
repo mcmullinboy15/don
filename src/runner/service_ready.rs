@@ -1,22 +1,21 @@
 use super::events::ItemDone;
-use super::health::run_health_monitor;
-use super::service;
-use super::{NodeKind, Runner, RunnerEvent, RunnerInternalCommand, ServiceState};
+use super::{NodeKind, Runner, RunnerEvent, ServiceState};
 use tokio::sync::mpsc;
 
 impl Runner {
-    /// Wire up a started service's output and ready check.
+    /// Fold a wired start into runner state.
     ///
-    /// Sets the service to Running, stores the handle, starts output capture,
-    /// and spawns the ready check (if configured). On ready check completion:
-    /// - If `done_tx` is `Some`, sends `ItemDone` (initial startup path).
-    /// - If `done_tx` is `None`, sends `RebuildComplete` (file-watch rebuild path).
-    pub(in crate::runner) async fn wire_service_output_and_ready_check(
+    /// The supervisor owns the process, the output reader, the ready racer
+    /// and the health monitor; this side keeps the shadows attach and
+    /// status read, makes the state transition, and remembers where the
+    /// ready outcome should answer (`pending_done` for a scheduled start).
+    /// The outcome itself arrives later as [`super::ItemReport::ServiceReady`],
+    /// on the same channel as the wired report and from the same producer,
+    /// so it can never be folded before this bookkeeping runs.
+    pub(in crate::runner) async fn handle_service_wired(
         &mut self,
         name: &str,
-        start_generation: u64,
         wired: super::service_supervisor::ServiceWired,
-        resolved: &crate::config::ResolvedService,
         done_tx: Option<mpsc::Sender<ItemDone>>,
     ) {
         let super::service_supervisor::ServiceWired {
@@ -25,8 +24,6 @@ impl Runner {
             docker_port_bindings,
             osc_sink,
             pty_input,
-            ready_exit_rx: exit_rx,
-            monitor_cancel_rx,
             proxy_backend_env,
         } = wired;
         for binding in docker_port_bindings
@@ -60,13 +57,14 @@ impl Runner {
             rs.handle_identity = Some(identity);
             rs.osc_sink = osc_sink;
             rs.pty_input = pty_input;
+            rs.pending_done = done_tx;
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop
             // guard in `handle_service_exited`).
             rs.last_start = Some(std::time::Instant::now());
-            // Refresh the backend-env shadow before ready resolution below:
-            // a restart reallocates ephemeral backend ports, and a `${PORT}`
-            // ready check must resolve to the port this spawn was told.
+            // Refresh the backend-env shadow: a restart reallocates ephemeral
+            // backend ports, and the status path's `${PORT}` display must
+            // resolve to the port this spawn was told.
             if let (Some(view), Some(backend_env)) = (rs.proxy_view.as_mut(), proxy_backend_env) {
                 view.backend_env = backend_env;
             }
@@ -77,123 +75,67 @@ impl Runner {
         }
         self.set_service_state(name, ServiceState::Running);
         self.refresh_runtime_port_manifest();
+    }
 
-        // Output reader, OSC sink and crash watching all live with the
-        // supervisor now — `exit_rx` above is its end-of-stream fan-out for
-        // the ready check to race against.
-
-        let name_owned = name.to_string();
-        // Resolve ready checks only after the handle is stored: Docker's
-        // actual host ports are authoritative only after container start.
-        let ready_config = self.effective_ready_check(name, resolved);
-        let event_tx = self.event_tx.clone();
-        // The proxy backend was activated by the supervisor at wire time —
-        // forwarding is live before this bookkeeping runs.
-
-        if let Some(ready) = ready_config {
-            // The monitor's cancellation lives with the supervisor — it
-            // drops the sender when the process stops or dies, so monitor
-            // lifetime is tied to custody. This side only threads the
-            // receiver through to the task that starts the monitor.
-            let monitor_cancel_rx = ready.monitor.then_some(monitor_cancel_rx);
-            let report_tx_for_monitor = self.report_tx.clone();
-            let cmd_tx_for_state = self.internal_tx.clone();
-            tokio::spawn(async move {
-                let ready_result = tokio::select! {
-                    result = service::run_ready_check(&ready) => result,
-                    _ = exit_rx => {
-                        Err(service::ServiceError::ProcessExitedDuringReadyCheck)
-                    }
-                };
-
-                let success = ready_result.is_ok();
-
-                // State update:
-                //   done_tx path -> runner's handle_service_done flips state
-                //     via set_service_state (which broadcasts). Don't
-                //     duplicate it here.
-                //   no-done_tx path (manual start / rebuild) -> no
-                //     handle_service_done gets called, so send a command so
-                //     the runner can flip state on its own task. Without
-                //     this, internal state stays at Running and later
-                //     health-monitor probes short-circuit.
-                if done_tx.is_none() {
-                    let _ = cmd_tx_for_state
-                        .send(RunnerInternalCommand::ReadyCheckComplete {
-                            name: name_owned.clone(),
-                            generation: start_generation,
-                            success,
-                            message: ready_result.as_ref().err().map(ToString::to_string),
-                        })
-                        .await;
-                }
-
-                // Kick off the long-lived health monitor once Ready, if
-                // configured. The cancel rx exists only when ready.monitor
-                // was true at wire-up time, so this branch needs no extra check.
-                if success && let Some(cancel_rx) = monitor_cancel_rx {
-                    let monitor_name = name_owned.clone();
-                    tokio::spawn(async move {
-                        run_health_monitor(monitor_name, ready, report_tx_for_monitor, cancel_rx)
-                            .await;
-                    });
-                }
-
-                if let Some(done_tx) = done_tx {
-                    let _ = done_tx
-                        .send(ItemDone {
-                            name: name_owned,
-                            kind: NodeKind::Service,
-                            success,
-                            message: ready_result.err().map(|e| e.to_string()),
-                            elapsed: None,
-                            last_run: None,
-                            service_start_generation: Some(start_generation),
-                            task_run_generation: None,
-                        })
-                        .await;
-                } else {
-                    let _ = event_tx.send(RunnerEvent::RebuildComplete {
-                        name: name_owned,
+    /// Fold a ready outcome reported by the service's supervisor.
+    ///
+    /// A scheduled start answers the dependency sweep (`pending_done`);
+    /// everything else — manual start, rebuild restart — flips state here
+    /// and broadcasts `RebuildComplete` so the watch cycle closes.
+    pub(in crate::runner) async fn handle_service_ready_report(
+        &mut self,
+        name: &str,
+        op_id: u64,
+        success: bool,
+        message: Option<String>,
+        had_check: bool,
+    ) {
+        // Interim currency guard until the generations die: identical to
+        // the old detached-task guards. With the supervisor forwarding
+        // outcomes after its own prepared report on one channel, this can
+        // only reject genuinely superseded outcomes.
+        let is_current = self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.start_generation == op_id && rs.state() == ServiceState::Running);
+        if !is_current {
+            return;
+        }
+        let pending_done = self
+            .services
+            .get_mut(name)
+            .and_then(|rs| rs.pending_done.take());
+        match pending_done {
+            Some(done_tx) => {
+                // Scheduled start: the dependency sweep folds the outcome
+                // via `handle_service_done` (state flip, ready line, lazy
+                // failure routing).
+                let _ = done_tx
+                    .send(ItemDone {
+                        name: name.to_string(),
+                        kind: NodeKind::Service,
                         success,
-                    });
-                }
-            });
-        } else if let Some(done_tx) = done_tx {
-            // No ready check, initial startup path — just signal completion.
-            // `handle_service_done` flips state to Ready and emits the
-            // "{name} started" lifecycle event; doing either here as well
-            // would double-log and duplicate the state transition.
-            let _ = done_tx
-                .send(ItemDone {
-                    name: name.to_string(),
-                    kind: NodeKind::Service,
-                    success: true,
-                    message: None,
-                    elapsed: None,
-                    last_run: None,
-                    service_start_generation: Some(start_generation),
-                    task_run_generation: None,
-                })
-                .await;
-        } else {
-            // No ready check, rebuild path — mark ready immediately.
-            // Only the backoff counter resets here: reaching Ready (which is
-            // immediate without a ready check) is not proof the service will
-            // survive, so the rapid-crash streak is left for the lifetime
-            // check in `handle_service_exited` to clear.
-            if let Some(rs) = self.services.get_mut(name) {
-                if let Some(handle) = rs.pending_restart.take() {
-                    handle.abort();
-                }
-                rs.restart_attempts = 0;
+                        message,
+                        elapsed: None,
+                        last_run: None,
+                        service_start_generation: Some(op_id),
+                        task_run_generation: None,
+                    })
+                    .await;
             }
-            self.set_service_state(name, ServiceState::Ready);
-            self.output_manager.service_event(name, "restarted");
-            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
-                name: name.to_string(),
-                success: true,
-            });
+            None => {
+                // Manual start / rebuild restart. State handling matches the
+                // old ReadyCheckComplete handler; a checkless restart also
+                // announces itself, as the old immediate-Ready branch did.
+                self.handle_ready_check_complete(name, op_id, success, message);
+                if success && !had_check {
+                    self.output_manager.service_event(name, "restarted");
+                }
+                let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                    name: name.to_string(),
+                    success,
+                });
+            }
         }
     }
 }
