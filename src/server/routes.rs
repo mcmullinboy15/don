@@ -405,6 +405,7 @@ async fn get_all_logs(
             let mut chunk = serde_json::to_vec(&serde_json::json!({
                 "name": line.name,
                 "lifecycle": line.is_lifecycle,
+                "verbose": line.is_verbose,
                 "line": String::from_utf8_lossy(&line.bytes),
             }))
             .unwrap_or_default();
@@ -491,7 +492,7 @@ async fn follow_logs(state: Arc<ApiState>, name: String, last: usize) -> Respons
     use tokio_stream::{StreamExt, wrappers::ReceiverStream};
     let stream = ReceiverStream::new(sink_rx).map(|sink_line| {
         let line_str = String::from_utf8_lossy(&sink_line.line).into_owned();
-        let json = serde_json::json!({ "line": line_str });
+        let json = serde_json::json!({ "line": line_str, "verbose": sink_line.is_verbose });
         let mut chunk = serde_json::to_vec(&json).unwrap_or_default();
         chunk.push(b'\n');
         Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk))

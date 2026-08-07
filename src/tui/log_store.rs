@@ -99,6 +99,7 @@ mod tests {
         FormattedLogLine {
             name: name.to_string(),
             is_lifecycle: false,
+            is_verbose: false,
             bytes: body.as_bytes().to_vec(),
         }
     }

@@ -1742,10 +1742,11 @@ async fn attach_tui_inner(
         loop {
             tokio::select! {
                 remote = remote_rx.recv() => match remote {
-                    Some(LogStreamEvent::Line { name, lifecycle, line }) => {
+                    Some(LogStreamEvent::Line { name, lifecycle, verbose, line }) => {
                         let line = don::output::FormattedLogLine {
                             name,
                             is_lifecycle: lifecycle,
+                            is_verbose: verbose,
                             bytes: line.into_bytes(),
                         };
                         if log_tx.send(line).is_err() {
@@ -1756,6 +1757,7 @@ async fn attach_tui_inner(
                         let notice = don::output::FormattedLogLine {
                             name: don::output::LIFECYCLE_EVENT_NAME.to_string(),
                             is_lifecycle: true,
+                            is_verbose: false,
                             bytes: format!("log stream lagged — {lagged} lines dropped")
                                 .into_bytes(),
                         };
@@ -2679,6 +2681,7 @@ async fn run_start(
                         don::output::FormattedLogLine {
                             name: don::output::LIFECYCLE_EVENT_NAME.to_string(),
                             is_lifecycle: true,
+                            is_verbose: false,
                             bytes: format!("log stream lagged — {n} lines dropped").into_bytes(),
                         }
                     }

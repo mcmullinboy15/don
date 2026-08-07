@@ -157,6 +157,12 @@ pub struct SinkLine {
     /// hidden kafka should still surface "send SIGTERM" without flooding
     /// the screen with kafka's own (filtered) shutdown chatter.
     pub is_lifecycle: bool,
+    /// True for verbose diagnostic messages. Always emitted and always
+    /// recorded — each consumer decides whether to *display* them (the TUI's
+    /// local `v` toggle, the stdout writer's `-v` flag, a follower's own
+    /// filter). Tagging at emission instead of gating there is what makes
+    /// verbose history revealable after the fact.
+    pub is_verbose: bool,
 }
 
 /// A handle to a sink. Clone the sender to subscribe a service to it.
@@ -239,6 +245,8 @@ pub struct FormattedLogLine {
     /// stdout/stderr. Lets the TUI keep lifecycle events visible even when
     /// the source service is filtered out (esp. during shutdown).
     pub is_lifecycle: bool,
+    /// True for verbose diagnostic messages; see [`SinkLine::is_verbose`].
+    pub is_verbose: bool,
     /// Fully formatted line bytes. Does NOT include a trailing newline —
     /// the renderer appends one (or, for ratatui, treats it as one row).
     pub bytes: Vec<u8>,
@@ -269,13 +277,6 @@ impl VerbosityControl {
     /// Set verbose logging on or off for all current emitters and sinks.
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    /// Flip verbose logging and return the new state.
-    pub fn toggle(&self) -> bool {
-        let new_value = !self.is_enabled();
-        self.set_enabled(new_value);
-        new_value
     }
 }
 
@@ -548,6 +549,7 @@ impl ServiceWriter {
                     line: chunk.clone(),
                     name: name.clone(),
                     is_lifecycle: false,
+                    is_verbose: false,
                 };
                 if sink.send(msg).is_err() {
                     dropped.push(sink.clone());
@@ -691,6 +693,7 @@ async fn follow_sink_from(
             // as non-lifecycle is correct for follow consumers, which
             // don't have a TUI filter to short-circuit anyway.
             is_lifecycle: false,
+            is_verbose: false,
         };
         if tx.try_send(sink_line).is_err() {
             break;
@@ -1083,6 +1086,7 @@ impl OutputManager {
                     line: Bytes::from(format!("{message}\n")),
                     name: "bazel".to_string(),
                     is_lifecycle: true,
+                    is_verbose: false,
                 });
             }
             None => self.lifecycle_event(&format!("bazel: {message}")),
@@ -1139,6 +1143,7 @@ impl OutputManager {
             line: Bytes::from(repaint.bytes),
             name: state.name.clone(),
             is_lifecycle: false,
+            is_verbose: false,
         };
         // Channel is empty and capacity >= 2, so this cannot fail.
         let _ = tx.try_send(sink_line);
@@ -1277,7 +1282,6 @@ impl OutputManager {
             don_prefix: self.don_prefix.clone(),
             stdout_sink: self.stdout_sink.clone(),
             bazel_prefix: self.bazel_prefix.clone(),
-            verbosity: self.verbosity.clone(),
         }
     }
 
@@ -1288,23 +1292,26 @@ impl OutputManager {
             line: Bytes::from(format!("{message}\n")),
             name: LIFECYCLE_EVENT_NAME.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
         });
     }
 
-    /// Emit a `[don]` lifecycle event only when verbose mode is enabled.
+    /// Emit a verbose-tagged `[don]` diagnostic event. Always emitted —
+    /// consumers filter on the tag (see [`SinkLine::is_verbose`]).
     pub fn debug_event(&self, message: &str) {
-        if self.verbosity.is_enabled() {
-            self.lifecycle_event(message);
-        }
+        let _ = self.stdout_sink.send(SinkLine {
+            prefix: Bytes::from(self.don_prefix.clone()),
+            line: Bytes::from(format!("{message}\n")),
+            name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            is_verbose: true,
+        });
     }
 
-    /// Log (in verbose mode only) the exact executable and arguments about
+    /// Log (verbose-tagged) the exact executable and arguments about
     /// to be passed to `execve`. See [`LifecycleEmitter::debug_spawn`].
     pub fn debug_spawn<S: AsRef<str>>(&self, label: &str, cmd: &str, args: &[S]) {
-        if !self.verbosity.is_enabled() {
-            return;
-        }
-        self.service_event(label, &format!("spawn {}", format_cmdline(cmd, args)));
+        self.service_debug_event(label, &format!("spawn {}", format_cmdline(cmd, args)));
     }
 
     /// Emit a `[don]` lifecycle event scoped to a service/task. The message
@@ -1317,15 +1324,20 @@ impl OutputManager {
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
         });
     }
 
-    /// Emit a `[don]` lifecycle event scoped to a service/task, only when
-    /// verbose mode is enabled. See [`Self::service_event`].
+    /// Emit a verbose-tagged `[don]` diagnostic event scoped to a
+    /// service/task. Always emitted — consumers filter on the tag.
     pub fn service_debug_event(&self, service: &str, message: &str) {
-        if self.verbosity.is_enabled() {
-            self.service_event(service, message);
-        }
+        let _ = self.stdout_sink.send(SinkLine {
+            prefix: Bytes::from(self.don_prefix.clone()),
+            line: Bytes::from(format!("{service}: {message}\n")),
+            name: service.to_string(),
+            is_lifecycle: true,
+            is_verbose: true,
+        });
     }
 
     /// Emit a `[don]` error event.
@@ -1335,6 +1347,7 @@ impl OutputManager {
             line: Bytes::from(format!("{message}\n")),
             name: LIFECYCLE_EVENT_NAME.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
         });
     }
 
@@ -1347,6 +1360,7 @@ impl OutputManager {
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
         });
     }
 
@@ -1522,7 +1536,6 @@ pub struct LifecycleEmitter {
     don_prefix: String,
     stdout_sink: SinkHandle,
     bazel_prefix: Option<Bytes>,
-    verbosity: VerbosityControl,
 }
 
 impl LifecycleEmitter {
@@ -1533,6 +1546,7 @@ impl LifecycleEmitter {
             line: Bytes::from(format!("{message}\n")),
             name: LIFECYCLE_EVENT_NAME.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
         });
     }
 
@@ -1545,6 +1559,7 @@ impl LifecycleEmitter {
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
         });
     }
 
@@ -1556,34 +1571,41 @@ impl LifecycleEmitter {
             line: Bytes::from(format!("{service}: {message}\n")),
             name: service.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
         });
     }
 
-    /// Emit a `[don]` lifecycle event only when verbose mode is enabled.
+    /// Emit a verbose-tagged `[don]` diagnostic event. Always emitted —
+    /// consumers filter on the tag (see [`SinkLine::is_verbose`]).
     pub fn debug_event(&self, message: &str) {
-        if self.verbosity.is_enabled() {
-            self.lifecycle_event(message);
-        }
+        let _ = self.stdout_sink.send(SinkLine {
+            prefix: Bytes::from(self.don_prefix.clone()),
+            line: Bytes::from(format!("{message}\n")),
+            name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            is_verbose: true,
+        });
     }
 
-    /// Emit a service-scoped `[don]` event only when verbose mode is enabled.
+    /// Emit a verbose-tagged, service-scoped `[don]` diagnostic event.
     pub fn service_debug_event(&self, service: &str, message: &str) {
-        if self.verbosity.is_enabled() {
-            self.service_event(service, message);
-        }
+        let _ = self.stdout_sink.send(SinkLine {
+            prefix: Bytes::from(self.don_prefix.clone()),
+            line: Bytes::from(format!("{service}: {message}\n")),
+            name: service.to_string(),
+            is_lifecycle: true,
+            is_verbose: true,
+        });
     }
 
-    /// Log (in verbose mode only) the exact executable and arguments about
+    /// Log (verbose-tagged) the exact executable and arguments about
     /// to be passed to `execve`. Use before every `Command::spawn()` so
-    /// `don -v` shows what don is actually asking the kernel to run.
+    /// verbose consumers see what don is actually asking the kernel to run.
     ///
     /// `label` is a short tag (e.g. service name, "bazel") to
     /// help the user identify the source of the spawn.
     pub fn debug_spawn<S: AsRef<str>>(&self, label: &str, cmd: &str, args: &[S]) {
-        if !self.verbosity.is_enabled() {
-            return;
-        }
-        self.service_event(label, &format!("spawn {}", format_cmdline(cmd, args)));
+        self.service_debug_event(label, &format!("spawn {}", format_cmdline(cmd, args)));
     }
 
     /// Emit a line prefixed as bazel tool output. Falls back to a
@@ -1597,6 +1619,7 @@ impl LifecycleEmitter {
                     line: Bytes::from(format!("{message}\n")),
                     name: "bazel".to_string(),
                     is_lifecycle: true,
+                    is_verbose: false,
                 });
             }
             None => self.lifecycle_event(&format!("bazel: {message}")),
@@ -1669,6 +1692,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.prefix,
                         &sanitized,
                         msg.is_lifecycle,
+                        msg.is_verbose,
                         &verbosity,
                         start,
                     )
@@ -1693,6 +1717,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.prefix,
                         &sanitized,
                         msg.is_lifecycle,
+                        msg.is_verbose,
                         &verbosity,
                         start,
                     )
@@ -1717,6 +1742,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         &msg.prefix,
                         &sanitized,
                         msg.is_lifecycle,
+                        msg.is_verbose,
                         &verbosity,
                         start,
                     )
@@ -1750,6 +1776,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 prefix,
                 &sanitized,
                 false,
+                false,
                 &verbosity,
                 start,
             )
@@ -1779,6 +1806,10 @@ fn build_formatted_bytes(
 
 /// Emit a complete formatted line to the target — either write to the pipe
 /// writer with a trailing `\n`, or ship it to the TUI as a [`FormattedLogLine`].
+///
+/// Verbose lines always reach the tap (history and followers filter for
+/// themselves); the pipe writer is its own consumer and skips them unless
+/// `-v` display mode is on.
 #[allow(clippy::too_many_arguments)]
 async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     target: &mut StdoutTarget<W>,
@@ -1787,6 +1818,7 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     prefix: &[u8],
     line: &[u8],
     is_lifecycle: bool,
+    is_verbose: bool,
     verbosity: &VerbosityControl,
     start: std::time::Instant,
 ) {
@@ -1796,9 +1828,13 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     tap.publish(Arc::new(FormattedLogLine {
         name: name.to_string(),
         is_lifecycle,
+        is_verbose,
         bytes: bytes.clone(),
     }))
     .await;
+    if is_verbose && !verbosity.is_enabled() {
+        return;
+    }
     match target {
         StdoutTarget::Writer(writer) => {
             use tokio::io::AsyncWriteExt;

@@ -371,7 +371,7 @@ pub async fn run_tui(
                             // `LogStore` so it can be replayed on resume.
                             if let Some(act) = active.as_mut()
                                 && act.modal.is_none()
-                                && app.should_render_log(&line.name, line.is_lifecycle)
+                                && app.should_render_log(&line.name, line.is_lifecycle, line.is_verbose)
                             {
                                 insert_line(&mut act.terminal, &line, cached_width)?;
                                 bar_dirty = true;
@@ -475,7 +475,7 @@ pub async fn run_tui(
                             cached_width = act.terminal.size()?.width.max(1);
                             let mut replayed_any = false;
                             for entry in store.iter_since(checkpoint) {
-                                if app.should_render_log(&entry.line.name, entry.line.is_lifecycle)
+                                if app.should_render_log(&entry.line.name, entry.line.is_lifecycle, entry.line.is_verbose)
                                 {
                                     insert_line(&mut act.terminal, &entry.line, cached_width)?;
                                     replayed_any = true;
@@ -686,7 +686,11 @@ fn clear_and_replay(
     execute!(std::io::stdout(), Clear(ClearType::Purge))?;
     let width = terminal.size()?.width.max(1);
     for entry in store.iter() {
-        if app.should_render_log(&entry.line.name, entry.line.is_lifecycle) {
+        if app.should_render_log(
+            &entry.line.name,
+            entry.line.is_lifecycle,
+            entry.line.is_verbose,
+        ) {
             insert_line(terminal, &entry.line, width)?;
         }
     }
@@ -713,7 +717,11 @@ fn close_modal_and_replay_new_logs(
 
     let width = terminal.size()?.width.max(1);
     for entry in store.iter_since(since) {
-        if app.should_render_log(&entry.line.name, entry.line.is_lifecycle) {
+        if app.should_render_log(
+            &entry.line.name,
+            entry.line.is_lifecycle,
+            entry.line.is_verbose,
+        ) {
             insert_line(terminal, &entry.line, width)?;
         }
     }
@@ -832,7 +840,11 @@ fn handle_key(
                 app.exit_requested = true;
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
-                let enabled = controls.verbosity.toggle();
+                // Purely local display state: verbose lines are always in
+                // the stream, this client just chooses to show them. The
+                // toggle no longer touches the process-wide VerbosityControl,
+                // so it cannot change what other consumers see or record.
+                let enabled = !app.verbose_enabled;
                 app.set_verbose_enabled(enabled);
                 controls.lifecycle_emitter.lifecycle_event(if enabled {
                     "verbose logging enabled"
@@ -889,6 +901,7 @@ fn handle_normal_key(
             draw_inline_bar(terminal, app)?;
             let _ = store.push(FormattedLogLine {
                 name: String::new(),
+                is_verbose: false,
                 is_lifecycle: false,
                 bytes: Vec::new(),
             });

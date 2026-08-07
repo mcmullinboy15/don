@@ -114,6 +114,10 @@ pub enum LogStreamEvent {
         name: String,
         /// True for `[don]`-prefixed lifecycle events.
         lifecycle: bool,
+        /// True for verbose diagnostic messages — always present in the
+        /// stream; the reader decides whether to display them.
+        #[serde(default)]
+        verbose: bool,
         line: String,
     },
     /// This follower fell `lagged` lines behind and they are gone —

@@ -351,7 +351,19 @@ impl App {
         });
     }
 
-    pub(crate) fn should_render_log(&self, name: &str, _is_lifecycle: bool) -> bool {
+    pub(crate) fn should_render_log(
+        &self,
+        name: &str,
+        _is_lifecycle: bool,
+        is_verbose: bool,
+    ) -> bool {
+        // Verbose diagnostics are always in the stream (and the store —
+        // toggling `v` reveals history); whether they *render* is purely
+        // this client's choice. Checked before the shutdown override so
+        // teardown stays readable unless the user asked for the firehose.
+        if is_verbose && !self.verbose_enabled {
+            return false;
+        }
         // During shutdown, every line bypasses the filter — the user wants
         // to see what's happening as each service tears down, including
         // service stdout from previously-hidden services (kafka, mongo, …).
@@ -996,12 +1008,12 @@ mod tests {
         app.filter.toggle_highlighted(); // clear all
         app.filter.commit();
 
-        assert!(!app.should_render_log("db", false));
+        assert!(!app.should_render_log("db", false, false));
         let changed = apply_service(&mut app, "db", ServiceState::Failed, None);
 
         assert!(changed);
-        assert!(app.should_render_log("db", false));
-        assert!(!app.should_render_log("api", false));
+        assert!(app.should_render_log("db", false, false));
+        assert!(!app.should_render_log("api", false, false));
     }
 
     #[test]
@@ -1018,7 +1030,7 @@ mod tests {
         let changed = apply_service(&mut app, "api", ServiceState::DependencyFailed, None);
 
         assert!(!changed);
-        assert!(!app.should_render_log("api", false));
+        assert!(!app.should_render_log("api", false, false));
     }
 
     #[test]
@@ -1035,8 +1047,8 @@ mod tests {
         let changed = apply_task(&mut app, "lint", TaskState::Failed);
 
         assert!(changed);
-        assert!(app.should_render_log("lint", false));
-        assert!(!app.should_render_log("build", false));
+        assert!(app.should_render_log("lint", false, false));
+        assert!(!app.should_render_log("build", false, false));
     }
 
     #[test]
@@ -1044,16 +1056,19 @@ mod tests {
         let direct = FormattedLogLine {
             name: "api".to_string(),
             is_lifecycle: false,
+            is_verbose: false,
             bytes: b"api output".to_vec(),
         };
         let lifecycle = FormattedLogLine {
             name: LIFECYCLE_EVENT_NAME.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
             bytes: b"[don] api: started".to_vec(),
         };
         let other = FormattedLogLine {
             name: LIFECYCLE_EVENT_NAME.to_string(),
             is_lifecycle: true,
+            is_verbose: false,
             bytes: b"[don] worker: started".to_vec(),
         };
 
@@ -1226,19 +1241,19 @@ mod tests {
         // Without shutdown: filter passes "api", rejects "worker" — for both
         // service stdout (is_lifecycle=false) and lifecycle events
         // (is_lifecycle=true).
-        assert!(app.should_render_log("api", false));
-        assert!(app.should_render_log("api", true));
-        assert!(!app.should_render_log("worker", false));
-        assert!(!app.should_render_log("worker", true));
+        assert!(app.should_render_log("api", false, false));
+        assert!(app.should_render_log("api", true, false));
+        assert!(!app.should_render_log("worker", false, false));
+        assert!(!app.should_render_log("worker", true, false));
 
         app.begin_shutdown();
 
         // After shutdown: every line passes regardless of filter — the user
         // wants visibility into everything happening as services tear down.
-        assert!(app.should_render_log("api", false));
-        assert!(app.should_render_log("api", true));
-        assert!(app.should_render_log("worker", false));
-        assert!(app.should_render_log("worker", true));
+        assert!(app.should_render_log("api", false, false));
+        assert!(app.should_render_log("api", true, false));
+        assert!(app.should_render_log("worker", false, false));
+        assert!(app.should_render_log("worker", true, false));
     }
 
     #[test]
