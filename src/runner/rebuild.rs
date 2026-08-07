@@ -1,91 +1,54 @@
+use super::build_batcher::{BatchRequest, RebuildSpec};
 use super::build_tools::{
     BazelRebuildItem, GraphRequeryOutcomeItem, GraphRequeryRequestItem, RebuildBatchOutcome,
-    RebuildBatchRequest, run_graph_requery_worker, run_rebuild_batch_worker, send_watch_update,
+    send_watch_update,
 };
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::{
-    Runner, RunnerEvent, RunnerInternalCommand, ServiceState, should_rebuild_after_graph_requery,
-};
+use super::{Runner, RunnerEvent, ServiceState, should_rebuild_after_graph_requery};
 
 impl Runner {
-    /// Flush all pending build-tool rebuilds as a single batch.
-    ///
-    /// Collects Bazel targets from the queued services, runs one build, then
-    /// restarts each affected service.
-    pub(in crate::runner) async fn flush_pending_rebuilds(&mut self) {
-        let mut names = self.builds.take_pending_rebuilds();
-
-        if names.is_empty() {
-            return;
-        }
-        if self.builds.rebuild_in_flight() {
-            self.builds.queue_rebuilds(names);
-            return;
-        }
-
-        // Defer services that haven't finished coming up. Rebuilding a service
-        // that is still building or starting would race its in-flight build or
-        // double-start it before the startup path attaches a process handle.
-        // Re-queue them; they're retried once they reach a running state. (This
-        // is what keeps a file edited mid-build from being lost: the rebuild
-        // waits here instead of running against a half-started service.)
-        let mut deferred: Vec<String> = Vec::new();
-        names.retain(|name| {
-            let coming_up = self.services.get(name).is_some_and(|rs| {
-                matches!(
-                    rs.state(),
-                    ServiceState::Building | ServiceState::Pending | ServiceState::Starting
-                )
-            });
-            if coming_up {
-                deferred.push(name.clone());
-                false
-            } else {
-                true
+    /// Capture what the batcher needs to rebuild `name`, from resolved
+    /// config. Resolved config is fixed after construction, so a spec built
+    /// at queue time equals one built at flush time — which is what frees
+    /// the batcher from reading runner state.
+    fn rebuild_spec_for(&self, name: &str) -> Option<RebuildSpec> {
+        let rs = self.services.get(name)?;
+        Some(match &rs.resolved.kind {
+            Some(crate::config::ServiceKind::Bazel(bazel)) => {
+                RebuildSpec::Bazel(BazelRebuildItem {
+                    name: name.to_string(),
+                    target: bazel.target.clone(),
+                    working_dir: working_dir_for(&self.base_dir, rs.resolved.dir.as_deref()),
+                })
             }
+            _ => RebuildSpec::Plain {
+                name: name.to_string(),
+            },
+        })
+    }
+
+    /// Queue `name` on the batcher's next rebuild batch.
+    pub(in crate::runner) fn queue_build_tool_rebuild(&self, name: &str) {
+        if let Some(spec) = self.rebuild_spec_for(name) {
+            let _ = self.batcher_tx.send(BatchRequest::QueueRebuild { spec });
+        }
+    }
+
+    /// Re-queue an item whose batch outcome arrived while it is still coming
+    /// up. The batcher defers such items at flush time from the state
+    /// snapshot, but the snapshot can trail the fold — this is the
+    /// application-side safety net. Returns whether the item was re-queued.
+    fn requeue_if_coming_up(&mut self, name: &str) -> bool {
+        let coming_up = self.services.get(name).is_some_and(|rs| {
+            matches!(
+                rs.state(),
+                ServiceState::Building | ServiceState::Pending | ServiceState::Starting
+            )
         });
-        self.builds.queue_rebuilds(deferred);
-        if names.is_empty() {
-            return;
+        if coming_up {
+            self.queue_build_tool_rebuild(name);
         }
-
-        let mut bazel_items: Vec<BazelRebuildItem> = Vec::new();
-        // Services without a build tool target (shouldn't happen, but handle gracefully)
-        let mut plain_rebuilds: Vec<String> = Vec::new();
-
-        for name in &names {
-            if let Some(rs) = self.services.get(name) {
-                match &rs.resolved.kind {
-                    Some(crate::config::ServiceKind::Bazel(bazel)) => {
-                        bazel_items.push(BazelRebuildItem {
-                            name: name.clone(),
-                            target: bazel.target.clone(),
-                            working_dir: working_dir_for(
-                                &self.base_dir,
-                                rs.resolved.dir.as_deref(),
-                            ),
-                        });
-                    }
-                    _ => {
-                        plain_rebuilds.push(name.clone());
-                    }
-                }
-            }
-        }
-        let request = RebuildBatchRequest {
-            bazel_items,
-            plain_rebuilds,
-            force: false,
-        };
-        let cmd_tx = self.internal_tx.clone();
-        let emitter = self.output_manager.clone_lifecycle_emitter();
-        let bazel_build_mutex = self.builds.bazel_mutex();
-        self.builds.set_rebuild_batch(tokio::spawn(async move {
-            let outcome = run_rebuild_batch_worker(request, emitter, bazel_build_mutex).await;
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::RebuildBatchComplete(outcome))
-                .await;
-        }));
+        coming_up
     }
 
     pub(in crate::runner) fn fail_rebuild(&self, name: &str, message: &str) {
@@ -134,6 +97,9 @@ impl Runner {
             self.fail_rebuild(name, message);
         }
         for name in &outcome.up_to_date {
+            if self.requeue_if_coming_up(name) {
+                continue;
+            }
             // Normally up-to-date means the running process already has the
             // current artifact, so there's nothing to do. But if an earlier
             // stale build deferred this service's restart, the process is still
@@ -159,6 +125,9 @@ impl Runner {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.batch_built = true;
             }
+            if self.requeue_if_coming_up(name) {
+                continue;
+            }
             if self.take_rebuild_stale(name) {
                 // A watched file changed mid-build. Skip restarting into the
                 // artifact we just built and let the follow-up cycle pick up
@@ -177,6 +146,9 @@ impl Runner {
             self.do_rebuild(name).await;
         }
         for name in &outcome.plain_rebuilds {
+            if self.requeue_if_coming_up(name) {
+                continue;
+            }
             if self.take_rebuild_stale(name) {
                 let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
                     name: name.clone(),
@@ -188,54 +160,42 @@ impl Runner {
         }
     }
 
-    pub(in crate::runner) fn spawn_forced_build_tool_rebuild(
+    /// Run a forced (skip up-to-date checks) rebuild for one item now. The
+    /// batcher answers synchronously whether it accepted — a batch already
+    /// in flight is the same "already in progress" error as before.
+    pub(in crate::runner) async fn spawn_forced_build_tool_rebuild(
         &mut self,
         name: &str,
     ) -> Result<(), super::CommandError> {
-        if self.builds.rebuild_in_flight() {
-            return Err(super::CommandError::InvalidState {
+        let spec =
+            self.rebuild_spec_for(name)
+                .ok_or_else(|| super::CommandError::UnknownService {
+                    name: name.to_string(),
+                })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let sent = self.batcher_tx.send(BatchRequest::ForceRebuild {
+            spec,
+            reply: reply_tx,
+        });
+        if sent.is_err() {
+            return Err(super::CommandError::Failed {
                 name: name.to_string(),
-                message: "build-tool rebuild already in progress".to_string(),
+                message: "build batcher is shutting down".to_string(),
             });
         }
-
-        let rs = self
-            .services
-            .get(name)
-            .ok_or_else(|| super::CommandError::UnknownService {
+        // Safe to await inline: the batcher never blocks (its outcome
+        // channel is unbounded), so the reply is immediate.
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(super::CommandError::InvalidState {
                 name: name.to_string(),
-            })?;
-        let mut bazel_items: Vec<BazelRebuildItem> = Vec::new();
-        let mut plain_rebuilds: Vec<String> = Vec::new();
-
-        match &rs.resolved.kind {
-            Some(crate::config::ServiceKind::Bazel(bazel)) => {
-                bazel_items.push(BazelRebuildItem {
-                    name: name.to_string(),
-                    target: bazel.target.clone(),
-                    working_dir: working_dir_for(&self.base_dir, rs.resolved.dir.as_deref()),
-                });
-            }
-            _ => plain_rebuilds.push(name.to_string()),
+                message,
+            }),
+            Err(_) => Err(super::CommandError::Failed {
+                name: name.to_string(),
+                message: "build batcher is shutting down".to_string(),
+            }),
         }
-        // This build supersedes anything queued for the batch.
-        self.builds.cancel_pending_rebuild(name);
-
-        let request = RebuildBatchRequest {
-            bazel_items,
-            plain_rebuilds,
-            force: true,
-        };
-        let cmd_tx = self.internal_tx.clone();
-        let emitter = self.output_manager.clone_lifecycle_emitter();
-        let bazel_build_mutex = self.builds.bazel_mutex();
-        self.builds.set_rebuild_batch(tokio::spawn(async move {
-            let outcome = run_rebuild_batch_worker(request, emitter, bazel_build_mutex).await;
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::RebuildBatchComplete(outcome))
-                .await;
-        }));
-        Ok(())
     }
 
     pub(in crate::runner) async fn handle_graph_requery_complete(
@@ -327,7 +287,7 @@ impl Runner {
         for name in services_to_rebuild {
             self.output_manager
                 .service_event(&name, "build graph changed — rebuilding");
-            self.builds.queue_rebuild(name);
+            self.queue_build_tool_rebuild(&name);
         }
 
         for name in tasks_to_rerun {
@@ -343,6 +303,11 @@ impl Runner {
     /// This prevents redundant concurrent queries when a single BUILD file
     /// change affects multiple services.
     pub(in crate::runner) async fn handle_build_graph_changed(&mut self, name: &str) {
+        // Re-query outcomes exist to feed the watcher updated patterns;
+        // without a watcher they'd be discarded on arrival, so don't queue.
+        if self.watch.is_none() {
+            return;
+        }
         if name == crate::watch::WORKSPACE_GRAPH_ITEM_NAME {
             let service_names: Vec<String> = self
                 .services
@@ -356,93 +321,61 @@ impl Runner {
                 .filter(|(_, rt)| rt.config.build_tool_watch_enabled())
                 .map(|(task_name, _)| task_name.clone())
                 .collect();
-            self.builds
-                .queue_requeries(service_names.into_iter().chain(task_names));
+            for item_name in service_names.into_iter().chain(task_names) {
+                self.queue_build_graph_requery(&item_name);
+            }
         } else {
-            self.builds.queue_requery(name);
+            self.queue_build_graph_requery(name);
         }
     }
 
-    /// Flush all pending build-graph re-queries.
-    ///
-    /// Runs build tool queries for each queued item and sends updated watch
-    /// patterns to the WatchManager. Uses stale-while-revalidate: old watch
-    /// patterns remain active during the re-query.
-    pub(in crate::runner) async fn flush_pending_graph_requery(&mut self) {
-        let names = self.builds.take_pending_requeries();
-
-        if names.is_empty() {
+    /// Queue one item on the batcher's next re-query batch. The request item
+    /// is built here, at queue time, from resolved config — same values a
+    /// flush-time build would produce, since config is fixed.
+    fn queue_build_graph_requery(&self, name: &str) {
+        let (bazel, watch_enabled, item_dir, ignore_patterns) =
+            if let Some(rs) = self.services.get(name) {
+                if !rs.resolved.build_tool_watch_enabled() {
+                    return;
+                }
+                (
+                    rs.resolved.bazel_config().cloned(),
+                    rs.resolved.build_tool_watch_enabled(),
+                    rs.resolved.dir.clone(),
+                    rs.resolved.ignore.clone(),
+                )
+            } else if let Some(rt) = self.tasks.get(name) {
+                if !rt.config.build_tool_watch_enabled() {
+                    return;
+                }
+                (
+                    rt.config.bazel.clone(),
+                    rt.config.build_tool_watch_enabled(),
+                    rt.config.dir.clone(),
+                    rt.config.ignore.clone(),
+                )
+            } else {
+                return;
+            };
+        if bazel.is_none() {
             return;
         }
-        if self.watch.is_none() {
-            return;
-        }
-        if self.builds.requery_in_flight() {
-            self.builds.queue_requeries(names);
-            return;
-        }
-
-        self.output_manager.lifecycle_event(&format!(
-            "re-querying build tool for {} item{}...",
-            names.len(),
-            if names.len() == 1 { "" } else { "s" }
-        ));
-
-        let mut items = Vec::new();
-        for name in &names {
-            let (bazel, watch_enabled, item_dir, ignore_patterns) =
-                if let Some(rs) = self.services.get(name) {
-                    if !rs.resolved.build_tool_watch_enabled() {
-                        continue;
-                    }
-                    (
-                        rs.resolved.bazel_config().cloned(),
-                        rs.resolved.build_tool_watch_enabled(),
-                        rs.resolved.dir.clone(),
-                        rs.resolved.ignore.clone(),
-                    )
-                } else if let Some(rt) = self.tasks.get(name) {
-                    if !rt.config.build_tool_watch_enabled() {
-                        continue;
-                    }
-                    (
-                        rt.config.bazel.clone(),
-                        rt.config.build_tool_watch_enabled(),
-                        rt.config.dir.clone(),
-                        rt.config.ignore.clone(),
-                    )
-                } else {
-                    continue;
-                };
-            if bazel.is_none() {
-                continue;
-            }
-            let working_dir = working_dir_for(&self.base_dir, item_dir.as_deref());
-            let ignore_patterns = resolve_watch_ignore_patterns(
-                &working_dir,
-                &ignore_patterns,
-                &self.base_dir,
-                &self.config.watch_ignore,
-            );
-            items.push(GraphRequeryRequestItem {
-                name: name.clone(),
+        let working_dir = working_dir_for(&self.base_dir, item_dir.as_deref());
+        let ignore_patterns = resolve_watch_ignore_patterns(
+            &working_dir,
+            &ignore_patterns,
+            &self.base_dir,
+            &self.config.watch_ignore,
+        );
+        let _ = self.batcher_tx.send(BatchRequest::QueueRequery {
+            item: GraphRequeryRequestItem {
+                name: name.to_string(),
                 bazel,
                 watch_enabled,
                 working_dir,
                 ignore_patterns,
-            });
-        }
-        if items.is_empty() {
-            return;
-        }
-        let cmd_tx = self.internal_tx.clone();
-        let emitter = self.output_manager.clone_lifecycle_emitter();
-        self.builds.set_requery_batch(tokio::spawn(async move {
-            let outcomes = run_graph_requery_worker(items, emitter).await;
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::GraphRequeryComplete(outcomes))
-                .await;
-        }));
+            },
+        });
     }
 
     /// Runs the build (if any), stops the old process, starts a new one.
@@ -476,7 +409,7 @@ impl Runner {
             // Queueing extends the batch window, so several Rebuild commands
             // from the watch module — which fire per-service after their own
             // debounce timers — coalesce into one build.
-            self.builds.queue_rebuild(name);
+            self.queue_build_tool_rebuild(name);
             return;
         }
 

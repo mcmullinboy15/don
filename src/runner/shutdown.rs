@@ -50,8 +50,22 @@ impl Runner {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
-        // Same treatment for the batched rebuild / graph re-query workers.
-        self.builds.abort_in_flight().await;
+        // Same treatment for the batched rebuild / graph re-query workers:
+        // the batcher actor aborts its in-flight batches (bounded joins
+        // inside) and exits, so no new batch can spawn mid-teardown.
+        let (batcher_done_tx, batcher_done_rx) = tokio::sync::oneshot::channel();
+        if self
+            .batcher_tx
+            .send(super::build_batcher::BatchRequest::Shutdown {
+                done: batcher_done_tx,
+            })
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(11), batcher_done_rx).await;
+        }
+        if let Some(handle) = self.batcher_handle.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        }
         if let Some(handle) = self.update_check_handle.take() {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
@@ -405,11 +419,9 @@ impl Runner {
                 }
                 RunnerInternalCommand::ServiceStopComplete { .. }
                 | RunnerInternalCommand::ServiceRebuildPrepared { .. }
-                | RunnerInternalCommand::GraphRequeryComplete(_)
                 | RunnerInternalCommand::TaskExited(_)
                 | RunnerInternalCommand::TaskRunWaitTimedOut { .. }
                 | RunnerInternalCommand::BatchBuildComplete(_)
-                | RunnerInternalCommand::RebuildBatchComplete(_)
                 | RunnerInternalCommand::LazyBuildComplete { .. }
                 | RunnerInternalCommand::ReadyCheckComplete { .. }
                 | RunnerInternalCommand::UpdateCheckComplete(_) => {}

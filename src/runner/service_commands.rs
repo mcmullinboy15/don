@@ -492,7 +492,7 @@ impl Runner {
         };
 
         let result = if resolved.is_build_tool_managed() {
-            self.spawn_forced_build_tool_rebuild(name)
+            self.spawn_forced_build_tool_rebuild(name).await
         } else {
             self.spawn_service_rebuild_worker(name, resolved)
         };

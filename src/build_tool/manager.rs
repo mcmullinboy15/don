@@ -130,12 +130,6 @@ impl BuildBatcher {
         self.rebuild_handle.is_some()
     }
 
-    /// Whether `name` is waiting for the next rebuild batch.
-    #[cfg(test)]
-    pub(crate) fn has_pending_rebuild(&self, name: &str) -> bool {
-        self.pending_rebuilds.iter().any(|queued| queued == name)
-    }
-
     /// Adopt a spawned rebuild batch. Aborted on drop, so a runner that goes
     /// away mid-build takes the build with it.
     pub(crate) fn set_rebuild_batch(&mut self, handle: tokio::task::JoinHandle<()>) {
