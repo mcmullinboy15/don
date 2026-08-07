@@ -51,19 +51,11 @@ pub(crate) struct RuntimeService {
     pub output_worker: Option<tokio::task::JoinHandle<()>>,
     /// OSC query sink for reclaiming PTY write on attach.
     pub osc_sink: Option<crate::output::OscSinkHandle>,
-    /// Sender into the live spawn's PTY input gate; `None` when there is no
-    /// PTY (docker, pipe mode) or no live process. Cleared wherever
-    /// `osc_sink` is.
-    pub pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
     /// Whether the current start was asked for by the dependency sweep —
     /// its ready outcome then drives the sweep-visible transition and the
     /// "ready" lifecycle line; manual/rebuild starts instead close the
     /// watch cycle with `RebuildComplete`.
     pub(in crate::runner) scheduled_start: bool,
-    /// Number of clients currently attached. Attach is multi-client
-    /// (tmux-style shared input); the count drives the stdout-sink pause
-    /// (paused while any client is attached) and the lifecycle events.
-    pub attach_count: usize,
     /// The runner's read-only view of the supervisor-owned proxy: binding
     /// metadata for status, port references and the ports manifest, plus the
     /// policy and backend-env shadows the runner refreshes itself.
@@ -140,9 +132,7 @@ impl RuntimeService {
             pgid: None,
             output_worker: None,
             osc_sink: None,
-            pty_input: None,
             scheduled_start: false,
-            attach_count: 0,
             proxy_view: None,
             resolved_watch_paths: Vec::new(),
             bazel_binary_path: None,
@@ -244,15 +234,6 @@ pub(crate) struct RuntimeTask {
     /// wires the run (state becomes `Running`). Without this, a scheduler
     /// sweep landing in that window re-requests the task and double-spawns.
     pub run_requested: bool,
-    /// OSC query sink for reclaiming PTY write on attach.
-    /// Sender into the live spawn's PTY input gate; `None` when there is no
-    /// PTY (docker, pipe mode) or no live process. Cleared wherever
-    /// `osc_sink` is.
-    pub pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
-    /// Number of clients currently attached. Attach is multi-client
-    /// (tmux-style shared input); the count drives the stdout-sink pause
-    /// (paused while any client is attached) and the lifecycle events.
-    pub attach_count: usize,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
     /// Monotonic token for `don run --wait` waiters, bumped per waiter
@@ -288,8 +269,6 @@ impl RuntimeTask {
             config,
             last_params: HashMap::new(),
             pgid: None,
-            pty_input: None,
-            attach_count: 0,
             resolved_watch_paths: Vec::new(),
             waiter_token: 0,
             run_requested: false,

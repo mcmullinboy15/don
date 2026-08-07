@@ -9,6 +9,7 @@
 //! ring buffer and fans out to the service's current sinks. The ring buffer persists
 //! across restarts, and [`ServiceWriter`] is cloneable for reuse.
 
+pub mod attach;
 pub(crate) mod emulator;
 pub(crate) mod osc;
 pub(crate) mod ring_buffer;
@@ -376,6 +377,13 @@ struct ServiceOutputState {
     /// Used to ensure `resume_stdout_sink` only restores it if it was
     /// actually present before the pause.
     stdout_paused: bool,
+    /// The live spawn's PTY input-gate sender, registered by the supervisor
+    /// at wire time and cleared at reap. `None` = nothing attachable
+    /// (stopped, docker, or pipe mode). See [`attach`].
+    attach_pty: Option<mpsc::Sender<PtyInput>>,
+    /// Attached clients, counted by [`attach::AttachControl`]; drives the
+    /// stdout-sink pause. Reset by the supervisor's reap clear.
+    attach_clients: usize,
 }
 
 impl ServiceOutputState {
@@ -755,6 +763,10 @@ pub struct OutputManager {
     /// always set once at construction; `register_service` republishes for
     /// the rare late registration (the build-tool prefix).
     services_watch: watch::Sender<Arc<HashMap<String, Arc<Mutex<ServiceOutputState>>>>>,
+    /// The sink senders [`attach::AttachControl`] borrows, published so
+    /// [`Self::shutdown`] can take them back before flushing — see
+    /// `AttachSinks`.
+    attach_sinks: watch::Sender<Option<attach::AttachSinks>>,
     /// The formatted `[don]` prefix, padded to align with service prefixes.
     don_prefix: String,
     /// Stdout sink sender — used for lifecycle events and service output.
@@ -1000,6 +1012,8 @@ impl OutputManager {
                     filter_pending: BytesMut::new(),
                     sinks,
                     stdout_paused: false,
+                    attach_pty: None,
+                    attach_clients: 0,
                 })),
             );
         }
@@ -1013,9 +1027,18 @@ impl OutputManager {
         );
 
         let (services_watch, _) = watch::channel(Arc::new(service_map.clone()));
+        let (attach_sinks, _) = watch::channel(Some(attach::AttachSinks {
+            stdout_sink: stdout_sink.clone(),
+            emitter: LifecycleEmitter {
+                don_prefix: don_prefix.clone(),
+                stdout_sink: stdout_sink.clone(),
+                bazel_prefix: None,
+            },
+        }));
         Ok(Self {
             services: service_map,
             services_watch,
+            attach_sinks,
             don_prefix,
             stdout_sink,
             writer_handles,
@@ -1124,38 +1147,6 @@ impl OutputManager {
         Some(follow_sink_from(state_arc, last_n, live_capacity).await)
     }
 
-    /// Add an attach sink preloaded with a screen repaint frame instead of a
-    /// ring-buffer snapshot. The bridge writes the frame verbatim, so the
-    /// client's terminal shows the process's current grid before live bytes
-    /// resume — no raw-byte replay.
-    pub(crate) async fn add_attach_sink(
-        &self,
-        name: &str,
-        repaint: emulator::RepaintFrame,
-        live_capacity: usize,
-    ) -> Option<mpsc::Receiver<SinkLine>> {
-        let state_arc = self.services.get(name)?.clone();
-        let capacity = live_capacity.max(2);
-        let (tx, rx) = mpsc::channel::<SinkLine>(capacity);
-        let mut state = state_arc.lock().await;
-        let sink_line = SinkLine {
-            prefix: Bytes::new(),
-            line: Bytes::from(repaint.bytes),
-            name: state.name.clone(),
-            is_lifecycle: false,
-            is_verbose: false,
-        };
-        // Channel is empty and capacity >= 2, so this cannot fail.
-        let _ = tx.try_send(sink_line);
-        state.sinks.push(SinkHandle::BoundedDrop(tx));
-        Some(rx)
-    }
-
-    /// Render an process's current screen; `None` when it has no screen.
-    pub(crate) async fn emulator_repaint(&self, name: &str) -> Option<emulator::RepaintFrame> {
-        self.emulator.repaint(name).await
-    }
-
     /// A handle to the emulator thread, for the server's resize path.
     pub(crate) fn emulator_handle(&self) -> emulator::EmulatorHandle {
         self.emulator.clone()
@@ -1244,9 +1235,21 @@ impl OutputManager {
                 filter_pending: BytesMut::new(),
                 sinks,
                 stdout_paused: false,
+                attach_pty: None,
+                attach_clients: 0,
             })),
         );
         let _ = self.services_watch.send(Arc::new(self.services.clone()));
+    }
+
+    /// Mint the attach handle for the API server. Call once — each call
+    /// spawns its own detach worker.
+    pub fn attach_control(&self) -> attach::AttachControl {
+        attach::AttachControl::spawn(
+            self.services_watch.subscribe(),
+            self.attach_sinks.subscribe(),
+            self.emulator.clone(),
+        )
     }
 
     /// Get a cloneable read-only handle to every process's buffered output.
@@ -1272,6 +1275,7 @@ impl OutputManager {
             state: Arc::clone(self.services.get(name)?),
             events: self.clone_lifecycle_emitter(),
             emulator: self.emulator.clone(),
+            stdout_sink: self.stdout_sink.clone(),
         })
     }
 
@@ -1419,6 +1423,11 @@ impl OutputManager {
     /// of the very last log line under load, which is preferable to the
     /// daemon silently refusing to exit.
     pub async fn shutdown(self) {
+        // Take the attach sinks back first. `AttachControl` lives in the API
+        // server's state, which outlives this flush; a sender clone held
+        // there would keep the writer channels open and cost the full 2s
+        // straggler wait below on every shutdown.
+        let _ = self.attach_sinks.send(None);
         for state_arc in self.services.values() {
             let mut state = state_arc.lock().await;
             state.sinks.clear();
@@ -1462,6 +1471,8 @@ pub struct ProcessOutput {
     state: Arc<Mutex<ServiceOutputState>>,
     events: LifecycleEmitter,
     emulator: emulator::EmulatorHandle,
+    /// For restoring the prefixed stdout sink in [`Self::clear_attach`].
+    stdout_sink: SinkHandle,
 }
 
 impl ProcessOutput {
@@ -1499,6 +1510,33 @@ impl ProcessOutput {
 
     /// (Re)register this process's server-side screen and route its output
     /// bytes into the emulator. See [`OutputManager::register_emulator`].
+    /// Register the live spawn's PTY input-gate sender for attach. Call at
+    /// wire time for PTY spawns; cleared by [`Self::clear_attach`] at reap.
+    pub async fn set_attach_pty(&self, pty_input: mpsc::Sender<PtyInput>) {
+        let mut state = self.state.lock().await;
+        state.attach_pty = Some(pty_input);
+    }
+
+    /// The spawn is gone: drop the attach registration, reset the client
+    /// count and resume prefixed stdout if any client had it paused. The
+    /// bridges themselves end on their own when the output sinks close;
+    /// their late detach notifications no-op against a zero count.
+    pub async fn clear_attach(&self) {
+        let mut state = self.state.lock().await;
+        state.attach_pty = None;
+        state.attach_clients = 0;
+        if state.stdout_paused {
+            state.stdout_paused = false;
+            let already_present = state
+                .sinks
+                .iter()
+                .any(|s| s.same_channel(&self.stdout_sink));
+            if !already_present {
+                state.sinks.push(self.stdout_sink.clone());
+            }
+        }
+    }
+
     pub async fn register_emulator(&self, cols: u16, rows: u16) {
         self.emulator.register(&self.name, cols, rows);
         let feed = SinkHandle::Emulator(self.emulator.feed_sender());

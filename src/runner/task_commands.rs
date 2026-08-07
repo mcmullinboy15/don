@@ -104,7 +104,6 @@ impl Runner {
                 // status read, and makes the runner-only state transition.
                 if let Some(rt) = self.tasks.get_mut(name) {
                     rt.pgid = Some(wired.pgid);
-                    rt.pty_input = wired.pty_input;
                 }
                 self.begin_task_run(name, intent, Some("running..."));
             }
@@ -190,9 +189,6 @@ impl Runner {
     }
 
     async fn stop_task_pgid(&mut self, name: &str, pgid: i32) -> CommandResult {
-        if self.reset_attach_state(name) {
-            self.output_manager.resume_stdout_sink(name).await;
-        }
         if let Some(writer) = self.output_manager.service_writer(name) {
             writer.close_follow_sinks().await;
         }
@@ -388,11 +384,8 @@ impl Runner {
             rt.last_params = params.clone();
             rt.set_needs_run_now(true);
         }
-        // Release attach lock and close follow sinks so any active attach
-        // session exits cleanly before the new process starts.
-        if self.reset_attach_state(name) {
-            self.output_manager.resume_stdout_sink(name).await;
-        }
+        // Close follow sinks so any active follower exits cleanly before
+        // the new process starts. (Attach cleanup is the supervisor's now.)
         if let Some(writer) = self.output_manager.service_writer(name) {
             writer.close_follow_sinks().await;
         }

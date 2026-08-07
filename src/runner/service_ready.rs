@@ -21,7 +21,6 @@ impl Runner {
             pgid: spawned_pgid,
             docker_port_bindings,
             osc_sink,
-            pty_input,
             proxy_backend_env,
         } = wired;
         for binding in docker_port_bindings
@@ -54,7 +53,6 @@ impl Runner {
             rs.docker_port_bindings = docker_port_bindings;
             rs.handle_identity = Some(identity);
             rs.osc_sink = osc_sink;
-            rs.pty_input = pty_input;
             rs.scheduled_start = scheduled;
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop

@@ -36,8 +36,6 @@ pub(crate) type TaskSupervisors = super::registry::Supervisors<RunRequest>;
 /// bookkeeping (shadows for attach/status, spawn lines) needs.
 pub(crate) struct TaskWired {
     pub(crate) pgid: i32,
-    /// Sender into this run's PTY input gate; `None` for pipe-mode spawns.
-    pub(crate) pty_input: Option<mpsc::Sender<crate::output::PtyInput>>,
     pub(crate) rendered_cmdline: String,
 }
 
@@ -171,6 +169,9 @@ async fn supervise(
                         // The scanner handle's drop removes its sink; tying it
                         // to this run's scope is exactly the lifetime we want.
                         let osc = output.add_osc_sink(pty_input.clone()).await;
+                        // Attach goes through the output state, not the
+                        // runner: register this run's gate for clients.
+                        output.set_attach_pty(pty_input.clone()).await;
                         Some((pty_input, osc))
                     }
                     _ => None,
@@ -181,14 +182,10 @@ async fn supervise(
                         let _ = writer.process_stream(child_output).await;
                     })
                 });
-                let (pty_input_tx, osc) = match pty_input {
-                    Some((tx, osc)) => (Some(tx), Some(osc)),
-                    None => (None, None),
-                };
+                let osc = pty_input.map(|(_, osc)| osc);
                 (
                     Ok(TaskRunReport::Running(TaskWired {
                         pgid,
-                        pty_input: pty_input_tx,
                         rendered_cmdline,
                     })),
                     Some((handle, reader, osc)),
@@ -249,6 +246,11 @@ async fn supervise(
             await_reader(reader).await;
         }
         drop(osc);
+        // The run is over: unregister attach so new clients are refused and
+        // muted stdout resumes before the completion message lands.
+        if let Some(output) = output.as_ref() {
+            output.clear_attach().await;
+        }
         outcome.finish(result, start.elapsed()).await;
     }
 }

@@ -5,7 +5,6 @@
 //! It owns all service/task state in a plain `HashMap` — no `Arc<Mutex<>>`.
 //! Communication uses channels: `mpsc` for commands in, `broadcast` for events out.
 
-mod attach;
 mod events;
 mod graph;
 mod lazy;
@@ -187,16 +186,6 @@ pub enum RunnerCommand {
         name: Option<String>,
         reply: oneshot::Sender<Vec<ProcessStatus>>,
     },
-    /// Request an interactive attach session for a service.
-    /// Returns the PTY write handle and a live output receiver, or an error.
-    Attach {
-        name: String,
-        pid: u32,
-        reply: oneshot::Sender<Result<AttachSession, CommandError>>,
-    },
-    /// Release an attach session — clear the lock and resume prefixed
-    /// output. The bridge's gate sender is already dropped by then.
-    Detach { name: String },
     /// Run all tasks currently in PendingRun state.
     RunPendingTasks {
         reply: oneshot::Sender<CommandResult>,
@@ -240,15 +229,6 @@ enum RunnerInternalCommand {
     },
     /// Result of the periodic crates.io update check.
     UpdateCheckComplete(Option<crate::update::UpdateAvailable>),
-}
-
-/// An active attach session returned to the WebSocket handler.
-pub struct AttachSession {
-    /// Sender into the spawn's PTY input gate — input frames and resizes
-    /// interleave atomically with every other writer.
-    pub pty_input: mpsc::Sender<crate::output::PtyInput>,
-    /// Live output receiver (preloaded with a screen repaint).
-    pub output_rx: mpsc::Receiver<crate::output::SinkLine>,
 }
 
 /// An event broadcast from the runner for external consumers.
@@ -916,6 +896,12 @@ impl Runner {
         self.watch_status_reader.clone()
     }
 
+    /// Mint the attach handle for the API server; see
+    /// [`crate::output::attach::AttachControl`].
+    pub fn attach_control(&self) -> crate::output::attach::AttachControl {
+        self.output_manager.attach_control()
+    }
+
     /// Handle to the server-side terminal-emulator thread, for the API
     /// server's attach-resize path.
     pub(crate) fn emulator_handle(&self) -> crate::output::emulator::EmulatorHandle {
@@ -1280,12 +1266,6 @@ impl Runner {
                             }
                             RunnerCommand::HardRestart { name, reply } => {
                                 self.handle_hard_restart_service_cmd(&name, reply).await;
-                            }
-                            RunnerCommand::Attach { name, pid, reply } => {
-                                self.handle_attach_cmd(&name, pid, reply).await;
-                            }
-                            RunnerCommand::Detach { name } => {
-                                self.handle_detach(&name).await;
                             }
                             RunnerCommand::Rebuild { name } => {
                                 self.handle_rebuild(&name).await;
@@ -2787,7 +2767,6 @@ mod tests {
         assert_eq!(rs.state(), ServiceState::Pending);
         assert!(rs.handle_identity.is_none());
         assert!(rs.osc_sink.is_none());
-        assert_eq!(rs.attach_count, 0);
         assert!(rs.proxy_view.is_none());
         assert!(rs.resolved_watch_paths.is_empty());
         assert!(rs.bazel_binary_path.is_none());
@@ -2864,7 +2843,6 @@ mod tests {
 
         assert_eq!(rt.state(), TaskState::Pending);
         assert!(rt.pgid.is_none());
-        assert_eq!(rt.attach_count, 0);
         assert!(rt.resolved_watch_paths.is_empty());
         assert_eq!(rt.config.cmd, "echo");
 

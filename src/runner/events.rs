@@ -19,8 +19,6 @@ impl Runner {
 
         if let Some(rt) = self.tasks.get_mut(name) {
             rt.pgid = None;
-            rt.attach_count = 0;
-            rt.pty_input = None;
         }
 
         let timing = elapsed.map(format_duration).unwrap_or_default();

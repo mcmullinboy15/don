@@ -5,14 +5,13 @@
 //! framing overhead. Resize events arrive via a separate POST endpoint.
 
 use super::{ApiState, NameSessions};
-use crate::runner::RunnerCommand;
 use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// Query parameters for the attach upgrade request.
 #[derive(Deserialize)]
@@ -86,27 +85,11 @@ pub(crate) async fn attach_handler(
             .into_response();
     }
 
-    // Request attach session from runner.
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(RunnerCommand::Attach {
-            name: name.clone(),
-            pid: params.pid,
-            reply: tx,
-        })
-        .is_err()
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({"error": "runner is shutting down"})),
-        )
-            .into_response();
-    }
-
-    let session = match rx.await {
-        Ok(Ok(session)) => session,
-        Ok(Err(e)) => {
+    // Attach straight through the process's output state — the supervisor
+    // registered the live spawn's gate there; no runner round trip.
+    let session = match state.attach.attach(&name, params.pid).await {
+        Ok(session) => session,
+        Err(e) => {
             let status = match e {
                 crate::runner::CommandError::UnknownService { .. } => StatusCode::NOT_FOUND,
                 crate::runner::CommandError::InvalidState { .. } => StatusCode::CONFLICT,
@@ -118,17 +101,13 @@ pub(crate) async fn attach_handler(
             )
                 .into_response();
         }
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(serde_json::json!({"error": "runner is shutting down"})),
-            )
-                .into_response();
-        }
     };
 
     let pty_input = session.pty_input;
     let output_rx = session.output_rx;
+    // Detach-on-drop: however the bridge task ends, releasing this guard is
+    // what decrements the client count and resumes prefixed stdout.
+    let attach_guard = session.guard;
 
     // Register this session and apply the new effective size — the smallest
     // attached client wins each dimension.
@@ -152,13 +131,11 @@ pub(crate) async fn attach_handler(
     let state_clone = state.clone();
     let name_clone = name.clone();
     tokio::spawn(async move {
+        let _attach_guard = attach_guard;
         let upgraded = match hyper::upgrade::on(request).await {
             Ok(upgraded) => upgraded,
             Err(_) => {
                 end_session(&state_clone, &name_clone, session_id).await;
-                let _ = state_clone
-                    .cmd_tx
-                    .send(RunnerCommand::Detach { name: name_clone });
                 return;
             }
         };
@@ -167,9 +144,6 @@ pub(crate) async fn attach_handler(
         bridge_raw(io, pty_input, output_rx).await;
 
         end_session(&state_clone, &name_clone, session_id).await;
-        let _ = state_clone
-            .cmd_tx
-            .send(RunnerCommand::Detach { name: name_clone });
     });
 
     // Return 101 Switching Protocols, with the session id the client echoes

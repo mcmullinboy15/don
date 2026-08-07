@@ -379,12 +379,8 @@ impl Runner {
                 Self::await_output_worker(worker).await;
             }
             rs.handle_identity = None;
-            rs.attach_count = 0;
             rs.control_reply = None;
             rs.stop_action = ServiceStopAction::None;
-        }
-        for rt in self.tasks.values_mut() {
-            rt.attach_count = 0;
         }
     }
 

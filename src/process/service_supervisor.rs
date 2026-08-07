@@ -97,10 +97,6 @@ pub(crate) struct ServiceWired {
     /// OSC response scanner handle — dropped on restart/stop to end the
     /// scanner and release its gate sender.
     pub(crate) osc_sink: Option<crate::output::OscSinkHandle>,
-    /// Sender into this spawn's PTY input gate. `None` for docker and
-    /// pipe-mode spawns. Attach bridges clone it; the runner's copy is
-    /// cleared on exit so the gate (and the PTY write half) can end.
-    pub(crate) pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
     /// The proxy's env-mode backend vars this spawn was launched with —
     /// `Some` iff the service has a proxy. The runner refreshes its
     /// `ProxyView` shadow from this, so ready checks written against
@@ -270,6 +266,11 @@ async fn supervise(
                         if let Some(handle) = reader.take() {
                             await_reader(handle).await;
                         }
+                        // The spawn is dead: unregister attach so new clients
+                        // are refused and muted stdout resumes.
+                        if let Some(output) = output.as_ref() {
+                            output.clear_attach().await;
+                        }
                         reap_and_report(&name, &mut held, &report_tx).await;
                         continue;
                     }
@@ -352,9 +353,16 @@ async fn supervise(
                     // reaped. Stopping something stopped succeeds.
                     None => Ok(()),
                 };
-                // The process is gone; its reader sees EOF and drains. Wait
-                // for that before notifying, so "stopped" never outruns the
-                // service's final output.
+                // The process is gone. Unregister attach FIRST: the
+                // registration holds a PTY-gate sender, and the gate holds
+                // the master's write half — the reader cannot see EOF until
+                // every sender is dropped, so waiting on it first deadlocks
+                // against this until the 2s bound.
+                if let Some(output) = output.as_ref() {
+                    output.clear_attach().await;
+                }
+                // Its reader now sees EOF and drains. Wait for that before
+                // notifying, so "stopped" never outruns the final output.
                 if let Some(handle) = reader.take() {
                     await_reader(handle).await;
                 }
@@ -622,19 +630,24 @@ async fn wire_spawn(
         service::ServiceHandle::Process(process) => process.take_pty_write(),
         service::ServiceHandle::Docker(_) => None,
     };
-    let (osc_sink, pty_input) = match (pty, output) {
+    let osc_sink = match (pty, output) {
         (Some(pty), Some(output)) => {
             // Feed the server-side screen from process start — a correct
             // repaint on attach requires having seen the setup sequences.
             // Matches the PTY's initial 80x24 size.
             output.register_emulator(80, 24).await;
-            // The gate owns the write half for this spawn's lifetime;
-            // the scanner and any attach bridges hold senders into it.
+            // The gate owns the write half for this spawn's lifetime; the
+            // scanner, the attach registration and any bridges hold senders
+            // into it — the last one dropping (scanner + registration both
+            // clear at reap) is what ends the gate.
             let pty_input = crate::output::spawn_pty_gate(pty);
             let osc_sink = output.add_osc_sink(pty_input.clone()).await;
-            (Some(osc_sink), Some(pty_input))
+            // Attach goes through the output state, not the runner: register
+            // this spawn's gate so any client can attach from here on.
+            output.set_attach_pty(pty_input).await;
+            Some(osc_sink)
         }
-        _ => (None, None),
+        _ => None,
     };
 
     // Fan the reader's end out twice: once to the ready check (races its
@@ -669,7 +682,6 @@ async fn wire_spawn(
             pgid,
             docker_port_bindings,
             osc_sink,
-            pty_input,
             proxy_backend_env: proxy.map(|p| p.env_vars()),
         },
         exit_rx,

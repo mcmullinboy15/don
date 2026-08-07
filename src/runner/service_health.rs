@@ -180,7 +180,6 @@ impl Runner {
                 rs.pgid = None;
                 rs.handle_identity = None;
                 rs.osc_sink = None;
-                rs.pty_input = None;
                 rs.stop_health_tracking();
             }
             self.sync_proxy_policy(name);
@@ -339,7 +338,6 @@ impl Runner {
             // read half on EOF once the process is gone.
             rs.handle_identity = None;
             rs.osc_sink = None;
-            rs.pty_input = None;
         }
         // Dropping the handle used to kill the lingering process
         // (kill_on_drop); the supervisor owns it now, so ask it to. A
@@ -423,9 +421,6 @@ impl Runner {
             return;
         }
         let shutdown_config = self.effective_shutdown_config(name);
-        if self.reset_attach_state(name) {
-            self.output_manager.resume_stdout_sink(name).await;
-        }
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .service_event(name, "stopping... (auto-restart)");

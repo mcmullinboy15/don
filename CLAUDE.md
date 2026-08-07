@@ -246,6 +246,7 @@ src/
     mod.rs                  # file watching, debounce, change-during-build state machine, config reload
   output/
     mod.rs                  # line buffering, service name prefixing, color assignment, sink management
+    attach.rs               # attach sessions over the live spawn's PTY gate; detach = guard drop
     ring_buffer.rs          # bounded per-service output buffer
     sanitize.rs             # ANSI escape sequence filtering (strip cursor/screen, keep colors)
   client/

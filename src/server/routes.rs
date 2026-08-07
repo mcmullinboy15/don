@@ -737,6 +737,7 @@ mod tests {
         let logs = crate::output::LogReader::for_tests();
         let completions = crate::param_completions::CompletionResolver::for_tests();
         let watch_status = crate::watch::report::WatchStatusReader::for_tests();
+        let attach = crate::output::attach::AttachControl::for_tests();
         let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         // Leak the sender so the receiver stays live for the router's
         // lifetime — tests never signal shutdown.
@@ -751,6 +752,7 @@ mod tests {
             logs,
             completions,
             watch_status,
+            attach,
             shutdown,
         }))
     }
