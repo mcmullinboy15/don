@@ -2112,14 +2112,14 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
 
     // Acquire the PID file lock so we don't race with a running daemon.
     let don_pid_path = don_dir.join("don.pid");
-    let pid_lock = match don::process::pid_file::PidFile::acquire(
+    let pid_lock = match don::sys::pid_file::PidFile::acquire(
         don_pid_path.clone(),
         std::process::id() as i32,
     )
     .await
     {
         Ok(lock) => lock,
-        Err(don::process::pid_file::PidFileError::AlreadyLocked) => {
+        Err(don::sys::pid_file::PidFileError::AlreadyLocked) => {
             if !force {
                 println!("don daemon is running — nothing to clean up (use --force to kill it)");
                 return 0;
@@ -2131,7 +2131,7 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
                 return 1;
             }
             // Now re-acquire the lock.
-            match don::process::pid_file::PidFile::acquire(don_pid_path, std::process::id() as i32)
+            match don::sys::pid_file::PidFile::acquire(don_pid_path, std::process::id() as i32)
                 .await
             {
                 Ok(lock) => lock,
@@ -2181,7 +2181,7 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
         }
     };
 
-    let report = don::process::cleanup::run_cleanup(&base, &docker_names).await;
+    let report = don::sys::cleanup::run_cleanup(&base, &docker_names).await;
     println!("{report}");
     for warning in &report.warnings {
         errln(format!("Warning: {warning}"));

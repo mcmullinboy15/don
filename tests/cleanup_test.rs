@@ -3,7 +3,7 @@
 
 mod helpers;
 
-use don::process::cleanup::run_cleanup;
+use don::sys::cleanup::run_cleanup;
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -56,7 +56,7 @@ fn cleanup_kills_orphaned_process() {
         let pgid = child.id() as i32;
 
         // Read start_time and write the pid file in the new format.
-        let ident = don::process::identity::capture(pgid).unwrap().unwrap();
+        let ident = don::sys::identity::capture(pgid).unwrap().unwrap();
         write_pid_file(&pid_dir.join("test-svc"), ident.pgid, ident.start_time);
 
         // Run cleanup ��� it should find the orphan, kill it, and remove the file.

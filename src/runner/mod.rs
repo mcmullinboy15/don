@@ -48,7 +48,7 @@ pub use state_store::{StateReader, StateSnapshot};
 
 use crate::config::{Config, Platform, ShutdownConfig};
 use crate::output::OutputManager;
-use crate::process::pid_file::PidFile;
+use crate::sys::pid_file::PidFile;
 use crate::proxy::ConnectionPolicy;
 use crate::watch::WatchManager;
 use std::collections::HashMap;
@@ -566,11 +566,11 @@ pub enum RunnerError {
     #[error("another don instance is already running (could not acquire {path})")]
     AlreadyRunning { path: String },
     #[error("process error: {0}")]
-    Process(#[from] crate::process::ProcessError),
+    Process(#[from] crate::sys::ProcessError),
     #[error("output error: {0}")]
     Output(#[from] crate::output::OutputError),
     #[error("pid file error: {0}")]
-    PidFile(#[from] crate::process::pid_file::PidFileError),
+    PidFile(#[from] crate::sys::pid_file::PidFileError),
     #[error("config error: {0}")]
     Config(String),
     #[error("io error: {0}")]
@@ -727,8 +727,8 @@ impl Runner {
         let (report_tx, report_rx) = mpsc::unbounded_channel();
         let (shutdown_flag_tx, _shutdown_flag_rx) = tokio::sync::watch::channel(false);
 
-        for outcome in crate::process::rlimit::raise_soft_resource_limits() {
-            if let Some(message) = crate::process::rlimit::format_outcome(&outcome) {
+        for outcome in crate::sys::rlimit::raise_soft_resource_limits() {
+            if let Some(message) = crate::sys::rlimit::format_outcome(&outcome) {
                 output_manager.service_debug_event("don", &message);
             }
         }

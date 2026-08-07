@@ -7,7 +7,7 @@
 //!
 //! `LISTEN_FDS` / `LISTEN_FDNAMES` are provided via the child's environment;
 //! `LISTEN_PID` is set by the `sh`-wrapper emitted by
-//! [`crate::process::listen_pid_shim`] (setenv from `pre_exec` doesn't
+//! [`crate::sys::listen_pid_shim`] (setenv from `pre_exec` doesn't
 //! survive `execve` with an explicit envp).
 
 use std::os::unix::io::RawFd;

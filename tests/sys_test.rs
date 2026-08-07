@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
 
-use don::process::{ChildOutput, SpawnConfig, cleanup_pgid_file, read_pgid_file, spawn_process};
+use don::sys::{ChildOutput, SpawnConfig, cleanup_pgid_file, read_pgid_file, spawn_process};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use nix::sys::signal::Signal;
@@ -196,7 +196,7 @@ process_test!(pgid_file_read_and_cleanup, {
 });
 
 process_test!(pid_file_identity_old_format, {
-    use don::process::read_pid_file_identity;
+    use don::sys::read_pid_file_identity;
 
     let dir = TempDir::new("pid-identity-old");
     let path = dir.path().join("test.pid");
@@ -209,7 +209,7 @@ process_test!(pid_file_identity_old_format, {
 });
 
 process_test!(pid_file_identity_new_format, {
-    use don::process::read_pid_file_identity;
+    use don::sys::read_pid_file_identity;
 
     let dir = TempDir::new("pid-identity-new");
     let path = dir.path().join("test.pid");
@@ -222,7 +222,7 @@ process_test!(pid_file_identity_new_format, {
 });
 
 process_test!(pid_file_identity_nonexistent, {
-    use don::process::read_pid_file_identity;
+    use don::sys::read_pid_file_identity;
 
     let dir = TempDir::new("pid-identity-missing");
     let path = dir.path().join("nope.pid");

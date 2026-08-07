@@ -297,7 +297,7 @@ pub fn expand_env_vars(input: &str, env: &HashMap<String, String>) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::process::test_util::TempDir;
+    use crate::sys::test_util::TempDir;
     use std::fs;
 
     #[test]

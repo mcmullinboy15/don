@@ -217,7 +217,7 @@ pub(crate) async fn resolve(req: ResolveRequest<'_>) -> Result<Vec<String>, Comp
 
     let mut env: HashMap<String, String> = std::env::vars().collect();
     env.extend(task_env.clone());
-    crate::process::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
+    crate::sys::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
     for (k, v) in partial {
         env.insert(format!("DON_PARAM_{}", k.to_ascii_uppercase()), v.clone());
     }

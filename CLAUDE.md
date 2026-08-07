@@ -232,7 +232,7 @@ src/
   runner/
     mod.rs                  # scheduler — dependency graph, startup/shutdown order, folds ItemReports
     state_store.rs          # runner-written / world-readable state projection
-  process/
+  sys/
     mod.rs                  # process group management, PTY spawning, identity tracking
     pid_file.rs             # PID file locking (flock-based) for single-instance guard
     identity.rs             # (pgid, start_time) capture for crash-recovery identity checks

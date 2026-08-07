@@ -64,7 +64,7 @@ async fn run_preset_build_worker(
     let mut env: HashMap<String, String> = std::env::vars().collect();
     env.extend(resolved.env.clone());
 
-    match crate::process::spawn_process(crate::process::SpawnConfig {
+    match crate::sys::spawn_process(crate::sys::SpawnConfig {
         cmd,
         args,
         dir: Some(work_dir),

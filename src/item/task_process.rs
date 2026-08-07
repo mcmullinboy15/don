@@ -9,7 +9,7 @@ use tokio::time;
 use crate::config::template::{self, TemplateError};
 use crate::config::{Platform, Task};
 use crate::duration::parse_duration;
-use crate::process::{ChildOutput, SpawnConfig, spawn_process};
+use crate::sys::{ChildOutput, SpawnConfig, spawn_process};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -19,7 +19,7 @@ use std::time::Duration;
 #[derive(Debug, thiserror::Error)]
 pub enum TaskError {
     #[error("process error: {0}")]
-    Process(#[from] crate::process::ProcessError),
+    Process(#[from] crate::sys::ProcessError),
     #[error("timed out after {timeout}")]
     Timeout { timeout: String },
     #[error("invalid duration: {0}")]
@@ -35,7 +35,7 @@ pub enum TaskError {
 /// Result of spawning a task process: the handle for waiting and the
 /// child's output stream for processing.
 pub(crate) struct TaskSpawn {
-    pub handle: crate::process::ProcessHandle,
+    pub handle: crate::sys::ProcessHandle,
     pub child_output: ChildOutput,
     pub rendered_cmdline: String,
 }
@@ -115,7 +115,7 @@ fn prepare_task_command(
         env.insert(k.clone(), render(&format!("env['{k}']"), v)?);
     }
     // Expose downloaded binaries on PATH.
-    crate::process::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
+    crate::sys::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
     // Expose each param to the child as DON_PARAM_<NAME> so tasks can read
     // their own inputs without re-parsing placeholders. Intentionally
     // separate from the `{{name}}` substitution so the task author can
@@ -129,7 +129,7 @@ fn prepare_task_command(
     let resolved_cmd = task
         .resolved_cmd(platform, task_name, Some(&cache_base))
         .map_err(|msg| {
-            TaskError::Process(crate::process::ProcessError::Spawn {
+            TaskError::Process(crate::sys::ProcessError::Spawn {
                 cmd: task.cmd.clone(),
                 source: std::io::Error::new(std::io::ErrorKind::InvalidInput, msg),
             })
@@ -164,7 +164,7 @@ fn prepare_task_command(
 ///
 /// On timeout, the process group is killed and `TaskError::Timeout` is returned.
 pub(crate) async fn wait_for_task(
-    handle: &mut crate::process::ProcessHandle,
+    handle: &mut crate::sys::ProcessHandle,
     timeout_str: Option<&str>,
 ) -> Result<ExitStatus, TaskError> {
     if let Some(timeout_str) = timeout_str {

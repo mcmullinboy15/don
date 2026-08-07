@@ -147,7 +147,7 @@ impl PidFile {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::process::test_util::TempDir;
+    use crate::sys::test_util::TempDir;
 
     #[tokio::test]
     async fn test_acquire_and_read_pid() {

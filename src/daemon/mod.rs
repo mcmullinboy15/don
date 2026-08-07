@@ -24,7 +24,7 @@ pub use client::DaemonClient;
 pub use paths::{DaemonEnv, DaemonPaths, PathError};
 pub use registry::{ProjectEntry, ProjectRegistry};
 
-use crate::process::pid_file::{PidFile, PidFileError};
+use crate::sys::pid_file::{PidFile, PidFileError};
 use routes::{ControlState, DaemonCommand};
 use std::net::SocketAddr;
 use std::sync::Arc;

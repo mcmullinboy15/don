@@ -3,7 +3,7 @@ mod helpers;
 
 use don::config::{LogConfig, LogFilterConfig};
 use don::output::OutputManager;
-use don::process::{SpawnConfig, spawn_process};
+use don::sys::{SpawnConfig, spawn_process};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::collections::HashMap;

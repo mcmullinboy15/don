@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::config::service::DockerConfig;
-use crate::process::ChildOutput;
+use crate::sys::ChildOutput;
 use stream::DockerLogReader;
 
 /// Errors from Docker operations.
@@ -155,7 +155,7 @@ pub(crate) fn env_reference_values(bindings: &[DockerPortBinding]) -> HashMap<St
 
 /// Handle to a running Docker container.
 ///
-/// Provides stop/remove operations analogous to [`crate::process::ProcessHandle`].
+/// Provides stop/remove operations analogous to [`crate::sys::ProcessHandle`].
 /// The container is identified by ID and name.
 pub struct DockerHandle {
     client: Docker,

@@ -7,8 +7,8 @@ use crate::config::service::{GoConfig, RustConfig, ServiceKind};
 use crate::config::{Platform, ReadyCheck, ResolvedService, ShutdownConfig};
 use crate::duration::parse_duration;
 use crate::output::LifecycleEmitter;
-use crate::process::env::merge_env;
-use crate::process::{ProcessHandle, SpawnConfig, signal_name, spawn_process};
+use crate::sys::env::merge_env;
+use crate::sys::{ProcessHandle, SpawnConfig, signal_name, spawn_process};
 use nix::sys::signal::Signal;
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -28,7 +28,7 @@ pub enum ServiceHandle {
 /// and the child's output stream for processing.
 pub(crate) struct StartResult {
     pub handle: ServiceHandle,
-    pub child_output: crate::process::ChildOutput,
+    pub child_output: crate::sys::ChildOutput,
 }
 
 #[derive(Clone)]
@@ -64,9 +64,9 @@ impl StopDebug {
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error("process error: {0}")]
-    Process(#[from] crate::process::ProcessError),
+    Process(#[from] crate::sys::ProcessError),
     #[error("env error: {0}")]
-    Env(#[from] crate::process::env::EnvError),
+    Env(#[from] crate::sys::env::EnvError),
     #[error("ready check failed after {retries} retries")]
     ReadyCheckExhausted { retries: u32 },
     #[error("process exited during ready check")]
@@ -175,7 +175,7 @@ pub(crate) async fn start_service(
             }
         }
         _ => {
-            return Err(crate::process::ProcessError::Spawn {
+            return Err(crate::sys::ProcessError::Spawn {
                 cmd: name.to_string(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -193,7 +193,7 @@ pub(crate) async fn start_service(
         listen_fds_env,
     )?;
     // Expose downloaded binaries on PATH so other services/tasks can call them.
-    crate::process::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
+    crate::sys::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
 
     // Bazel launcher scripts (`rules_*`-generated wrappers) commonly read
     // `BUILD_WORKSPACE_DIRECTORY` under `set -u`. When don launches the built
@@ -213,14 +213,14 @@ pub(crate) async fn start_service(
 
     // Expand ${VAR} references in the command and args against the env map.
     // This lets proxy-injected vars like PORT be used in run args.
-    let cmd = crate::process::env::expand_env_vars(&cmd, &env);
+    let cmd = crate::sys::env::expand_env_vars(&cmd, &env);
     let args: Vec<String> = args
         .iter()
-        .map(|a| crate::process::env::expand_env_vars(a, &env))
+        .map(|a| crate::sys::env::expand_env_vars(a, &env))
         .collect();
 
     // Build PGID file path.
-    std::fs::create_dir_all(pid_dir).map_err(crate::process::ProcessError::Io)?;
+    std::fs::create_dir_all(pid_dir).map_err(crate::sys::ProcessError::Io)?;
     let pgid_file_path = pid_dir.join(name);
 
     if let Some(em) = emitter {
@@ -492,7 +492,7 @@ pub(crate) async fn stop_service_interruptibly(
             if let Err(e) = process.signal(signal)
                 && !matches!(
                     e,
-                    crate::process::ProcessError::Signal {
+                    crate::sys::ProcessError::Signal {
                         source: nix::Error::ESRCH,
                         ..
                     }
@@ -523,7 +523,7 @@ pub(crate) async fn stop_service_interruptibly(
                 if let Err(e) = process.signal(Signal::SIGKILL)
                     && !matches!(
                         e,
-                        crate::process::ProcessError::Signal {
+                        crate::sys::ProcessError::Signal {
                             source: nix::Error::ESRCH,
                             ..
                         }
@@ -533,7 +533,7 @@ pub(crate) async fn stop_service_interruptibly(
                 }
                 tokio::time::timeout(Duration::from_millis(500), process.wait())
                     .await
-                    .map_err(|_| crate::process::ProcessError::Unkillable {
+                    .map_err(|_| crate::sys::ProcessError::Unkillable {
                         pgid: process.pgid(),
                     })??;
             }

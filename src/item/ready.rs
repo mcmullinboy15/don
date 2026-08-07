@@ -29,11 +29,11 @@ pub(crate) fn resolve_ready_check(
     env.extend(public_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
     if let Some(tcp) = ready.tcp.take() {
-        let expanded = crate::process::env::expand_env_vars(&tcp, &env);
+        let expanded = crate::sys::env::expand_env_vars(&tcp, &env);
         ready.tcp = Some(rewrite_tcp_port(&expanded, replacements));
     }
     if let Some(http) = ready.http.take() {
-        let expanded = crate::process::env::expand_env_vars(&http, &env);
+        let expanded = crate::sys::env::expand_env_vars(&http, &env);
         ready.http = Some(rewrite_http_port(&expanded, replacements));
     }
     Some(ready)

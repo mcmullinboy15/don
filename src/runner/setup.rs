@@ -2,7 +2,7 @@ use super::profile::resolve_profile_items_for_platform;
 use super::{RunnerError, RuntimeService, RuntimeTask, ServiceState, TaskItemState};
 use crate::config::{Config, Platform, ServiceKind};
 use crate::output::OutputManager;
-use crate::process::pid_file::{PidFile, PidFileError};
+use crate::sys::pid_file::{PidFile, PidFileError};
 use crate::task_state::TaskState;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,7 +54,7 @@ pub(in crate::runner) async fn cleanup_stale_state(
             }
         })
         .collect();
-    let cleanup_report = crate::process::cleanup::run_cleanup(base_dir, &docker_names).await;
+    let cleanup_report = crate::sys::cleanup::run_cleanup(base_dir, &docker_names).await;
     if cleanup_report.pid_files_removed > 0
         || cleanup_report.sock_removed
         || cleanup_report.containers_removed > 0
