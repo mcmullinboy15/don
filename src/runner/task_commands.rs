@@ -277,9 +277,11 @@ impl Runner {
             // Feed the server-side screen from process start so an attach
             // gets a coherent repaint. Matches the PTY's initial 80x24.
             output.register_emulator(80, 24).await;
-            let osc_handle = output.add_osc_sink(pty).await;
+            let pty_input = crate::output::spawn_pty_gate(pty);
+            let osc_handle = output.add_osc_sink(pty_input.clone()).await;
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.osc_sink = Some(osc_handle);
+                rt.pty_input = Some(pty_input);
             }
         }
 

@@ -62,53 +62,63 @@ const SERVICE_COLORS: &[Color] = &[
 /// never collide with the rotating service palette.
 const BAZEL_COLOR: Color = Color::Grey;
 
-/// Handle to an active OSC response sink. Use [`take_pty_write`] to
-/// stop the sink and reclaim the PTY handle (e.g., for attach).
+/// One unit of input to a PTY-backed process, funneled through its gate.
+#[derive(Debug)]
+pub enum PtyInput {
+    /// Bytes to write. Frame-atomic: the gate performs one write per frame,
+    /// so interleaved writers (several attached clients, the OSC scanner)
+    /// cannot shear a paste mid-blob.
+    Frame(Vec<u8>),
+    /// Resize the PTY to `(cols, rows)`.
+    Resize(u16, u16),
+}
+
+/// Spawn the input gate for one PTY-backed spawn. The gate owns the write
+/// half for the process's whole lifetime; everything that wants to write —
+/// attach bridges, the OSC scanner, resize — holds a sender. The gate (and
+/// with it the PTY master's write side) ends when the last sender drops:
+/// the item's stored sender on exit, the scanner with its sink, and each
+/// bridge on disconnect.
+pub(crate) fn spawn_pty_gate(mut pty_write: pty_process::OwnedWritePty) -> mpsc::Sender<PtyInput> {
+    let (tx, mut rx) = mpsc::channel::<PtyInput>(64);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        while let Some(input) = rx.recv().await {
+            match input {
+                PtyInput::Frame(bytes) => {
+                    if pty_write.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+                PtyInput::Resize(cols, rows) => {
+                    let _ = pty_write.resize(pty_process::Size::new(rows, cols));
+                }
+            }
+        }
+    });
+    tx
+}
+
+/// Handle to an active OSC response scanner. Exists for its [`Drop`]: a
+/// restart replaces the item's handle, and dropping the old one removes its
+/// sink and releases its gate sender.
 pub struct OscSinkHandle {
     /// Our copy of the sender. Dropping it *and* removing the service's copy
-    /// from the sinks list closes the channel, stopping the task. `None` once
-    /// reclaimed by [`take_pty_write`].
+    /// from the sinks list closes the channel, stopping the task.
     handle: Option<SinkHandle>,
-    /// The OSC task, which owns the PTY write half and returns it on a clean
-    /// channel close. `None` once awaited by [`take_pty_write`].
-    join: Option<JoinHandle<pty_process::OwnedWritePty>>,
+    /// The scanner task, which holds a gate sender until its channel closes.
+    join: Option<JoinHandle<()>>,
     service_state: Arc<Mutex<ServiceOutputState>>,
 }
 
-impl OscSinkHandle {
-    /// Stop the OSC sink and reclaim the PTY write handle.
-    /// Removes the sink from the service's sinks list, closes the channel,
-    /// and waits for the task to return the handle. Clears both fields so the
-    /// [`Drop`] impl is a no-op afterwards.
-    pub async fn take_pty_write(mut self) -> Option<pty_process::OwnedWritePty> {
-        if let Some(handle) = self.handle.take() {
-            // Remove our sender from the service's sinks list, then drop it to
-            // close the channel.
-            {
-                let mut state = self.service_state.lock().await;
-                state.sinks.retain(|s| !s.same_channel(&handle));
-            }
-            drop(handle);
-        }
-        match self.join.take() {
-            Some(join) => join.await.ok(),
-            None => None,
-        }
-    }
-}
-
 impl Drop for OscSinkHandle {
-    /// Stop the OSC task when the handle is dropped — e.g. when a restart
-    /// replaces `osc_sink` or a service stops. Without this the task lives on
-    /// holding the PTY's write half (the service's copy of the channel sender
-    /// stays in the sinks list, so the channel never closes), leaking one PTY
-    /// master per restart until the system runs out of PTYs.
-    ///
-    /// [`take_pty_write`] clears both fields first, so this is a no-op after a
-    /// reclaim.
+    /// Stop the scanner when the handle is dropped — e.g. when a restart
+    /// replaces `osc_sink` or a service stops. Without this the task lives
+    /// on (the service's copy of the channel sender stays in the sinks
+    /// list, so the channel never closes), keeping a gate sender alive and
+    /// with it one PTY master per restart.
     fn drop(&mut self) {
-        // Aborting the task drops its `OwnedWritePty`, closing the PTY master's
-        // write half. (The read half is dropped with the output worker.)
+        // Aborting the task drops its gate sender.
         if let Some(join) = self.join.take() {
             join.abort();
         }
@@ -1109,7 +1119,7 @@ impl OutputManager {
     pub async fn add_osc_sink(
         &self,
         name: &str,
-        pty_write: pty_process::OwnedWritePty,
+        pty_input: mpsc::Sender<PtyInput>,
     ) -> Option<OscSinkHandle> {
         let state_arc = self.services.get(name)?.clone();
         let (tx, rx) = mpsc::channel::<SinkLine>(16);
@@ -1118,7 +1128,7 @@ impl OutputManager {
             let mut state = state_arc.lock().await;
             state.sinks.push(handle.clone());
         }
-        let join = tokio::spawn(osc_sink_task(rx, pty_write));
+        let join = tokio::spawn(osc_sink_task(rx, pty_input));
         Some(OscSinkHandle {
             handle: Some(handle),
             join: Some(join),
@@ -1429,14 +1439,14 @@ impl ItemOutput {
 
     /// Attach an OSC response sink so terminal queries from the child reach
     /// its PTY. See [`OutputManager::add_osc_sink`].
-    pub async fn add_osc_sink(&self, pty_write: pty_process::OwnedWritePty) -> OscSinkHandle {
+    pub async fn add_osc_sink(&self, pty_input: mpsc::Sender<PtyInput>) -> OscSinkHandle {
         let (tx, rx) = mpsc::channel::<SinkLine>(16);
         let handle = SinkHandle::BoundedDrop(tx);
         {
             let mut state = self.state.lock().await;
             state.sinks.push(handle.clone());
         }
-        let join = tokio::spawn(osc_sink_task(rx, pty_write));
+        let join = tokio::spawn(osc_sink_task(rx, pty_input));
         OscSinkHandle {
             handle: Some(handle),
             join: Some(join),
@@ -1800,17 +1810,18 @@ async fn file_sink_task(mut rx: mpsc::UnboundedReceiver<SinkLine>, mut file: tok
 /// writes responses directly to the PTY write handle. Returns the PTY
 /// write handle when the channel closes (process exit or sink removal)
 /// so it can be reclaimed by the caller.
-async fn osc_sink_task(
-    mut rx: mpsc::Receiver<SinkLine>,
-    mut pty_write: pty_process::OwnedWritePty,
-) -> pty_process::OwnedWritePty {
-    use tokio::io::AsyncWriteExt;
+async fn osc_sink_task(mut rx: mpsc::Receiver<SinkLine>, pty_input: mpsc::Sender<PtyInput>) {
     while let Some(msg) = rx.recv().await {
         for response in osc::find_responses(&msg.line) {
-            let _ = pty_write.write_all(response).await;
+            if pty_input
+                .send(PtyInput::Frame(response.to_vec()))
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
     }
-    pty_write
 }
 
 /// Open a log file for appending, creating parent directories as needed.
@@ -2546,9 +2557,9 @@ mod tests {
 
     /// Dropping an `OscSinkHandle` (as a restart/stop does when it replaces or
     /// clears `osc_sink`) must remove the sink and stop its task — otherwise
-    /// the task keeps the PTY master's write half open, leaking one PTY per
-    /// drop on any exit path that skips `close_follow_sinks` (e.g. lazy
-    /// ready-check failures).
+    /// the scanner keeps a gate sender alive, keeping the PTY master's write
+    /// half open and leaking one PTY per drop on any exit path that skips
+    /// `close_follow_sinks` (e.g. lazy ready-check failures).
     #[tokio::test]
     async fn dropping_osc_sink_handle_removes_sink() {
         let config = crate::config::LogConfig::Stdout;
@@ -2560,10 +2571,12 @@ mod tests {
         let state = mgr.services.get("api").unwrap().clone();
         let before = state.lock().await.sinks.len();
 
-        // Hand a real PTY's write half to an OSC sink.
+        // Hand a real PTY's write half to a gate, and its sender to the
+        // scanner — the shape every PTY-backed wire produces.
         let (pty, _pts) = pty_process::open().unwrap();
         let (_read, write) = pty.into_split();
-        let handle = mgr.add_osc_sink("api", write).await.unwrap();
+        let pty_input = spawn_pty_gate(write);
+        let handle = mgr.add_osc_sink("api", pty_input).await.unwrap();
         assert_eq!(
             state.lock().await.sinks.len(),
             before + 1,

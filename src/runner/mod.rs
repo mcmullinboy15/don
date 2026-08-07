@@ -409,12 +409,9 @@ pub enum RunnerCommand {
         pid: u32,
         reply: oneshot::Sender<Result<AttachSession, CommandError>>,
     },
-    /// Release an attach session — return the PTY write handle, clear the lock,
-    /// and resume prefixed output.
-    Detach {
-        name: String,
-        pty_write: Option<pty_process::OwnedWritePty>,
-    },
+    /// Release an attach session — clear the lock and resume prefixed
+    /// output. The bridge's gate sender is already dropped by then.
+    Detach { name: String },
     /// Run all tasks currently in PendingRun state.
     RunPendingTasks {
         reply: oneshot::Sender<CommandResult>,
@@ -536,9 +533,10 @@ enum RunnerInternalCommand {
 
 /// An active attach session returned to the WebSocket handler.
 pub struct AttachSession {
-    /// The PTY write half for forwarding stdin.
-    pub pty_write: pty_process::OwnedWritePty,
-    /// Live output receiver (preloaded with ring buffer snapshot).
+    /// Sender into the spawn's PTY input gate — input frames and resizes
+    /// interleave atomically with every other writer.
+    pub pty_input: mpsc::Sender<crate::output::PtyInput>,
+    /// Live output receiver (preloaded with a screen repaint).
     pub output_rx: mpsc::Receiver<crate::output::SinkLine>,
 }
 
@@ -1761,8 +1759,8 @@ impl Runner {
                             RunnerCommand::Attach { name, pid, reply } => {
                                 self.handle_attach_cmd(&name, pid, reply).await;
                             }
-                            RunnerCommand::Detach { name, pty_write } => {
-                                self.handle_detach(&name, pty_write).await;
+                            RunnerCommand::Detach { name } => {
+                                self.handle_detach(&name).await;
                             }
                             RunnerCommand::Rebuild { name } => {
                                 self.handle_rebuild(&name).await;

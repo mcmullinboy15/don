@@ -152,6 +152,7 @@ impl Runner {
         {
             // Release attach lock if held.
             rt.attach_lock = None;
+            rt.pty_input = None;
             // Can't await here (sync fn), but the stdout sink resume
             // will happen naturally when the follow sink closes.
         }
@@ -221,6 +222,7 @@ impl Runner {
         if let Some(rt) = self.tasks.get_mut(name) {
             rt.pgid = None;
             rt.attach_lock = None;
+            rt.pty_input = None;
         }
 
         let timing = elapsed.map(format_duration).unwrap_or_default();

@@ -180,6 +180,7 @@ impl Runner {
                 rs.pgid = None;
                 rs.handle_identity = None;
                 rs.osc_sink = None;
+                rs.pty_input = None;
                 rs.stop_health_tracking();
             }
             self.sync_proxy_policy(name);
@@ -338,6 +339,7 @@ impl Runner {
             // read half on EOF once the process is gone.
             rs.handle_identity = None;
             rs.osc_sink = None;
+            rs.pty_input = None;
         }
         // Dropping the handle used to kill the lingering process
         // (kill_on_drop); the supervisor owns it now, so ask it to. A

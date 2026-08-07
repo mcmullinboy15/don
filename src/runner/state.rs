@@ -51,6 +51,10 @@ pub(crate) struct RuntimeService {
     pub output_worker: Option<tokio::task::JoinHandle<()>>,
     /// OSC query sink for reclaiming PTY write on attach.
     pub osc_sink: Option<crate::output::OscSinkHandle>,
+    /// Sender into the live spawn's PTY input gate; `None` when there is no
+    /// PTY (docker, pipe mode) or no live process. Cleared wherever
+    /// `osc_sink` is.
+    pub pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
     /// PID of the client holding the interactive attach lock.
     pub attach_lock: Option<u32>,
     /// Pending attach waiter (client waiting for process to start).
@@ -130,6 +134,7 @@ impl RuntimeService {
             pgid: None,
             output_worker: None,
             osc_sink: None,
+            pty_input: None,
             attach_lock: None,
             attach_waiter: None,
             proxy_view: None,
@@ -235,6 +240,10 @@ pub(crate) struct RuntimeTask {
     pub run_requested: bool,
     /// OSC query sink for reclaiming PTY write on attach.
     pub osc_sink: Option<crate::output::OscSinkHandle>,
+    /// Sender into the live spawn's PTY input gate; `None` when there is no
+    /// PTY (docker, pipe mode) or no live process. Cleared wherever
+    /// `osc_sink` is.
+    pub pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
     /// PID of the client holding the interactive attach lock.
     pub attach_lock: Option<u32>,
     /// Pending attach waiter (client waiting for process to start).
@@ -276,6 +285,7 @@ impl RuntimeTask {
             last_params: HashMap::new(),
             pgid: None,
             osc_sink: None,
+            pty_input: None,
             attach_lock: None,
             attach_waiter: None,
             resolved_watch_paths: Vec::new(),

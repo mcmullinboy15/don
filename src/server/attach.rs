@@ -96,11 +96,13 @@ pub(crate) async fn attach_handler(
         }
     };
 
-    let pty_write = session.pty_write;
+    let pty_input = session.pty_input;
     let output_rx = session.output_rx;
 
     // Apply initial resize — the PTY and the emulated grid move together.
-    let _ = pty_write.resize(pty_process::Size::new(params.rows, params.cols));
+    let _ = pty_input
+        .send(crate::output::PtyInput::Resize(params.cols, params.rows))
+        .await;
     state.emulator.resize(&name, params.cols, params.rows);
 
     // Register resize channel.
@@ -120,16 +122,15 @@ pub(crate) async fn attach_handler(
                 // Upgrade failed — clean up.
                 let mut map = state_clone.attach_resize_txs.lock().await;
                 map.remove(&name_clone);
-                let _ = state_clone.cmd_tx.send(RunnerCommand::Detach {
-                    name: name_clone,
-                    pty_write: Some(pty_write),
-                });
+                let _ = state_clone
+                    .cmd_tx
+                    .send(RunnerCommand::Detach { name: name_clone });
                 return;
             }
         };
 
         let io = hyper_util::rt::TokioIo::new(upgraded);
-        let pty_back = bridge_raw(io, pty_write, output_rx, resize_rx).await;
+        bridge_raw(io, pty_input, output_rx, resize_rx).await;
 
         // Clean up resize channel.
         {
@@ -137,11 +138,9 @@ pub(crate) async fn attach_handler(
             map.remove(&name_clone);
         }
 
-        // Return PTY write handle to runner.
-        let _ = state_clone.cmd_tx.send(RunnerCommand::Detach {
-            name: name_clone,
-            pty_write: pty_back,
-        });
+        let _ = state_clone
+            .cmd_tx
+            .send(RunnerCommand::Detach { name: name_clone });
     });
 
     // Return 101 Switching Protocols.
@@ -176,14 +175,17 @@ pub(crate) async fn resize_handler(
     }
 }
 
-/// Bridge a raw bidirectional stream to the PTY. Returns the PTY write
-/// handle (Some if still valid, None if dropped).
+/// Bridge a raw bidirectional stream to the PTY's input gate. Each client
+/// read becomes one atomic input frame; the gate interleaves frames from
+/// every writer without shearing.
 async fn bridge_raw<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     io: S,
-    mut pty_write: pty_process::OwnedWritePty,
+    pty_input: mpsc::Sender<crate::output::PtyInput>,
     mut output_rx: mpsc::Receiver<crate::output::SinkLine>,
     mut resize_rx: mpsc::Receiver<(u16, u16)>,
-) -> Option<pty_process::OwnedWritePty> {
+) {
+    use crate::output::PtyInput;
+
     let (mut io_read, mut io_write) = tokio::io::split(io);
 
     // Channel for OSC responses detected in the output stream.
@@ -201,7 +203,7 @@ async fn bridge_raw<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         }
     };
 
-    // Task: client → PTY (raw bytes) + OSC responses + resize.
+    // Task: client → gate (input frames) + OSC responses + resize.
     let client_to_pty = async move {
         let mut buf = [0u8; 4096];
         loop {
@@ -210,25 +212,24 @@ async fn bridge_raw<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                     match result {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if pty_write.write_all(&buf[..n]).await.is_err() {
+                            if pty_input.send(PtyInput::Frame(buf[..n].to_vec())).await.is_err() {
                                 break;
                             }
                         }
                     }
                 }
                 Some(data) = osc_rx.recv() => {
-                    let _ = pty_write.write_all(&data).await;
+                    let _ = pty_input.send(PtyInput::Frame(data.to_vec())).await;
                 }
                 Some((cols, rows)) = resize_rx.recv() => {
-                    let _ = pty_write.resize(pty_process::Size::new(rows, cols));
+                    let _ = pty_input.send(PtyInput::Resize(cols, rows)).await;
                 }
             }
         }
-        pty_write
     };
 
     tokio::select! {
-        _ = output_to_client => None,
-        pty = client_to_pty => Some(pty),
+        _ = output_to_client => (),
+        _ = client_to_pty => (),
     }
 }

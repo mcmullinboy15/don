@@ -94,8 +94,13 @@ pub(in crate::runner) struct ServiceWired {
     pub(in crate::runner) identity: super::state::ServiceHandleIdentity,
     pub(in crate::runner) pgid: Option<i32>,
     pub(in crate::runner) docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
-    /// OSC response sink handle, for the attach paths' take/restore dance.
+    /// OSC response scanner handle — dropped on restart/stop to end the
+    /// scanner and release its gate sender.
     pub(in crate::runner) osc_sink: Option<crate::output::OscSinkHandle>,
+    /// Sender into this spawn's PTY input gate. `None` for docker and
+    /// pipe-mode spawns. Attach bridges clone it; the runner's copy is
+    /// cleared on exit so the gate (and the PTY write half) can end.
+    pub(in crate::runner) pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
     /// Resolves when the output reader ends (process died) — the ready
     /// check races against it. Errs immediately when the service has no
     /// registered output, which matches the old wiring's behavior.
@@ -563,15 +568,19 @@ async fn wire_spawn(
         service::ServiceHandle::Process(process) => process.take_pty_write(),
         service::ServiceHandle::Docker(_) => None,
     };
-    let osc_sink = match (pty, output) {
+    let (osc_sink, pty_input) = match (pty, output) {
         (Some(pty), Some(output)) => {
             // Feed the server-side screen from process start — a correct
             // repaint on attach requires having seen the setup sequences.
             // Matches the PTY's initial 80x24 size.
             output.register_emulator(80, 24).await;
-            Some(output.add_osc_sink(pty).await)
+            // The gate owns the write half for this spawn's lifetime;
+            // the scanner and any attach bridges hold senders into it.
+            let pty_input = crate::output::spawn_pty_gate(pty);
+            let osc_sink = output.add_osc_sink(pty_input.clone()).await;
+            (Some(osc_sink), Some(pty_input))
         }
-        _ => None,
+        _ => (None, None),
     };
 
     // Fan the reader's end out twice: once to the ready check (races its
@@ -605,6 +614,7 @@ async fn wire_spawn(
         pgid,
         docker_port_bindings,
         osc_sink,
+        pty_input,
         ready_exit_rx: exit_rx,
         monitor_cancel_rx: cancel_rx,
         proxy_backend_env: proxy.map(|p| p.env_vars()),

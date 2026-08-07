@@ -10,18 +10,15 @@ impl Runner {
             .or_else(|| self.tasks.get(name).and_then(|rt| rt.attach_lock))
     }
 
-    /// Get a mutable reference to the OSC sink option for a service or task.
-    pub(in crate::runner) fn get_osc_sink_mut(
-        &mut self,
+    /// The live spawn's PTY input-gate sender for a service or task.
+    fn get_pty_input(
+        &self,
         name: &str,
-    ) -> Option<&mut Option<crate::output::OscSinkHandle>> {
-        if let Some(rs) = self.services.get_mut(name) {
-            Some(&mut rs.osc_sink)
-        } else if let Some(rt) = self.tasks.get_mut(name) {
-            Some(&mut rt.osc_sink)
-        } else {
-            None
-        }
+    ) -> Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>> {
+        self.services
+            .get(name)
+            .and_then(|rs| rs.pty_input.clone())
+            .or_else(|| self.tasks.get(name).and_then(|rt| rt.pty_input.clone()))
     }
 
     /// Remove the attach lock for a service or task, returning whether it was set.
@@ -146,16 +143,15 @@ impl Runner {
         name: &str,
         pid: u32,
     ) -> Result<AttachSession, CommandError> {
-        // Reclaim the PTY write handle by stopping the OSC sink.
-        let osc_handle = self.get_osc_sink_mut(name).and_then(|opt| opt.take());
-        let pty_write = match osc_handle {
-            Some(osc_handle) => osc_handle.take_pty_write().await,
-            None => None,
-        };
-        let pty_write = pty_write.ok_or_else(|| CommandError::InvalidState {
-            name: name.to_string(),
-            message: "no PTY available (spawned in pipe mode)".to_string(),
-        })?;
+        // The input gate owns the PTY write half for the spawn's lifetime;
+        // a bridge just gets a sender into it. No custody changes hands, so
+        // nothing needs restoring on detach.
+        let pty_input = self
+            .get_pty_input(name)
+            .ok_or_else(|| CommandError::InvalidState {
+                name: name.to_string(),
+                message: "no PTY available (spawned in pipe mode)".to_string(),
+            })?;
 
         // Preload the client with a coherent repaint of the item's current
         // screen, then stream live bytes — never a raw-byte replay. Items
@@ -180,7 +176,7 @@ impl Runner {
             .service_event(name, &format!("attached (pid {pid})"));
 
         Ok(AttachSession {
-            pty_write,
+            pty_input,
             output_rx,
         })
     }
@@ -199,27 +195,9 @@ impl Runner {
         }
     }
 
-    /// Release an attach session.
-    pub(in crate::runner) async fn handle_detach(
-        &mut self,
-        name: &str,
-        pty_write: Option<pty_process::OwnedWritePty>,
-    ) {
-        // Only return the PTY write handle if the attach lock is still held.
-        // If the service/task was stopped/restarted while we were attached,
-        // the lock was already cleared and the current process has a fresh
-        // PTY — setting the stale one would corrupt it.
-        if self.get_attach_lock(name).is_some()
-            && let Some(pty) = pty_write
-        {
-            // Restart the OSC response sink with the returned handle.
-            if let Some(osc_handle) = self.output_manager.add_osc_sink(name, pty).await
-                && let Some(sink_slot) = self.get_osc_sink_mut(name)
-            {
-                *sink_slot = Some(osc_handle);
-            }
-        }
-
+    /// Release an attach session. The bridge already dropped its gate
+    /// sender; only bookkeeping remains.
+    pub(in crate::runner) async fn handle_detach(&mut self, name: &str) {
         // Release lock.
         self.remove_attach_lock(name);
 

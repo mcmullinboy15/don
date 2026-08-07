@@ -24,6 +24,7 @@ impl Runner {
             pgid: spawned_pgid,
             docker_port_bindings,
             osc_sink,
+            pty_input,
             ready_exit_rx: exit_rx,
             monitor_cancel_rx,
             proxy_backend_env,
@@ -58,6 +59,7 @@ impl Runner {
             rs.docker_port_bindings = docker_port_bindings;
             rs.handle_identity = Some(identity);
             rs.osc_sink = osc_sink;
+            rs.pty_input = pty_input;
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop
             // guard in `handle_service_exited`).
