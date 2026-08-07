@@ -78,42 +78,24 @@ impl Runner {
         Ok(())
     }
 
-    /// Resolve a service ready check against its actual public runtime ports.
+    /// Resolve a service ready check against its actual public runtime
+    /// ports, from the runner's shadows — for `don status -v` and the ready
+    /// lifecycle line. The authoritative resolution for the check that
+    /// actually runs happens in the service supervisor, over its live proxy
+    /// and docker state, via [`resolve_ready_check`]; both call the same
+    /// function, so they cannot drift.
     pub(in crate::runner) fn effective_ready_check(
         &self,
         name: &str,
         resolved: &crate::config::ResolvedService,
     ) -> Option<ReadyCheck> {
-        let mut ready = resolved.ready.clone()?;
-        let mut env = resolved.env.clone();
-        // Backend vars first, then public ones. A `proxy = { env = "PORT" }`
-        // service is told its ephemeral backend port through `PORT`, and a
-        // ready check pointed at `${PORT}` means "is the service itself up?" —
-        // checking the public listener instead would pass the moment Don bound
-        // the proxy, before the service had started at all.
-        //
-        // The spawn path adds these to its own copy of `resolved` before
-        // launching (see `service_commands`), which is why checks resolved
-        // correctly while `don status -v` and the ready lifecycle event, both
-        // reading the stored `resolved`, printed the raw `${PORT}`.
-        env.extend(self.runtime_backend_env(name));
-        env.extend(self.runtime_public_env(name));
-
-        if let Some(tcp) = ready.tcp.take() {
-            let expanded = crate::process::env::expand_env_vars(&tcp, &env);
-            ready.tcp = Some(rewrite_tcp_port(
-                &expanded,
-                &self.ready_port_replacements(name),
-            ));
-        }
-        if let Some(http) = ready.http.take() {
-            let expanded = crate::process::env::expand_env_vars(&http, &env);
-            ready.http = Some(rewrite_http_port(
-                &expanded,
-                &self.ready_port_replacements(name),
-            ));
-        }
-        Some(ready)
+        resolve_ready_check(
+            resolved.ready.as_ref(),
+            &resolved.env,
+            &self.runtime_backend_env(name),
+            &self.runtime_public_env(name),
+            &self.ready_port_replacements(name),
+        )
     }
 
     /// Queue a rewrite of `.don/ports.json` from the runner's current live
@@ -192,45 +174,21 @@ impl Runner {
     }
 
     fn ready_port_replacements(&self, name: &str) -> HashMap<u16, u16> {
-        let mut candidates: HashMap<u16, Option<u16>> = HashMap::new();
         let Some(runtime) = self.services.get(name) else {
             return HashMap::new();
         };
-
-        if let Some(proxy) = runtime.proxy_view.as_ref() {
-            for binding in &proxy.bindings {
-                let Ok(configured) = binding.configured_addr.parse::<SocketAddr>() else {
-                    continue;
-                };
-                record_port_replacement(
-                    &mut candidates,
-                    configured.port(),
-                    binding.bound_addr.port(),
-                );
-            }
-        }
-        if runtime.handle_identity == Some(super::state::ServiceHandleIdentity::Docker) {
-            for binding in runtime
-                .docker_port_bindings
-                .iter()
-                .filter(|binding| binding.protocol == "tcp")
-            {
-                record_port_replacement(
-                    &mut candidates,
-                    binding.configured_host_port,
-                    binding.host_port,
-                );
-            }
-        }
-
-        candidates
-            .into_iter()
-            .filter_map(|(configured, actual)| {
-                actual
-                    .filter(|actual| configured != 0 && configured != *actual)
-                    .map(|actual| (configured, actual))
-            })
-            .collect()
+        let proxy_bindings = runtime
+            .proxy_view
+            .as_ref()
+            .map(|view| view.bindings.as_slice())
+            .unwrap_or(&[]);
+        let docker_bindings =
+            if runtime.handle_identity == Some(super::state::ServiceHandleIdentity::Docker) {
+                runtime.docker_port_bindings.as_slice()
+            } else {
+                &[]
+            };
+        port_replacements_for(proxy_bindings, docker_bindings)
     }
 
     fn port_manifest(&self) -> PortManifest {
@@ -289,6 +247,72 @@ impl Runner {
             services,
         }
     }
+}
+
+/// Resolve a ready check's `${VAR}` references and configured-to-actual
+/// port rewrites.
+///
+/// Backend vars layer first, then public ones. A `proxy = { env = "PORT" }`
+/// service is told its ephemeral backend port through `PORT`, and a ready
+/// check pointed at `${PORT}` means "is the service itself up?" — checking
+/// the public listener instead would pass the moment Don bound the proxy,
+/// before the service had started at all.
+pub(in crate::runner) fn resolve_ready_check(
+    ready: Option<&ReadyCheck>,
+    base_env: &HashMap<String, String>,
+    backend_env: &HashMap<String, String>,
+    public_env: &HashMap<String, String>,
+    replacements: &HashMap<u16, u16>,
+) -> Option<ReadyCheck> {
+    let mut ready = ready?.clone();
+    let mut env = base_env.clone();
+    env.extend(backend_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env.extend(public_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    if let Some(tcp) = ready.tcp.take() {
+        let expanded = crate::process::env::expand_env_vars(&tcp, &env);
+        ready.tcp = Some(rewrite_tcp_port(&expanded, replacements));
+    }
+    if let Some(http) = ready.http.take() {
+        let expanded = crate::process::env::expand_env_vars(&http, &env);
+        ready.http = Some(rewrite_http_port(&expanded, replacements));
+    }
+    Some(ready)
+}
+
+/// Configured-to-actual port replacements for a spawn, from its live proxy
+/// bindings and docker port bindings — the supervisor-side twin of
+/// [`Runner::ready_port_replacements`].
+pub(in crate::runner) fn port_replacements_for(
+    proxy_bindings: &[crate::proxy::ProxyBinding],
+    docker_bindings: &[crate::docker::DockerPortBinding],
+) -> HashMap<u16, u16> {
+    let mut candidates: HashMap<u16, Option<u16>> = HashMap::new();
+    for binding in proxy_bindings {
+        let Ok(configured) = binding.configured_addr.parse::<SocketAddr>() else {
+            continue;
+        };
+        record_port_replacement(
+            &mut candidates,
+            configured.port(),
+            binding.bound_addr.port(),
+        );
+    }
+    for binding in docker_bindings.iter().filter(|b| b.protocol == "tcp") {
+        record_port_replacement(
+            &mut candidates,
+            binding.configured_host_port,
+            binding.host_port,
+        );
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(configured, actual)| {
+            actual
+                .filter(|actual| configured != 0 && configured != *actual)
+                .map(|actual| (configured, actual))
+        })
+        .collect()
 }
 
 fn extend_service_references(

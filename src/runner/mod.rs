@@ -453,7 +453,6 @@ pub enum RunnerCommand {
 /// must never miss one — lossy observation is for peers and edges, which
 /// resync from the snapshot. Starts with lazy demand; per-item lifecycle
 /// reports (exit, transitions) migrate here as supervisors absorb them.
-#[derive(Debug)]
 pub(in crate::runner) enum ItemReport {
     /// A lazy service's proxy saw its first connection. Demand originates
     /// inside the item, but the *reaction* belongs to the scheduler: a lazy
@@ -475,18 +474,30 @@ pub(in crate::runner) enum ItemReport {
     HealthChanged { name: String, healthy: bool },
     /// A task process exited after an explicit run/restart.
     TaskExited(TaskExit),
-}
-
-enum RunnerInternalCommand {
-    /// Report from a task's run supervisor: the run settled without a
-    /// spawn, is now running (wired metadata only — custody stays with the
-    /// supervisor), or failed to prepare.
+    /// A service's supervisor settled a start request — wired (metadata
+    /// only; custody stays with the supervisor) or failed to prepare.
+    ServiceStartPrepared {
+        name: String,
+        context: Box<ServiceStartContext>,
+        intent: ServiceStartIntent,
+        result: Result<Box<service_supervisor::ServiceWired>, String>,
+    },
+    /// A service's supervisor finished executing a stop.
+    ServiceStopComplete {
+        name: String,
+        op_id: u64,
+        result: Result<(), String>,
+    },
+    /// A task's supervisor settled a run request.
     TaskRunPrepared {
         name: String,
         task_cfg: Box<crate::config::Task>,
         intent: TaskRunIntent,
         result: Result<task_supervisor::TaskRunReport, String>,
     },
+}
+
+enum RunnerInternalCommand {
     /// A manually-triggered task wait exceeded its requested wait deadline.
     TaskRunWaitTimedOut {
         name: String,
@@ -507,19 +518,6 @@ enum RunnerInternalCommand {
         generation: u64,
         success: bool,
         message: Option<String>,
-    },
-    /// Completion from a detached manual service stop/restart worker.
-    ServiceStopComplete {
-        name: String,
-        op_id: u64,
-        result: Result<(), String>,
-    },
-    /// Completion from a detached service start worker.
-    ServiceStartPrepared {
-        name: String,
-        context: Box<ServiceStartContext>,
-        intent: ServiceStartIntent,
-        result: Result<Box<service_supervisor::ServiceWired>, String>,
     },
     /// Completion from a detached rebuild worker for a single service.
     ServiceRebuildPrepared {
@@ -1055,7 +1053,6 @@ impl Runner {
                 shutdown: config.shutdown.clone(),
             },
             &|name| output_manager.item_output(name),
-            &internal_tx,
             &report_tx,
             &mut proxies,
         );
@@ -1071,7 +1068,6 @@ impl Runner {
                 global_watch_ignore: config.watch_ignore.clone(),
             },
             &|name| output_manager.item_output(name),
-            &internal_tx,
             &report_tx,
         );
 
@@ -1798,27 +1794,6 @@ impl Runner {
                     }
                     Some(cmd) = self.internal_rx.recv() => {
                         match cmd {
-                            RunnerInternalCommand::TaskRunPrepared {
-                                name,
-                                task_cfg,
-                                intent,
-                                result,
-                            } => {
-                                self.handle_task_run_prepared(&name, &task_cfg, intent, result)
-                                    .await;
-                            }
-                            RunnerInternalCommand::ServiceStopComplete { name, op_id, result } => {
-                                self.handle_service_stop_complete(&name, op_id, result).await;
-                            }
-                            RunnerInternalCommand::ServiceStartPrepared {
-                                name,
-                                context,
-                                intent,
-                                result,
-                            } => {
-                                self.handle_service_start_prepared(&name, context, intent, result)
-                                    .await;
-                            }
                             RunnerInternalCommand::ServiceRebuildPrepared {
                                 name,
                                 op_id,
@@ -1884,6 +1859,27 @@ impl Runner {
                             }
                             ItemReport::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
+                            }
+                            ItemReport::ServiceStartPrepared {
+                                name,
+                                context,
+                                intent,
+                                result,
+                            } => {
+                                self.handle_service_start_prepared(&name, context, intent, result)
+                                    .await;
+                            }
+                            ItemReport::ServiceStopComplete { name, op_id, result } => {
+                                self.handle_service_stop_complete(&name, op_id, result).await;
+                            }
+                            ItemReport::TaskRunPrepared {
+                                name,
+                                task_cfg,
+                                intent,
+                                result,
+                            } => {
+                                self.handle_task_run_prepared(&name, &task_cfg, intent, result)
+                                    .await;
                             }
                         }
                     }

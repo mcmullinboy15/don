@@ -1,6 +1,6 @@
 use super::graph::topological_sort;
 
-use super::{Runner, RunnerInternalCommand, ServiceState, ServiceStopAction};
+use super::{Runner, ServiceState, ServiceStopAction};
 use crate::signals::force_shutdown_requested;
 use std::collections::{BTreeMap, HashMap};
 use tokio::task::JoinSet;
@@ -389,9 +389,11 @@ impl Runner {
     }
 
     async fn drain_late_worker_results(&mut self) {
-        while let Ok(cmd) = self.internal_rx.try_recv() {
-            match cmd {
-                RunnerInternalCommand::ServiceStartPrepared {
+        // Late prepared reports carry spawned processes' identities; kill
+        // those. Everything else is bookkeeping nobody needs mid-teardown.
+        while let Ok(report) = self.report_rx.try_recv() {
+            match report {
+                super::ItemReport::ServiceStartPrepared {
                     name,
                     context,
                     result,
@@ -399,18 +401,13 @@ impl Runner {
                 } => {
                     self.stop_late_service_start(name, context, result).await;
                 }
-                RunnerInternalCommand::TaskRunPrepared { name, result, .. } => {
+                super::ItemReport::TaskRunPrepared { name, result, .. } => {
                     self.stop_late_task_start(name, result).await;
                 }
-                RunnerInternalCommand::ServiceStopComplete { .. }
-                | RunnerInternalCommand::ServiceRebuildPrepared { .. }
-                | RunnerInternalCommand::TaskRunWaitTimedOut { .. }
-                | RunnerInternalCommand::BatchBuildComplete(_)
-                | RunnerInternalCommand::LazyBuildComplete { .. }
-                | RunnerInternalCommand::ReadyCheckComplete { .. }
-                | RunnerInternalCommand::UpdateCheckComplete(_) => {}
+                _ => {}
             }
         }
+        while self.internal_rx.try_recv().is_ok() {}
     }
 
     pub(in crate::runner) async fn stop_late_service_start(

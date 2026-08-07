@@ -20,7 +20,6 @@
 //! restart policy, and shutdown sequencing. Proxy *decisions* likewise stay
 //! with the runner and arrive as [`ProxyDirective`]s.
 
-use super::RunnerInternalCommand;
 use super::service;
 use super::service_worker::{ServiceStartMode, start_service_worker};
 use super::{ServiceStartContext, ServiceStartIntent};
@@ -167,7 +166,6 @@ pub(in crate::runner) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     env: &StartEnv,
     outputs: &dyn Fn(&str) -> Option<ItemOutput>,
-    internal_tx: &mpsc::Sender<RunnerInternalCommand>,
     report_tx: &mpsc::UnboundedSender<super::ItemReport>,
     proxies: &mut std::collections::HashMap<String, ProxyAssets>,
 ) -> ServiceStarts {
@@ -179,7 +177,6 @@ pub(in crate::runner) fn spawn_supervisors<'a>(
             rx,
             env.clone(),
             output,
-            internal_tx.clone(),
             report_tx.clone(),
             busy,
             assets,
@@ -230,7 +227,6 @@ async fn supervise(
     mut rx: mpsc::UnboundedReceiver<ServiceCommand>,
     env: StartEnv,
     output: Option<ItemOutput>,
-    internal_tx: mpsc::Sender<RunnerInternalCommand>,
     report_tx: mpsc::UnboundedSender<super::ItemReport>,
     busy: Arc<AtomicBool>,
     proxy_assets: Option<ProxyAssets>,
@@ -348,14 +344,14 @@ async fn supervise(
                 }
                 match request.notify {
                     StopNotify::Internal { op_id } => {
-                        let sent = internal_tx
-                            .send(RunnerInternalCommand::ServiceStopComplete {
+                        if report_tx
+                            .send(super::ItemReport::ServiceStopComplete {
                                 name: name.clone(),
                                 op_id,
                                 result,
                             })
-                            .await;
-                        if sent.is_err() {
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -372,15 +368,15 @@ async fn supervise(
         // the child inherits.
         if let Some(p) = proxy.as_mut() {
             if fresh_backend_ports && let Err(error) = p.reallocate_ephemeral_ports().await {
-                let sent = internal_tx
-                    .send(RunnerInternalCommand::ServiceStartPrepared {
+                if report_tx
+                    .send(super::ItemReport::ServiceStartPrepared {
                         name: name.clone(),
                         context,
                         intent,
                         result: Err(format!("failed to allocate ephemeral ports: {error}")),
                     })
-                    .await;
-                if sent.is_err() {
+                    .is_err()
+                {
                     return;
                 }
                 continue;
@@ -455,15 +451,15 @@ async fn supervise(
                     )),
                     Err(message) => Err(message),
                 };
-                let sent = internal_tx
-                    .send(RunnerInternalCommand::ServiceStartPrepared {
+                if report_tx
+                    .send(super::ItemReport::ServiceStartPrepared {
                         name: name.clone(),
                         context,
                         intent,
                         result: wired,
                     })
-                    .await;
-                if sent.is_err() {
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -675,28 +671,24 @@ mod tests {
 
     struct Harness {
         tx: mpsc::UnboundedSender<ServiceCommand>,
-        _internal_rx: mpsc::Receiver<RunnerInternalCommand>,
         report_rx: mpsc::UnboundedReceiver<super::super::ItemReport>,
         handle: tokio::task::JoinHandle<()>,
     }
 
     async fn spawn_harness(assets: Option<ProxyAssets>) -> Harness {
         let (tx, rx) = mpsc::unbounded_channel();
-        let (internal_tx, internal_rx) = mpsc::channel(64);
         let (report_tx, report_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(supervise(
             "svc".to_string(),
             rx,
             test_env().await,
             None,
-            internal_tx,
             report_tx,
             Arc::new(AtomicBool::new(false)),
             assets,
         ));
         Harness {
             tx,
-            _internal_rx: internal_rx,
             report_rx,
             handle,
         }

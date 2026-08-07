@@ -14,7 +14,7 @@
 //! transition item state, which drives the cross-item dependency scheduler.
 
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::{ItemDone, NodeKind, RunnerInternalCommand, TaskExit};
+use super::{ItemDone, NodeKind, TaskExit};
 use crate::task_state::{TaskRunInfo, TaskState};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,20 +63,11 @@ pub(in crate::runner) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     ctx: &super::task_worker::TaskWorkerContext,
     outputs: &dyn Fn(&str) -> Option<crate::output::ItemOutput>,
-    internal_tx: &mpsc::Sender<RunnerInternalCommand>,
     report_tx: &mpsc::UnboundedSender<super::ItemReport>,
 ) -> TaskSupervisors {
     TaskSupervisors::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
-        supervise(
-            name,
-            rx,
-            ctx.clone(),
-            output,
-            internal_tx.clone(),
-            report_tx.clone(),
-            busy,
-        )
+        supervise(name, rx, ctx.clone(), output, report_tx.clone(), busy)
     })
 }
 
@@ -93,7 +84,6 @@ async fn supervise(
     mut rx: mpsc::UnboundedReceiver<RunRequest>,
     ctx: super::task_worker::TaskWorkerContext,
     output: Option<crate::output::ItemOutput>,
-    internal_tx: mpsc::Sender<RunnerInternalCommand>,
     report_tx: mpsc::UnboundedSender<super::ItemReport>,
     busy: Arc<AtomicBool>,
 ) {
@@ -228,15 +218,15 @@ async fn supervise(
             rerun: matches!(intent, super::TaskRunIntent::Background),
         });
 
-        let sent = internal_tx
-            .send(RunnerInternalCommand::TaskRunPrepared {
+        if report_tx
+            .send(super::ItemReport::TaskRunPrepared {
                 name: name.clone(),
                 task_cfg: task_cfg.clone(),
                 intent,
                 result: report,
             })
-            .await;
-        if sent.is_err() {
+            .is_err()
+        {
             return;
         }
 
@@ -643,7 +633,6 @@ mod tests {
     /// need synchronising and the lock-free `Arc<HashMap<_, _>>` would go.
     #[tokio::test]
     async fn the_registry_addresses_tasks_without_creating_them() {
-        let (internal_tx, _internal_rx) = mpsc::channel(4);
         let temp = tempfile::tempdir().unwrap();
         let output = crate::output::OutputManager::new(&[], tokio::io::sink())
             .await
@@ -656,8 +645,7 @@ mod tests {
         };
         let names = ["build".to_string(), "migrate".to_string()];
         let (report_tx, _report_rx) = mpsc::unbounded_channel();
-        let mut supervisors =
-            spawn_supervisors(names.iter(), &ctx, &|_| None, &internal_tx, &report_tx);
+        let mut supervisors = spawn_supervisors(names.iter(), &ctx, &|_| None, &report_tx);
         let registry = supervisors.registry().clone();
 
         assert!(registry.get("build").is_some());
