@@ -158,6 +158,11 @@ impl Client {
         }
     }
 
+    /// The unix socket path this client talks to.
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
     /// Directly wrap an existing socket path (tests, non-standard layouts).
     pub fn with_socket_path(socket_path: PathBuf) -> Self {
         Self { socket_path }

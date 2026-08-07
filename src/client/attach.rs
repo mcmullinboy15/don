@@ -262,3 +262,157 @@ async fn send_resize(
     let _ = stream.read(&mut buf).await;
     Ok(())
 }
+
+/// Why a TUI bridge session ended.
+pub enum BridgeEnd {
+    /// The user typed the escape sequence (Ctrl+P Ctrl+Q).
+    Escape,
+    /// The server closed the stream (task exited, runner stopped).
+    ServerDisconnect,
+    /// The session could not start or broke.
+    Error(ClientError),
+}
+
+/// Bridge the current (already-raw or about-to-be-raw) terminal into
+/// `name`'s PTY for the TUI's bridge mode.
+///
+/// Unlike [`run_attach`], everything forwards — including Ctrl+C and
+/// Ctrl+D, which the bridged program may want — and the only way out from
+/// the keyboard is the docker-style escape sequence Ctrl+P Ctrl+Q. No
+/// reconnect loop: the caller owns what happens next.
+pub async fn bridge_once(socket_path: &Path, name: &str) -> BridgeEnd {
+    let mut stream = match UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => return BridgeEnd::Error(ClientError::Io(e)),
+    };
+
+    let pid = std::process::id();
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let path = format!(
+        "/attach/{}?pid={pid}&cols={cols}&rows={rows}",
+        super::urlencode(name),
+    );
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: don-attach\r\n\
+         \r\n"
+    );
+    if let Err(e) = stream.write_all(req.as_bytes()).await {
+        return BridgeEnd::Error(ClientError::Io(e));
+    }
+    let (status, headers, leftover) = match super::read_head(&mut stream).await {
+        Ok(r) => r,
+        Err(e) => return BridgeEnd::Error(e),
+    };
+    if status != 101 {
+        let body = match super::drain_body(&mut stream, &headers, leftover).await {
+            Ok(b) => b,
+            Err(e) => return BridgeEnd::Error(e),
+        };
+        return BridgeEnd::Error(super::classify_error(status, &body));
+    }
+    let session_id = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-don-attach-session"))
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok());
+
+    let _guard = match RawModeGuard::enable() {
+        Ok(g) => g,
+        Err(e) => return BridgeEnd::Error(e),
+    };
+    if !leftover.is_empty() {
+        let mut stdout = tokio::io::stdout();
+        let _ = stdout.write_all(&leftover).await;
+        let _ = stdout.flush().await;
+    }
+
+    let (mut stream_read, mut stream_write) = stream.split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
+    let resize_handle = tokio::spawn({
+        use futures_util::StreamExt;
+        async move {
+            let mut reader = crossterm::event::EventStream::new();
+            while let Some(Ok(event)) = reader.next().await {
+                if let crossterm::event::Event::Resize(cols, rows) = event
+                    && resize_tx.send((cols, rows)).await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+
+    let socket_path = socket_path.to_path_buf();
+    let name_owned = name.to_string();
+    // Escape detection: a lone Ctrl+P is HELD (not forwarded) until the
+    // next byte decides — Ctrl+Q escapes, anything else releases the held
+    // byte to the task. Docker's semantics.
+    let mut held_ctrl_p = false;
+    let mut stdin_buf = [0u8; 4096];
+    let mut stream_buf = [0u8; 8192];
+    let end = loop {
+        tokio::select! {
+            read_result = stdin.read(&mut stdin_buf) => {
+                match read_result {
+                    Ok(0) => break BridgeEnd::ServerDisconnect,
+                    Ok(n) => {
+                        let mut out: Vec<u8> = Vec::with_capacity(n + 1);
+                        let mut escaped = false;
+                        for &byte in &stdin_buf[..n] {
+                            if held_ctrl_p {
+                                held_ctrl_p = false;
+                                if byte == 0x11 {
+                                    escaped = true;
+                                    break;
+                                }
+                                out.push(0x10);
+                                if byte == 0x10 {
+                                    held_ctrl_p = true;
+                                    continue;
+                                }
+                                out.push(byte);
+                            } else if byte == 0x10 {
+                                held_ctrl_p = true;
+                            } else {
+                                out.push(byte);
+                            }
+                        }
+                        if !out.is_empty() && stream_write.write_all(&out).await.is_err() {
+                            break BridgeEnd::ServerDisconnect;
+                        }
+                        if escaped {
+                            break BridgeEnd::Escape;
+                        }
+                    }
+                    Err(e) => break BridgeEnd::Error(ClientError::Io(e)),
+                }
+            }
+            read_result = stream_read.read(&mut stream_buf) => {
+                match read_result {
+                    Ok(0) | Err(_) => break BridgeEnd::ServerDisconnect,
+                    Ok(n) => {
+                        if stdout.write_all(&stream_buf[..n]).await.is_err() {
+                            break BridgeEnd::ServerDisconnect;
+                        }
+                        let _ = stdout.flush().await;
+                    }
+                }
+            }
+            Some((cols, rows)) = resize_rx.recv() => {
+                let sp = socket_path.clone();
+                let n2 = name_owned.clone();
+                tokio::spawn(async move {
+                    let _ = send_resize(&sp, &n2, session_id, cols, rows).await;
+                });
+            }
+        }
+    };
+    resize_handle.abort();
+    let _ = resize_handle.await;
+    end
+}

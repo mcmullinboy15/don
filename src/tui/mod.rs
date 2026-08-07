@@ -461,6 +461,34 @@ pub async fn run_tui(
                         if app.exit_requested {
                             break;
                         }
+                        if let Some(name) = app.bridge_request.take()
+                            && let Some(act) = active.take()
+                        {
+                            let checkpoint = store.next_id();
+                            act.tear_down().await?;
+                            let end = run_bridge(&client, &name).await;
+                            // Rebuild the inline TUI where the bridge left
+                            // the cursor and replay only what arrived while
+                            // it was down — the Release-path pattern.
+                            let mut act = ActiveTerm::enter(&input_tx)?;
+                            act.terminal.draw(|f| render::draw_bar(f, &app))?;
+                            cached_width = act.terminal.size()?.width.max(1);
+                            let mut replayed_any = false;
+                            for entry in store.iter_since(checkpoint) {
+                                if app.should_render_log(&entry.line.name, entry.line.is_lifecycle)
+                                {
+                                    insert_line(&mut act.terminal, &entry.line, cached_width)?;
+                                    replayed_any = true;
+                                }
+                            }
+                            if replayed_any {
+                                draw_inline_bar(&mut act.terminal, &app)?;
+                            }
+                            active = Some(act);
+                            if let Some(message) = end {
+                                controls.lifecycle_emitter.lifecycle_event(&message);
+                            }
+                        }
                     }
                     None => {
                         input_open = false;
@@ -1073,6 +1101,11 @@ fn handle_tasks_key(
         };
         open_log_popup_for_name(app, store, item.name);
         redraw_modal(modal, app)?;
+    } else if key.code == KeyCode::Char('a') {
+        // Bridge into the highlighted task's PTY — the interactive-task flow.
+        if let Some(item) = highlighted_task_item(app) {
+            app.bridge_request = Some(item.name);
+        }
     }
     Ok(())
 }
@@ -1133,9 +1166,36 @@ fn handle_services_key(
             open_log_popup_for_name(app, store, item.name);
             redraw_modal(modal, app)?;
         }
+        KeyCode::Char('a') => {
+            // Bridge into the highlighted service's PTY.
+            if let Some(item) = highlighted_service_item(app) {
+                app.bridge_request = Some(item.name);
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// Run one bridge session against `name`, with a banner on each side.
+/// Returns a lifecycle message to emit after the TUI is rebuilt, if the
+/// session ended in a way worth narrating.
+async fn run_bridge(client: &std::sync::Arc<Client>, name: &str) -> Option<String> {
+    {
+        use std::io::Write;
+        let banner =
+            format!("── bridged into '{name}' — Ctrl+P Ctrl+Q returns to the dashboard ──\r\n");
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(banner.as_bytes());
+        let _ = stdout.flush();
+    }
+    match crate::client::attach::bridge_once(client.socket_path(), name).await {
+        crate::client::attach::BridgeEnd::Escape => None,
+        crate::client::attach::BridgeEnd::ServerDisconnect => Some(format!(
+            "'{name}' bridge ended (process exited or restarted)"
+        )),
+        crate::client::attach::BridgeEnd::Error(e) => Some(format!("attach '{name}' failed: {e}")),
+    }
 }
 
 fn handle_log_popup_key(key: KeyEvent, app: &mut App) {

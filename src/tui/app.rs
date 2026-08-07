@@ -202,6 +202,10 @@ pub(crate) struct App {
     /// Set by key handling (remote-mode Ctrl+D) to ask the main loop to
     /// exit cleanly, restoring the terminal, without a shutdown.
     pub(crate) exit_requested: bool,
+    /// Set by the overlay 'a' key: bridge the terminal into this item's
+    /// PTY. Consumed by the main loop, which tears the TUI down, runs the
+    /// bridge, and rebuilds.
+    pub(crate) bridge_request: Option<String>,
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
     pub(crate) verbose_enabled: bool,
@@ -298,6 +302,7 @@ impl App {
 
         Self {
             exit_requested: false,
+            bridge_request: None,
             counts,
             view_mode: ViewMode::Normal,
             verbose_enabled,
