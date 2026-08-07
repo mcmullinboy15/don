@@ -53,10 +53,11 @@ pub(crate) struct RuntimeService {
     /// PTY (docker, pipe mode) or no live process. Cleared wherever
     /// `osc_sink` is.
     pub pty_input: Option<tokio::sync::mpsc::Sender<crate::output::PtyInput>>,
-    /// Where the current scheduled start's ready outcome answers the
-    /// dependency sweep. `Some` only between a scheduled start's wiring and
-    /// its ready report; manual/rebuild starts leave it `None`.
-    pub(in crate::runner) pending_done: Option<tokio::sync::mpsc::Sender<super::ItemDone>>,
+    /// Whether the current start was asked for by the dependency sweep —
+    /// its ready outcome then drives the sweep-visible transition and the
+    /// "ready" lifecycle line; manual/rebuild starts instead close the
+    /// watch cycle with `RebuildComplete`.
+    pub(in crate::runner) scheduled_start: bool,
     /// Number of clients currently attached. Attach is multi-client
     /// (tmux-style shared input); the count drives the stdout-sink pause
     /// (paused while any client is attached) and the lifecycle events.
@@ -100,10 +101,11 @@ pub(crate) struct RuntimeService {
     pub control_reply: Option<oneshot::Sender<CommandResult>>,
     /// Follow-up action to run after the current stop completes.
     pub stop_action: ServiceStopAction,
-    /// In-flight start-preparation worker (download/build) for this service.
-    /// Monotonic generation for start-preparation workers so stale
-    /// completions can be ignored.
-    pub start_generation: u64,
+    /// Token for the in-flight lazy JIT build, so a stale build completion
+    /// (superseded by a newer connection-triggered build) is ignored. Only
+    /// the lazy build path uses this — every other completion is ordered by
+    /// construction on the report channel.
+    pub lazy_build_token: u64,
     /// In-flight rebuild-preparation worker (build only) for this service.
     pub rebuild_worker: Option<tokio::task::JoinHandle<()>>,
     /// Monotonic generation for rebuild workers so stale completions can
@@ -137,7 +139,7 @@ impl RuntimeService {
             output_worker: None,
             osc_sink: None,
             pty_input: None,
-            pending_done: None,
+            scheduled_start: false,
             attach_count: 0,
             proxy_view: None,
             resolved_watch_paths: Vec::new(),
@@ -151,7 +153,7 @@ impl RuntimeService {
             control_generation: 0,
             control_reply: None,
             stop_action: ServiceStopAction::None,
-            start_generation: 0,
+            lazy_build_token: 0,
             rebuild_worker: None,
             rebuild_generation: 0,
             rebuild_stale: false,

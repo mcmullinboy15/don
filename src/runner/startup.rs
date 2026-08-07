@@ -175,8 +175,8 @@ impl Runner {
     pub(in crate::runner) fn spawn_lazy_build(&mut self, name: &str, item: BatchBuildItem) {
         let generation = match self.services.get_mut(name) {
             Some(rs) => {
-                rs.start_generation = rs.start_generation.saturating_add(1);
-                rs.start_generation
+                rs.lazy_build_token = rs.lazy_build_token.saturating_add(1);
+                rs.lazy_build_token
             }
             None => return,
         };
@@ -617,11 +617,7 @@ impl Runner {
                 self.report_skipped_non_blocking_dependencies(&name, &skipped);
                 self.output_manager
                     .service_debug_event(&name, "start triggered (deps satisfied)");
-                if let Err(e) = self.queue_scheduled_service_start(
-                    &name,
-                    done_tx.clone(),
-                    ServiceStartMode::Full,
-                ) {
+                if let Err(e) = self.queue_scheduled_service_start(&name, ServiceStartMode::Full) {
                     self.set_service_state(&name, ServiceState::Failed);
                     self.output_manager
                         .service_error_event(&name, &e.to_string());

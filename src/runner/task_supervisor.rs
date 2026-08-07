@@ -499,7 +499,6 @@ impl TaskRunOutcome {
                         message,
                         elapsed: Some(elapsed),
                         last_run: Some(last_run),
-                        service_start_generation: None,
                         task_run_generation: None,
                     })
                     .await;

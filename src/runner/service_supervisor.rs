@@ -35,10 +35,6 @@ pub(in crate::runner) struct StartRequest {
     pub(in crate::runner) context: Box<ServiceStartContext>,
     pub(in crate::runner) mode: ServiceStartMode,
     pub(in crate::runner) intent: ServiceStartIntent,
-    /// The runner's start generation for this request, echoed in every
-    /// report about the run so the fold's interim currency guards keep
-    /// working until the generations die.
-    pub(in crate::runner) op_id: u64,
     /// Allocate new ephemeral backend ports before spawning. Set on the
     /// restart path so the new process binds a fresh port while draining
     /// connections to the old one finish undisturbed.
@@ -284,7 +280,6 @@ async fn supervise(
                             && report_tx
                                 .send(super::ItemReport::ServiceReady {
                                     name: name.clone(),
-                                    op_id: outcome.op_id,
                                     success: outcome.success,
                                     message: outcome.message,
                                     had_check: outcome.had_check,
@@ -318,7 +313,6 @@ async fn supervise(
             mode,
             intent,
             fresh_backend_ports,
-            op_id,
         } = match command {
             ServiceCommand::Start(request) => request,
             ServiceCommand::Proxy(directive) => {
@@ -504,14 +498,13 @@ async fn supervise(
                 match ready_parts {
                     Some((Some(ready), exit_rx, cancel_rx)) => {
                         ready_pending = Some(spawn_ready_racer(
-                            &name, op_id, ready, exit_rx, cancel_rx, &report_tx,
+                            &name, ready, exit_rx, cancel_rx, &report_tx,
                         ));
                     }
                     Some((None, _exit_rx, _cancel_rx))
                         if report_tx
                             .send(super::ItemReport::ServiceReady {
                                 name: name.clone(),
-                                op_id,
                                 success: true,
                                 message: None,
                                 had_check: false,
@@ -685,7 +678,6 @@ async fn wire_spawn(
 
 /// What the ready racer settles into, forwarded by the supervisor loop.
 struct ReadyOutcome {
-    op_id: u64,
     success: bool,
     message: Option<String>,
     had_check: bool,
@@ -732,7 +724,6 @@ fn resolve_supervisor_ready(
 /// supervisor loop, which forwards it on the report channel.
 fn spawn_ready_racer(
     name: &str,
-    op_id: u64,
     ready: crate::config::ReadyCheck,
     exit_rx: tokio::sync::oneshot::Receiver<()>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
@@ -761,7 +752,6 @@ fn spawn_ready_racer(
             });
         }
         let _ = ready_tx.send(ReadyOutcome {
-            op_id,
             success,
             message: result.err().map(|e| e.to_string()),
             had_check: true,

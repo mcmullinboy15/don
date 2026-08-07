@@ -179,7 +179,6 @@ impl Runner {
                         message: outcome.failure_message(),
                         elapsed: None,
                         last_run: None,
-                        service_start_generation: None,
                         task_run_generation: None,
                     })
                     .await;

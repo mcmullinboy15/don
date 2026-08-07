@@ -77,9 +77,9 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 enum ServiceStartIntent {
-    Scheduled {
-        done_tx: mpsc::Sender<ItemDone>,
-    },
+    /// The dependency sweep asked for this start; the ready outcome drives
+    /// the sweep-visible transition.
+    Scheduled,
     Reply {
         reply: oneshot::Sender<CommandResult>,
     },
@@ -487,7 +487,6 @@ pub(in crate::runner) enum ItemReport {
     /// supervisor loop, so it always trails its own prepared report.
     ServiceReady {
         name: String,
-        op_id: u64,
         success: bool,
         message: Option<String>,
         had_check: bool,
@@ -1861,15 +1860,12 @@ impl Runner {
                             }
                             ItemReport::ServiceReady {
                                 name,
-                                op_id,
                                 success,
                                 message,
                                 had_check,
                             } => {
-                                self.handle_service_ready_report(
-                                    &name, op_id, success, message, had_check,
-                                )
-                                .await;
+                                self.handle_service_ready_report(&name, success, message, had_check)
+                                    .await;
                             }
                             ItemReport::ServiceStopComplete { name, op_id, result } => {
                                 self.handle_service_stop_complete(&name, op_id, result).await;
@@ -2456,7 +2452,7 @@ mod tests {
         let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
         if let Some(service) = runner.services.get_mut("api") {
             service.resolved.lazy = true;
-            service.start_generation = 2;
+            service.lazy_build_token = 2;
         }
         runner.set_service_state("api", ServiceState::Building);
 
@@ -2536,54 +2532,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ready_check_completion_requires_current_running_generation() {
+    async fn ready_report_folds_only_in_running_state() {
         struct Case {
             name: &'static str,
             state: ServiceState,
-            current_generation: u64,
-            completion_generation: u64,
             success: bool,
             expected: ServiceState,
         }
 
+        // Staleness by generation is unrepresentable now: the supervisor
+        // clears a pending outcome on any newer Start/Stop, and outcomes
+        // arrive after their own wired report on one channel. What is left
+        // to guard is state: a crash's exit report folding first moves the
+        // service out of Running, and the outcome must then be inert.
         let cases = vec![
             Case {
-                name: "stopped service ignores same-generation completion",
+                name: "stopped service ignores a completion",
                 state: ServiceState::Stopped,
-                current_generation: 2,
-                completion_generation: 2,
                 success: true,
                 expected: ServiceState::Stopped,
             },
             Case {
-                name: "newer running service ignores stale success",
-                state: ServiceState::Running,
-                current_generation: 2,
-                completion_generation: 1,
+                name: "failed service ignores a completion",
+                state: ServiceState::Failed,
                 success: true,
-                expected: ServiceState::Running,
+                expected: ServiceState::Failed,
             },
             Case {
-                name: "newer running service ignores stale failure",
+                name: "running service accepts success",
                 state: ServiceState::Running,
-                current_generation: 2,
-                completion_generation: 1,
-                success: false,
-                expected: ServiceState::Running,
-            },
-            Case {
-                name: "current running service accepts success",
-                state: ServiceState::Running,
-                current_generation: 2,
-                completion_generation: 2,
                 success: true,
                 expected: ServiceState::Ready,
             },
             Case {
-                name: "current running service accepts failure",
+                name: "running service accepts failure",
                 state: ServiceState::Running,
-                current_generation: 2,
-                completion_generation: 2,
                 success: false,
                 expected: ServiceState::Failed,
             },
@@ -2592,17 +2575,11 @@ mod tests {
         for case in cases {
             let temp = tempfile::tempdir().unwrap();
             let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-            if let Some(service) = runner.services.get_mut("api") {
-                service.start_generation = case.current_generation;
-            }
             runner.set_service_state("api", case.state);
 
-            runner.handle_ready_check_complete(
-                "api",
-                case.completion_generation,
-                case.success,
-                None,
-            );
+            runner
+                .handle_service_ready_report("api", case.success, None, true)
+                .await;
 
             assert_eq!(
                 runner.services.get("api").map(|service| service.state()),
@@ -2611,32 +2588,6 @@ mod tests {
                 case.name,
             );
         }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn scheduled_service_completion_ignores_stale_generation() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-        if let Some(service) = runner.services.get_mut("api") {
-            service.start_generation = 2;
-        }
-        runner.set_service_state("api", ServiceState::Running);
-
-        runner.handle_item_done(&ItemDone {
-            name: "api".to_string(),
-            kind: NodeKind::Service,
-            success: true,
-            message: None,
-            elapsed: None,
-            last_run: None,
-            service_start_generation: Some(1),
-            task_run_generation: None,
-        });
-
-        assert_eq!(
-            runner.services.get("api").map(|service| service.state()),
-            Some(ServiceState::Running),
-        );
     }
 
     /// Regression: a watched file changes *during* a bazel build. The build

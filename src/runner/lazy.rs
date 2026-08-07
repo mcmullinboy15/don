@@ -93,7 +93,7 @@ impl Runner {
             self.lazy_build_handles.remove(name);
         }
         let is_current_build = self.services.get(name).is_some_and(|rs| {
-            rs.start_generation == generation && rs.state() == ServiceState::Building
+            rs.lazy_build_token == generation && rs.state() == ServiceState::Building
         });
         if !is_current_build {
             return;

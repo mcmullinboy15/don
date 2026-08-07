@@ -1,7 +1,5 @@
 use super::support::format_duration;
-use super::{
-    CommandError, CommandResult, NodeKind, Runner, RunnerEvent, ServiceState, TaskItemState,
-};
+use super::{CommandError, CommandResult, NodeKind, Runner, RunnerEvent, TaskItemState};
 
 /// Completion notification from a spawned item.
 pub(in crate::runner) struct ItemDone {
@@ -13,9 +11,6 @@ pub(in crate::runner) struct ItemDone {
     pub(in crate::runner) elapsed: Option<std::time::Duration>,
     /// Metadata for a task process that actually ran.
     pub(in crate::runner) last_run: Option<crate::task_state::TaskRunInfo>,
-    /// Start generation for service completions. A completion from an older
-    /// spawn must not mutate the state of a newer or already-stopped service.
-    pub(in crate::runner) service_start_generation: Option<u64>,
     /// Run generation for manually-triggered task completions that need to
     /// re-notify startup dependency resolution. `None` for normal startup
     /// item completions.
@@ -34,101 +29,12 @@ pub(in crate::runner) struct TaskExit {
 }
 
 impl Runner {
-    /// Handle an item completion notification.
+    /// Handle an item completion notification. Services no longer produce
+    /// these — their ready outcomes fold directly from the report channel.
     pub(in crate::runner) fn handle_item_done(&mut self, item: &ItemDone) {
         match item.kind {
-            NodeKind::Service => self.handle_service_done(item),
+            NodeKind::Service => {}
             NodeKind::Task => self.handle_task_done(item),
-        }
-    }
-
-    fn handle_service_done(&mut self, item: &ItemDone) {
-        let is_current_running_generation =
-            item.service_start_generation.is_some_and(|generation| {
-                self.services.get(&item.name).is_some_and(|rs| {
-                    rs.start_generation == generation && rs.state() == ServiceState::Running
-                })
-            });
-        if !is_current_running_generation {
-            return;
-        }
-
-        if item.success {
-            // Report the address actually probed, not the configured template.
-            // `effective_ready_check` is what the probe itself ran against, so
-            // going through it keeps this line, `don status -v`, and reality in
-            // agreement — printing `${PORT}` here told the user nothing about
-            // which port was checked.
-            let message = self.services.get(&item.name).map(|rs| {
-                match self.effective_ready_check(&item.name, &rs.resolved) {
-                    Some(r) if r.tcp.is_some() => {
-                        format!("ready (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
-                    }
-                    Some(r) if r.http.is_some() => {
-                        format!("ready (http {})", r.http.as_deref().unwrap_or("unknown"))
-                    }
-                    Some(r) if r.exec.is_some() => "ready (exec)".to_string(),
-                    _ => "started".to_string(),
-                }
-            });
-            // Re-activate the proxy backend on ready. The supervisor already
-            // activates at wire time; this covers a backend cleared between
-            // wire and ready (e.g. a rebuild's ClearBackend landing late).
-            if self
-                .services
-                .get(&item.name)
-                .is_some_and(|rs| rs.proxy_view.is_some())
-            {
-                self.send_proxy_directive(
-                    &item.name,
-                    super::service_supervisor::ProxyDirective::SetBackend,
-                );
-            }
-            // Reaching Ready resets the backoff counter, but not the
-            // rapid-crash streak — see `handle_service_exited`, which clears
-            // that only once the process has survived past the crash window.
-            if let Some(rs) = self.services.get_mut(&item.name) {
-                if let Some(handle) = rs.pending_restart.take() {
-                    handle.abort();
-                }
-                rs.restart_attempts = 0;
-            }
-            self.set_service_state(&item.name, ServiceState::Ready);
-            if let Some(message) = message {
-                self.output_manager.service_event(&item.name, &message);
-            }
-        } else {
-            // If a lazy service fails, reset to Lazy so the next connection
-            // can re-trigger it instead of leaving it permanently failed.
-            let is_lazy = self
-                .services
-                .get(&item.name)
-                .is_some_and(|rs| rs.resolved.lazy && rs.proxy_view.is_some());
-            if is_lazy {
-                // Route through the crash-loop guard: returns to `Lazy` and
-                // re-arms the proxy trigger normally, but gives up (leaving it
-                // `Failed`, trigger un-armed) once it has crashed on launch too
-                // many times in a row — otherwise a still-queued connection
-                // relaunches a dying service in a tight, no-backoff loop.
-                self.handle_lazy_launch_failure(&item.name, item.message.as_deref());
-            } else {
-                self.set_service_state(&item.name, ServiceState::Failed);
-                if let Some(ref msg) = item.message {
-                    self.output_manager.service_error_event(&item.name, msg);
-                }
-                let policy = self
-                    .services
-                    .get(&item.name)
-                    .map(|rs| rs.resolved.on_failure)
-                    .unwrap_or_default();
-                if matches!(policy, crate::config::OnFailure::Restart) {
-                    let reason = item
-                        .message
-                        .as_deref()
-                        .unwrap_or("service failed before becoming ready");
-                    self.schedule_auto_restart(&item.name, reason, true);
-                }
-            }
         }
     }
 
@@ -244,7 +150,6 @@ impl Runner {
                             message: None,
                             elapsed: None,
                             last_run: None,
-                            service_start_generation: None,
                             task_run_generation: run_generation,
                         })
                         .await;

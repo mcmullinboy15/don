@@ -1,10 +1,10 @@
 use super::service_worker::{ServiceStartContext, ServiceStartMode, run_service_build_worker};
 use super::{
-    CommandError, CommandResult, ItemDone, NodeKind, Runner, RunnerEvent, RunnerInternalCommand,
-    ServiceStartIntent, ServiceState, ServiceStopAction,
+    CommandError, CommandResult, Runner, RunnerEvent, RunnerInternalCommand, ServiceStartIntent,
+    ServiceState, ServiceStopAction,
 };
 use std::collections::HashMap;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 impl Runner {
     fn lookup_service(&self, name: &str) -> Result<&crate::config::Service, CommandError> {
@@ -69,20 +69,12 @@ impl Runner {
                 name: name.to_string(),
             });
         };
-        let op_id = match self.services.get_mut(name) {
-            Some(rs) => {
-                rs.start_generation = rs.start_generation.saturating_add(1);
-                rs.start_generation
-            }
-            None => 0,
-        };
         if !handle.request(super::service_supervisor::ServiceCommand::Start(
             super::service_supervisor::StartRequest {
                 context: Box::new(context),
                 mode,
                 intent,
                 fresh_backend_ports,
-                op_id,
             },
         )) {
             return Err(CommandError::Failed {
@@ -105,22 +97,17 @@ impl Runner {
                 .await;
             return;
         }
-        // The supervisor only reports the start it is committed to, so the
-        // service's current generation *is* this start's. Downstream still
-        // needs it: the dependency sweep uses it to recognise its own start.
-        let op_id = self.services.get(name).map_or(0, |rs| rs.start_generation);
-
         match result {
             Ok(wired) => match intent {
-                ServiceStartIntent::Scheduled { done_tx } => {
-                    self.handle_service_wired(name, *wired, Some(done_tx)).await;
+                ServiceStartIntent::Scheduled => {
+                    self.handle_service_wired(name, *wired, true).await;
                 }
                 ServiceStartIntent::Reply { reply } => {
-                    self.handle_service_wired(name, *wired, None).await;
+                    self.handle_service_wired(name, *wired, false).await;
                     let _ = reply.send(Ok(()));
                 }
                 ServiceStartIntent::Background => {
-                    self.handle_service_wired(name, *wired, None).await;
+                    self.handle_service_wired(name, *wired, false).await;
                 }
             },
             Err(message) => {
@@ -136,20 +123,10 @@ impl Runner {
                     rs.reset_restart_tracking();
                 }
                 match intent {
-                    ServiceStartIntent::Scheduled { done_tx } => {
-                        let _ = done_tx
-                            .send(ItemDone {
-                                name: name.to_string(),
-                                kind: NodeKind::Service,
-                                success: false,
-                                message: Some(message),
-                                elapsed: None,
-                                last_run: None,
-                                service_start_generation: Some(op_id),
-                                task_run_generation: None,
-                            })
-                            .await;
-                    }
+                    // The failure handling above (Failed state + optional
+                    // auto-restart) is the whole answer for a scheduled
+                    // start: the Failed transition re-schedules the sweep.
+                    ServiceStartIntent::Scheduled => {}
                     ServiceStartIntent::Reply { reply } => {
                         let _ = reply.send(Err(CommandError::Failed {
                             name: name.to_string(),
@@ -334,7 +311,6 @@ impl Runner {
     pub(in crate::runner) fn queue_scheduled_service_start(
         &mut self,
         name: &str,
-        done_tx: mpsc::Sender<ItemDone>,
         mode: ServiceStartMode,
     ) -> Result<(), CommandError> {
         if self.shutting_down {
@@ -346,13 +322,7 @@ impl Runner {
         let context = self.service_start_snapshot(name)?;
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "starting...");
-        self.spawn_service_start_worker(
-            name,
-            context,
-            mode,
-            ServiceStartIntent::Scheduled { done_tx },
-            false,
-        )
+        self.spawn_service_start_worker(name, context, mode, ServiceStartIntent::Scheduled, false)
     }
 
     pub(in crate::runner) async fn handle_start_service_cmd(
@@ -680,72 +650,6 @@ impl Runner {
         self.output_manager
             .service_event(name, "stopping... (requested)");
         self.send_service_stop(name, shutdown_config, false, reply, ServiceStopAction::None);
-    }
-
-    /// Runner-internal handler for [`RunnerInternalCommand::ReadyCheckComplete`].
-    ///
-    /// Emitted by the async ready-check task inside
-    /// [`wire_service_output_and_ready_check`] when there's no `done_tx`
-    /// (manual start or rebuild). Updates the runner's own state — the
-    /// broadcast follows via `set_service_state`.
-    ///
-    /// On failure, mirrors `handle_service_done`'s lazy-retry behaviour so
-    /// a proxied lazy service resets to `Lazy` instead of getting stuck on
-    /// `Failed`.
-    pub(in crate::runner) fn handle_ready_check_complete(
-        &mut self,
-        name: &str,
-        generation: u64,
-        success: bool,
-        message: Option<String>,
-    ) {
-        let is_current_running_generation = self.services.get(name).is_some_and(|rs| {
-            rs.start_generation == generation && rs.state() == ServiceState::Running
-        });
-        if !is_current_running_generation {
-            return;
-        }
-        if success {
-            // Backoff resets on Ready; the rapid-crash streak does not (it is
-            // cleared only by a sufficiently long-lived run, a clean exit, or
-            // manual intervention) so a service that flaps ready→crash→ready
-            // can still trip the crash-loop ceiling.
-            if let Some(rs) = self.services.get_mut(name) {
-                if let Some(handle) = rs.pending_restart.take() {
-                    handle.abort();
-                }
-                rs.restart_attempts = 0;
-            }
-            self.set_service_state(name, ServiceState::Ready);
-            return;
-        }
-        let is_lazy = self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.resolved.lazy && rs.proxy_view.is_some());
-        if is_lazy {
-            // Route through the crash-loop guard so a lazy service that keeps
-            // dying on launch is eventually left `Failed` with its proxy
-            // trigger un-armed, instead of being relaunched in a tight loop by
-            // a still-queued connection. See `handle_lazy_launch_failure`.
-            self.handle_lazy_launch_failure(name, message.as_deref());
-        } else {
-            self.set_service_state(name, ServiceState::Failed);
-            let policy = self
-                .services
-                .get(name)
-                .map(|rs| rs.resolved.on_failure)
-                .unwrap_or_default();
-            if matches!(policy, crate::config::OnFailure::Restart) {
-                self.schedule_auto_restart(
-                    name,
-                    message
-                        .as_deref()
-                        .unwrap_or("service failed before becoming ready"),
-                    true,
-                );
-            }
-        }
     }
 
     pub(in crate::runner) async fn handle_restart_service_cmd(
