@@ -6,8 +6,6 @@
 //! Communication uses channels: `mpsc` for commands in, `broadcast` for events out.
 
 mod attach;
-mod build_batcher;
-mod build_tools;
 mod completions;
 mod env_refs;
 mod events;
@@ -24,8 +22,7 @@ mod setup;
 mod shutdown;
 mod startup;
 mod state;
-pub(crate) mod state_store;
-mod status;
+pub(crate) mod status;
 mod support;
 mod task_commands;
 mod watch_link;
@@ -35,16 +32,25 @@ mod watch_link;
 // These aliases keep the runner's internal paths stable and the shared state
 // vocabulary on its public `don::runner::…` path.
 pub use crate::command::{CommandError, CommandResult};
+
+// The batch-build workers and the batcher actor live in `crate::build_tool`;
+// the state projection and its `ProcessStatus` vocabulary at the crate root.
+// Aliases keep the runner's internal paths and the public `don::runner::…`
+// surface stable.
+pub(in crate::runner) use crate::build_tool::{batch as build_tools, batcher as build_batcher};
 pub(crate) use crate::process::{ProcessKind, ProcessReport};
 pub(in crate::runner) use crate::process::{
     ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, health, paths,
     service_supervisor, service_worker, task_supervisor, task_worker,
 };
 pub use crate::process::{ServiceState, TaskState};
+pub(in crate::runner) use crate::state_store;
+pub use crate::state_store::{
+    ParamInfo, ProcessStatus, StateReader, StateSnapshot, VerboseInfo, all_services_ready,
+};
 
 pub(crate) use params::resolve_task_params;
 pub use profile::resolve_profile_processes;
-pub use state_store::{StateReader, StateSnapshot};
 
 use crate::config::{Config, Platform, ShutdownConfig};
 use crate::output::OutputManager;
@@ -303,141 +309,6 @@ pub struct AttachSession {
     pub output_rx: mpsc::Receiver<crate::output::SinkLine>,
 }
 
-/// Status of a single process (service or task) for status queries.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum ProcessStatus {
-    Service {
-        name: String,
-        state: ServiceState,
-        /// Root service/task failures blocking this process.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        failed_dependencies: Vec<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        verbose: Option<VerboseInfo>,
-    },
-    Task {
-        name: String,
-        state: TaskState,
-        /// Root service/task failures blocking this process.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        failed_dependencies: Vec<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        last_run: Option<crate::task_state::TaskRunInfo>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        verbose: Option<VerboseInfo>,
-    },
-}
-
-/// One task param, as a client needs to see it to build a run form.
-///
-/// Deliberately not [`crate::config::TaskParam`] itself: that carries the
-/// `completions` shell command, which is an implementation detail of the
-/// daemon and has no business crossing to a browser. Clients learn only
-/// *that* a param has dynamic completions, and ask for the values.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ParamInfo {
-    /// Param identifier, as passed to `POST /run/:task`.
-    pub name: String,
-    /// Human-readable label; falls back to `name` when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-    /// Whether the task refuses to run without a value.
-    pub required: bool,
-    /// Value used when the client doesn't supply one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default: Option<String>,
-    /// One of `string`, `int`, `bool`, `choice`.
-    pub kind: String,
-    /// Fixed candidate values, when the config lists them inline.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub choices: Vec<String>,
-    /// Whether candidates come from a completion command — fetch them from
-    /// the completions endpoint rather than expecting `choices`.
-    #[serde(default)]
-    pub has_completions: bool,
-    /// Lower bound for `int` params.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min: Option<i64>,
-    /// Upper bound for `int` params.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max: Option<i64>,
-}
-
-impl ParamInfo {
-    /// Project a configured param into its client-visible shape.
-    pub(crate) fn from_config(param: &crate::config::TaskParam) -> Self {
-        use crate::config::ParamKind;
-        Self {
-            name: param.name.clone(),
-            prompt: param.prompt.clone(),
-            required: param.required,
-            default: param.default.clone(),
-            kind: match param.kind {
-                ParamKind::String => "string",
-                ParamKind::Int => "int",
-                ParamKind::Bool => "bool",
-                ParamKind::Choice => "choice",
-            }
-            .to_string(),
-            choices: param.choices.clone(),
-            has_completions: param.completions.is_some(),
-            min: param.validate.as_ref().and_then(|v| v.min),
-            max: param.validate.as_ref().and_then(|v| v.max),
-        }
-    }
-}
-
-/// Extended information for verbose status display.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct VerboseInfo {
-    /// Services/tasks this process depends on. Non-blocking (ordering-only)
-    /// edges serialize as `{ name, blocking = false }`, blocking ones as a
-    /// string.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<crate::config::Dependency>,
-    /// File watch patterns (explicit or resolved from build tool).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub watch: Vec<String>,
-    /// Number of file watch patterns resolved for this process.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub watch_count: usize,
-    /// Proxy entries, each formatted as `"addr (env=NAME)"` or
-    /// `"addr (listenfd)"` for display.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub proxy: Vec<String>,
-    /// Active Docker mappings, formatted with actual host addresses.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub docker_ports: Vec<String>,
-    /// Active Don-managed proxy connections. Present only for env/forward
-    /// proxy entries; listenfd connections are owned by the child process.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy_active_connections: Option<usize>,
-    /// Bazel target (if configured).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bazel_target: Option<String>,
-    /// Params a task declares, so a client can render a run form without
-    /// reading `don.toml` itself. Empty for services.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub params: Vec<ParamInfo>,
-    /// Ready check description.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ready: Option<String>,
-    /// Run command.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cmd: Option<String>,
-    /// Live watch-manager state for this process, if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub watch_state: Option<String>,
-    /// Extra watch diagnostics for this process.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub watch_notes: Vec<String>,
-}
-
-fn is_zero(value: &usize) -> bool {
-    *value == 0
-}
-
 /// A global snapshot of everything the file watcher is monitoring right now,
 /// independent of any single service. Returned by `GET /watch` / `don watch`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -493,24 +364,6 @@ pub struct WatchReportItem {
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
-}
-
-/// Whether every service in `processes` has reached an available state — `Ready`
-/// (passed its ready check) or `Lazy` (proxy bound, will spawn on first
-/// connection). Tasks are ignored: they are one-shot and do not gate stack
-/// readiness. An process set with no services is considered ready.
-///
-/// This is the bool surfaced by `don status --json`, so scripts and agents can
-/// poll "is the whole stack up?" without parsing the human-readable table.
-/// Status only ever reports the active set (the started profile's subset), so
-/// services excluded by a profile do not drag this to `false`.
-pub fn all_services_ready(processes: &[ProcessStatus]) -> bool {
-    processes.iter().all(|process| match process {
-        ProcessStatus::Service { state, .. } => {
-            matches!(state, ServiceState::Ready | ServiceState::Lazy)
-        }
-        ProcessStatus::Task { .. } => true,
-    })
 }
 
 /// An event broadcast from the runner for external consumers.

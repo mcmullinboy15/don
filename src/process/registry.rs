@@ -19,7 +19,7 @@
 //! nothing to synchronise. If processes ever became dynamic this needs the
 //! [`StateWriter`]/[`StateReader`] treatment rather than a mutex.
 //!
-//! [`StateWriter`]: super::state_store::StateWriter
+//! [`StateWriter`]: crate::state_store::StateWriter
 //! [`StateReader`]: super::StateReader
 
 use std::collections::HashMap;

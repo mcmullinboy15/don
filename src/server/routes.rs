@@ -755,8 +755,8 @@ fn error_body(message: &str) -> serde_json::Value {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::runner::state_store::{self, StateSnapshot};
     use crate::runner::{ServiceState, StateReader};
+    use crate::state_store::{self, StateSnapshot};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;

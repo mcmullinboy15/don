@@ -1,5 +1,5 @@
-use super::ProcessKind;
-use super::paths::any_glob_path_changed_since;
+use crate::process::ProcessKind;
+use crate::process::paths::any_glob_path_changed_since;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

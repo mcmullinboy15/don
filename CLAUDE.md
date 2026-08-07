@@ -231,7 +231,7 @@ src/
     paths.rs                # watch-path staleness checks
   runner/
     mod.rs                  # scheduler — dependency graph, startup/shutdown order, folds ProcessReports
-    state_store.rs          # runner-written / world-readable state projection
+  state_store.rs            # runner-written / world-readable state projection + ProcessStatus
   sys/
     mod.rs                  # process group management, PTY spawning, identity tracking
     pid_file.rs             # PID file locking (flock-based) for single-instance guard

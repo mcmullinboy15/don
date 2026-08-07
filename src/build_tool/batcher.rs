@@ -31,17 +31,18 @@ use std::collections::HashMap;
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::build_tools::{
+use super::batch::{
     BazelRebuildItem, GraphRequeryOutcomeItem, GraphRequeryRequestItem, RebuildBatchOutcome,
     RebuildBatchRequest, run_graph_requery_worker, run_rebuild_batch_worker,
 };
-use super::state_store::StateReader;
-use super::{ProcessStatus, ServiceState};
 use crate::build_tool::manager::{BatchDue, BuildBatcher};
 use crate::output::LifecycleEmitter;
+use crate::process::ServiceState;
+use crate::state_store::ProcessStatus;
+use crate::state_store::StateReader;
 
 /// What one queued rebuild is, captured at queue time.
-pub(in crate::runner) enum RebuildSpec {
+pub(crate) enum RebuildSpec {
     /// A bazel-built service: the batch runs `bazel build` for its target.
     Bazel(BazelRebuildItem),
     /// A build-tool-managed service with no bazel target (shouldn't happen,
@@ -60,7 +61,7 @@ impl RebuildSpec {
 }
 
 /// Everything the batcher can be asked to do.
-pub(in crate::runner) enum BatchRequest {
+pub(crate) enum BatchRequest {
     /// Queue a rebuild and (re)open the batch window.
     QueueRebuild { spec: RebuildSpec },
     /// Queue a build-graph re-query and (re)open its window.
@@ -77,7 +78,7 @@ pub(in crate::runner) enum BatchRequest {
 }
 
 /// A finished batch, forwarded to the runner for application.
-pub(in crate::runner) enum BatchOutcome {
+pub(crate) enum BatchOutcome {
     Rebuilds(RebuildBatchOutcome),
     Requeries(Vec<GraphRequeryOutcomeItem>),
 }
@@ -90,7 +91,7 @@ enum WorkerDone {
 
 /// Spawn the batcher task. Returns its mailbox, the outcome channel the
 /// runner folds, and the task handle (joined bounded at shutdown).
-pub(in crate::runner) fn spawn(
+pub(crate) fn spawn(
     state: StateReader,
     emitter: LifecycleEmitter,
 ) -> (
@@ -327,7 +328,7 @@ mod tests {
     use super::*;
     use crate::config::LogConfig;
     use crate::output::OutputManager;
-    use crate::runner::state_store::{self, StateSnapshot, StateWriter};
+    use crate::state_store::{self, StateSnapshot, StateWriter};
     use std::time::Duration;
 
     async fn test_emitter() -> LifecycleEmitter {

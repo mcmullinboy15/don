@@ -17,6 +17,7 @@ pub(crate) mod proxy;
 pub mod runner;
 pub mod server;
 pub mod signals;
+pub mod state_store;
 pub mod sys;
 pub mod task_state;
 pub(crate) mod tui;

@@ -11,6 +11,8 @@
 //! - **Tier 2**: Watch resolved source directories. These are the directories
 //!   the build tool reports as inputs for a given target.
 
+pub(crate) mod batch;
+pub(crate) mod batcher;
 pub(crate) mod bazel;
 pub(crate) mod manager;
 
