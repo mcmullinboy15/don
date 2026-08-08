@@ -3,6 +3,7 @@ pub mod client;
 pub mod command;
 pub mod completions;
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub(crate) mod docker;
 pub mod download;

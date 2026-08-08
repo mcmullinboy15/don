@@ -407,6 +407,8 @@ pub struct Runner {
     /// server at bind time — the runner itself never resolves completions.
     completions: crate::param_completions::CompletionResolver,
 
+    /// Name -> kind facts, so a client's 404 never wakes the scheduler.
+    catalog: std::sync::Arc<crate::control::ProcessCatalog>,
     /// Where every service can be reached, published for supervisors that
     /// render their own `$(peer.KEY)` env references. See
     /// [`crate::endpoints`].
@@ -503,6 +505,12 @@ impl Runner {
         // proxy at spawn below; the runner keeps only the view. Lazy services
         // get a per-service trigger channel whose receiving half rides along,
         // and the supervisor forwards each trigger as a demand report.
+        let catalog = std::sync::Arc::new(crate::control::ProcessCatalog::new(
+            &config,
+            services.keys().cloned().collect(),
+            tasks.keys().cloned().collect(),
+        ));
+
         // One gate per process, created before any supervisor so each can be
         // handed its own reader at spawn.
         let gate_names: Vec<String> = services.keys().chain(tasks.keys()).cloned().collect();
@@ -636,6 +644,7 @@ impl Runner {
             event_tx,
             state,
             start_gates,
+            catalog,
             gate_recompute_scheduled: false,
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
@@ -952,6 +961,11 @@ impl Runner {
     /// [`crate::watch::report::WatchStatusReader`].
     pub fn watch_status_reader(&self) -> crate::watch::report::WatchStatusReader {
         self.watch_status_reader.clone()
+    }
+
+    /// The control plane for clients: see [`crate::control::ProcessControl`].
+    pub fn process_control(&self) -> crate::control::ProcessControl {
+        crate::control::ProcessControl::new(self.catalog.clone(), self.cmd_tx.clone())
     }
 
     /// Mint the attach handle for the API server; see

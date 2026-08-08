@@ -73,6 +73,9 @@ pub(crate) struct ApiState {
     /// Read-only handle for the global watch report — `GET /watch` queries
     /// the watch manager directly, without the runner.
     pub watch_status: crate::watch::report::WatchStatusReader,
+    /// What a client may ask a process to do. Name checks are answered here
+    /// without waking the scheduler; the rest is addressed at supervisors.
+    pub control: crate::control::ProcessControl,
     /// Attach sessions, opened against the per-process output state where
     /// the supervisor registered the live spawn's PTY gate. Detach is the
     /// session guard dropping — there is no request for it.
@@ -149,6 +152,7 @@ pub async fn serve_api(
     completions: crate::param_completions::CompletionResolver,
     watch_status: crate::watch::report::WatchStatusReader,
     attach: crate::output::attach::AttachControl,
+    control: crate::control::ProcessControl,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);
@@ -165,6 +169,7 @@ pub async fn serve_api(
         completions,
         watch_status,
         attach,
+        control,
         shutdown: shutdown.clone(),
     });
     let app = routes::build_router(state);
@@ -201,6 +206,7 @@ pub fn serve_for_runner(
     let completions = runner.completion_resolver();
     let watch_status = runner.watch_status_reader();
     let attach = runner.attach_control();
+    let control = runner.process_control();
     let path = socket_path.to_path_buf();
     let display = socket_path.display().to_string();
     // Deliberately NO LifecycleEmitter in this task: an emitter holds a
@@ -221,6 +227,7 @@ pub fn serve_for_runner(
             completions,
             watch_status,
             attach,
+            control,
             shutdown_rx,
         )
         .await

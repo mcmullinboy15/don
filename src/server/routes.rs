@@ -252,29 +252,20 @@ struct WatchResponse {
 
 /// `POST /start/:name` — start a stopped service.
 async fn post_start(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
-    dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::Start {
-        name,
-        reply,
-    })
-    .await
+    let reply = state.control.start(&name).await;
+    map_command_reply(&name, reply, StatusCode::INTERNAL_SERVER_ERROR).await
 }
 
 /// `POST /stop/:name` — stop a running service.
 async fn post_stop(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
-    dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::Stop {
-        name,
-        reply,
-    })
-    .await
+    let reply = state.control.stop(&name).await;
+    map_command_reply(&name, reply, StatusCode::INTERNAL_SERVER_ERROR).await
 }
 
 /// `POST /restart/:name` — restart a service.
 async fn post_restart(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
-    dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::Restart {
-        name,
-        reply,
-    })
-    .await
+    let reply = state.control.restart(&name).await;
+    map_command_reply(&name, reply, StatusCode::INTERNAL_SERVER_ERROR).await
 }
 
 /// `POST /hard-restart/:name` — kill and restart without graceful stop.
@@ -282,11 +273,8 @@ async fn post_hard_restart(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Response {
-    dispatch_control_cmd(state, &name, |name, reply| RunnerCommand::HardRestart {
-        name,
-        reply,
-    })
-    .await
+    let reply = state.control.hard_restart(&name).await;
+    map_command_reply(&name, reply, StatusCode::INTERNAL_SERVER_ERROR).await
 }
 
 #[derive(Deserialize)]
@@ -308,7 +296,7 @@ async fn post_shutdown(
     if query.force {
         crate::signals::request_force_shutdown();
     }
-    if state.cmd_tx.send(RunnerCommand::Shutdown).is_err() {
+    if state.control.shutdown().is_err() {
         return runner_unavailable();
     }
     StatusCode::NO_CONTENT.into_response()
@@ -547,26 +535,16 @@ async fn post_run_task(
             .into_response();
     }
 
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(RunnerCommand::RunTask {
-            name: name.clone(),
-            params: body.params,
-            wait,
-            wait_timeout: body.wait_timeout,
-            reply: tx,
-        })
-        .is_err()
-    {
-        return runner_unavailable();
-    }
+    let reply = state
+        .control
+        .run_task(&name, body.params, wait, body.wait_timeout)
+        .await;
     let failed_status = if wait {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    map_command_reply(&name, rx.await, failed_status).await
+    map_command_reply(&name, reply, failed_status).await
 }
 
 /// Shared command-reply-to-response mapping, shared between `post_run_task`
@@ -574,7 +552,7 @@ async fn post_run_task(
 /// field beyond `name` + `reply`) and the other control endpoints.
 async fn map_command_reply(
     name: &str,
-    reply: Result<Result<(), CommandError>, oneshot::error::RecvError>,
+    reply: crate::control::ControlResult,
     failed_status: StatusCode,
 ) -> Response {
     match reply {
@@ -663,15 +641,7 @@ async fn post_run_pending(State(state): State<Arc<ApiState>>) -> Response {
         )
             .into_response();
     }
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(RunnerCommand::RunPendingTasks { reply: tx })
-        .is_err()
-    {
-        return runner_unavailable();
-    }
-    match rx.await {
+    match state.control.run_pending().await {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -683,17 +653,6 @@ async fn post_run_pending(State(state): State<Arc<ApiState>>) -> Response {
 }
 
 // --- helpers ---
-
-async fn dispatch_control_cmd<F>(state: Arc<ApiState>, name: &str, build: F) -> Response
-where
-    F: FnOnce(String, oneshot::Sender<Result<(), CommandError>>) -> RunnerCommand,
-{
-    let (tx, rx) = oneshot::channel();
-    if state.cmd_tx.send(build(name.to_string(), tx)).is_err() {
-        return runner_unavailable();
-    }
-    map_command_reply(name, rx.await, StatusCode::INTERNAL_SERVER_ERROR).await
-}
 
 fn runner_unavailable() -> Response {
     (
@@ -738,6 +697,7 @@ mod tests {
         let completions = crate::param_completions::CompletionResolver::for_tests();
         let watch_status = crate::watch::report::WatchStatusReader::for_tests();
         let attach = crate::output::attach::AttachControl::for_tests();
+        let control = crate::control::ProcessControl::for_tests();
         let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         // Leak the sender so the receiver stays live for the router's
         // lifetime — tests never signal shutdown.
@@ -753,6 +713,7 @@ mod tests {
             completions,
             watch_status,
             attach,
+            control,
             shutdown,
         }))
     }
