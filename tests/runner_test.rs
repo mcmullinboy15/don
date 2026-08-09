@@ -920,6 +920,15 @@ retries = 30
             launches >= 2,
             "expected the auto-restart to launch the script at least twice, got {launches}"
         );
+        // And *bounded*. A lower bound alone would pass under an infinite
+        // respawn loop, which is exactly what a permission level that is
+        // sticky across a crash would produce if demand were not one-shot
+        // (see `crate::gate` and `Demand`). The crash-loop guard gives up
+        // after MAX_RAPID_CRASHES, so the script cannot run many times.
+        assert!(
+            launches <= 4,
+            "expected the crash-loop guard to bound respawns, got {launches}"
+        );
     });
 }
 

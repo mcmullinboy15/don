@@ -228,12 +228,6 @@ pub(crate) struct RuntimeTask {
     pub last_params: HashMap<String, String>,
     /// Process group ID of the running task (for shutdown kills).
     pub pgid: Option<i32>,
-    /// A run request is with the supervisor and its prepared result has not
-    /// come back yet. Covers the window the supervisor's `is_busy` cannot:
-    /// after it emits `TaskRunPrepared` (busy drops) but before the runner
-    /// wires the run (state becomes `Running`). Without this, a scheduler
-    /// sweep landing in that window re-requests the task and double-spawns.
-    pub run_requested: bool,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
     /// Monotonic token for `don run --wait` waiters, bumped per waiter
@@ -271,7 +265,6 @@ impl RuntimeTask {
             pgid: None,
             resolved_watch_paths: Vec::new(),
             waiter_token: 0,
-            run_requested: false,
             run_waiter: None,
             has_success,
             last_run,

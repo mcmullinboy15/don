@@ -447,14 +447,20 @@ fn integration_stop_endpoint_stops_service() {
 
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
-        // Give the service time to start.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait for it to actually be up, rather than hoping 300ms was enough
+        // — a sleep that fires early would leave this asserting nothing.
+        assert!(
+            wait_for_process_state(&socket, "keeper", "ready", Duration::from_secs(5)).await,
+            "keeper should be ready before we stop it"
+        );
 
         let (status, _) = request(&socket, "POST", "/stop/keeper").await;
         assert_eq!(status, 204);
 
-        // Confirm state flipped to Stopped via /status.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // No sleep here, deliberately: 204 means the runner has folded
+        // `Stopped`, so the very next read must already see it. If the reply
+        // ever starts coming from somewhere that only knows the *process*
+        // died, this is the assertion that catches it.
         let (_, body) = request(&socket, "GET", "/status").await;
         assert!(
             body.contains("\"state\":\"stopped\""),

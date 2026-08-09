@@ -47,9 +47,6 @@ impl Runner {
             });
         }
 
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.run_requested = true;
-        }
         Ok(())
     }
 
@@ -60,9 +57,6 @@ impl Runner {
         intent: TaskRunIntent,
         result: Result<task_supervisor::TaskRunReport, String>,
     ) {
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.run_requested = false;
-        }
         if self.shutting_down {
             self.stop_late_task_start(name.to_string(), result).await;
             return;
@@ -573,9 +567,11 @@ impl Runner {
 
         // Reject while already in flight — otherwise we'd race two spawns of
         // the same task and the output would interleave unpredictably.
-        let already_in_flight = self.tasks.get(name).is_some_and(|rt| {
-            matches!(rt.state(), TaskState::Running | TaskState::Building) || rt.run_requested
-        }) || self.task_supervisors.registry().is_busy(name);
+        let already_in_flight = self
+            .tasks
+            .get(name)
+            .is_some_and(|rt| matches!(rt.state(), TaskState::Running | TaskState::Building))
+            || self.task_supervisors.registry().is_busy(name);
         if already_in_flight {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),

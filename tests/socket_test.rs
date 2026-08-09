@@ -1002,6 +1002,65 @@ fn integration_lazy_starts_immediately_when_dependency_satisfied() {
 /// worth waiting for, so the request is refused and says which one. A
 /// dependency that has *settled* never will come up on its own, and the user
 /// named this service anyway, so the start proceeds.
+/// A stopped service stays stopped, even though its gate is wide open.
+///
+/// Since permission became dependency-only it is *sticky*: a service whose
+/// dependencies are satisfied carries an `Open` level for the rest of the
+/// session, including while it is stopped. Nothing restarts it because
+/// demand is one-shot and a stop withdraws it — this pins that, because the
+/// failure mode is a service that springs back to life after `don stop`.
+#[test]
+fn integration_a_stopped_service_does_not_restart_itself_off_a_standing_gate() {
+    run_with_timeout(Duration::from_secs(25), async {
+        let dir = TempDir::new("stopped-stays-stopped");
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "bash", &["-c", "echo KEEPER_UP; exec sleep 60"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "KEEPER_UP", Duration::from_secs(8)).await,
+            "expected keeper to start. output: {}",
+            read_buf(&buf)
+        );
+
+        let (stop_tx, stop_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Stop {
+                name: "keeper".to_string(),
+                reply: stop_tx,
+            })
+            .unwrap();
+        stop_rx
+            .await
+            .unwrap()
+            .expect("stopping keeper should succeed");
+
+        let launches_after_stop = read_buf(&buf).matches("KEEPER_UP").count();
+
+        // Long enough for several scheduler passes to publish the still-open
+        // level. A demand that was not withdrawn would spend one of them.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            read_buf(&buf).matches("KEEPER_UP").count(),
+            launches_after_stop,
+            "a stopped service restarted itself. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = handle.await;
+    });
+}
+
 #[test]
 fn integration_explicit_start_waits_for_a_working_dep_but_not_a_settled_one() {
     run_with_timeout(Duration::from_secs(25), async {
