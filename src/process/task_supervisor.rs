@@ -109,6 +109,12 @@ async fn supervise(
     let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<RunRequest> = None;
     let mut mailbox_closed = false;
+    // A task is wanted from the moment it exists; its startup evaluation
+    // decides whether it actually needs to run.
+    let mut demand = super::Demand::Scheduled;
+    // See `crate::gate`: a level decided before this demand arose cannot have
+    // accounted for it.
+    let demand_rev: u64 = 0;
 
     loop {
         let request = match pending.take() {
@@ -120,17 +126,26 @@ async fn supervise(
                 // "your dependencies are satisfied", and the *decision* to
                 // run — skip-if-unchanged, auto_run, params — belongs to the
                 // worker below, which already owns it.
-                let permitted = gate
-                    .as_mut()
-                    .and_then(|gate| gate.take())
-                    .zip(startup.as_ref())
-                    .map(|(_, startup)| RunRequest {
-                        task_cfg: startup.task_cfg.clone(),
-                        params: std::collections::HashMap::new(),
-                        mode: super::task_worker::TaskRunMode::Startup {
-                            has_dependents: startup.has_dependents,
-                        },
-                        intent: super::TaskRunIntent::Scheduled,
+                let permitted = startup
+                    .as_ref()
+                    .filter(|_| {
+                        gate.as_ref().is_some_and(|g| {
+                            let grant = g.get();
+                            grant.rev > demand_rev && demand.permitted_by(grant.level)
+                        })
+                    })
+                    .map(|startup| {
+                        // One-shot, like the service side: a run is spent
+                        // here, and only a fresh demand re-arms it.
+                        demand = super::Demand::None;
+                        RunRequest {
+                            task_cfg: startup.task_cfg.clone(),
+                            params: std::collections::HashMap::new(),
+                            mode: super::task_worker::TaskRunMode::Startup {
+                                has_dependents: startup.has_dependents,
+                            },
+                            intent: super::TaskRunIntent::Scheduled,
+                        }
                     });
                 match permitted {
                     Some(request) => {
@@ -142,12 +157,10 @@ async fn supervise(
                             received = rx.recv() => match received {
                                 Some(request) => {
                                     busy.store(true, Ordering::Relaxed);
-                                    // A mailbox run supersedes any standing
-                                    // permission; spending it here keeps the
+                                    // A mailbox run supersedes standing
+                                    // demand; withdrawing it here keeps the
                                     // task from running twice.
-                                    if let Some(gate) = gate.as_mut() {
-                                        gate.burn();
-                                    }
+                                    demand = super::Demand::None;
                                     request
                                 }
                                 None => return,

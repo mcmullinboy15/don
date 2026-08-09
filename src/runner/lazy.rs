@@ -13,7 +13,30 @@ impl Runner {
     /// Moving to `Pending` is the request: no parallel name set is needed, and
     /// the normal pending-process scheduler can wait, cascade dependency failure,
     /// and start the service when its dependencies become ready.
-    pub(in crate::runner) fn handle_lazy_connection(&mut self, name: &str) {
+    /// A supervisor reports that something now wants it running.
+    ///
+    /// The supervisor owns the demand itself; this only projects it, so
+    /// `don status` can say `Pending` and dependents keep waiting. A process
+    /// that already holds a live one has an authoritative state already, and
+    /// says nothing here.
+    pub(in crate::runner) fn handle_demand(&mut self, name: &str, _demand: super::Demand) {
+        if self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.handle_identity.is_some())
+        {
+            return;
+        }
+        if self.services.contains_key(name) {
+            self.narrate_lazy_demand(name);
+            self.set_service_state(name, ServiceState::Pending);
+        } else if self.tasks.contains_key(name) {
+            self.set_task_state(name, super::TaskState::Pending);
+        }
+    }
+
+    /// Say why a first connection is or isn't about to start the service.
+    fn narrate_lazy_demand(&mut self, name: &str) {
         let deps = match self.services.get(name) {
             Some(rs) if rs.state() == ServiceState::Lazy => rs.resolved.depends_on.clone(),
             _ => return,
@@ -49,8 +72,6 @@ impl Runner {
                 );
             }
         }
-
-        self.set_service_state(name, ServiceState::Pending);
     }
 
     /// Start the detached build-tool chain for a triggered lazy service when

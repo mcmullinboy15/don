@@ -162,6 +162,10 @@ pub(crate) struct StartEnv {
     /// Where every peer can be reached, for rendering this service's
     /// `$(peer.KEY)` env references at the moment it starts.
     pub(crate) endpoints: crate::endpoints::EndpointReader,
+    /// Set once teardown begins. Checked before every self-started start, so
+    /// a supervisor cannot spawn into a shutdown the runner has already
+    /// planned around — which is why the gate needs no teardown revocation.
+    pub(crate) shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Owner half for services.
@@ -288,6 +292,19 @@ async fn supervise(
     let service_writer = output.as_ref().map(|output| output.writer());
     // Build-tool facts, kept current by `ServiceCommand::Configure`.
     let mut batch_built = false;
+    // Whether anything wants this service running. One-shot: see `Demand`.
+    // A lazy service starts life unwanted and is demanded by its first
+    // connection; everything else is wanted from the moment it exists.
+    let mut demand = if resolved.lazy {
+        super::Demand::None
+    } else {
+        super::Demand::Scheduled
+    };
+    // The revision current when this demand arose. A level published before
+    // it cannot have taken it into account, so it is not safe to act on —
+    // see `crate::gate`. Starts at 0 so the initial set waits for the
+    // scheduler's first pass.
+    let mut demand_rev: u64 = 0;
     // The docker host-port mapping this supervisor's last spawn got. Retained
     // across stops so the next start can request the same ports.
     let mut last_docker_bindings: Vec<crate::docker::DockerPortBinding> = Vec::new();
@@ -319,25 +336,31 @@ async fn supervise(
             Some(command) => command,
             None => loop {
                 busy.store(false, Ordering::Relaxed);
-                // Level read: a grant published while this supervisor was
-                // busy is still visible here. Spending requires holding no
-                // process, which with the epoch is the whole anti-double-
-                // start argument.
+                // Start when something wants this running, its dependencies
+                // allow it, and it is holding nothing. The level is read here
+                // rather than waited on, so a grant published while this
+                // supervisor was busy is not missed.
+                //
+                // `demand` is cleared in this same step — that one-shot-ness
+                // is what stops a crashing service relaunching off a gate
+                // that stays open across the crash. See `Demand`.
                 if held.is_none()
-                    && let Some(reader) = gate.as_mut()
-                    && let Some(epoch) = reader.take()
+                    && !*env.shutdown_rx.borrow()
+                    && gate.as_ref().is_some_and(|reader| {
+                        let grant = reader.get();
+                        // Only a level decided *after* this demand arose can
+                        // be trusted to have accounted for it.
+                        grant.rev > demand_rev && demand.permitted_by(grant.level)
+                    })
                 {
+                    demand = super::Demand::None;
                     env.emitter
                         .service_debug_event(&name, "start triggered (deps satisfied)");
                     // Tell the scheduler a start is under way, so it can fold
-                    // Pending -> Starting. Only this supervisor knows when a
-                    // grant is actually spent; closing the gate at publish
-                    // time would close it before anything consumed it.
+                    // Pending -> Starting. Only this supervisor knows when
+                    // demand is actually spent.
                     if report_tx
-                        .send(super::ProcessReport::ServiceStarting {
-                            name: name.clone(),
-                            epoch,
-                        })
+                        .send(super::ProcessReport::ServiceStarting { name: name.clone() })
                         .is_err()
                     {
                         return;
@@ -407,11 +430,14 @@ async fn supervise(
                     }
                     // The lazy proxy saw a connection: demand. The runner
                     // gates on service state, so duplicates are harmless.
-                    demand = wait_demand(&mut demand_rx), if demand_rx.is_some() => {
-                        match demand {
+                    trigger = wait_demand(&mut demand_rx), if demand_rx.is_some() => {
+                        match trigger {
                             Some(_) => {
+                                demand = demand.max(super::Demand::Scheduled);
+                                demand_rev = gate.as_ref().map_or(0, |g| g.rev());
                                 let _ = report_tx.send(super::ProcessReport::Demand {
                                     name: name.clone(),
+                                    demand,
                                 });
                             }
                             // Every trigger sender is gone (proxy shut down);
@@ -446,13 +472,10 @@ async fn supervise(
                 reader_eof = None;
                 monitor_cancel = None;
                 ready_pending = None;
-                // Spend the standing permission without acting on it: a stop
-                // must not be undone by a grant published just before it. A
-                // restart's follow-up start arrives as a mailbox Start, not a
-                // permit, so this cannot suppress one.
-                if let Some(gate) = gate.as_mut() {
-                    gate.burn();
-                }
+                // A stop withdraws demand: nothing wants this running now, so
+                // an open gate cannot undo it. A restart's follow-up start
+                // arrives as a mailbox Start, which does not consult demand.
+                demand = super::Demand::None;
                 let result = match held.take() {
                     Some(handle) => {
                         let debug = service::StopDebug::new(name.clone(), env.emitter.clone());
@@ -975,6 +998,11 @@ mod tests {
             emitter: output_manager.clone_lifecycle_emitter(),
             shutdown: ShutdownConfig::default(),
             fallback_ports: false,
+            shutdown_rx: {
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                std::mem::forget(tx);
+                rx
+            },
             endpoints: {
                 let (writer, reader) = crate::endpoints::channel();
                 writer.seed(std::iter::once("svc".to_string()));
@@ -1199,7 +1227,7 @@ mod tests {
             .expect("demand should be forwarded")
             .expect("report channel open");
         match report {
-            super::super::ProcessReport::Demand { name } => assert_eq!(name, "svc"),
+            super::super::ProcessReport::Demand { name, .. } => assert_eq!(name, "svc"),
             _ => panic!("expected a demand report"),
         }
 

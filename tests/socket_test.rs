@@ -995,6 +995,99 @@ fn integration_lazy_starts_immediately_when_dependency_satisfied() {
 
 /// A lazy service with a pending first connection whose dependency then fails
 /// must surface DependencyFailed and never launch its process.
+/// An explicit `don start` honours the dependency graph — the one start path
+/// that used to ignore it entirely.
+///
+/// The rule is asymmetric on purpose: a dependency that is still coming up is
+/// worth waiting for, so the request is refused and says which one. A
+/// dependency that has *settled* never will come up on its own, and the user
+/// named this service anyway, so the start proceeds.
+#[test]
+fn integration_explicit_start_waits_for_a_working_dep_but_not_a_settled_one() {
+    run_with_timeout(Duration::from_secs(25), async {
+        let dir = TempDir::new("explicit-start-deps");
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("slow", "bash", &["-c", "sleep 30"])
+            .ready_exec("false", &[])
+            .done()
+            .add_custom_service("api", "bash", &["-c", "echo API_STARTED; exec sleep 60"])
+            .depends_on(&["slow"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // `slow` never passes its ready check, so `api` waits.
+        assert!(
+            wait_for_output(&buf, "slow: starting", Duration::from_secs(8)).await,
+            "expected slow to start. output: {}",
+            read_buf(&buf)
+        );
+
+        // Still coming up: refuse, and name the dependency.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Start {
+                name: "api".to_string(),
+                reply: reply_tx,
+            })
+            .unwrap();
+        let err = reply_rx
+            .await
+            .unwrap()
+            .expect_err("a dependency that is still coming up must be waited for");
+        assert!(
+            err.to_string().contains("waiting for dependency 'slow'"),
+            "expected the blocking dependency to be named, got: {err}"
+        );
+        assert!(
+            !read_buf(&buf).contains("API_STARTED"),
+            "api must not have started. output: {}",
+            read_buf(&buf)
+        );
+
+        // Settle the dependency by stopping it. Waiting can no longer help,
+        // so the same request now succeeds.
+        let (stop_tx, stop_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Stop {
+                name: "slow".to_string(),
+                reply: stop_tx,
+            })
+            .unwrap();
+        stop_rx
+            .await
+            .unwrap()
+            .expect("stopping slow should succeed");
+
+        let (retry_tx, retry_rx) = oneshot::channel();
+        cmd_tx
+            .send(RunnerCommand::Start {
+                name: "api".to_string(),
+                reply: retry_tx,
+            })
+            .unwrap();
+        retry_rx
+            .await
+            .unwrap()
+            .expect("a settled dependency must not block an explicit start");
+        assert!(
+            wait_for_output(&buf, "API_STARTED", Duration::from_secs(8)).await,
+            "expected api to start past its settled dependency. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = handle.await;
+    });
+}
+
 #[test]
 fn integration_lazy_dependency_failure_blocks_start() {
     run_with_timeout(Duration::from_secs(20), async {

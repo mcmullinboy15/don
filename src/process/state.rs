@@ -107,6 +107,41 @@ pub(crate) enum ProcessKind {
     Task,
 }
 
+/// Whether anything currently wants this process running, and on whose
+/// authority.
+///
+/// **One-shot.** Demand is cleared in the same synchronous step that begins a
+/// start, and nothing re-arms it but a fresh request: a client, a lazy proxy
+/// connection, or the restart policy. That is what an epoch on the gate used
+/// to do, moved to where it needs no identifier — the decision and the spend
+/// happen together in one loop, with no channel between them.
+///
+/// Making this a level would relaunch a crashing service instantly and
+/// forever, because a gate stays open across a crash and `on_failure` is only
+/// consulted on the exit report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Demand {
+    /// Nobody wants this running.
+    None,
+    /// The startup set or a lazy connection wants it. Waits for dependencies
+    /// to be *satisfied*.
+    Scheduled,
+    /// Someone named it explicitly. Waits only for dependencies to *settle* —
+    /// a failed dependency is not worth waiting for, and they asked anyway.
+    Requested,
+}
+
+impl Demand {
+    /// Whether this demand may act on `level`.
+    pub(crate) fn permitted_by(self, level: crate::gate::Gate) -> bool {
+        match self {
+            Self::None => false,
+            Self::Scheduled => level >= crate::gate::Gate::Open,
+            Self::Requested => level >= crate::gate::Gate::Degraded,
+        }
+    }
+}
+
 /// See [`RuntimeService::handle_identity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServiceHandleIdentity {

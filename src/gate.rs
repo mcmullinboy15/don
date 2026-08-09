@@ -17,24 +17,46 @@
 //! # Why a level alone is not enough
 //!
 //! A level double-starts. Concretely: the gate opens, the supervisor starts,
-//! the process dies instantly, the supervisor reaps and reports — and the
-//! runner has not folded that report yet, so the gate is *still* open. The
-//! supervisor is idle again, sees permission, and starts a second time,
-//! ignoring the service's `on_failure` policy.
+//! the process dies instantly, the supervisor reaps — and the gate is still
+//! open, because nothing about this process's own lifecycle closes it. An
+//! idle supervisor would see permission and start again, at zero backoff,
+//! ignoring `on_failure` and the crash-loop guard (both of which live in
+//! `runner/service_health.rs` and are only reached via `ServiceExited`).
 //!
-//! So each level carries a ticket. [`Gate::Open`] has an `epoch`, minted only
-//! on a `Blocked -> Open` edge, and a supervisor spends an epoch at most once
-//! ([`GateReader::take`]). Republishing an open gate keeps its epoch, so it is
-//! idempotent; a genuine re-permission bumps it. This is the same shape as the
-//! `lazy_build_token` and `control_generation` guards already in the codebase.
+//! The answer is that permission is necessary but not sufficient: a start
+//! also needs *demand*, which the supervisor owns and which is **one-shot** —
+//! cleared in the same synchronous step that begins the start. Because the
+//! decision and the spend happen together inside one loop, with no channel
+//! between them, demand needs no epoch or generation to identify it.
 //!
-//! # The invariant that makes a permit safe to hold
+//! # What a level does *not* tell you
 //!
-//! **`Open` implies the process is `Pending`.** Everything that would
-//! invalidate a permission — starting, stopping, failing, a build starting —
-//! also moves the process out of `Pending`, which closes the gate. That is
-//! what lets a supervisor act on a permission it read a moment ago without
-//! re-validating anything.
+//! A gate says what this process's **dependencies** allow. It says nothing
+//! about whether the process is wanted, or whether it is already running —
+//! deliberately, because a gate that also encoded "is it wanted" would read
+//! this process's own state, and `state(X) -> gate(X) -> state(X)` is a
+//! self-loop. Reading only *dependencies'* states keeps every influence edge
+//! a dependency edge, and the dependency graph is a validated DAG.
+//!
+//! So a level is sticky: once a dependency is up, the gate stays open for the
+//! rest of the session, across starts, crashes and stops. Permission is not
+//! an instruction. What turns it into a start is the supervisor's own demand,
+//! and *that* is one-shot.
+//!
+//! # Why a level carries a revision
+//!
+//! Demand and permission are two facts that must be read *together*. They are
+//! now held by two different actors, so a supervisor can hold fresh demand and
+//! a stale level: a dependency starts re-running, its dependents' levels are
+//! scheduled for recompute, and before that lands a connection gives one of
+//! them demand. Acting on the level it can see would start a service whose
+//! dependency is mid-rerun.
+//!
+//! So every publish pass stamps a monotonic `rev`, and a supervisor may only
+//! spend demand against a level published *after* that demand arose. One pass
+//! of the scheduler is therefore the synchronisation point where the two facts
+//! meet — which is exactly what the runner used to do for free when it owned
+//! both.
 //!
 //! # Ownership
 //!
@@ -47,24 +69,30 @@
 use std::collections::HashMap;
 use tokio::sync::watch;
 
-/// One process's permission to run.
+/// A published level, stamped with the scheduler pass that produced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Gate {
-    /// Not permitted: dependencies unmet, a build in flight, the user stopped
-    /// it, or teardown has begun.
-    Blocked,
-    /// Permitted. `epoch` identifies *this* grant; a holder spends it once.
-    Open { epoch: u64 },
+pub(crate) struct Grant {
+    pub(crate) level: Gate,
+    /// The scheduler pass this was published by. Monotonic across all
+    /// processes, so "published after my demand arose" is a comparison.
+    pub(crate) rev: u64,
 }
 
-impl Gate {
-    /// The epoch of an open gate.
-    pub(crate) fn epoch(self) -> Option<u64> {
-        match self {
-            Self::Open { epoch } => Some(epoch),
-            Self::Blocked => None,
-        }
-    }
+/// How far a process's dependencies let it go.
+///
+/// Ordered: `Blocked < Degraded < Open`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Gate {
+    /// A dependency is still making progress. Nothing may start — waiting is
+    /// the right thing to do, because the wait will end.
+    Blocked,
+    /// Every dependency has settled, but not all are satisfied: something
+    /// failed, stopped, or is parked waiting for a human. Waiting will not
+    /// end, so a process someone asked for *by name* may proceed; the
+    /// scheduler's own starts may not.
+    Degraded,
+    /// Every dependency is satisfied.
+    Open,
 }
 
 /// The write half: the scheduler's answer for every process.
@@ -72,10 +100,11 @@ impl Gate {
 /// Not `Clone` — it is moved into the runner at construction, so no other
 /// component can grant permission.
 pub(crate) struct GateWriter {
-    txs: HashMap<String, watch::Sender<Gate>>,
-    /// Last epoch handed out, per process. Bumped only on a `Blocked -> Open`
-    /// edge, which is what makes a republished grant idempotent.
-    epochs: HashMap<String, u64>,
+    txs: HashMap<String, watch::Sender<Grant>>,
+    /// Bumped once per scheduler pass and stamped onto every level published
+    /// in it. See the module doc: this is what lets a supervisor tell a level
+    /// computed *after* its demand from one computed before.
+    rev: u64,
     /// Publishing is a no-op until armed. Transitions during construction and
     /// setup therefore cannot grant permission.
     armed: bool,
@@ -87,85 +116,49 @@ impl GateWriter {
         self.armed = true;
     }
 
-    /// Publish one process's permission.
-    ///
-    /// Opening an already-open gate is a no-op: the epoch is preserved, so a
-    /// supervisor that has already spent it does not start again. Returns
-    /// whether this call *newly* granted permission, so a caller can hang
-    /// edge-triggered work off the grant.
-    pub(crate) fn set(&mut self, name: &str, allow: bool) -> bool {
+    /// Begin a scheduler pass. Every level published until the next call is
+    /// stamped with the same revision.
+    pub(crate) fn begin_pass(&mut self) {
+        self.rev += 1;
+    }
+
+    /// Publish one process's level. Returns whether the *level* changed —
+    /// the revision always advances, so holders can always tell freshness.
+    pub(crate) fn set(&mut self, name: &str, level: Gate) -> bool {
         if !self.armed {
             return false;
         }
         let Some(tx) = self.txs.get(name) else {
             return false;
         };
-        let current = *tx.borrow();
-        match (current, allow) {
-            (Gate::Open { .. }, true) | (Gate::Blocked, false) => false,
-            (Gate::Blocked, true) => {
-                let epoch = self.epochs.entry(name.to_string()).or_default();
-                *epoch += 1;
-                tx.send_replace(Gate::Open { epoch: *epoch });
-                true
-            }
-            (Gate::Open { .. }, false) => {
-                tx.send_replace(Gate::Blocked);
-                false
-            }
-        }
-    }
-
-    /// Block every gate. The first act of teardown, so a permission published
-    /// a moment ago cannot be spent into a process nobody will stop.
-    pub(crate) fn block_all(&mut self) {
-        // Deliberately ignores `armed`: shutdown must be able to revoke
-        // permissions granted before it started.
-        for tx in self.txs.values() {
-            if matches!(*tx.borrow(), Gate::Open { .. }) {
-                tx.send_replace(Gate::Blocked);
-            }
-        }
+        let changed = tx.borrow().level != level;
+        tx.send_replace(Grant {
+            level,
+            rev: self.rev,
+        });
+        changed
     }
 }
 
 /// The read half, one per process.
+///
+/// A level read is correct after missing any number of changes, which is the
+/// point: a supervisor busy through a docker pull or a build sees the current
+/// answer when it finishes, not a notification it slept through.
 #[derive(Debug)]
 pub(crate) struct GateReader {
-    rx: watch::Receiver<Gate>,
-    /// The last epoch this reader spent. The anti-double-start half of the
-    /// level/ticket pair.
-    spent: Option<u64>,
+    rx: watch::Receiver<Grant>,
 }
 
 impl GateReader {
-    /// The current permission — a *level* read, correct after missing any
-    /// number of changes.
-    pub(crate) fn get(&self) -> Gate {
+    /// The current grant: what dependencies allow, and when that was decided.
+    pub(crate) fn get(&self) -> Grant {
         *self.rx.borrow()
     }
 
-    /// Spend the current permission, if there is an unspent one.
-    ///
-    /// Returns the epoch on the first call per grant and `None` after, so a
-    /// republished level cannot start a second process.
-    pub(crate) fn take(&mut self) -> Option<u64> {
-        let epoch = self.get().epoch()?;
-        if self.spent == Some(epoch) {
-            return None;
-        }
-        self.spent = Some(epoch);
-        Some(epoch)
-    }
-
-    /// Treat the current grant as spent without acting on it.
-    ///
-    /// Used when a supervisor takes a job from its mailbox instead: a stop
-    /// must not be immediately undone by a stale open gate.
-    pub(crate) fn burn(&mut self) {
-        if let Some(epoch) = self.get().epoch() {
-            self.spent = Some(epoch);
-        }
+    /// The revision now, for stamping demand as it arises.
+    pub(crate) fn rev(&self) -> u64 {
+        self.rx.borrow().rev
     }
 
     /// Wait for the next change. Cancel-safe, so it can be a `select!` arm.
@@ -190,14 +183,17 @@ pub(crate) fn channel<'a>(
     let mut txs = HashMap::new();
     let mut readers = HashMap::new();
     for name in names {
-        let (tx, rx) = watch::channel(Gate::Blocked);
+        let (tx, rx) = watch::channel(Grant {
+            level: Gate::Blocked,
+            rev: 0,
+        });
         txs.insert(name.clone(), tx);
-        readers.insert(name.clone(), GateReader { rx, spent: None });
+        readers.insert(name.clone(), GateReader { rx });
     }
     (
         GateWriter {
             txs,
-            epochs: HashMap::new(),
+            rev: 0,
             armed: false,
         },
         readers,
@@ -217,117 +213,91 @@ mod tests {
         (writer, reader)
     }
 
+    fn publish(writer: &mut GateWriter, name: &str, level: Gate) {
+        writer.begin_pass();
+        writer.set(name, level);
+    }
+
     #[test]
     fn nothing_is_permitted_before_the_scheduler_arms() {
         let names = ["api".to_string()];
         let (mut writer, mut readers) = channel(names.iter());
-        let mut reader = readers.remove("api").unwrap();
-        writer.set("api", true);
-        assert_eq!(reader.get(), Gate::Blocked);
-        assert_eq!(reader.take(), None);
+        let reader = readers.remove("api").unwrap();
+        publish(&mut writer, "api", Gate::Open);
+        assert_eq!(reader.get().level, Gate::Blocked);
 
-        // …and arming does not retroactively grant anything; the next
-        // decision does.
         writer.arm();
-        assert_eq!(reader.get(), Gate::Blocked);
-        writer.set("api", true);
-        assert!(reader.take().is_some());
+        publish(&mut writer, "api", Gate::Open);
+        assert_eq!(reader.get().level, Gate::Open);
     }
 
     #[test]
-    fn a_grant_survives_not_being_looked_at() {
-        // The whole point of a level: a supervisor busy through the grant
-        // still sees it when it finishes.
-        let (mut writer, mut reader) = one("api");
-        writer.set("api", true);
-        writer.set("api", true);
-        writer.set("api", true);
-        assert_eq!(reader.take(), Some(1), "one grant, one epoch");
+    fn a_level_survives_not_being_looked_at() {
+        // The point of a level: a supervisor busy through the changes sees
+        // the current answer when it finishes, not a missed notification.
+        let (mut writer, reader) = one("api");
+        publish(&mut writer, "api", Gate::Open);
+        publish(&mut writer, "api", Gate::Blocked);
+        publish(&mut writer, "api", Gate::Degraded);
+        assert_eq!(reader.get().level, Gate::Degraded);
     }
 
     #[test]
-    fn a_grant_is_spendable_once() {
-        struct Case {
-            name: &'static str,
-            /// Applied after the first spend.
-            republish: bool,
-            reblock: bool,
-            want_second: Option<u64>,
-        }
-
-        let cases = vec![
-            Case {
-                name: "republishing the same permission does not re-grant",
-                republish: true,
-                reblock: false,
-                want_second: None,
-            },
-            Case {
-                name: "no further publish, no further grant",
-                republish: false,
-                reblock: false,
-                want_second: None,
-            },
-            Case {
-                name: "blocked then reopened is a genuinely new grant",
-                republish: true,
-                reblock: true,
-                want_second: Some(2),
-            },
-        ];
-
-        for case in cases {
-            let (mut writer, mut reader) = one("api");
-            writer.set("api", true);
-            assert_eq!(reader.take(), Some(1), "{}: first spend", case.name);
-
-            if case.reblock {
-                writer.set("api", false);
-            }
-            if case.republish {
-                writer.set("api", true);
-            }
-            assert_eq!(
-                reader.take(),
-                case.want_second,
-                "{}: second spend",
-                case.name
-            );
-        }
-    }
-
-    #[test]
-    fn set_reports_only_the_granting_edge() {
+    fn set_reports_only_real_level_changes() {
         let (mut writer, _reader) = one("api");
-        assert!(writer.set("api", true), "blocked -> open is the grant");
-        assert!(!writer.set("api", true), "republishing is not a new grant");
-        assert!(!writer.set("api", false), "revoking is not a grant");
-        assert!(writer.set("api", true), "reopening is a new grant");
-        assert!(!writer.set("ghost", true), "unknown names grant nothing");
+        writer.begin_pass();
+        assert!(writer.set("api", Gate::Open));
+        writer.begin_pass();
+        assert!(
+            !writer.set("api", Gate::Open),
+            "republishing is not a change"
+        );
+        writer.begin_pass();
+        assert!(writer.set("api", Gate::Degraded));
+        assert!(
+            !writer.set("ghost", Gate::Open),
+            "unknown names change nothing"
+        );
+    }
+
+    /// The revision is what stops a supervisor acting on a level that was
+    /// decided before its demand existed — the race that splitting demand
+    /// from permission introduces. See the module doc.
+    #[test]
+    fn a_republished_level_still_advances_the_revision() {
+        let (mut writer, reader) = one("api");
+        publish(&mut writer, "api", Gate::Open);
+        let first = reader.rev();
+
+        // Same level, new pass: a holder whose demand arose during the first
+        // pass must be able to tell this one is newer.
+        publish(&mut writer, "api", Gate::Open);
+        assert!(
+            reader.rev() > first,
+            "an unchanged level must still carry a fresh revision"
+        );
     }
 
     #[test]
-    fn burning_a_grant_stops_it_being_spent() {
-        // A stop taken from the mailbox must not be undone by the open gate
-        // that was published just before it.
-        let (mut writer, mut reader) = one("api");
-        writer.set("api", true);
-        reader.burn();
-        assert_eq!(reader.take(), None);
+    fn one_pass_stamps_every_process_alike() {
+        let names = ["api".to_string(), "db".to_string()];
+        let (mut writer, mut readers) = channel(names.iter());
+        writer.arm();
+        let api = readers.remove("api").unwrap();
+        let db = readers.remove("db").unwrap();
 
-        // A later, genuine re-grant is still spendable.
-        writer.set("api", false);
-        writer.set("api", true);
-        assert_eq!(reader.take(), Some(2));
+        writer.begin_pass();
+        writer.set("api", Gate::Open);
+        writer.set("db", Gate::Degraded);
+        assert_eq!(api.get().rev, db.get().rev, "one pass, one revision");
     }
 
+    /// The ordering is the permission rule: a scheduled start needs `Open`, an
+    /// explicitly requested one is content with `Degraded`.
     #[test]
-    fn shutdown_revokes_permission_it_did_not_grant() {
-        let (mut writer, mut reader) = one("api");
-        writer.set("api", true);
-        writer.block_all();
-        assert_eq!(reader.get(), Gate::Blocked);
-        assert_eq!(reader.take(), None);
+    fn levels_are_ordered_by_how_much_they_permit() {
+        assert!(Gate::Blocked < Gate::Degraded);
+        assert!(Gate::Degraded < Gate::Open);
     }
 
     #[tokio::test]

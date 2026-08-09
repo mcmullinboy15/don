@@ -1,3 +1,4 @@
+use super::Demand;
 use super::service_worker::{ServiceStartMode, run_service_build_worker};
 use super::{
     CommandError, CommandResult, Runner, RunnerEvent, RunnerInternalCommand, ServiceStartIntent,
@@ -60,7 +61,7 @@ impl Runner {
     /// that has already left `Pending` — a manual start won the race, or
     /// teardown began — ignores the ack; the supervisor's own idle-and-empty
     /// check is the other half.
-    pub(in crate::runner) fn handle_service_starting(&mut self, name: &str, epoch: u64) {
+    pub(in crate::runner) fn handle_service_starting(&mut self, name: &str) {
         let pending = self
             .services
             .get(name)
@@ -68,7 +69,7 @@ impl Runner {
         if !pending {
             self.output_manager.service_debug_event(
                 name,
-                &format!("start permit (epoch {epoch}) arrived for a non-pending service"),
+                "start began for a service that had already left Pending",
             );
             return;
         }
@@ -301,14 +302,15 @@ impl Runner {
             return;
         }
         let state = self.services.get(name).map(|rs| rs.state());
+        // `Pending` is deliberately not here. It does not mean "busy", it
+        // means "wanted, waiting for dependencies" — and overriding that wait
+        // is exactly what an explicit start is for. It falls through to the
+        // dependency rule below.
         let operation_in_progress = self.services.get(name).is_some_and(|rs| {
             self.service_starts.registry().is_busy(name)
                 || matches!(
                     rs.state(),
-                    ServiceState::Pending
-                        | ServiceState::Building
-                        | ServiceState::Starting
-                        | ServiceState::Stopping
+                    ServiceState::Building | ServiceState::Starting | ServiceState::Stopping
                 )
         });
         if operation_in_progress {
@@ -330,6 +332,34 @@ impl Runner {
             }));
             return;
         }
+
+        // An explicit start honours the dependency graph — this used to be the
+        // one start path that didn't, so `don start api` would spawn `api`
+        // with `postgres` down.
+        //
+        // It honours it on the *relaxed* rule: a dependency that is still
+        // coming up is worth waiting for, so refuse and say so; one that has
+        // settled (failed, stopped, parked awaiting a human) never will be, so
+        // proceed — the user asked for this by name. Same predicate the
+        // supervisors use, so the two paths cannot drift.
+        let deps = self
+            .services
+            .get(name)
+            .map(|rs| rs.resolved.depends_on.clone())
+            .unwrap_or_default();
+        if !Demand::Requested.permitted_by(self.dep_level(&deps)) {
+            let waiting: Vec<&str> = deps
+                .iter()
+                .filter(|dep| !self.is_dep_gate_open(dep) && !self.is_dep_settled(&dep.name))
+                .map(|dep| dep.name.as_str())
+                .collect();
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: format!("waiting for dependency '{}'", waiting.join("', '")),
+            }));
+            return;
+        }
+
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager
             .service_event(name, "starting... (requested)");

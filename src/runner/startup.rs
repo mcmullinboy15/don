@@ -5,8 +5,7 @@ use super::graph::{dep_name_map, topological_sort};
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::{ProcessKind, Runner, RunnerInternalCommand, RuntimeService, ServiceState, TaskState};
 use crate::config::Dependency;
-use crate::signals::shutdown_requested;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 fn push_unique_name(names: &mut Vec<String>, name: &str) {
     if !names.iter().any(|existing| existing == name) {
@@ -292,7 +291,7 @@ impl Runner {
     /// was stopped, and nothing is going to move it to a satisfied state
     /// without another explicit request. Only non-blocking (ordering-only)
     /// edges use this — it is what lets a dependent start anyway.
-    fn is_dep_settled(&self, dep: &str) -> bool {
+    pub(in crate::runner) fn is_dep_settled(&self, dep: &str) -> bool {
         if let Some(rs) = self.services.get(dep) {
             return matches!(
                 rs.state(),
@@ -326,6 +325,31 @@ impl Runner {
             return true;
         }
         !dep.blocking && self.is_dep_settled(&dep.name)
+    }
+
+    /// How far this process's dependencies let it go.
+    ///
+    /// Three-valued because "may I run?" has two different answers depending
+    /// on who is asking. The scheduler starts a process only when everything
+    /// it needs is actually *up*; a user who names a process explicitly is
+    /// willing to proceed past a dependency that has stopped making progress,
+    /// because waiting for it would never end.
+    ///
+    /// Reads only the *dependencies'* states — never this process's own. That
+    /// is what keeps the influence graph a DAG (see [`crate::gate`]).
+    pub(in crate::runner) fn dep_level(&self, deps: &[Dependency]) -> crate::gate::Gate {
+        if deps.iter().all(|dep| self.is_dep_gate_open(dep)) {
+            return crate::gate::Gate::Open;
+        }
+        // Not all satisfied. If every unsatisfied one has *settled*, waiting
+        // will not help — an explicit request may still proceed.
+        if deps
+            .iter()
+            .all(|dep| self.is_dep_satisfied(&dep.name) || self.is_dep_settled(&dep.name))
+        {
+            return crate::gate::Gate::Degraded;
+        }
+        crate::gate::Gate::Blocked
     }
 
     /// Announce the non-blocking dependencies this process is not waiting for.
@@ -560,66 +584,49 @@ impl Runner {
 
         self.reconcile_dependency_failures(&dep_map, &order);
 
-        let ready: Vec<String> = order
-            .iter()
-            .filter(|name| self.is_process_pending(name))
-            .filter(|name| {
-                dep_map
-                    .get(name.as_str())
-                    .is_none_or(|deps| deps.iter().all(|dep| self.is_dep_gate_open(dep)))
-            })
-            .cloned()
-            .collect();
+        // One pass, one revision. A supervisor may only act on a level
+        // stamped after its demand arose — see [`crate::gate`].
+        self.start_gates.begin_pass();
 
-        // Publish permission for *every* process, not only the newly-ready
-        // ones: a gate is a level, so "you may not run" has to be said out
-        // loud. Teardown revokes everything regardless of readiness.
-        //
-        // Nothing is started here. A supervisor spends its own permission —
-        // this is the whole of the scheduler's output.
-        // A build-tool-managed lazy service takes a JIT build detour before it
-        // may run at all. Starting one moves the service to Building, so it
-        // must not also be permitted; the build's completion returns it to
-        // Pending, where the next pass considers it again.
-        let mut building: HashSet<String> = HashSet::new();
-        for name in &ready {
-            if self.start_lazy_build_if_needed(name) {
-                building.insert(name.clone());
-            }
-        }
-
-        let blocked_by_shutdown = self.shutting_down || shutdown_requested();
+        // Publish a level for *every* process. A gate says only what this
+        // process's dependencies allow — never whether anything wants it,
+        // which is the supervisor's own business. Keeping this free of the
+        // process's own state is what makes the influence graph a DAG.
         for name in &order {
-            let allow =
-                !blocked_by_shutdown && ready.contains(name) && !building.contains(name.as_str());
-            if !self.start_gates.set(name, allow) {
-                continue;
+            let deps = dep_map.get(name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+            let mut level = self.dep_level(deps);
+
+            // The build-tool detour: an artifact this process cannot build
+            // for itself is as much a precondition as a dependency.
+            if level > crate::gate::Gate::Blocked {
+                self.start_lazy_build_if_needed(name);
             }
-            // Granted just now: say which non-blocking dependencies we are
-            // deliberately not waiting on, so a start that follows a visible
-            // failure doesn't look like don ignored the dependency graph.
-            // On the grant edge, so a re-published level cannot repeat it.
-            let skipped = dep_map
-                .get(name.as_str())
-                .map(|deps| self.skipped_non_blocking_dependencies(deps))
-                .unwrap_or_default();
-            self.report_skipped_non_blocking_dependencies(name, &skipped);
+            if !self.artifact_ready(name) {
+                level = crate::gate::Gate::Blocked;
+            }
+
+            if self.start_gates.set(name, level) && level > crate::gate::Gate::Blocked {
+                // Newly permitted: say which non-blocking dependencies we are
+                // deliberately not waiting for, so a start that follows a
+                // visible failure doesn't look like don ignored the graph.
+                let skipped = self.skipped_non_blocking_dependencies(deps);
+                self.report_skipped_non_blocking_dependencies(name, &skipped);
+            }
         }
     }
 
-    fn is_process_pending(&self, name: &str) -> bool {
+    /// Whether this process's build artifact exists.
+    ///
+    /// Read from build bookkeeping, never from `ServiceState::Building` —
+    /// sourcing it from lifecycle state would put `state(X)` back into
+    /// `gate(X)` and bring the epoch back with it.
+    fn artifact_ready(&self, name: &str) -> bool {
+        if self.lazy_build_handles.contains_key(name) {
+            return false;
+        }
         self.services
             .get(name)
-            .is_some_and(|rs| rs.state() == ServiceState::Pending)
-            || self
-                .tasks
-                .get(name)
-                // `run_requested` covers the window `is_busy` cannot: the
-                // supervisor has emitted the prepared run (busy dropped) but
-                // the runner hasn't wired it yet (state still Pending). A
-                // sweep landing there used to re-request and double-spawn.
-                .is_some_and(|rt| rt.state() == TaskState::Pending && !rt.run_requested)
-                && !self.task_supervisors.registry().is_busy(name)
+            .is_none_or(|rs| !rs.resolved.is_build_tool_managed() || rs.batch_built)
     }
 
     /// Whether every process participating in initial startup has settled.

@@ -23,7 +23,7 @@ pub(crate) mod task_worker;
 
 pub use state::{ServiceState, TaskState};
 
-pub(crate) use state::{ProcessKind, ServiceHandleIdentity};
+pub(crate) use state::{Demand, ProcessKind, ServiceHandleIdentity};
 use tokio::sync::oneshot;
 
 pub(crate) enum ServiceStartIntent {
@@ -67,7 +67,7 @@ pub(crate) enum ProcessReport {
     /// inside the process, but the *reaction* belongs to the scheduler: a lazy
     /// service has dependencies, and starting it is a scheduling decision
     /// like any other.
-    Demand { name: String },
+    Demand { name: String, demand: Demand },
     /// A service's process died and its supervisor reaped it. `status` is
     /// the reaped exit status (`None` when the wait itself failed).
     ServiceExited {
@@ -90,8 +90,7 @@ pub(crate) enum ProcessReport {
     /// This is the ack that makes a level-triggered permission single-use
     /// across the channel boundary: the runner folds it into `Starting`,
     /// which closes the gate. `epoch` lets the fold ignore an ack for a
-    /// grant already superseded — the same role `op_id` plays for stops.
-    ServiceStarting { name: String, epoch: u64 },
+    ServiceStarting { name: String },
     ServiceStartPrepared {
         name: String,
         intent: ServiceStartIntent,

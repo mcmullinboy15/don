@@ -34,11 +34,11 @@ pub use crate::command::{CommandError, CommandResult};
 // surface stable.
 pub(in crate::runner) use crate::build_tool::{batch as build_tools, batcher as build_batcher};
 pub use crate::param_completions::CompletionError;
-pub(crate) use crate::process::{ProcessKind, ProcessReport};
 pub(in crate::runner) use crate::process::{
-    ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, health, paths,
+    Demand, ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, health, paths,
     service_supervisor, service_worker, task_supervisor, task_worker,
 };
+pub(crate) use crate::process::{ProcessKind, ProcessReport};
 pub use crate::process::{ServiceState, TaskState};
 pub(in crate::runner) use crate::state_store;
 pub use crate::state_store::{
@@ -579,6 +579,7 @@ impl Runner {
                 shutdown: config.shutdown.clone(),
                 fallback_ports: config.fallback_ports,
                 endpoints: endpoints_reader,
+                shutdown_rx: shutdown_flag_tx.subscribe(),
             },
             &|name| output_manager.process_output(name),
             &|name| services.get(name).map(|rs| rs.resolved.clone()),
@@ -697,22 +698,13 @@ impl Runner {
         if let Some(state) = changed {
             self.sync_proxy_policy(name);
             self.broadcast_service_state(name, state);
-            if (matches!(
-                state,
-                ServiceState::Pending
-                        | ServiceState::Lazy
-                        | ServiceState::Ready
-                        // Stopped opens a non-blocking dependency's gate, so
-                        // dependents need a sweep to notice.
-                        | ServiceState::Stopped
-                        | ServiceState::Failed
-                        | ServiceState::DependencyFailed
-            ) || matches!(
-                previous_state,
-                Some(ServiceState::Failed | ServiceState::DependencyFailed)
-            )) {
-                self.schedule_gate_recompute();
-            }
+            // Every transition, not a chosen subset. A gate is derived
+            // purely from peers' states now, so any state change can move
+            // some dependent's level — and a level that goes stale is a
+            // start that should not have happened. Recomputing is a cheap
+            // pure pass that publishes nothing when nothing changed.
+            self.schedule_gate_recompute();
+            let _ = previous_state;
         }
     }
 
@@ -833,20 +825,11 @@ impl Runner {
             .and_then(|rt| rt.set_state(new_state));
         if let Some(state) = changed {
             self.broadcast_task_state(name, state);
-            if (matches!(
-                state,
-                TaskState::Pending
-                    | TaskState::PendingRun
-                    | TaskState::Completed
-                    | TaskState::Skipped
-                    | TaskState::Failed
-                    | TaskState::DependencyFailed
-            ) || matches!(
-                previous_state,
-                Some(TaskState::Failed | TaskState::DependencyFailed)
-            )) {
-                self.schedule_gate_recompute();
-            }
+            // Every transition — see `set_service_state`. A task in the
+            // middle of a re-run stops satisfying its dependents, and that
+            // must reach their gates before anything acts on a stale level.
+            self.schedule_gate_recompute();
+            let _ = previous_state;
         }
     }
 
@@ -1407,7 +1390,9 @@ impl Runner {
                             // Only the first connection acts: it moves Lazy →
                             // Pending, and the normal dependency scheduler
                             // owns the service from there.
-                            ProcessReport::Demand { name } => self.handle_lazy_connection(&name),
+                            ProcessReport::Demand { name, demand } => {
+                                self.handle_demand(&name, demand);
+                            }
                             ProcessReport::ServiceExited { name, pgid, status } => {
                                 self.handle_service_exited(&name, pgid, status).await;
                             }
@@ -1420,8 +1405,8 @@ impl Runner {
                             ProcessReport::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
                             }
-                            ProcessReport::ServiceStarting { name, epoch } => {
-                                self.handle_service_starting(&name, epoch);
+                            ProcessReport::ServiceStarting { name } => {
+                                self.handle_service_starting(&name);
                             }
                             ProcessReport::ServiceStartPrepared {
                                 name,
