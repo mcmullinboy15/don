@@ -42,8 +42,6 @@ pub(crate) struct RuntimeService {
     /// child PID for services spawned by don. Docker services do not expose a
     /// local PID here.
     pub pgid: Option<i32>,
-    /// OSC query sink for reclaiming PTY write on attach.
-    pub osc_sink: Option<crate::output::OscSinkHandle>,
     /// Whether the current start was asked for by the dependency sweep —
     /// its ready outcome then drives the sweep-visible transition and the
     /// "ready" lifecycle line; manual/rebuild starts instead close the
@@ -96,7 +94,6 @@ impl RuntimeService {
             docker_port_bindings: Vec::new(),
             handle_identity: None,
             pgid: None,
-            osc_sink: None,
             scheduled_start: false,
             proxy_view: None,
             resolved_watch_paths: Vec::new(),

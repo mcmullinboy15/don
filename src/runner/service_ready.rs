@@ -20,7 +20,6 @@ impl Runner {
             identity,
             pgid: spawned_pgid,
             docker_port_bindings,
-            osc_sink,
             proxy_backend_env,
         } = wired;
         for binding in docker_port_bindings
@@ -50,7 +49,6 @@ impl Runner {
 
         if let Some(rs) = self.services.get_mut(name) {
             rs.pgid = spawned_pgid;
-            rs.osc_sink = osc_sink;
             rs.scheduled_start = scheduled;
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop

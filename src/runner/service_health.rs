@@ -89,7 +89,6 @@ impl Runner {
         if state == ServiceState::Failed {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.pgid = None;
-                rs.osc_sink = None;
             }
             self.clear_service_custody(name);
             self.sync_proxy_policy(name);

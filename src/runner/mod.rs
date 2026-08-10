@@ -2659,7 +2659,6 @@ mod tests {
 
         assert_eq!(rs.state(), ServiceState::Pending);
         assert!(rs.handle_identity.is_none());
-        assert!(rs.osc_sink.is_none());
         assert!(rs.proxy_view.is_none());
         assert!(rs.resolved_watch_paths.is_empty());
         assert!(rs.bazel_binary_path.is_none());

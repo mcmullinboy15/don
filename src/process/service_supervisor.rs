@@ -138,9 +138,6 @@ pub(crate) struct ServiceWired {
     pub(crate) identity: super::state::ServiceHandleIdentity,
     pub(crate) pgid: Option<i32>,
     pub(crate) docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
-    /// OSC response scanner handle — dropped on restart/stop to end the
-    /// scanner and release its gate sender.
-    pub(crate) osc_sink: Option<crate::output::OscSinkHandle>,
     /// The proxy's env-mode backend vars this spawn was launched with —
     /// `Some` iff the service has a proxy. The runner refreshes its
     /// `ProxyView` shadow from this, so ready checks written against
@@ -357,6 +354,10 @@ async fn supervise(
     let mut reader_eof: Option<tokio::sync::oneshot::Receiver<()>> = None;
     // Dropping this ends the held process's health monitor, if one ran.
     let mut monitor_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
+    // The OSC response scanner for the held spawn. It holds a sender into the
+    // PTY gate, which holds the master's write half, so a stale one keeps the
+    // PTY open — it belongs with the process, not with a shadow of it.
+    let mut osc_sink: Option<crate::output::OscSinkHandle> = None;
     // Health transitions from the monitor this supervisor spawns. They land
     // here rather than on the report channel so the restart policy sees them
     // before the scheduler does.
@@ -437,6 +438,7 @@ async fn supervise(
                         busy.store(true, Ordering::Relaxed);
                         reader_eof = None;
                         monitor_cancel = None;
+                        osc_sink = None;
                         if let Some(handle) = reader.take() {
                             await_reader(handle).await;
                         }
@@ -486,6 +488,7 @@ async fn supervise(
                                 if matches!(decided, super::health::PolicyOutcome::LazyRearm { .. }) {
                                     reader_eof = None;
                                     monitor_cancel = None;
+                                    osc_sink = None;
                                     let _ = run_stop(
                                         &name,
                                         &env,
@@ -625,6 +628,7 @@ async fn supervise(
             ServiceCommand::Stop(request) => {
                 reader_eof = None;
                 monitor_cancel = None;
+                osc_sink = None;
                 ready_pending = None;
                 // A stop withdraws demand: nothing wants this running now, so
                 // an open gate cannot undo it. A restart's follow-up start is
@@ -674,6 +678,7 @@ async fn supervise(
             ServiceCommand::Restart(request) => {
                 reader_eof = None;
                 monitor_cancel = None;
+                osc_sink = None;
                 ready_pending = None;
                 demand = super::Demand::None;
                 if request.reset_policy {
@@ -870,6 +875,7 @@ async fn supervise(
                             &mut reader,
                             &mut reader_eof,
                             &mut monitor_cancel,
+                            &mut osc_sink,
                         )
                         .await;
                         // Resolution reads this spawn's live proxy and docker
@@ -1081,6 +1087,7 @@ async fn wire_spawn(
     reader: &mut Option<tokio::task::JoinHandle<()>>,
     reader_eof: &mut Option<tokio::sync::oneshot::Receiver<()>>,
     monitor_cancel: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    osc_sink: &mut Option<crate::output::OscSinkHandle>,
 ) -> (
     ServiceWired,
     tokio::sync::oneshot::Receiver<()>,
@@ -1106,7 +1113,10 @@ async fn wire_spawn(
         service::ServiceHandle::Process(process) => process.take_pty_write(),
         service::ServiceHandle::Docker(_) => None,
     };
-    let osc_sink = match (pty, output) {
+    // Held by this supervisor for the spawn's lifetime. Dropping it ends the
+    // scanner and releases its PTY-gate sender, so it must be dropped
+    // wherever the process is: stop, reap, or the next wire replacing it.
+    *osc_sink = match (pty, output) {
         (Some(pty), Some(output)) => {
             // Feed the server-side screen from process start — a correct
             // repaint on attach requires having seen the setup sequences.
@@ -1157,7 +1167,6 @@ async fn wire_spawn(
             identity,
             pgid,
             docker_port_bindings,
-            osc_sink,
             proxy_backend_env: proxy.map(|p| p.env_vars()),
         },
         exit_rx,
