@@ -128,7 +128,7 @@ impl Runner {
                 && self
                     .services
                     .get(name)
-                    .is_some_and(|rs| rs.proxy_view.is_some())
+                    .is_some_and(|rs| !rs.resolved.proxy.is_empty())
             {
                 self.send_proxy_directive(
                     name,

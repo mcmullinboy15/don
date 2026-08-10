@@ -139,7 +139,7 @@ impl Runner {
         let proxy_names: Vec<String> = self
             .services
             .iter()
-            .filter(|(_, rs)| rs.proxy_view.is_some())
+            .filter(|(_, rs)| !rs.resolved.proxy.is_empty())
             .map(|(name, _)| name.clone())
             .collect();
         for name in proxy_names {

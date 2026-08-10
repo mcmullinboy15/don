@@ -168,14 +168,13 @@ pub(crate) struct ServiceProxy {
     policy: ConnectionPolicy,
 }
 
-/// The runner's read-only view of a service's proxy.
+/// What the runner takes from a service's proxy at bind time.
 ///
-/// The live [`ServiceProxy`] belongs to the service's supervisor; everything
-/// the runner needs for status, port references and the ports manifest is
-/// here instead. `bindings` never changes after bind. `backend_env` and
-/// `policy` are shadows the runner refreshes itself: it is the only sender of
-/// policy changes, and every (re)spawn reports its backend env through the
-/// wired message — so the shadow is current wherever it is read.
+/// The live [`ServiceProxy`] belongs to the service's supervisor. This is only
+/// what the runner needs *once*, before handing it over: the bindings (which
+/// never change after bind, and go into the endpoint projection) and a handle
+/// to the shared connection counter. Nothing here is a shadow of mutable
+/// state — policy lives with the proxy, and backend env with the endpoints.
 #[derive(Debug, Clone)]
 pub(crate) struct ProxyView {
     /// Configured-to-actual binding metadata, in declaration order.
@@ -183,38 +182,14 @@ pub(crate) struct ProxyView {
     /// Live count of Don-owned forward connections, shared with the accept
     /// loops. `None` when the service has no env/forward entries.
     active_forward_connections: Option<Arc<AtomicUsize>>,
-    /// Env-mode backend vars (e.g. `{"PORT": "49152"}`) as of the last
-    /// spawn — reallocation on restart makes these per-process values.
-    pub(crate) backend_env: HashMap<String, String>,
-    /// The connection policy the runner last commanded.
-    pub(crate) policy: ConnectionPolicy,
 }
 
 impl ProxyView {
-    /// Human-readable entries using the actual bound public addresses.
-    pub(crate) fn descriptions(&self) -> Vec<String> {
-        descriptions_for(&self.bindings)
-    }
-
-    /// Whether the proxy is refusing connections under the last policy.
-    pub(crate) fn is_refusing(&self) -> bool {
-        self.policy == ConnectionPolicy::Refuse
-    }
-
-    /// Active Don-owned proxy connections; `None` for listenfd-only proxies.
-    pub(crate) fn active_forward_connections(&self) -> Option<usize> {
-        self.active_forward_connections
-            .as_ref()
-            .map(|count| count.load(Ordering::Relaxed))
-    }
-
-    /// True if any proxy entry requires serial (no-overlap) restart. A fixed
-    /// `Forward` backend can't have two processes binding the same port at
-    /// once, so the old instance must fully exit before the new one starts.
-    pub(crate) fn requires_full_exit_on_restart(&self) -> bool {
-        self.bindings
-            .iter()
-            .any(|binding| matches!(binding.mode, ProxyBindingMode::Forward { .. }))
+    /// The shared live counter itself, for a holder that wants to keep
+    /// reading it. This is a handle to one number, not a copy of it — it
+    /// cannot go stale the way a snapshotted value would.
+    pub(crate) fn connection_counter(&self) -> Option<Arc<AtomicUsize>> {
+        self.active_forward_connections.clone()
     }
 }
 
@@ -508,8 +483,6 @@ impl ServiceProxy {
             bindings: self.bindings.clone(),
             active_forward_connections: (!self.forward.is_empty())
                 .then(|| self.active_forward_connections.clone()),
-            backend_env: self.env_vars(),
-            policy: self.policy,
         }
     }
 
@@ -711,7 +684,7 @@ pub(crate) fn env_reference_values_for(bindings: &[ProxyBinding]) -> HashMap<Str
 }
 
 /// Human-readable listener entries derived from binding metadata.
-fn descriptions_for(bindings: &[ProxyBinding]) -> Vec<String> {
+pub(crate) fn descriptions_for(bindings: &[ProxyBinding]) -> Vec<String> {
     bindings
         .iter()
         .map(|binding| match &binding.mode {
@@ -1431,7 +1404,7 @@ mod tests {
             bindings.iter().map(|binding| binding.bound_addr).collect();
         assert_eq!(proxy.listen_addrs(), actual_addrs);
         assert_eq!(
-            proxy.view().descriptions(),
+            super::descriptions_for(&proxy.view().bindings),
             vec![
                 format!("{} (listenfd)", actual_addrs[0]),
                 format!("{} (env=api_port)", actual_addrs[1]),
@@ -1718,7 +1691,6 @@ mod tests {
                 "{}: entering refusal should report a change",
                 case.name
             );
-            assert!(proxy.view().is_refusing(), "{}", case.name);
 
             // Every listener refuses — parked connections and new ones alike.
             for (addr, mut early) in addrs.iter().zip(parked) {
@@ -1744,7 +1716,6 @@ mod tests {
                 ConnectionPolicy::Serve
             };
             assert!(proxy.set_policy(recovered), "{}", case.name);
-            assert!(!proxy.view().is_refusing(), "{}", case.name);
             for addr in &addrs {
                 let mut after = tokio::net::TcpStream::connect(addr).await.unwrap();
                 assert!(

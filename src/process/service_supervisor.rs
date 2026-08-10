@@ -622,7 +622,7 @@ async fn supervise(
                 continue;
             }
             ServiceCommand::Proxy(directive) => {
-                apply_proxy_directive(&mut proxy, directive);
+                apply_proxy_directive(&name, &env.emitter, &mut proxy, directive);
                 continue;
             }
             ServiceCommand::Stop(request) => {
@@ -844,7 +844,7 @@ async fn supervise(
                     // ClearBackend-then-Stop, and that order is preserved
                     // because the directive comes first in the mailbox.
                     Some(ServiceCommand::Proxy(directive)) => {
-                        apply_proxy_directive(&mut proxy, directive);
+                        apply_proxy_directive(&name, &env.emitter, &mut proxy, directive);
                     }
                     Some(next) => superseded = Some(next),
                     // Guarded so a closed mailbox doesn't spin this select.
@@ -1013,14 +1013,30 @@ async fn run_stop(
 
 /// Apply a runner proxy decision to the owned proxy. No-op for services
 /// without one, and after `Shutdown`.
+///
+/// Whether a policy is a *change* is answered by the proxy itself rather than
+/// by a shadow of what was last commanded — the owner knows. Narrating the
+/// refusal edge belongs here for the same reason.
 fn apply_proxy_directive(
+    name: &str,
+    emitter: &LifecycleEmitter,
     proxy: &mut Option<crate::proxy::ServiceProxy>,
     directive: ProxyDirective,
 ) {
     match directive {
         ProxyDirective::SetPolicy(policy) => {
-            if let Some(p) = proxy.as_mut() {
-                p.set_policy(policy);
+            let Some(p) = proxy.as_mut() else { return };
+            if !p.set_policy(policy) {
+                return;
+            }
+            // Only the refusal edge is worth a line, and it belongs in the
+            // normal log: a dev staring at `ECONNRESET` in their browser
+            // shouldn't have to rerun with `--verbose` to find out why.
+            match policy {
+                crate::proxy::ConnectionPolicy::Refuse => {
+                    emitter.service_error_event(name, "proxy refusing connections (service failed)")
+                }
+                _ => emitter.service_event(name, "proxy accepting connections again"),
             }
         }
         ProxyDirective::SetBackend => {
@@ -1647,13 +1663,7 @@ mod tests {
             let (proxy, backend) = loop {
                 attempt += 1;
                 let proxy = bind_env_proxy(None).await;
-                let backend_port: u16 = proxy
-                    .view()
-                    .backend_env
-                    .get("PORT")
-                    .unwrap()
-                    .parse()
-                    .unwrap();
+                let backend_port: u16 = proxy.env_vars().get("PORT").unwrap().parse().unwrap();
                 match tokio::net::TcpListener::bind(("127.0.0.1", backend_port)).await {
                     Ok(listener) => break (proxy, listener),
                     Err(error) => assert!(

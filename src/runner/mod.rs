@@ -55,6 +55,8 @@ use crate::sys::pid_file::PidFile;
 use crate::watch::WatchManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 #[cfg(test)]
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
@@ -122,6 +124,16 @@ pub(crate) enum ServiceStopAction {
     #[default]
     None,
     RestartSpawnOnly,
+}
+
+/// Whether a service's proxy is closing connections rather than queuing them.
+///
+/// A service that failed *and* has no process left has nothing to queue for —
+/// a client would hang on a socket nobody will read. Shared by the policy the
+/// runner commands and the `status -v` line that explains it, so the two
+/// cannot drift.
+pub(in crate::runner) fn refusing_connections(state: ServiceState, live: bool) -> bool {
+    matches!(state, ServiceState::Failed | ServiceState::DependencyFailed) && !live
 }
 
 fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {
@@ -431,6 +443,9 @@ pub struct Runner {
     /// Sends manifest snapshots / removals to the serialized writer task that
     /// owns `.don/ports.json` filesystem I/O. `None` after shutdown flush.
     manifest_writer_tx: Option<mpsc::UnboundedSender<runtime_ports::ManifestWrite>>,
+    /// Live forward-connection counters, by service. Captured once at bind;
+    /// `don status -v` reads them.
+    proxy_connection_counters: HashMap<String, Arc<AtomicUsize>>,
     /// Join handle for the manifest-writer task, awaited on shutdown so the
     /// final removal is observable once the runner stops.
     manifest_writer_handle: Option<tokio::task::JoinHandle<()>>,
@@ -521,6 +536,10 @@ impl Runner {
         endpoints.seed(services.keys().cloned());
 
         let mut proxies: HashMap<String, service_supervisor::ProxyAssets> = HashMap::new();
+        // Handles to the proxies' live connection counters. Immutable after
+        // construction and shared with the accept loops, so this is a way to
+        // read one number rather than a copy of it.
+        let mut proxy_connection_counters: HashMap<String, Arc<AtomicUsize>> = HashMap::new();
         for (name, rs) in services.iter_mut() {
             if rs.resolved.proxy.is_empty() {
                 continue;
@@ -552,7 +571,10 @@ impl Runner {
                     );
                     let view = proxy.view();
                     endpoints.publish_proxy(name, view.bindings.clone());
-                    rs.proxy_view = Some(view);
+                    if let Some(counter) = view.connection_counter() {
+                        proxy_connection_counters.insert(name.clone(), counter);
+                    }
+                    let _ = rs;
                     proxies.insert(
                         name.clone(),
                         service_supervisor::ProxyAssets { proxy, demand_rx },
@@ -661,6 +683,7 @@ impl Runner {
             shutdown_flag_tx,
             shutting_down: false,
             manifest_writer_tx: Some(manifest_writer_tx),
+            proxy_connection_counters,
             manifest_writer_handle: Some(manifest_writer_handle),
         };
         // Seed the projection before anyone can read it. The process set is fixed
@@ -726,41 +749,20 @@ impl Runner {
         let Some(rs) = self.services.get(name) else {
             return;
         };
-        let policy = match rs.state() {
-            ServiceState::Lazy => ConnectionPolicy::LazyTrigger,
-            ServiceState::Failed | ServiceState::DependencyFailed if !live => {
-                ConnectionPolicy::Refuse
-            }
-            _ => ConnectionPolicy::Serve,
-        };
-        let Some(rs) = self.services.get_mut(name) else {
-            return;
-        };
-        let Some(view) = rs.proxy_view.as_mut() else {
-            return;
-        };
-        // The runner is the only sender of policy changes, so its shadow is
-        // the authority on whether this is a change at all.
-        if view.policy == policy {
-            return;
-        }
-        let was_refusing = view.is_refusing();
-        view.policy = policy;
-        self.send_proxy_directive(name, service_supervisor::ProxyDirective::SetPolicy(policy));
-        // Only the refusal edge is worth a line, and it belongs in the normal
-        // log: a dev staring at `ECONNRESET` in their browser shouldn't have
-        // to rerun with `--verbose` to find out why.
-        let refusing = policy == ConnectionPolicy::Refuse;
-        if refusing == was_refusing {
-            return;
-        }
-        if refusing {
-            self.output_manager
-                .service_error_event(name, "proxy refusing connections (service failed)");
+        let policy = if rs.state() == ServiceState::Lazy {
+            ConnectionPolicy::LazyTrigger
+        } else if refusing_connections(rs.state(), live) {
+            ConnectionPolicy::Refuse
         } else {
-            self.output_manager
-                .service_event(name, "proxy accepting connections again");
+            ConnectionPolicy::Serve
+        };
+        if rs.resolved.proxy.is_empty() {
+            return;
         }
+        // Sent unconditionally: the proxy answers whether this is a change,
+        // and narrates the refusal edge. Deduping here would need a shadow of
+        // a value the owner already has.
+        self.send_proxy_directive(name, service_supervisor::ProxyDirective::SetPolicy(policy));
     }
 
     /// Hand a proxy decision to the service's supervisor, which owns the
@@ -1097,7 +1099,7 @@ impl Runner {
         let lazy_names: Vec<String> = self
             .services
             .iter()
-            .filter(|(_, rs)| rs.resolved.lazy && rs.proxy_view.is_some())
+            .filter(|(_, rs)| rs.resolved.lazy && !rs.resolved.proxy.is_empty())
             .map(|(name, _)| name.clone())
             .collect();
         for name in lazy_names {
@@ -2662,7 +2664,6 @@ mod tests {
         );
 
         assert_eq!(rs.state(), ServiceState::Pending);
-        assert!(rs.proxy_view.is_none());
         assert!(rs.resolved_watch_paths.is_empty());
         assert!(rs.bazel_binary_path.is_none());
         assert!(!rs.batch_built);

@@ -564,6 +564,19 @@ impl Service {
 }
 
 impl ResolvedService {
+    /// Whether any proxy entry forces a serial (no-overlap) restart. A fixed
+    /// `Forward` backend cannot have two processes bound to the same port at
+    /// once, so the old instance must fully exit before the new one starts.
+    ///
+    /// Mirrors `ProxyView::requires_full_exit_on_restart`, from config rather
+    /// than from bound state — the answer is the same because binding never
+    /// changes an entry's mode.
+    pub fn requires_full_exit_on_restart(&self) -> bool {
+        self.proxy
+            .iter()
+            .any(|entry| matches!(entry.mode, crate::config::ProxyMode::Forward(_)))
+    }
+
     /// Returns the `DockerConfig` if this is a Docker service.
     pub fn docker_config(&self) -> Option<&DockerConfig> {
         match &self.kind {

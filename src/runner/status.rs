@@ -75,6 +75,7 @@ impl Runner {
             if detail_name.is_some_and(|want| want != name) {
                 continue;
             }
+            let live = self.service_runtime(name).is_some();
             let verbose_info = {
                 let resolved = &rs.resolved;
                 let ready = self.endpoint_ready_check(name, resolved).as_ref().map(|r| {
@@ -142,8 +143,17 @@ impl Runner {
                     } else {
                         Vec::new()
                     },
-                    proxy: rs.proxy_view.as_ref().map_or_else(
-                        || {
+                    proxy: {
+                        // Bound addresses come from the endpoint projection;
+                        // before bind (or for a service with none) fall back
+                        // to what the config asked for.
+                        let bound = self
+                            .endpoints
+                            .snapshot()
+                            .get(name)
+                            .map(|endpoints| endpoints.proxy.clone())
+                            .unwrap_or_default();
+                        if bound.is_empty() {
                             resolved
                                 .proxy
                                 .iter()
@@ -159,29 +169,28 @@ impl Runner {
                                     }
                                 })
                                 .collect()
-                        },
-                        |proxy| {
-                            let mut entries = proxy.descriptions();
+                        } else {
+                            let mut entries = crate::proxy::descriptions_for(&bound);
                             // A failed service's listeners still exist, so
                             // say why they are closing connections instead of
                             // leaving the address looking healthy.
-                            if proxy.is_refusing() {
+                            if super::refusing_connections(rs.state(), live) {
                                 for entry in &mut entries {
                                     entry.push_str(" — refusing (service failed)");
                                 }
                             }
                             entries
-                        },
-                    ),
+                        }
+                    },
                     docker_ports: self
                         .service_runtime(name)
                         .filter(|runtime| runtime.docker)
                         .map(|runtime| runtime.docker_ports)
                         .unwrap_or_default(),
-                    proxy_active_connections: rs
-                        .proxy_view
-                        .as_ref()
-                        .and_then(|proxy| proxy.active_forward_connections()),
+                    proxy_active_connections: self
+                        .proxy_connection_counters
+                        .get(name)
+                        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed)),
                     bazel_target: resolved.bazel_config().map(|b| b.target.clone()),
                     ready,
                     cmd,

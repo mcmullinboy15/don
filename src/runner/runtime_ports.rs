@@ -104,14 +104,6 @@ impl Runner {
                 docker_ports: crate::docker::describe_port_bindings(&docker_port_bindings),
             }),
         );
-        if let Some(rs) = self.services.get_mut(name) {
-            // Refresh the backend-env shadow: a restart reallocates ephemeral
-            // backend ports, and the status path's `${PORT}` display must
-            // resolve to the port this spawn was told.
-            if let (Some(view), Some(backend_env)) = (rs.proxy_view.as_mut(), proxy_backend_env) {
-                view.backend_env = backend_env;
-            }
-        }
         self.refresh_runtime_port_manifest();
     }
 

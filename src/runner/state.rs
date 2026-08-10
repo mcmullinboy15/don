@@ -35,10 +35,6 @@ pub(crate) struct RuntimeService {
     /// "ready" lifecycle line; manual/rebuild starts instead close the
     /// watch cycle with `RebuildComplete`.
     pub(in crate::runner) scheduled_start: bool,
-    /// The runner's read-only view of the supervisor-owned proxy: binding
-    /// metadata for status, port references and the ports manifest, plus the
-    /// policy and backend-env shadows the runner refreshes itself.
-    pub proxy_view: Option<crate::proxy::ProxyView>,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
     /// Bazel binary path resolved via `bazel cquery --output=files`.
@@ -80,7 +76,6 @@ impl RuntimeService {
             resolved,
 
             scheduled_start: false,
-            proxy_view: None,
             resolved_watch_paths: Vec::new(),
             bazel_binary_path: None,
             batch_built: false,

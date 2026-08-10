@@ -211,7 +211,7 @@ impl Runner {
         if self
             .services
             .get(name)
-            .is_some_and(|rs| rs.proxy_view.is_some())
+            .is_some_and(|rs| !rs.resolved.proxy.is_empty())
         {
             self.send_proxy_directive(
                 name,
@@ -229,8 +229,7 @@ impl Runner {
             let wait_full = self
                 .services
                 .get(name)
-                .and_then(|rs| rs.proxy_view.as_ref())
-                .is_some_and(|p| p.requires_full_exit_on_restart());
+                .is_some_and(|rs| rs.resolved.requires_full_exit_on_restart());
             self.send_service_stop(
                 name,
                 shutdown_config,
