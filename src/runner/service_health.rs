@@ -78,7 +78,7 @@ impl Runner {
         // held; this guards the *fold*: by the time the report lands, the
         // runner may have wired a newer process for the service, and this
         // exit is then history, not news.
-        if self.services.get(name).and_then(|rs| rs.pgid) != Some(pgid) {
+        if self.service_runtime(name).and_then(|runtime| runtime.pid) != Some(pgid) {
             return;
         }
         // A service can sit in `Failed` with its process still alive: a failed
@@ -87,9 +87,6 @@ impl Runner {
         // exits, clear the runtime fields and let the proxy switch to
         // refusing — the failure itself was reported long ago.
         if state == ServiceState::Failed {
-            if let Some(rs) = self.services.get_mut(name) {
-                rs.pgid = None;
-            }
             self.clear_service_custody(name);
             self.sync_proxy_policy(name);
             if let Some(writer) = self.output_manager.service_writer(name) {
@@ -104,9 +101,6 @@ impl Runner {
             return;
         }
 
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.pgid = None;
-        }
         self.clear_service_custody(name);
         self.fold_policy(name, &policy);
 

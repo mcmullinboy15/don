@@ -20,11 +20,8 @@ impl Runner {
     /// that already holds a live one has an authoritative state already, and
     /// says nothing here.
     pub(in crate::runner) fn handle_demand(&mut self, name: &str, _demand: super::Demand) {
-        if self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.handle_identity.is_some())
-        {
+        // Already holding a live process: its state is authoritative.
+        if self.service_runtime(name).is_some() {
             return;
         }
         if self.services.contains_key(name) {

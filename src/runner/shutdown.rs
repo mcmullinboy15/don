@@ -199,14 +199,28 @@ impl Runner {
         // and a supervisor holding nothing answers immediately, so telling
         // everyone costs nothing. They stay out of the narration and the
         // countdown: a service with no live process was never "stopping".
+        // Custody, read once from the projection: the fold is not running
+        // during teardown, so this is exactly as fresh as the old shadow was.
+        let live: HashMap<String, Option<i32>> = self
+            .state
+            .current()
+            .processes
+            .iter()
+            .filter_map(|status| match status {
+                crate::state_store::ProcessStatus::Service { name, runtime, .. } => {
+                    runtime.as_ref().map(|runtime| (name.clone(), runtime.pid))
+                }
+                _ => None,
+            })
+            .collect();
         let mut by_depth: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         let mut quiet_by_depth: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         for name in &order {
-            let Some(service) = self.services.get(name) else {
+            if !self.services.contains_key(name) {
                 continue;
-            };
+            }
             let depth = depths.get(name).copied().unwrap_or(0);
-            if service.handle_identity.is_none() {
+            if !live.contains_key(name) {
                 quiet_by_depth.entry(depth).or_default().push(name.clone());
                 continue;
             }
@@ -231,7 +245,7 @@ impl Runner {
             let mut stopping_pgids: HashMap<String, i32> = HashMap::new();
             let mut join_set: JoinSet<String> = JoinSet::new();
             for name in &names {
-                if let Some(pgid) = self.services.get(name).and_then(|rs| rs.pgid) {
+                if let Some(pgid) = live.get(name).copied().flatten() {
                     stopping_pgids.insert(name.clone(), pgid);
                 }
                 // The supervisor owns the process; ask it to stop and join
@@ -285,9 +299,6 @@ impl Runner {
                         })
                         .collect();
                     for name in names {
-                        if let Some(rs) = self.services.get_mut(&name) {
-                            rs.pgid = None;
-                        }
                         self.clear_service_custody(&name);
                         self.set_service_state(&name, ServiceState::Stopped);
                     }
@@ -307,9 +318,6 @@ impl Runner {
                 {
                     Ok(Some(Ok(name))) => {
                         stopping_pgids.remove(&name);
-                        if let Some(rs) = self.services.get_mut(&name) {
-                            rs.pgid = None;
-                        }
                         self.clear_service_custody(&name);
                         self.set_service_state(&name, ServiceState::Stopped);
                         remaining -= 1;

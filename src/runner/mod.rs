@@ -722,14 +722,13 @@ impl Runner {
     /// Call this after any change to a service's state *or* its process
     /// handle. It is idempotent.
     fn sync_proxy_policy(&mut self, name: &str) {
+        let live = self.service_runtime(name).is_some();
         let Some(rs) = self.services.get(name) else {
             return;
         };
         let policy = match rs.state() {
             ServiceState::Lazy => ConnectionPolicy::LazyTrigger,
-            ServiceState::Failed | ServiceState::DependencyFailed
-                if rs.handle_identity.is_none() =>
-            {
+            ServiceState::Failed | ServiceState::DependencyFailed if !live => {
                 ConnectionPolicy::Refuse
             }
             _ => ConnectionPolicy::Serve,
@@ -2663,7 +2662,6 @@ mod tests {
         );
 
         assert_eq!(rs.state(), ServiceState::Pending);
-        assert!(rs.handle_identity.is_none());
         assert!(rs.proxy_view.is_none());
         assert!(rs.resolved_watch_paths.is_empty());
         assert!(rs.bazel_binary_path.is_none());

@@ -48,7 +48,6 @@ impl Runner {
         }
 
         if let Some(rs) = self.services.get_mut(name) {
-            rs.pgid = spawned_pgid;
             rs.scheduled_start = scheduled;
         }
         self.fold_service_custody(

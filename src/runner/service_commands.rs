@@ -219,7 +219,11 @@ impl Runner {
             );
         }
 
-        if self.services.get(name).is_some_and(|rs| rs.pgid.is_some()) {
+        if self
+            .service_runtime(name)
+            .and_then(|runtime| runtime.pid)
+            .is_some()
+        {
             self.set_service_state(name, ServiceState::Stopping);
             let shutdown_config = self.effective_shutdown_config(name);
             let wait_full = self
@@ -352,11 +356,7 @@ impl Runner {
             }));
             return;
         }
-        if self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.handle_identity.is_some())
-        {
+        if self.service_runtime(name).is_some() {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "already running".to_string(),
@@ -607,9 +607,6 @@ impl Runner {
 
         match result {
             Ok(()) => {
-                if let Some(rs) = self.services.get_mut(name) {
-                    rs.pgid = None;
-                }
                 self.clear_service_custody(name);
                 self.set_service_state(name, ServiceState::Stopped);
                 let next_result = if restarting {
@@ -635,9 +632,6 @@ impl Runner {
                 Self::answer(reply, next_result);
             }
             Err(message) => {
-                if let Some(rs) = self.services.get_mut(name) {
-                    rs.pgid = None;
-                }
                 self.clear_service_custody(name);
                 self.set_service_state(name, ServiceState::Failed);
                 self.output_manager.service_error_event(name, &message);
@@ -698,7 +692,11 @@ impl Runner {
         if let Some(rs) = self.services.get_mut(name) {
             rs.restart_pending = false;
         }
-        if self.services.get(name).and_then(|rs| rs.pgid).is_none() {
+        if self
+            .service_runtime(name)
+            .and_then(|runtime| runtime.pid)
+            .is_none()
+        {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "not running".to_string(),
@@ -759,7 +757,11 @@ impl Runner {
         if let Some(rs) = self.services.get_mut(name) {
             rs.restart_pending = false;
         }
-        if self.services.get(name).and_then(|rs| rs.pgid).is_none() {
+        if self
+            .service_runtime(name)
+            .and_then(|runtime| runtime.pid)
+            .is_none()
+        {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
         }

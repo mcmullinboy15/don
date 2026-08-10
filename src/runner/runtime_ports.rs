@@ -73,8 +73,8 @@ impl Runner {
     ///
     /// There is exactly one other custody funnel,
     /// [`clear_service_custody`](Self::clear_service_custody). Setting
-    /// `handle_identity` anywhere else means a supervisor's endpoints and the
-    /// runner's shadow disagree about whether a container is live — which
+    /// Recording custody anywhere else means the endpoint projection and the
+    /// state projection disagree about whether a container is live — which
     /// shows up as a peer's `$(db.PORT)` resolving when it shouldn't, or not
     /// resolving when it should.
     pub(in crate::runner) fn fold_service_custody(
@@ -105,8 +105,6 @@ impl Runner {
             }),
         );
         if let Some(rs) = self.services.get_mut(name) {
-            rs.docker_port_bindings = docker_port_bindings;
-            rs.handle_identity = Some(identity);
             // Refresh the backend-env shadow: a restart reallocates ephemeral
             // backend ports, and the status path's `${PORT}` display must
             // resolve to the port this spawn was told.
@@ -123,9 +121,6 @@ impl Runner {
     pub(in crate::runner) fn clear_service_custody(&mut self, name: &str) {
         self.endpoints.clear_custody(name);
         self.state.set_service_runtime(name, None);
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.handle_identity = None;
-        }
         self.refresh_runtime_port_manifest();
     }
 

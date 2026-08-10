@@ -14,7 +14,7 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::{ServiceHandleIdentity, ServiceState, ServiceStopAction, TaskRunWaiter, TaskState};
+use super::{ServiceState, ServiceStopAction, TaskRunWaiter, TaskState};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 
@@ -30,18 +30,6 @@ pub(crate) struct RuntimeService {
     failed_dependencies: Vec<String>,
     /// The fully resolved service config (platform overrides applied once).
     pub resolved: crate::config::service::ResolvedService,
-    /// Last authoritative Docker host-port bindings. Retained while the
-    /// container is stopped so a restart can request the same fallback ports.
-    pub docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
-    /// What kind of process the service's supervisor currently holds, if
-    /// any — the runner-side shadow of custody, for liveness gates and
-    /// docker-ness checks now that the handle itself lives with the
-    /// supervisor. Set at wire, cleared wherever the handle used to be.
-    pub handle_identity: Option<ServiceHandleIdentity>,
-    /// Process group ID for the current local process. This is equal to the
-    /// child PID for services spawned by don. Docker services do not expose a
-    /// local PID here.
-    pub pgid: Option<i32>,
     /// Whether the current start was asked for by the dependency sweep —
     /// its ready outcome then drives the sweep-visible transition and the
     /// "ready" lifecycle line; manual/rebuild starts instead close the
@@ -91,9 +79,6 @@ impl RuntimeService {
             failed_dependencies: Vec::new(),
             resolved,
 
-            docker_port_bindings: Vec::new(),
-            handle_identity: None,
-            pgid: None,
             scheduled_start: false,
             proxy_view: None,
             resolved_watch_paths: Vec::new(),
