@@ -35,7 +35,7 @@ pub use crate::command::{CommandError, CommandResult};
 pub(in crate::runner) use crate::build_tool::{batch as build_tools, batcher as build_batcher};
 pub use crate::param_completions::CompletionError;
 pub(in crate::runner) use crate::process::{
-    Demand, ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, health, paths,
+    Demand, ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, paths,
     service_supervisor, service_worker, task_supervisor, task_worker,
 };
 pub(crate) use crate::process::{ProcessKind, ProcessReport};
@@ -66,10 +66,6 @@ use self::build_tools::bazel_graph_requery_group_dir;
 #[cfg(test)]
 use self::graph::compute_depths;
 use self::graph::topological_sort;
-#[cfg(test)]
-use self::health::run_health_monitor;
-#[cfg(test)]
-use self::health::unhealthy_restart_backoff_secs;
 #[cfg(test)]
 use self::paths::any_glob_path_changed_since;
 use self::support::check_gitignore;
@@ -308,8 +304,10 @@ pub struct Runner {
     /// Consolidated per-task runtime state.
     tasks: HashMap<String, RuntimeTask>,
 
-    /// The processes' lossless report channel — see [`ProcessReport`].
-    report_tx: mpsc::UnboundedSender<ProcessReport>,
+    /// The receiving half of the processes' lossless report channel — see
+    /// [`ProcessReport`]. The runner keeps no sender: every report now
+    /// originates in a supervisor, so the senders live with them and the
+    /// channel closes exactly when the last one ends.
     report_rx: mpsc::UnboundedReceiver<ProcessReport>,
 
     /// Signals the API server task to stop accepting connections.
@@ -633,7 +631,6 @@ impl Runner {
             base_dir,
             services,
             tasks,
-            report_tx,
             report_rx,
             server_shutdown_tx: None,
             docker_client,
@@ -1275,7 +1272,7 @@ impl Runner {
                                 | ServiceState::Ready
                                 | ServiceState::Starting
                                 | ServiceState::Lazy
-                        ) || rs.pending_restart.is_some()
+                        ) || rs.restart_pending
                             || starts.is_busy(name)
                     });
 
@@ -1392,14 +1389,11 @@ impl Runner {
                             ProcessReport::Demand { name, demand } => {
                                 self.handle_demand(&name, demand);
                             }
-                            ProcessReport::ServiceExited { name, pgid, status } => {
-                                self.handle_service_exited(&name, pgid, status).await;
+                            ProcessReport::ServiceExited { name, pgid, status, policy } => {
+                                self.handle_service_exited(&name, pgid, status, policy).await;
                             }
-                            ProcessReport::RestartDue { name, attempt } => {
-                                self.handle_auto_restart(&name, attempt).await;
-                            }
-                            ProcessReport::HealthChanged { name, healthy } => {
-                                self.handle_service_health_changed(&name, healthy).await;
+                            ProcessReport::HealthChanged { name, healthy, policy } => {
+                                self.handle_service_health_changed(&name, healthy, policy).await;
                             }
                             ProcessReport::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
@@ -1411,8 +1405,9 @@ impl Runner {
                                 name,
                                 intent,
                                 result,
+                                policy,
                             } => {
-                                self.handle_service_start_prepared(&name, intent, result)
+                                self.handle_service_start_prepared(&name, intent, result, policy)
                                     .await;
                             }
                             ProcessReport::ServiceReady {
@@ -1420,9 +1415,12 @@ impl Runner {
                                 success,
                                 message,
                                 had_check,
+                                policy,
                             } => {
-                                self.handle_service_ready_report(&name, success, message, had_check)
-                                    .await;
+                                self.handle_service_ready_report(
+                                    &name, success, message, had_check, policy,
+                                )
+                                .await;
                             }
                             ProcessReport::ServiceStopComplete { name, result, reply, restarting } => {
                                 self.handle_service_stop_complete(
@@ -1619,196 +1617,6 @@ mod tests {
             };
             assert!(failed_dependencies.is_empty(), "json: {json}");
         }
-    }
-
-    #[test]
-    fn unhealthy_restart_backoff_table() {
-        struct Case {
-            attempt: u32,
-            want_secs: u64,
-        }
-        let cases = [
-            Case {
-                attempt: 1,
-                want_secs: 1,
-            },
-            Case {
-                attempt: 2,
-                want_secs: 2,
-            },
-            Case {
-                attempt: 3,
-                want_secs: 4,
-            },
-            Case {
-                attempt: 4,
-                want_secs: 8,
-            },
-            Case {
-                attempt: 5,
-                want_secs: 16,
-            },
-            Case {
-                attempt: 6,
-                want_secs: 32,
-            },
-            // Cap kicks in at attempt 7 (1<<6 = 64 → clamped to 60).
-            Case {
-                attempt: 7,
-                want_secs: 60,
-            },
-            Case {
-                attempt: 12,
-                want_secs: 60,
-            },
-            Case {
-                attempt: u32::MAX,
-                want_secs: 60,
-            },
-            // Defensive: a 0 attempt shouldn't blow up — saturating_sub keeps
-            // exp at 0 and the wait at 1s.
-            Case {
-                attempt: 0,
-                want_secs: 1,
-            },
-        ];
-        for c in cases {
-            assert_eq!(
-                unhealthy_restart_backoff_secs(c.attempt),
-                c.want_secs,
-                "attempt {}",
-                c.attempt
-            );
-        }
-    }
-
-    /// Drive `run_health_monitor` against a controllable TCP target and
-    /// verify it emits the right `ServiceHealthChanged` sequence.
-    ///
-    /// Strategy: bind a real `TcpListener`, point the monitor at its port
-    /// with a tiny interval, then close/rebind to flip health. We assert
-    /// only the sequence of `healthy` flags, not their timing — the loop
-    /// is naturally jittery and exact timings would make the test flaky.
-    #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn run_health_monitor_emits_unhealthy_then_recovers() {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let ready = crate::config::ReadyCheck {
-            exec: None,
-            tcp: Some(format!("127.0.0.1:{port}")),
-            http: None,
-            interval: "1s".to_string(),
-            retries: 1,
-            timeout: "100ms".to_string(),
-            monitor: true,
-            monitor_interval: "20ms".to_string(),
-            unhealthy_after: 2,
-        };
-
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let monitor = tokio::spawn(run_health_monitor(
-            "svc".to_string(),
-            ready,
-            cmd_tx,
-            cancel_rx,
-        ));
-
-        // Listener is up — the monitor sees only successes and reports nothing.
-        // Drain for ~120ms to confirm silence on the happy path.
-        let no_msg =
-            tokio::time::timeout(std::time::Duration::from_millis(120), cmd_rx.recv()).await;
-        assert!(
-            no_msg.is_err(),
-            "monitor should not emit while target is healthy"
-        );
-
-        // Drop the listener so connect() starts failing. After
-        // unhealthy_after=2 consecutive failures, expect healthy=false.
-        drop(listener);
-        let msg = tokio::time::timeout(std::time::Duration::from_millis(500), cmd_rx.recv())
-            .await
-            .expect("timeout waiting for unhealthy event")
-            .expect("monitor channel closed unexpectedly");
-        match msg {
-            ProcessReport::HealthChanged { name, healthy } => {
-                assert_eq!(name, "svc");
-                assert!(!healthy, "expected unhealthy event first");
-            }
-            _ => {
-                panic!("unexpected report variant — monitor should only send HealthChanged")
-            }
-        }
-
-        // Rebind so probes pass again — expect a recovery event.
-        //
-        // The port had to be genuinely released to make the monitor fail, and
-        // the kernel can hand it to any other process in that window, so this
-        // bind can lose a race the test can't prevent. Retry briefly: a real
-        // regression keeps the port free and binds on the first attempt, while
-        // a thief that never leaves fails the test rather than hiding.
-        let restored = {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
-            loop {
-                match TcpListener::bind(format!("127.0.0.1:{port}")).await {
-                    Ok(listener) => break Ok(listener),
-                    Err(e) if std::time::Instant::now() < deadline => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        let _ = e;
-                    }
-                    Err(e) => break Err(e),
-                }
-            }
-        };
-        let _restored = restored.expect("another process took the monitored port mid-test");
-        let msg = tokio::time::timeout(std::time::Duration::from_millis(500), cmd_rx.recv())
-            .await
-            .expect("timeout waiting for recovery event")
-            .expect("monitor channel closed unexpectedly");
-        match msg {
-            ProcessReport::HealthChanged { name, healthy } => {
-                assert_eq!(name, "svc");
-                assert!(healthy, "expected recovery event after rebind");
-            }
-            _ => {
-                panic!("unexpected report variant — monitor should only send HealthChanged")
-            }
-        }
-
-        // Tear the monitor down cleanly so the test exits.
-        let _ = cancel_tx.send(());
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), monitor).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn run_health_monitor_exits_on_cancel() {
-        let ready = crate::config::ReadyCheck {
-            exec: None,
-            tcp: Some("127.0.0.1:1".to_string()),
-            http: None,
-            interval: "10s".to_string(),
-            retries: 1,
-            timeout: "100ms".to_string(),
-            monitor: true,
-            monitor_interval: "10s".to_string(),
-            unhealthy_after: 5,
-        };
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let monitor = tokio::spawn(run_health_monitor(
-            "svc".to_string(),
-            ready,
-            cmd_tx,
-            cancel_rx,
-        ));
-        // Long monitor_interval — without cancel, the join would hang.
-        // Cancel and confirm the task returns within a short window.
-        let _ = cancel_tx.send(());
-        let result = tokio::time::timeout(std::time::Duration::from_millis(200), monitor).await;
-        assert!(result.is_ok(), "monitor should exit promptly after cancel");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2379,7 +2187,13 @@ mod tests {
             runner.set_service_state("api", case.state);
 
             runner
-                .handle_service_ready_report("api", case.success, None, true)
+                .handle_service_ready_report(
+                    "api",
+                    case.success,
+                    None,
+                    true,
+                    crate::process::health::PolicyOutcome::None,
+                )
                 .await;
 
             assert_eq!(

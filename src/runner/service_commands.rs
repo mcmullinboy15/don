@@ -116,6 +116,7 @@ impl Runner {
         name: &str,
         intent: ServiceStartIntent,
         result: Result<Box<super::service_supervisor::ServiceWired>, String>,
+        policy: crate::process::health::PolicyOutcome,
     ) {
         if self.shutting_down {
             self.stop_late_service_start(name.to_string(), result).await;
@@ -135,16 +136,10 @@ impl Runner {
                 }
             },
             Err(message) => {
-                self.set_service_state(name, ServiceState::Failed);
+                self.apply_failure_state(name, &policy);
                 self.output_manager.service_error_event(name, &message);
-                let should_auto_restart = matches!(intent, ServiceStartIntent::Background)
-                    && self.services.get(name).is_some_and(|rs| {
-                        rs.resolved.on_failure == crate::config::OnFailure::Restart
-                    });
-                if should_auto_restart {
-                    self.schedule_auto_restart(name, &message, true);
-                } else if let Some(rs) = self.services.get_mut(name) {
-                    rs.reset_restart_tracking();
+                if let Some(rs) = self.services.get_mut(name) {
+                    rs.restart_pending = policy.restart_pending();
                 }
                 match intent {
                     // The failure handling above (Failed state + optional
@@ -238,6 +233,9 @@ impl Runner {
                 wait_full,
                 None,
                 ServiceStopAction::RestartSpawnOnly,
+                // One step of a rebuild, not a user giving up on the
+                // service — the failure history carries across it.
+                false,
             );
             return;
         }
@@ -496,6 +494,7 @@ impl Runner {
         wait_full_exit: bool,
         reply: Option<oneshot::Sender<CommandResult>>,
         stop_action: ServiceStopAction,
+        reset_policy: bool,
     ) {
         if !self.services.contains_key(name) {
             Self::answer(
@@ -526,6 +525,7 @@ impl Runner {
                         notify: super::service_supervisor::StopNotify::Reply(
                             carried.take().flatten(),
                         ),
+                        reset_policy,
                     },
                 ))
             });
@@ -566,6 +566,9 @@ impl Runner {
                         fresh_backend_ports: plan.fresh_backend_ports,
                         intent: ServiceStartIntent::Background,
                         reply: carried.take().flatten(),
+                        // Every caller of this is an explicit request; the
+                        // policy's own retry never comes through here.
+                        reset_policy: true,
                     }),
                 ))
             });
@@ -681,8 +684,7 @@ impl Runner {
             )
         }) {
             if let Some(rs) = self.services.get_mut(name) {
-                rs.stop_health_tracking();
-                rs.reset_restart_tracking();
+                rs.restart_pending = false;
             }
             self.clear_service_custody(name);
             self.set_service_state(name, ServiceState::Stopped);
@@ -694,8 +696,7 @@ impl Runner {
         // Cancel monitor + any pending auto-restart before tearing down the
         // process so a recovery probe doesn't race with the stop.
         if let Some(rs) = self.services.get_mut(name) {
-            rs.stop_health_tracking();
-            rs.reset_restart_tracking();
+            rs.restart_pending = false;
         }
         if self.services.get(name).and_then(|rs| rs.pgid).is_none() {
             let _ = reply.send(Err(CommandError::InvalidState {
@@ -714,6 +715,7 @@ impl Runner {
             false,
             Some(reply),
             ServiceStopAction::None,
+            true,
         );
     }
 
@@ -755,8 +757,7 @@ impl Runner {
         }
 
         if let Some(rs) = self.services.get_mut(name) {
-            rs.stop_health_tracking();
-            rs.reset_restart_tracking();
+            rs.restart_pending = false;
         }
         if self.services.get(name).and_then(|rs| rs.pgid).is_none() {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));

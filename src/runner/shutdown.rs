@@ -249,6 +249,8 @@ impl Runner {
                             wait_full_exit: true,
                             interrupt: None,
                             notify: super::service_supervisor::StopNotify::Done(done_tx),
+                            // Teardown: the failure history dies with the runner.
+                            reset_policy: false,
                         },
                     ))
                 });
@@ -437,6 +439,8 @@ impl Runner {
                     wait_full_exit: false,
                     interrupt: None,
                     notify: super::service_supervisor::StopNotify::Done(done_tx),
+                    // Teardown: the failure history dies with the runner.
+                    reset_policy: false,
                 },
             ));
         }
@@ -465,6 +469,8 @@ impl Runner {
                     wait_full_exit: false,
                     interrupt: None,
                     notify: super::service_supervisor::StopNotify::Done(done_tx),
+                    // Teardown: the failure history dies with the runner.
+                    reset_policy: false,
                 },
             ))
         });

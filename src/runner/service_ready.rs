@@ -55,7 +55,6 @@ impl Runner {
             // Stamp the spawn time so a fast crash can be distinguished from a
             // failure after the service did real work (see the crash-loop
             // guard in `handle_service_exited`).
-            rs.last_start = Some(std::time::Instant::now());
         }
         self.fold_service_custody(name, identity, docker_port_bindings, proxy_backend_env);
         if let Some(pgid) = spawned_pgid {
@@ -81,6 +80,7 @@ impl Runner {
         success: bool,
         message: Option<String>,
         had_check: bool,
+        policy: crate::process::health::PolicyOutcome,
     ) {
         let Some(rs) = self.services.get(name) else {
             return;
@@ -135,14 +135,8 @@ impl Runner {
                     super::service_supervisor::ProxyDirective::SetBackend,
                 );
             }
-            // Reaching Ready resets the backoff counter, but not the
-            // rapid-crash streak — see `handle_service_exited`, which clears
-            // that only once the process has survived past the crash window.
             if let Some(rs) = self.services.get_mut(name) {
-                if let Some(handle) = rs.pending_restart.take() {
-                    handle.abort();
-                }
-                rs.restart_attempts = 0;
+                rs.restart_pending = false;
             }
             self.set_service_state(name, ServiceState::Ready);
             if let Some(message) = ready_message {
@@ -153,37 +147,19 @@ impl Runner {
                 self.output_manager.service_event(name, "restarted");
             }
         } else {
-            // If a lazy service fails, reset to Lazy so the next connection
-            // can re-trigger it instead of leaving it permanently failed.
-            let is_lazy = self
-                .services
-                .get(name)
-                .is_some_and(|rs| rs.resolved.lazy && rs.proxy_view.is_some());
-            if is_lazy {
-                // Route through the crash-loop guard: returns to `Lazy` and
-                // re-arms the proxy trigger normally, but gives up (leaving
-                // it `Failed`, trigger un-armed) once it has crashed on
-                // launch too many times in a row.
-                self.handle_lazy_launch_failure(name, message.as_deref());
-            } else {
-                self.set_service_state(name, ServiceState::Failed);
-                if scheduled && let Some(ref msg) = message {
-                    self.output_manager.service_error_event(name, msg);
-                }
-                let policy = self
-                    .services
-                    .get(name)
-                    .map(|rs| rs.resolved.on_failure)
-                    .unwrap_or_default();
-                if matches!(policy, crate::config::OnFailure::Restart) {
-                    self.schedule_auto_restart(
-                        name,
-                        message
-                            .as_deref()
-                            .unwrap_or("service failed before becoming ready"),
-                        true,
-                    );
-                }
+            // The supervisor already applied its restart policy — including
+            // the crash ceiling that stops a lazy service relaunching off a
+            // still-queued trigger connection — and narrated the result.
+            // Landing it in the right state is what is left.
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.restart_pending = policy.restart_pending();
+            }
+            self.apply_failure_state(name, &policy);
+            if scheduled
+                && matches!(policy, crate::process::health::PolicyOutcome::None)
+                && let Some(ref msg) = message
+            {
+                self.output_manager.service_error_event(name, msg);
             }
         }
 

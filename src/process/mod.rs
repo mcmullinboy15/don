@@ -74,27 +74,36 @@ pub(crate) enum ProcessReport {
         name: String,
         pgid: i32,
         status: Option<std::process::ExitStatus>,
+        /// What the supervisor's restart policy decided about it. Already
+        /// narrated and already armed where it applies — the scheduler folds
+        /// this only to keep its own view of "is anything still coming up"
+        /// honest, and to know which state a lazy re-arm lands in.
+        policy: health::PolicyOutcome,
     },
-    /// A service's restart backoff elapsed; attempt `attempt` may begin.
-    RestartDue { name: String, attempt: u32 },
-    /// The health monitor observed a transition. State-guarded on fold;
-    /// the monitor itself dies with custody (its cancel lives in the
-    /// supervisor), so it cannot outlive its process by more than a probe.
-    HealthChanged { name: String, healthy: bool },
+    /// The health monitor observed a transition. State-guarded on fold; the
+    /// monitor itself dies with custody (its cancel lives in the supervisor),
+    /// so it cannot outlive its process by more than a probe.
+    HealthChanged {
+        name: String,
+        healthy: bool,
+        policy: health::PolicyOutcome,
+    },
     /// A task process exited after an explicit run/restart.
     TaskExited(TaskExit),
-    /// A service's supervisor settled a start request — wired (metadata
-    /// only; custody stays with the supervisor) or failed to prepare.
     /// A supervisor spent its start permission and is beginning a start.
     ///
     /// This is the ack that makes a level-triggered permission single-use
     /// across the channel boundary: the runner folds it into `Starting`,
-    /// which closes the gate. `epoch` lets the fold ignore an ack for a
+    /// which closes the gate.
     ServiceStarting { name: String },
+    /// A service's supervisor settled a start request — wired (metadata
+    /// only; custody stays with the supervisor) or failed to prepare.
     ServiceStartPrepared {
         name: String,
         intent: ServiceStartIntent,
         result: Result<Box<service_supervisor::ServiceWired>, String>,
+        /// Set when `result` is an error and the policy chose to retry.
+        policy: health::PolicyOutcome,
     },
     /// A service's ready check settled — or reported immediately when no
     /// check is configured (`had_check: false`). Forwarded by the
@@ -104,6 +113,7 @@ pub(crate) enum ProcessReport {
         success: bool,
         message: Option<String>,
         had_check: bool,
+        policy: health::PolicyOutcome,
     },
     /// A service's supervisor finished executing a stop.
     ///

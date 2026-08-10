@@ -72,6 +72,11 @@ pub(crate) struct RestartRequest {
     /// Answered by the fold when the *stop* half lands; the start that
     /// follows reports its own progress.
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+    /// Clear the failure history first. An explicitly requested restart is a
+    /// fresh chance; the restart policy's *own* retry must not be, or the
+    /// streak that bounds a crash loop would be wiped by every attempt it
+    /// scheduled — and the loop would never end.
+    pub(crate) reset_policy: bool,
 }
 
 /// Everything a service's supervisor can be asked to do.
@@ -157,6 +162,9 @@ pub(crate) struct StopRequest {
     pub(crate) interrupt: Option<tokio::sync::watch::Receiver<bool>>,
     /// Where completion goes; see [`StopNotify`].
     pub(crate) notify: StopNotify,
+    /// See [`RestartRequest::reset_policy`]. A user stopping a service clears
+    /// its failure history; a stop that is one step of a rebuild does not.
+    pub(crate) reset_policy: bool,
 }
 
 /// How a stop's completion travels back.
@@ -349,6 +357,24 @@ async fn supervise(
     let mut reader_eof: Option<tokio::sync::oneshot::Receiver<()>> = None;
     // Dropping this ends the held process's health monitor, if one ran.
     let mut monitor_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
+    // Health transitions from the monitor this supervisor spawns. They land
+    // here rather than on the report channel so the restart policy sees them
+    // before the scheduler does.
+    let (health_tx, mut health_rx) = mpsc::unbounded_channel::<bool>();
+    // Restart policy. Every input it needs — a failed prepare, a failed ready
+    // check, a health transition, how long this spawn lived — is something
+    // this loop observed itself, which is what lets the whole of it live here.
+    let mut policy =
+        super::health::RestartPolicy::new(resolved.on_failure, resolved.lazy && proxy.is_some());
+    // When the armed auto-restart is due, and which attempt it is.
+    let mut backoff: Option<(tokio::time::Instant, u32)> = None;
+    // Facts about the spawn currently held.
+    let mut spawned_at: Option<std::time::Instant> = None;
+    let mut reached_ready = false;
+    // This spawn failed its ready check but was left running (the `notify`
+    // policy). Its eventual exit is then old news, not a fresh failure — the
+    // scheduler already marked it `Failed` and reported why.
+    let mut ready_failed = false;
     // The in-flight ready racer's outcome, forwarded by THIS loop onto the
     // report channel so it always trails its own prepared report (single
     // producer, one channel). Cleared on Start/Stop so a superseded run's
@@ -419,26 +445,129 @@ async fn supervise(
                         if let Some(output) = output.as_ref() {
                             output.clear_attach().await;
                         }
-                        reap_and_report(&name, &mut held, &report_tx).await;
+                        if reap_and_report(
+                            &name,
+                            &mut held,
+                            &report_tx,
+                            &env,
+                            &mut policy,
+                            &mut backoff,
+                            spawned_at.take(),
+                            reached_ready,
+                            ready_failed,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        reached_ready = false;
+                        ready_failed = false;
                         continue;
                     }
                     // The ready racer settled — forward through this loop
                     // so the outcome trails its own prepared report.
                     outcome = wait_ready(&mut ready_pending), if ready_pending.is_some() => {
                         ready_pending = None;
-                        if let Some(outcome) = outcome
-                            && report_tx
+                        if let Some(outcome) = outcome {
+                            let policy_outcome = if outcome.success {
+                                reached_ready = true;
+                                policy.on_ready();
+                                backoff = None;
+                                super::health::PolicyOutcome::None
+                            } else {
+                                ready_failed = true;
+                                let decided = policy.decide(super::health::FailureKind::Ready);
+                                arm_backoff(&name, &env, &decided, &mut backoff, outcome.message.as_deref());
+                                // A lazy service that failed its ready check
+                                // may still be running — it never bound its
+                                // port, say. Nothing else will end it, and
+                                // while it lives it holds the PTY open.
+                                if matches!(decided, super::health::PolicyOutcome::LazyRearm { .. }) {
+                                    reader_eof = None;
+                                    monitor_cancel = None;
+                                    let _ = run_stop(
+                                        &name,
+                                        &env,
+                                        output.as_ref(),
+                                        &mut held,
+                                        &mut reader,
+                                        &effective_shutdown(&resolved, &env),
+                                        true,
+                                        false,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                decided
+                            };
+                            if report_tx
                                 .send(super::ProcessReport::ServiceReady {
                                     name: name.clone(),
                                     success: outcome.success,
                                     message: outcome.message,
                                     had_check: outcome.had_check,
+                                    policy: policy_outcome,
                                 })
                                 .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    // The monitor this supervisor started saw the service
+                    // change health. The policy decides before the scheduler
+                    // hears about it.
+                    transition = health_rx.recv() => {
+                        let Some(healthy) = transition else { continue };
+                        busy.store(true, Ordering::Relaxed);
+                        let policy_outcome = if healthy {
+                            // Recovery clears the backoff counter only; the
+                            // rapid-crash streak is cleared by a spawn that
+                            // outlives the crash window, not by a transient
+                            // return to Ready.
+                            policy.on_ready();
+                            backoff = None;
+                            super::health::PolicyOutcome::None
+                        } else {
+                            let decided = policy.decide(super::health::FailureKind::Unhealthy);
+                            arm_backoff(&name, &env, &decided, &mut backoff, Some("unhealthy"));
+                            decided
+                        };
+                        if report_tx
+                            .send(super::ProcessReport::HealthChanged {
+                                name: name.clone(),
+                                healthy,
+                                policy: policy_outcome,
+                            })
+                            .is_err()
                         {
                             return;
                         }
                         continue;
+                    }
+                    // The armed auto-restart came due. It runs as an ordinary
+                    // internal restart, so the stop-then-start sequence and
+                    // its reports are the same ones a manual restart makes.
+                    () = wait_backoff(&backoff) => {
+                        busy.store(true, Ordering::Relaxed);
+                        let attempt = backoff.take().map_or(1, |(_, attempt)| attempt);
+                        env.emitter
+                            .service_event(&name, &format!("auto-restart firing (attempt {attempt})"));
+                        break ServiceCommand::Restart(Box::new(RestartRequest {
+                            config: effective_shutdown(&resolved, &env),
+                            wait_full_exit: false,
+                            interrupt: None,
+                            clear_backend_first: false,
+                            start_mode: ServiceStartMode::Full,
+                            fresh_backend_ports: false,
+                            intent: super::ServiceStartIntent::Background,
+                            reply: None,
+                            // This IS the policy retrying. Keeping the streak
+                            // is what lets the ceiling ever be reached.
+                            reset_policy: false,
+                        }));
                     }
                     // Permission changed. Nothing is decided here: the level
                     // is read at the top of this loop, which is the single
@@ -486,6 +615,7 @@ async fn supervise(
                 if let Some(next) = request.batch_built {
                     batch_built = next;
                 }
+                policy.reconfigure(resolved.on_failure, resolved.lazy);
                 continue;
             }
             ServiceCommand::Proxy(directive) => {
@@ -500,6 +630,15 @@ async fn supervise(
                 // an open gate cannot undo it. A restart's follow-up start is
                 // part of the same command, so it does not consult demand.
                 demand = super::Demand::None;
+                if request.reset_policy {
+                    policy.reset();
+                }
+                // Whatever the policy had queued is moot: this process is
+                // going away by request.
+                backoff = None;
+                spawned_at = None;
+                reached_ready = false;
+                ready_failed = false;
                 let result = run_stop(
                     &name,
                     &env,
@@ -537,6 +676,13 @@ async fn supervise(
                 monitor_cancel = None;
                 ready_pending = None;
                 demand = super::Demand::None;
+                if request.reset_policy {
+                    policy.reset();
+                }
+                backoff = None;
+                spawned_at = None;
+                reached_ready = false;
+                ready_failed = false;
                 // Owning the proxy makes this a call rather than a mailbox
                 // hop, so it cannot arrive after the stop it must precede.
                 if request.clear_backend_first
@@ -603,11 +749,23 @@ async fn supervise(
             match build_context(&name, &resolved, batch_built, &env, &last_docker_bindings) {
                 Ok(context) => context,
                 Err(message) => {
+                    let decided = match intent {
+                        super::ServiceStartIntent::Background => {
+                            let decided = policy.decide(super::health::FailureKind::Prepare);
+                            arm_backoff(&name, &env, &decided, &mut backoff, Some(&message));
+                            decided
+                        }
+                        _ => {
+                            policy.reset();
+                            super::health::PolicyOutcome::None
+                        }
+                    };
                     if report_tx
                         .send(super::ProcessReport::ServiceStartPrepared {
                             name: name.clone(),
                             intent,
                             result: Err(message),
+                            policy: decided,
                         })
                         .is_err()
                     {
@@ -622,11 +780,24 @@ async fn supervise(
         // the child inherits.
         if let Some(p) = proxy.as_mut() {
             if fresh_backend_ports && let Err(error) = p.reallocate_ephemeral_ports().await {
+                let message = format!("failed to allocate ephemeral ports: {error}");
+                let decided = match intent {
+                    super::ServiceStartIntent::Background => {
+                        let decided = policy.decide(super::health::FailureKind::Prepare);
+                        arm_backoff(&name, &env, &decided, &mut backoff, Some(&message));
+                        decided
+                    }
+                    _ => {
+                        policy.reset();
+                        super::health::PolicyOutcome::None
+                    }
+                };
                 if report_tx
                     .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
                         intent,
-                        result: Err(format!("failed to allocate ephemeral ports: {error}")),
+                        result: Err(message),
+                        policy: decided,
                     })
                     .is_err()
                 {
@@ -713,15 +884,36 @@ async fn supervise(
                         // same host ports. This supervisor produced them, so
                         // its copy is the authoritative one.
                         last_docker_bindings = wired.docker_port_bindings.clone();
+                        // The crash ceiling measures from here.
+                        spawned_at = Some(std::time::Instant::now());
+                        reached_ready = false;
+                        ready_failed = false;
                         (Ok(Box::new(wired)), Some((ready, exit_rx, cancel_rx)))
                     }
                     Err(message) => (Err(message), None),
+                };
+                // A start that could not even be prepared is a failure like
+                // any other, and it is the policy's to judge. Background
+                // starts are the ones nobody is waiting on an answer for, so
+                // they are the ones worth retrying.
+                let prepare_policy = match (&wired, &intent) {
+                    (Err(message), super::ServiceStartIntent::Background) => {
+                        let decided = policy.decide(super::health::FailureKind::Prepare);
+                        arm_backoff(&name, &env, &decided, &mut backoff, Some(message));
+                        decided
+                    }
+                    (Err(_), _) => {
+                        policy.reset();
+                        super::health::PolicyOutcome::None
+                    }
+                    (Ok(_), _) => super::health::PolicyOutcome::None,
                 };
                 if report_tx
                     .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
                         intent,
                         result: wired,
+                        policy: prepare_policy,
                     })
                     .is_err()
                 {
@@ -734,7 +926,10 @@ async fn supervise(
                 match ready_parts {
                     Some((Some(ready), exit_rx, cancel_rx)) => {
                         ready_pending = Some(spawn_ready_racer(
-                            &name, ready, exit_rx, cancel_rx, &report_tx,
+                            ready,
+                            exit_rx,
+                            cancel_rx,
+                            health_tx.clone(),
                         ));
                     }
                     Some((None, _exit_rx, _cancel_rx))
@@ -744,6 +939,7 @@ async fn supervise(
                                 success: true,
                                 message: None,
                                 had_check: false,
+                                policy: super::health::PolicyOutcome::None,
                             })
                             .is_err() =>
                     {
@@ -1016,16 +1212,13 @@ fn resolve_supervisor_ready(
 /// so monitor lifetime stays tied to custody). The outcome goes back to the
 /// supervisor loop, which forwards it on the report channel.
 fn spawn_ready_racer(
-    name: &str,
     ready: crate::config::ReadyCheck,
     exit_rx: tokio::sync::oneshot::Receiver<()>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
-    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
+    health_tx: mpsc::UnboundedSender<bool>,
 ) -> tokio::sync::oneshot::Receiver<ReadyOutcome> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let monitor_cancel_rx = ready.monitor.then_some(cancel_rx);
-    let monitor_report_tx = report_tx.clone();
-    let name = name.to_string();
     tokio::spawn(async move {
         let result = tokio::select! {
             result = service::run_ready_check(&ready) => result,
@@ -1033,15 +1226,10 @@ fn spawn_ready_racer(
         };
         let success = result.is_ok();
         if success && let Some(cancel_rx) = monitor_cancel_rx {
-            let monitor_name = name.clone();
+            // Health transitions go to the supervisor, not the scheduler: the
+            // restart policy they feed lives there now.
             tokio::spawn(async move {
-                super::health::run_health_monitor(
-                    monitor_name,
-                    ready,
-                    monitor_report_tx,
-                    cancel_rx,
-                )
-                .await;
+                super::health::run_health_monitor(ready, health_tx, cancel_rx).await;
             });
         }
         let _ = ready_tx.send(ReadyOutcome {
@@ -1058,25 +1246,150 @@ fn spawn_ready_racer(
 /// Docker containers are held but not reaped here — the bollard stream's
 /// EOF semantics aren't a death certificate, matching the old crash
 /// watcher's docker exclusion.
+#[allow(clippy::too_many_arguments)]
 async fn reap_and_report(
     name: &str,
     held: &mut Option<service::ServiceHandle>,
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
-) {
+    env: &StartEnv,
+    policy: &mut super::health::RestartPolicy,
+    backoff: &mut Option<(tokio::time::Instant, u32)>,
+    spawned_at: Option<std::time::Instant>,
+    reached_ready: bool,
+    ready_failed: bool,
+) -> Result<(), ()> {
     if !matches!(held.as_ref(), Some(service::ServiceHandle::Process(_))) {
-        return;
+        return Ok(());
     }
     let Some(service::ServiceHandle::Process(mut proc)) = held.take() else {
-        return;
+        return Ok(());
     };
     let pgid = proc.pgid();
     // The reader already hit end-of-stream, so this wait returns promptly.
     let status = proc.wait().await.ok();
-    let _ = report_tx.send(super::ProcessReport::ServiceExited {
-        name: name.to_string(),
-        pgid,
-        status,
-    });
+    let clean = status.as_ref().is_some_and(|s| s.success());
+    let decided = if clean {
+        policy.reset();
+        *backoff = None;
+        super::health::PolicyOutcome::None
+    } else if ready_failed {
+        // This spawn already failed its ready check and was reported then.
+        // Its exit is the tail of that failure, not a fresh one — counting it
+        // again would double-charge the crash ceiling.
+        super::health::PolicyOutcome::None
+    } else {
+        // Narrated here, beside the decision it causes, so "auto-restart in
+        // 1s" can never print before the death that prompted it.
+        let message = super::health::format_unexpected_exit(status);
+        env.emitter.service_error_event(name, &message);
+        let decided = policy.decide(super::health::FailureKind::Crash {
+            lived: spawned_at.map(|at| at.elapsed()),
+            reached_ready,
+        });
+        arm_backoff(name, env, &decided, backoff, Some(&message));
+        decided
+    };
+    report_tx
+        .send(super::ProcessReport::ServiceExited {
+            name: name.to_string(),
+            pgid,
+            status,
+            policy: decided,
+        })
+        .map_err(|_| ())
+}
+
+/// Narrate a policy decision and arm the timer it asks for.
+///
+/// Both halves live here because the decision does: a line that explains a
+/// restart belongs next to the code that scheduled it.
+fn arm_backoff(
+    name: &str,
+    env: &StartEnv,
+    outcome: &super::health::PolicyOutcome,
+    backoff: &mut Option<(tokio::time::Instant, u32)>,
+    reason: Option<&str>,
+) {
+    use super::health::PolicyOutcome;
+    let window = super::health::RAPID_CRASH_WINDOW.as_secs();
+    match outcome {
+        PolicyOutcome::None => {}
+        PolicyOutcome::RestartScheduled {
+            attempt,
+            backoff_secs,
+        } => {
+            env.emitter.service_error_event(
+                name,
+                &format!(
+                    "{} — auto-restart in {backoff_secs}s (attempt {attempt})",
+                    reason.unwrap_or("failed")
+                ),
+            );
+            *backoff = Some((
+                tokio::time::Instant::now() + std::time::Duration::from_secs(*backoff_secs),
+                *attempt,
+            ));
+        }
+        PolicyOutcome::GaveUpStarting { attempts } => {
+            *backoff = None;
+            env.emitter.service_error_event(
+                name,
+                &format!(
+                    "{} — giving up after {attempts} failed starts without becoming ready",
+                    reason.unwrap_or("failed")
+                ),
+            );
+        }
+        PolicyOutcome::GaveUpCrashing { rapid_crashes } => {
+            *backoff = None;
+            env.emitter.service_error_event(
+                name,
+                &format!(
+                    "crashed within {window}s of starting {rapid_crashes} times in a row — \
+                     giving up (not auto-restarting)"
+                ),
+            );
+        }
+        PolicyOutcome::LazyRearm {
+            give_up,
+            rapid_crashes,
+        } => {
+            *backoff = None;
+            if *give_up {
+                env.emitter.service_error_event(
+                    name,
+                    &format!(
+                        "crashed within {window}s of starting {rapid_crashes} times in a row — \
+                         giving up; not re-arming the lazy trigger \
+                         (run `don restart {name}` to retry)"
+                    ),
+                );
+            } else if let Some(message) = reason {
+                env.emitter.service_error_event(
+                    name,
+                    &format!("{message} (will retry on next connection)"),
+                );
+            }
+        }
+    }
+}
+
+/// This service's shutdown settings layered over the workspace defaults —
+/// the supervisor's copy of the runner's `effective_shutdown_config`.
+fn effective_shutdown(resolved: &crate::config::ResolvedService, env: &StartEnv) -> ShutdownConfig {
+    resolved
+        .shutdown
+        .clone()
+        .map(|shutdown| shutdown.merged_over(&env.shutdown))
+        .unwrap_or_else(|| env.shutdown.clone())
+}
+
+/// Sleep until an armed auto-restart is due, or pend forever when none is.
+async fn wait_backoff(backoff: &Option<(tokio::time::Instant, u32)>) {
+    match backoff {
+        Some((due, _)) => tokio::time::sleep_until(*due).await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]
@@ -1226,6 +1539,7 @@ mod tests {
                     fresh_backend_ports: false,
                     intent: ServiceStartIntent::Background,
                     reply: case.with_reply.then_some(reply_tx),
+                    reset_policy: true,
                 })))
                 .unwrap();
 

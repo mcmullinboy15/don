@@ -17,7 +17,6 @@
 use super::{ServiceHandleIdentity, ServiceState, ServiceStopAction, TaskRunWaiter, TaskState};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
-use std::time::Instant;
 
 /// All per-service runtime state, consolidated into a single struct.
 ///
@@ -60,26 +59,11 @@ pub(crate) struct RuntimeService {
     pub bazel_binary_path: Option<String>,
     /// Whether this service was built during the batch build phase.
     pub batch_built: bool,
-    /// Cancel channel for the per-service health monitor task. `Some` when
-    /// the monitor is running; dropping it (or sending) signals the loop
-    /// to exit. Cleared on stop, restart, or process exit.
-    /// Number of consecutive `on_failure = "restart"` cycles we've
-    /// triggered without the service recovering to Ready. Drives backoff
-    /// for the next scheduled restart. Reset to 0 on Ready.
-    pub restart_attempts: u32,
-    /// When the current process was last spawned. Used to detect a crash
-    /// loop: a process that exits within a few seconds of starting is
-    /// likely failing on launch rather than after doing useful work.
-    pub last_start: Option<Instant>,
-    /// Number of consecutive crashes where the process died within the
-    /// rapid-crash window of being started. A hard cap on this count makes
-    /// don give up auto-restarting regardless of `on_failure`. Reset
-    /// whenever the service recovers, is stopped, or runs long enough to
-    /// clear the streak.
-    pub rapid_crashes: u32,
-    /// Handle to a scheduled `RestartUnhealthy` command. Aborted on stop,
-    /// recovery, or manual restart so we don't fire a stale auto-restart.
-    pub pending_restart: Option<tokio::task::JoinHandle<()>>,
+    /// Whether this service's supervisor has an auto-restart armed. A
+    /// projection of the policy decision it reported, not a decision — the
+    /// scheduler reads it so a stack sitting in a backoff still counts as
+    /// having work in flight.
+    pub restart_pending: bool,
     /// Follow-up action to run after the current stop completes.
     pub stop_action: ServiceStopAction,
     /// In-flight rebuild-preparation worker (build only) for this service.
@@ -118,38 +102,13 @@ impl RuntimeService {
             resolved_watch_paths: Vec::new(),
             bazel_binary_path: None,
             batch_built: false,
-            restart_attempts: 0,
-            last_start: None,
-            rapid_crashes: 0,
-            pending_restart: None,
+            restart_pending: false,
             stop_action: ServiceStopAction::None,
             rebuild_worker: None,
             rebuild_generation: 0,
             rebuild_stale: false,
             artifact_ahead_of_process: false,
         }
-    }
-
-    /// Stop any running health monitor and abort any pending auto-restart.
-    /// Safe to call when neither is set. Used on stop/restart/process exit
-    /// to make sure stale monitor traffic and stale auto-restart timers
-    /// can't fire after the service is no longer in Ready/Unhealthy.
-    pub(crate) fn stop_health_tracking(&mut self) {
-        // Monitor cancellation moved to the supervisor (dropped on Stop or
-        // process death); this now only clears the runner-side restart
-        // timer.
-        if let Some(handle) = self.pending_restart.take() {
-            handle.abort();
-        }
-    }
-
-    /// Reset the auto-restart failure-streak counters. Called when the
-    /// service reaches a healthy state, exits cleanly, or is stopped /
-    /// restarted by the user — any of which means the prior run of failures
-    /// no longer counts toward the give-up thresholds.
-    pub(crate) fn reset_restart_tracking(&mut self) {
-        self.restart_attempts = 0;
-        self.rapid_crashes = 0;
     }
 
     pub(crate) fn state(&self) -> ServiceState {
