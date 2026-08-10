@@ -1,9 +1,6 @@
 use super::Demand;
-use super::service_worker::{ServiceStartMode, run_service_build_worker};
-use super::{
-    CommandError, CommandResult, Runner, RunnerEvent, RunnerInternalCommand, ServiceStartIntent,
-    ServiceState, ServiceStopAction,
-};
+use super::service_worker::ServiceStartMode;
+use super::{CommandError, CommandResult, Runner, RunnerEvent, ServiceStartIntent, ServiceState};
 use tokio::sync::oneshot;
 
 /// What a restart should do, as the scheduler asks for it.
@@ -90,7 +87,7 @@ impl Runner {
     /// the ack is ignored; the supervisor's own idle-and-empty check is the
     /// other half. Teardown refuses outright: nothing may come up while the
     /// stop order is being walked.
-    pub(in crate::runner) fn handle_service_starting(&mut self, name: &str) {
+    pub(in crate::runner) fn handle_service_starting(&mut self, name: &str, restarting: bool) {
         let startable = !self.shutting_down
             && self.services.get(name).is_some_and(|rs| {
                 matches!(
@@ -107,7 +104,14 @@ impl Runner {
             return;
         }
         self.set_service_state(name, ServiceState::Starting);
-        self.output_manager.service_event(name, "starting...");
+        self.output_manager.service_event(
+            name,
+            if restarting {
+                "restarting..."
+            } else {
+                "starting..."
+            },
+        );
     }
 
     pub(in crate::runner) async fn handle_service_start_prepared(
@@ -158,128 +162,65 @@ impl Runner {
         self.refresh_runtime_port_manifest();
     }
 
-    pub(in crate::runner) fn spawn_service_rebuild_worker(
+    /// Ask this service's supervisor to rebuild and restart into the result.
+    ///
+    /// The whole cycle — build, stop, spawn, and the staleness that decides
+    /// whether the spawn happens — is the supervisor's; this only routes the
+    /// request and reports an unknown name.
+    pub(in crate::runner) fn send_rebuild(
         &mut self,
         name: &str,
-        resolved: crate::config::ResolvedService,
-    ) -> Result<(), CommandError> {
-        let Some(rs) = self.services.get_mut(name) else {
-            return Err(CommandError::UnknownService {
-                name: name.to_string(),
-            });
-        };
-        rs.rebuild_generation = rs.rebuild_generation.saturating_add(1);
-        let op_id = rs.rebuild_generation;
-
-        let cmd_tx = self.internal_tx.clone();
-        let name_owned = name.to_string();
-        let base_dir = self.base_dir.clone();
-        let emitter = self.output_manager.clone_lifecycle_emitter();
-        let docker_client = self.docker_client.clone();
-        let service_writer = self.output_manager.service_writer(name);
-        let worker = tokio::spawn(async move {
-            let result = run_service_build_worker(
-                &base_dir,
-                docker_client.as_ref(),
-                &emitter,
-                &name_owned,
-                &resolved,
-                false,
-                service_writer.as_ref(),
-            )
-            .await;
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::ServiceRebuildPrepared {
-                    name: name_owned,
-                    op_id,
-                    result,
-                })
-                .await;
-        });
-        rs.rebuild_worker = Some(worker);
-        Ok(())
-    }
-
-    pub(in crate::runner) async fn continue_rebuild_restart(&mut self, name: &str) {
-        if self.shutting_down {
-            return;
-        }
-        // Clear the backend before the stop is queued: mailbox FIFO applies
-        // it first, so connections arriving during the restart queue instead
-        // of racing the dying process.
-        if self
-            .services
-            .get(name)
-            .is_some_and(|rs| !rs.resolved.proxy.is_empty())
-        {
-            self.send_proxy_directive(
-                name,
-                super::service_supervisor::ProxyDirective::ClearBackend,
-            );
-        }
-
-        if self
-            .service_runtime(name)
-            .and_then(|runtime| runtime.pid)
-            .is_some()
-        {
-            self.set_service_state(name, ServiceState::Stopping);
-            let shutdown_config = self.effective_shutdown_config(name);
-            let wait_full = self
-                .services
-                .get(name)
-                .is_some_and(|rs| rs.resolved.requires_full_exit_on_restart());
-            self.send_service_stop(
-                name,
-                shutdown_config,
-                wait_full,
-                None,
-                ServiceStopAction::RestartSpawnOnly,
-                // One step of a rebuild, not a user giving up on the
-                // service — the failure history carries across it.
-                false,
-            );
-            return;
-        }
-
-        if let Err(e) = self.queue_rebuild_service_start(name).await {
-            self.fail_rebuild(name, &e.to_string());
-        }
-    }
-
-    pub(in crate::runner) async fn handle_service_rebuild_prepared(
-        &mut self,
-        name: &str,
-        op_id: u64,
-        result: Result<(), String>,
+        forced: bool,
+        reply: Option<oneshot::Sender<CommandResult>>,
     ) {
-        let is_current = self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.rebuild_generation == op_id);
-        if !is_current {
+        if self.shutting_down {
+            Self::answer(
+                reply,
+                Err(CommandError::InvalidState {
+                    name: name.to_string(),
+                    message: "shutdown in progress".to_string(),
+                }),
+            );
             return;
         }
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.rebuild_worker = None;
+        let mut carried = Some(reply);
+        let sent = self
+            .service_starts
+            .registry()
+            .get(name)
+            .is_some_and(|handle| {
+                handle.request(super::service_supervisor::ServiceCommand::Rebuild(
+                    super::service_supervisor::RebuildRequest {
+                        forced,
+                        reply: carried.take().flatten(),
+                    },
+                ))
+            });
+        if !sent {
+            self.fail_rebuild(name, "rebuild requested for unknown service");
+            Self::answer(
+                carried.flatten(),
+                Err(CommandError::UnknownService {
+                    name: name.to_string(),
+                }),
+            );
         }
+    }
 
-        match result {
-            Ok(()) => {
-                if self.take_rebuild_stale(name) {
-                    let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
-                        name: name.to_string(),
-                        success: true,
-                    });
-                } else {
-                    self.continue_rebuild_restart(name).await;
-                }
-            }
-            Err(message) if message == "shutdown requested" => {
-                self.initiate_shutdown().await;
-            }
-            Err(message) => self.fail_rebuild(name, &message),
+    /// A watched file changed while a rebuild cycle was running.
+    pub(in crate::runner) fn send_mark_stale(&self, name: &str) {
+        if let Some(handle) = self.service_starts.registry().get(name) {
+            let _ = handle.request(super::service_supervisor::ServiceCommand::MarkStale);
         }
+    }
+
+    /// Close a watch cycle that never reached a supervisor.
+    pub(in crate::runner) fn fail_rebuild(&self, name: &str, message: &str) {
+        self.output_manager.service_error_event(name, message);
+        let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+            name: name.to_string(),
+            success: false,
+        });
     }
 
     pub(in crate::runner) fn queue_background_service_start(
@@ -296,33 +237,6 @@ impl Runner {
         self.set_service_state(name, ServiceState::Starting);
         self.output_manager.service_event(name, "starting...");
         self.spawn_service_start_worker(name, mode, ServiceStartIntent::Background, false)
-    }
-
-    pub(in crate::runner) async fn queue_rebuild_service_start(
-        &mut self,
-        name: &str,
-    ) -> Result<(), CommandError> {
-        if self.shutting_down {
-            return Err(CommandError::InvalidState {
-                name: name.to_string(),
-                message: "shutdown in progress".to_string(),
-            });
-        }
-        // Ephemeral backend ports are reallocated by the supervisor (the
-        // proxy's owner) as part of handling this start — a failure there
-        // surfaces through the prepared-Err path like any other prepare
-        // failure. The runner's backend-env shadow refreshes from the wired
-        // message, before ready resolution reads it.
-        self.set_service_state(name, ServiceState::Starting);
-        self.output_manager.service_event(name, "restarting...");
-        self.spawn_service_start_worker(
-            name,
-            ServiceStartMode::SpawnOnly,
-            ServiceStartIntent::Background,
-            // Restart: the new process must bind fresh ephemeral backend
-            // ports while connections draining to the old ones finish.
-            true,
-        )
     }
 
     pub(in crate::runner) async fn handle_start_service_cmd(
@@ -424,10 +338,7 @@ impl Runner {
         };
         if matches!(
             state,
-            ServiceState::Pending
-                | ServiceState::Building
-                | ServiceState::Starting
-                | ServiceState::Stopping
+            ServiceState::Building | ServiceState::Starting | ServiceState::Stopping
         ) {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
@@ -435,63 +346,25 @@ impl Runner {
             }));
             return;
         }
-        if self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.rebuild_worker.is_some())
-        {
-            let _ = reply.send(Err(CommandError::InvalidState {
-                name: name.to_string(),
-                message: "operation already in progress".to_string(),
-            }));
-            return;
-        }
-
-        self.clear_rebuild_stale(name);
         self.output_manager
             .service_event(name, "rebuilding (requested hard restart)");
-
-        let resolved = match self.services.get(name) {
-            Some(rs) => rs.resolved.clone(),
-            None => {
-                let _ = reply.send(Err(CommandError::UnknownService {
-                    name: name.to_string(),
-                }));
-                return;
-            }
-        };
-
-        let result = if resolved.is_build_tool_managed() {
-            self.spawn_forced_build_tool_rebuild(name).await
-        } else {
-            self.spawn_service_rebuild_worker(name, resolved)
-        };
-
-        match result {
-            Ok(()) => {
-                let _ = reply.send(Ok(()));
-            }
-            Err(e) => {
-                self.output_manager
-                    .service_error_event(name, &e.to_string());
-                let _ = reply.send(Err(e));
-            }
-        }
+        // The supervisor answers as soon as the build is accepted; a forced
+        // rebuild refused because a batch is already in flight is still the
+        // synchronous "already in progress" this path has always given.
+        self.send_rebuild(name, true, Some(reply));
     }
 
     /// Ask the service's supervisor — the process's owner — to stop it.
     ///
     /// The reply rides down with the request and comes back on the report
-    /// channel; only `stop_action` (what the *rebuild* cycle wants next)
-    /// stays fold-side, and it needs no currency check: a supervisor runs one
-    /// stop at a time, so completions arrive in the order the stops were sent.
+    /// channel. No currency check is needed: a supervisor runs one stop at a
+    /// time, so completions arrive in the order the stops were sent.
     pub(in crate::runner) fn send_service_stop(
         &mut self,
         name: &str,
         shutdown_config: crate::config::ShutdownConfig,
         wait_full_exit: bool,
         reply: Option<oneshot::Sender<CommandResult>>,
-        stop_action: ServiceStopAction,
         reset_policy: bool,
     ) {
         if !self.services.contains_key(name) {
@@ -502,9 +375,6 @@ impl Runner {
                 }),
             );
             return;
-        }
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.stop_action = stop_action;
         }
 
         let shutdown_rx = self.shutdown_flag_tx.subscribe();
@@ -564,6 +434,7 @@ impl Runner {
                         fresh_backend_ports: plan.fresh_backend_ports,
                         intent: ServiceStartIntent::Background,
                         reply: carried.take().flatten(),
+                        announce_restarting: false,
                         // Every caller of this is an explicit request; the
                         // policy's own retry never comes through here.
                         reset_policy: true,
@@ -592,12 +463,10 @@ impl Runner {
         name: &str,
         result: Result<(), String>,
         reply: Option<oneshot::Sender<CommandResult>>,
-        restarting: bool,
     ) {
-        let stop_action = match self.services.get_mut(name) {
-            Some(rs) => std::mem::take(&mut rs.stop_action),
-            None => return,
-        };
+        if !self.services.contains_key(name) {
+            return;
+        }
 
         if let Some(writer) = self.output_manager.service_writer(name) {
             writer.close_follow_sinks().await;
@@ -607,27 +476,9 @@ impl Runner {
             Ok(()) => {
                 self.clear_service_custody(name);
                 self.set_service_state(name, ServiceState::Stopped);
-                let next_result = if restarting {
-                    // The supervisor has already begun the start half; its
-                    // own `ServiceStarting` report drives the transition.
-                    Ok(())
-                } else {
-                    match stop_action {
-                        ServiceStopAction::None => Ok(()),
-                        ServiceStopAction::RestartSpawnOnly => {
-                            if self.take_rebuild_stale(name) {
-                                let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
-                                    name: name.to_string(),
-                                    success: true,
-                                });
-                                Ok(())
-                            } else {
-                                self.queue_rebuild_service_start(name).await
-                            }
-                        }
-                    }
-                };
-                Self::answer(reply, next_result);
+                // A restart's start half is the supervisor's; its own
+                // `ServiceStarting` report drives the transition.
+                Self::answer(reply, Ok(()));
             }
             Err(message) => {
                 self.clear_service_custody(name);
@@ -705,14 +556,7 @@ impl Runner {
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .service_event(name, "stopping... (requested)");
-        self.send_service_stop(
-            name,
-            shutdown_config,
-            false,
-            Some(reply),
-            ServiceStopAction::None,
-            true,
-        );
+        self.send_service_stop(name, shutdown_config, false, Some(reply), true);
     }
 
     pub(in crate::runner) async fn handle_restart_service_cmd(

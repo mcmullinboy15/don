@@ -119,13 +119,6 @@ impl Drop for TaskRunWaiter {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-pub(crate) enum ServiceStopAction {
-    #[default]
-    None,
-    RestartSpawnOnly,
-}
-
 /// Whether a service's proxy is closing connections rather than queuing them.
 ///
 /// A service that failed *and* has no process left has nothing to queue for —
@@ -229,11 +222,6 @@ enum RunnerInternalCommand {
         outcome: BatchBuildOutcome,
     },
     /// Completion from a detached rebuild worker for a single service.
-    ServiceRebuildPrepared {
-        name: String,
-        op_id: u64,
-        result: Result<(), String>,
-    },
     /// Result of the periodic crates.io update check.
     UpdateCheckComplete(Option<crate::update::UpdateAvailable>),
 }
@@ -326,8 +314,6 @@ pub struct Runner {
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 
     /// Docker API client. `Some` if any service uses the docker preset.
-    docker_client: Option<bollard::Docker>,
-
     // Channels
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     cmd_rx: mpsc::UnboundedReceiver<RunnerCommand>,
@@ -590,6 +576,7 @@ impl Runner {
         let service_starts = service_supervisor::spawn_supervisors(
             services.keys(),
             &service_supervisor::StartEnv {
+                batcher_tx: batcher_tx.clone(),
                 base_dir: base_dir.clone(),
                 pid_dir: base_dir.join(".don").join("pids"),
                 platform,
@@ -655,7 +642,6 @@ impl Runner {
             tasks,
             report_rx,
             server_shutdown_tx: None,
-            docker_client,
             cmd_tx,
             cmd_rx,
             internal_tx,
@@ -1325,10 +1311,10 @@ impl Runner {
                                 self.handle_hard_restart_service_cmd(&name, reply).await;
                             }
                             RunnerCommand::Rebuild { name } => {
-                                self.handle_rebuild(&name).await;
+                                self.send_rebuild(&name, false, None);
                             }
                             RunnerCommand::RebuildStale { name } => {
-                                self.mark_rebuild_stale(&name);
+                                self.send_mark_stale(&name);
                             }
                             RunnerCommand::TaskRerun { name } => {
                                 self.handle_task_rerun(&name).await;
@@ -1350,14 +1336,6 @@ impl Runner {
                     }
                     Some(cmd) = self.internal_rx.recv() => {
                         match cmd {
-                            RunnerInternalCommand::ServiceRebuildPrepared {
-                                name,
-                                op_id,
-                                result,
-                            } => {
-                                self.handle_service_rebuild_prepared(&name, op_id, result)
-                                    .await;
-                            }
                             RunnerInternalCommand::TaskRunWaitTimedOut {
                                 name,
                                 token,
@@ -1402,8 +1380,21 @@ impl Runner {
                             ProcessReport::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
                             }
-                            ProcessReport::ServiceStarting { name } => {
-                                self.handle_service_starting(&name);
+                            ProcessReport::RebuildCycleDone { name, success } => {
+                                // The supervisor ran the whole cycle; this
+                                // closes the watch cycle it opened.
+                                let _ = self
+                                    .event_tx
+                                    .send(RunnerEvent::RebuildComplete { name, success });
+                            }
+                            ProcessReport::ServiceArtifactBuilt { name } => {
+                                if let Some(rs) = self.services.get_mut(&name) {
+                                    rs.batch_built = true;
+                                }
+                                self.schedule_gate_recompute();
+                            }
+                            ProcessReport::ServiceStarting { name, restarting } => {
+                                self.handle_service_starting(&name, restarting);
                             }
                             ProcessReport::ServiceStartPrepared {
                                 name,
@@ -1426,11 +1417,9 @@ impl Runner {
                                 )
                                 .await;
                             }
-                            ProcessReport::ServiceStopComplete { name, result, reply, restarting } => {
-                                self.handle_service_stop_complete(
-                                    &name, result, reply, restarting,
-                                )
-                                .await;
+                            ProcessReport::ServiceStopComplete { name, result, reply, .. } => {
+                                self.handle_service_stop_complete(&name, result, reply)
+                                    .await;
                             }
                             ProcessReport::TaskRunPrepared {
                                 name,
@@ -1449,9 +1438,6 @@ impl Runner {
                     // batch that has already finished.
                     Some(outcome) = self.batch_outcome_rx.recv() => {
                         match outcome {
-                            build_batcher::BatchOutcome::Rebuilds(outcome) => {
-                                self.handle_rebuild_batch_complete(outcome).await;
-                            }
                             build_batcher::BatchOutcome::Requeries(outcomes) => {
                                 self.handle_graph_requery_complete(outcomes).await;
                             }
@@ -1524,7 +1510,6 @@ impl Runner {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::build_tools::RebuildBatchOutcome;
     use super::*;
     use std::fs;
 
@@ -1622,102 +1607,6 @@ mod tests {
                 } => failed_dependencies,
             };
             assert!(failed_dependencies.is_empty(), "json: {json}");
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn up_to_date_batch_rebuild_still_emits_rebuild_complete() {
-        use crate::config::service::{Service, ServiceKind};
-        use crate::config::types::{BazelConfig, LogConfig, LogFilterConfig};
-
-        let temp = tempfile::tempdir().unwrap();
-        let config = crate::config::Config {
-            services: [(
-                "api".to_string(),
-                Service {
-                    dir: None,
-                    env: HashMap::new(),
-                    env_file: Vec::new(),
-                    watch: Vec::new(),
-                    ignore: Vec::new(),
-                    debounce: None,
-                    depends_on: Vec::new(),
-                    proxy: Vec::new(),
-                    lazy: false,
-                    download: None,
-                    ready: None,
-                    shutdown: None,
-                    log: LogConfig::Stdout,
-                    log_filter: LogFilterConfig::default(),
-                    reload: true,
-                    tty: true,
-                    on_failure: crate::config::OnFailure::Notify,
-                    platform: HashMap::new(),
-                    hidden: false,
-                    auto_filter_on_failure: None,
-                    kind: Some(ServiceKind::Bazel(BazelConfig {
-                        target: "//api:api".to_string(),
-                        watch: true,
-                    })),
-                },
-            )]
-            .into_iter()
-            .collect(),
-            service_groups: HashMap::new(),
-            tasks: HashMap::new(),
-            profiles: HashMap::new(),
-            default_profile: None,
-            watch_ignore: Vec::new(),
-            shutdown: crate::config::ShutdownConfig::default(),
-            log_filter: LogFilterConfig::default(),
-            auto_filter_on_failure: true,
-            fallback_ports: false,
-        };
-        let output_manager = crate::output::OutputManager::new_verbose(
-            &[("api", &LogConfig::Stdout)],
-            tokio::io::sink(),
-            false,
-        )
-        .await
-        .unwrap();
-        let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let mut runner = Runner::new(
-            config,
-            Platform::LinuxX86_64,
-            output_manager,
-            temp.path().to_path_buf(),
-            None,
-            shutdown_rx,
-            true,
-        )
-        .await
-        .unwrap();
-        // A batch outcome for a service that is still coming up is re-queued
-        // by the application guard rather than applied, so settle it first —
-        // which is the only state an outcome reaches in practice (the
-        // batcher defers coming-up services at flush time).
-        runner.set_service_state("api", ServiceState::Ready);
-        let mut events = runner.subscribe();
-
-        runner
-            .handle_rebuild_batch_complete(RebuildBatchOutcome {
-                build_succeeded: Vec::new(),
-                up_to_date: vec!["api".to_string()],
-                failed: Vec::new(),
-                plain_rebuilds: Vec::new(),
-            })
-            .await;
-
-        let event = tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
-            .await
-            .expect("timeout waiting for RebuildComplete")
-            .expect("runner event channel closed unexpectedly");
-        match event {
-            RunnerEvent::RebuildComplete {
-                name,
-                success: true,
-            } if name == "api" => {}
-            other => panic!("unexpected runner event: {other:?}"),
         }
     }
 
@@ -2209,115 +2098,6 @@ mod tests {
                 case.name,
             );
         }
-    }
-
-    /// Regression: a watched file changes *during* a bazel build. The build
-    /// that completes is correct, but its restart is deferred because the process
-    /// went stale. The follow-up cycle then finds bazel "up to date" — and must
-    /// still restart, because up-to-date is measured against the last *build*,
-    /// not against the *running process*. Without the fix the service keeps
-    /// running the old binary forever.
-    #[tokio::test(flavor = "current_thread")]
-    async fn stale_build_then_up_to_date_followup_still_restarts() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-
-        // The service is up, running the pre-edit binary.
-        runner.set_service_state("api", ServiceState::Running);
-
-        // A watched file changed mid-build → the watcher marked it stale.
-        runner.mark_rebuild_stale("api");
-
-        // The in-flight build completes successfully. Because it's stale, the
-        // restart is deferred to the follow-up cycle (process stays Running).
-        runner
-            .handle_rebuild_batch_complete(RebuildBatchOutcome {
-                build_succeeded: vec!["api".to_string()],
-                up_to_date: Vec::new(),
-                failed: Vec::new(),
-                plain_rebuilds: Vec::new(),
-            })
-            .await;
-        assert_eq!(
-            runner.services.get("api").map(|rs| rs.state()),
-            Some(ServiceState::Running),
-            "a stale build should defer the restart, not restart immediately",
-        );
-
-        // Follow-up cycle: the artifact is already built, so bazel reports up
-        // to date. The running process still predates that build, so don must
-        // restart it rather than no-op.
-        runner
-            .handle_rebuild_batch_complete(RebuildBatchOutcome {
-                build_succeeded: Vec::new(),
-                up_to_date: vec!["api".to_string()],
-                failed: Vec::new(),
-                plain_rebuilds: Vec::new(),
-            })
-            .await;
-        assert_eq!(
-            runner.services.get("api").map(|rs| rs.state()),
-            Some(ServiceState::Starting),
-            "up-to-date follow-up after a deferred build must still restart the process",
-        );
-    }
-
-    /// The deferred-restart flag set by a stale build must survive the
-    /// watcher's re-trigger. In production a fresh `handle_rebuild` runs between
-    /// the two batch completions (cycle 1 -> watch re-trigger -> cycle 2); it
-    /// clears `rebuild_stale` but must NOT clear `artifact_ahead_of_process`, or
-    /// the up-to-date follow-up would no-op and strand the old binary. This is
-    /// the same scenario as `stale_build_then_up_to_date_followup_still_restarts`
-    /// but exercises the intermediate re-trigger the outcome-only test skips.
-    #[tokio::test(flavor = "current_thread")]
-    async fn deferred_restart_survives_watch_retrigger() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-        runner.set_service_state("api", ServiceState::Running);
-
-        // Cycle 1: a change lands mid-build; the successful build defers restart.
-        runner.mark_rebuild_stale("api");
-        runner
-            .handle_rebuild_batch_complete(RebuildBatchOutcome {
-                build_succeeded: vec!["api".to_string()],
-                up_to_date: Vec::new(),
-                failed: Vec::new(),
-                plain_rebuilds: Vec::new(),
-            })
-            .await;
-        assert!(
-            runner
-                .services
-                .get("api")
-                .is_some_and(|rs| rs.artifact_ahead_of_process),
-            "a stale build should mark the process as behind the latest build",
-        );
-
-        // The watcher re-triggers a rebuild. handle_rebuild clears rebuild_stale
-        // but must leave the deferred-restart flag intact.
-        runner.handle_rebuild("api").await;
-        assert!(
-            runner
-                .services
-                .get("api")
-                .is_some_and(|rs| rs.artifact_ahead_of_process),
-            "the watch re-trigger must not drop the deferred-restart flag",
-        );
-
-        // Cycle 2: bazel now reports up to date — must still restart.
-        runner
-            .handle_rebuild_batch_complete(RebuildBatchOutcome {
-                build_succeeded: Vec::new(),
-                up_to_date: vec!["api".to_string()],
-                failed: Vec::new(),
-                plain_rebuilds: Vec::new(),
-            })
-            .await;
-        assert_eq!(
-            runner.services.get("api").map(|rs| rs.state()),
-            Some(ServiceState::Starting),
-            "up-to-date follow-up after the re-trigger must still restart",
-        );
     }
 
     #[test]

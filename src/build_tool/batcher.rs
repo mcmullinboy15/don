@@ -41,6 +41,23 @@ use crate::process::ServiceState;
 use crate::state_store::ProcessStatus;
 use crate::state_store::StateReader;
 
+/// What a batch decided about one item, delivered to that item's supervisor.
+///
+/// The batch itself is cross-item by nature — one `bazel build //a //b //c` —
+/// but its *consequences* are per-item, and the thing that acts on them is the
+/// supervisor that owns the process. So the batch fans out here rather than
+/// being folded by the scheduler and re-dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RebuildItemOutcome {
+    /// The build tool produced a fresh artifact.
+    Built,
+    /// Sources already match the artifact; nothing was built.
+    UpToDate,
+    /// Passed through the batch untouched — build-tool managed with no target.
+    NotBuilt,
+    Failed(String),
+}
+
 /// What one queued rebuild is, captured at queue time.
 pub(crate) enum RebuildSpec {
     /// A bazel-built service: the batch runs `bazel build` for its target.
@@ -62,8 +79,12 @@ impl RebuildSpec {
 
 /// Everything the batcher can be asked to do.
 pub(crate) enum BatchRequest {
-    /// Queue a rebuild and (re)open the batch window.
-    QueueRebuild { spec: RebuildSpec },
+    /// Queue a rebuild and (re)open the batch window. The outcome goes back
+    /// to `outcome`, which is the requesting supervisor's own channel.
+    QueueRebuild {
+        spec: RebuildSpec,
+        outcome: mpsc::UnboundedSender<RebuildItemOutcome>,
+    },
     /// Queue a build-graph re-query and (re)open its window.
     QueueRequery { item: GraphRequeryRequestItem },
     /// Run a forced rebuild for one item immediately, bypassing the window.
@@ -71,15 +92,20 @@ pub(crate) enum BatchRequest {
     /// hard-restart path's synchronous "already in progress" answer.
     ForceRebuild {
         spec: RebuildSpec,
+        outcome: mpsc::UnboundedSender<RebuildItemOutcome>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Abort any in-flight batch (bounded) and exit.
     Shutdown { done: oneshot::Sender<()> },
 }
 
-/// A finished batch, forwarded to the runner for application.
+/// A finished batch of build-graph re-queries, forwarded to the runner.
+///
+/// Rebuild outcomes do not come this way: they fan out per item to the
+/// supervisors that asked for them. A re-query's result is cross-item by
+/// nature (it rewrites watch registrations and can fan one graph change out
+/// to several processes), so it stays a scheduler concern.
 pub(crate) enum BatchOutcome {
-    Rebuilds(RebuildBatchOutcome),
     Requeries(Vec<GraphRequeryOutcomeItem>),
 }
 
@@ -113,6 +139,10 @@ async fn run(
 ) {
     let mut scheduler = BuildBatcher::new();
     let mut rebuild_specs: HashMap<String, RebuildSpec> = HashMap::new();
+    // Where each item's outcome goes. Overwritten on every queue, so it is
+    // always the most recent asker's channel.
+    let mut rebuild_outcomes: HashMap<String, mpsc::UnboundedSender<RebuildItemOutcome>> =
+        HashMap::new();
     let mut requery_specs: HashMap<String, GraphRequeryRequestItem> = HashMap::new();
     // Workers report here; the handles stored in the scheduler are wrappers
     // around these sends, so `abort_in_flight` still kills the real work.
@@ -121,15 +151,20 @@ async fn run(
     loop {
         tokio::select! {
             request = request_rx.recv() => match request {
-                Some(BatchRequest::QueueRebuild { spec }) => {
+                Some(BatchRequest::QueueRebuild { spec, outcome }) => {
                     scheduler.queue_rebuild(spec.name());
+                    rebuild_outcomes.insert(spec.name().to_string(), outcome);
                     rebuild_specs.insert(spec.name().to_string(), spec);
                 }
                 Some(BatchRequest::QueueRequery { item }) => {
                     scheduler.queue_requery(item.name.clone());
                     requery_specs.insert(item.name.clone(), item);
                 }
-                Some(BatchRequest::ForceRebuild { spec, reply }) => {
+                Some(BatchRequest::ForceRebuild {
+                    spec,
+                    outcome,
+                    reply,
+                }) => {
                     if scheduler.rebuild_in_flight() {
                         let _ = reply.send(Err(
                             "build-tool rebuild already in progress".to_string(),
@@ -139,6 +174,7 @@ async fn run(
                     // This build supersedes anything queued for the batch.
                     scheduler.cancel_pending_rebuild(spec.name());
                     rebuild_specs.remove(spec.name());
+                    rebuild_outcomes.insert(spec.name().to_string(), outcome);
                     spawn_rebuild_batch(
                         &mut scheduler,
                         vec![spec],
@@ -165,10 +201,7 @@ async fn run(
                 match done {
                     WorkerDone::Rebuilds(outcome) => {
                         scheduler.finish_rebuild_batch();
-                        if outcome_tx.send(BatchOutcome::Rebuilds(outcome)).is_err() {
-                            scheduler.abort_in_flight().await;
-                            return;
-                        }
+                        deliver_rebuilds(outcome, &mut rebuild_outcomes);
                     }
                     WorkerDone::Requeries(outcomes) => {
                         scheduler.finish_requery_batch();
@@ -195,6 +228,35 @@ async fn run(
                 ),
             },
         }
+    }
+}
+
+/// Hand each item in a finished batch to the supervisor that asked for it.
+///
+/// A dropped receiver just means that supervisor ended; there is nobody left
+/// to restart, so the outcome is discarded rather than being an error.
+fn deliver_rebuilds(
+    outcome: RebuildBatchOutcome,
+    senders: &mut HashMap<String, mpsc::UnboundedSender<RebuildItemOutcome>>,
+) {
+    let mut send = |name: &str, item: RebuildItemOutcome| {
+        if let Some(tx) = senders.get(name)
+            && tx.send(item).is_err()
+        {
+            senders.remove(name);
+        }
+    };
+    for (name, message) in &outcome.failed {
+        send(name, RebuildItemOutcome::Failed(message.clone()));
+    }
+    for name in &outcome.up_to_date {
+        send(name, RebuildItemOutcome::UpToDate);
+    }
+    for name in &outcome.build_succeeded {
+        send(name, RebuildItemOutcome::Built);
+    }
+    for name in &outcome.plain_rebuilds {
+        send(name, RebuildItemOutcome::NotBuilt);
     }
 }
 
@@ -368,11 +430,16 @@ mod tests {
         (writer, tx, outcome_rx, handle)
     }
 
-    fn queue(tx: &mpsc::UnboundedSender<BatchRequest>, name: &str) {
+    fn queue(
+        tx: &mpsc::UnboundedSender<BatchRequest>,
+        name: &str,
+        outcome: &mpsc::UnboundedSender<RebuildItemOutcome>,
+    ) {
         tx.send(BatchRequest::QueueRebuild {
             spec: RebuildSpec::Plain {
                 name: name.to_string(),
             },
+            outcome: outcome.clone(),
         })
         .unwrap();
     }
@@ -382,66 +449,63 @@ mod tests {
     /// window closes.
     #[tokio::test(start_paused = true)]
     async fn a_burst_of_rebuild_requests_becomes_one_batch() {
-        let (_writer, tx, mut outcome_rx, handle) = spawn_actor(service_statuses(&[
+        let (_writer, tx, _outcome_rx, handle) = spawn_actor(service_statuses(&[
             ("api", ServiceState::Ready),
             ("web", ServiceState::Ready),
         ]))
         .await;
+        let (item_tx, mut item_rx) = mpsc::unbounded_channel();
 
         for name in ["api", "web", "api", "web", "api"] {
-            queue(&tx, name);
+            queue(&tx, name, &item_tx);
         }
 
-        let outcome = tokio::time::timeout(Duration::from_secs(5), outcome_rx.recv())
-            .await
-            .expect("the window should close and the batch should run")
-            .expect("actor alive");
-        let BatchOutcome::Rebuilds(outcome) = outcome else {
-            panic!("expected a rebuild outcome");
-        };
-        let mut names = outcome.plain_rebuilds.clone();
-        names.sort();
-        assert_eq!(
-            names,
-            vec!["api".to_string(), "web".to_string()],
-            "all five requests went into the one batch"
-        );
+        // Five requests, two services, one batch — so exactly two outcomes.
+        let mut seen = 0;
+        for _ in 0..2 {
+            let outcome = tokio::time::timeout(Duration::from_secs(5), item_rx.recv())
+                .await
+                .expect("the window should close and the batch should run")
+                .expect("actor alive");
+            assert_eq!(outcome, RebuildItemOutcome::NotBuilt);
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
 
-        // Nothing left over to build again.
-        let extra = tokio::time::timeout(Duration::from_millis(500), outcome_rx.recv()).await;
+        let extra = tokio::time::timeout(Duration::from_millis(500), item_rx.recv()).await;
         assert!(extra.is_err(), "exactly one batch for the burst");
         handle.abort();
     }
 
     /// Regression: a watched file changes while a service is still coming up
     /// (`Building`). The request must be deferred — not dropped, and not
-    /// raced against the in-flight startup build — then run once the
-    /// service settles.
+    /// raced against the in-flight startup build — then run once the service
+    /// settles.
+    ///
+    /// This deferral cannot move to the supervisor: during the *startup*
+    /// batch build the service is `Building` but its supervisor is idle and
+    /// holds nothing, so it would queue a build racing the one already
+    /// running — and `run_batch_build_chain` never takes the bazel mutex.
     #[tokio::test(start_paused = true)]
     async fn rebuild_during_build_is_deferred_not_dropped() {
-        let (writer, tx, mut outcome_rx, handle) =
+        let (writer, tx, _outcome_rx, handle) =
             spawn_actor(service_statuses(&[("api", ServiceState::Building)])).await;
+        let (item_tx, mut item_rx) = mpsc::unbounded_channel();
 
-        queue(&tx, "api");
+        queue(&tx, "api", &item_tx);
 
-        // While the service is Building, windows keep re-arming and nothing
-        // flushes into a build.
-        let deferred = tokio::time::timeout(Duration::from_secs(2), outcome_rx.recv()).await;
+        let deferred = tokio::time::timeout(Duration::from_secs(2), item_rx.recv()).await;
         assert!(
             deferred.is_err(),
             "rebuild must stay deferred while the service is coming up"
         );
 
-        // Once the service settles, the deferred rebuild fires.
         writer.publish_processes(service_statuses(&[("api", ServiceState::Ready)]));
-        let outcome = tokio::time::timeout(Duration::from_secs(5), outcome_rx.recv())
+        let outcome = tokio::time::timeout(Duration::from_secs(5), item_rx.recv())
             .await
             .expect("deferred rebuild should fire once the service is up")
             .expect("actor alive");
-        let BatchOutcome::Rebuilds(outcome) = outcome else {
-            panic!("expected a rebuild outcome");
-        };
-        assert_eq!(outcome.plain_rebuilds, vec!["api".to_string()]);
+        assert_eq!(outcome, RebuildItemOutcome::NotBuilt);
         handle.abort();
     }
 
@@ -449,42 +513,40 @@ mod tests {
     /// batch is in flight is refused, not queued.
     #[tokio::test(start_paused = true)]
     async fn force_rebuild_is_refused_while_a_batch_runs() {
-        let (_writer, tx, mut outcome_rx, handle) =
+        let (_writer, tx, _outcome_rx, handle) =
             spawn_actor(service_statuses(&[("api", ServiceState::Ready)])).await;
+        let (item_tx, mut item_rx) = mpsc::unbounded_channel();
 
-        // Occupy the slot: a forced rebuild spawns immediately.
         let (first_tx, first_rx) = oneshot::channel();
         tx.send(BatchRequest::ForceRebuild {
             spec: RebuildSpec::Plain {
                 name: "api".to_string(),
             },
+            outcome: item_tx.clone(),
             reply: first_tx,
         })
         .unwrap();
         assert!(first_rx.await.unwrap().is_ok());
 
-        // The plain worker completes almost instantly, so the refusal race
-        // is only observable if the second request lands before the actor
-        // processes the worker's completion — both are already queued, and
-        // mailbox order guarantees the second ForceRebuild is handled
-        // before the (later-sent) completion can be. To keep this
-        // deterministic, send the second request immediately after the
-        // first's reply, before yielding to the actor again.
+        // The plain worker finishes almost instantly, so the refusal is only
+        // observable if the second request lands before the actor processes
+        // the first's completion. Both are queued already, and mailbox order
+        // guarantees the second ForceRebuild is handled first.
         let (second_tx, second_rx) = oneshot::channel();
         tx.send(BatchRequest::ForceRebuild {
             spec: RebuildSpec::Plain {
                 name: "api".to_string(),
             },
+            outcome: item_tx,
             reply: second_tx,
         })
         .unwrap();
-        let second = second_rx.await.unwrap();
-        match second {
+        match second_rx.await.unwrap() {
             Err(message) => assert!(message.contains("already in progress")),
             Ok(()) => {
                 // The worker finished before the second request was handled;
-                // that is also a legal serialization — the batch completed.
-                let _ = tokio::time::timeout(Duration::from_secs(5), outcome_rx.recv()).await;
+                // that is also a legal serialization.
+                let _ = tokio::time::timeout(Duration::from_secs(5), item_rx.recv()).await;
             }
         }
         handle.abort();

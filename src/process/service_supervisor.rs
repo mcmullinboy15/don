@@ -72,11 +72,23 @@ pub(crate) struct RestartRequest {
     /// Answered by the fold when the *stop* half lands; the start that
     /// follows reports its own progress.
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+    /// See [`super::ProcessReport::ServiceStarting::restarting`].
+    pub(crate) announce_restarting: bool,
     /// Clear the failure history first. An explicitly requested restart is a
     /// fresh chance; the restart policy's *own* retry must not be, or the
     /// streak that bounds a crash loop would be wiped by every attempt it
     /// scheduled — and the loop would never end.
     pub(crate) reset_policy: bool,
+}
+
+/// One request to rebuild: produce a fresh artifact, then restart into it.
+pub(crate) struct RebuildRequest {
+    /// Skip the build tool's up-to-date check — the hard-restart path.
+    pub(crate) forced: bool,
+    /// Answered as soon as the build is *accepted*, not when it finishes.
+    /// A forced rebuild refused because a batch is already running is the
+    /// hard-restart path's synchronous "already in progress".
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
 }
 
 /// Everything a service's supervisor can be asked to do.
@@ -85,6 +97,13 @@ pub(crate) enum ServiceCommand {
     Start(StartRequest),
     /// End the held process and start a fresh one. See [`RestartRequest`].
     Restart(Box<RestartRequest>),
+    /// Build this service's artifact and restart into it. See
+    /// [`RebuildRequest`] and the cycle it drives in `supervise`.
+    Rebuild(RebuildRequest),
+    /// A watched file changed while a rebuild cycle was running, so the
+    /// artifact that cycle is about to produce is already out of date. The
+    /// cycle skips its restart and lets the follow-up cycle do it.
+    MarkStale,
     /// End the held process: graceful signal per the config, bounded wait,
     /// SIGKILL fallback — the body of the old runner-side stop worker.
     /// The reply waits for the output reader to drain, so "stopped" can
@@ -112,8 +131,6 @@ pub(crate) enum ProxyDirective {
     SetPolicy(crate::proxy::ConnectionPolicy),
     /// Point forwarding backends at their configured addresses.
     SetBackend,
-    /// Clear forwarding backends; new connections queue until set again.
-    ClearBackend,
     /// Stop listening entirely — teardown is beginning.
     Shutdown,
 }
@@ -195,6 +212,10 @@ pub(crate) struct StartEnv {
     /// a supervisor cannot spawn into a shutdown the runner has already
     /// planned around — which is why the gate needs no teardown revocation.
     pub(crate) shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// The build batcher's mailbox. Rebuilds are coalesced across services —
+    /// one `bazel build` for N targets — so the batching stays shared even
+    /// though the cycle it feeds belongs to each supervisor.
+    pub(crate) batcher_tx: mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
 }
 
 /// Owner half for services.
@@ -354,6 +375,20 @@ async fn supervise(
     let mut reader_eof: Option<tokio::sync::oneshot::Receiver<()>> = None;
     // Dropping this ends the held process's health monitor, if one ran.
     let mut monitor_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
+    // A rebuild cycle in flight: a build was asked for and the restart it
+    // implies has not happened yet. `stale` records that a watched file
+    // changed *during* the cycle, which is what makes the artifact it is
+    // about to produce already out of date.
+    let mut cycle: Option<CycleState> = None;
+    // A build succeeded but its restart was skipped because the cycle went
+    // stale, so the running process is behind the artifact. Up-to-date is
+    // measured against the last *build*, not the running process, so the
+    // follow-up cycle must restart even when the build tool says there is
+    // nothing to do. Cleared only by a restart that actually happens.
+    let mut artifact_ahead = false;
+    // Where the batcher delivers this service's share of a batch.
+    let (rebuild_tx, mut rebuild_rx) =
+        mpsc::unbounded_channel::<crate::build_tool::batcher::RebuildItemOutcome>();
     // The OSC response scanner for the held spawn. It holds a sender into the
     // PTY gate, which holds the master's write half, so a stale one keeps the
     // PTY open — it belongs with the process, not with a shadow of it.
@@ -411,7 +446,10 @@ async fn supervise(
                     // Pending -> Starting. Only this supervisor knows when
                     // demand is actually spent.
                     if report_tx
-                        .send(super::ProcessReport::ServiceStarting { name: name.clone() })
+                        .send(super::ProcessReport::ServiceStarting {
+                            name: name.clone(),
+                            restarting: false,
+                        })
                         .is_err()
                     {
                         return;
@@ -519,6 +557,45 @@ async fn supervise(
                         }
                         continue;
                     }
+                    // This service's share of a finished batch. The cycle
+                    // continues here rather than in the scheduler, so the
+                    // build, the stop and the spawn are one sequence in one
+                    // place.
+                    outcome = rebuild_rx.recv() => {
+                        let Some(outcome) = outcome else { continue };
+                        busy.store(true, Ordering::Relaxed);
+                        match settle_cycle(
+                            &name,
+                            &env,
+                            outcome,
+                            &mut cycle,
+                            &mut artifact_ahead,
+                            &report_tx,
+                            &mut batch_built,
+                        ) {
+                            CycleNext::Done => continue,
+                            CycleNext::Stop => return,
+                            CycleNext::Restart => {
+                                break ServiceCommand::Restart(Box::new(RestartRequest {
+                                    config: effective_shutdown(&resolved, &env),
+                                    wait_full_exit: resolved.requires_full_exit_on_restart(),
+                                    interrupt: None,
+                                    // Connections arriving mid-restart queue
+                                    // instead of racing the dying process.
+                                    clear_backend_first: true,
+                                    start_mode: ServiceStartMode::SpawnOnly,
+                                    fresh_backend_ports: true,
+                                    intent: super::ServiceStartIntent::Background,
+                                    reply: None,
+                                    announce_restarting: true,
+                                    // A rebuild is not a user giving up on
+                                    // the service; the failure history rides
+                                    // across it.
+                                    reset_policy: false,
+                                }));
+                            }
+                        }
+                    }
                     // The monitor this supervisor started saw the service
                     // change health. The policy decides before the scheduler
                     // hears about it.
@@ -567,6 +644,7 @@ async fn supervise(
                             fresh_backend_ports: false,
                             intent: super::ServiceStartIntent::Background,
                             reply: None,
+                            announce_restarting: false,
                             // This IS the policy retrying. Keeping the streak
                             // is what lets the ceiling ever be reached.
                             reset_policy: false,
@@ -625,6 +703,132 @@ async fn supervise(
                 apply_proxy_directive(&name, &env.emitter, &mut proxy, directive);
                 continue;
             }
+            ServiceCommand::MarkStale => {
+                // Only meaningful inside a cycle. Outside one the watcher
+                // sends an ordinary Rebuild instead.
+                if let Some(cycle) = cycle.as_mut() {
+                    cycle.stale = true;
+                }
+                continue;
+            }
+            ServiceCommand::Rebuild(request) => {
+                // A new cycle: staleness is per-cycle, so it starts clear.
+                // `artifact_ahead` deliberately does not — it records that
+                // the *process* is behind, which no new request changes.
+                cycle = Some(CycleState { stale: false });
+                if !resolved.is_build_tool_managed() {
+                    // Not batched: run this service's own build command here,
+                    // *before* the stop, so a failed build leaves the version
+                    // that works still running.
+                    env.emitter
+                        .service_event(&name, "rebuilding (file changed)");
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                    let build = super::service_worker::run_service_build_worker(
+                        &env.base_dir,
+                        env.docker_client.as_ref(),
+                        &env.emitter,
+                        &name,
+                        &resolved,
+                        false,
+                        service_writer.as_ref(),
+                    );
+                    // Raced against the mailbox so a Stop or a shutdown can
+                    // cut a slow build short — the build child is
+                    // `kill_on_drop`, so abandoning the future ends it.
+                    tokio::pin!(build);
+                    let mut shutdown_rx = env.shutdown_rx.clone();
+                    let outcome = loop {
+                        tokio::select! {
+                            result = &mut build => break result,
+                            // Teardown must not wait out a slow build. The
+                            // build child is `kill_on_drop`, so abandoning the
+                            // future here ends it.
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    env.emitter.service_event(
+                                        &name,
+                                        "rebuild cancelled by shutdown",
+                                    );
+                                    cycle = None;
+                                    break Err("shutdown requested".to_string());
+                                }
+                            }
+                            next = rx.recv(), if !mailbox_closed => match next {
+                                Some(ServiceCommand::MarkStale) => {
+                                    if let Some(cycle) = cycle.as_mut() {
+                                        cycle.stale = true;
+                                    }
+                                }
+                                Some(ServiceCommand::Proxy(directive)) => {
+                                    apply_proxy_directive(
+                                        &name, &env.emitter, &mut proxy, directive,
+                                    );
+                                }
+                                Some(next) => {
+                                    // Superseded: drop the build and take the
+                                    // newer command.
+                                    cycle = None;
+                                    pending = Some(next);
+                                    break Err("superseded".to_string());
+                                }
+                                None => mailbox_closed = true,
+                            },
+                        }
+                    };
+                    if cycle.is_none() {
+                        continue;
+                    }
+                    let item = match outcome {
+                        Ok(()) => crate::build_tool::batcher::RebuildItemOutcome::NotBuilt,
+                        Err(message) => {
+                            crate::build_tool::batcher::RebuildItemOutcome::Failed(message)
+                        }
+                    };
+                    match settle_cycle(
+                        &name,
+                        &env,
+                        item,
+                        &mut cycle,
+                        &mut artifact_ahead,
+                        &report_tx,
+                        &mut batch_built,
+                    ) {
+                        CycleNext::Done => continue,
+                        CycleNext::Stop => return,
+                        CycleNext::Restart => {
+                            pending = Some(ServiceCommand::Restart(Box::new(RestartRequest {
+                                config: effective_shutdown(&resolved, &env),
+                                wait_full_exit: resolved.requires_full_exit_on_restart(),
+                                interrupt: None,
+                                clear_backend_first: true,
+                                start_mode: ServiceStartMode::SpawnOnly,
+                                fresh_backend_ports: true,
+                                intent: super::ServiceStartIntent::Background,
+                                reply: None,
+                                announce_restarting: true,
+                                reset_policy: false,
+                            })));
+                            continue;
+                        }
+                    }
+                }
+                let spec = rebuild_spec_for(&name, &resolved, &env);
+                let accepted = queue_build(&env, spec, &request, &rebuild_tx).await;
+                if let Some(reply) = request.reply {
+                    let _ = reply.send(accepted.clone().map_err(|message| {
+                        crate::command::CommandError::InvalidState {
+                            name: name.clone(),
+                            message,
+                        }
+                    }));
+                }
+                if accepted.is_err() {
+                    cycle = None;
+                }
+                continue;
+            }
             ServiceCommand::Stop(request) => {
                 reader_eof = None;
                 monitor_cancel = None;
@@ -662,7 +866,6 @@ async fn supervise(
                                 name: name.clone(),
                                 result,
                                 reply,
-                                restarting: false,
                             })
                             .is_err()
                         {
@@ -695,7 +898,7 @@ async fn supervise(
                 {
                     proxy.clear_backend();
                 }
-                let result = run_stop(
+                let stop = run_stop(
                     &name,
                     &env,
                     output.as_ref(),
@@ -705,17 +908,52 @@ async fn supervise(
                     false,
                     request.wait_full_exit,
                     request.interrupt,
-                )
-                .await;
+                );
+                // Race the mailbox while stopping. A `MarkStale` landing here
+                // is the one the runner used to catch by processing
+                // `RebuildStale` during a detached stop; without this the
+                // change is lost, because the watcher sends no second
+                // `Rebuild` for a cycle it believes is already running.
+                tokio::pin!(stop);
+                let result = loop {
+                    tokio::select! {
+                        result = &mut stop => break result,
+                        next = rx.recv(), if !mailbox_closed => match next {
+                            Some(ServiceCommand::MarkStale) => {
+                                if let Some(cycle) = cycle.as_mut() {
+                                    cycle.stale = true;
+                                }
+                            }
+                            Some(ServiceCommand::Proxy(directive)) => {
+                                apply_proxy_directive(
+                                    &name, &env.emitter, &mut proxy, directive,
+                                );
+                            }
+                            Some(next) => {
+                                pending = Some(next);
+                                break (&mut stop).await;
+                            }
+                            None => mailbox_closed = true,
+                        },
+                    }
+                };
+                // A stale cycle skips its spawn: the service stays stopped and
+                // the follow-up cycle brings it up on the newer sources.
+                let stale_now = cycle.as_ref().is_some_and(|cycle| cycle.stale);
+                if stale_now && cycle.take().is_some() {
+                    let _ = report_tx.send(super::ProcessReport::RebuildCycleDone {
+                        name: name.clone(),
+                        success: true,
+                    });
+                }
                 // A failed stop leaves nothing safe to start over, and a
                 // teardown that began mid-restart wants no new process.
-                let restarting = result.is_ok() && !*env.shutdown_rx.borrow();
+                let restarting = result.is_ok() && !stale_now && !*env.shutdown_rx.borrow();
                 if report_tx
                     .send(super::ProcessReport::ServiceStopComplete {
                         name: name.clone(),
                         result,
                         reply: request.reply,
-                        restarting,
                     })
                     .is_err()
                 {
@@ -728,11 +966,18 @@ async fn supervise(
                 // Stopped before Starting — the transition pair a restart has
                 // always shown.
                 if report_tx
-                    .send(super::ProcessReport::ServiceStarting { name: name.clone() })
+                    .send(super::ProcessReport::ServiceStarting {
+                        name: name.clone(),
+                        restarting: request.announce_restarting,
+                    })
                     .is_err()
                 {
                     return;
                 }
+                // Committing to a spawn brings the process up to the current
+                // artifact.
+                artifact_ahead = false;
+                cycle = None;
                 StartRequest {
                     mode: request.start_mode,
                     intent: request.intent,
@@ -958,6 +1203,159 @@ async fn supervise(
     }
 }
 
+/// A rebuild cycle in flight.
+struct CycleState {
+    /// A watched file changed since this cycle began.
+    stale: bool,
+}
+
+/// What a settled batch outcome asks the loop to do next.
+enum CycleNext {
+    /// The cycle is over; nothing to start.
+    Done,
+    /// Stop and restart into the artifact.
+    Restart,
+    /// The report channel closed — the scheduler is gone.
+    Stop,
+}
+
+/// Capture what the batcher needs to rebuild this service. Resolved config is
+/// fixed after construction, so a spec built now equals one built at flush
+/// time — which is what frees the batcher from reading anyone's state.
+fn rebuild_spec_for(
+    name: &str,
+    resolved: &crate::config::ResolvedService,
+    env: &StartEnv,
+) -> crate::build_tool::batcher::RebuildSpec {
+    use crate::build_tool::batcher::RebuildSpec;
+    match &resolved.kind {
+        Some(crate::config::ServiceKind::Bazel(bazel)) => {
+            RebuildSpec::Bazel(crate::build_tool::batch::BazelRebuildItem {
+                name: name.to_string(),
+                target: bazel.target.clone(),
+                working_dir: super::paths::working_dir_for(&env.base_dir, resolved.dir.as_deref()),
+            })
+        }
+        _ => RebuildSpec::Plain {
+            name: name.to_string(),
+        },
+    }
+}
+
+/// Ask the batcher to build this service, forced or coalesced.
+///
+/// Awaiting the forced reply inline is safe: the batcher never blocks on a
+/// send (its outcome channels are unbounded), so the answer is immediate.
+async fn queue_build(
+    env: &StartEnv,
+    spec: crate::build_tool::batcher::RebuildSpec,
+    request: &RebuildRequest,
+    outcome: &mpsc::UnboundedSender<crate::build_tool::batcher::RebuildItemOutcome>,
+) -> Result<(), String> {
+    use crate::build_tool::batcher::BatchRequest;
+    let gone = || "build batcher is shutting down".to_string();
+    if !request.forced {
+        return env
+            .batcher_tx
+            .send(BatchRequest::QueueRebuild {
+                spec,
+                outcome: outcome.clone(),
+            })
+            .map_err(|_| gone());
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    env.batcher_tx
+        .send(BatchRequest::ForceRebuild {
+            spec,
+            outcome: outcome.clone(),
+            reply: reply_tx,
+        })
+        .map_err(|_| gone())?;
+    match reply_rx.await {
+        Ok(result) => result,
+        Err(_) => Err(gone()),
+    }
+}
+
+/// Decide what a batch outcome means for the cycle it belongs to.
+///
+/// This is the whole of the rebuild state machine, and it reads only state
+/// this supervisor owns. The asymmetry between the arms is deliberate and
+/// pinned by tests: `UpToDate` consults `artifact_ahead` but not staleness
+/// (nothing was built, so nothing went stale), `Built` consults staleness and
+/// *sets* `artifact_ahead`, and a pass-through build sets neither.
+fn settle_cycle(
+    name: &str,
+    env: &StartEnv,
+    outcome: crate::build_tool::batcher::RebuildItemOutcome,
+    cycle: &mut Option<CycleState>,
+    artifact_ahead: &mut bool,
+    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
+    batch_built: &mut bool,
+) -> CycleNext {
+    use crate::build_tool::batcher::RebuildItemOutcome as Item;
+    let stale = cycle.as_ref().is_some_and(|cycle| cycle.stale);
+    let done = |success: bool, cycle: &mut Option<CycleState>| {
+        *cycle = None;
+        if report_tx
+            .send(super::ProcessReport::RebuildCycleDone {
+                name: name.to_string(),
+                success,
+            })
+            .is_err()
+        {
+            return CycleNext::Stop;
+        }
+        CycleNext::Done
+    };
+
+    match outcome {
+        Item::Failed(message) => {
+            // The old process keeps running: a failed build is no reason to
+            // take away the version that works.
+            env.emitter.service_error_event(name, &message);
+            done(false, cycle)
+        }
+        Item::Built => {
+            *batch_built = true;
+            if report_tx
+                .send(super::ProcessReport::ServiceArtifactBuilt {
+                    name: name.to_string(),
+                })
+                .is_err()
+            {
+                return CycleNext::Stop;
+            }
+            if stale {
+                // Skip restarting into an artifact already known to be out of
+                // date, but remember that the process is now behind a
+                // successful build.
+                *artifact_ahead = true;
+                return done(true, cycle);
+            }
+            CycleNext::Restart
+        }
+        Item::NotBuilt => {
+            if stale {
+                return done(true, cycle);
+            }
+            CycleNext::Restart
+        }
+        Item::UpToDate => {
+            if *artifact_ahead {
+                env.emitter.service_debug_event(
+                    name,
+                    "up to date, but process is behind last build — restarting",
+                );
+                return CycleNext::Restart;
+            }
+            env.emitter
+                .service_debug_event(name, "skipped (no changes)");
+            done(true, cycle)
+        }
+    }
+}
+
 /// End the held process and let its reader finish — the body both `Stop` and
 /// `Restart` run.
 ///
@@ -1042,11 +1440,6 @@ fn apply_proxy_directive(
         ProxyDirective::SetBackend => {
             if let Some(p) = proxy.as_ref() {
                 p.set_backend();
-            }
-        }
-        ProxyDirective::ClearBackend => {
-            if let Some(p) = proxy.as_ref() {
-                p.clear_backend();
             }
         }
         ProxyDirective::Shutdown => {
@@ -1434,6 +1827,12 @@ mod tests {
             .await
             .unwrap();
         StartEnv {
+            batcher_tx: {
+                let (tx, rx) = mpsc::unbounded_channel();
+                // Keep the receiver alive so sends succeed; nothing drains it.
+                std::mem::forget(rx);
+                tx
+            },
             base_dir: std::env::temp_dir(),
             pid_dir: std::env::temp_dir(),
             platform: Platform::LinuxX86_64,
@@ -1516,6 +1915,125 @@ mod tests {
         .unwrap()
     }
 
+    /// The rebuild cycle's decision table, which is the whole of the
+    /// staleness machinery now that one owner runs build, stop and spawn.
+    ///
+    /// These carry the semantics of two runner tests that drove the old
+    /// fold directly (`stale_build_then_up_to_date_followup_still_restarts`
+    /// and `deferred_restart_survives_watch_retrigger`). The asymmetry
+    /// between the arms is the point and is easy to break:
+    /// `UpToDate` consults `artifact_ahead` but not staleness — nothing was
+    /// built, so nothing went stale — while `Built` consults staleness and is
+    /// the only thing that *sets* `artifact_ahead`.
+    #[tokio::test]
+    async fn the_rebuild_cycle_decides_when_to_restart() {
+        use crate::build_tool::batcher::RebuildItemOutcome as Item;
+
+        struct Case {
+            name: &'static str,
+            /// Outcomes applied in order; `stale` marks the cycle stale
+            /// before that step, as a `MarkStale` mid-cycle would.
+            steps: Vec<(Item, bool)>,
+            want_restart: bool,
+            want_artifact_ahead: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a fresh build restarts into it",
+                steps: vec![(Item::Built, false)],
+                want_restart: true,
+                want_artifact_ahead: false,
+            },
+            Case {
+                name: "up to date with nothing pending is a no-op",
+                steps: vec![(Item::UpToDate, false)],
+                want_restart: false,
+                want_artifact_ahead: false,
+            },
+            Case {
+                name: "a build that went stale defers its restart",
+                steps: vec![(Item::Built, true)],
+                want_restart: false,
+                want_artifact_ahead: true,
+            },
+            Case {
+                // The pin: up-to-date is measured against the last *build*,
+                // not the running process, so the follow-up must still
+                // restart even though the build tool had nothing to do.
+                name: "a stale build then up-to-date still restarts",
+                steps: vec![(Item::Built, true), (Item::UpToDate, false)],
+                want_restart: true,
+                want_artifact_ahead: true,
+            },
+            Case {
+                // A re-trigger must not lose the deferred restart: a new
+                // cycle clears staleness but never `artifact_ahead`.
+                name: "a deferred restart survives a re-trigger",
+                steps: vec![
+                    (Item::Built, true),
+                    (Item::Built, true),
+                    (Item::UpToDate, false),
+                ],
+                want_restart: true,
+                want_artifact_ahead: true,
+            },
+            Case {
+                name: "a failed build keeps the old process",
+                steps: vec![(Item::Failed("boom".to_string()), false)],
+                want_restart: false,
+                want_artifact_ahead: false,
+            },
+            Case {
+                name: "a pass-through build restarts",
+                steps: vec![(Item::NotBuilt, false)],
+                want_restart: true,
+                want_artifact_ahead: false,
+            },
+            Case {
+                name: "a stale pass-through does not",
+                steps: vec![(Item::NotBuilt, true)],
+                want_restart: false,
+                want_artifact_ahead: false,
+            },
+        ];
+
+        for case in cases {
+            let env = test_env().await;
+            let (report_tx, _report_rx) = mpsc::unbounded_channel();
+            let mut artifact_ahead = false;
+            let mut batch_built = false;
+            let mut restarted = false;
+            for (outcome, stale) in case.steps {
+                // Each step is its own cycle, as a fresh Rebuild would be.
+                let mut cycle = Some(CycleState { stale });
+                restarted = matches!(
+                    settle_cycle(
+                        "svc",
+                        &env,
+                        outcome,
+                        &mut cycle,
+                        &mut artifact_ahead,
+                        &report_tx,
+                        &mut batch_built,
+                    ),
+                    CycleNext::Restart
+                );
+                // A restart that happens brings the process up to date.
+                if restarted {
+                    artifact_ahead = false;
+                }
+            }
+            assert_eq!(restarted, case.want_restart, "{}: restart", case.name);
+            assert_eq!(
+                artifact_ahead && !restarted,
+                case.want_artifact_ahead && !case.want_restart,
+                "{}: artifact_ahead",
+                case.name
+            );
+        }
+    }
+
     /// `Restart` is one operation and its reports say so: the stop half
     /// lands first, then the start is announced — the transition pair a
     /// restart has always shown, now produced by one owner instead of a stop
@@ -1564,6 +2082,7 @@ mod tests {
                     fresh_backend_ports: false,
                     intent: ServiceStartIntent::Background,
                     reply: case.with_reply.then_some(reply_tx),
+                    announce_restarting: false,
                     reset_policy: true,
                 })))
                 .unwrap();
@@ -1573,12 +2092,10 @@ mod tests {
                     name,
                     result,
                     reply,
-                    restarting,
                 }) => {
                     assert_eq!(name, "svc", "{}", case.name);
                     // Nothing is held, so stopping succeeds trivially.
                     assert!(result.is_ok(), "{}: {result:?}", case.name);
-                    assert!(restarting, "{}: a start must follow", case.name);
                     assert_eq!(reply.is_some(), case.with_reply, "{}", case.name);
                     reply
                 }
@@ -1599,7 +2116,7 @@ mod tests {
             drop(carried);
 
             match harness.report_rx.recv().await {
-                Some(super::super::ProcessReport::ServiceStarting { name }) => {
+                Some(super::super::ProcessReport::ServiceStarting { name, .. }) => {
                     assert_eq!(name, "svc", "{}", case.name);
                 }
                 _ => panic!("{}: expected the start to be announced", case.name),
@@ -1636,15 +2153,6 @@ mod tests {
                 name: "set backend forwards to the service",
                 directives: vec![ProxyDirective::SetBackend],
                 expect: Expect::Forwarded,
-            },
-            Case {
-                name: "clear after set parks, refuse then closes",
-                directives: vec![
-                    ProxyDirective::SetBackend,
-                    ProxyDirective::ClearBackend,
-                    ProxyDirective::SetPolicy(ConnectionPolicy::Refuse),
-                ],
-                expect: Expect::Refused,
             },
             Case {
                 name: "shutdown drops the listener",

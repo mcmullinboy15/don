@@ -90,12 +90,26 @@ pub(crate) enum ProcessReport {
     },
     /// A task process exited after an explicit run/restart.
     TaskExited(TaskExit),
+    /// A service's rebuild cycle ended. The supervisor sequenced the build,
+    /// the stop and the spawn itself; this exists so the scheduler can close
+    /// the watch cycle it opened, which it does by broadcasting the
+    /// (unchanged) `RunnerEvent::RebuildComplete`.
+    RebuildCycleDone { name: String, success: bool },
+    /// A batch build produced this service's artifact. Folded so the gate's
+    /// `artifact_ready` check knows the service may now run.
+    ServiceArtifactBuilt { name: String },
     /// A supervisor spent its start permission and is beginning a start.
     ///
     /// This is the ack that makes a level-triggered permission single-use
     /// across the channel boundary: the runner folds it into `Starting`,
     /// which closes the gate.
-    ServiceStarting { name: String },
+    ServiceStarting {
+        name: String,
+        /// A rebuild cycle's spawn, which announces itself as "restarting"
+        /// rather than "starting" — the user asked for a rebuild, not a
+        /// start, and the log should say what they asked for.
+        restarting: bool,
+    },
     /// A service's supervisor settled a start request — wired (metadata
     /// only; custody stays with the supervisor) or failed to prepare.
     ServiceStartPrepared {
@@ -129,10 +143,6 @@ pub(crate) enum ProcessReport {
         /// `don stop` returning means the service is no longer a satisfied
         /// dependency.
         reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
-        /// The supervisor has already begun the start half of a restart; a
-        /// [`ProcessReport::ServiceStarting`] from it follows. The fold
-        /// applies `Stopped` and leaves the start alone.
-        restarting: bool,
     },
     /// A task's supervisor settled a run request.
     TaskRunPrepared {

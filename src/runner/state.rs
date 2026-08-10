@@ -14,7 +14,7 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::{ServiceState, ServiceStopAction, TaskRunWaiter, TaskState};
+use super::{ServiceState, TaskRunWaiter, TaskState};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 
@@ -46,23 +46,6 @@ pub(crate) struct RuntimeService {
     /// scheduler reads it so a stack sitting in a backoff still counts as
     /// having work in flight.
     pub restart_pending: bool,
-    /// Follow-up action to run after the current stop completes.
-    pub stop_action: ServiceStopAction,
-    /// In-flight rebuild-preparation worker (build only) for this service.
-    pub rebuild_worker: Option<tokio::task::JoinHandle<()>>,
-    /// Monotonic generation for rebuild workers so stale completions can
-    /// be ignored.
-    pub rebuild_generation: u64,
-    /// A watched file changed during the current rebuild cycle, so any
-    /// pending restart for that cycle should be skipped.
-    pub rebuild_stale: bool,
-    /// A build completed successfully but its restart was skipped because the
-    /// process went stale (a watched file changed mid-build), so the running
-    /// process is now *behind* the latest built artifact. The follow-up
-    /// rebuild cycle must restart even if the build tool reports "up to date" —
-    /// up-to-date is measured against the last *build*, not against the
-    /// *running process*. Cleared once the process is (re)started.
-    pub artifact_ahead_of_process: bool,
 }
 
 impl RuntimeService {
@@ -80,11 +63,6 @@ impl RuntimeService {
             bazel_binary_path: None,
             batch_built: false,
             restart_pending: false,
-            stop_action: ServiceStopAction::None,
-            rebuild_worker: None,
-            rebuild_generation: 0,
-            rebuild_stale: false,
-            artifact_ahead_of_process: false,
         }
     }
 

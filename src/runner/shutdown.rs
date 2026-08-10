@@ -1,6 +1,6 @@
 use super::graph::topological_sort;
 
-use super::{Runner, ServiceState, ServiceStopAction};
+use super::{Runner, ServiceState};
 use crate::signals::force_shutdown_requested;
 use std::collections::{BTreeMap, HashMap};
 use tokio::task::JoinSet;
@@ -59,19 +59,6 @@ impl Runner {
         if let Some(handle) = self.update_check_handle.take() {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
-        }
-
-        let mut service_worker_handles = Vec::new();
-        for (name, rs) in &mut self.services {
-            if let Some(worker) = rs.rebuild_worker.take() {
-                self.output_manager
-                    .service_event(name, "rebuild cancelled by shutdown");
-                worker.abort();
-                service_worker_handles.push(worker);
-            }
-        }
-        for worker in service_worker_handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
         }
 
         for (name, rt) in &mut self.tasks {
@@ -399,16 +386,8 @@ impl Runner {
 
     /// Wait for remaining async tasks to finish after shutdown.
     pub(in crate::runner) async fn wait_for_shutdown(&mut self) {
-        // All handles should already be stopped by initiate_shutdown.
-        // Drop remaining handles, release sockets, clear attach state.
-        for rs in self.services.values_mut() {
-            if let Some(worker) = rs.rebuild_worker.take() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
-            rs.stop_action = ServiceStopAction::None;
-        }
-        // Custody goes through the funnel even here, so the projection and
-        // the shadow end teardown agreeing.
+        // Custody goes through the funnel even here, so the projection ends
+        // teardown agreeing with reality.
         let names: Vec<String> = self.services.keys().cloned().collect();
         for name in names {
             self.clear_service_custody(&name);
