@@ -50,10 +50,36 @@ pub(crate) struct ConfigureRequest {
     pub(crate) batch_built: Option<bool>,
 }
 
+/// One request to stop and immediately start again, as one operation.
+///
+/// Restart is a single command rather than a stop the scheduler follows up
+/// on, because every step of it belongs to the owner: the proxy whose backend
+/// must be cleared first, the process being ended, and the spawn that
+/// replaces it. As one mailbox item it also cannot interleave with anything
+/// else this service was asked to do.
+pub(crate) struct RestartRequest {
+    pub(crate) config: ShutdownConfig,
+    pub(crate) wait_full_exit: bool,
+    /// See [`StopRequest::interrupt`].
+    pub(crate) interrupt: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Clear forwarding backends before stopping, so connections arriving
+    /// mid-restart queue instead of racing the dying process.
+    pub(crate) clear_backend_first: bool,
+    pub(crate) start_mode: ServiceStartMode,
+    /// See [`StartRequest::fresh_backend_ports`].
+    pub(crate) fresh_backend_ports: bool,
+    pub(crate) intent: ServiceStartIntent,
+    /// Answered by the fold when the *stop* half lands; the start that
+    /// follows reports its own progress.
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+}
+
 /// Everything a service's supervisor can be asked to do.
 pub(crate) enum ServiceCommand {
     /// Begin a start — or supersede the one being prepared.
     Start(StartRequest),
+    /// End the held process and start a fresh one. See [`RestartRequest`].
+    Restart(Box<RestartRequest>),
     /// End the held process: graceful signal per the config, bounded wait,
     /// SIGKILL fallback — the body of the old runner-side stop worker.
     /// The reply waits for the output reader to drain, so "stopped" can
@@ -135,11 +161,9 @@ pub(crate) struct StopRequest {
 
 /// How a stop's completion travels back.
 pub(crate) enum StopNotify {
-    /// The manual/restart path: `ServiceStopComplete{op_id}` through the
-    /// internal channel, so the runner's control plumbing
-    /// (`control_reply`, `stop_action`, `control_generation`) is untouched
-    /// by custody.
-    Internal { op_id: u64 },
+    /// The manual path: [`super::ProcessReport::ServiceStopComplete`] on the
+    /// report channel, carrying the requester's reply for the fold to answer.
+    Reply(Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>),
     /// The shutdown path: a plain done-signal the reverse-dependency loop
     /// joins on, per depth. (The internal channel is not read during
     /// shutdown, so it cannot carry this.)
@@ -473,57 +497,29 @@ async fn supervise(
                 monitor_cancel = None;
                 ready_pending = None;
                 // A stop withdraws demand: nothing wants this running now, so
-                // an open gate cannot undo it. A restart's follow-up start
-                // arrives as a mailbox Start, which does not consult demand.
+                // an open gate cannot undo it. A restart's follow-up start is
+                // part of the same command, so it does not consult demand.
                 demand = super::Demand::None;
-                let result = match held.take() {
-                    Some(handle) => {
-                        let debug = service::StopDebug::new(name.clone(), env.emitter.clone());
-                        match request.interrupt {
-                            Some(shutdown_rx) => service::stop_service_interruptibly(
-                                handle,
-                                Some(&request.config),
-                                request.wait_full_exit,
-                                shutdown_rx,
-                                Some(debug),
-                            )
-                            .await
-                            .map_err(|e| e.to_string()),
-                            None => service::stop_service(
-                                handle,
-                                Some(&request.config),
-                                request.force,
-                                request.wait_full_exit,
-                                Some(debug),
-                            )
-                            .await
-                            .map_err(|e| e.to_string()),
-                        }
-                    }
-                    // Nothing held: the process already exited and was
-                    // reaped. Stopping something stopped succeeds.
-                    None => Ok(()),
-                };
-                // The process is gone. Unregister attach FIRST: the
-                // registration holds a PTY-gate sender, and the gate holds
-                // the master's write half — the reader cannot see EOF until
-                // every sender is dropped, so waiting on it first deadlocks
-                // against this until the 2s bound.
-                if let Some(output) = output.as_ref() {
-                    output.clear_attach().await;
-                }
-                // Its reader now sees EOF and drains. Wait for that before
-                // notifying, so "stopped" never outruns the final output.
-                if let Some(handle) = reader.take() {
-                    await_reader(handle).await;
-                }
+                let result = run_stop(
+                    &name,
+                    &env,
+                    output.as_ref(),
+                    &mut held,
+                    &mut reader,
+                    &request.config,
+                    request.force,
+                    request.wait_full_exit,
+                    request.interrupt,
+                )
+                .await;
                 match request.notify {
-                    StopNotify::Internal { op_id } => {
+                    StopNotify::Reply(reply) => {
                         if report_tx
                             .send(super::ProcessReport::ServiceStopComplete {
                                 name: name.clone(),
-                                op_id,
                                 result,
+                                reply,
+                                restarting: false,
                             })
                             .is_err()
                         {
@@ -535,6 +531,62 @@ async fn supervise(
                     }
                 }
                 continue;
+            }
+            ServiceCommand::Restart(request) => {
+                reader_eof = None;
+                monitor_cancel = None;
+                ready_pending = None;
+                demand = super::Demand::None;
+                // Owning the proxy makes this a call rather than a mailbox
+                // hop, so it cannot arrive after the stop it must precede.
+                if request.clear_backend_first
+                    && let Some(proxy) = proxy.as_ref()
+                {
+                    proxy.clear_backend();
+                }
+                let result = run_stop(
+                    &name,
+                    &env,
+                    output.as_ref(),
+                    &mut held,
+                    &mut reader,
+                    &request.config,
+                    false,
+                    request.wait_full_exit,
+                    request.interrupt,
+                )
+                .await;
+                // A failed stop leaves nothing safe to start over, and a
+                // teardown that began mid-restart wants no new process.
+                let restarting = result.is_ok() && !*env.shutdown_rx.borrow();
+                if report_tx
+                    .send(super::ProcessReport::ServiceStopComplete {
+                        name: name.clone(),
+                        result,
+                        reply: request.reply,
+                        restarting,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if !restarting {
+                    continue;
+                }
+                // Reported separately from the stop so the scheduler folds
+                // Stopped before Starting — the transition pair a restart has
+                // always shown.
+                if report_tx
+                    .send(super::ProcessReport::ServiceStarting { name: name.clone() })
+                    .is_err()
+                {
+                    return;
+                }
+                StartRequest {
+                    mode: request.start_mode,
+                    intent: request.intent,
+                    fresh_backend_ports: request.fresh_backend_ports,
+                }
             }
         };
 
@@ -702,6 +754,59 @@ async fn supervise(
             }
         }
     }
+}
+
+/// End the held process and let its reader finish — the body both `Stop` and
+/// `Restart` run.
+///
+/// Attach is unregistered *before* the reader is awaited: the registration
+/// holds a PTY-gate sender and the gate holds the master's write half, so the
+/// reader cannot see EOF until every sender is dropped. Awaiting it first
+/// would deadlock against that until the 2s bound. Waiting for the drain at
+/// all is what stops "stopped" outrunning the process's final lines.
+#[allow(clippy::too_many_arguments)]
+async fn run_stop(
+    name: &str,
+    env: &StartEnv,
+    output: Option<&ProcessOutput>,
+    held: &mut Option<service::ServiceHandle>,
+    reader: &mut Option<tokio::task::JoinHandle<()>>,
+    config: &ShutdownConfig,
+    force: bool,
+    wait_full_exit: bool,
+    interrupt: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), String> {
+    let result = match held.take() {
+        Some(handle) => {
+            let debug = service::StopDebug::new(name.to_string(), env.emitter.clone());
+            match interrupt {
+                Some(shutdown_rx) => service::stop_service_interruptibly(
+                    handle,
+                    Some(config),
+                    wait_full_exit,
+                    shutdown_rx,
+                    Some(debug),
+                )
+                .await
+                .map_err(|e| e.to_string()),
+                None => {
+                    service::stop_service(handle, Some(config), force, wait_full_exit, Some(debug))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+        }
+        // Nothing held: the process already exited and was reaped. Stopping
+        // something stopped succeeds.
+        None => Ok(()),
+    };
+    if let Some(output) = output {
+        output.clear_attach().await;
+    }
+    if let Some(handle) = reader.take() {
+        await_reader(handle).await;
+    }
+    result
 }
 
 /// Apply a runner proxy decision to the owned proxy. No-op for services
@@ -1071,6 +1176,97 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// `Restart` is one operation and its reports say so: the stop half
+    /// lands first, then the start is announced — the transition pair a
+    /// restart has always shown, now produced by one owner instead of a stop
+    /// the scheduler followed up on.
+    ///
+    /// The requester's reply travels *through*, unanswered. Callers read a
+    /// stop reply as "the scheduler has applied this" (`don stop` returning
+    /// means the service is no longer a satisfied dependency), which only the
+    /// fold can promise.
+    #[tokio::test]
+    async fn restart_reports_its_stop_then_announces_the_start() {
+        struct Case {
+            name: &'static str,
+            clear_backend_first: bool,
+            with_reply: bool,
+        }
+        let cases = [
+            Case {
+                name: "plain restart",
+                clear_backend_first: false,
+                with_reply: true,
+            },
+            Case {
+                name: "restart clearing the proxy backend first",
+                clear_backend_first: true,
+                with_reply: true,
+            },
+            Case {
+                name: "restart nobody is waiting on",
+                clear_backend_first: false,
+                with_reply: false,
+            },
+        ];
+
+        for case in cases {
+            let mut harness = spawn_harness(None).await;
+            let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+            harness
+                .tx
+                .send(ServiceCommand::Restart(Box::new(RestartRequest {
+                    config: ShutdownConfig::default(),
+                    wait_full_exit: false,
+                    interrupt: None,
+                    clear_backend_first: case.clear_backend_first,
+                    start_mode: ServiceStartMode::Full,
+                    fresh_backend_ports: false,
+                    intent: ServiceStartIntent::Background,
+                    reply: case.with_reply.then_some(reply_tx),
+                })))
+                .unwrap();
+
+            let carried = match harness.report_rx.recv().await {
+                Some(super::super::ProcessReport::ServiceStopComplete {
+                    name,
+                    result,
+                    reply,
+                    restarting,
+                }) => {
+                    assert_eq!(name, "svc", "{}", case.name);
+                    // Nothing is held, so stopping succeeds trivially.
+                    assert!(result.is_ok(), "{}: {result:?}", case.name);
+                    assert!(restarting, "{}: a start must follow", case.name);
+                    assert_eq!(reply.is_some(), case.with_reply, "{}", case.name);
+                    reply
+                }
+                _ => panic!("{}: expected the stop half first", case.name),
+            };
+            if case.with_reply {
+                // Unanswered while its sender is still alive — proof the
+                // supervisor handed it on rather than resolving it.
+                assert!(
+                    matches!(
+                        reply_rx.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ),
+                    "{}: the supervisor answered a reply the fold owes",
+                    case.name
+                );
+            }
+            drop(carried);
+
+            match harness.report_rx.recv().await {
+                Some(super::super::ProcessReport::ServiceStarting { name }) => {
+                    assert_eq!(name, "svc", "{}", case.name);
+                }
+                _ => panic!("{}: expected the start to be announced", case.name),
+            }
+            harness.handle.abort();
+        }
     }
 
     /// The supervisor applies each proxy directive to the proxy it owns —

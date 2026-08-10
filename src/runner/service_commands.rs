@@ -6,6 +6,31 @@ use super::{
 };
 use tokio::sync::oneshot;
 
+/// What a restart should do, as the scheduler asks for it.
+///
+/// The shape varies by caller — a manual restart re-runs the full start, the
+/// rebuild cycle re-spawns onto fresh backend ports behind a cleared proxy —
+/// so it travels as one value rather than four positional flags.
+pub(in crate::runner) struct RestartPlan {
+    pub(in crate::runner) wait_full_exit: bool,
+    pub(in crate::runner) clear_backend_first: bool,
+    pub(in crate::runner) start_mode: ServiceStartMode,
+    pub(in crate::runner) fresh_backend_ports: bool,
+}
+
+impl RestartPlan {
+    /// Stop and run the whole start again: what `don restart` and an
+    /// auto-restart both want.
+    pub(in crate::runner) fn full() -> Self {
+        Self {
+            wait_full_exit: false,
+            clear_backend_first: false,
+            start_mode: ServiceStartMode::Full,
+            fresh_backend_ports: false,
+        }
+    }
+}
+
 impl Runner {
     fn lookup_service(&self, name: &str) -> Result<&crate::config::Service, CommandError> {
         if let Some(svc) = self.config.services.get(name) {
@@ -54,23 +79,32 @@ impl Runner {
         Ok(())
     }
 
-    /// A supervisor spent its start permission and is starting.
+    /// A supervisor spent its start permission, or began the start half of a
+    /// restart it owns.
     ///
-    /// The transition to `Starting` is what closes the gate, so this is the
-    /// runner's half of making a level-triggered grant single-use. A service
-    /// that has already left `Pending` — a manual start won the race, or
-    /// teardown began — ignores the ack; the supervisor's own idle-and-empty
-    /// check is the other half.
+    /// For a spent permission the transition to `Starting` is what closes the
+    /// gate, so this is the runner's half of making a level-triggered grant
+    /// single-use. The states accepted are the ones a start can legitimately
+    /// begin from: `Pending` for a gate grant, and the settled states a
+    /// restart's own stop just produced. Anything else means the service
+    /// moved on without this supervisor — a manual start won the race — and
+    /// the ack is ignored; the supervisor's own idle-and-empty check is the
+    /// other half. Teardown refuses outright: nothing may come up while the
+    /// stop order is being walked.
     pub(in crate::runner) fn handle_service_starting(&mut self, name: &str) {
-        let pending = self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.state() == ServiceState::Pending);
-        if !pending {
-            self.output_manager.service_debug_event(
-                name,
-                "start began for a service that had already left Pending",
-            );
+        let startable = !self.shutting_down
+            && self.services.get(name).is_some_and(|rs| {
+                matches!(
+                    rs.state(),
+                    ServiceState::Pending
+                        | ServiceState::Stopped
+                        | ServiceState::Failed
+                        | ServiceState::Unhealthy
+                )
+            });
+        if !startable {
+            self.output_manager
+                .service_debug_event(name, "start began for a service that could no longer start");
             return;
         }
         self.set_service_state(name, ServiceState::Starting);
@@ -198,12 +232,11 @@ impl Runner {
                 .get(name)
                 .and_then(|rs| rs.proxy_view.as_ref())
                 .is_some_and(|p| p.requires_full_exit_on_restart());
-            let (reply_tx, _reply_rx) = oneshot::channel();
             self.send_service_stop(
                 name,
                 shutdown_config,
                 wait_full,
-                reply_tx,
+                None,
                 ServiceStopAction::RestartSpawnOnly,
             );
             return;
@@ -452,29 +485,33 @@ impl Runner {
 
     /// Ask the service's supervisor — the process's owner — to stop it.
     ///
-    /// Bookkeeping (`control_generation`, `control_reply`, `stop_action`)
-    /// is unchanged from the worker era; only the executor moved. The
-    /// completion still arrives as `ServiceStopComplete{op_id}`.
+    /// The reply rides down with the request and comes back on the report
+    /// channel; only `stop_action` (what the *rebuild* cycle wants next)
+    /// stays fold-side, and it needs no currency check: a supervisor runs one
+    /// stop at a time, so completions arrive in the order the stops were sent.
     pub(in crate::runner) fn send_service_stop(
         &mut self,
         name: &str,
         shutdown_config: crate::config::ShutdownConfig,
         wait_full_exit: bool,
-        reply: oneshot::Sender<CommandResult>,
+        reply: Option<oneshot::Sender<CommandResult>>,
         stop_action: ServiceStopAction,
     ) {
-        let Some(rs) = self.services.get_mut(name) else {
-            let _ = reply.send(Err(CommandError::UnknownService {
-                name: name.to_string(),
-            }));
+        if !self.services.contains_key(name) {
+            Self::answer(
+                reply,
+                Err(CommandError::UnknownService {
+                    name: name.to_string(),
+                }),
+            );
             return;
-        };
-        rs.control_generation = rs.control_generation.saturating_add(1);
-        let op_id = rs.control_generation;
-        rs.control_reply = Some(reply);
-        rs.stop_action = stop_action;
+        }
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.stop_action = stop_action;
+        }
 
         let shutdown_rx = self.shutdown_flag_tx.subscribe();
+        let mut carried = Some(reply);
         let sent = self
             .service_starts
             .registry()
@@ -486,37 +523,78 @@ impl Runner {
                         force: false,
                         wait_full_exit,
                         interrupt: Some(shutdown_rx),
-                        notify: super::service_supervisor::StopNotify::Internal { op_id },
+                        notify: super::service_supervisor::StopNotify::Reply(
+                            carried.take().flatten(),
+                        ),
                     },
                 ))
             });
-        if !sent
-            && let Some(rs) = self.services.get_mut(name)
-            && let Some(reply) = rs.control_reply.take()
-        {
-            let _ = reply.send(Err(CommandError::Failed {
-                name: name.to_string(),
-                message: "service supervisor is shutting down".to_string(),
-            }));
+        if !sent {
+            Self::answer(
+                carried.flatten(),
+                Err(CommandError::Failed {
+                    name: name.to_string(),
+                    message: "service supervisor is shutting down".to_string(),
+                }),
+            );
+        }
+    }
+
+    /// Ask the supervisor to stop what it holds and start again — one
+    /// operation, because every step of it belongs to the owner.
+    pub(in crate::runner) fn send_service_restart(
+        &mut self,
+        name: &str,
+        plan: RestartPlan,
+        reply: Option<oneshot::Sender<CommandResult>>,
+    ) {
+        let shutdown_config = self.effective_shutdown_config(name);
+        let shutdown_rx = self.shutdown_flag_tx.subscribe();
+        let mut carried = Some(reply);
+        let sent = self
+            .service_starts
+            .registry()
+            .get(name)
+            .is_some_and(|handle| {
+                handle.request(super::service_supervisor::ServiceCommand::Restart(
+                    Box::new(super::service_supervisor::RestartRequest {
+                        config: shutdown_config,
+                        wait_full_exit: plan.wait_full_exit,
+                        interrupt: Some(shutdown_rx),
+                        clear_backend_first: plan.clear_backend_first,
+                        start_mode: plan.start_mode,
+                        fresh_backend_ports: plan.fresh_backend_ports,
+                        intent: ServiceStartIntent::Background,
+                        reply: carried.take().flatten(),
+                    }),
+                ))
+            });
+        if !sent {
+            Self::answer(
+                carried.flatten(),
+                Err(CommandError::Failed {
+                    name: name.to_string(),
+                    message: "service supervisor is shutting down".to_string(),
+                }),
+            );
+        }
+    }
+
+    fn answer(reply: Option<oneshot::Sender<CommandResult>>, result: CommandResult) {
+        if let Some(reply) = reply {
+            let _ = reply.send(result);
         }
     }
 
     pub(in crate::runner) async fn handle_service_stop_complete(
         &mut self,
         name: &str,
-        op_id: u64,
         result: Result<(), String>,
+        reply: Option<oneshot::Sender<CommandResult>>,
+        restarting: bool,
     ) {
-        let is_current = self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.control_generation == op_id);
-        if !is_current {
-            return;
-        }
-
-        let (reply, stop_action) = match self.services.get_mut(name) {
-            Some(rs) => (rs.control_reply.take(), std::mem::take(&mut rs.stop_action)),
+        let stop_action = match self.services.get_mut(name) {
+            Some(rs) => std::mem::take(&mut rs.stop_action),
             None => return,
         };
 
@@ -531,26 +609,27 @@ impl Runner {
                 }
                 self.clear_service_custody(name);
                 self.set_service_state(name, ServiceState::Stopped);
-                let next_result = match stop_action {
-                    ServiceStopAction::None => Ok(()),
-                    ServiceStopAction::RestartFull => {
-                        self.queue_background_service_start(name, ServiceStartMode::Full)
-                    }
-                    ServiceStopAction::RestartSpawnOnly => {
-                        if self.take_rebuild_stale(name) {
-                            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
-                                name: name.to_string(),
-                                success: true,
-                            });
-                            Ok(())
-                        } else {
-                            self.queue_rebuild_service_start(name).await
+                let next_result = if restarting {
+                    // The supervisor has already begun the start half; its
+                    // own `ServiceStarting` report drives the transition.
+                    Ok(())
+                } else {
+                    match stop_action {
+                        ServiceStopAction::None => Ok(()),
+                        ServiceStopAction::RestartSpawnOnly => {
+                            if self.take_rebuild_stale(name) {
+                                let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
+                                    name: name.to_string(),
+                                    success: true,
+                                });
+                                Ok(())
+                            } else {
+                                self.queue_rebuild_service_start(name).await
+                            }
                         }
                     }
                 };
-                if let Some(reply) = reply {
-                    let _ = reply.send(next_result);
-                }
+                Self::answer(reply, next_result);
             }
             Err(message) => {
                 if let Some(rs) = self.services.get_mut(name) {
@@ -559,12 +638,13 @@ impl Runner {
                 self.clear_service_custody(name);
                 self.set_service_state(name, ServiceState::Failed);
                 self.output_manager.service_error_event(name, &message);
-                if let Some(reply) = reply {
-                    let _ = reply.send(Err(CommandError::Failed {
+                Self::answer(
+                    reply,
+                    Err(CommandError::Failed {
                         name: name.to_string(),
                         message,
-                    }));
-                }
+                    }),
+                );
             }
         }
         self.refresh_runtime_port_manifest();
@@ -628,7 +708,13 @@ impl Runner {
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .service_event(name, "stopping... (requested)");
-        self.send_service_stop(name, shutdown_config, false, reply, ServiceStopAction::None);
+        self.send_service_stop(
+            name,
+            shutdown_config,
+            false,
+            Some(reply),
+            ServiceStopAction::None,
+        );
     }
 
     pub(in crate::runner) async fn handle_restart_service_cmd(
@@ -676,16 +762,9 @@ impl Runner {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
         }
-        let shutdown_config = self.effective_shutdown_config(name);
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .service_event(name, "stopping... (requested restart)");
-        self.send_service_stop(
-            name,
-            shutdown_config,
-            false,
-            reply,
-            ServiceStopAction::RestartFull,
-        );
+        self.send_service_restart(name, RestartPlan::full(), Some(reply));
     }
 }

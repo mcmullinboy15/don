@@ -394,7 +394,6 @@ impl Runner {
             if let Some(worker) = rs.rebuild_worker.take() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
             }
-            rs.control_reply = None;
             rs.stop_action = ServiceStopAction::None;
         }
         // Custody goes through the funnel even here, so the projection and

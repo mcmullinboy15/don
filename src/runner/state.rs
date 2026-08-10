@@ -14,13 +14,10 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::{
-    CommandResult, ServiceHandleIdentity, ServiceState, ServiceStopAction, TaskRunWaiter, TaskState,
-};
+use super::{ServiceHandleIdentity, ServiceState, ServiceStopAction, TaskRunWaiter, TaskState};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 use std::time::Instant;
-use tokio::sync::oneshot;
 
 /// All per-service runtime state, consolidated into a single struct.
 ///
@@ -83,11 +80,6 @@ pub(crate) struct RuntimeService {
     /// Handle to a scheduled `RestartUnhealthy` command. Aborted on stop,
     /// recovery, or manual restart so we don't fire a stale auto-restart.
     pub pending_restart: Option<tokio::task::JoinHandle<()>>,
-    /// Monotonic generation for manual control workers so stale completions
-    /// can be ignored.
-    pub control_generation: u64,
-    /// Pending reply for a manual stop/restart request.
-    pub control_reply: Option<oneshot::Sender<CommandResult>>,
     /// Follow-up action to run after the current stop completes.
     pub stop_action: ServiceStopAction,
     /// In-flight rebuild-preparation worker (build only) for this service.
@@ -130,8 +122,6 @@ impl RuntimeService {
             last_start: None,
             rapid_crashes: 0,
             pending_restart: None,
-            control_generation: 0,
-            control_reply: None,
             stop_action: ServiceStopAction::None,
             rebuild_worker: None,
             rebuild_generation: 0,

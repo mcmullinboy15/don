@@ -420,16 +420,13 @@ impl Runner {
             let _ = reply.send(self.queue_background_service_start(name, ServiceStartMode::Full));
             return;
         }
-        let shutdown_config = self.effective_shutdown_config(name);
         self.set_service_state(name, ServiceState::Stopping);
         self.output_manager
             .service_event(name, "stopping... (auto-restart)");
-        self.send_service_stop(
+        self.send_service_restart(
             name,
-            shutdown_config,
-            false,
-            reply,
-            super::ServiceStopAction::RestartFull,
+            super::service_commands::RestartPlan::full(),
+            Some(reply),
         );
     }
 }

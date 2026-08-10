@@ -125,7 +125,6 @@ impl Drop for TaskRunWaiter {
 pub(crate) enum ServiceStopAction {
     #[default]
     None,
-    RestartFull,
     RestartSpawnOnly,
 }
 
@@ -1425,8 +1424,11 @@ impl Runner {
                                 self.handle_service_ready_report(&name, success, message, had_check)
                                     .await;
                             }
-                            ProcessReport::ServiceStopComplete { name, op_id, result } => {
-                                self.handle_service_stop_complete(&name, op_id, result).await;
+                            ProcessReport::ServiceStopComplete { name, result, reply, restarting } => {
+                                self.handle_service_stop_complete(
+                                    &name, result, reply, restarting,
+                                )
+                                .await;
                             }
                             ProcessReport::TaskRunPrepared {
                                 name,

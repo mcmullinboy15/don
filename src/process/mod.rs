@@ -106,10 +106,23 @@ pub(crate) enum ProcessReport {
         had_check: bool,
     },
     /// A service's supervisor finished executing a stop.
+    ///
+    /// No operation id: a supervisor runs one stop at a time and reports it
+    /// before taking the next command, so the Nth completion is the Nth stop
+    /// by construction.
     ServiceStopComplete {
         name: String,
-        op_id: u64,
         result: Result<(), String>,
+        /// The requester's reply, carried down with the stop and back up
+        /// here. Answered by the fold rather than the supervisor, because
+        /// callers read a stop reply as "the scheduler has applied this" —
+        /// `don stop` returning means the service is no longer a satisfied
+        /// dependency.
+        reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+        /// The supervisor has already begun the start half of a restart; a
+        /// [`ProcessReport::ServiceStarting`] from it follows. The fold
+        /// applies `Stopped` and leaves the start alone.
+        restarting: bool,
     },
     /// A task's supervisor settled a run request.
     TaskRunPrepared {
