@@ -630,7 +630,7 @@ mod tests {
     }
 
     /// Drive `run_health_monitor` against a controllable TCP target and
-    /// verify it emits the right `ServiceHealthChanged` sequence.
+    /// verify it reports the right healthy/unhealthy sequence.
     ///
     /// Strategy: bind a real `TcpListener`, point the monitor at its port
     /// with a tiny interval, then close/rebind to flip health. We assert

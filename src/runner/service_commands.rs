@@ -48,10 +48,9 @@ impl Runner {
 
     /// Queue a start on this service's supervisor.
     ///
-    /// Bumps `start_generation` because the ready check and the dependency
-    /// sweep still key off it, but deciding whether a *prepared* start is
-    /// current is no longer a question the runner asks — the supervisor only
-    /// reports the start it is committed to.
+    /// Whether a *prepared* start is still current is not a question the
+    /// runner asks: a supervisor is the only thing that reports a prepared
+    /// start for its service, and only for the start it is committed to.
     fn spawn_service_start_worker(
         &mut self,
         name: &str,

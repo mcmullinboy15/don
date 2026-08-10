@@ -107,8 +107,8 @@ type TuiTerminal = Terminal<FixedBottomBackend<std::io::Stdout>>;
 ///   catch it — just a TUI to kill mid-raw-mode) and settles for the
 ///   graceful request.
 /// - **Ctrl+D**: remote detaches — exit the TUI, leave the stack running.
-///   In-process there is nothing to detach *to* until the fork model lands,
-///   so it is ignored.
+///   In-process there is nothing to detach *to* — the runner shares this
+///   process — so it is ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiMode {
     /// The TUI shares a process with the runner (`don start` today).

@@ -511,7 +511,7 @@ impl Runner {
                 continue;
             }
             // Lazy bazel services defer their query+build+cquery to
-            // first connection (JIT in the `lazy_start_rx` handler). Pulling
+            // first connection (the JIT build below). Pulling
             // them into the startup batch would query and build services
             // the user may never touch this session.
             if rs.resolved.lazy {

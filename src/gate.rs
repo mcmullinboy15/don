@@ -20,8 +20,15 @@
 //! the process dies instantly, the supervisor reaps — and the gate is still
 //! open, because nothing about this process's own lifecycle closes it. An
 //! idle supervisor would see permission and start again, at zero backoff,
-//! ignoring `on_failure` and the crash-loop guard (both of which live in
-//! `runner/service_health.rs` and are only reached via `ServiceExited`).
+//! ignoring `on_failure` and the crash ceiling.
+//!
+//! Those now live *in* the supervisor
+//! ([`crate::process::health::RestartPolicy`]), beside the loop that would do
+//! the relaunching — so one-shot demand is no longer the only thing standing
+//! between a crash and a tight loop. It is still what expresses the
+//! distinction the policy depends on: **a crash is not a request**. A restart
+//! the policy scheduled arrives as its own mailbox command, which is why it
+//! does not consult demand at all.
 //!
 //! The answer is that permission is necessary but not sufficient: a start
 //! also needs *demand*, which the supervisor owns and which is **one-shot** —

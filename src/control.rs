@@ -13,13 +13,22 @@
 //!
 //! # What still goes through the runner
 //!
-//! The *request* path stops using [`RunnerCommand`]. The *reply* path does
-//! not: three integration tests use a reply as a happens-after marker for a
-//! runner fold — `socket_test` treats a stop reply as "this is no longer a
-//! satisfied dependency", which is only true once the runner has folded
-//! `Stopped`. So a client's oneshot rides down to the supervisor and comes
-//! back up through the report channel, answered after the fold. That is the
-//! shape `ServiceStartIntent::Reply` already proved.
+//! The lifecycle verbs still do, and deliberately. Two things pin them there.
+//! A reply is a happens-after marker for a runner fold — `socket_test` treats
+//! a stop reply as "this is no longer a satisfied dependency", which is only
+//! true once the runner has folded `Stopped` — so the reply must ride the
+//! fold whichever way the request travels. And the pre-checks (`cannot start
+//! while Stopping`, `waiting for dependency 'x'`, `not running`) read
+//! fold-current state, which a projection would race.
+//!
+//! What this module removes is the part that never needed the loop: deciding
+//! whether a name exists at all, and what kind of process it is. A typo
+//! answers 404 without waking the scheduler.
+//!
+//! Execution has left, even though the request has not: a verb reaches the
+//! supervisor as one command, and the client's oneshot rides down with it and
+//! comes back on the report channel. That is the shape
+//! `ServiceStartIntent::Reply` already proved.
 
 use std::collections::{HashMap, HashSet};
 

@@ -222,13 +222,13 @@ src/
   process/
     mod.rs                  # per-process mechanism root; the edge rule: imports nothing from runner/
     registry.rs             # ProcessRegistry — addressed, send-only handles to supervisors
-    service_supervisor.rs   # service lifecycle owner: spawn → ready → reap, stop, restart
+    service_supervisor.rs   # service lifecycle owner: spawn → ready → reap, stop, restart, backoff
     service_process.rs      # service spawn/stop mechanics (process + docker)
     service_worker.rs       # service start preparation (build, ports, env, proxy)
     task_supervisor.rs      # task run owner: prepare → wire → exit, mailbox supersession
     task_process.rs         # task execution: timeout, skip-if-unchanged
     task_worker.rs          # task run preparation (params, hashing, spawn)
-    health.rs               # health monitor loop
+    health.rs               # health monitor loop + RestartPolicy (backoff, crash ceilings)
     ready.rs                # ready-check resolution against live runtime ports
     params.rs               # task param value resolution
     env_refs.rs             # $(service.key) runtime env reference rendering
@@ -293,21 +293,29 @@ Modules communicate via **tokio channels**, not shared mutable state:
 - **`mpsc`** for commands into the runner (CLI/API -> runner). The runner owns an `mpsc::Receiver<RunnerCommand>` and processes commands sequentially. This gives it a clean command loop with no shared mutable state.
 - **`broadcast`** for events out of the runner (runner -> output/API/watch). Service state changes (started, ready, stopped, failed) are broadcast so multiple consumers can observe without coupling.
 - **`oneshot`** for request/reply (e.g., verbose status). The API sends a command with a `oneshot::Sender` for the reply, the runner fills it.
+**Two module edges are enforced by a test, not by convention:** `src/process/`
+must not reference `crate::runner`, and neither must `src/tui/`. Both are load
+bearing — the first is the direction of the whole supervisor design, the second
+is what lets the TUI detach and reattach — and both erode by someone reaching
+for a runner type that already has the fact they want.
+`tests/module_edges_test.rs` fails the build if either does.
+
 - **`watch`** for the projections out of the runner — state (`state_store.rs`), endpoints (`endpoints.rs`) and per-process run permission (`gate.rs`). Readers see the latest value, not every intermediate one.
 
-**No `Arc<Mutex<_>>` for shared state.** The runner owns all service state in a plain `HashMap<String, ServiceState>` and is the only thing that may mutate it. This avoids deadlocks and contention.
+**No `Arc<Mutex<_>>` for shared state.** The runner owns all *scheduling* state in plain `HashMap`s and is the only thing that may mutate it. This avoids deadlocks and contention. Per-process runtime state — the handle, the reader, the OSC sink, the proxy, the restart counters — belongs to that process's supervisor; the runner learns about it from reports and keeps no second copy.
 
-**Reading that state does not go through the command channel.** A status query is the one thing that should never queue behind whatever the runner is currently doing. `state_store.rs` publishes a cheap projection — every process's `ProcessStatus`, plus `startup_complete` — through a `watch`, and splits the handle by type so single-writer is enforced by ownership rather than by discipline:
+**Reading that state does not go through the command channel.** A status query is the one thing that should never queue behind whatever the runner is currently doing. `state_store.rs` publishes a projection — every process's `ProcessStatus`, plus `startup_complete` — through a `watch`, and splits the handle by type so single-writer is enforced by ownership rather than by discipline:
 
 - `StateWriter` is **not** `Clone` and is moved into the runner at construction, so no other component can obtain one.
 - `StateReader` is `Clone` and exposes reads only. The server, the TUI and the web UI hold one.
 
 `Arc<RwLock<State>>` was rejected for exactly this reason: it hands every holder a `.write()`.
 
-Two rules for the projection:
+Three rules for the projection:
 
 - **It carries only what is cheap to recompute on every transition.** Verbose status stays a command — it needs a watch-manager round trip and a per-service ready-check resolution.
 - **Reads return `Arc<StateSnapshot>`, never `watch::Ref`.** A `Ref` holds a read lock for as long as it lives; returning an `Arc` makes "held across an `.await`" unrepresentable rather than merely documented against.
+- **For runtime detail, the snapshot is the record, not a copy of one.** A service's pid, docker-ness and port mappings live *only* in `ProcessStatus::Service.runtime`, written by the custody funnels from the supervisor's wired report. The runner keeps no shadow of them, which is why `publish_processes` **merges** (the fold rebuilds the list from scheduling state and knows nothing about pids) and why the patch methods **publish independently of state transitions** (a wire landing while a service is already `Running` changes no state, and `set_state` would no-op).
 
 The state store and the `RunnerEvent` broadcast update on exactly the same transitions, which is what lets a consumer that missed an event resync from the snapshot and get a consistent answer. The TUI does this on `RecvError::Lagged`.
 
