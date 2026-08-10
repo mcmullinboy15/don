@@ -169,13 +169,17 @@ impl Runner {
     }
 
     pub(in crate::runner) fn spawn_lazy_build(&mut self, name: &str, process: BatchBuildItem) {
-        let generation = match self.services.get_mut(name) {
-            Some(rs) => {
-                rs.lazy_build_token = rs.lazy_build_token.saturating_add(1);
-                rs.lazy_build_token
-            }
-            None => return,
-        };
+        if !self.services.contains_key(name) {
+            return;
+        }
+        // Unique among the *in-flight* builds for this name, which is all the
+        // currency check needs: `lazy_build_handles` holds exactly the live
+        // one, and each spawn sends exactly one completion.
+        let generation = self
+            .lazy_build_handles
+            .get(name)
+            .map_or(0, |(generation, _)| *generation)
+            .saturating_add(1);
         let cmd_tx = self.internal_tx.clone();
         let base_dir = self.base_dir.clone();
         let emitter = self.output_manager.clone_lifecycle_emitter();

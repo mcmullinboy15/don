@@ -409,7 +409,7 @@ impl Runner {
         if self
             .services
             .get(name)
-            .is_some_and(|rs| rs.rebuild_worker.is_some() || rs.control_worker.is_some())
+            .is_some_and(|rs| rs.rebuild_worker.is_some())
         {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
@@ -516,10 +516,7 @@ impl Runner {
         }
 
         let (reply, stop_action) = match self.services.get_mut(name) {
-            Some(rs) => {
-                rs.control_worker = None;
-                (rs.control_reply.take(), std::mem::take(&mut rs.stop_action))
-            }
+            Some(rs) => (rs.control_reply.take(), std::mem::take(&mut rs.stop_action)),
             None => return,
         };
 

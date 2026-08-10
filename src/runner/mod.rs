@@ -2209,11 +2209,19 @@ mod tests {
             service.resolved.lazy = true;
             service.resolved.depends_on = vec![crate::config::Dependency::blocking("setup")];
         }
+        // Stand in for the `spawn_lazy_build` this fold normally answers.
+        runner.lazy_build_handles.insert(
+            "api".to_string(),
+            (
+                1,
+                crate::build_tool::AbortOnDrop::new(tokio::spawn(std::future::pending())),
+            ),
+        );
         runner.set_service_state("api", ServiceState::Building);
 
         runner.handle_lazy_build_complete(
             "api",
-            0,
+            1,
             build_tools::BatchBuildOutcome {
                 resolved_watches: Vec::new(),
                 warnings: Vec::new(),
@@ -2235,8 +2243,16 @@ mod tests {
         let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
         if let Some(service) = runner.services.get_mut("api") {
             service.resolved.lazy = true;
-            service.lazy_build_token = 2;
         }
+        // A newer lazy build (generation 2) is the in-flight one; the
+        // completion below claims to be generation 1.
+        runner.lazy_build_handles.insert(
+            "api".to_string(),
+            (
+                2,
+                crate::build_tool::AbortOnDrop::new(tokio::spawn(std::future::pending())),
+            ),
+        );
         runner.set_service_state("api", ServiceState::Building);
 
         runner.handle_lazy_build_complete(

@@ -110,12 +110,14 @@ impl Runner {
             .lazy_build_handles
             .get(name)
             .is_some_and(|(active_generation, _)| *active_generation == generation);
-        if matching_handle {
-            self.lazy_build_handles.remove(name);
+        if !matching_handle {
+            return;
         }
-        let is_current_build = self.services.get(name).is_some_and(|rs| {
-            rs.lazy_build_token == generation && rs.state() == ServiceState::Building
-        });
+        self.lazy_build_handles.remove(name);
+        let is_current_build = self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.state() == ServiceState::Building);
         if !is_current_build {
             return;
         }

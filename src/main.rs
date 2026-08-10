@@ -2540,11 +2540,6 @@ async fn run_start(
         };
 
     let is_active = |name: &str| active_processes.as_ref().is_none_or(|s| s.contains(name));
-    let has_foreground_tasks = config
-        .tasks
-        .iter()
-        .any(|(name, task)| is_active(name) && task.terminal.is_foreground());
-
     // Collect service names and their log configs for OutputManager.
     let service_configs: Vec<(&str, &don::config::LogConfig)> = config
         .services
@@ -2652,8 +2647,6 @@ async fn run_start(
         Some(port) => Some(start_with_ui(port, &base, profile_ref).await?),
         None => None,
     };
-
-    let _ = has_foreground_tasks; // logged earlier; TUI now handles fg tasks via pause/resume
 
     if is_tty {
         // TUI mode: nothing may write to the real stdout while the TUI owns

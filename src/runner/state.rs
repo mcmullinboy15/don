@@ -46,9 +46,6 @@ pub(crate) struct RuntimeService {
     /// child PID for services spawned by don. Docker services do not expose a
     /// local PID here.
     pub pgid: Option<i32>,
-    /// Output reader task for the current process. It must drain before
-    /// output sinks are torn down or final shutdown logs can be lost.
-    pub output_worker: Option<tokio::task::JoinHandle<()>>,
     /// OSC query sink for reclaiming PTY write on attach.
     pub osc_sink: Option<crate::output::OscSinkHandle>,
     /// Whether the current start was asked for by the dependency sweep —
@@ -86,8 +83,6 @@ pub(crate) struct RuntimeService {
     /// Handle to a scheduled `RestartUnhealthy` command. Aborted on stop,
     /// recovery, or manual restart so we don't fire a stale auto-restart.
     pub pending_restart: Option<tokio::task::JoinHandle<()>>,
-    /// In-flight manual stop/restart worker, if any.
-    pub control_worker: Option<tokio::task::JoinHandle<()>>,
     /// Monotonic generation for manual control workers so stale completions
     /// can be ignored.
     pub control_generation: u64,
@@ -95,11 +90,6 @@ pub(crate) struct RuntimeService {
     pub control_reply: Option<oneshot::Sender<CommandResult>>,
     /// Follow-up action to run after the current stop completes.
     pub stop_action: ServiceStopAction,
-    /// Token for the in-flight lazy JIT build, so a stale build completion
-    /// (superseded by a newer connection-triggered build) is ignored. Only
-    /// the lazy build path uses this — every other completion is ordered by
-    /// construction on the report channel.
-    pub lazy_build_token: u64,
     /// In-flight rebuild-preparation worker (build only) for this service.
     pub rebuild_worker: Option<tokio::task::JoinHandle<()>>,
     /// Monotonic generation for rebuild workers so stale completions can
@@ -130,7 +120,6 @@ impl RuntimeService {
             docker_port_bindings: Vec::new(),
             handle_identity: None,
             pgid: None,
-            output_worker: None,
             osc_sink: None,
             scheduled_start: false,
             proxy_view: None,
@@ -141,11 +130,9 @@ impl RuntimeService {
             last_start: None,
             rapid_crashes: 0,
             pending_restart: None,
-            control_worker: None,
             control_generation: 0,
             control_reply: None,
             stop_action: ServiceStopAction::None,
-            lazy_build_token: 0,
             rebuild_worker: None,
             rebuild_generation: 0,
             rebuild_stale: false,

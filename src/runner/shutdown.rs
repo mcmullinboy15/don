@@ -310,7 +310,6 @@ impl Runner {
                         }
                         self.clear_service_custody(&name);
                         self.set_service_state(&name, ServiceState::Stopped);
-                        self.drain_service_output(&name).await;
                         remaining -= 1;
                         self.output_manager
                             .service_event(&name, &format!("stopped ({remaining} remaining)"));
@@ -392,14 +391,8 @@ impl Runner {
         // All handles should already be stopped by initiate_shutdown.
         // Drop remaining handles, release sockets, clear attach state.
         for rs in self.services.values_mut() {
-            if let Some(worker) = rs.control_worker.take() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
             if let Some(worker) = rs.rebuild_worker.take() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
-            if let Some(worker) = rs.output_worker.take() {
-                Self::await_output_worker(worker).await;
             }
             rs.control_reply = None;
             rs.stop_action = ServiceStopAction::None;
@@ -500,28 +493,5 @@ impl Runner {
             nix::unistd::Pid::from_raw(wired.pgid),
             nix::sys::signal::Signal::SIGKILL,
         );
-    }
-
-    async fn drain_service_output(&mut self, name: &str) {
-        let Some(worker) = self
-            .services
-            .get_mut(name)
-            .and_then(|rs| rs.output_worker.take())
-        else {
-            return;
-        };
-
-        Self::await_output_worker(worker).await;
-    }
-
-    async fn await_output_worker(worker: tokio::task::JoinHandle<()>) {
-        let mut worker = worker;
-        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker).await {
-            Ok(_) => {}
-            Err(_) => {
-                worker.abort();
-                let _ = worker.await;
-            }
-        }
     }
 }

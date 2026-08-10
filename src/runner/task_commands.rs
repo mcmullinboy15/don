@@ -350,23 +350,6 @@ impl Runner {
         start_message: &str,
         wait_reply: Option<(oneshot::Sender<CommandResult>, Option<String>)>,
     ) {
-        if task_cfg.terminal.is_foreground() && self.is_another_foreground_task_running(name) {
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.last_params = params.clone();
-                rt.set_needs_run_now(true);
-            }
-            self.set_task_state(name, TaskState::PendingRun);
-            self.output_manager
-                .service_event(name, "pending — another foreground task owns the terminal");
-            if let Some(reply) = wait_reply {
-                let _ = reply.0.send(Err(CommandError::InvalidState {
-                    name: name.to_string(),
-                    message: "another foreground task owns the terminal".to_string(),
-                }));
-            }
-            return;
-        }
-
         if let Some(rt) = self.tasks.get_mut(name) {
             if let Some(waiter) = rt.run_waiter.take() {
                 waiter.complete(Err(CommandError::Failed {
@@ -474,14 +457,6 @@ impl Runner {
                 timeout: timeout.to_string(),
             }));
         }
-    }
-
-    fn is_another_foreground_task_running(&self, name: &str) -> bool {
-        self.tasks.iter().any(|(task_name, rt)| {
-            task_name != name
-                && rt.config.terminal.is_foreground()
-                && rt.state() == TaskState::Running
-        })
     }
 
     /// Run all tasks currently in PendingRun state.
