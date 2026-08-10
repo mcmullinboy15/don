@@ -628,7 +628,7 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
             last_run,
             failed_dependencies,
         } => app.apply_task_state(name, state, last_run, failed_dependencies),
-        RunnerEvent::UpdateCheckComplete {
+        RunnerEvent::UpdateCheck {
             current_version,
             latest_version,
         } => {

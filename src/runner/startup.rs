@@ -3,7 +3,7 @@ use super::build_tools::{
 };
 use super::graph::{dep_name_map, topological_sort};
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::{ProcessKind, Runner, RunnerInternalCommand, RuntimeService, ServiceState, TaskState};
+use super::{ProcessKind, Runner, RuntimeService, ServiceState, TaskState, WorkerDone};
 use crate::config::Dependency;
 use std::collections::HashMap;
 
@@ -161,9 +161,7 @@ impl Runner {
                 global_watch_ignore,
             )
             .await;
-            let _ = cmd_tx
-                .send(RunnerInternalCommand::BatchBuildComplete(outcome))
-                .await;
+            let _ = cmd_tx.send(WorkerDone::BatchBuild(outcome)).await;
         });
         self.batch_build_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
     }
@@ -204,7 +202,7 @@ impl Runner {
             )
             .await;
             let _ = cmd_tx
-                .send(RunnerInternalCommand::LazyBuildComplete {
+                .send(WorkerDone::LazyBuild {
                     name: svc_name,
                     generation,
                     outcome,

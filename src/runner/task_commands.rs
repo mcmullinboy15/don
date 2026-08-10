@@ -1,8 +1,7 @@
 use super::task_supervisor;
 use super::task_worker::TaskRunMode;
 use super::{
-    CommandError, CommandResult, Runner, RunnerEvent, RunnerInternalCommand, TaskRunIntent,
-    TaskRunWaiter, TaskState, resolve_task_params,
+    CommandError, CommandResult, Runner, RunnerEvent, TaskRunIntent, TaskState, resolve_task_params,
 };
 use crate::config::TaskAutoRun;
 use crate::duration::parse_duration;
@@ -25,6 +24,7 @@ impl Runner {
         params: HashMap<String, String>,
         mode: TaskRunMode,
         intent: TaskRunIntent,
+        wait: Option<task_supervisor::RunWait>,
     ) -> Result<(), CommandError> {
         // The registry is built from the task map, so a hit here is proof the
         // task exists — no separate existence check needed.
@@ -39,6 +39,7 @@ impl Runner {
             params,
             mode,
             intent,
+            wait,
         });
         if !queued {
             return Err(CommandError::Failed {
@@ -165,14 +166,6 @@ impl Runner {
             // not an outcome anyone is waiting on. Only a failure is.
             TaskRunIntent::Background => {
                 if !outcome.success {
-                    if let Some(rt) = self.tasks.get_mut(name)
-                        && let Some(waiter) = rt.run_waiter.take()
-                    {
-                        waiter.complete(Err(CommandError::Failed {
-                            name: name.to_string(),
-                            message: outcome.message.clone(),
-                        }));
-                    }
                     let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
                         name: name.to_string(),
                         success: false,
@@ -352,12 +345,6 @@ impl Runner {
         wait_reply: Option<(oneshot::Sender<CommandResult>, Option<String>)>,
     ) {
         if let Some(rt) = self.tasks.get_mut(name) {
-            if let Some(waiter) = rt.run_waiter.take() {
-                waiter.complete(Err(CommandError::Failed {
-                    name: name.to_string(),
-                    message: "task run was superseded".to_string(),
-                }));
-            }
             rt.last_params = params.clone();
             rt.set_needs_run_now(true);
         }
@@ -372,24 +359,32 @@ impl Runner {
 
         self.output_manager
             .service_debug_event(name, "spawning process...");
+        let wait = wait_reply.map(|(reply, timeout)| task_supervisor::RunWait {
+            reply,
+            // An unparseable spelling waits indefinitely, as it did when the
+            // old timeout task simply failed to spawn.
+            timeout: timeout.and_then(|spelling| {
+                parse_duration(&spelling)
+                    .ok()
+                    .map(|duration| (duration, spelling))
+            }),
+        });
+        let mut carried = Some(wait);
         match self.spawn_task_worker(
             name,
             task_cfg.clone(),
             params.clone(),
             TaskRunMode::Triggered,
             TaskRunIntent::Background,
+            carried.take().flatten(),
         ) {
-            Ok(()) => {
-                if let Some((reply, timeout)) = wait_reply {
-                    self.register_task_run_waiter(name, reply, timeout);
-                }
-            }
+            Ok(()) => {}
             Err(e) => {
                 self.set_task_state(name, TaskState::Failed);
                 self.output_manager
                     .service_error_event(name, &format!("failed to start: {e}"));
-                if let Some((reply, _)) = wait_reply {
-                    let _ = reply.send(Err(CommandError::Failed {
+                if let Some(wait) = carried.take().flatten() {
+                    let _ = wait.reply.send(Err(CommandError::Failed {
                         name: name.to_string(),
                         message: format!("failed to start: {e}"),
                     }));
@@ -399,64 +394,6 @@ impl Runner {
                     success: false,
                 });
             }
-        }
-    }
-
-    fn register_task_run_waiter(
-        &mut self,
-        name: &str,
-        reply: oneshot::Sender<CommandResult>,
-        timeout: Option<String>,
-    ) {
-        let token = match self.tasks.get_mut(name) {
-            Some(rt) => {
-                rt.waiter_token = rt.waiter_token.saturating_add(1);
-                rt.waiter_token
-            }
-            None => return,
-        };
-        let timeout_task = timeout.as_ref().and_then(|timeout| {
-            let duration = parse_duration(timeout).ok()?;
-            let cmd_tx = self.internal_tx.clone();
-            let name = name.to_string();
-            let timeout = timeout.clone();
-            Some(tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
-                let _ = cmd_tx
-                    .send(RunnerInternalCommand::TaskRunWaitTimedOut {
-                        name,
-                        token,
-                        timeout,
-                    })
-                    .await;
-            }))
-        });
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.run_waiter = Some(TaskRunWaiter::new(token, reply, timeout_task));
-        }
-    }
-
-    pub(in crate::runner) fn handle_task_run_wait_timeout(
-        &mut self,
-        name: &str,
-        token: u64,
-        timeout: &str,
-    ) {
-        let Some(rt) = self.tasks.get_mut(name) else {
-            return;
-        };
-        let is_matching_waiter = rt
-            .run_waiter
-            .as_ref()
-            .is_some_and(|waiter| waiter.token() == token);
-        if !is_matching_waiter {
-            return;
-        }
-        if let Some(waiter) = rt.run_waiter.take() {
-            waiter.complete(Err(CommandError::TimedOut {
-                name: name.to_string(),
-                timeout: timeout.to_string(),
-            }));
         }
     }
 

@@ -24,6 +24,21 @@ pub(crate) struct RunRequest {
     pub(crate) params: std::collections::HashMap<String, String>,
     pub(crate) mode: super::task_worker::TaskRunMode,
     pub(crate) intent: super::TaskRunIntent,
+    /// Someone waiting for this run to finish (`don run --wait`).
+    pub(crate) wait: Option<RunWait>,
+}
+
+/// A caller blocked on a run's outcome.
+///
+/// The supervisor holds this for the run it belongs to, which is what makes
+/// the old `waiter_token` unnecessary: it ran one run at a time and the
+/// timeout was a detached task reporting through a shared channel, so the
+/// runner needed an identity to match answers to askers. One actor holding
+/// both the timer and the run needs no such thing.
+pub(crate) struct RunWait {
+    pub(crate) reply: tokio::sync::oneshot::Sender<crate::command::CommandResult>,
+    /// Parsed `--wait` deadline; `None` waits indefinitely.
+    pub(crate) timeout: Option<(std::time::Duration, String)>,
 }
 
 /// Owner half for tasks. See [`Supervisors`].
@@ -60,6 +75,7 @@ pub(crate) fn spawn_supervisors<'a>(
     config: &dyn Fn(&str) -> Option<StartupConfig>,
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     gates: &mut std::collections::HashMap<String, crate::gate::GateReader>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> TaskSupervisors {
     TaskSupervisors::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
@@ -74,6 +90,7 @@ pub(crate) fn spawn_supervisors<'a>(
             busy,
             startup,
             gate,
+            shutdown_rx.clone(),
         )
     })
 }
@@ -105,6 +122,7 @@ async fn supervise(
     busy: Arc<AtomicBool>,
     startup: Option<StartupConfig>,
     mut gate: Option<crate::gate::GateReader>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<RunRequest> = None;
@@ -115,6 +133,8 @@ async fn supervise(
     // See `crate::gate`: a level decided before this demand arose cannot have
     // accounted for it.
     let demand_rev: u64 = 0;
+    // Whoever is blocked on the run in hand, if anyone.
+    let mut waiter: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>> = None;
 
     loop {
         let request = match pending.take() {
@@ -139,6 +159,7 @@ async fn supervise(
                         // here, and only a fresh demand re-arms it.
                         demand = super::Demand::None;
                         RunRequest {
+                            wait: None,
                             task_cfg: startup.task_cfg.clone(),
                             params: std::collections::HashMap::new(),
                             mode: super::task_worker::TaskRunMode::Startup {
@@ -182,6 +203,7 @@ async fn supervise(
             params,
             mode,
             intent,
+            wait: request_wait,
         } = request;
 
         let task_cfg_for_worker = task_cfg.clone();
@@ -302,14 +324,55 @@ async fn supervise(
         let Some((mut handle, reader, osc)) = run else {
             continue;
         };
+        // This run supersedes whatever the last one's waiter was told to
+        // expect. Answering here rather than leaving it to a fold is what
+        // lets the token go: only one run is ever in hand.
+        if let Some(previous) = waiter.take() {
+            let _ = previous.send(Err(crate::command::CommandError::Failed {
+                name: name.clone(),
+                message: "task run was superseded".to_string(),
+            }));
+        }
+        let mut wait_deadline = None;
+        if let Some(run_wait) = request_wait {
+            waiter = Some(run_wait.reply);
+            wait_deadline = run_wait.timeout;
+        }
         let Some(outcome) = outcome else { continue };
         let timeout = task_cfg.timeout.clone();
         let start = std::time::Instant::now();
         let wait = super::task::wait_for_task(&mut handle, timeout.as_deref());
         tokio::pin!(wait);
+        let deadline = wait_deadline
+            .as_ref()
+            .map(|(duration, _)| tokio::time::Instant::now() + *duration);
         let result = loop {
             tokio::select! {
                 result = &mut wait => break result,
+                // The `--wait` deadline. The run itself continues: a caller
+                // giving up waiting is not a reason to kill their task.
+                () = wait_until(&deadline), if waiter.is_some() && deadline.is_some() => {
+                    if let (Some(reply), Some((_, spelling))) =
+                        (waiter.take(), wait_deadline.as_ref())
+                    {
+                        let _ = reply.send(Err(crate::command::CommandError::TimedOut {
+                            name: name.clone(),
+                            timeout: spelling.clone(),
+                        }));
+                    }
+                }
+                // Teardown: answer the caller now, while there is still a
+                // channel to answer on.
+                _ = shutdown_rx.changed(), if waiter.is_some() => {
+                    if *shutdown_rx.borrow()
+                        && let Some(reply) = waiter.take()
+                    {
+                        let _ = reply.send(Err(crate::command::CommandError::Failed {
+                            name: name.clone(),
+                            message: "run cancelled by shutdown".to_string(),
+                        }));
+                    }
+                }
                 next = rx.recv(), if !mailbox_closed => match next {
                     Some(next) => pending = Some(next),
                     None => mailbox_closed = true,
@@ -328,7 +391,15 @@ async fn supervise(
         if let Some(output) = output.as_ref() {
             output.clear_attach().await;
         }
-        outcome.finish(result, start.elapsed()).await;
+        outcome.finish(result, start.elapsed(), waiter.take()).await;
+    }
+}
+
+/// Sleep until a `--wait` deadline, parking forever when there is none.
+async fn wait_until(deadline: &Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(*deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -525,6 +596,7 @@ impl TaskRunOutcome {
         self,
         result: Result<std::process::ExitStatus, super::task::TaskError>,
         elapsed: Duration,
+        reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
     ) {
         let (success, exit_code, message) = match result {
             Ok(status) if status.success() => (true, status.code(), None),
@@ -569,6 +641,7 @@ impl TaskRunOutcome {
                 elapsed: Some(elapsed),
                 last_run: Some(last_run),
                 rerun: self.rerun,
+                reply,
             }));
     }
 }
@@ -694,6 +767,8 @@ mod tests {
         let names = ["build".to_string(), "migrate".to_string()];
         let (report_tx, _report_rx) = mpsc::unbounded_channel();
         let mut gates = std::collections::HashMap::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(shutdown_tx);
         let mut supervisors = spawn_supervisors(
             names.iter(),
             &ctx,
@@ -701,6 +776,7 @@ mod tests {
             &|_| None,
             &report_tx,
             &mut gates,
+            &shutdown_rx,
         );
         let registry = supervisors.registry().clone();
 
@@ -724,6 +800,7 @@ mod tests {
         let handle = registry.get("build").unwrap().clone();
         assert!(
             !handle.request(RunRequest {
+                wait: None,
                 task_cfg: Box::new(test_task()),
                 params: std::collections::HashMap::new(),
                 mode: super::super::task_worker::TaskRunMode::Triggered,
@@ -797,7 +874,7 @@ mod tests {
             let (report_tx, mut report_rx) = mpsc::unbounded_channel();
 
             outcome("build", temp.path(), report_tx, case.rerun)
-                .finish(Ok(case.status), Duration::from_millis(5))
+                .finish(Ok(case.status), Duration::from_millis(5), None)
                 .await;
 
             let Ok(super::super::ProcessReport::TaskExited(exit)) = report_rx.try_recv() else {
@@ -827,7 +904,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let (report_tx, _report_rx) = mpsc::unbounded_channel();
             outcome("build", temp.path(), report_tx, false)
-                .finish(Ok(status), Duration::from_millis(1))
+                .finish(Ok(status), Duration::from_millis(1), None)
                 .await;
 
             let state = TaskStateStore::new(temp.path().join(".don").join("task-state"));

@@ -61,15 +61,6 @@ impl Runner {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
 
-        for (name, rt) in &mut self.tasks {
-            if let Some(waiter) = rt.run_waiter.take() {
-                waiter.complete(Err(super::CommandError::Failed {
-                    name: name.clone(),
-                    message: "run cancelled by shutdown".to_string(),
-                }));
-            }
-        }
-
         // Stop every task's run supervisor, cancelling anything it is
         // preparing. Draining the map drops the senders too, so nothing can
         // queue a run after this point. Abort them all before awaiting any,

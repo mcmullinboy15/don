@@ -14,7 +14,7 @@
 //! [`Runner::set_task_state`]: super::Runner::set_task_state
 //! [`RunnerEvent`]: super::RunnerEvent
 
-use super::{ServiceState, TaskRunWaiter, TaskState};
+use super::{ServiceState, TaskState};
 use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 
@@ -121,14 +121,6 @@ pub(crate) struct RuntimeTask {
     pub pgid: Option<i32>,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
-    /// Monotonic token for `don run --wait` waiters, bumped per waiter
-    /// registration so a superseded waiter's timeout cannot answer its
-    /// replacement. Exit completions need no token: a present waiter always
-    /// belongs to the in-flight run (concurrent runs are rejected, and
-    /// supersession replaces the waiter explicitly).
-    pub waiter_token: u64,
-    /// Pending reply for a manually-triggered `don run --wait` request.
-    pub run_waiter: Option<TaskRunWaiter>,
     /// Whether the task has ever completed successfully.
     pub has_success: bool,
     /// Metadata for the most recent process run, including failures.
@@ -155,8 +147,6 @@ impl RuntimeTask {
             last_params: HashMap::new(),
             pgid: None,
             resolved_watch_paths: Vec::new(),
-            waiter_token: 0,
-            run_waiter: None,
             has_success,
             last_run,
             dependency_evaluated: false,

@@ -75,50 +75,6 @@ use crate::signals::shutdown_requested;
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-
-pub(crate) struct TaskRunWaiter {
-    /// Identifies which registration this waiter is — so a timeout fired
-    /// for a superseded waiter cannot answer its replacement.
-    token: u64,
-    reply: Option<oneshot::Sender<CommandResult>>,
-    timeout_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl TaskRunWaiter {
-    pub(crate) fn new(
-        token: u64,
-        reply: oneshot::Sender<CommandResult>,
-        timeout_task: Option<tokio::task::JoinHandle<()>>,
-    ) -> Self {
-        Self {
-            token,
-            reply: Some(reply),
-            timeout_task,
-        }
-    }
-
-    pub(crate) fn token(&self) -> u64 {
-        self.token
-    }
-
-    pub(crate) fn complete(mut self, result: CommandResult) {
-        if let Some(timeout_task) = self.timeout_task.take() {
-            timeout_task.abort();
-        }
-        if let Some(reply) = self.reply.take() {
-            let _ = reply.send(result);
-        }
-    }
-}
-
-impl Drop for TaskRunWaiter {
-    fn drop(&mut self) {
-        if let Some(timeout_task) = self.timeout_task.take() {
-            timeout_task.abort();
-        }
-    }
-}
-
 /// Whether a service's proxy is closing connections rather than queuing them.
 ///
 /// A service that failed *and* has no process left has nothing to queue for —
@@ -206,24 +162,18 @@ pub enum RunnerCommand {
     Shutdown,
 }
 
-enum RunnerInternalCommand {
-    /// A manually-triggered task wait exceeded its requested wait deadline.
-    TaskRunWaitTimedOut {
-        name: String,
-        token: u64,
-        timeout: String,
-    },
+enum WorkerDone {
     /// Result of the startup-phase batch build.
-    BatchBuildComplete(BatchBuildOutcome),
+    BatchBuild(BatchBuildOutcome),
     /// Result of a just-in-time build for a single lazy service.
-    LazyBuildComplete {
+    LazyBuild {
         name: String,
         generation: u64,
         outcome: BatchBuildOutcome,
     },
     /// Completion from a detached rebuild worker for a single service.
     /// Result of the periodic crates.io update check.
-    UpdateCheckComplete(Option<crate::update::UpdateAvailable>),
+    UpdateCheck(Option<crate::update::UpdateAvailable>),
 }
 
 /// An event broadcast from the runner for external consumers.
@@ -265,7 +215,7 @@ pub enum RunnerEvent {
     /// Shutdown complete.
     ShutdownComplete,
     /// The latest crates.io version changed, or no newer version is available.
-    UpdateCheckComplete {
+    UpdateCheck {
         current_version: String,
         latest_version: Option<String>,
     },
@@ -317,8 +267,8 @@ pub struct Runner {
     // Channels
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     cmd_rx: mpsc::UnboundedReceiver<RunnerCommand>,
-    internal_tx: mpsc::Sender<RunnerInternalCommand>,
-    internal_rx: mpsc::Receiver<RunnerInternalCommand>,
+    internal_tx: mpsc::Sender<WorkerDone>,
+    internal_rx: mpsc::Receiver<WorkerDone>,
     event_tx: broadcast::Sender<RunnerEvent>,
 
     /// The write half of the globally-readable state projection.
@@ -344,7 +294,7 @@ pub struct Runner {
     shutdown_rx: Option<mpsc::Receiver<()>>,
 
     /// Detached batch-build task spawned at startup for services/tasks with
-    /// a bazel config. `Some` until [`RunnerInternalCommand::BatchBuildComplete`]
+    /// a bazel config. `Some` until [`WorkerDone::BatchBuild`]
     /// arrives and the handle is consumed. Wrapped in [`AbortOnDrop`] so
     /// shutting the runner down — or dropping the field before completion —
     /// aborts the task, dropping the in-flight `Child` (with `kill_on_drop`)
@@ -353,7 +303,7 @@ pub struct Runner {
 
     /// Detached JIT build tasks spawned when a lazy service's proxy gets
     /// its first connection. Keyed by service name. Entries are inserted
-    /// on spawn and removed when [`RunnerInternalCommand::LazyBuildComplete`]
+    /// on spawn and removed when [`WorkerDone::LazyBuild`]
     /// arrives. Wrapped in [`AbortOnDrop`] for the same reason as
     /// [`Self::batch_build_handle`]: on shutdown we abort any in-flight
     /// JIT builds so bazel output stops streaming before
@@ -626,6 +576,7 @@ impl Runner {
             },
             &report_tx,
             &mut gate_readers,
+            &shutdown_flag_tx.subscribe(),
         );
 
         let (manifest_writer_tx, manifest_writer_handle) = runtime_ports::spawn_manifest_writer(
@@ -994,7 +945,7 @@ impl Runner {
                     result = check => {
                         if let Ok(update) = result
                             && internal_tx
-                                .send(RunnerInternalCommand::UpdateCheckComplete(update))
+                                .send(WorkerDone::UpdateCheck(update))
                                 .await
                                 .is_err()
                         {
@@ -1025,7 +976,7 @@ impl Runner {
         let current_version = update
             .map(|u| u.current_version)
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-        let _ = self.event_tx.send(RunnerEvent::UpdateCheckComplete {
+        let _ = self.event_tx.send(RunnerEvent::UpdateCheck {
             current_version,
             latest_version,
         });
@@ -1196,7 +1147,7 @@ impl Runner {
         // keeps processing the main command loop — shutdown signals,
         // connection-triggered lazy starts, and non-build-tool services all
         // stay responsive while bazel crunches. On completion the task posts
-        // `RunnerInternalCommand::BatchBuildComplete`, which transitions `Building`
+        // `WorkerDone::BatchBuild`, which transitions `Building`
         // processes to `Pending`/`Failed` and triggers the ready-process sweep.
         //
         // The handle is stored as `AbortOnDrop` on `self` so `Shutdown` drops
@@ -1336,13 +1287,7 @@ impl Runner {
                     }
                     Some(cmd) = self.internal_rx.recv() => {
                         match cmd {
-                            RunnerInternalCommand::TaskRunWaitTimedOut {
-                                name,
-                                token,
-                                timeout,
-                            } => {
-                                self.handle_task_run_wait_timeout(&name, token, &timeout);
-                            }                            RunnerInternalCommand::BatchBuildComplete(outcome) => {
+                            WorkerDone::BatchBuild(outcome) => {
                                 // Drop the abort-on-drop handle: the task is done,
                                 // and leaving the handle live would abort after the
                                 // task has already returned (harmless but noisy).
@@ -1351,14 +1296,14 @@ impl Runner {
                                 self.apply_batch_build_outcome(outcome);
                                 self.schedule_startup_batch_replays(&replay_items);
                             }
-                            RunnerInternalCommand::LazyBuildComplete {
+                            WorkerDone::LazyBuild {
                                 name,
                                 generation,
                                 outcome,
                             } => {
                                 self.handle_lazy_build_complete(&name, generation, outcome);
                             }
-                            RunnerInternalCommand::UpdateCheckComplete(update) => {
+                            WorkerDone::UpdateCheck(update) => {
                                 self.broadcast_update_check(update);
                             }
                         }

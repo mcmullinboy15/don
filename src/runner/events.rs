@@ -11,6 +11,7 @@ impl Runner {
             elapsed,
             last_run,
             rerun,
+            reply,
         } = exit;
         let name = name.as_str();
         if self.tasks.get(name).is_none_or(|rt| rt.pgid != Some(pgid)) {
@@ -65,13 +66,11 @@ impl Runner {
                 success,
             });
         }
-        // A present waiter always belongs to this run: concurrent runs are
-        // rejected at request time, and a superseding run replaces the
-        // waiter explicitly before it spawns.
-        if let Some(rt) = self.tasks.get_mut(name)
-            && let Some(waiter) = rt.run_waiter.take()
-        {
-            waiter.complete(wait_result);
+        // The reply rode down with the run and back up on its exit report, so
+        // answering it here means what every other command reply means: the
+        // scheduler has applied this.
+        if let Some(reply) = reply {
+            let _ = reply.send(wait_result);
         }
     }
 }

@@ -67,7 +67,7 @@ pub(crate) struct BatchBuildItem {
 }
 
 /// Everything the detached batch-build task produces. Applied to runner
-/// state in the main loop when [`super::RunnerInternalCommand::BatchBuildComplete`]
+/// state in the main loop when [`super::WorkerDone::BatchBuild`]
 /// arrives — keeps all `&mut self` mutations on the runner task.
 pub(crate) struct BatchBuildOutcome {
     /// Per-item resolved watch paths — applied to `resolved_watch_paths` on

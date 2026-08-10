@@ -43,7 +43,6 @@ pub(crate) enum TaskRunIntent {
     Background,
 }
 
-#[derive(Debug)]
 pub(crate) struct TaskExit {
     pub(crate) name: String,
     pub(crate) pgid: i32,
@@ -52,6 +51,9 @@ pub(crate) struct TaskExit {
     pub(crate) elapsed: Option<std::time::Duration>,
     pub(crate) last_run: Option<crate::task_state::TaskRunInfo>,
     pub(crate) rerun: bool,
+    /// A `don run --wait` caller, answered by the fold so the reply means
+    /// "the scheduler has applied this" like every other command reply.
+    pub(crate) reply: Option<oneshot::Sender<crate::command::CommandResult>>,
 }
 
 /// Runner-private messages emitted by detached workers.
