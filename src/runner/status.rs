@@ -27,6 +27,9 @@ impl Runner {
                 name: name.clone(),
                 state: rs.state(),
                 failed_dependencies: rs.failed_dependencies().to_vec(),
+                // Absent so the merge in `publish_processes` carries forward
+                // what custody reported; the fold does not know pids.
+                runtime: None,
                 verbose: None,
             });
         }
@@ -39,6 +42,7 @@ impl Runner {
                 state: rt.state(),
                 failed_dependencies: rt.failed_dependencies().to_vec(),
                 last_run: rt.last_run.clone(),
+                pid: None,
                 verbose: None,
             });
         }
@@ -169,22 +173,11 @@ impl Runner {
                             entries
                         },
                     ),
-                    docker_ports: match rs.handle_identity {
-                        Some(super::ServiceHandleIdentity::Docker) => rs
-                            .docker_port_bindings
-                            .iter()
-                            .map(|binding| {
-                                format!(
-                                    "{} → {} ({}/{})",
-                                    binding.configured,
-                                    binding.connect_addr(),
-                                    binding.container_port,
-                                    binding.protocol
-                                )
-                            })
-                            .collect(),
-                        _ => Vec::new(),
-                    },
+                    docker_ports: self
+                        .service_runtime(name)
+                        .filter(|runtime| runtime.docker)
+                        .map(|runtime| runtime.docker_ports)
+                        .unwrap_or_default(),
                     proxy_active_connections: rs
                         .proxy_view
                         .as_ref()
@@ -205,6 +198,7 @@ impl Runner {
                 name: name.clone(),
                 state: rs.state(),
                 failed_dependencies: rs.failed_dependencies().to_vec(),
+                runtime: self.service_runtime(name),
                 verbose: verbose_info,
             });
         }
@@ -288,6 +282,7 @@ impl Runner {
                 state: rt.state(),
                 failed_dependencies: rt.failed_dependencies().to_vec(),
                 last_run: rt.last_run.clone(),
+                pid: self.task_pid(name),
                 verbose: verbose_info,
             });
         }

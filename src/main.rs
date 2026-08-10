@@ -1879,6 +1879,7 @@ fn print_status_table(processes: &[ProcessStatus], verbose: bool, show_watch_pat
                 state,
                 failed_dependencies,
                 verbose,
+                ..
             } => (
                 "service",
                 name.as_str(),
@@ -1895,6 +1896,7 @@ fn print_status_table(processes: &[ProcessStatus], verbose: bool, show_watch_pat
                 failed_dependencies,
                 last_run,
                 verbose,
+                ..
             } => (
                 "task",
                 name.as_str(),
@@ -3074,6 +3076,7 @@ mod tests {
 
     fn service(name: &str, state: ServiceState) -> ProcessStatus {
         ProcessStatus::Service {
+            runtime: None,
             name: name.to_string(),
             state,
             failed_dependencies: Vec::new(),
@@ -3083,6 +3086,7 @@ mod tests {
 
     fn task(name: &str, state: TaskState) -> ProcessStatus {
         ProcessStatus::Task {
+            pid: None,
             name: name.to_string(),
             state,
             failed_dependencies: Vec::new(),

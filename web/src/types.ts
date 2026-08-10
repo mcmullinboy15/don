@@ -73,6 +73,16 @@ export interface TaskRunInfo {
   message?: string;
 }
 
+/** What a service's supervisor currently holds (`state_store::ServiceRuntime`).
+ * Absent means it holds nothing — that is the liveness answer. `pid` is absent
+ * for docker services, which have no local process, so a missing pid alone
+ * does not mean "not running". */
+export interface ServiceRuntime {
+  pid?: number;
+  docker?: boolean;
+  docker_ports?: string[];
+}
+
 /** One row of `GET /status` (`runner::ProcessStatus`). */
 export type Process =
   | {
@@ -80,6 +90,7 @@ export type Process =
       name: string;
       state: ServiceState;
       failed_dependencies?: string[];
+      runtime?: ServiceRuntime;
       verbose?: VerboseInfo;
     }
   | {
@@ -87,6 +98,7 @@ export type Process =
       name: string;
       state: TaskStateStore;
       failed_dependencies?: string[];
+      pid?: number;
       last_run?: TaskRunInfo;
       verbose?: VerboseInfo;
     };

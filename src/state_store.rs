@@ -34,6 +34,7 @@
 //! documenting against it.
 
 use crate::process::{ServiceState, TaskState};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -47,6 +48,10 @@ pub enum ProcessStatus {
         /// Root service/task failures blocking this process.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         failed_dependencies: Vec<String>,
+        /// What the supervisor currently holds, if anything. `Some` is the
+        /// liveness answer; the scheduler keeps no separate copy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<ServiceRuntime>,
         #[serde(skip_serializing_if = "Option::is_none")]
         verbose: Option<VerboseInfo>,
     },
@@ -56,11 +61,33 @@ pub enum ProcessStatus {
         /// Root service/task failures blocking this process.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         failed_dependencies: Vec<String>,
+        /// Process group id of the running task, if one is running.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         last_run: Option<crate::task_state::TaskRunInfo>,
         #[serde(skip_serializing_if = "Option::is_none")]
         verbose: Option<VerboseInfo>,
     },
+}
+
+/// What a service's supervisor holds right now.
+///
+/// Published by the fold straight from the wired report, so it is the one
+/// record of custody rather than a copy of one. Absent means the supervisor
+/// holds nothing — which is the liveness check every caller wants.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceRuntime {
+    /// Process group id. `None` for docker services, which have no local
+    /// process — so this being absent does not mean "not running".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// Whether custody is of a container rather than a local process.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub docker: bool,
+    /// Preformatted docker port lines, as `don status -v` shows them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docker_ports: Vec<String>,
 }
 
 /// One task param, as a client needs to see it to build a run form.
@@ -218,15 +245,137 @@ pub(crate) struct StateWriter {
 }
 
 impl StateWriter {
-    /// Replace the published process list, preserving `startup_complete`.
+    /// Replace the published process list, preserving `startup_complete` and
+    /// each process's runtime detail.
+    ///
+    /// The fold rebuilds this list from scheduling state, which does not know
+    /// about pids or port bindings — those arrive on their own reports and are
+    /// patched in by [`Self::set_service_runtime`] / [`Self::set_task_pid`].
+    /// Merging rather than overwriting is what lets the snapshot *be* the
+    /// store instead of a copy of one.
     pub(crate) fn publish_processes(&self, processes: Vec<ProcessStatus>) {
         // Read and drop the borrow before sending: holding a `Ref` across
         // `send_replace` would deadlock against its own write lock.
-        let startup_complete = self.tx.borrow().startup_complete;
+        let current = self.tx.borrow();
+        let startup_complete = current.startup_complete;
+        let mut carried_runtime: HashMap<&str, &Option<ServiceRuntime>> = HashMap::new();
+        let mut carried_pid: HashMap<&str, Option<i32>> = HashMap::new();
+        for status in &current.processes {
+            match status {
+                ProcessStatus::Service { name, runtime, .. } => {
+                    carried_runtime.insert(name.as_str(), runtime);
+                }
+                ProcessStatus::Task { name, pid, .. } => {
+                    carried_pid.insert(name.as_str(), *pid);
+                }
+            }
+        }
+        let processes: Vec<ProcessStatus> = processes
+            .into_iter()
+            .map(|status| match status {
+                ProcessStatus::Service {
+                    name,
+                    state,
+                    failed_dependencies,
+                    runtime,
+                    verbose,
+                } => {
+                    let runtime = runtime.or_else(|| {
+                        carried_runtime
+                            .get(name.as_str())
+                            .and_then(|held| (*held).clone())
+                    });
+                    ProcessStatus::Service {
+                        name,
+                        state,
+                        failed_dependencies,
+                        runtime,
+                        verbose,
+                    }
+                }
+                ProcessStatus::Task {
+                    name,
+                    state,
+                    failed_dependencies,
+                    pid,
+                    last_run,
+                    verbose,
+                } => {
+                    let pid = pid.or_else(|| carried_pid.get(name.as_str()).copied().flatten());
+                    ProcessStatus::Task {
+                        name,
+                        state,
+                        failed_dependencies,
+                        pid,
+                        last_run,
+                        verbose,
+                    }
+                }
+            })
+            .collect();
+        drop(current);
         self.tx.send_replace(Arc::new(StateSnapshot {
             processes,
             startup_complete,
         }));
+    }
+
+    /// Record (or clear) what a service's supervisor holds.
+    ///
+    /// Published independently of any state transition, because custody
+    /// changes on its own schedule: a wire that lands while the service is
+    /// already `Running` changes no state, and `set_state` would no-op.
+    pub(crate) fn set_service_runtime(&self, name: &str, runtime: Option<ServiceRuntime>) {
+        self.patch(|status| match status {
+            ProcessStatus::Service {
+                name: process_name,
+                runtime: held,
+                ..
+            } if process_name == name => {
+                *held = runtime.clone();
+                true
+            }
+            _ => false,
+        });
+    }
+
+    /// Record (or clear) a running task's process group id.
+    pub(crate) fn set_task_pid(&self, name: &str, pid: Option<i32>) {
+        self.patch(|status| match status {
+            ProcessStatus::Task {
+                name: process_name,
+                pid: held,
+                ..
+            } if process_name == name => {
+                *held = pid;
+                true
+            }
+            _ => false,
+        });
+    }
+
+    /// Apply `edit` to each entry, republishing only if something changed.
+    fn patch(&self, mut edit: impl FnMut(&mut ProcessStatus) -> bool) {
+        let current = self.tx.borrow();
+        let startup_complete = current.startup_complete;
+        let mut processes = current.processes.clone();
+        drop(current);
+        let mut touched = false;
+        for status in &mut processes {
+            touched |= edit(status);
+        }
+        if !touched {
+            return;
+        }
+        self.tx.send_replace(Arc::new(StateSnapshot {
+            processes,
+            startup_complete,
+        }));
+    }
+
+    /// The snapshot as currently published — the fold's own read.
+    pub(crate) fn current(&self) -> Arc<StateSnapshot> {
+        self.tx.borrow().clone()
     }
 
     /// Mark the initial startup sweep as finished (or not), preserving processes.
@@ -308,11 +457,112 @@ mod tests {
 
     fn service(name: &str, state: ServiceState) -> ProcessStatus {
         ProcessStatus::Service {
+            runtime: None,
             name: name.to_string(),
             state,
             failed_dependencies: Vec::new(),
             verbose: None,
         }
+    }
+
+    fn runtime_of(snapshot: &StateSnapshot, want: &str) -> Option<ServiceRuntime> {
+        snapshot.processes.iter().find_map(|status| match status {
+            ProcessStatus::Service { name, runtime, .. } if name == want => runtime.clone(),
+            _ => None,
+        })
+    }
+
+    /// The snapshot *is* the record of custody, so a republish driven by a
+    /// state change must not erase it — the fold that rebuilds the process
+    /// list knows nothing about pids.
+    #[test]
+    fn republishing_carries_runtime_detail_forward() {
+        struct Case {
+            name: &'static str,
+            /// Applied in order before the final republish.
+            set: Option<Option<ServiceRuntime>>,
+            republish: bool,
+            expect_pid: Option<i32>,
+        }
+        let live = || {
+            Some(ServiceRuntime {
+                pid: Some(42),
+                docker: false,
+                docker_ports: Vec::new(),
+            })
+        };
+        let cases = vec![
+            Case {
+                name: "no custody recorded yet",
+                set: None,
+                republish: false,
+                expect_pid: None,
+            },
+            Case {
+                name: "custody is visible once recorded",
+                set: Some(live()),
+                republish: false,
+                expect_pid: Some(42),
+            },
+            Case {
+                name: "a state-driven republish preserves it",
+                set: Some(live()),
+                republish: true,
+                expect_pid: Some(42),
+            },
+            Case {
+                name: "clearing custody clears it",
+                set: Some(None),
+                republish: false,
+                expect_pid: None,
+            },
+        ];
+
+        for case in cases {
+            let (writer, reader) = channel(StateSnapshot::default());
+            writer.publish_processes(vec![service("api", ServiceState::Running)]);
+            if let Some(runtime) = case.set {
+                writer.set_service_runtime("api", runtime);
+            }
+            if case.republish {
+                writer.publish_processes(vec![service("api", ServiceState::Ready)]);
+            }
+            let snapshot = reader.snapshot();
+            assert_eq!(
+                runtime_of(&snapshot, "api").and_then(|runtime| runtime.pid),
+                case.expect_pid,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    /// A patch has to publish on its own: custody can change while the state
+    /// does not, and `set_state` would no-op there.
+    #[test]
+    fn a_runtime_patch_publishes_without_a_state_change() {
+        let (writer, reader) = channel(StateSnapshot::default());
+        writer.publish_processes(vec![service("api", ServiceState::Running)]);
+        let seen = reader.snapshot();
+        writer.set_service_runtime(
+            "api",
+            Some(ServiceRuntime {
+                pid: Some(7),
+                docker: false,
+                docker_ports: Vec::new(),
+            }),
+        );
+        let after = reader.snapshot();
+        assert!(
+            !Arc::ptr_eq(&seen, &after),
+            "the patch must republish, not mutate in place"
+        );
+        assert_eq!(runtime_of(&after, "api").and_then(|r| r.pid), Some(7));
+
+        // An unknown name touches nothing.
+        let before = reader.snapshot();
+        writer.set_service_runtime("nope", None);
+        assert!(Arc::ptr_eq(&before, &reader.snapshot()));
     }
 
     fn state_of(snapshot: &StateSnapshot, want: &str) -> Option<ServiceState> {

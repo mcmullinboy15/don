@@ -98,6 +98,7 @@ impl Runner {
                 if let Some(rt) = self.tasks.get_mut(name) {
                     rt.pgid = Some(wired.pgid);
                 }
+                self.state.set_task_pid(name, Some(wired.pgid));
                 self.begin_task_run(name, intent, Some("running..."));
             }
             Err(message) => {

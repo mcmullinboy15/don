@@ -95,6 +95,24 @@ impl DockerPortBinding {
 /// names refer to the first mapping; every mapping also gets an indexed name.
 ///
 /// Free function so it can be unit-tested without a live Docker client.
+/// Render each binding the way `don status -v` shows it. Formatted once, at
+/// the moment custody is recorded, so the projection carries display-ready
+/// lines instead of the bindings themselves.
+pub(crate) fn describe_port_bindings(bindings: &[DockerPortBinding]) -> Vec<String> {
+    bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "{} → {} ({}/{})",
+                binding.configured,
+                binding.connect_addr(),
+                binding.container_port,
+                binding.protocol
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn public_env_vars(bindings: &[DockerPortBinding]) -> HashMap<String, String> {
     let mut vars = HashMap::new();
     for (index, binding) in bindings.iter().enumerate() {

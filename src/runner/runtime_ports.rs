@@ -81,6 +81,7 @@ impl Runner {
         &mut self,
         name: &str,
         identity: super::ServiceHandleIdentity,
+        pgid: Option<i32>,
         docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
         proxy_backend_env: Option<std::collections::HashMap<String, String>>,
     ) {
@@ -90,6 +91,18 @@ impl Runner {
             docker_port_bindings.clone(),
             proxy_backend_env.clone(),
             docker_live,
+        );
+        // The projection is where custody is recorded, not a copy of where it
+        // is recorded. Published here rather than on the state transition,
+        // because a wire can land while the service is already `Running` and
+        // `set_service_state` would no-op.
+        self.state.set_service_runtime(
+            name,
+            Some(crate::state_store::ServiceRuntime {
+                pid: pgid,
+                docker: docker_live,
+                docker_ports: crate::docker::describe_port_bindings(&docker_port_bindings),
+            }),
         );
         if let Some(rs) = self.services.get_mut(name) {
             rs.docker_port_bindings = docker_port_bindings;
@@ -109,10 +122,48 @@ impl Runner {
     /// references stop resolving and it leaves the port manifest.
     pub(in crate::runner) fn clear_service_custody(&mut self, name: &str) {
         self.endpoints.clear_custody(name);
+        self.state.set_service_runtime(name, None);
         if let Some(rs) = self.services.get_mut(name) {
             rs.handle_identity = None;
         }
         self.refresh_runtime_port_manifest();
+    }
+
+    /// What this service's supervisor currently holds, read from the
+    /// projection the fold publishes. The scheduler keeps no second copy —
+    /// this *is* the record.
+    pub(in crate::runner) fn service_runtime(
+        &self,
+        name: &str,
+    ) -> Option<crate::state_store::ServiceRuntime> {
+        self.state
+            .current()
+            .processes
+            .iter()
+            .find_map(|status| match status {
+                crate::state_store::ProcessStatus::Service {
+                    name: process_name,
+                    runtime,
+                    ..
+                } if process_name == name => runtime.clone(),
+                _ => None,
+            })
+    }
+
+    /// The running task's process group id, if it has one.
+    pub(in crate::runner) fn task_pid(&self, name: &str) -> Option<i32> {
+        self.state
+            .current()
+            .processes
+            .iter()
+            .find_map(|status| match status {
+                crate::state_store::ProcessStatus::Task {
+                    name: process_name,
+                    pid,
+                    ..
+                } if process_name == name => *pid,
+                _ => None,
+            })
     }
 
     /// Queue a rewrite of `.don/ports.json` from the runner's current live

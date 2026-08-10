@@ -20,6 +20,7 @@ impl Runner {
         if let Some(rt) = self.tasks.get_mut(name) {
             rt.pgid = None;
         }
+        self.state.set_task_pid(name, None);
 
         let timing = elapsed.map(format_duration).unwrap_or_default();
         let wait_result: CommandResult = if success {

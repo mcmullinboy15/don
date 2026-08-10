@@ -725,6 +725,7 @@ mod tests {
 
         fn snapshot_service(name: &str, state: ServiceState) -> ProcessStatus {
             ProcessStatus::Service {
+                runtime: None,
                 name: name.to_string(),
                 state,
                 failed_dependencies: Vec::new(),
@@ -829,6 +830,7 @@ mod tests {
 
         app.resync_from(&StateSnapshot {
             processes: vec![ProcessStatus::Service {
+                runtime: None,
                 name: "api".to_string(),
                 state: ServiceState::Failed,
                 failed_dependencies: Vec::new(),

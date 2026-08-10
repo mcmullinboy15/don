@@ -347,6 +347,7 @@ mod tests {
                 name: name.to_string(),
                 state: *state,
                 failed_dependencies: Vec::new(),
+                runtime: None,
                 verbose: None,
             })
             .collect()

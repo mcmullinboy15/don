@@ -735,12 +735,14 @@ mod tests {
         StateSnapshot {
             processes: vec![
                 ProcessStatus::Service {
+                    runtime: None,
                     name: "api".to_string(),
                     state: ServiceState::Ready,
                     failed_dependencies: Vec::new(),
                     verbose: None,
                 },
                 ProcessStatus::Service {
+                    runtime: None,
                     name: "web".to_string(),
                     state: ServiceState::Starting,
                     failed_dependencies: Vec::new(),
@@ -830,6 +832,7 @@ mod tests {
         assert_eq!(before["processes"][0]["state"], "starting");
 
         writer.publish_processes(vec![ProcessStatus::Service {
+            runtime: None,
             name: "web".to_string(),
             state: ServiceState::Ready,
             failed_dependencies: Vec::new(),

@@ -803,12 +803,15 @@ impl Runner {
         let Some(rs) = self.services.get(name) else {
             return;
         };
+        let failed_dependencies = rs.failed_dependencies().to_vec();
         self.publish_state();
+        // The pid comes from the projection the custody funnels write, so the
+        // event and the snapshot cannot disagree about what is running.
         let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
             name: name.to_string(),
             state,
-            pid: rs.pgid,
-            failed_dependencies: rs.failed_dependencies().to_vec(),
+            pid: self.service_runtime(name).and_then(|runtime| runtime.pid),
+            failed_dependencies,
         });
     }
 
@@ -1528,6 +1531,7 @@ mod tests {
     fn all_services_ready_table() {
         fn svc(state: ServiceState) -> ProcessStatus {
             ProcessStatus::Service {
+                runtime: None,
                 name: "s".to_string(),
                 state,
                 failed_dependencies: Vec::new(),
@@ -1536,6 +1540,7 @@ mod tests {
         }
         fn task(state: TaskState) -> ProcessStatus {
             ProcessStatus::Task {
+                pid: None,
                 name: "t".to_string(),
                 state,
                 failed_dependencies: Vec::new(),
