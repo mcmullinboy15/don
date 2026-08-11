@@ -132,19 +132,38 @@ Two rules the crash path depends on:
 target; the current code splits building between two subsystems with different
 rules, and the scheduler owns one of them.
 
-Today:
+**Rebuild** conforms: supervisor → build manager → per-item outcome →
+supervisor sequences build, stop, spawn.
 
-- **Rebuild** conforms: supervisor → build manager → per-item outcome →
-  supervisor sequences build, stop, spawn.
-- **Startup and lazy JIT builds do not.** `Runner::spawn_startup_batch_build`
-  and `spawn_lazy_build` detach `run_batch_build_chain`, whose result the
-  scheduler applies (`apply_batch_build_outcome`) and records as
-  `RuntimeService::batch_built`, which the gate then consults via
-  `artifact_ready`.
+**Startup and lazy JIT builds do not**, and the clearest evidence is that
+`publish_start_gates` contradicts its own doc comment eight lines later. The
+comment says the function *starts nothing* and is kept *free of the process's
+own state*, "which is what makes the influence graph a DAG". The loop then:
 
-That second path takes no bazel mutex, and is safe without one *only because
-the scheduler serialises it by construction* — a coupling that exists purely
-because the wrong component owns the work.
+```rust
+if level > Gate::Blocked {
+    self.start_lazy_build_if_needed(name);   // starts something
+}
+if !self.artifact_ready(name) {              // reads this process's own state
+    level = Gate::Blocked;
+}
+```
+
+It is also circular inside a single iteration. `artifact_ready` is false while
+`lazy_build_handles` holds an entry for the process — and the line above
+*inserts* that entry. The gate spawns a build and then blocks on the build it
+just spawned. When the build finishes it sets `batch_built`, which flips
+`artifact_ready`, which reopens the gate: the gate's output depends on work the
+gate performed.
+
+So `batch_built` is not a gate input that happens to live on the scheduler. It
+exists *because* the scheduler builds. Move the build and both it and
+`artifact_ready` disappear — a supervisor that needs an artifact gets one
+before it spawns, and the gate answers only the question it claims to.
+
+The same path also takes no bazel mutex, and is safe without one only because
+the scheduler serialises it by construction — a second coupling with the same
+single cause.
 
 Target:
 
