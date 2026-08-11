@@ -2,7 +2,10 @@
 
 ## Project Overview
 
-Don is a dev environment orchestrator. See `docs/design.md` for the full design document. The crate is both a library (`don`) and a CLI binary — the library exposes all core functionality so other Rust tools can embed it.
+Don is a dev environment orchestrator. See `docs/design.md` for the full
+design document, and `docs/ownership.md` for who owns what — the four actors,
+the commands-down/reports-up invariant, and the module edges enforced by
+`tests/module_edges_test.rs`. Read it before moving state between modules. The crate is both a library (`don`) and a CLI binary — the library exposes all core functionality so other Rust tools can embed it.
 
 ## Build & Test
 

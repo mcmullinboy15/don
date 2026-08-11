@@ -4,6 +4,10 @@ Don is a dev environment orchestrator. You write a `don.toml` config that define
 
 ## Architecture
 
+> Component responsibilities — who owns what, the signals between them, and
+> the one boundary that is not yet where it belongs — are in
+> [`ownership.md`](ownership.md).
+
 Don is built as both a library (`don`) and a CLI binary. The library exposes all core functionality so other Rust tools can embed don's capabilities.
 
 At runtime, don:
