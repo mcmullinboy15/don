@@ -2390,7 +2390,6 @@ mod tests {
 
         assert_eq!(rs.state(), ServiceState::Pending);
         assert!(rs.resolved_watch_paths.is_empty());
-        assert!(rs.bazel_binary_path.is_none());
         assert!(!rs.batch_built);
         assert!(rs.resolved.kind.is_none());
 

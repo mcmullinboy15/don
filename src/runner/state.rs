@@ -37,8 +37,6 @@ pub(crate) struct RuntimeService {
     pub(in crate::runner) scheduled_start: bool,
     /// Watch paths resolved from build tool queries (bazel).
     pub resolved_watch_paths: Vec<String>,
-    /// Bazel binary path resolved via `bazel cquery --output=files`.
-    pub bazel_binary_path: Option<String>,
     /// Whether this service was built during the batch build phase.
     pub batch_built: bool,
     /// Whether this service's supervisor has an auto-restart armed. A
@@ -60,7 +58,6 @@ impl RuntimeService {
 
             scheduled_start: false,
             resolved_watch_paths: Vec::new(),
-            bazel_binary_path: None,
             batch_built: false,
             restart_pending: false,
         }

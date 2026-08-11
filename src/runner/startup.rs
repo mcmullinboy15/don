@@ -58,23 +58,22 @@ impl Runner {
         // the binary-backed resolved config so subsequent spawns go direct
         // instead of through `bazel run`.
         for (name, path_str) in outcome.binary_paths {
-            if let Some(rs) = self.services.get_mut(&name) {
-                rs.bazel_binary_path = Some(path_str.clone());
-                if let Some(svc) = self.config.services.get(&name) {
-                    let mut resolved = svc.resolve_with_bazel_binary(self.platform, &path_str);
-                    // Re-expand `depends_on` against the config's service
-                    // groups. `resolve_with_bazel_binary` walks back to the
-                    // raw user-supplied list (group refs and all) — without
-                    // this, a bazel service that lists a group as a dep
-                    // ends up with an unexpanded `["mongo-search-deps"]` in
-                    // its runtime state, and shutdown's `topological_sort`
-                    // bails because the group name isn't a real node.
-                    resolved.depends_on = self
-                        .config
-                        .effective_depends_on(&name, &resolved.depends_on);
-                    rs.resolved = resolved.clone();
-                    self.configure_supervisor(&name, Some(Box::new(resolved)), None);
-                }
+            if let Some(rs) = self.services.get_mut(&name)
+                && let Some(svc) = self.config.services.get(&name)
+            {
+                let mut resolved = svc.resolve_with_bazel_binary(self.platform, &path_str);
+                // Re-expand `depends_on` against the config's service
+                // groups. `resolve_with_bazel_binary` walks back to the
+                // raw user-supplied list (group refs and all) — without
+                // this, a bazel service that lists a group as a dep
+                // ends up with an unexpanded `["mongo-search-deps"]` in
+                // its runtime state, and shutdown's `topological_sort`
+                // bails because the group name isn't a real node.
+                resolved.depends_on = self
+                    .config
+                    .effective_depends_on(&name, &resolved.depends_on);
+                rs.resolved = resolved.clone();
+                self.configure_supervisor(&name, Some(Box::new(resolved)), None);
             }
         }
 
