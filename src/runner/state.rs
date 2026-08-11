@@ -35,8 +35,6 @@ pub(crate) struct RuntimeService {
     /// "ready" lifecycle line; manual/rebuild starts instead close the
     /// watch cycle with `RebuildComplete`.
     pub(in crate::runner) scheduled_start: bool,
-    /// Watch paths resolved from build tool queries (bazel).
-    pub resolved_watch_paths: Vec<String>,
     /// Whether this service was built during the batch build phase.
     pub batch_built: bool,
     /// Whether this service's supervisor has an auto-restart armed. A
@@ -57,7 +55,6 @@ impl RuntimeService {
             resolved,
 
             scheduled_start: false,
-            resolved_watch_paths: Vec::new(),
             batch_built: false,
             restart_pending: false,
         }
@@ -116,8 +113,6 @@ pub(crate) struct RuntimeTask {
     pub last_params: HashMap<String, String>,
     /// Process group ID of the running task (for shutdown kills).
     pub pgid: Option<i32>,
-    /// Watch paths resolved from build tool queries (bazel).
-    pub resolved_watch_paths: Vec<String>,
     /// Whether the task has ever completed successfully.
     pub has_success: bool,
     /// Metadata for the most recent process run, including failures.
@@ -143,7 +138,6 @@ impl RuntimeTask {
             config,
             last_params: HashMap::new(),
             pgid: None,
-            resolved_watch_paths: Vec::new(),
             has_success,
             last_run,
             dependency_evaluated: false,

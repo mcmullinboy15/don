@@ -39,11 +39,6 @@ impl Runner {
                             if count == 1 { "" } else { "s" }
                         ),
                     );
-                    if let Some(rs) = self.services.get_mut(&outcome.name) {
-                        rs.resolved_watch_paths = info.watch_paths.clone();
-                    } else if let Some(rt) = self.tasks.get_mut(&outcome.name) {
-                        rt.resolved_watch_paths = info.watch_paths.clone();
-                    }
                     if outcome.watch_enabled
                         && let Some(ref tx) = watch_update_tx
                     {

@@ -96,15 +96,20 @@ impl Runner {
                         format!("{} {}", r.cmd, r.args.join(" "))
                     }
                 });
-                // Use resolved build tool watch paths if explicit ones are empty.
-                let watch = if resolved.watch.is_empty() {
-                    rs.resolved_watch_paths.clone()
-                } else {
-                    resolved.watch.clone()
-                };
                 let watch_item = watch_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.items.get(name));
+                // With no explicit `watch`, the patterns came from the build
+                // tool — and went straight to the watcher, which is the one
+                // thing that knows what is actually registered. Ask it rather
+                // than keeping a copy that can only be less true.
+                let watch = if resolved.watch.is_empty() {
+                    watch_item
+                        .map(|item| item.patterns.clone())
+                        .unwrap_or_default()
+                } else {
+                    resolved.watch.clone()
+                };
                 let mut watch_notes = Vec::new();
                 if let Some(snapshot) = &watch_snapshot {
                     if snapshot.notify_error_count > 0
@@ -222,14 +227,17 @@ impl Runner {
                 } else {
                     format!("{} {}", task.cmd, task.args.join(" "))
                 };
-                let watch = if task.watch.is_empty() {
-                    rt.resolved_watch_paths.clone()
-                } else {
-                    task.watch.clone()
-                };
                 let watch_item = watch_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.items.get(name));
+                // See the service branch: the watcher owns the resolved set.
+                let watch = if task.watch.is_empty() {
+                    watch_item
+                        .map(|item| item.patterns.clone())
+                        .unwrap_or_default()
+                } else {
+                    task.watch.clone()
+                };
                 let mut watch_notes = Vec::new();
                 if let Some(snapshot) = &watch_snapshot {
                     if snapshot.notify_error_count > 0

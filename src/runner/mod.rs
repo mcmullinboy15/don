@@ -2389,7 +2389,6 @@ mod tests {
         );
 
         assert_eq!(rs.state(), ServiceState::Pending);
-        assert!(rs.resolved_watch_paths.is_empty());
         assert!(!rs.batch_built);
         assert!(rs.resolved.kind.is_none());
 
@@ -2463,7 +2462,6 @@ mod tests {
 
         assert_eq!(rt.state(), TaskState::Pending);
         assert!(rt.pgid.is_none());
-        assert!(rt.resolved_watch_paths.is_empty());
         assert_eq!(rt.config.cmd, "echo");
 
         assert!(rt.mark_dependency_failed(vec!["setup".to_string()]));

@@ -39,21 +39,6 @@ impl Runner {
             self.output_manager.error_event(warning);
         }
 
-        for (name, kind, paths) in outcome.resolved_watches {
-            match kind {
-                ProcessKind::Service => {
-                    if let Some(rs) = self.services.get_mut(&name) {
-                        rs.resolved_watch_paths = paths;
-                    }
-                }
-                ProcessKind::Task => {
-                    if let Some(rt) = self.tasks.get_mut(&name) {
-                        rt.resolved_watch_paths = paths;
-                    }
-                }
-            }
-        }
-
         // Binary-path resolution only applies to bazel services — swap in
         // the binary-backed resolved config so subsequent spawns go direct
         // instead of through `bazel run`.
