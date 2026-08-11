@@ -582,6 +582,66 @@ mod tests {
         .unwrap();
     }
 
+    /// An item with no bazel target: the chain passes it through without
+    /// running anything, which is what lets these tests exercise the queueing
+    /// rules without a build tool on PATH.
+    fn prepare_item(name: &str) -> BatchBuildItem {
+        BatchBuildItem {
+            name: name.to_string(),
+            kind: crate::process::ProcessKind::Service,
+            bazel: None,
+            watch_enabled: false,
+            working_dir: std::env::temp_dir(),
+            ignore: Vec::new(),
+        }
+    }
+
+    /// Two rules at once, because they have one cause.
+    ///
+    /// Nothing may build before the runner has said whether there is a
+    /// watcher: watch paths are resolved *by* these builds and have to reach
+    /// the watcher before any supervisor spawns. And every supervisor asks for
+    /// its artifact the moment it is constructed, so the burst that parking
+    /// accumulates must leave as **one** batch — one `bazel build` naming
+    /// every target, not one invocation per service.
+    #[tokio::test(start_paused = true)]
+    async fn preparations_park_until_the_watcher_is_ready_then_leave_as_one_batch() {
+        let (_writer, tx, _outcome_rx, handle) = spawn_actor(Vec::new()).await;
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+        let (web_tx, mut web_rx) = mpsc::unbounded_channel();
+
+        for (name, outcome) in [("api", &api_tx), ("web", &web_tx), ("api", &api_tx)] {
+            tx.send(BatchRequest::QueuePrepare {
+                item: Box::new(prepare_item(name)),
+                outcome: outcome.clone(),
+            })
+            .unwrap();
+        }
+
+        let early = tokio::time::timeout(Duration::from_secs(2), api_rx.recv()).await;
+        assert!(
+            early.is_err(),
+            "a build before the watcher exists would register its watch paths into a void"
+        );
+
+        tx.send(BatchRequest::WatchReady { updates: None }).unwrap();
+
+        for (label, rx) in [("api", &mut api_rx), ("web", &mut web_rx)] {
+            let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{label}: the parked build should run"))
+                .expect("actor alive");
+            // No bazel target, so the chain has nothing to report for it.
+            assert!(matches!(outcome, PrepareOutcome::Failed(_)), "{label}");
+        }
+
+        // Three requests, two items, one batch — so the repeat produced no
+        // second outcome for `api`.
+        let extra = tokio::time::timeout(Duration::from_millis(500), api_rx.recv()).await;
+        assert!(extra.is_err(), "exactly one batch for the burst");
+        handle.abort();
+    }
+
     /// One edit fans out into a rebuild request per affected service; those
     /// must collapse into a single batch, and nothing may build before the
     /// window closes.
@@ -620,10 +680,11 @@ mod tests {
     /// raced against the in-flight startup build — then run once the service
     /// settles.
     ///
-    /// This deferral cannot move to the supervisor: during the *startup*
-    /// batch build the service is `Building` but its supervisor is idle and
-    /// holds nothing, so it would queue a build racing the one already
-    /// running — and `run_batch_build_chain` never takes the bazel mutex.
+    /// This deferral cannot move to the supervisor: during the *preparation*
+    /// build the service is `Building` but its supervisor is idle and holds
+    /// nothing, so a rebuild landing there would queue a second build of the
+    /// same target behind the bazel mutex and then restart into whichever
+    /// finished last.
     #[tokio::test(start_paused = true)]
     async fn rebuild_during_build_is_deferred_not_dropped() {
         let (writer, tx, _outcome_rx, handle) =

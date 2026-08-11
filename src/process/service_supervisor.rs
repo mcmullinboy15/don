@@ -1929,6 +1929,8 @@ async fn wait_backoff(backoff: &Option<(tokio::time::Instant, u32)>) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::build_tool::batch::{BatchBuildItem, PrepareOutcome};
+    use crate::build_tool::batcher::BatchRequest;
     use crate::config::{LogConfig, Platform, ProxyEntry, ProxyMode};
     use crate::output::OutputManager;
     use crate::proxy::{ConnectionPolicy, ServiceProxy};
@@ -1936,18 +1938,20 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     async fn test_env() -> StartEnv {
+        test_env_with_batcher().await.0
+    }
+
+    /// The same env, with the build manager's mailbox handed back so a test
+    /// can see what this supervisor asks for — and answer it.
+    async fn test_env_with_batcher() -> (StartEnv, mpsc::UnboundedReceiver<BatchRequest>) {
         let log_config = LogConfig::Stdout;
         let services = [("svc", &log_config)];
         let output_manager = OutputManager::new(&services, tokio::io::sink())
             .await
             .unwrap();
-        StartEnv {
-            batcher_tx: {
-                let (tx, rx) = mpsc::unbounded_channel();
-                // Keep the receiver alive so sends succeed; nothing drains it.
-                std::mem::forget(rx);
-                tx
-            },
+        let (batcher_tx, batcher_rx) = mpsc::unbounded_channel();
+        let env = StartEnv {
+            batcher_tx,
             base_dir: std::env::temp_dir(),
             pid_dir: std::env::temp_dir(),
             platform: Platform::LinuxX86_64,
@@ -1968,7 +1972,8 @@ mod tests {
                 std::mem::forget(writer);
                 reader
             },
-        }
+        };
+        (env, batcher_rx)
     }
 
     /// A minimal service config for the supervisor harness.
@@ -1981,6 +1986,21 @@ mod tests {
             .get("svc")
             .unwrap()
             .resolve(Platform::LinuxX86_64)
+    }
+
+    /// A bazel-managed service — one that cannot spawn until the build
+    /// manager has produced its artifact.
+    fn bazel_resolved(lazy: bool) -> crate::config::ResolvedService {
+        let config: crate::config::Config = "[services.svc]\nbazel.target = \"//svc:svc\"\n"
+            .parse()
+            .unwrap();
+        let mut resolved = config
+            .services
+            .get("svc")
+            .unwrap()
+            .resolve(Platform::LinuxX86_64);
+        resolved.lazy = lazy;
+        resolved
     }
 
     struct Harness {
@@ -2029,6 +2049,168 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Take the artifact request this supervisor made, or report that it
+    /// never made one.
+    async fn next_prepare(
+        batcher_rx: &mut mpsc::UnboundedReceiver<BatchRequest>,
+    ) -> Option<(BatchBuildItem, mpsc::UnboundedSender<PrepareOutcome>)> {
+        match tokio::time::timeout(Duration::from_secs(2), batcher_rx.recv()).await {
+            Ok(Some(BatchRequest::QueuePrepare { item, outcome })) => Some((*item, outcome)),
+            Ok(Some(_)) => panic!("expected a preparation request"),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// **Dependencies gate running, not building.** A supervisor asks for its
+    /// artifact the moment it is constructed — before any gate has been
+    /// published, and without one at all here — because that is what lets one
+    /// `bazel build` cover the whole workspace. Asking at gate-open would
+    /// serialise every build along the dependency chain.
+    ///
+    /// A lazy service is the one exception, and for the reason that makes the
+    /// rule: nothing wants it yet. It asks on its first connection.
+    #[tokio::test]
+    async fn an_artifact_is_asked_for_at_construction_but_lazily_on_demand() {
+        struct Case {
+            name: &'static str,
+            lazy: bool,
+            /// Whether a request is expected before any demand arrives.
+            want_eager: bool,
+        }
+        let cases = [
+            Case {
+                name: "an ordinary bazel service builds immediately",
+                lazy: false,
+                want_eager: true,
+            },
+            Case {
+                name: "a lazy bazel service waits for a connection",
+                lazy: true,
+                want_eager: false,
+            },
+        ];
+
+        for case in cases {
+            let (env, mut batcher_rx) = test_env_with_batcher().await;
+            let (lazy_tx, demand_rx) = mpsc::channel(16);
+            let proxy = bind_env_proxy(Some(lazy_tx.clone())).await;
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let (report_tx, _report_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(supervise(
+                "svc".to_string(),
+                rx,
+                env,
+                None,
+                report_tx,
+                Arc::new(AtomicBool::new(false)),
+                Some(ProxyAssets {
+                    proxy,
+                    demand_rx: Some(demand_rx),
+                }),
+                Some(bazel_resolved(case.lazy)),
+                // No gate at all: permission never arrives, and the request
+                // must not be waiting on it.
+                None,
+            ));
+
+            let eager = next_prepare(&mut batcher_rx).await;
+            assert_eq!(eager.is_some(), case.want_eager, "{}", case.name);
+            if let Some((item, _)) = &eager {
+                assert_eq!(item.name, "svc", "{}", case.name);
+                assert_eq!(
+                    item.bazel.as_ref().map(|bazel| bazel.target.as_str()),
+                    Some("//svc:svc"),
+                    "{}",
+                    case.name
+                );
+            }
+
+            if !case.want_eager {
+                lazy_tx.send("svc".to_string()).await.unwrap();
+                assert!(
+                    next_prepare(&mut batcher_rx).await.is_some(),
+                    "{}: a first connection must ask for the artifact",
+                    case.name
+                );
+            }
+            handle.abort();
+        }
+    }
+
+    /// An artifact is as much a precondition as a dependency, and it is the
+    /// supervisor's to obtain — so an open gate does not start a service whose
+    /// build is still running. That hold is also what puts the watch paths the
+    /// build resolves in place before the first spawn: the build manager
+    /// registers them with the watcher before it reports an outcome, and this
+    /// supervisor does not move until that outcome arrives.
+    #[tokio::test]
+    async fn an_open_gate_does_not_start_a_service_still_waiting_on_its_build() {
+        let (env, mut batcher_rx) = test_env_with_batcher().await;
+        let names = ["svc".to_string()];
+        let (mut gate_writer, mut gate_readers) = crate::gate::channel(names.iter());
+        gate_writer.arm();
+        gate_writer.begin_pass();
+        gate_writer.set("svc", crate::gate::Gate::Open);
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(supervise(
+            "svc".to_string(),
+            rx,
+            env,
+            None,
+            report_tx,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Some(bazel_resolved(false)),
+            gate_readers.remove("svc"),
+        ));
+
+        assert!(
+            matches!(
+                report_rx.recv().await,
+                Some(super::super::ProcessReport::ArtifactBuild {
+                    status: super::super::ArtifactBuildStatus::Started,
+                    ..
+                })
+            ),
+            "a build must be announced before anything else happens"
+        );
+        let (_, outcome) = next_prepare(&mut batcher_rx)
+            .await
+            .expect("a bazel service must ask for its artifact");
+
+        // The gate is Open and demand is standing, yet nothing may spawn.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), report_rx.recv())
+                .await
+                .is_err(),
+            "an open gate must not start a service whose artifact does not exist yet"
+        );
+
+        outcome
+            .send(PrepareOutcome::Ready { binary_path: None })
+            .unwrap();
+
+        assert!(
+            matches!(
+                report_rx.recv().await,
+                Some(super::super::ProcessReport::ArtifactBuild {
+                    status: super::super::ArtifactBuildStatus::Ready,
+                    ..
+                })
+            ),
+            "expected the artifact to be reported ready"
+        );
+        match tokio::time::timeout(Duration::from_secs(5), report_rx.recv()).await {
+            Ok(Some(super::super::ProcessReport::ServiceStarting { name, .. })) => {
+                assert_eq!(name, "svc");
+            }
+            _ => panic!("the start should follow the artifact, in that order"),
+        }
+        handle.abort();
     }
 
     /// The rebuild cycle's decision table, which is the whole of the

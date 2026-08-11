@@ -20,7 +20,7 @@ can answer "why did X restart?" without reading every module.
 |---|---|---|
 | **Scheduler** (`src/runner/`) | dependency graph, gate levels, the fold over reports, the state/endpoint/ports projections, shutdown order | hold a pid, a handle or a port binding; decide when a process restarts |
 | **Supervisor** (`src/process/`) | one process end to end: prepare, spawn, ready check, health monitor, restart policy, its proxy, its rebuild cycle | command a peer; import anything from `runner` |
-| **Build manager** (`src/build_tool/`) | building: coalescing across processes, workspace grouping, the bazel mutex, watch-path and binary-path resolution | know about dependencies or lifecycle state |
+| **Build manager** (`src/build_tool/`) | *every* build — the first as much as a rebuild: coalescing across processes, workspace grouping, the bazel mutex, watch-path and binary-path resolution, the mtime scan that catches an edit made mid-build | know about dependencies or lifecycle state |
 | **Watcher** (`src/watch/`) | file watching, debounce, per-item watch state and registrations | decide what a change *means* |
 
 Two of these edges are enforced by `tests/module_edges_test.rs` rather than by
@@ -50,14 +50,14 @@ flowchart TD
     G -->|"Gate{Blocked / Degraded / Open}"| S
     E -->|"Start · Stop · Restart · RunTask"| SCHED
     SCHED -->|"ServiceCommand / RunRequest<br/>via ProcessRegistry"| S
-    S -->|"ProcessReport<br/>Starting · Prepared · Ready · Exited<br/>StopComplete · Demand · HealthChanged"| F
+    S -->|"ProcessReport<br/>Starting · Prepared · Ready · Exited<br/>StopComplete · Demand · HealthChanged<br/>ArtifactBuild"| F
     F --> G
     F --> P
     P -->|"snapshot · RunnerEvent"| E
     T -->|"Stop"| S
 
-    S -->|"QueueRebuild / ForceRebuild"| BM
-    BM -->|"RebuildItemOutcome, per item"| S
+    S -->|"QueuePrepare / QueueRebuild / ForceRebuild"| BM
+    BM -->|"PrepareOutcome · RebuildItemOutcome, per item"| S
     BM -->|"WatchUpdate"| W
     W -->|"Rebuild · MarkStale · TaskRerun"| SCHED
     W -->|"BuildGraphChanged"| BM
@@ -126,85 +126,24 @@ Two rules the crash path depends on:
   failure history; the policy's own retry must not, or the streak that bounds
   a crash loop is wiped by every attempt it schedules.
 
-## Building — the known deviation
+## Building
 
-**As of 2026-08-10 the diagram below is not yet true.** It is the agreed
-target; the current code splits building between two subsystems with different
-rules, and the scheduler owns one of them.
-
-**Rebuild** conforms: supervisor → build manager → per-item outcome →
-supervisor sequences build, stop, spawn.
-
-**Startup and lazy JIT builds do not**, and the clearest evidence is that
-`publish_start_gates` contradicts its own doc comment eight lines later. The
-comment says the function *starts nothing* and is kept *free of the process's
-own state*, "which is what makes the influence graph a DAG". The loop then:
-
-```rust
-if level > Gate::Blocked {
-    self.start_lazy_build_if_needed(name);   // starts something
-}
-if !self.artifact_ready(name) {              // reads this process's own state
-    level = Gate::Blocked;
-}
-```
-
-It is also circular inside a single iteration. `artifact_ready` is false while
-`lazy_build_handles` holds an entry for the process — and the line above
-*inserts* that entry. The gate spawns a build and then blocks on the build it
-just spawned. When the build finishes it sets `batch_built`, which flips
-`artifact_ready`, which reopens the gate: the gate's output depends on work the
-gate performed.
-
-So `batch_built` is not a gate input that happens to live on the scheduler. It
-exists *because* the scheduler builds. Move the build and both it and
-`artifact_ready` disappear — a supervisor that needs an artifact gets one
-before it spawns, and the gate answers only the question it claims to.
-
-The same path also takes no bazel mutex, and is safe without one only because
-the scheduler serialises it by construction — a second coupling with the same
-single cause.
-
-### Two rules that come with the move
-
-**Build failures do not retry; runtime failures do.** Retrying a compile that
-just failed recompiles the same broken code. The restart policy exists for
-crashes, unhealthy probes and ready-check failures — things where waiting can
-plausibly change the answer.
-
-This is currently violated. In `Full` mode `start_service_worker` runs the
-build inline and `?`-propagates it, so a build failure arrives as
-`ServiceStartPrepared{Err}` and meets `FailureKind::Prepare`, which *does*
-schedule a backoff under `on_failure = "restart"`. (`Prepare` also bundles
-download and port-allocation failures, which the same rule says should not
-retry either.) The move fixes it by construction: once the build happens
-before the spawn rather than inside it, "the build failed" is no longer a
-prepare error and never reaches the policy.
-
-**The startup mtime scan survives.** `run_batch_build_chain` stamps a
-timestamp before building and afterwards checks whether any watched source or
-BUILD file is newer, emitting a *replay* — "you edited a file while the
-startup build was running, so build again before starting". That looks like
-the rebuild cycle's staleness flag but cannot be merged with it: the cycle
-learns staleness from the *watcher*, and during the startup build nothing is
-watching those paths yet, because the watch paths are resolved **by that
-build**. The mtime scan is the only thing covering that bootstrap window. It
-moves into the build manager with the rest of the chain; it does not
-disappear.
-
-Target:
+Startup, lazy JIT and rebuild are one sentence: *a supervisor that needs an
+artifact asks the build manager for one.*
 
 ```mermaid
 flowchart LR
     G["Scheduler<br/>gate = dependencies only"] -->|"Gate"| S
-    S["Supervisor"] -->|"Build{spec}"| M["Build manager<br/>coalesce · group · mutex"]
-    M -->|"BuildOutcome{Built / UpToDate / Failed, binary_path}"| S
+    S["Supervisor"] -->|"QueuePrepare / QueueRebuild{spec}"| M["Build manager<br/>coalesce · group · mutex"]
+    M -->|"per-item outcome:<br/>Ready{binary_path} · Stale · Failed"| S
     M -->|"WatchUpdate"| W["Watcher"]
 ```
 
-Startup, lazy and rebuild collapse into one sentence: *a supervisor that needs
-an artifact asks the build manager for one.* The scheduler does not appear in
-it, `batch_built` and `artifact_ready` disappear, and the gate means only what
+The scheduler does not appear in it. It learns that a build is running the
+way it learns everything else — from a report — and folds it into `Building`
+so `don status` can say so, so `initial_startup_settled` stays open while one
+runs, and so a rebuild requested mid-build is deferred rather than raced. It
+never decides that a build should happen, and the gate means only what
 `src/gate.rs` says it means.
 
 The load-bearing detail:
@@ -214,10 +153,39 @@ The load-bearing detail:
 An artifact can be built before its dependencies are up — bazel does not care
 whether postgres is listening. So a supervisor requests its build **when it is
 constructed**, not when its gate opens. Every supervisor asks at once, the
-debounce window coalesces them, and bazel still gets one invocation for the
-whole workspace. Building at gate-open would serialise builds along the
-dependency chain, which is the one real regression this ordering avoids by
-construction. Lazy services keep today's behaviour: no build until demanded.
+debounce window coalesces them, and bazel gets one invocation for the whole
+workspace. Building at gate-open would serialise builds along the dependency
+chain, which is the one real regression this ordering avoids by construction.
+Lazy services are the exception for the reason that makes the rule: nothing
+wants one yet, so its supervisor asks on first demand.
+
+One request is late by construction, and it is why nothing builds the instant
+`Runner::new` returns. Watch paths are resolved *by* these builds and have to
+reach the watcher before anything spawns — but the watcher does not exist
+until the runner has set it up. The build manager parks preparation requests
+until the runner says `WatchReady`, which is also what guarantees the whole
+startup burst leaves as one batch. A supervisor then waits for its outcome
+before spawning, so the registrations are always in place first.
+
+### Two rules that come with it
+
+**Build failures do not retry; runtime failures do.** Retrying a compile that
+just failed recompiles the same broken code. The restart policy exists for
+crashes, unhealthy probes and ready-check failures — things where waiting can
+plausibly change the answer. A supervisor whose build fails withdraws its own
+demand, so the failure never reaches `RestartPolicy` at all; only an explicit
+request by name starts that process again.
+
+**The startup mtime scan survives.** `run_batch_build_chain` stamps a
+timestamp before building and afterwards checks whether any watched source or
+BUILD file is newer, reporting `PrepareOutcome::Stale` — "you edited a file
+while the build was running, so build again before starting". That looks like
+the rebuild cycle's staleness flag but cannot be merged with it: the cycle
+learns staleness from the *watcher*, and during this build nothing is watching
+those paths yet, because the watch paths are resolved **by that build**. The
+mtime scan is the only thing covering that bootstrap window. It lives in the
+build manager with the rest of the chain, and the supervisor answers it by
+asking again.
 
 ## Reading state
 
