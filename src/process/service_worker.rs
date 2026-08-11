@@ -184,6 +184,26 @@ pub(crate) async fn run_service_build_worker(
     }
 }
 
+/// Why a start could not be prepared.
+///
+/// The distinction is the whole point: a build that failed will fail the same
+/// way on the next attempt, because the sources have not changed. The restart
+/// policy is for failures where waiting can plausibly change the answer.
+pub(crate) struct StartFailure {
+    pub(crate) message: String,
+    /// The build tool refused. Never retried.
+    pub(crate) from_build: bool,
+}
+
+impl StartFailure {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            from_build: false,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_service_worker(
     base_dir: &std::path::Path,
@@ -195,7 +215,7 @@ pub(crate) async fn start_service_worker(
     context: &ServiceStartContext,
     mode: ServiceStartMode,
     service_writer: Option<&crate::output::ServiceWriter>,
-) -> Result<service::StartResult, String> {
+) -> Result<service::StartResult, StartFailure> {
     if matches!(mode, ServiceStartMode::Full) {
         ensure_download_for_config_worker(
             base_dir,
@@ -206,7 +226,7 @@ pub(crate) async fn start_service_worker(
             emitter,
         )
         .await
-        .map_err(|e| format!("download failed: {e}"))?;
+        .map_err(|e| StartFailure::other(format!("download failed: {e}")))?;
 
         run_service_build_worker(
             base_dir,
@@ -217,7 +237,11 @@ pub(crate) async fn start_service_worker(
             context.batch_built,
             service_writer,
         )
-        .await?;
+        .await
+        .map_err(|message| StartFailure {
+            message,
+            from_build: true,
+        })?;
     }
 
     service::start_service(
@@ -235,5 +259,5 @@ pub(crate) async fn start_service_worker(
         &context.prior_docker_port_bindings,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| StartFailure::other(e.to_string()))
 }

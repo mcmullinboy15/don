@@ -1143,18 +1143,22 @@ async fn supervise(
                     }
                     Err(message) => (Err(message), None),
                 };
-                // A start that could not even be prepared is a failure like
-                // any other, and it is the policy's to judge. Background
-                // starts are the ones nobody is waiting on an answer for, so
-                // they are the ones worth retrying.
+                // A start that could not be prepared is a failure like any
+                // other *unless the build tool refused*: retrying a build
+                // recompiles sources that have not changed, so no amount of
+                // backoff can change the answer. Only a background start is
+                // retried at all — the others have someone waiting on a reply.
                 let prepare_policy = match (&wired, &intent) {
-                    (Err(message), super::ServiceStartIntent::Background) => {
+                    (Err(failure), super::ServiceStartIntent::Background)
+                        if !failure.from_build =>
+                    {
                         let decided = policy.decide(super::health::FailureKind::Prepare);
-                        arm_backoff(&name, &env, &decided, &mut backoff, Some(message));
+                        arm_backoff(&name, &env, &decided, &mut backoff, Some(&failure.message));
                         decided
                     }
                     (Err(_), _) => {
                         policy.reset();
+                        backoff = None;
                         super::health::PolicyOutcome::None
                     }
                     (Ok(_), _) => super::health::PolicyOutcome::None,
@@ -1163,7 +1167,7 @@ async fn supervise(
                     .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
                         intent,
-                        result: wired,
+                        result: wired.map_err(|failure| failure.message),
                         policy: prepare_policy,
                     })
                     .is_err()

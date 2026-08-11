@@ -27,6 +27,11 @@ impl Runner {
         if self.services.contains_key(name) {
             self.narrate_lazy_demand(name);
             self.set_service_state(name, ServiceState::Pending);
+            // Build now, not when dependencies come up: an artifact does not
+            // depend on postgres listening, and waiting would serialise the
+            // build behind a wait it has nothing to do with. Dependencies gate
+            // *running*.
+            self.start_lazy_build_if_needed(name);
         } else if self.tasks.contains_key(name) {
             self.set_task_state(name, super::TaskState::Pending);
         }
@@ -71,8 +76,13 @@ impl Runner {
         }
     }
 
-    /// Start the detached build-tool chain for a triggered lazy service when
-    /// it has not been batch-built yet. Returns whether a build was started.
+    /// Start the build-tool chain for a triggered lazy service that has not
+    /// been built yet. Returns whether a build was started.
+    ///
+    /// Called from the demand fold, not from gate publishing: an artifact does
+    /// not depend on a peer being up, so making the build wait for
+    /// dependencies would serialise it behind a wait it has nothing to do
+    /// with. Dependencies gate *running*.
     pub(in crate::runner) fn start_lazy_build_if_needed(&mut self, name: &str) -> bool {
         let needs_jit = self.services.get(name).is_some_and(|rs| {
             rs.state() == ServiceState::Pending
@@ -89,7 +99,7 @@ impl Runner {
             None => return false,
         };
         self.output_manager
-            .service_event(name, "dependencies ready — building before start");
+            .service_event(name, "first connection — building before start");
         self.set_service_state(name, ServiceState::Building);
         self.spawn_lazy_build(name, process);
         true

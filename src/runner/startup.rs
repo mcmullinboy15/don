@@ -582,11 +582,9 @@ impl Runner {
             let deps = dep_map.get(name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
             let mut level = self.dep_level(deps);
 
-            // The build-tool detour: an artifact this process cannot build
-            // for itself is as much a precondition as a dependency.
-            if level > crate::gate::Gate::Blocked {
-                self.start_lazy_build_if_needed(name);
-            }
+            // An artifact this process cannot build for itself is as much a
+            // precondition as a dependency. Reading it is fine; *starting* a
+            // build here would not be — see the note on `artifact_ready`.
             if !self.artifact_ready(name) {
                 level = crate::gate::Gate::Blocked;
             }
@@ -606,6 +604,13 @@ impl Runner {
     /// Read from build bookkeeping, never from `ServiceState::Building` —
     /// sourcing it from lifecycle state would put `state(X)` back into
     /// `gate(X)` and bring the epoch back with it.
+    ///
+    /// This is the last thing in the gate that is not a dependency, and it is
+    /// on the way out: it exists only because the scheduler still owns some
+    /// building. See `docs/ownership.md`. Publishing a gate must stay free of
+    /// side effects — it used to *start* the lazy build here and then block on
+    /// the handle it had just inserted, which made the gate's output depend on
+    /// work the gate performed.
     fn artifact_ready(&self, name: &str) -> bool {
         if self.lazy_build_handles.contains_key(name) {
             return false;
