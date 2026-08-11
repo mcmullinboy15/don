@@ -1,5 +1,5 @@
 use super::build_tools::{
-    BatchBuildItem, BatchBuildOutcome, BatchBuildReplayItem, run_batch_build_chain,
+    BatchBuildItem, PrepareBatchOutcome, PrepareOutcome, run_batch_build_chain,
 };
 use super::graph::{dep_name_map, topological_sort};
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
@@ -28,65 +28,62 @@ fn format_non_blocking_dependencies(dependencies: &[String]) -> String {
 }
 
 impl Runner {
-    /// Apply the outcome of the detached batch-build chain: mutate the
-    /// runtime state (watch paths, binary paths, `batch_built` flag) and
-    /// transition `Building` processes to `Pending` (on success) or `Failed`
-    /// (on build failure). The caller is responsible for dropping its
-    /// cached batch-build handle. State transitions schedule the normal
-    /// pending-process sweep so newly-unblocked processes start.
-    pub(in crate::runner) fn apply_batch_build_outcome(&mut self, outcome: BatchBuildOutcome) {
+    /// Apply the outcome of the detached batch-build chain: record the
+    /// resolved binary path, mark the artifact built, and transition
+    /// `Building` processes to `Pending` (on success) or `Failed` (on build
+    /// failure). The caller is responsible for dropping its cached
+    /// batch-build handle and for re-requesting anything reported stale.
+    /// State transitions schedule the normal pending-process sweep so
+    /// newly-unblocked processes start.
+    pub(in crate::runner) fn apply_batch_build_outcome(&mut self, outcome: &PrepareBatchOutcome) {
         for warning in &outcome.warnings {
             self.output_manager.error_event(warning);
         }
 
-        // Binary-path resolution only applies to bazel services — swap in
-        // the binary-backed resolved config so subsequent spawns go direct
-        // instead of through `bazel run`.
-        for (name, path_str) in outcome.binary_paths {
-            if let Some(rs) = self.services.get_mut(&name)
-                && let Some(svc) = self.config.services.get(&name)
-            {
-                let mut resolved = svc.resolve_with_bazel_binary(self.platform, &path_str);
-                // Re-expand `depends_on` against the config's service
-                // groups. `resolve_with_bazel_binary` walks back to the
-                // raw user-supplied list (group refs and all) — without
-                // this, a bazel service that lists a group as a dep
-                // ends up with an unexpanded `["mongo-search-deps"]` in
-                // its runtime state, and shutdown's `topological_sort`
-                // bails because the group name isn't a real node.
-                resolved.depends_on = self
-                    .config
-                    .effective_depends_on(&name, &resolved.depends_on);
-                rs.resolved = resolved.clone();
-                self.configure_supervisor(&name, Some(Box::new(resolved)), None);
-            }
-        }
-
-        for name in outcome.succeeded {
-            let was_building = if let Some(rs) = self.services.get_mut(&name) {
-                rs.batch_built = true;
-                rs.state() == ServiceState::Building
-            } else {
-                false
-            };
-            self.configure_supervisor(&name, None, Some(true));
-            if was_building {
-                self.set_service_state(&name, ServiceState::Pending);
-                continue;
-            }
-            if self.tasks.contains_key(&name) {
-                self.set_task_state(&name, TaskState::Pending);
-            }
-        }
-
-        for (name, msg) in outcome.failed {
-            self.output_manager
-                .service_error_event(&name, &format!("batch build failed: {msg}"));
-            if self.services.contains_key(&name) {
-                self.set_service_state(&name, ServiceState::Failed);
-            }
-            if self.tasks.contains_key(&name) {
-                self.set_task_state(&name, TaskState::Failed);
+        for (name, decided) in &outcome.items {
+            match decided {
+                PrepareOutcome::Ready { binary_path } => {
+                    let was_building = if let Some(rs) = self.services.get_mut(name) {
+                        rs.batch_built = true;
+                        // The path is the *only* thing the build taught us
+                        // about this service. Setting it on the config we
+                        // already resolved — rather than re-resolving from
+                        // raw config — is what keeps service-group expansion
+                        // in `depends_on` intact.
+                        if let Some(path) = binary_path {
+                            rs.resolved.resolved_binary_path = Some(path.clone());
+                        }
+                        rs.state() == ServiceState::Building
+                    } else {
+                        false
+                    };
+                    let resolved = binary_path
+                        .is_some()
+                        .then(|| self.services.get(name).map(|rs| rs.resolved.clone()))
+                        .flatten();
+                    self.configure_supervisor(name, resolved.map(Box::new), Some(true));
+                    if was_building {
+                        self.set_service_state(name, ServiceState::Pending);
+                        continue;
+                    }
+                    if self.tasks.contains_key(name) {
+                        self.set_task_state(name, TaskState::Pending);
+                    }
+                }
+                // The caller schedules the replay; the state stays `Building`
+                // so nothing starts against the artifact we already know is
+                // out of date.
+                PrepareOutcome::Stale => {}
+                PrepareOutcome::Failed(message) => {
+                    self.output_manager
+                        .service_error_event(name, &format!("batch build failed: {message}"));
+                    if self.services.contains_key(name) {
+                        self.set_service_state(name, ServiceState::Failed);
+                    }
+                    if self.tasks.contains_key(name) {
+                        self.set_task_state(name, TaskState::Failed);
+                    }
+                }
             }
         }
     }
@@ -199,66 +196,28 @@ impl Runner {
         );
     }
 
+    /// Re-request every item the chain reported stale. The build manager has
+    /// already narrated *why*; the process stays `Building` throughout, so
+    /// nothing starts against the artifact it just declared out of date.
     pub(in crate::runner) fn schedule_startup_batch_replays(
         &mut self,
-        replay_items: &[BatchBuildReplayItem],
+        outcome: &PrepareBatchOutcome,
     ) {
-        let mut replay_batch = Vec::new();
-
-        for replay in replay_items {
-            let Some(process) = self.collect_batch_build_item_by_name(&replay.name) else {
-                continue;
-            };
-            let message = match (replay.source_changed, replay.graph_changed, replay.kind) {
-                (true, true, ProcessKind::Service) => {
-                    "files changed during build — rebuilding before start"
-                }
-                (true, false, ProcessKind::Service) => {
-                    "source files changed during build — rebuilding before start"
-                }
-                (false, true, ProcessKind::Service) => {
-                    "build graph changed during build — rebuilding before start"
-                }
-                (true, true, ProcessKind::Task) => {
-                    "files changed during build — re-running build before start"
-                }
-                (true, false, ProcessKind::Task) => {
-                    "source files changed during build — re-running build before start"
-                }
-                (false, true, ProcessKind::Task) => {
-                    "build graph changed during build — re-running build before start"
-                }
-                (false, false, _) => continue,
-            };
-            self.output_manager.service_event(&replay.name, message);
-            match replay.kind {
-                ProcessKind::Service => {
-                    self.set_service_state(&replay.name, ServiceState::Building)
-                }
-                ProcessKind::Task => self.set_task_state(&replay.name, TaskState::Building),
-            }
-            replay_batch.push(process);
-        }
+        let replay_batch: Vec<BatchBuildItem> = outcome
+            .items
+            .iter()
+            .filter(|(_, decided)| *decided == PrepareOutcome::Stale)
+            .filter_map(|(name, _)| self.collect_batch_build_item_by_name(name))
+            .collect();
 
         self.spawn_startup_batch_build(replay_batch);
     }
 
-    pub(in crate::runner) fn schedule_lazy_build_replay(
-        &mut self,
-        replay: &BatchBuildReplayItem,
-    ) -> bool {
-        let Some(process) = self.collect_batch_build_item_by_name(&replay.name) else {
+    pub(in crate::runner) fn schedule_lazy_build_replay(&mut self, name: &str) -> bool {
+        let Some(process) = self.collect_batch_build_item_by_name(name) else {
             return false;
         };
-        let message = match (replay.source_changed, replay.graph_changed) {
-            (true, true) => "files changed during build — rebuilding before start",
-            (true, false) => "source files changed during build — rebuilding before start",
-            (false, true) => "build graph changed during build — rebuilding before start",
-            (false, false) => return false,
-        };
-        self.output_manager.service_event(&replay.name, message);
-        self.set_service_state(&replay.name, ServiceState::Building);
-        self.spawn_lazy_build(&replay.name, process);
+        self.spawn_lazy_build(name, process);
         true
     }
 

@@ -62,7 +62,7 @@ use std::time::SystemTime;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use self::build_tools::BatchBuildOutcome;
+use self::build_tools::PrepareBatchOutcome;
 #[cfg(test)]
 use self::build_tools::bazel_graph_requery_group_dir;
 #[cfg(test)]
@@ -164,12 +164,12 @@ pub enum RunnerCommand {
 
 enum WorkerDone {
     /// Result of the startup-phase batch build.
-    BatchBuild(BatchBuildOutcome),
+    BatchBuild(PrepareBatchOutcome),
     /// Result of a just-in-time build for a single lazy service.
     LazyBuild {
         name: String,
         generation: u64,
-        outcome: BatchBuildOutcome,
+        outcome: PrepareBatchOutcome,
     },
     /// Completion from a detached rebuild worker for a single service.
     /// Result of the periodic crates.io update check.
@@ -1292,9 +1292,8 @@ impl Runner {
                                 // and leaving the handle live would abort after the
                                 // task has already returned (harmless but noisy).
                                 self.batch_build_handle = None;
-                                let replay_items = outcome.replay_items.clone();
-                                self.apply_batch_build_outcome(outcome);
-                                self.schedule_startup_batch_replays(&replay_items);
+                                self.apply_batch_build_outcome(&outcome);
+                                self.schedule_startup_batch_replays(&outcome);
                             }
                             WorkerDone::LazyBuild {
                                 name,
@@ -1872,13 +1871,12 @@ mod tests {
         runner.handle_lazy_build_complete(
             "api",
             1,
-            build_tools::BatchBuildOutcome {
-                resolved_watches: Vec::new(),
+            build_tools::PrepareBatchOutcome {
                 warnings: Vec::new(),
-                succeeded: ["api".to_string()].into_iter().collect(),
-                failed: Vec::new(),
-                binary_paths: HashMap::new(),
-                replay_items: Vec::new(),
+                items: vec![(
+                    "api".to_string(),
+                    build_tools::PrepareOutcome::Ready { binary_path: None },
+                )],
             },
         );
         runner.publish_start_gates().await;
@@ -1908,13 +1906,12 @@ mod tests {
         runner.handle_lazy_build_complete(
             "api",
             1,
-            build_tools::BatchBuildOutcome {
-                resolved_watches: Vec::new(),
+            build_tools::PrepareBatchOutcome {
                 warnings: Vec::new(),
-                succeeded: std::collections::HashSet::new(),
-                failed: vec![("api".to_string(), "stale build failure".to_string())],
-                binary_paths: HashMap::new(),
-                replay_items: Vec::new(),
+                items: vec![(
+                    "api".to_string(),
+                    build_tools::PrepareOutcome::Failed("stale build failure".to_string()),
+                )],
             },
         );
 

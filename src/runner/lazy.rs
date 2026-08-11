@@ -4,7 +4,7 @@
 //! connection transitions it to `Pending`, after which the normal dependency
 //! scheduler owns it just like any other service.
 
-use super::build_tools::BatchBuildOutcome;
+use super::build_tools::{PrepareBatchOutcome, PrepareOutcome};
 use super::{ProcessKind, Runner, ServiceState};
 
 impl Runner {
@@ -111,7 +111,7 @@ impl Runner {
         &mut self,
         name: &str,
         generation: u64,
-        outcome: BatchBuildOutcome,
+        outcome: PrepareBatchOutcome,
     ) {
         let matching_handle = self
             .lazy_build_handles
@@ -128,10 +128,13 @@ impl Runner {
         if !is_current_build {
             return;
         }
-        let replay_items = outcome.replay_items.clone();
-        self.apply_batch_build_outcome(outcome);
-        if let Some(process) = replay_items.iter().find(|process| process.name == name) {
-            self.schedule_lazy_build_replay(process);
+        let stale = outcome
+            .items
+            .iter()
+            .any(|(item, decided)| item == name && *decided == PrepareOutcome::Stale);
+        self.apply_batch_build_outcome(&outcome);
+        if stale {
+            self.schedule_lazy_build_replay(name);
         }
     }
 }

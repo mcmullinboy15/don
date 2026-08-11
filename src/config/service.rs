@@ -471,26 +471,16 @@ pub struct GoConfig {
 }
 
 impl Service {
-    /// Resolve the service for a specific platform, applying overrides if present.
-    /// For Bazel services with a known binary path, use `resolve_with_bazel_binary` instead.
+    /// Resolve the service for a specific platform, applying overrides if
+    /// present.
+    ///
+    /// A bazel service's built-binary path is *not* set here: it is learned
+    /// from `bazel cquery` long after this runs, and is written onto the
+    /// already-resolved value by whoever asked for the build. Re-resolving
+    /// from raw config to attach it used to undo the service-group expansion
+    /// in `depends_on`.
     pub fn resolve(&self, platform: Platform) -> ResolvedService {
         self.resolve_inner(platform)
-    }
-
-    /// Resolve with a known Bazel binary path (from `bazel cquery`).
-    /// Sets the kind to `Custom` with the binary path as the run command.
-    pub fn resolve_with_bazel_binary(
-        &self,
-        platform: Platform,
-        bazel_binary: &str,
-    ) -> ResolvedService {
-        let mut resolved = self.resolve_inner(platform);
-        // Only attach the binary path for Bazel services — for any other
-        // kind this accessor is a no-op (shouldn't be called, but defensive).
-        if matches!(resolved.kind, Some(ServiceKind::Bazel(_))) {
-            resolved.resolved_binary_path = Some(bazel_binary.to_string());
-        }
-        resolved
     }
 
     fn resolve_inner(&self, platform: Platform) -> ResolvedService {

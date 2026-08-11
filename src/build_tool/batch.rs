@@ -42,17 +42,9 @@ pub(crate) struct GraphRequeryOutcomeItem {
     pub(crate) result: Result<crate::build_tool::ResolvedBuildInfo, String>,
 }
 
-#[derive(Clone)]
-pub(crate) struct BatchBuildReplayItem {
-    pub(crate) name: String,
-    pub(crate) kind: ProcessKind,
-    pub(crate) source_changed: bool,
-    pub(crate) graph_changed: bool,
-}
-
-/// Snapshot of a service or task that needs a batch build. Owned — the
-/// detached batch-build task runs entirely off this and never touches the
-/// live [`super::Runner`] state.
+/// Snapshot of a service or task that needs its artifact built. Owned — the
+/// detached chain runs entirely off this and never touches live scheduler
+/// state.
 #[derive(Clone)]
 pub(crate) struct BatchBuildItem {
     pub(crate) name: String,
@@ -66,26 +58,34 @@ pub(crate) struct BatchBuildItem {
     pub(crate) ignore: Vec<String>,
 }
 
-/// Everything the detached batch-build task produces. Applied to runner
-/// state in the main loop when [`super::WorkerDone::BatchBuild`]
-/// arrives — keeps all `&mut self` mutations on the runner task.
-pub(crate) struct BatchBuildOutcome {
-    /// Per-item resolved watch paths — applied to `resolved_watch_paths` on
-    /// the runtime service/task entry.
-    pub(crate) resolved_watches: Vec<(String, ProcessKind, Vec<String>)>,
+/// What the chain decided about one item.
+///
+/// Per item rather than per batch because the batch is cross-item by nature —
+/// one `bazel build //a //b //c` — but its *consequences* belong to whoever
+/// owns that process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrepareOutcome {
+    /// The artifact exists and the process may run. `binary_path` is the
+    /// absolute executable `bazel cquery --output=files` reported; `None`
+    /// means fall back to `bazel run`.
+    Ready { binary_path: Option<String> },
+    /// The build succeeded, but a watched source or BUILD file changed while
+    /// it was running — the artifact is already out of date, so ask again
+    /// before starting. This is the *only* cover for that window: the watcher
+    /// is not yet watching those paths, because this build is what resolves
+    /// them.
+    Stale,
+    /// The build tool refused. Never retried — recompiling unchanged sources
+    /// cannot change the answer.
+    Failed(String),
+}
+
+/// Everything one run of the chain produces.
+pub(crate) struct PrepareBatchOutcome {
     /// Non-fatal warnings (query failures, binary-path cquery failures).
     pub(crate) warnings: Vec<String>,
-    /// Names whose batch build succeeded — transition `Building` → `Pending`.
-    pub(crate) succeeded: HashSet<String>,
-    /// `(name, message)` for items whose batch build failed — transition
-    /// `Building` → `Failed` and surface the message as an error event.
-    pub(crate) failed: Vec<(String, String)>,
-    /// Absolute binary paths from `bazel cquery --output=files`, keyed by
-    /// service name. Only populated for bazel services whose build succeeded.
-    pub(crate) binary_paths: HashMap<String, String>,
-    /// Items whose source and/or build-graph inputs changed while the batch
-    /// query/build/cquery pipeline was in flight and need another cycle.
-    pub(crate) replay_items: Vec<BatchBuildReplayItem>,
+    /// Exactly one outcome per requested item, in request order.
+    pub(crate) items: Vec<(String, PrepareOutcome)>,
 }
 
 pub(crate) async fn run_rebuild_batch_worker(
@@ -305,31 +305,32 @@ pub(crate) async fn run_graph_requery_worker(
     outcomes.into_iter().flatten().collect()
 }
 
-/// Run the full startup-phase batch build: optional watch resolution → batch
-/// build → bazel binary-path cquery. Pure off-task function that takes owned
-/// inputs and returns an [`BatchBuildOutcome`] the main loop applies.
+/// Run the full artifact-preparation chain: optional watch resolution →
+/// batch build → bazel binary-path cquery → the mtime scan that catches an
+/// edit made while the build ran. Pure off-task function that takes owned
+/// inputs and returns one [`PrepareOutcome`] per item.
 ///
-/// Sends [`crate::watch::WatchUpdate`]s directly to the watch manager as
-/// they resolve so file watching is live before the builds complete.
+/// Sends [`crate::watch::WatchUpdate`]s directly to the watch manager as they
+/// resolve — before the builds complete, and therefore before any supervisor
+/// waiting on an outcome can spawn.
 pub(crate) async fn run_batch_build_chain(
     items: Vec<BatchBuildItem>,
     base_dir: PathBuf,
     emitter: crate::output::LifecycleEmitter,
     watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
     global_watch_ignore: Vec<String>,
-) -> BatchBuildOutcome {
+) -> PrepareBatchOutcome {
     let scan_since = SystemTime::now();
-    let mut outcome = BatchBuildOutcome {
-        resolved_watches: Vec::new(),
+    let mut outcome = PrepareBatchOutcome {
         warnings: Vec::new(),
-        succeeded: HashSet::new(),
-        failed: Vec::new(),
-        binary_paths: HashMap::new(),
-        replay_items: Vec::new(),
+        items: Vec::new(),
     };
     if items.is_empty() {
         return outcome;
     }
+    let mut succeeded: HashSet<String> = HashSet::new();
+    let mut failed: HashMap<String, String> = HashMap::new();
+    let mut binary_paths: HashMap<String, String> = HashMap::new();
 
     // Step 1: resolve watch paths with one query per build-tool working set.
     //
@@ -441,9 +442,6 @@ pub(crate) async fn run_batch_build_chain(
                 .await;
             }
         }
-        outcome
-            .resolved_watches
-            .push((item.name.clone(), item.kind, info.watch_paths.clone()));
     }
 
     // Step 2: batch builds. Bazel groups run concurrently, but each group
@@ -531,10 +529,10 @@ pub(crate) async fn run_batch_build_chain(
         match result {
             Ok(batch) => {
                 for name in batch.succeeded {
-                    outcome.succeeded.insert(name);
+                    succeeded.insert(name);
                 }
                 for (name, msg) in batch.failed {
-                    outcome.failed.push((name, msg));
+                    failed.insert(name, msg);
                 }
             }
             Err(e) => outcome
@@ -543,7 +541,7 @@ pub(crate) async fn run_batch_build_chain(
         }
     }
 
-    let built_count = outcome.succeeded.len();
+    let built_count = succeeded.len();
     if built_count > 0 {
         emitter.lifecycle_event(&format!(
             "batch build complete: {built_count} item{} built",
@@ -552,14 +550,12 @@ pub(crate) async fn run_batch_build_chain(
     }
 
     // Step 3: resolve every succeeded bazel service's built-binary path,
-    // grouped by workspace. Lets the runner spawn the artifact directly
+    // grouped by workspace. Lets a supervisor spawn the artifact directly
     // instead of via `bazel run`. Tasks don't need this.
     let bazel_services_to_resolve: Vec<&BatchBuildItem> = items
         .iter()
         .filter(|i| {
-            i.kind == ProcessKind::Service
-                && i.bazel.is_some()
-                && outcome.succeeded.contains(&i.name)
+            i.kind == ProcessKind::Service && i.bazel.is_some() && succeeded.contains(&i.name)
         })
         .collect();
 
@@ -599,7 +595,7 @@ pub(crate) async fn run_batch_build_chain(
                                     &item.name,
                                     &format!("resolved binary {rel_path}"),
                                 );
-                                outcome.binary_paths.insert(item.name.clone(), path_str);
+                                binary_paths.insert(item.name.clone(), path_str);
                             }
                             None => {
                                 outcome.warnings.push(format!(
@@ -622,28 +618,81 @@ pub(crate) async fn run_batch_build_chain(
         }
     }
 
+    // Step 4: decide each item, newest-mtime scan included. Every requested
+    // name gets exactly one outcome — a supervisor is waiting on it and
+    // silence would leave it parked forever.
     for item in &items {
-        if !item.watch_enabled || !outcome.succeeded.contains(&item.name) {
-            continue;
-        }
-        let Some(info) = resolved_info_by_item.get(&item.name) else {
-            continue;
+        let decided = if let Some(message) = failed.get(&item.name) {
+            PrepareOutcome::Failed(message.clone())
+        } else if succeeded.contains(&item.name) {
+            if let Some(reason) = stale_since(
+                item,
+                resolved_info_by_item.get(&item.name),
+                &base_dir,
+                scan_since,
+            ) {
+                emitter.service_event(&item.name, reason);
+                PrepareOutcome::Stale
+            } else {
+                PrepareOutcome::Ready {
+                    binary_path: binary_paths.get(&item.name).cloned(),
+                }
+            }
+        } else {
+            // The resolver returned neither a success nor a failure for this
+            // target — a panicked worker, or a target the batch never
+            // covered. Reporting it as failed is what keeps the process out
+            // of a permanent `Building`.
+            PrepareOutcome::Failed("build tool returned no result for this target".to_string())
         };
-        let source_changed =
-            any_glob_path_changed_since(&base_dir, &info.watch_paths, &item.ignore, scan_since);
-        let graph_changed =
-            any_glob_path_changed_since(&base_dir, &info.graph_definition_globs, &[], scan_since);
-        if source_changed || graph_changed {
-            outcome.replay_items.push(BatchBuildReplayItem {
-                name: item.name.clone(),
-                kind: item.kind,
-                source_changed,
-                graph_changed,
-            });
-        }
+        outcome.items.push((item.name.clone(), decided));
     }
 
     outcome
+}
+
+/// Whether an input changed while this item was being built, and how to say
+/// so. The scan is against the timestamp taken *before* the chain started, so
+/// it covers the whole query → build → cquery pipeline.
+///
+/// This is not the rebuild cycle's staleness flag and cannot be merged with
+/// it: that one is learned from the watcher, and during this build nothing is
+/// watching these paths yet — they are what this build resolves.
+fn stale_since(
+    item: &BatchBuildItem,
+    info: Option<&crate::build_tool::ResolvedBuildInfo>,
+    base_dir: &Path,
+    scan_since: SystemTime,
+) -> Option<&'static str> {
+    if !item.watch_enabled {
+        return None;
+    }
+    let info = info?;
+    let source_changed =
+        any_glob_path_changed_since(base_dir, &info.watch_paths, &item.ignore, scan_since);
+    let graph_changed =
+        any_glob_path_changed_since(base_dir, &info.graph_definition_globs, &[], scan_since);
+    match (source_changed, graph_changed, item.kind) {
+        (true, true, ProcessKind::Service) => {
+            Some("files changed during build — rebuilding before start")
+        }
+        (true, false, ProcessKind::Service) => {
+            Some("source files changed during build — rebuilding before start")
+        }
+        (false, true, ProcessKind::Service) => {
+            Some("build graph changed during build — rebuilding before start")
+        }
+        (true, true, ProcessKind::Task) => {
+            Some("files changed during build — re-running build before start")
+        }
+        (true, false, ProcessKind::Task) => {
+            Some("source files changed during build — re-running build before start")
+        }
+        (false, true, ProcessKind::Task) => {
+            Some("build graph changed during build — re-running build before start")
+        }
+        (false, false, _) => None,
+    }
 }
 
 /// Resolve a bazel-reported executable path to an absolute path.
