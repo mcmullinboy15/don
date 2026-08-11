@@ -165,6 +165,33 @@ The same path also takes no bazel mutex, and is safe without one only because
 the scheduler serialises it by construction — a second coupling with the same
 single cause.
 
+### Two rules that come with the move
+
+**Build failures do not retry; runtime failures do.** Retrying a compile that
+just failed recompiles the same broken code. The restart policy exists for
+crashes, unhealthy probes and ready-check failures — things where waiting can
+plausibly change the answer.
+
+This is currently violated. In `Full` mode `start_service_worker` runs the
+build inline and `?`-propagates it, so a build failure arrives as
+`ServiceStartPrepared{Err}` and meets `FailureKind::Prepare`, which *does*
+schedule a backoff under `on_failure = "restart"`. (`Prepare` also bundles
+download and port-allocation failures, which the same rule says should not
+retry either.) The move fixes it by construction: once the build happens
+before the spawn rather than inside it, "the build failed" is no longer a
+prepare error and never reaches the policy.
+
+**The startup mtime scan survives.** `run_batch_build_chain` stamps a
+timestamp before building and afterwards checks whether any watched source or
+BUILD file is newer, emitting a *replay* — "you edited a file while the
+startup build was running, so build again before starting". That looks like
+the rebuild cycle's staleness flag but cannot be merged with it: the cycle
+learns staleness from the *watcher*, and during the startup build nothing is
+watching those paths yet, because the watch paths are resolved **by that
+build**. The mtime scan is the only thing covering that bootstrap window. It
+moves into the build manager with the rest of the chain; it does not
+disappear.
+
 Target:
 
 ```mermaid
