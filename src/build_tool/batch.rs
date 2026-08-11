@@ -319,6 +319,7 @@ pub(crate) async fn run_batch_build_chain(
     emitter: crate::output::LifecycleEmitter,
     watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
     global_watch_ignore: Vec<String>,
+    bazel_build_mutex: Arc<tokio::sync::Mutex<()>>,
 ) -> PrepareBatchOutcome {
     let scan_since = SystemTime::now();
     let mut outcome = PrepareBatchOutcome {
@@ -328,6 +329,11 @@ pub(crate) async fn run_batch_build_chain(
     if items.is_empty() {
         return outcome;
     }
+    // Held for the whole chain. `bazel query`, `bazel build` and
+    // `bazel cquery` all contend for the same workspace analysis lock, so a
+    // rebuild batch must not interleave with a preparation — which used to be
+    // true only because the scheduler serialised the two by construction.
+    let _bazel_guard = bazel_build_mutex.lock().await;
     let mut succeeded: HashSet<String> = HashSet::new();
     let mut failed: HashMap<String, String> = HashMap::new();
     let mut binary_paths: HashMap<String, String> = HashMap::new();

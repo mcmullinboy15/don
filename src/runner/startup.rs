@@ -1,10 +1,7 @@
-use super::build_tools::{
-    BatchBuildItem, PrepareBatchOutcome, PrepareOutcome, run_batch_build_chain,
-};
 use super::graph::{dep_name_map, topological_sort};
-use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
-use super::{ProcessKind, Runner, RuntimeService, ServiceState, TaskState, WorkerDone};
+use super::{ProcessKind, Runner, RuntimeService, ServiceState, TaskState};
 use crate::config::Dependency;
+use crate::process::ArtifactBuildStatus;
 use std::collections::HashMap;
 
 fn push_unique_name(names: &mut Vec<String>, name: &str) {
@@ -28,197 +25,49 @@ fn format_non_blocking_dependencies(dependencies: &[String]) -> String {
 }
 
 impl Runner {
-    /// Apply the outcome of the detached batch-build chain: record the
-    /// resolved binary path, mark the artifact built, and transition
-    /// `Building` processes to `Pending` (on success) or `Failed` (on build
-    /// failure). The caller is responsible for dropping its cached
-    /// batch-build handle and for re-requesting anything reported stale.
-    /// State transitions schedule the normal pending-process sweep so
-    /// newly-unblocked processes start.
-    pub(in crate::runner) fn apply_batch_build_outcome(&mut self, outcome: &PrepareBatchOutcome) {
-        for warning in &outcome.warnings {
-            self.output_manager.error_event(warning);
-        }
-
-        for (name, decided) in &outcome.items {
-            match decided {
-                PrepareOutcome::Ready { binary_path } => {
-                    let was_building = if let Some(rs) = self.services.get_mut(name) {
-                        rs.batch_built = true;
-                        // The path is the *only* thing the build taught us
-                        // about this service. Setting it on the config we
-                        // already resolved — rather than re-resolving from
-                        // raw config — is what keeps service-group expansion
-                        // in `depends_on` intact.
-                        if let Some(path) = binary_path {
-                            rs.resolved.resolved_binary_path = Some(path.clone());
-                        }
-                        rs.state() == ServiceState::Building
-                    } else {
-                        false
-                    };
-                    let resolved = binary_path
-                        .is_some()
-                        .then(|| self.services.get(name).map(|rs| rs.resolved.clone()))
-                        .flatten();
-                    self.configure_supervisor(name, resolved.map(Box::new), Some(true));
-                    if was_building {
+    /// Fold a supervisor's report about its own artifact build.
+    ///
+    /// The scheduler neither starts nor waits on the build: it records the
+    /// `Building` state so `don status` can show it, so
+    /// [`Self::initial_startup_settled`] stays open while one runs, and so a
+    /// rebuild requested mid-build is deferred rather than raced.
+    pub(in crate::runner) fn handle_artifact_build(
+        &mut self,
+        name: &str,
+        kind: ProcessKind,
+        status: ArtifactBuildStatus,
+    ) {
+        match status {
+            ArtifactBuildStatus::Started => match kind {
+                ProcessKind::Service => self.set_service_state(name, ServiceState::Building),
+                ProcessKind::Task => self.set_task_state(name, TaskState::Building),
+            },
+            // Only a process still waiting on this build returns to the
+            // scheduler. Anything else — stopped, restarted, failed since —
+            // has moved on, and the artifact is simply there when it needs it.
+            ArtifactBuildStatus::Ready => match kind {
+                ProcessKind::Service => {
+                    if self.services.get(name).map(RuntimeService::state)
+                        == Some(ServiceState::Building)
+                    {
                         self.set_service_state(name, ServiceState::Pending);
-                        continue;
                     }
-                    if self.tasks.contains_key(name) {
+                }
+                ProcessKind::Task => {
+                    if self.tasks.get(name).map(|rt| rt.state()) == Some(TaskState::Building) {
                         self.set_task_state(name, TaskState::Pending);
                     }
                 }
-                // The caller schedules the replay; the state stays `Building`
-                // so nothing starts against the artifact we already know is
-                // out of date.
-                PrepareOutcome::Stale => {}
-                PrepareOutcome::Failed(message) => {
-                    self.output_manager
-                        .service_error_event(name, &format!("batch build failed: {message}"));
-                    if self.services.contains_key(name) {
-                        self.set_service_state(name, ServiceState::Failed);
-                    }
-                    if self.tasks.contains_key(name) {
-                        self.set_task_state(name, TaskState::Failed);
-                    }
+            },
+            ArtifactBuildStatus::Failed(message) => {
+                self.output_manager
+                    .service_error_event(name, &format!("build failed: {message}"));
+                match kind {
+                    ProcessKind::Service => self.set_service_state(name, ServiceState::Failed),
+                    ProcessKind::Task => self.set_task_state(name, TaskState::Failed),
                 }
             }
         }
-    }
-
-    fn collect_batch_build_item_by_name(&self, name: &str) -> Option<BatchBuildItem> {
-        if let Some(rs) = self.services.get(name) {
-            if rs.resolved.is_build_tool_managed() {
-                return Some(self.build_batch_item(name, ProcessKind::Service, rs));
-            }
-            return None;
-        }
-
-        let rt = self.tasks.get(name)?;
-        rt.config.bazel.as_ref()?;
-        let working_dir = working_dir_for(&self.base_dir, rt.config.dir.as_deref());
-        let ignore = resolve_watch_ignore_patterns(
-            &working_dir,
-            &rt.config.ignore,
-            &self.base_dir,
-            &self.config.watch_ignore,
-        );
-        Some(BatchBuildItem {
-            name: name.to_string(),
-            kind: ProcessKind::Task,
-            bazel: rt.config.bazel.clone(),
-            watch_enabled: rt.config.build_tool_watch_enabled(),
-            working_dir,
-            ignore,
-        })
-    }
-
-    pub(in crate::runner) fn spawn_startup_batch_build(&mut self, processes: Vec<BatchBuildItem>) {
-        if processes.is_empty() {
-            return;
-        }
-
-        let cmd_tx = self.internal_tx.clone();
-        let base_dir = self.base_dir.clone();
-        let emitter = self.output_manager.clone_lifecycle_emitter();
-        let watch_update_tx = self
-            .watch
-            .as_ref()
-            .map(super::watch_link::WatchHandle::updates);
-        let global_watch_ignore = resolve_watch_ignore_patterns(
-            &self.base_dir,
-            &[],
-            &self.base_dir,
-            &self.config.watch_ignore,
-        );
-        let handle = tokio::spawn(async move {
-            let outcome = run_batch_build_chain(
-                processes,
-                base_dir,
-                emitter,
-                watch_update_tx,
-                global_watch_ignore,
-            )
-            .await;
-            let _ = cmd_tx.send(WorkerDone::BatchBuild(outcome)).await;
-        });
-        self.batch_build_handle = Some(crate::build_tool::AbortOnDrop::new(handle));
-    }
-
-    pub(in crate::runner) fn spawn_lazy_build(&mut self, name: &str, process: BatchBuildItem) {
-        if !self.services.contains_key(name) {
-            return;
-        }
-        // Unique among the *in-flight* builds for this name, which is all the
-        // currency check needs: `lazy_build_handles` holds exactly the live
-        // one, and each spawn sends exactly one completion.
-        let generation = self
-            .lazy_build_handles
-            .get(name)
-            .map_or(0, |(generation, _)| *generation)
-            .saturating_add(1);
-        let cmd_tx = self.internal_tx.clone();
-        let base_dir = self.base_dir.clone();
-        let emitter = self.output_manager.clone_lifecycle_emitter();
-        let watch_update_tx = self
-            .watch
-            .as_ref()
-            .map(super::watch_link::WatchHandle::updates);
-        let global_watch_ignore = resolve_watch_ignore_patterns(
-            &self.base_dir,
-            &[],
-            &self.base_dir,
-            &self.config.watch_ignore,
-        );
-        let svc_name = name.to_string();
-        let handle = tokio::spawn(async move {
-            let outcome = run_batch_build_chain(
-                vec![process],
-                base_dir,
-                emitter,
-                watch_update_tx,
-                global_watch_ignore,
-            )
-            .await;
-            let _ = cmd_tx
-                .send(WorkerDone::LazyBuild {
-                    name: svc_name,
-                    generation,
-                    outcome,
-                })
-                .await;
-        });
-        self.lazy_build_handles.insert(
-            name.to_string(),
-            (generation, crate::build_tool::AbortOnDrop::new(handle)),
-        );
-    }
-
-    /// Re-request every item the chain reported stale. The build manager has
-    /// already narrated *why*; the process stays `Building` throughout, so
-    /// nothing starts against the artifact it just declared out of date.
-    pub(in crate::runner) fn schedule_startup_batch_replays(
-        &mut self,
-        outcome: &PrepareBatchOutcome,
-    ) {
-        let replay_batch: Vec<BatchBuildItem> = outcome
-            .items
-            .iter()
-            .filter(|(_, decided)| *decided == PrepareOutcome::Stale)
-            .filter_map(|(name, _)| self.collect_batch_build_item_by_name(name))
-            .collect();
-
-        self.spawn_startup_batch_build(replay_batch);
-    }
-
-    pub(in crate::runner) fn schedule_lazy_build_replay(&mut self, name: &str) -> bool {
-        let Some(process) = self.collect_batch_build_item_by_name(name) else {
-            return false;
-        };
-        self.spawn_lazy_build(name, process);
-        true
     }
 
     /// Check if a dependency is satisfied.
@@ -441,76 +290,6 @@ impl Runner {
         }
     }
 
-    /// Snapshot of a batch-buildable service or task — everything the
-    /// standalone [`run_batch_build_chain`] needs. Taken at startup before
-    /// the detached task runs so the task doesn't touch `self`.
-    pub(in crate::runner) fn collect_batch_build_items(&self) -> Vec<BatchBuildItem> {
-        let mut processes: Vec<BatchBuildItem> = Vec::new();
-
-        for (name, rs) in &self.services {
-            if !rs.resolved.is_build_tool_managed() {
-                continue;
-            }
-            // Lazy bazel services defer their query+build+cquery to
-            // first connection (the JIT build below). Pulling
-            // them into the startup batch would query and build services
-            // the user may never touch this session.
-            if rs.resolved.lazy {
-                continue;
-            }
-            processes.push(self.build_batch_item(name, ProcessKind::Service, rs));
-        }
-        for (name, rt) in &self.tasks {
-            if rt.config.bazel.is_none() {
-                continue;
-            }
-            let working_dir = working_dir_for(&self.base_dir, rt.config.dir.as_deref());
-            let ignore = resolve_watch_ignore_patterns(
-                &working_dir,
-                &rt.config.ignore,
-                &self.base_dir,
-                &self.config.watch_ignore,
-            );
-            processes.push(BatchBuildItem {
-                name: name.clone(),
-                kind: ProcessKind::Task,
-                bazel: rt.config.bazel.clone(),
-                watch_enabled: rt.config.build_tool_watch_enabled(),
-                working_dir,
-                ignore,
-            });
-        }
-
-        processes
-    }
-
-    /// Snapshot a single service into a [`BatchBuildItem`] for the JIT
-    /// lazy-build path. Shares the field layout with
-    /// [`Self::collect_batch_build_items`] so the chain logic doesn't care
-    /// whether the build is startup-batched or JIT.
-    pub(in crate::runner) fn build_batch_item(
-        &self,
-        name: &str,
-        kind: ProcessKind,
-        rs: &RuntimeService,
-    ) -> BatchBuildItem {
-        let working_dir = working_dir_for(&self.base_dir, rs.resolved.dir.as_deref());
-        let ignore = resolve_watch_ignore_patterns(
-            &working_dir,
-            &rs.resolved.ignore,
-            &self.base_dir,
-            &self.config.watch_ignore,
-        );
-        BatchBuildItem {
-            name: name.to_string(),
-            kind,
-            bazel: rs.resolved.bazel_config().cloned(),
-            watch_enabled: rs.resolved.build_tool_watch_enabled(),
-            working_dir,
-            ignore,
-        }
-    }
-
     /// Decide which processes may run, and publish that.
     ///
     /// This is the whole of the scheduler: resolve dependency failures to
@@ -534,19 +313,13 @@ impl Runner {
         self.start_gates.begin_pass();
 
         // Publish a level for *every* process. A gate says only what this
-        // process's dependencies allow — never whether anything wants it,
-        // which is the supervisor's own business. Keeping this free of the
-        // process's own state is what makes the influence graph a DAG.
+        // process's dependencies allow — never whether anything wants it, and
+        // never whether its artifact exists. Both are the supervisor's own
+        // business, and keeping this free of the process's own state is what
+        // makes the influence graph a DAG.
         for name in &order {
             let deps = dep_map.get(name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
-            let mut level = self.dep_level(deps);
-
-            // An artifact this process cannot build for itself is as much a
-            // precondition as a dependency. Reading it is fine; *starting* a
-            // build here would not be — see the note on `artifact_ready`.
-            if !self.artifact_ready(name) {
-                level = crate::gate::Gate::Blocked;
-            }
+            let level = self.dep_level(deps);
 
             if self.start_gates.set(name, level) && level > crate::gate::Gate::Blocked {
                 // Newly permitted: say which non-blocking dependencies we are
@@ -556,27 +329,6 @@ impl Runner {
                 self.report_skipped_non_blocking_dependencies(name, &skipped);
             }
         }
-    }
-
-    /// Whether this process's build artifact exists.
-    ///
-    /// Read from build bookkeeping, never from `ServiceState::Building` —
-    /// sourcing it from lifecycle state would put `state(X)` back into
-    /// `gate(X)` and bring the epoch back with it.
-    ///
-    /// This is the last thing in the gate that is not a dependency, and it is
-    /// on the way out: it exists only because the scheduler still owns some
-    /// building. See `docs/ownership.md`. Publishing a gate must stay free of
-    /// side effects — it used to *start* the lazy build here and then block on
-    /// the handle it had just inserted, which made the gate's output depend on
-    /// work the gate performed.
-    fn artifact_ready(&self, name: &str) -> bool {
-        if self.lazy_build_handles.contains_key(name) {
-            return false;
-        }
-        self.services
-            .get(name)
-            .is_none_or(|rs| !rs.resolved.is_build_tool_managed() || rs.batch_built)
     }
 
     /// Whether every process participating in initial startup has settled.

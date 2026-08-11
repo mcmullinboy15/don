@@ -18,22 +18,35 @@
 //!   synchronously, and a bounded outcome channel would let that pair
 //!   deadlock.
 //!
-//! Rebuild specs are captured at *queue* time from resolved config (fixed
-//! after construction — there is no live config reload), which is what frees
-//! this task from reading runner state to build a batch. The one thing it
-//! still reads is the state *snapshot*: services that are still coming up
-//! (`Building`/`Pending`/`Starting`) are deferred back onto the queue, so a
-//! file edited mid-build waits instead of racing the in-flight startup build.
-//! The snapshot can trail the runner's fold, so the application side keeps
-//! its own eligibility guard as the safety net.
+//! Specs are captured at *queue* time from resolved config (fixed after
+//! construction — there is no live config reload), which is what frees this
+//! task from reading runner state to build a batch. The one thing it still
+//! reads is the state *snapshot*, and only for rebuilds: services that are
+//! still coming up (`Building`/`Pending`/`Starting`) are deferred back onto
+//! the queue, so a file edited mid-build waits instead of racing the in-flight
+//! preparation. The snapshot can trail the runner's fold, so the application
+//! side keeps its own eligibility guard as the safety net.
+//!
+//! Preparations are deliberately *not* deferred that way: a supervisor asks
+//! for its artifact before it starts, so every one of them is `Building` by
+//! the time the window closes, and deferring would deadlock startup.
+//!
+//! One request is late by construction. Watch paths are resolved *by* the
+//! preparation build and must reach the watcher before anything spawns, but
+//! the watcher does not exist until the runner has finished setting it up.
+//! So preparation requests that arrive before [`BatchRequest::WatchReady`] are
+//! parked here rather than queued — which is also what makes the whole
+//! startup burst land in one batch.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot};
 
 use super::batch::{
-    BazelRebuildItem, GraphRequeryOutcomeItem, GraphRequeryRequestItem, RebuildBatchOutcome,
-    RebuildBatchRequest, run_graph_requery_worker, run_rebuild_batch_worker,
+    BatchBuildItem, BazelRebuildItem, GraphRequeryOutcomeItem, GraphRequeryRequestItem,
+    PrepareBatchOutcome, PrepareOutcome, RebuildBatchOutcome, RebuildBatchRequest,
+    run_batch_build_chain, run_graph_requery_worker, run_rebuild_batch_worker,
 };
 use crate::build_tool::manager::{BatchDue, BuildBatcher};
 use crate::output::LifecycleEmitter;
@@ -79,6 +92,19 @@ impl RebuildSpec {
 
 /// Everything the batcher can be asked to do.
 pub(crate) enum BatchRequest {
+    /// Produce this process's artifact so its supervisor may spawn it. Sent
+    /// when a supervisor is constructed — dependencies gate *running*, not
+    /// building — or, for a lazy service, on its first demand.
+    QueuePrepare {
+        item: Box<BatchBuildItem>,
+        outcome: mpsc::UnboundedSender<PrepareOutcome>,
+    },
+    /// The runner has finished deciding whether there is a file watcher, and
+    /// preparation builds may start. Sent exactly once; see the module docs
+    /// for why nothing may build before it.
+    WatchReady {
+        updates: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+    },
     /// Queue a rebuild and (re)open the batch window. The outcome goes back
     /// to `outcome`, which is the requesting supervisor's own channel.
     QueueRebuild {
@@ -111,8 +137,17 @@ pub(crate) enum BatchOutcome {
 
 /// What the detached workers hand back to the actor.
 enum WorkerDone {
+    Prepares(PrepareBatchOutcome),
     Rebuilds(RebuildBatchOutcome),
     Requeries(Vec<GraphRequeryOutcomeItem>),
+}
+
+/// The workspace facts every preparation batch needs, fixed at construction.
+pub(crate) struct WorkspaceContext {
+    pub(crate) base_dir: PathBuf,
+    /// Project-wide watch-ignore patterns, for the build-graph registrations
+    /// the chain pushes to the watcher.
+    pub(crate) global_watch_ignore: Vec<String>,
 }
 
 /// Spawn the batcher task. Returns its mailbox, the outcome channel the
@@ -120,6 +155,7 @@ enum WorkerDone {
 pub(crate) fn spawn(
     state: StateReader,
     emitter: LifecycleEmitter,
+    workspace: WorkspaceContext,
 ) -> (
     mpsc::UnboundedSender<BatchRequest>,
     mpsc::UnboundedReceiver<BatchOutcome>,
@@ -127,7 +163,7 @@ pub(crate) fn spawn(
 ) {
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
-    let handle = tokio::spawn(run(request_rx, outcome_tx, state, emitter));
+    let handle = tokio::spawn(run(request_rx, outcome_tx, state, emitter, workspace));
     (request_tx, outcome_rx, handle)
 }
 
@@ -136,6 +172,7 @@ async fn run(
     outcome_tx: mpsc::UnboundedSender<BatchOutcome>,
     state: StateReader,
     emitter: LifecycleEmitter,
+    workspace: WorkspaceContext,
 ) {
     let mut scheduler = BuildBatcher::new();
     let mut rebuild_specs: HashMap<String, RebuildSpec> = HashMap::new();
@@ -144,6 +181,13 @@ async fn run(
     let mut rebuild_outcomes: HashMap<String, mpsc::UnboundedSender<RebuildItemOutcome>> =
         HashMap::new();
     let mut requery_specs: HashMap<String, GraphRequeryRequestItem> = HashMap::new();
+    let mut prepare_specs: HashMap<String, BatchBuildItem> = HashMap::new();
+    let mut prepare_outcomes: HashMap<String, mpsc::UnboundedSender<PrepareOutcome>> =
+        HashMap::new();
+    // `None` until the runner says whether there is a watcher; see the module
+    // docs. Preparation requests arriving before that are parked, not queued.
+    let mut watch_updates: Option<Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>> = None;
+    let mut parked_prepares: Vec<String> = Vec::new();
     // Workers report here; the handles stored in the scheduler are wrappers
     // around these sends, so `abort_in_flight` still kills the real work.
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerDone>();
@@ -151,6 +195,20 @@ async fn run(
     loop {
         tokio::select! {
             request = request_rx.recv() => match request {
+                Some(BatchRequest::QueuePrepare { item, outcome }) => {
+                    let name = item.name.clone();
+                    prepare_outcomes.insert(name.clone(), outcome);
+                    prepare_specs.insert(name.clone(), *item);
+                    if watch_updates.is_some() {
+                        scheduler.queue_prepare(name);
+                    } else if !parked_prepares.contains(&name) {
+                        parked_prepares.push(name);
+                    }
+                }
+                Some(BatchRequest::WatchReady { updates }) => {
+                    watch_updates = Some(updates);
+                    scheduler.queue_prepares(std::mem::take(&mut parked_prepares));
+                }
                 Some(BatchRequest::QueueRebuild { spec, outcome }) => {
                     scheduler.queue_rebuild(spec.name());
                     rebuild_outcomes.insert(spec.name().to_string(), outcome);
@@ -199,6 +257,10 @@ async fn run(
                 // Release the slot before forwarding: anything the
                 // application enqueues must see a free batcher.
                 match done {
+                    WorkerDone::Prepares(outcome) => {
+                        scheduler.finish_prepare_batch();
+                        deliver_prepares(outcome, &emitter, &mut prepare_outcomes);
+                    }
                     WorkerDone::Rebuilds(outcome) => {
                         scheduler.finish_rebuild_batch();
                         deliver_rebuilds(outcome, &mut rebuild_outcomes);
@@ -213,6 +275,14 @@ async fn run(
                 }
             },
             due = scheduler.next_due() => match due {
+                BatchDue::Prepares => flush_prepares(
+                    &mut scheduler,
+                    &mut prepare_specs,
+                    watch_updates.as_ref().and_then(Clone::clone),
+                    &workspace,
+                    &emitter,
+                    &worker_tx,
+                ),
                 BatchDue::Rebuilds => flush_rebuilds(
                     &mut scheduler,
                     &mut rebuild_specs,
@@ -258,6 +328,67 @@ fn deliver_rebuilds(
     for name in &outcome.plain_rebuilds {
         send(name, RebuildItemOutcome::NotBuilt);
     }
+}
+
+/// Hand each item in a finished preparation batch to the supervisor that
+/// asked for it. Same dropped-receiver rule as [`deliver_rebuilds`].
+fn deliver_prepares(
+    outcome: PrepareBatchOutcome,
+    emitter: &LifecycleEmitter,
+    senders: &mut HashMap<String, mpsc::UnboundedSender<PrepareOutcome>>,
+) {
+    for warning in &outcome.warnings {
+        emitter.error_event(warning);
+    }
+    for (name, decided) in outcome.items {
+        if let Some(tx) = senders.get(&name)
+            && tx.send(decided).is_err()
+        {
+            senders.remove(&name);
+        }
+    }
+}
+
+fn flush_prepares(
+    scheduler: &mut BuildBatcher,
+    specs: &mut HashMap<String, BatchBuildItem>,
+    watch_updates: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+    workspace: &WorkspaceContext,
+    emitter: &LifecycleEmitter,
+    worker_tx: &mpsc::UnboundedSender<WorkerDone>,
+) {
+    let names = scheduler.take_pending_prepares();
+    if names.is_empty() {
+        return;
+    }
+    if scheduler.prepare_in_flight() {
+        scheduler.queue_prepares(names);
+        return;
+    }
+    // Deliberately no `coming_up` deferral here — see the module docs. Every
+    // item in this batch is `Building` precisely because it asked for this.
+    let items: Vec<BatchBuildItem> = names.iter().filter_map(|name| specs.remove(name)).collect();
+    if items.is_empty() {
+        return;
+    }
+
+    let emitter = emitter.clone();
+    let base_dir = workspace.base_dir.clone();
+    let global_watch_ignore = workspace.global_watch_ignore.clone();
+    let bazel_build_mutex = scheduler.bazel_mutex();
+    let worker_tx = worker_tx.clone();
+    scheduler.set_prepare_batch(tokio::spawn(async move {
+        let outcome = run_batch_build_chain(
+            items,
+            base_dir,
+            emitter,
+            watch_updates,
+            global_watch_ignore,
+            bazel_build_mutex,
+        )
+        .await;
+        let _ = worker_tx.send(WorkerDone::Prepares(outcome));
+    }));
 }
 
 /// Whether the snapshot says this service is still coming up. Rebuilding a
@@ -426,7 +557,14 @@ mod tests {
         let (writer, reader) = state_store::channel(StateSnapshot::default());
         writer.publish_processes(initial);
         let emitter = test_emitter().await;
-        let (tx, outcome_rx, handle) = spawn(reader, emitter);
+        let (tx, outcome_rx, handle) = spawn(
+            reader,
+            emitter,
+            WorkspaceContext {
+                base_dir: std::env::temp_dir(),
+                global_watch_ignore: Vec::new(),
+            },
+        );
         (writer, tx, outcome_rx, handle)
     }
 

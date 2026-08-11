@@ -4,8 +4,7 @@
 //! connection transitions it to `Pending`, after which the normal dependency
 //! scheduler owns it just like any other service.
 
-use super::build_tools::{PrepareBatchOutcome, PrepareOutcome};
-use super::{ProcessKind, Runner, ServiceState};
+use super::{Runner, ServiceState};
 
 impl Runner {
     /// Record the first proxy connection for a lazy service.
@@ -27,11 +26,9 @@ impl Runner {
         if self.services.contains_key(name) {
             self.narrate_lazy_demand(name);
             self.set_service_state(name, ServiceState::Pending);
-            // Build now, not when dependencies come up: an artifact does not
-            // depend on postgres listening, and waiting would serialise the
-            // build behind a wait it has nothing to do with. Dependencies gate
-            // *running*.
-            self.start_lazy_build_if_needed(name);
+            // Whether an artifact has to be built first is the supervisor's
+            // business: it asked for the build the moment it saw this same
+            // demand, and reports its progress like any other build.
         } else if self.tasks.contains_key(name) {
             self.set_task_state(name, super::TaskState::Pending);
         }
@@ -73,68 +70,6 @@ impl Runner {
                     ),
                 );
             }
-        }
-    }
-
-    /// Start the build-tool chain for a triggered lazy service that has not
-    /// been built yet. Returns whether a build was started.
-    ///
-    /// Called from the demand fold, not from gate publishing: an artifact does
-    /// not depend on a peer being up, so making the build wait for
-    /// dependencies would serialise it behind a wait it has nothing to do
-    /// with. Dependencies gate *running*.
-    pub(in crate::runner) fn start_lazy_build_if_needed(&mut self, name: &str) -> bool {
-        let needs_jit = self.services.get(name).is_some_and(|rs| {
-            rs.state() == ServiceState::Pending
-                && rs.resolved.lazy
-                && rs.resolved.is_build_tool_managed()
-                && !rs.batch_built
-        });
-        if !needs_jit {
-            return false;
-        }
-
-        let process = match self.services.get(name) {
-            Some(rs) => self.build_batch_item(name, ProcessKind::Service, rs),
-            None => return false,
-        };
-        self.output_manager
-            .service_event(name, "first connection — building before start");
-        self.set_service_state(name, ServiceState::Building);
-        self.spawn_lazy_build(name, process);
-        true
-    }
-
-    /// Apply a lazy JIT build result and return successful builds to Pending.
-    /// The normal scheduler then re-checks every dependency before starting.
-    pub(in crate::runner) fn handle_lazy_build_complete(
-        &mut self,
-        name: &str,
-        generation: u64,
-        outcome: PrepareBatchOutcome,
-    ) {
-        let matching_handle = self
-            .lazy_build_handles
-            .get(name)
-            .is_some_and(|(active_generation, _)| *active_generation == generation);
-        if !matching_handle {
-            return;
-        }
-        self.lazy_build_handles.remove(name);
-        let is_current_build = self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.state() == ServiceState::Building);
-        if !is_current_build {
-            return;
-        }
-        let stale = outcome
-            .items
-            .iter()
-            .any(|(item, decided)| item == name && *decided == PrepareOutcome::Stale);
-        self.apply_batch_build_outcome(&outcome);
-        if stale {
-            self.schedule_lazy_build_replay(name);
         }
     }
 }

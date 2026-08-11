@@ -56,6 +56,20 @@ pub(crate) struct TaskExit {
     pub(crate) reply: Option<oneshot::Sender<crate::command::CommandResult>>,
 }
 
+/// Where a process's artifact build has got to. See
+/// [`ProcessReport::ArtifactBuild`].
+pub(crate) enum ArtifactBuildStatus {
+    /// A build was requested and is now in the build manager's hands.
+    Started,
+    /// The artifact exists; the process may run.
+    Ready,
+    /// The build failed. Never retried: recompiling sources that have not
+    /// changed cannot change the answer, so this never reaches the restart
+    /// policy — it is the end of the road for this process until someone
+    /// asks for it by name.
+    Failed(String),
+}
+
 /// Runner-private messages emitted by detached workers.
 /// What an process tells the scheduler, on the lossless report channel.
 ///
@@ -97,9 +111,17 @@ pub(crate) enum ProcessReport {
     /// the watch cycle it opened, which it does by broadcasting the
     /// (unchanged) `RunnerEvent::RebuildComplete`.
     RebuildCycleDone { name: String, success: bool },
-    /// A batch build produced this service's artifact. Folded so the gate's
-    /// `artifact_ready` check knows the service may now run.
-    ServiceArtifactBuilt { name: String },
+    /// A supervisor's artifact build changed state.
+    ///
+    /// The build manager owns building; this exists only so the scheduler's
+    /// projection can say `Building`, so `initial_startup_settled` stays open
+    /// while one runs, and so a rebuild queued mid-build is deferred rather
+    /// than raced. Whether the build *happens* is never the scheduler's call.
+    ArtifactBuild {
+        name: String,
+        kind: ProcessKind,
+        status: ArtifactBuildStatus,
+    },
     /// A supervisor spent its start permission and is beginning a start.
     ///
     /// This is the ack that makes a level-triggered permission single-use

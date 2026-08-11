@@ -62,7 +62,6 @@ use std::time::SystemTime;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use self::build_tools::PrepareBatchOutcome;
 #[cfg(test)]
 use self::build_tools::bazel_graph_requery_group_dir;
 #[cfg(test)]
@@ -85,11 +84,12 @@ pub(in crate::runner) fn refusing_connections(state: ServiceState, live: bool) -
     matches!(state, ServiceState::Failed | ServiceState::DependencyFailed) && !live
 }
 
+/// Whether a build-graph re-query should trigger a rebuild for this service.
+///
+/// Only a service that is actually up: a lazy service nobody has connected to
+/// yet sits in `Lazy`, and cold-starting it because a BUILD file moved would
+/// build — and run — something the user never asked for.
 fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {
-    if service.resolved.lazy && !service.batch_built {
-        return false;
-    }
-
     matches!(
         service.state(),
         ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
@@ -160,20 +160,6 @@ pub enum RunnerCommand {
     },
     /// Initiate graceful shutdown.
     Shutdown,
-}
-
-enum WorkerDone {
-    /// Result of the startup-phase batch build.
-    BatchBuild(PrepareBatchOutcome),
-    /// Result of a just-in-time build for a single lazy service.
-    LazyBuild {
-        name: String,
-        generation: u64,
-        outcome: PrepareBatchOutcome,
-    },
-    /// Completion from a detached rebuild worker for a single service.
-    /// Result of the periodic crates.io update check.
-    UpdateCheck(Option<crate::update::UpdateAvailable>),
 }
 
 /// An event broadcast from the runner for external consumers.
@@ -267,8 +253,11 @@ pub struct Runner {
     // Channels
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
     cmd_rx: mpsc::UnboundedReceiver<RunnerCommand>,
-    internal_tx: mpsc::Sender<WorkerDone>,
-    internal_rx: mpsc::Receiver<WorkerDone>,
+    /// Results from the detached crates.io update checker — the runner's one
+    /// remaining detached worker now that building belongs to the build
+    /// manager.
+    update_tx: mpsc::Sender<Option<crate::update::UpdateAvailable>>,
+    update_rx: mpsc::Receiver<Option<crate::update::UpdateAvailable>>,
     event_tx: broadcast::Sender<RunnerEvent>,
 
     /// The write half of the globally-readable state projection.
@@ -292,23 +281,6 @@ pub struct Runner {
     // main `select!`. It's never `None` after construction until `run()`
     // consumes it.
     shutdown_rx: Option<mpsc::Receiver<()>>,
-
-    /// Detached batch-build task spawned at startup for services/tasks with
-    /// a bazel config. `Some` until [`WorkerDone::BatchBuild`]
-    /// arrives and the handle is consumed. Wrapped in [`AbortOnDrop`] so
-    /// shutting the runner down — or dropping the field before completion —
-    /// aborts the task, dropping the in-flight `Child` (with `kill_on_drop`)
-    /// and sending SIGKILL to the bazel client.
-    batch_build_handle: Option<crate::build_tool::AbortOnDrop<()>>,
-
-    /// Detached JIT build tasks spawned when a lazy service's proxy gets
-    /// its first connection. Keyed by service name. Entries are inserted
-    /// on spawn and removed when [`WorkerDone::LazyBuild`]
-    /// arrives. Wrapped in [`AbortOnDrop`] for the same reason as
-    /// [`Self::batch_build_handle`]: on shutdown we abort any in-flight
-    /// JIT builds so bazel output stops streaming before
-    /// "shutdown complete" is emitted.
-    lazy_build_handles: HashMap<String, (u64, crate::build_tool::AbortOnDrop<()>)>,
 
     /// Detached periodic crates.io update checker.
     update_check_handle: Option<tokio::task::JoinHandle<()>>,
@@ -402,11 +374,10 @@ impl Runner {
         headless: bool,
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (internal_tx, internal_rx) = mpsc::channel(64);
+        let (update_tx, update_rx) = mpsc::channel(64);
         let (event_tx, _) = broadcast::channel(256);
         let (state, state_reader) = state_store::channel(state_store::StateSnapshot::default());
-        let (batcher_tx, batch_outcome_rx, batcher_handle) =
-            build_batcher::spawn(state_reader, output_manager.clone_lifecycle_emitter());
+
         let (report_tx, report_rx) = mpsc::unbounded_channel();
         let (shutdown_flag_tx, _shutdown_flag_rx) = tokio::sync::watch::channel(false);
 
@@ -417,6 +388,22 @@ impl Runner {
         }
 
         let base_dir = setup::canonicalize_base_dir(&base_dir)?;
+        // Resolved once: every supervisor's build spec and the build manager's
+        // own build-graph registrations use the same project-wide list.
+        let global_watch_ignore = crate::process::paths::resolve_watch_ignore_patterns(
+            &base_dir,
+            &[],
+            &base_dir,
+            &config.watch_ignore,
+        );
+        let (batcher_tx, batch_outcome_rx, batcher_handle) = build_batcher::spawn(
+            state_reader,
+            output_manager.clone_lifecycle_emitter(),
+            build_batcher::WorkspaceContext {
+                base_dir: base_dir.clone(),
+                global_watch_ignore: global_watch_ignore.clone(),
+            },
+        );
         let (watch_status_tx, watch_status_reader) = crate::watch::report::status_channel();
         let completions = crate::param_completions::CompletionResolver::new(
             config.tasks.clone(),
@@ -536,6 +523,7 @@ impl Runner {
                 fallback_ports: config.fallback_ports,
                 endpoints: endpoints_reader,
                 shutdown_rx: shutdown_flag_tx.subscribe(),
+                global_watch_ignore: global_watch_ignore.clone(),
             },
             &|name| output_manager.process_output(name),
             &|name| services.get(name).map(|rs| rs.resolved.clone()),
@@ -577,6 +565,7 @@ impl Runner {
             &report_tx,
             &mut gate_readers,
             &shutdown_flag_tx.subscribe(),
+            &batcher_tx,
         );
 
         let (manifest_writer_tx, manifest_writer_handle) = runtime_ports::spawn_manifest_writer(
@@ -595,8 +584,8 @@ impl Runner {
             server_shutdown_tx: None,
             cmd_tx,
             cmd_rx,
-            internal_tx,
-            internal_rx,
+            update_tx,
+            update_rx,
             event_tx,
             state,
             start_gates,
@@ -605,8 +594,6 @@ impl Runner {
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
             watch: None,
-            batch_build_handle: None,
-            lazy_build_handles: HashMap::new(),
             update_check_handle: None,
             service_starts,
             task_supervisors,
@@ -856,27 +843,6 @@ impl Runner {
         self.completions.clone()
     }
 
-    /// Push build-tool facts to a service's supervisor, which owns its own
-    /// start context and cannot derive them.
-    ///
-    /// Sent alongside the shadow update rather than instead of it: the runner
-    /// still reads `resolved` for dependency edges and status.
-    pub(crate) fn configure_supervisor(
-        &self,
-        name: &str,
-        resolved: Option<Box<crate::config::ResolvedService>>,
-        batch_built: Option<bool>,
-    ) {
-        if let Some(handle) = self.service_starts.registry().get(name) {
-            let _ = handle.request(service_supervisor::ServiceCommand::Configure(
-                service_supervisor::ConfigureRequest {
-                    resolved,
-                    batch_built,
-                },
-            ));
-        }
-    }
-
     /// A read-only handle for the global watch report; see
     /// [`crate::watch::report::WatchStatusReader`].
     pub fn watch_status_reader(&self) -> crate::watch::report::WatchStatusReader {
@@ -932,7 +898,7 @@ impl Runner {
             return;
         }
 
-        let internal_tx = self.internal_tx.clone();
+        let update_tx = self.update_tx.clone();
         let mut shutdown_rx = self.shutdown_flag_tx.subscribe();
         self.update_check_handle = Some(tokio::spawn(async move {
             loop {
@@ -944,10 +910,7 @@ impl Runner {
                 tokio::select! {
                     result = check => {
                         if let Ok(update) = result
-                            && internal_tx
-                                .send(WorkerDone::UpdateCheck(update))
-                                .await
-                                .is_err()
+                            && update_tx.send(update).await.is_err()
                         {
                             break;
                         }
@@ -1143,28 +1106,18 @@ impl Runner {
             let _ = self.watch_status_tx.send(Some(None));
         }
 
-        // Kick off batch builds (bazel) as a detached task. The runner
-        // keeps processing the main command loop — shutdown signals,
-        // connection-triggered lazy starts, and non-build-tool services all
-        // stay responsive while bazel crunches. On completion the task posts
-        // `WorkerDone::BatchBuild`, which transitions `Building`
-        // processes to `Pending`/`Failed` and triggers the ready-process sweep.
-        //
-        // The handle is stored as `AbortOnDrop` on `self` so `Shutdown` drops
-        // the in-flight `Child`, whose `kill_on_drop(true)` sends SIGKILL to
-        // the bazel client.
-        let batch_items = self.collect_batch_build_items();
-        for process in &batch_items {
-            match process.kind {
-                ProcessKind::Service => {
-                    self.set_service_state(&process.name, ServiceState::Building)
-                }
-                ProcessKind::Task => self.set_task_state(&process.name, TaskState::Building),
-            }
-        }
-        if !batch_items.is_empty() {
-            self.spawn_startup_batch_build(batch_items);
-        }
+        // Release the build manager. Every supervisor asked for its artifact
+        // as it was constructed, and the manager has been holding those
+        // requests for exactly this moment: watch paths are resolved *by*
+        // those builds and must reach the watcher, so nothing may build until
+        // there is (or provably is not) a watcher to receive them. Holding
+        // them this long is also what makes the whole startup burst one
+        // `bazel build`.
+        let _ = self
+            .batcher_tx
+            .send(build_batcher::BatchRequest::WatchReady {
+                updates: self.watch.as_ref().map(watch_link::WatchHandle::updates),
+            });
 
         // Validate the active dependency graph before starting anything.
         let dep_map = self.build_dep_name_map();
@@ -1285,27 +1238,8 @@ impl Runner {
                             }
                         }
                     }
-                    Some(cmd) = self.internal_rx.recv() => {
-                        match cmd {
-                            WorkerDone::BatchBuild(outcome) => {
-                                // Drop the abort-on-drop handle: the task is done,
-                                // and leaving the handle live would abort after the
-                                // task has already returned (harmless but noisy).
-                                self.batch_build_handle = None;
-                                self.apply_batch_build_outcome(&outcome);
-                                self.schedule_startup_batch_replays(&outcome);
-                            }
-                            WorkerDone::LazyBuild {
-                                name,
-                                generation,
-                                outcome,
-                            } => {
-                                self.handle_lazy_build_complete(&name, generation, outcome);
-                            }
-                            WorkerDone::UpdateCheck(update) => {
-                                self.broadcast_update_check(update);
-                            }
-                        }
+                    Some(update) = self.update_rx.recv() => {
+                        self.broadcast_update_check(update);
                     }
                     Some(report) = self.report_rx.recv() => {
                         match report {
@@ -1331,11 +1265,8 @@ impl Runner {
                                     .event_tx
                                     .send(RunnerEvent::RebuildComplete { name, success });
                             }
-                            ProcessReport::ServiceArtifactBuilt { name } => {
-                                if let Some(rs) = self.services.get_mut(&name) {
-                                    rs.batch_built = true;
-                                }
-                                self.schedule_gate_recompute();
+                            ProcessReport::ArtifactBuild { name, kind, status } => {
+                                self.handle_artifact_build(&name, kind, status);
                             }
                             ProcessReport::ServiceStarting { name, restarting } => {
                                 self.handle_service_starting(&name, restarting);
@@ -1850,74 +1781,62 @@ mod tests {
         (runner, shutdown_tx)
     }
 
+    /// The scheduler's whole part in a build, as a table: it records what
+    /// the supervisor tells it and decides nothing. A `Ready` for a process
+    /// that has moved on since — stopped, restarted — is inert; the artifact
+    /// is simply there when that process next needs it.
     #[tokio::test(flavor = "current_thread")]
-    async fn lazy_jit_completion_rechecks_dependencies_before_start() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-        if let Some(service) = runner.services.get_mut("api") {
-            service.resolved.lazy = true;
-            service.resolved.depends_on = vec![crate::config::Dependency::blocking("setup")];
+    async fn artifact_build_reports_only_move_a_process_still_waiting() {
+        struct Case {
+            name: &'static str,
+            before: ServiceState,
+            status: crate::process::ArtifactBuildStatus,
+            want: ServiceState,
         }
-        // Stand in for the `spawn_lazy_build` this fold normally answers.
-        runner.lazy_build_handles.insert(
-            "api".to_string(),
-            (
-                1,
-                crate::build_tool::AbortOnDrop::new(tokio::spawn(std::future::pending())),
-            ),
-        );
-        runner.set_service_state("api", ServiceState::Building);
 
-        runner.handle_lazy_build_complete(
-            "api",
-            1,
-            build_tools::PrepareBatchOutcome {
-                warnings: Vec::new(),
-                items: vec![(
-                    "api".to_string(),
-                    build_tools::PrepareOutcome::Ready { binary_path: None },
-                )],
+        let cases = vec![
+            Case {
+                name: "a requested build shows as Building",
+                before: ServiceState::Pending,
+                status: crate::process::ArtifactBuildStatus::Started,
+                want: ServiceState::Building,
             },
-        );
-        runner.publish_start_gates().await;
+            Case {
+                name: "a lazy service demanded then built returns to the scheduler",
+                before: ServiceState::Building,
+                status: crate::process::ArtifactBuildStatus::Ready,
+                want: ServiceState::Pending,
+            },
+            Case {
+                // Never retried: the restart policy is for failures where
+                // waiting can change the answer, and a compile is not one.
+                name: "a build failure is terminal",
+                before: ServiceState::Building,
+                status: crate::process::ArtifactBuildStatus::Failed("boom".to_string()),
+                want: ServiceState::Failed,
+            },
+            Case {
+                name: "a service stopped mid-build stays stopped",
+                before: ServiceState::Stopped,
+                status: crate::process::ArtifactBuildStatus::Ready,
+                want: ServiceState::Stopped,
+            },
+        ];
 
-        let service = runner.services.get("api").unwrap();
-        assert_eq!(service.state(), ServiceState::Pending);
-    }
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+            runner.set_service_state("api", case.before);
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn stale_lazy_jit_completion_does_not_overwrite_newer_service_operation() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-        if let Some(service) = runner.services.get_mut("api") {
-            service.resolved.lazy = true;
+            runner.handle_artifact_build("api", ProcessKind::Service, case.status);
+
+            assert_eq!(
+                runner.services.get("api").map(|service| service.state()),
+                Some(case.want),
+                "case '{}'",
+                case.name,
+            );
         }
-        // A newer lazy build (generation 2) is the in-flight one; the
-        // completion below claims to be generation 1.
-        runner.lazy_build_handles.insert(
-            "api".to_string(),
-            (
-                2,
-                crate::build_tool::AbortOnDrop::new(tokio::spawn(std::future::pending())),
-            ),
-        );
-        runner.set_service_state("api", ServiceState::Building);
-
-        runner.handle_lazy_build_complete(
-            "api",
-            1,
-            build_tools::PrepareBatchOutcome {
-                warnings: Vec::new(),
-                items: vec![(
-                    "api".to_string(),
-                    build_tools::PrepareOutcome::Failed("stale build failure".to_string()),
-                )],
-            },
-        );
-
-        let service = runner.services.get("api").unwrap();
-        assert_eq!(service.state(), ServiceState::Building);
-        assert!(!service.batch_built);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2386,7 +2305,6 @@ mod tests {
         );
 
         assert_eq!(rs.state(), ServiceState::Pending);
-        assert!(!rs.batch_built);
         assert!(rs.resolved.kind.is_none());
 
         struct Case {
@@ -2477,7 +2395,6 @@ mod tests {
             name: &'static str,
             state: ServiceState,
             lazy: bool,
-            batch_built: bool,
             expected: bool,
         }
 
@@ -2486,34 +2403,30 @@ mod tests {
                 name: "ready non-lazy rebuilds",
                 state: ServiceState::Ready,
                 lazy: false,
-                batch_built: true,
                 expected: true,
             },
             Case {
                 name: "running non-lazy rebuilds",
                 state: ServiceState::Running,
                 lazy: false,
-                batch_built: true,
                 expected: true,
             },
             Case {
                 name: "untouched lazy service does not cold start",
                 state: ServiceState::Lazy,
                 lazy: true,
-                batch_built: false,
                 expected: false,
             },
             Case {
                 name: "pending service does not rebuild",
                 state: ServiceState::Pending,
                 lazy: false,
-                batch_built: true,
                 expected: false,
             },
         ];
 
         for case in cases {
-            let mut service = RuntimeService::new(
+            let service = RuntimeService::new(
                 ResolvedService {
                     dir: None,
                     env: HashMap::new(),
@@ -2538,7 +2451,6 @@ mod tests {
                 },
                 case.state,
             );
-            service.batch_built = case.batch_built;
 
             assert_eq!(
                 should_rebuild_after_graph_requery(&service),

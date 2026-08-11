@@ -7,12 +7,18 @@
 //! Bazel's server lock and takes an order of magnitude longer than one
 //! invocation naming a dozen targets.
 //!
+//! The same is true of the *first* build. Every supervisor asks for its
+//! artifact the moment it is constructed — dependencies gate running, not
+//! building — so a workspace of thirty services fires thirty requests inside
+//! a millisecond, and they must become one `bazel build` naming thirty
+//! targets.
+//!
 //! [`BuildBatcher`] owns that coalescing: the queues, the batch windows, the
 //! in-flight handles, and the mutex that serialises Bazel. It deliberately
-//! does *not* decide what a rebuild means — which items are eligible, what
-//! target each maps to, and what happens when the build finishes are all
-//! runner concerns, because they need the runner's item state. This owns
-//! *when* work runs and *that only one batch runs at a time*.
+//! does *not* decide what a build means — which items are eligible, what
+//! target each maps to, and what happens when the build finishes belong to
+//! the supervisor that owns the process. This owns *when* work runs and
+//! *that only one batch of a kind runs at a time*.
 //!
 //! The batch windows are the reason [`queue_rebuild`](BuildBatcher::queue_rebuild)
 //! and friends arm the deadline themselves rather than leaving it to callers.
@@ -39,6 +45,14 @@ const REBUILD_BATCH_WINDOW: Duration = Duration::from_millis(50);
 /// one is about to follow.
 const GRAPH_REQUERY_WINDOW: Duration = Duration::from_millis(100);
 
+/// How long to collect artifact-preparation requests before running them.
+///
+/// Supervisors ask as they are constructed, which is one synchronous burst;
+/// this only has to be wide enough to span it. Getting this wrong is the one
+/// regression the "ask at construction" rule exists to avoid — a window that
+/// closed too early would give bazel one invocation per service.
+const PREPARE_BATCH_WINDOW: Duration = Duration::from_millis(50);
+
 /// Coalesces build-tool rebuilds and build-graph re-queries.
 ///
 /// One per runner. See the module docs for what this does and does not own.
@@ -63,6 +77,13 @@ pub(crate) struct BuildBatcher {
     requery_deadline: Option<Instant>,
     /// The in-flight re-query batch.
     requery_handle: Option<AbortOnDrop<()>>,
+
+    /// Items queued for the next artifact-preparation batch.
+    pending_prepares: Vec<String>,
+    /// When the current preparation window closes.
+    prepare_deadline: Option<Instant>,
+    /// The in-flight preparation batch.
+    prepare_handle: Option<AbortOnDrop<()>>,
 }
 
 impl BuildBatcher {
@@ -75,6 +96,9 @@ impl BuildBatcher {
             pending_requeries: Vec::new(),
             requery_deadline: None,
             requery_handle: None,
+            pending_prepares: Vec::new(),
+            prepare_deadline: None,
+            prepare_handle: None,
         }
     }
 
@@ -192,6 +216,49 @@ impl BuildBatcher {
         }
     }
 
+    // -- artifact preparation batch ---------------------------------------
+
+    /// Queue `name` for the next preparation batch and (re)open the window.
+    pub(crate) fn queue_prepare(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if !self.pending_prepares.contains(&name) {
+            self.pending_prepares.push(name);
+        }
+        self.prepare_deadline = Some(Instant::now() + PREPARE_BATCH_WINDOW);
+    }
+
+    /// Take everything queued and close the window. Same contract as
+    /// [`take_pending_rebuilds`](Self::take_pending_rebuilds).
+    pub(crate) fn take_pending_prepares(&mut self) -> Vec<String> {
+        self.prepare_deadline = None;
+        std::mem::take(&mut self.pending_prepares)
+    }
+
+    pub(crate) fn queue_prepares<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for name in names {
+            self.queue_prepare(name);
+        }
+    }
+
+    pub(crate) fn prepare_in_flight(&self) -> bool {
+        self.prepare_handle.is_some()
+    }
+
+    pub(crate) fn set_prepare_batch(&mut self, handle: tokio::task::JoinHandle<()>) {
+        self.prepare_handle = Some(AbortOnDrop::new(handle));
+    }
+
+    pub(crate) fn finish_prepare_batch(&mut self) {
+        self.prepare_handle = None;
+        if !self.pending_prepares.is_empty() {
+            self.prepare_deadline = Some(Instant::now() + PREPARE_BATCH_WINDOW);
+        }
+    }
+
     // -- driving ----------------------------------------------------------
 
     /// Resolve once a batch window closes.
@@ -200,46 +267,50 @@ impl BuildBatcher {
     /// `select!` arm unconditionally. The returned [`BatchDue`] says which
     /// queue to flush.
     pub(crate) async fn next_due(&self) -> BatchDue {
-        match (self.rebuild_deadline, self.requery_deadline) {
-            (Some(rebuild), Some(requery)) => {
-                if rebuild <= requery {
-                    tokio::time::sleep_until(rebuild).await;
-                    BatchDue::Rebuilds
-                } else {
-                    tokio::time::sleep_until(requery).await;
-                    BatchDue::Requeries
-                }
+        let soonest = [
+            (self.prepare_deadline, BatchDue::Prepares),
+            (self.rebuild_deadline, BatchDue::Rebuilds),
+            (self.requery_deadline, BatchDue::Requeries),
+        ]
+        .into_iter()
+        .filter_map(|(deadline, kind)| deadline.map(|at| (at, kind)))
+        .min_by_key(|(at, _)| *at);
+        match soonest {
+            Some((at, kind)) => {
+                tokio::time::sleep_until(at).await;
+                kind
             }
-            (Some(rebuild), None) => {
-                tokio::time::sleep_until(rebuild).await;
-                BatchDue::Rebuilds
-            }
-            (None, Some(requery)) => {
-                tokio::time::sleep_until(requery).await;
-                BatchDue::Requeries
-            }
-            (None, None) => std::future::pending().await,
+            None => std::future::pending().await,
         }
     }
 
-    /// Abort any in-flight batch and wait for it to actually unwind.
+    /// Abort every in-flight batch and wait for them to actually unwind.
     ///
-    /// Awaiting matters as much as aborting. The worker holds
+    /// Awaiting matters as much as aborting. The workers hold
     /// [`LifecycleEmitter`] clones and the `Child` inside has
     /// `kill_on_drop(true)`, so dropping the aborted future is what SIGKILLs
     /// the bazel client — and `OutputManager::shutdown` blocks until
-    /// every sink handle is gone. The 5s bound guards the pathological case
-    /// of a stuck bazel pipe: better to continue shutdown than wedge on it.
+    /// every sink handle is gone. The 5s bound is shared across all three
+    /// rather than paid per batch: it guards the pathological case of a stuck
+    /// bazel pipe, and teardown's own budget is finite.
     ///
     /// [`LifecycleEmitter`]: crate::output::LifecycleEmitter
     pub(crate) async fn abort_in_flight(&mut self) {
-        let guards = [self.rebuild_handle.take(), self.requery_handle.take()];
-        for guard in guards {
-            let Some(handle) = guard.and_then(AbortOnDrop::into_inner) else {
-                continue;
-            };
+        let handles: Vec<tokio::task::JoinHandle<()>> = [
+            self.prepare_handle.take(),
+            self.rebuild_handle.take(),
+            self.requery_handle.take(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(AbortOnDrop::into_inner)
+        .collect();
+        for handle in &handles {
             handle.abort();
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for handle in handles {
+            let _ = tokio::time::timeout_at(deadline, handle).await;
         }
     }
 }
@@ -247,6 +318,7 @@ impl BuildBatcher {
 /// Which queue's batch window has closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatchDue {
+    Prepares,
     Rebuilds,
     Requeries,
 }
@@ -397,11 +469,13 @@ mod tests {
             std::future::pending::<()>().await;
         }));
         batcher.set_requery_batch(tokio::spawn(std::future::pending()));
+        batcher.set_prepare_batch(tokio::spawn(std::future::pending()));
 
         batcher.abort_in_flight().await;
 
         assert!(!batcher.rebuild_in_flight());
         assert!(!batcher.requery_in_flight());
+        assert!(!batcher.prepare_in_flight());
         assert!(
             rx.await.is_err(),
             "abort_in_flight must await the task, not just fire an abort"

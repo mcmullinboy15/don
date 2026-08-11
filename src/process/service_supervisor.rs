@@ -41,15 +41,6 @@ pub(crate) struct StartRequest {
     pub(crate) fresh_backend_ports: bool,
 }
 
-/// Build-tool facts the runner learns from the batcher and the supervisor
-/// cannot derive. Each field is `None` when that fact did not change.
-pub(crate) struct ConfigureRequest {
-    /// A re-resolved config — currently only the bazel-binary rewrite.
-    pub(crate) resolved: Option<Box<crate::config::ResolvedService>>,
-    /// Whether the startup batch build has produced this service's artifact.
-    pub(crate) batch_built: Option<bool>,
-}
-
 /// One request to stop and immediately start again, as one operation.
 ///
 /// Restart is a single command rather than a stop the scheduler follows up
@@ -109,11 +100,6 @@ pub(crate) enum ServiceCommand {
     /// The reply waits for the output reader to drain, so "stopped" can
     /// never outrun the process's last lines.
     Stop(StopRequest),
-    /// Build-tool resolution changed what this service *is*: a bazel binary
-    /// path resolved, or a batch build completed. Applied immediately like a
-    /// proxy directive; mailbox FIFO gives the only ordering that matters —
-    /// a `Configure` sent before a `Start` is applied first.
-    Configure(ConfigureRequest),
     /// Adjust the owned proxy. Applied immediately, even while a start is
     /// being prepared — a proxy directive is never a supersession.
     Proxy(ProxyDirective),
@@ -212,10 +198,14 @@ pub(crate) struct StartEnv {
     /// a supervisor cannot spawn into a shutdown the runner has already
     /// planned around — which is why the gate needs no teardown revocation.
     pub(crate) shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    /// The build batcher's mailbox. Rebuilds are coalesced across services —
-    /// one `bazel build` for N targets — so the batching stays shared even
+    /// The build manager's mailbox. Every build this supervisor needs —
+    /// the first one as much as a rebuild — is asked for here, because
+    /// coalescing is cross-service (one `bazel build` for N targets) even
     /// though the cycle it feeds belongs to each supervisor.
     pub(crate) batcher_tx: mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
+    /// Project-wide watch-ignore patterns, for the build spec this supervisor
+    /// hands the build manager.
+    pub(crate) global_watch_ignore: Vec<String>,
 }
 
 /// Owner half for services.
@@ -340,8 +330,18 @@ async fn supervise(
     // mailbox as "supervisor is gone".
     let Some(mut resolved) = resolved else { return };
     let service_writer = output.as_ref().map(|output| output.writer());
-    // Build-tool facts, kept current by `ServiceCommand::Configure`.
+    // Whether the build manager has produced this service's artifact, so the
+    // per-service build inside `start_service_worker` must not run again.
     let mut batch_built = false;
+    // Where the build manager delivers this service's artifact.
+    let (prepare_tx, mut prepare_rx) =
+        mpsc::unbounded_channel::<crate::build_tool::batch::PrepareOutcome>();
+    // An artifact request is outstanding. A supervisor that needs an artifact
+    // does not spawn until it has one, whatever its gate says — an artifact is
+    // as much a precondition as a dependency, and getting it is its own job.
+    let mut awaiting_artifact = resolved.is_build_tool_managed()
+        && !resolved.lazy
+        && request_artifact(&name, &resolved, &env, &prepare_tx, &report_tx);
     // Whether anything wants this service running. One-shot: see `Demand`.
     // A lazy service starts life unwanted and is demanded by its first
     // connection; everything else is wanted from the moment it exists.
@@ -431,6 +431,7 @@ async fn supervise(
                 // is what stops a crashing service relaunching off a gate
                 // that stays open across the crash. See `Demand`.
                 if held.is_none()
+                    && !awaiting_artifact
                     && !*env.shutdown_rx.borrow()
                     && gate.as_ref().is_some_and(|reader| {
                         let grant = reader.get();
@@ -557,6 +558,66 @@ async fn supervise(
                         }
                         continue;
                     }
+                    // This service's artifact, from the build manager.
+                    // Nothing has spawned yet, and nothing can until this
+                    // lands — which is also what puts the watch registrations
+                    // this build resolved in place before the first start.
+                    outcome = prepare_rx.recv() => {
+                        use crate::build_tool::batch::PrepareOutcome;
+                        let Some(outcome) = outcome else { continue };
+                        busy.store(true, Ordering::Relaxed);
+                        match outcome {
+                            PrepareOutcome::Ready { binary_path } => {
+                                awaiting_artifact = false;
+                                batch_built = true;
+                                // Written onto the config this supervisor
+                                // already holds — the build taught us the path
+                                // and nothing else.
+                                if let Some(path) = binary_path {
+                                    resolved.resolved_binary_path = Some(path);
+                                }
+                                if report_tx
+                                    .send(super::ProcessReport::ArtifactBuild {
+                                        name: name.clone(),
+                                        kind: super::ProcessKind::Service,
+                                        status: super::ArtifactBuildStatus::Ready,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            // A watched file changed while the build ran, so
+                            // the artifact is already out of date. The build
+                            // manager narrated why; ask again. The service
+                            // stays `Building` throughout, so nothing starts
+                            // against it.
+                            PrepareOutcome::Stale => {
+                                awaiting_artifact = request_artifact(
+                                    &name, &resolved, &env, &prepare_tx, &report_tx,
+                                );
+                            }
+                            PrepareOutcome::Failed(message) => {
+                                awaiting_artifact = false;
+                                // The end of the road, not a crash. Retrying a
+                                // compile that just failed recompiles the same
+                                // broken sources, so withdrawing demand here is
+                                // what keeps this away from the restart policy.
+                                demand = super::Demand::None;
+                                if report_tx
+                                    .send(super::ProcessReport::ArtifactBuild {
+                                        name: name.clone(),
+                                        kind: super::ProcessKind::Service,
+                                        status: super::ArtifactBuildStatus::Failed(message),
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // This service's share of a finished batch. The cycle
                     // continues here rather than in the scheduler, so the
                     // build, the stop and the spawn are one sequence in one
@@ -673,6 +734,23 @@ async fn supervise(
                                     name: name.clone(),
                                     demand,
                                 });
+                                // A lazy service is the one thing that does
+                                // not build at construction: nobody had asked
+                                // for it yet. Now somebody has — and it still
+                                // builds before its dependencies are checked,
+                                // for the same reason everything else does.
+                                if resolved.is_build_tool_managed()
+                                    && !batch_built
+                                    && !awaiting_artifact
+                                {
+                                    env.emitter.service_event(
+                                        &name,
+                                        "first connection — building before start",
+                                    );
+                                    awaiting_artifact = request_artifact(
+                                        &name, &resolved, &env, &prepare_tx, &report_tx,
+                                    );
+                                }
                             }
                             // Every trigger sender is gone (proxy shut down);
                             // stop selecting on a closed channel.
@@ -689,16 +767,6 @@ async fn supervise(
             fresh_backend_ports,
         } = match command {
             ServiceCommand::Start(request) => request,
-            ServiceCommand::Configure(request) => {
-                if let Some(next) = request.resolved {
-                    resolved = *next;
-                }
-                if let Some(next) = request.batch_built {
-                    batch_built = next;
-                }
-                policy.reconfigure(resolved.on_failure, resolved.lazy);
-                continue;
-            }
             ServiceCommand::Proxy(directive) => {
                 apply_proxy_directive(&name, &env.emitter, &mut proxy, directive);
                 continue;
@@ -1223,6 +1291,57 @@ enum CycleNext {
     Stop,
 }
 
+/// Ask the build manager for this service's artifact, and tell the scheduler
+/// a build is under way. Returns whether a request is now outstanding.
+///
+/// Sent when the supervisor is *constructed*, not when its gate opens.
+/// An artifact does not depend on postgres listening, so building at gate-open
+/// would serialise every build along the dependency chain — and hand bazel one
+/// invocation per service instead of one for the whole workspace. Dependencies
+/// gate *running*.
+///
+/// The report goes first so that "a build is outstanding" is never claimed
+/// without the scheduler having been told; a dead scheduler means this
+/// supervisor is about to end anyway.
+fn request_artifact(
+    name: &str,
+    resolved: &crate::config::ResolvedService,
+    env: &StartEnv,
+    outcome: &mpsc::UnboundedSender<crate::build_tool::batch::PrepareOutcome>,
+    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
+) -> bool {
+    if report_tx
+        .send(super::ProcessReport::ArtifactBuild {
+            name: name.to_string(),
+            kind: super::ProcessKind::Service,
+            status: super::ArtifactBuildStatus::Started,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let working_dir = super::paths::working_dir_for(&env.base_dir, resolved.dir.as_deref());
+    let ignore = super::paths::resolve_watch_ignore_patterns(
+        &working_dir,
+        &resolved.ignore,
+        &env.base_dir,
+        &env.global_watch_ignore,
+    );
+    env.batcher_tx
+        .send(crate::build_tool::batcher::BatchRequest::QueuePrepare {
+            item: Box::new(crate::build_tool::batch::BatchBuildItem {
+                name: name.to_string(),
+                kind: super::ProcessKind::Service,
+                bazel: resolved.bazel_config().cloned(),
+                watch_enabled: resolved.build_tool_watch_enabled(),
+                working_dir,
+                ignore,
+            }),
+            outcome: outcome.clone(),
+        })
+        .is_ok()
+}
+
 /// Capture what the batcher needs to rebuild this service. Resolved config is
 /// fixed after construction, so a spec built now equals one built at flush
 /// time — which is what frees the batcher from reading anyone's state.
@@ -1322,14 +1441,6 @@ fn settle_cycle(
         }
         Item::Built => {
             *batch_built = true;
-            if report_tx
-                .send(super::ProcessReport::ServiceArtifactBuilt {
-                    name: name.to_string(),
-                })
-                .is_err()
-            {
-                return CycleNext::Stop;
-            }
             if stale {
                 // Skip restarting into an artifact already known to be out of
                 // date, but remember that the process is now behind a
@@ -1844,6 +1955,7 @@ mod tests {
             emitter: output_manager.clone_lifecycle_emitter(),
             shutdown: ShutdownConfig::default(),
             fallback_ports: false,
+            global_watch_ignore: Vec::new(),
             shutdown_rx: {
                 let (tx, rx) = tokio::sync::watch::channel(false);
                 std::mem::forget(tx);

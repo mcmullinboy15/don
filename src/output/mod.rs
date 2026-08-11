@@ -1601,6 +1601,19 @@ impl LifecycleEmitter {
         });
     }
 
+    /// Emit an untagged `[don]` error event — a workspace-level problem with
+    /// no single process to blame, such as a build-tool query that failed for
+    /// a whole bazel workspace.
+    pub fn error_event(&self, message: &str) {
+        let _ = self.stdout_sink.send(SinkLine {
+            prefix: Bytes::from(self.don_prefix.clone()),
+            line: Bytes::from(format!("{message}\n")),
+            name: LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            is_verbose: false,
+        });
+    }
+
     /// Emit a `[don]` error event scoped to a service. Tagged with the
     /// service name.
     pub fn service_error_event(&self, service: &str, message: &str) {

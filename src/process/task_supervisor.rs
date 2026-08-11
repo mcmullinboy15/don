@@ -68,6 +68,7 @@ pub(crate) enum TaskRunReport {
 /// [`Supervisors::spawn_all`].
 ///
 /// [`Supervisors::spawn_all`]: super::registry::Supervisors::spawn_all
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     ctx: &super::task_worker::TaskWorkerContext,
@@ -76,6 +77,7 @@ pub(crate) fn spawn_supervisors<'a>(
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     gates: &mut std::collections::HashMap<String, crate::gate::GateReader>,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+    batcher_tx: &mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
 ) -> TaskSupervisors {
     TaskSupervisors::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
@@ -91,8 +93,55 @@ pub(crate) fn spawn_supervisors<'a>(
             startup,
             gate,
             shutdown_rx.clone(),
+            batcher_tx.clone(),
         )
     })
+}
+
+/// Ask the build manager for this task's artifact, and tell the scheduler a
+/// build is under way. Returns whether a request is now outstanding.
+///
+/// The service side's rule applies unchanged: asked for at construction, not
+/// at gate-open, so the whole workspace coalesces into one invocation. See
+/// [`super::service_supervisor`].
+fn request_artifact(
+    name: &str,
+    task_cfg: &crate::config::Task,
+    ctx: &super::task_worker::TaskWorkerContext,
+    outcome: &mpsc::UnboundedSender<crate::build_tool::batch::PrepareOutcome>,
+    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
+    batcher_tx: &mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
+) -> bool {
+    if report_tx
+        .send(super::ProcessReport::ArtifactBuild {
+            name: name.to_string(),
+            kind: super::ProcessKind::Task,
+            status: super::ArtifactBuildStatus::Started,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let working_dir = working_dir_for(&ctx.base_dir, task_cfg.dir.as_deref());
+    let ignore = resolve_watch_ignore_patterns(
+        &working_dir,
+        &task_cfg.ignore,
+        &ctx.base_dir,
+        &ctx.global_watch_ignore,
+    );
+    batcher_tx
+        .send(crate::build_tool::batcher::BatchRequest::QueuePrepare {
+            item: Box::new(crate::build_tool::batch::BatchBuildItem {
+                name: name.to_string(),
+                kind: super::ProcessKind::Task,
+                bazel: task_cfg.bazel.clone(),
+                watch_enabled: task_cfg.build_tool_watch_enabled(),
+                working_dir,
+                ignore,
+            }),
+            outcome: outcome.clone(),
+        })
+        .is_ok()
 }
 
 /// What a task needs to issue its own startup run when permitted.
@@ -123,10 +172,26 @@ async fn supervise(
     startup: Option<StartupConfig>,
     mut gate: Option<crate::gate::GateReader>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    batcher_tx: mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
 ) {
     let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<RunRequest> = None;
     let mut mailbox_closed = false;
+    // Where the build manager delivers this task's artifact. A task with a
+    // bazel target needs it built before it runs, exactly like a service.
+    let (prepare_tx, mut prepare_rx) =
+        mpsc::unbounded_channel::<crate::build_tool::batch::PrepareOutcome>();
+    let mut awaiting_artifact = match startup.as_ref() {
+        Some(startup) if startup.task_cfg.bazel.is_some() => request_artifact(
+            &name,
+            &startup.task_cfg,
+            &ctx,
+            &prepare_tx,
+            &report_tx,
+            &batcher_tx,
+        ),
+        _ => false,
+    };
     // A task is wanted from the moment it exists; its startup evaluation
     // decides whether it actually needs to run.
     let mut demand = super::Demand::Scheduled;
@@ -148,6 +213,7 @@ async fn supervise(
                 // worker below, which already owns it.
                 let permitted = startup
                     .as_ref()
+                    .filter(|_| !awaiting_artifact)
                     .filter(|_| {
                         gate.as_ref().is_some_and(|g| {
                             let grant = g.get();
@@ -190,6 +256,53 @@ async fn supervise(
                             changed = wait_gate(&mut gate), if gate.is_some() => {
                                 if changed.is_none() {
                                     gate = None;
+                                }
+                                continue;
+                            }
+                            // This task's artifact, from the build manager.
+                            outcome = prepare_rx.recv() => {
+                                use crate::build_tool::batch::PrepareOutcome;
+                                let Some(outcome) = outcome else { continue };
+                                let status = match outcome {
+                                    // Nothing to record: a task runs the
+                                    // command it was configured with, and the
+                                    // build only had to make the target exist.
+                                    PrepareOutcome::Ready { .. } => {
+                                        awaiting_artifact = false;
+                                        super::ArtifactBuildStatus::Ready
+                                    }
+                                    // Sources changed mid-build; the build
+                                    // manager said so. Ask again.
+                                    PrepareOutcome::Stale => {
+                                        awaiting_artifact = match startup.as_ref() {
+                                            Some(startup) => request_artifact(
+                                                &name,
+                                                &startup.task_cfg,
+                                                &ctx,
+                                                &prepare_tx,
+                                                &report_tx,
+                                                &batcher_tx,
+                                            ),
+                                            None => false,
+                                        };
+                                        continue;
+                                    }
+                                    PrepareOutcome::Failed(message) => {
+                                        awaiting_artifact = false;
+                                        // Not retried — see the service side.
+                                        demand = super::Demand::None;
+                                        super::ArtifactBuildStatus::Failed(message)
+                                    }
+                                };
+                                if report_tx
+                                    .send(super::ProcessReport::ArtifactBuild {
+                                        name: name.clone(),
+                                        kind: super::ProcessKind::Task,
+                                        status,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
                                 }
                                 continue;
                             }
@@ -777,6 +890,12 @@ mod tests {
             &report_tx,
             &mut gates,
             &shutdown_rx,
+            &{
+                let (tx, rx) = mpsc::unbounded_channel();
+                // Keep the receiver alive so sends succeed; nothing drains it.
+                std::mem::forget(rx);
+                tx
+            },
         );
         let registry = supervisors.registry().clone();
 

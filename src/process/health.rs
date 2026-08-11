@@ -106,12 +106,6 @@ impl RestartPolicy {
         }
     }
 
-    /// Keep the policy current with a config the supervisor re-resolved.
-    pub(crate) fn reconfigure(&mut self, on_failure: crate::config::OnFailure, lazy: bool) {
-        self.on_failure = on_failure;
-        self.lazy_with_proxy = lazy && self.lazy_with_proxy;
-    }
-
     /// The service reached `Ready`. Clears the backoff counter but *not* the
     /// rapid-crash streak: that is cleared only by a spawn that survives past
     /// the crash window, so a service that flaps Ready-then-dead still trips

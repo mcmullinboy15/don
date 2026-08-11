@@ -35,8 +35,6 @@ pub(crate) struct RuntimeService {
     /// "ready" lifecycle line; manual/rebuild starts instead close the
     /// watch cycle with `RebuildComplete`.
     pub(in crate::runner) scheduled_start: bool,
-    /// Whether this service was built during the batch build phase.
-    pub batch_built: bool,
     /// Whether this service's supervisor has an auto-restart armed. A
     /// projection of the policy decision it reported, not a decision — the
     /// scheduler reads it so a stack sitting in a backoff still counts as
@@ -55,7 +53,6 @@ impl RuntimeService {
             resolved,
 
             scheduled_start: false,
-            batch_built: false,
             restart_pending: false,
         }
     }

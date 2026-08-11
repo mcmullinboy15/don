@@ -26,23 +26,13 @@ impl Runner {
         // waiting on Ctrl+C, and stopping services takes long enough that the
         // withdrawal normally lands well before we exit.
 
-        // Abort the detached batch-build task and await its termination so
-        // it can't keep any `LifecycleEmitter`/`SinkHandle` clones alive
-        // past shutdown. The `Child` inside has `kill_on_drop(true)`, so
-        // dropping the aborted future SIGKILLs the bazel client;
-        // awaiting the JoinHandle guarantees the drop has actually run
-        // before we continue. A 5s timeout guards against the pathological
-        // case where the inner reader tasks don't drop promptly — we'd
-        // rather continue shutdown than wedge on a stuck bazel pipe.
-        if let Some(guard) = self.batch_build_handle.take()
-            && let Some(handle) = guard.into_inner()
-        {
-            handle.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        }
-        // Same treatment for the batched rebuild / graph re-query workers:
-        // the batcher actor aborts its in-flight batches (bounded joins
-        // inside) and exits, so no new batch can spawn mid-teardown.
+        // End the build manager. It aborts every in-flight batch — the first
+        // build as much as a rebuild or a re-query — and awaits them, so no
+        // `LifecycleEmitter`/`SinkHandle` clone outlives shutdown and no new
+        // batch can spawn mid-teardown. The `Child` inside has
+        // `kill_on_drop(true)`, so dropping the aborted future SIGKILLs the
+        // bazel client; the bounded joins inside guarantee the drop has run
+        // before this returns.
         let (batcher_done_tx, batcher_done_rx) = tokio::sync::oneshot::channel();
         if self
             .batcher_tx
@@ -91,22 +81,6 @@ impl Runner {
         // teardown tail, once the stops have joined and the task pgid sweep
         // has run — aborting earlier would drop held handles (kill_on_drop)
         // before the graceful path decides anything.
-
-        // Same treatment for any in-flight JIT lazy builds. These are
-        // spawned when a lazy service's proxy gets its first connection
-        // and, until this was tracked, would keep streaming bazel
-        // output long past "shutdown complete".
-        let lazy_handles: Vec<tokio::task::JoinHandle<()>> = self
-            .lazy_build_handles
-            .drain()
-            .filter_map(|(_, (_, guard))| guard.into_inner())
-            .collect();
-        for h in &lazy_handles {
-            h.abort();
-        }
-        for h in lazy_handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
-        }
 
         self.drain_late_worker_results().await;
 
@@ -399,7 +373,7 @@ impl Runner {
                 _ => {}
             }
         }
-        while self.internal_rx.try_recv().is_ok() {}
+        while self.update_rx.try_recv().is_ok() {}
     }
 
     /// Ask a supervisor to stop whatever it holds, without waiting.
