@@ -32,9 +32,6 @@ pub struct WatchReport {
     /// Number of errors the notify backend has reported since startup.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub notify_error_count: u64,
-    /// Number of runner events the watcher missed due to channel lag.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub runner_event_lag_count: u64,
     /// The most recent notify backend error, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_notify_error: Option<String>,
@@ -58,8 +55,6 @@ pub struct WatchReportItem {
     pub kind: String,
     /// Current watch state (idle, debouncing, rebuilding, …).
     pub state: String,
-    /// Whether a change arrived during the current rebuild cycle.
-    pub stale: bool,
     /// Effective debounce in milliseconds.
     pub debounce_ms: u64,
     /// Resolved watch patterns.
@@ -95,7 +90,6 @@ pub(crate) fn build_watch_report(snapshot: &WatchSnapshot) -> WatchReport {
             name: name.clone(),
             kind: item.kind.to_string(),
             state: item.state.to_string(),
-            stale: item.stale,
             debounce_ms: item.debounce_ms,
             patterns: item.patterns.clone(),
             ignore_patterns: item.ignore_patterns.clone(),
@@ -109,7 +103,6 @@ pub(crate) fn build_watch_report(snapshot: &WatchSnapshot) -> WatchReport {
         items,
         global_ignore: snapshot.global_ignore.clone(),
         notify_error_count: snapshot.notify_error_count,
-        runner_event_lag_count: snapshot.runner_event_lag_count,
         last_notify_error: snapshot.last_notify_error.clone(),
     }
 }

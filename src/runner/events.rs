@@ -1,5 +1,5 @@
 use super::support::format_duration;
-use super::{CommandError, CommandResult, Runner, RunnerEvent, TaskExit, TaskState};
+use super::{CommandError, CommandResult, Runner, TaskExit, TaskState};
 
 impl Runner {
     /// A task's supervisor picked up a triggered run.
@@ -27,7 +27,6 @@ impl Runner {
             message,
             elapsed,
             last_run,
-            rerun,
             reply,
         } = exit;
         let name = name.as_str();
@@ -76,12 +75,6 @@ impl Runner {
             }
         }
 
-        if rerun {
-            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
-                name: name.to_string(),
-                success,
-            });
-        }
         // The reply rode down with the run and back up on its exit report, so
         // answering it here means what every other command reply means: the
         // scheduler has applied this.

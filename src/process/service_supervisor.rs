@@ -73,9 +73,28 @@ pub(crate) struct RestartRequest {
 }
 
 /// One request to rebuild: produce a fresh artifact, then restart into it.
+/// Why a rebuild was asked for, which decides what happens if one is already
+/// running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RebuildSource {
+    /// Watched files changed. If a cycle is already running, its artifact is
+    /// already out of date: record that and let it start another when it
+    /// finishes, rather than racing a second build against the first.
+    ///
+    /// The file watcher used to hold this back itself, sending a distinct
+    /// "mark stale" signal instead of a second rebuild — which is why it had
+    /// to know when a cycle ended, and needed a completion channel to find
+    /// out.
+    FileChange,
+    /// Somebody asked for this rebuild by name. It supersedes.
+    Requested,
+}
+
 pub(crate) struct RebuildRequest {
     /// Skip the build tool's up-to-date check — the hard-restart path.
     pub(crate) forced: bool,
+    /// See [`RebuildSource`].
+    pub(crate) source: RebuildSource,
     /// Answered as soon as the build is *accepted*, not when it finishes.
     /// A forced rebuild refused because a batch is already running is the
     /// hard-restart path's synchronous "already in progress".
@@ -91,10 +110,6 @@ pub(crate) enum ServiceCommand {
     /// Build this service's artifact and restart into it. See
     /// [`RebuildRequest`] and the cycle it drives in `supervise`.
     Rebuild(RebuildRequest),
-    /// A watched file changed while a rebuild cycle was running, so the
-    /// artifact that cycle is about to produce is already out of date. The
-    /// cycle skips its restart and lets the follow-up cycle do it.
-    MarkStale,
     /// End the held process: graceful signal per the config, bounded wait,
     /// SIGKILL fallback — the body of the old runner-side stop worker.
     /// The reply waits for the output reader to drain, so "stopped" can
@@ -631,11 +646,10 @@ async fn supervise(
                             outcome,
                             &mut cycle,
                             &mut artifact_ahead,
-                            &report_tx,
                             &mut batch_built,
                         ) {
                             CycleNext::Done => continue,
-                            CycleNext::Stop => return,
+                            CycleNext::Again => break rebuild_again(),
                             CycleNext::Restart => {
                                 break ServiceCommand::Restart(Box::new(RestartRequest {
                                     config: effective_shutdown(&resolved, &env),
@@ -771,15 +785,21 @@ async fn supervise(
                 apply_proxy_directive(&name, &env.emitter, &mut proxy, directive);
                 continue;
             }
-            ServiceCommand::MarkStale => {
-                // Only meaningful inside a cycle. Outside one the watcher
-                // sends an ordinary Rebuild instead.
-                if let Some(cycle) = cycle.as_mut() {
-                    cycle.stale = true;
-                }
-                continue;
-            }
             ServiceCommand::Rebuild(request) => {
+                // A change that arrives while a cycle is running does not
+                // start a second one: the artifact this cycle is about to
+                // produce is already out of date, so the cycle records that
+                // and runs another when it finishes. Only a request by name
+                // supersedes.
+                if request.source == RebuildSource::FileChange
+                    && let Some(cycle) = cycle.as_mut()
+                {
+                    cycle.stale = true;
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                    continue;
+                }
                 // A new cycle: staleness is per-cycle, so it starts clear.
                 // `artifact_ahead` deliberately does not — it records that
                 // the *process* is behind, which no new request changes.
@@ -824,9 +844,14 @@ async fn supervise(
                                 }
                             }
                             next = rx.recv(), if !mailbox_closed => match next {
-                                Some(ServiceCommand::MarkStale) => {
+                                Some(ServiceCommand::Rebuild(request))
+                                    if request.source == RebuildSource::FileChange =>
+                                {
                                     if let Some(cycle) = cycle.as_mut() {
                                         cycle.stale = true;
+                                    }
+                                    if let Some(reply) = request.reply {
+                                        let _ = reply.send(Ok(()));
                                     }
                                 }
                                 Some(ServiceCommand::Proxy(directive)) => {
@@ -860,11 +885,13 @@ async fn supervise(
                         item,
                         &mut cycle,
                         &mut artifact_ahead,
-                        &report_tx,
                         &mut batch_built,
                     ) {
                         CycleNext::Done => continue,
-                        CycleNext::Stop => return,
+                        CycleNext::Again => {
+                            pending = Some(rebuild_again());
+                            continue;
+                        }
                         CycleNext::Restart => {
                             pending = Some(ServiceCommand::Restart(Box::new(RestartRequest {
                                 config: effective_shutdown(&resolved, &env),
@@ -987,9 +1014,14 @@ async fn supervise(
                     tokio::select! {
                         result = &mut stop => break result,
                         next = rx.recv(), if !mailbox_closed => match next {
-                            Some(ServiceCommand::MarkStale) => {
+                            Some(ServiceCommand::Rebuild(request))
+                                if request.source == RebuildSource::FileChange =>
+                            {
                                 if let Some(cycle) = cycle.as_mut() {
                                     cycle.stale = true;
+                                }
+                                if let Some(reply) = request.reply {
+                                    let _ = reply.send(Ok(()));
                                 }
                             }
                             Some(ServiceCommand::Proxy(directive)) => {
@@ -1006,13 +1038,11 @@ async fn supervise(
                     }
                 };
                 // A stale cycle skips its spawn: the service stays stopped and
-                // the follow-up cycle brings it up on the newer sources.
+                // the follow-up cycle — queued here, by the thing that knows
+                // this cycle just ended — brings it up on the newer sources.
                 let stale_now = cycle.as_ref().is_some_and(|cycle| cycle.stale);
                 if stale_now && cycle.take().is_some() {
-                    let _ = report_tx.send(super::ProcessReport::RebuildCycleDone {
-                        name: name.clone(),
-                        success: true,
-                    });
+                    pending = Some(rebuild_again());
                 }
                 // A failed stop leaves nothing safe to start over, and a
                 // teardown that began mid-restart wants no new process.
@@ -1287,8 +1317,14 @@ enum CycleNext {
     Done,
     /// Stop and restart into the artifact.
     Restart,
-    /// The report channel closed — the scheduler is gone.
-    Stop,
+    /// Sources changed while this cycle ran, so its artifact is already out
+    /// of date: run another one now.
+    ///
+    /// The file watcher used to do this, by holding the item in `Rebuilding`
+    /// and re-firing when the completion came back. Ending a cycle is a fact
+    /// this supervisor has first and the watcher only ever learned second
+    /// hand.
+    Again,
 }
 
 /// Ask the build manager for this service's artifact, and tell the scheduler
@@ -1400,6 +1436,18 @@ async fn queue_build(
     }
 }
 
+/// The follow-up cycle for sources that changed while one was running.
+///
+/// `Requested` rather than `FileChange`: the cycle it belongs to has already
+/// ended, so there is nothing to fold into and it must actually start.
+fn rebuild_again() -> ServiceCommand {
+    ServiceCommand::Rebuild(RebuildRequest {
+        forced: false,
+        source: RebuildSource::Requested,
+        reply: None,
+    })
+}
+
 /// Decide what a batch outcome means for the cycle it belongs to.
 ///
 /// This is the whole of the rebuild state machine, and it reads only state
@@ -1413,23 +1461,18 @@ fn settle_cycle(
     outcome: crate::build_tool::batcher::RebuildItemOutcome,
     cycle: &mut Option<CycleState>,
     artifact_ahead: &mut bool,
-    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     batch_built: &mut bool,
 ) -> CycleNext {
     use crate::build_tool::batcher::RebuildItemOutcome as Item;
     let stale = cycle.as_ref().is_some_and(|cycle| cycle.stale);
-    let done = |success: bool, cycle: &mut Option<CycleState>| {
+    let done = |cycle: &mut Option<CycleState>| {
         *cycle = None;
-        if report_tx
-            .send(super::ProcessReport::RebuildCycleDone {
-                name: name.to_string(),
-                success,
-            })
-            .is_err()
-        {
-            return CycleNext::Stop;
-        }
         CycleNext::Done
+    };
+    // Sources moved under this cycle; end it and start another on them.
+    let again = |cycle: &mut Option<CycleState>| {
+        *cycle = None;
+        CycleNext::Again
     };
 
     match outcome {
@@ -1437,7 +1480,7 @@ fn settle_cycle(
             // The old process keeps running: a failed build is no reason to
             // take away the version that works.
             env.emitter.service_error_event(name, &message);
-            done(false, cycle)
+            done(cycle)
         }
         Item::Built => {
             *batch_built = true;
@@ -1446,13 +1489,13 @@ fn settle_cycle(
                 // date, but remember that the process is now behind a
                 // successful build.
                 *artifact_ahead = true;
-                return done(true, cycle);
+                return again(cycle);
             }
             CycleNext::Restart
         }
         Item::NotBuilt => {
             if stale {
-                return done(true, cycle);
+                return again(cycle);
             }
             CycleNext::Restart
         }
@@ -1466,7 +1509,7 @@ fn settle_cycle(
             }
             env.emitter
                 .service_debug_event(name, "skipped (no changes)");
-            done(true, cycle)
+            done(cycle)
         }
     }
 }
@@ -2097,7 +2140,7 @@ mod tests {
             let (lazy_tx, demand_rx) = mpsc::channel(16);
             let proxy = bind_env_proxy(Some(lazy_tx.clone())).await;
             let (_tx, rx) = mpsc::unbounded_channel();
-            let (report_tx, _report_rx) = mpsc::unbounded_channel();
+            let (report_tx, _report_rx) = mpsc::unbounded_channel::<super::super::ProcessReport>();
             let handle = tokio::spawn(supervise(
                 "svc".to_string(),
                 rx,
@@ -2298,7 +2341,7 @@ mod tests {
 
         for case in cases {
             let env = test_env().await;
-            let (report_tx, _report_rx) = mpsc::unbounded_channel();
+            let (_report_tx, _report_rx) = mpsc::unbounded_channel::<super::super::ProcessReport>();
             let mut artifact_ahead = false;
             let mut batch_built = false;
             let mut restarted = false;
@@ -2312,7 +2355,6 @@ mod tests {
                         outcome,
                         &mut cycle,
                         &mut artifact_ahead,
-                        &report_tx,
                         &mut batch_built,
                     ),
                     CycleNext::Restart

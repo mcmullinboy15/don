@@ -1,9 +1,6 @@
 use super::task_supervisor;
 use super::task_worker::TaskRunMode;
-use super::{
-    CommandError, CommandResult, Runner, RunnerEvent, TaskRunIntent, TaskState, resolve_task_params,
-};
-use crate::config::TaskAutoRun;
+use super::{CommandError, CommandResult, Runner, TaskRunIntent, TaskState, resolve_task_params};
 use crate::duration::parse_duration;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
@@ -143,17 +140,11 @@ impl Runner {
             // settle: PendingRun/Skipped/Failed all re-schedule the sweep,
             // and the old completion message's fold was a no-op for every
             // settle state.
-            TaskRunIntent::Scheduled => {}
-            // A deferred or skipped background run has nobody to tell: it is
-            // not an outcome anyone is waiting on. Only a failure is.
-            TaskRunIntent::Background => {
-                if !outcome.success {
-                    let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
-                        name: name.to_string(),
-                        success: false,
-                    });
-                }
-            }
+            // Nobody is waiting on the outcome either way: the transitions
+            // above are the whole answer, and the file watcher — the only
+            // thing that ever wanted a completion — no longer tracks the
+            // cycles it starts.
+            TaskRunIntent::Scheduled | TaskRunIntent::Background => {}
         }
     }
 
@@ -207,91 +198,12 @@ impl Runner {
             .then_some(done_rx)
     }
 
-    /// Handle a file-watch-triggered task re-run.
-    ///
-    /// Respects the task's auto-run policy — tasks that should not auto-rerun
-    /// from a watch event transition to `PendingRun` instead of spawning.
-    /// Explicit-run paths (the user triggering a task via `don run <name>` or
-    /// `--all-pending`) bypass this gate by calling [`spawn_task_rerun`]
-    /// directly.
-    pub(in crate::runner) async fn handle_task_rerun(&mut self, name: &str) {
-        let task_cfg = match self.tasks.get(name) {
-            Some(rt) => rt.config.clone(),
-            None => {
-                self.output_manager
-                    .service_error_event(name, "rerun requested for unknown task");
-                let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
-                    name: name.to_string(),
-                    success: false,
-                });
-                return;
-            }
-        };
-
-        if self
-            .tasks
-            .get(name)
-            .is_some_and(|rt| rt.state() == TaskState::Building)
-        {
-            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
-                name: name.to_string(),
-                success: true,
-            });
-            return;
+    /// Tell a task's supervisor its watched inputs changed. Whether that
+    /// means a run is its answer, not this one's.
+    pub(in crate::runner) fn send_task_rerun(&self, name: &str) {
+        if let Some(handle) = self.task_supervisors.registry().get(name) {
+            let _ = handle.request(task_supervisor::TaskCommand::Rerun);
         }
-
-        // Skip the needs_run hash check — the file watcher already confirmed
-        // a matching file changed. The hash check is only needed at startup
-        // (to skip tasks whose inputs haven't changed since the last run).
-
-        // Only `auto_run = true` / `"always"` allows watch-triggered reruns.
-        // `"once"` is intentionally startup-only, and `false` / `"never"`
-        // keeps the task manual forever.
-        if !task_cfg.auto_run.runs_automatically_on_watch() {
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.set_needs_run_now(true);
-            }
-            self.set_task_state(name, TaskState::PendingRun);
-            let message = match task_cfg.auto_run {
-                TaskAutoRun::Always => "files changed (pending)",
-                TaskAutoRun::Never => "files changed (pending — auto_run = false)",
-                TaskAutoRun::Once => "files changed (pending — auto_run = once)",
-            };
-            self.output_manager.service_event(name, message);
-            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
-                name: name.to_string(),
-                success: true,
-            });
-            return;
-        }
-
-        // Tasks that declare params require user-supplied values. File-watch
-        // triggers park them in PendingRun so the user can run them explicitly
-        // (via the palette's form or `don run <task> --<param>=<value>`).
-        if !task_cfg.params.is_empty() {
-            if let Some(rt) = self.tasks.get_mut(name) {
-                rt.set_needs_run_now(true);
-            }
-            self.set_task_state(name, TaskState::PendingRun);
-            self.output_manager.service_event(
-                name,
-                "files changed (pending — task has params, run manually)",
-            );
-            let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
-                name: name.to_string(),
-                success: true,
-            });
-            return;
-        }
-
-        self.spawn_task_rerun(
-            name,
-            &task_cfg,
-            &HashMap::new(),
-            "re-running (file changed)",
-            None,
-        )
-        .await;
     }
 
     /// Queue a triggered run on this task's supervisor. Used by the
@@ -345,10 +257,6 @@ impl Runner {
                         message: format!("failed to start: {e}"),
                     }));
                 }
-                let _ = self.event_tx.send(RunnerEvent::TaskRerunComplete {
-                    name: name.to_string(),
-                    success: false,
-                });
             }
         }
     }

@@ -1290,10 +1290,9 @@ fn print_watch_report(report: &don::WatchReport) {
         }
     );
     for item in &report.items {
-        let stale = if item.stale { " stale" } else { "" };
         println!(
-            "  {}  {dim}{} · {} · debounce {}ms{}{reset}",
-            item.name, item.kind, item.state, item.debounce_ms, stale
+            "  {}  {dim}{} · {} · debounce {}ms{reset}",
+            item.name, item.kind, item.state, item.debounce_ms
         );
         for pattern in &item.patterns {
             println!("      {pattern}");
@@ -1307,22 +1306,14 @@ fn print_watch_report(report: &don::WatchReport) {
     }
 
     // Diagnostics worth surfacing: a non-zero count here usually explains a
-    // "didn't reload" report (dropped events or an item stuck mid-rebuild).
-    if report.notify_error_count > 0 || report.runner_event_lag_count > 0 {
+    // "didn't reload" report.
+    if report.notify_error_count > 0 {
         println!();
-        if report.notify_error_count > 0 {
-            let last = report.last_notify_error.as_deref().unwrap_or("");
-            println!(
-                "{dim}notify errors:{reset} {} (last: {last})",
-                report.notify_error_count
-            );
-        }
-        if report.runner_event_lag_count > 0 {
-            println!(
-                "{dim}runner-event lag:{reset} {} — an item may be stuck mid-rebuild",
-                report.runner_event_lag_count
-            );
-        }
+        let last = report.last_notify_error.as_deref().unwrap_or("");
+        println!(
+            "{dim}notify errors:{reset} {} (last: {last})",
+            report.notify_error_count
+        );
     }
 }
 

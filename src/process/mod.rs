@@ -20,6 +20,7 @@ pub mod state;
 pub(crate) mod task;
 pub(crate) mod task_supervisor;
 pub(crate) mod task_worker;
+pub(crate) mod watch_dispatch;
 
 pub use state::{ServiceState, TaskState};
 
@@ -49,7 +50,6 @@ pub(crate) struct TaskExit {
     pub(crate) message: Option<String>,
     pub(crate) elapsed: Option<std::time::Duration>,
     pub(crate) last_run: Option<crate::task_state::TaskRunInfo>,
-    pub(crate) rerun: bool,
     /// A `don run --wait` caller, answered by the fold so the reply means
     /// "the scheduler has applied this" like every other command reply.
     pub(crate) reply: Option<oneshot::Sender<crate::command::CommandResult>>,
@@ -105,11 +105,6 @@ pub(crate) enum ProcessReport {
     },
     /// A task process exited after an explicit run/restart.
     TaskExited(TaskExit),
-    /// A service's rebuild cycle ended. The supervisor sequenced the build,
-    /// the stop and the spawn itself; this exists so the scheduler can close
-    /// the watch cycle it opened, which it does by broadcasting the
-    /// (unchanged) `RunnerEvent::RebuildComplete`.
-    RebuildCycleDone { name: String, success: bool },
     /// A supervisor's artifact build changed state.
     ///
     /// The build manager owns building; this exists only so the scheduler's

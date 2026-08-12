@@ -1,6 +1,6 @@
 use super::Demand;
 use super::service_worker::ServiceStartMode;
-use super::{CommandError, CommandResult, Runner, RunnerEvent, ServiceStartIntent, ServiceState};
+use super::{CommandError, CommandResult, Runner, ServiceStartIntent, ServiceState};
 use tokio::sync::oneshot;
 
 /// What a restart should do, as the scheduler asks for it.
@@ -192,12 +192,16 @@ impl Runner {
                 handle.request(super::service_supervisor::ServiceCommand::Rebuild(
                     super::service_supervisor::RebuildRequest {
                         forced,
+                        // Anything routed through the scheduler was asked
+                        // for by name; the watcher no longer comes this way.
+                        source: super::service_supervisor::RebuildSource::Requested,
                         reply: carried.take().flatten(),
                     },
                 ))
             });
         if !sent {
-            self.fail_rebuild(name, "rebuild requested for unknown service");
+            self.output_manager
+                .service_error_event(name, "rebuild requested for unknown service");
             Self::answer(
                 carried.flatten(),
                 Err(CommandError::UnknownService {
@@ -205,22 +209,6 @@ impl Runner {
                 }),
             );
         }
-    }
-
-    /// A watched file changed while a rebuild cycle was running.
-    pub(in crate::runner) fn send_mark_stale(&self, name: &str) {
-        if let Some(handle) = self.service_starts.registry().get(name) {
-            let _ = handle.request(super::service_supervisor::ServiceCommand::MarkStale);
-        }
-    }
-
-    /// Close a watch cycle that never reached a supervisor.
-    pub(in crate::runner) fn fail_rebuild(&self, name: &str, message: &str) {
-        self.output_manager.service_error_event(name, message);
-        let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
-            name: name.to_string(),
-            success: false,
-        });
     }
 
     pub(in crate::runner) fn queue_background_service_start(

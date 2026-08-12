@@ -1266,8 +1266,9 @@ fn integration_lazy_dep_rerun_failure_after_startup_blocks_start() {
         // Re-run `setup` post-startup. auto_run = always makes an in-flight
         // rerun count as unsatisfied, so a connection now defers.
         cmd_tx
-            .send(RunnerCommand::TaskRerun {
+            .send(RunnerCommand::Restart {
                 name: "setup".to_string(),
+                reply: tokio::sync::oneshot::channel().0,
             })
             .unwrap();
         assert!(

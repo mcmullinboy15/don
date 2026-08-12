@@ -111,21 +111,14 @@ impl Runner {
                     resolved.watch.clone()
                 };
                 let mut watch_notes = Vec::new();
-                if let Some(snapshot) = &watch_snapshot {
-                    if snapshot.notify_error_count > 0
-                        && let Some(ref last) = snapshot.last_notify_error
-                    {
-                        watch_notes.push(format!(
-                            "notify errors={} last={last}",
-                            snapshot.notify_error_count
-                        ));
-                    }
-                    if snapshot.runner_event_lag_count > 0 {
-                        watch_notes.push(format!(
-                            "runner-event lag count={}",
-                            snapshot.runner_event_lag_count
-                        ));
-                    }
+                if let Some(snapshot) = &watch_snapshot
+                    && snapshot.notify_error_count > 0
+                    && let Some(ref last) = snapshot.last_notify_error
+                {
+                    watch_notes.push(format!(
+                        "notify errors={} last={last}",
+                        snapshot.notify_error_count
+                    ));
                 }
                 if let Some(process) = watch_item {
                     if let Some(ref last_error) = process.last_error {
@@ -201,8 +194,8 @@ impl Runner {
                     cmd,
                     watch_state: watch_item.map(|process| {
                         format!(
-                            "{} state={} stale={} debounce={}ms",
-                            process.kind, process.state, process.stale, process.debounce_ms
+                            "{} state={} debounce={}ms",
+                            process.kind, process.state, process.debounce_ms
                         )
                     }),
                     watch_notes,
@@ -239,21 +232,14 @@ impl Runner {
                     task.watch.clone()
                 };
                 let mut watch_notes = Vec::new();
-                if let Some(snapshot) = &watch_snapshot {
-                    if snapshot.notify_error_count > 0
-                        && let Some(ref last) = snapshot.last_notify_error
-                    {
-                        watch_notes.push(format!(
-                            "notify errors={} last={last}",
-                            snapshot.notify_error_count
-                        ));
-                    }
-                    if snapshot.runner_event_lag_count > 0 {
-                        watch_notes.push(format!(
-                            "runner-event lag count={}",
-                            snapshot.runner_event_lag_count
-                        ));
-                    }
+                if let Some(snapshot) = &watch_snapshot
+                    && snapshot.notify_error_count > 0
+                    && let Some(ref last) = snapshot.last_notify_error
+                {
+                    watch_notes.push(format!(
+                        "notify errors={} last={last}",
+                        snapshot.notify_error_count
+                    ));
                 }
                 if let Some(process) = watch_item {
                     if let Some(ref last_error) = process.last_error {
@@ -287,8 +273,8 @@ impl Runner {
                     cmd: Some(cmd_str),
                     watch_state: watch_item.map(|process| {
                         format!(
-                            "{} state={} stale={} debounce={}ms",
-                            process.kind, process.state, process.stale, process.debounce_ms
+                            "{} state={} debounce={}ms",
+                            process.kind, process.state, process.debounce_ms
                         )
                     }),
                     watch_notes,

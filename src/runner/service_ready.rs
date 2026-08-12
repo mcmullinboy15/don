@@ -1,4 +1,4 @@
-use super::{Runner, RunnerEvent, ServiceState};
+use super::{Runner, ServiceState};
 
 impl Runner {
     /// Fold a wired start into runner state.
@@ -161,14 +161,6 @@ impl Runner {
             {
                 self.output_manager.service_error_event(name, msg);
             }
-        }
-
-        if !scheduled {
-            // Manual starts and rebuild restarts close the watch cycle.
-            let _ = self.event_tx.send(RunnerEvent::RebuildComplete {
-                name: name.to_string(),
-                success,
-            });
         }
     }
 }

@@ -687,9 +687,12 @@ fn shutdown_interrupts_rebuild_worker() {
 
         std::fs::write(dir.path().join("slow-build"), "1").unwrap();
 
+        // A rebuild by name — the same cycle a watched file starts, minus
+        // waiting for the debounce.
         cmd_tx
-            .send(RunnerCommand::Rebuild {
+            .send(RunnerCommand::HardRestart {
                 name: "builder".to_string(),
+                reply: tokio::sync::oneshot::channel().0,
             })
             .unwrap();
 

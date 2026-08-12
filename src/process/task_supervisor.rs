@@ -58,6 +58,14 @@ pub(crate) struct RunWait {
 pub(crate) enum TaskCommand {
     /// Run this task. A run already in flight is superseded.
     Run(RunRequest),
+    /// This task's watched files changed.
+    ///
+    /// Whether that means a run is decided here, from three facts this
+    /// supervisor already has: the task's `auto_run` policy, whether it
+    /// declares params a watch event cannot supply, and whether its artifact
+    /// is still being built. The scheduler used to answer all three, which
+    /// meant the file watcher had to wait to hear how it went.
+    Rerun,
     /// End the run in flight, if any, then run again with the parameters the
     /// last run used.
     ///
@@ -198,6 +206,12 @@ pub(crate) struct StartupConfig {
 enum Ask {
     /// Start this run.
     Run(RunRequest),
+    /// Do not run; park the task for a manual trigger and say why.
+    ///
+    /// Reported as an ordinary prepared-run outcome, so the scheduler folds
+    /// it into `PendingRun` exactly as it does one this supervisor reaches by
+    /// preparing a run and finding nothing to do.
+    Park(String),
     /// End the run in hand; start `then` once it is gone, and fire `done`
     /// when it is.
     Cancel {
@@ -223,10 +237,55 @@ fn resolve_command(
     name: &str,
     startup: Option<&StartupConfig>,
     last_params: &std::collections::HashMap<String, String>,
+    awaiting_artifact: bool,
 ) -> Ask {
     match command {
         TaskCommand::Run(request) => Ask::Run(request),
         TaskCommand::Kill { done } => Ask::Cancel { then: None, done },
+        TaskCommand::Rerun => {
+            let Some(startup) = startup else {
+                return Ask::Nothing;
+            };
+            // The artifact this run would use is still being built. Its
+            // completion starts the run; a second one here would race it.
+            if awaiting_artifact {
+                return Ask::Nothing;
+            }
+            // Only `auto_run = true` / `"always"` re-runs from a watch event.
+            // `"once"` is startup-only and `false` / `"never"` is manual
+            // forever — both park instead.
+            if !startup.task_cfg.auto_run.runs_automatically_on_watch() {
+                return Ask::Park(
+                    match startup.task_cfg.auto_run {
+                        crate::config::TaskAutoRun::Always => "files changed (pending)",
+                        crate::config::TaskAutoRun::Never => {
+                            "files changed (pending — auto_run = false)"
+                        }
+                        crate::config::TaskAutoRun::Once => {
+                            "files changed (pending — auto_run = once)"
+                        }
+                    }
+                    .to_string(),
+                );
+            }
+            // A task with params needs values a file change cannot supply.
+            if !startup.task_cfg.params.is_empty() {
+                return Ask::Park(
+                    "files changed (pending — task has params, run manually)".to_string(),
+                );
+            }
+            // No hash check: the watcher already confirmed a matching file
+            // changed. That check exists for startup, to skip a task whose
+            // inputs have not moved since its last run.
+            Ask::Run(RunRequest {
+                task_cfg: startup.task_cfg.clone(),
+                params: std::collections::HashMap::new(),
+                mode: super::task_worker::TaskRunMode::Triggered,
+                intent: super::TaskRunIntent::Background,
+                wait: None,
+                start_message: Some("re-running (file changed)".to_string()),
+            })
+        }
         TaskCommand::Restart { reply } => {
             let Some(startup) = startup else {
                 answer(
@@ -386,7 +445,11 @@ async fn supervise(
                                     // nothing to kill — only its follow-up
                                     // run, if it has one, survives.
                                     match resolve_command(
-                                        command, &name, startup.as_ref(), &last_params,
+                                        command,
+                                        &name,
+                                        startup.as_ref(),
+                                        &last_params,
+                                        awaiting_artifact,
                                     ) {
                                         Ask::Run(request)
                                         | Ask::Cancel { then: Some(request), .. } => {
@@ -402,6 +465,29 @@ async fn supervise(
                                             // already true.
                                             if let Some(done) = done {
                                                 let _ = done.send(());
+                                            }
+                                            continue;
+                                        }
+                                        Ask::Park(message) => {
+                                            if report_tx
+                                                .send(super::ProcessReport::TaskRunPrepared {
+                                                    name: name.clone(),
+                                                    task_cfg: match startup.as_ref() {
+                                                        Some(startup) => {
+                                                            startup.task_cfg.clone()
+                                                        }
+                                                        // `Park` is only ever
+                                                        // resolved with one.
+                                                        None => continue,
+                                                    },
+                                                    intent: super::TaskRunIntent::Background,
+                                                    result: Ok(TaskRunReport::PendingRun {
+                                                        message,
+                                                    }),
+                                                })
+                                                .is_err()
+                                            {
+                                                return;
                                             }
                                             continue;
                                         }
@@ -524,14 +610,18 @@ async fn supervise(
                 result = &mut worker => break result,
                 next = rx.recv(), if !mailbox_closed => match next {
                     Some(command) => {
-                        match resolve_command(command, &name, startup.as_ref(), &last_params) {
+                        match resolve_command(
+                            command, &name, startup.as_ref(), &last_params, false,
+                        ) {
                             Ask::Run(request) => superseded = Some(request),
                             Ask::Cancel { then, done } => {
                                 abandoned = true;
                                 superseded = then;
                                 cancel_done = done.or(cancel_done);
                             }
-                            Ask::Nothing => {}
+                            // A run is already being prepared, so there is
+                            // nothing to park — it will settle on its own.
+                            Ask::Park(_) | Ask::Nothing => {}
                         }
                     }
                     // Guarded so a closed mailbox doesn't spin this select:
@@ -615,7 +705,6 @@ async fn supervise(
             global_watch_ignore: ctx.global_watch_ignore.clone(),
             pgid: handle.pgid(),
             report_tx: report_tx.clone(),
-            rerun: matches!(intent, super::TaskRunIntent::Background),
         });
 
         if report_tx
@@ -692,7 +781,9 @@ async fn supervise(
                 }
                 next = rx.recv(), if !mailbox_closed => match next {
                     Some(command) => {
-                        match resolve_command(command, &name, startup.as_ref(), &last_params) {
+                        match resolve_command(
+                            command, &name, startup.as_ref(), &last_params, false,
+                        ) {
                             // A run queued behind this one starts strictly
                             // after it — owning the exit is what makes that
                             // ordering structural rather than checked.
@@ -711,7 +802,8 @@ async fn supervise(
                                 cancel_done = done.or(cancel_done);
                                 pending = then;
                             }
-                            Ask::Nothing => {}
+                            // Running now; nothing to park.
+                            Ask::Park(_) | Ask::Nothing => {}
                         }
                     }
                     None => mailbox_closed = true,
@@ -931,9 +1023,6 @@ pub(crate) struct TaskRunOutcome {
     /// Exit reports for non-scheduled runs travel on the processes' lossless
     /// report channel, like service exits.
     pub(crate) report_tx: mpsc::UnboundedSender<super::ProcessReport>,
-    /// Whether this run was triggered by a file watch, which decides if a
-    /// `TaskRerunComplete` event is broadcast when it lands.
-    pub(crate) rerun: bool,
 }
 
 impl TaskRunOutcome {
@@ -995,7 +1084,6 @@ impl TaskRunOutcome {
                 message,
                 elapsed: Some(elapsed),
                 last_run: Some(last_run),
-                rerun: self.rerun,
                 reply,
             }));
     }
@@ -1112,7 +1200,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect();
 
-            let ask = resolve_command(command, "seed", Some(&startup), &last_params);
+            let ask = resolve_command(command, "seed", Some(&startup), &last_params, false);
             let (got, params) = match &ask {
                 Ask::Run(request) => ("run", Some(request.params.clone())),
                 Ask::Cancel { then: None, .. } => ("cancel-only", None),
@@ -1120,6 +1208,7 @@ mod tests {
                     then: Some(request),
                     ..
                 } => ("cancel-then-run", Some(request.params.clone())),
+                Ask::Park(_) => ("park", None),
                 Ask::Nothing => ("nothing", None),
             };
             assert_eq!(got, case.want, "{}", case.name);
@@ -1143,7 +1232,6 @@ mod tests {
         name: &str,
         base_dir: &std::path::Path,
         report_tx: mpsc::UnboundedSender<super::super::ProcessReport>,
-        rerun: bool,
     ) -> TaskRunOutcome {
         TaskRunOutcome {
             name: name.to_string(),
@@ -1152,7 +1240,6 @@ mod tests {
             global_watch_ignore: Vec::new(),
             pgid: 4242,
             report_tx,
-            rerun,
         }
     }
 
@@ -1320,7 +1407,6 @@ mod tests {
     async fn a_finished_run_reports_exactly_once() {
         struct Case {
             name: &'static str,
-            rerun: bool,
             status: std::process::ExitStatus,
             want_success: bool,
             want_message: Option<&'static str>,
@@ -1329,28 +1415,24 @@ mod tests {
         let cases = vec![
             Case {
                 name: "scheduled success",
-                rerun: false,
                 status: ExitStatusExt::from_raw(0),
                 want_success: true,
                 want_message: None,
             },
             Case {
                 name: "scheduled failure carries the exit code",
-                rerun: false,
                 status: ExitStatusExt::from_raw(3 << 8),
                 want_success: false,
                 want_message: Some("exit code 3"),
             },
             Case {
                 name: "rerun success",
-                rerun: true,
                 status: ExitStatusExt::from_raw(0),
                 want_success: true,
                 want_message: None,
             },
             Case {
                 name: "rerun failure",
-                rerun: true,
                 status: ExitStatusExt::from_raw(1 << 8),
                 want_success: false,
                 want_message: Some("exit code 1"),
@@ -1361,7 +1443,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let (report_tx, mut report_rx) = mpsc::unbounded_channel();
 
-            outcome("build", temp.path(), report_tx, case.rerun)
+            outcome("build", temp.path(), report_tx)
                 .finish(Ok(case.status), Duration::from_millis(5), None)
                 .await;
 
@@ -1371,7 +1453,6 @@ mod tests {
             assert_eq!(exit.name, "build", "{}", case.name);
             assert_eq!(exit.success, case.want_success, "{}", case.name);
             assert_eq!(exit.message.as_deref(), case.want_message, "{}", case.name);
-            assert_eq!(exit.rerun, case.rerun, "{}", case.name);
             assert!(
                 report_rx.try_recv().is_err(),
                 "{}: exactly one report per run",
@@ -1390,7 +1471,7 @@ mod tests {
         ] {
             let temp = tempfile::tempdir().unwrap();
             let (report_tx, _report_rx) = mpsc::unbounded_channel();
-            outcome("build", temp.path(), report_tx, false)
+            outcome("build", temp.path(), report_tx)
                 .finish(Ok(status), Duration::from_millis(1), None)
                 .await;
 

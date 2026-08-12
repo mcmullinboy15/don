@@ -15,10 +15,7 @@ impl Runner {
         &mut self,
         outcomes: Vec<GraphRequeryOutcomeItem>,
     ) {
-        let watch_update_tx = self
-            .watch
-            .as_ref()
-            .map(super::watch_link::WatchHandle::updates);
+        let watch_update_tx = self.watch.as_ref().map(crate::watch::WatchHandle::updates);
         let mut services_to_rebuild: Vec<String> = Vec::new();
         let mut tasks_to_rerun: Vec<String> = Vec::new();
         let global_watch_ignore = resolve_watch_ignore_patterns(
@@ -101,7 +98,7 @@ impl Runner {
         for name in tasks_to_rerun {
             self.output_manager
                 .service_event(&name, "build graph changed — re-running");
-            self.handle_task_rerun(&name).await;
+            self.send_task_rerun(&name);
         }
     }
 

@@ -1830,8 +1830,9 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
 
         std::fs::write(&db_gate, "ok").unwrap();
         cmd_tx
-            .send(RunnerCommand::TaskRerun {
+            .send(RunnerCommand::Restart {
                 name: "db".to_string(),
+                reply: tokio::sync::oneshot::channel().0,
             })
             .unwrap();
         wait_for_substr(&buf, "DB_RECOVERING", Duration::from_secs(5)).await;
@@ -1869,8 +1870,9 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
         );
 
         cmd_tx
-            .send(RunnerCommand::TaskRerun {
+            .send(RunnerCommand::Restart {
                 name: "cache".to_string(),
+                reply: tokio::sync::oneshot::channel().0,
             })
             .unwrap();
         wait_for_substr(&buf, "CACHE_FAIL", Duration::from_secs(5)).await;
@@ -1909,8 +1911,9 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
 
         std::fs::write(&cache_gate, "ok").unwrap();
         cmd_tx
-            .send(RunnerCommand::TaskRerun {
+            .send(RunnerCommand::Restart {
                 name: "cache".to_string(),
+                reply: tokio::sync::oneshot::channel().0,
             })
             .unwrap();
         wait_for_substr(&buf, "api: started", Duration::from_secs(10)).await;

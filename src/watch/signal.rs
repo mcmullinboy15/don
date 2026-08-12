@@ -1,68 +1,42 @@
-//! The watch module's own vocabulary for talking to whoever owns it.
+//! How the watcher tells anyone that files changed.
 //!
-//! Watching files is not a runner concern — it is "these paths changed, that
-//! item should rebuild". Spelling that in [`crate::runner::RunnerCommand`]
-//! made `watch` import from `runner` while `runner` constructs and drives
-//! `watch`, which is a cycle for no gain: only four of the ~19 runner commands
-//! and three of its events were ever involved.
+//! Watching files is not a runner concern — it is "these paths changed,
+//! under this item's patterns". What that *means* is the receiver's: whether
+//! to rebuild, whether a build is already running, whether this task is even
+//! allowed to re-run itself. The watcher used to answer several of those
+//! questions itself, which is why it needed a completion channel back.
 //!
-//! So the watcher speaks [`WatchSignal`] out and [`WatchOutcome`] in, and the
-//! owner translates. Today that owner is the runner
-//! ([`crate::runner::watch_link`]), but nothing here knows that — which is the
-//! point. A test can drive a `WatchManager` with two plain channels and no
-//! runner at all.
+//! It does not any more, so all that is left is one verb. The receiver is a
+//! [`WatchDispatch`], which the watcher holds without knowing what is on the
+//! other side — a test can drive a `WatchManager` with a recording
+//! implementation and no supervisors at all.
 
-/// Something changed on disk and an item should act on it.
+use super::WatchItemKind;
+
+/// Something a watcher watches told it that files changed.
 ///
-/// Emitted after the item's debounce window closes, so one save that touches
-/// several watched files produces one signal per item, not one per file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WatchSignal {
-    /// A service's watched files changed — rebuild and restart it.
-    Rebuild { name: String },
-    /// A task's watched files changed — run it again.
-    TaskRerun { name: String },
-    /// Files changed *while* this item was already rebuilding, so the build
-    /// in flight is producing a stale artifact.
-    ///
-    /// Separate from [`Rebuild`](Self::Rebuild) because the owner cannot act
-    /// on it yet: it records the staleness and re-fires once the in-flight
-    /// cycle reports back. Sending `Rebuild` here instead would start a second
-    /// build against the first one.
-    RebuildStale { name: String },
-    /// A build-tool definition file changed (`BUILD`, `MODULE.bazel`, …), so
-    /// the item's watch paths may no longer be right and need re-querying.
-    ///
-    /// Unlike the others this has no completion: the owner re-queries
-    /// asynchronously and pushes new patterns back through `WatchUpdate`.
-    BuildGraphChanged { name: String },
+/// Called from the watcher's own task after the item's debounce window
+/// closes, so one save touching several watched files produces one call per
+/// item, not one per file. Implementations must not block: the sole
+/// implementation puts a message in a supervisor's mailbox.
+pub(crate) trait WatchDispatch: Send + Sync {
+    /// `name`'s watched files changed. For [`WatchItemKind::BuildGraph`] the
+    /// name is the process's, not the synthetic `__graph` item's.
+    fn changed(&self, name: &str, kind: WatchItemKind);
 }
 
-/// The result of work this watcher asked for.
-///
-/// Only rebuilds and re-runs report back, and only because the watcher gates
-/// on them: an item stays in [`WatchState::Rebuilding`] — swallowing further
-/// edits into a `stale` flag — until its outcome lands. Missing one strands
-/// that item, which is why [`Lagged`](Self::Lagged) is explicit rather than
-/// silent.
-///
-/// [`WatchState::Rebuilding`]: super::WatchState::Rebuilding
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WatchOutcome {
-    /// A service finished rebuilding, successfully or not.
-    ///
-    /// `success` is carried for diagnostics only — the watcher clears
-    /// `Rebuilding` either way, because a failed build still ends the cycle
-    /// and the next edit must be able to start a new one.
-    RebuildComplete { name: String, success: bool },
-    /// A task finished re-running. Same contract as
-    /// [`RebuildComplete`](Self::RebuildComplete).
-    TaskRerunComplete { name: String, success: bool },
-    /// `n` outcomes were dropped in transit and will never arrive.
-    ///
-    /// The owner's event stream is lossy under load, and a dropped completion
-    /// leaves an item stuck in `Rebuilding` until it is re-registered. The
-    /// watcher cannot recover the lost names, so it reports the gap loudly
-    /// instead of appearing to work.
-    Lagged(u64),
+/// A dispatch that records instead of sending, for tests that want to see
+/// what the watcher decided without standing up a supervisor.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingDispatch {
+    pub(crate) calls: std::sync::Mutex<Vec<(String, WatchItemKind)>>,
+}
+
+#[cfg(test)]
+impl WatchDispatch for RecordingDispatch {
+    fn changed(&self, name: &str, kind: WatchItemKind) {
+        #[allow(clippy::unwrap_used)]
+        self.calls.lock().unwrap().push((name.to_string(), kind));
+    }
 }

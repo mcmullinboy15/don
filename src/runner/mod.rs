@@ -20,7 +20,6 @@ mod state;
 pub(crate) mod status;
 mod support;
 mod task_commands;
-mod watch_link;
 
 // The per-process mechanism — supervisors, spawn/stop workers, health monitor,
 // ready resolution — lives in `crate::process` and imports nothing from here.
@@ -126,15 +125,6 @@ pub enum RunnerCommand {
         name: String,
         reply: oneshot::Sender<CommandResult>,
     },
-    /// Rebuild a service triggered by a file watch event.
-    /// Runs the build command (if any), then restarts the service.
-    Rebuild { name: String },
-    /// A watched file changed during the current rebuild cycle for a service.
-    /// The active build should finish, but any pending restart should be
-    /// skipped because the build output is already stale.
-    RebuildStale { name: String },
-    /// Re-run a task triggered by a file watch event.
-    TaskRerun { name: String },
     /// Query the status of all services and tasks. When `name` is `Some`, only
     /// that process is returned, with its full resolved watch path list included.
     Status {
@@ -189,10 +179,6 @@ pub enum RunnerEvent {
         /// Root service/task failures when `state` is `DependencyFailed`.
         failed_dependencies: Vec<String>,
     },
-    /// A rebuild cycle completed (file watch triggered).
-    RebuildComplete { name: String, success: bool },
-    /// A task re-run completed (file watch triggered).
-    TaskRerunComplete { name: String, success: bool },
     /// The initial startup sweep has decided every process — nothing is left
     /// merely being *considered*. Fires once per run.
     StartupSettled,
@@ -294,7 +280,7 @@ pub struct Runner {
     /// `None` until one is running, and stays `None` when the config gives it
     /// nothing to watch — so this answers "is there a watcher?" rather than
     /// "has startup got that far?".
-    watch: Option<watch_link::WatchHandle>,
+    watch: Option<crate::watch::WatchHandle>,
 
     /// One start supervisor per service, plus the registry addressing them.
     ///
@@ -1020,19 +1006,17 @@ impl Runner {
         let config_for_watch = self.config.clone();
         let platform_for_watch = self.platform;
         let base_dir_for_watch = self.base_dir.clone();
-        // The watcher speaks its own vocabulary; `watch_link` adapts it to the
-        // runner's, so `watch` needs no runner types. Subscribe before setup
-        // so no completion emitted during it is missed.
-        let (watch_signal_tx, watch_signal_rx) = mpsc::unbounded_channel();
-        let (watch_outcome_tx, watch_outcome_rx) = mpsc::unbounded_channel();
-        let watch_link_handle = watch_link::spawn(
-            watch_signal_rx,
-            self.cmd_tx.clone(),
-            self.batcher_tx.clone(),
-            self.requery_catalog(),
-            self.event_tx.subscribe(),
-            watch_outcome_tx,
-        );
+        // The watcher addresses supervisors itself, like every other edge —
+        // the scheduler is not on the path between a saved file and the
+        // process that cares about it.
+        let dispatch: Box<dyn crate::watch::WatchDispatch> =
+            Box::new(crate::process::watch_dispatch::SupervisorDispatch::new(
+                self.service_starts.registry().clone(),
+                self.task_supervisors.registry().clone(),
+                self.batcher_tx.clone(),
+                self.requery_catalog(),
+                self.output_manager.clone_lifecycle_emitter(),
+            ));
         let emitter_for_watch = self.output_manager.clone_lifecycle_emitter();
         let watch_setup_started = Instant::now();
         self.output_manager.debug_event(&format!(
@@ -1044,8 +1028,7 @@ impl Runner {
                 &config_for_watch,
                 platform_for_watch,
                 &base_dir_for_watch,
-                watch_signal_tx,
-                watch_outcome_rx,
+                dispatch,
                 watch_update_rx,
                 watch_query_rx,
                 emitter_for_watch,
@@ -1080,7 +1063,7 @@ impl Runner {
                     let _ = self
                         .watch_status_tx
                         .send(Some(Some(watch_query_tx.clone())));
-                    self.watch = Some(watch_link::WatchHandle::new(
+                    self.watch = Some(crate::watch::WatchHandle::new(
                         watch_update_tx,
                         watch_query_tx,
                     ));
@@ -1116,7 +1099,7 @@ impl Runner {
         let _ = self
             .batcher_tx
             .send(build_batcher::BatchRequest::WatchReady {
-                updates: self.watch.as_ref().map(watch_link::WatchHandle::updates),
+                updates: self.watch.as_ref().map(crate::watch::WatchHandle::updates),
             });
 
         // Validate the active dependency graph before starting anything.
@@ -1213,15 +1196,6 @@ impl Runner {
                             RunnerCommand::HardRestart { name, reply } => {
                                 self.handle_hard_restart_service_cmd(&name, reply).await;
                             }
-                            RunnerCommand::Rebuild { name } => {
-                                self.send_rebuild(&name, false, None);
-                            }
-                            RunnerCommand::RebuildStale { name } => {
-                                self.send_mark_stale(&name);
-                            }
-                            RunnerCommand::TaskRerun { name } => {
-                                self.handle_task_rerun(&name).await;
-                            }
                             RunnerCommand::RunPendingTasks { reply } => {
                                 self.handle_run_pending_tasks(reply).await;
                             }
@@ -1259,13 +1233,6 @@ impl Runner {
                             }
                             ProcessReport::TaskStarting { name, message } => {
                                 self.handle_task_starting(&name, &message);
-                            }
-                            ProcessReport::RebuildCycleDone { name, success } => {
-                                // The supervisor ran the whole cycle; this
-                                // closes the watch cycle it opened.
-                                let _ = self
-                                    .event_tx
-                                    .send(RunnerEvent::RebuildComplete { name, success });
                             }
                             ProcessReport::ArtifactBuild { name, kind, status } => {
                                 self.handle_artifact_build(&name, kind, status);
@@ -1345,12 +1312,6 @@ impl Runner {
             handle.abort();
             let _ = handle.await;
         }
-        // Aborting the watcher drops its signal sender, so the link would
-        // exit on its own — but only once it is next polled. Ending it here
-        // keeps teardown deterministic rather than leaving a task racing the
-        // rest of shutdown.
-        watch_link_handle.abort();
-        let _ = watch_link_handle.await;
 
         self.finish_runtime_port_manifest().await;
         if self.shutting_down {
