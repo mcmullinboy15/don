@@ -153,14 +153,16 @@ impl Runner {
         // countdown: a service with no live process was never "stopping".
         // Custody, read once from the projection: the fold is not running
         // during teardown, so this is exactly as fresh as the old shadow was.
-        let live: HashMap<String, Option<i32>> = self
+        // Names only — what to do with the process is the supervisor's, which
+        // is why the pgids this used to carry are no longer read.
+        let live: std::collections::HashSet<String> = self
             .state
             .current()
             .processes
             .iter()
             .filter_map(|status| match status {
                 crate::state_store::ProcessStatus::Service { name, runtime, .. } => {
-                    runtime.as_ref().map(|runtime| (name.clone(), runtime.pid))
+                    runtime.as_ref().map(|_| name.clone())
                 }
                 _ => None,
             })
@@ -172,7 +174,7 @@ impl Runner {
                 continue;
             }
             let depth = depths.get(name).copied().unwrap_or(0);
-            if !live.contains_key(name) {
+            if !live.contains(name) {
                 quiet_by_depth.entry(depth).or_default().push(name.clone());
                 continue;
             }
@@ -192,14 +194,8 @@ impl Runner {
                     .service_event(name, &format!("stopping... ({remaining} remaining)"));
             }
 
-            // Track PGIDs of services being stopped so we can SIGKILL
-            // them if a second Ctrl+C arrives during graceful shutdown.
-            let mut stopping_pgids: HashMap<String, i32> = HashMap::new();
             let mut join_set: JoinSet<String> = JoinSet::new();
             for name in &names {
-                if let Some(pgid) = live.get(name).copied().flatten() {
-                    stopping_pgids.insert(name.clone(), pgid);
-                }
                 // The supervisor owns the process; ask it to stop and join
                 // on the done-signal. A supervisor holding nothing answers
                 // immediately, so sending unconditionally is safe — and it
@@ -213,7 +209,13 @@ impl Runner {
                             config: shutdown_config,
                             force,
                             wait_full_exit: true,
-                            interrupt: None,
+                            // A second Ctrl+C arriving mid-stop cuts the
+                            // grace period short. The supervisor holds the
+                            // process, so it is the one that escalates; this
+                            // used to be the scheduler polling a flag and
+                            // signalling process groups it read out of the
+                            // snapshot.
+                            interrupt: Some(crate::signals::force_watch()),
                             notify: super::service_supervisor::StopNotify::Done(done_tx),
                             // Teardown: the failure history dies with the runner.
                             reset_policy: false,
@@ -229,58 +231,33 @@ impl Runner {
                 }
             }
 
-            // Wait for graceful stops, but if a second Ctrl+C arrives,
-            // SIGKILL all processes being stopped and abort the futures.
+            let mut force_rx = crate::signals::force_watch();
+            let mut announced_force = false;
             loop {
-                if force_shutdown_requested() && !join_set.is_empty() {
-                    self.output_manager
-                        .lifecycle_event("forcing immediate shutdown");
-                    // SIGKILL all processes that are still being stopped.
-                    let names: Vec<String> = stopping_pgids
-                        .iter()
-                        .map(|(name, pgid)| {
-                            self.output_manager.service_event(
-                                name,
-                                &format!("send SIGKILL to pgid {pgid} (force shutdown)"),
-                            );
-                            let _ = nix::sys::signal::killpg(
-                                nix::unistd::Pid::from_raw(*pgid),
-                                nix::sys::signal::Signal::SIGKILL,
-                            );
-                            name.clone()
-                        })
-                        .collect();
-                    for name in names {
-                        self.clear_service_custody(&name);
-                        self.set_service_state(&name, ServiceState::Stopped);
+                tokio::select! {
+                    joined = join_set.join_next() => match joined {
+                        Some(Ok(name)) => {
+                            self.clear_service_custody(&name);
+                            self.set_service_state(&name, ServiceState::Stopped);
+                            remaining -= 1;
+                            self.output_manager
+                                .service_event(&name, &format!("stopped ({remaining} remaining)"));
+                        }
+                        Some(Err(_)) => {
+                            remaining = remaining.saturating_sub(1);
+                        }
+                        // All stops joined.
+                        None => break,
+                    },
+                    // Narration only: the escalation reached the supervisors
+                    // directly, and their stops are already collapsing.
+                    _ = force_rx.changed(), if !announced_force => {
+                        if *force_rx.borrow() {
+                            announced_force = true;
+                            self.output_manager
+                                .lifecycle_event("forcing immediate shutdown");
+                        }
                     }
-                    join_set.abort_all();
-                    while join_set.join_next().await.is_some() {}
-                    remaining = 0;
-                    break;
-                }
-
-                // Poll for the next completed stop, with a short sleep so
-                // we can re-check the force flag promptly.
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    join_set.join_next(),
-                )
-                .await
-                {
-                    Ok(Some(Ok(name))) => {
-                        stopping_pgids.remove(&name);
-                        self.clear_service_custody(&name);
-                        self.set_service_state(&name, ServiceState::Stopped);
-                        remaining -= 1;
-                        self.output_manager
-                            .service_event(&name, &format!("stopped ({remaining} remaining)"));
-                    }
-                    Ok(Some(Err(_))) => {
-                        remaining = remaining.saturating_sub(1);
-                    }
-                    Ok(None) => break,  // All tasks done.
-                    Err(_) => continue, // Timeout — re-check force flag.
                 }
             }
 
