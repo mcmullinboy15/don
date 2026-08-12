@@ -110,6 +110,13 @@ pub(crate) enum ServiceCommand {
     /// Build this service's artifact and restart into it. See
     /// [`RebuildRequest`] and the cycle it drives in `supervise`.
     Rebuild(RebuildRequest),
+    /// This service's build-graph definition files changed (a BUILD file, a
+    /// `package.json`, …), so the watch patterns resolved from them may no
+    /// longer be right.
+    ///
+    /// The supervisor asks the build manager to re-query — the same way it
+    /// asks for any other build — and decides what to do with the answer.
+    BuildGraphChanged,
     /// End the held process: graceful signal per the config, bounded wait,
     /// SIGKILL fallback — the body of the old runner-side stop worker.
     /// The reply waits for the output reader to drain, so "stopped" can
@@ -404,6 +411,10 @@ async fn supervise(
     // Where the batcher delivers this service's share of a batch.
     let (rebuild_tx, mut rebuild_rx) =
         mpsc::unbounded_channel::<crate::build_tool::batcher::RebuildItemOutcome>();
+    // Where the batcher delivers this service's share of a build-graph
+    // re-query.
+    let (requery_tx, mut requery_rx) =
+        mpsc::unbounded_channel::<crate::build_tool::batch::RequeryOutcome>();
     // The OSC response scanner for the held spawn. It holds a sender into the
     // PTY gate, which holds the master's write half, so a stale one keeps the
     // PTY open — it belongs with the process, not with a shadow of it.
@@ -637,6 +648,21 @@ async fn supervise(
                     // continues here rather than in the scheduler, so the
                     // build, the stop and the spawn are one sequence in one
                     // place.
+                    // A re-query this supervisor asked for. The patterns are
+                    // already registered; what is left is whether the process
+                    // it is running was built from a graph that has moved —
+                    // which only something holding that process can answer.
+                    outcome = requery_rx.recv() => {
+                        use crate::build_tool::batch::RequeryOutcome;
+                        let Some(outcome) = outcome else { continue };
+                        if outcome == RequeryOutcome::Updated && held.is_some() {
+                            env.emitter
+                                .service_event(&name, "build graph changed — rebuilding");
+                            busy.store(true, Ordering::Relaxed);
+                            break rebuild_again();
+                        }
+                        continue;
+                    }
                     outcome = rebuild_rx.recv() => {
                         let Some(outcome) = outcome else { continue };
                         busy.store(true, Ordering::Relaxed);
@@ -783,6 +809,10 @@ async fn supervise(
             ServiceCommand::Start(request) => request,
             ServiceCommand::Proxy(directive) => {
                 apply_proxy_directive(&name, &env.emitter, &mut proxy, directive);
+                continue;
+            }
+            ServiceCommand::BuildGraphChanged => {
+                request_requery(&name, &resolved, &env, &requery_tx);
                 continue;
             }
             ServiceCommand::Rebuild(request) => {
@@ -1376,6 +1406,40 @@ fn request_artifact(
             outcome: outcome.clone(),
         })
         .is_ok()
+}
+
+/// Ask the build manager to re-resolve this service's watch paths.
+///
+/// The registrations come back through the watcher, applied by the manager
+/// that resolved them; what lands on [`RequeryOutcome`] is only whether they
+/// changed, which is all this supervisor needs to decide about its process.
+fn request_requery(
+    name: &str,
+    resolved: &crate::config::ResolvedService,
+    env: &StartEnv,
+    outcome: &mpsc::UnboundedSender<crate::build_tool::batch::RequeryOutcome>,
+) {
+    let working_dir = super::paths::working_dir_for(&env.base_dir, resolved.dir.as_deref());
+    let ignore_patterns = super::paths::resolve_watch_ignore_patterns(
+        &working_dir,
+        &resolved.ignore,
+        &env.base_dir,
+        &env.global_watch_ignore,
+    );
+    let _ = env
+        .batcher_tx
+        .send(crate::build_tool::batcher::BatchRequest::QueueRequery {
+            item: crate::build_tool::batch::GraphRequeryRequestItem {
+                name: name.to_string(),
+                kind: super::ProcessKind::Service,
+                bazel: resolved.bazel_config().cloned(),
+                watch_enabled: resolved.build_tool_watch_enabled(),
+                working_dir,
+                ignore_patterns,
+                global_watch_ignore: env.global_watch_ignore.clone(),
+            },
+            outcome: outcome.clone(),
+        });
 }
 
 /// Capture what the batcher needs to rebuild this service. Resolved config is

@@ -29,17 +29,38 @@ pub(crate) struct RebuildBatchOutcome {
 #[derive(Clone)]
 pub(crate) struct GraphRequeryRequestItem {
     pub(crate) name: String,
+    pub(crate) kind: ProcessKind,
     pub(crate) bazel: Option<crate::config::BazelConfig>,
     pub(crate) watch_enabled: bool,
     pub(crate) working_dir: PathBuf,
     pub(crate) ignore_patterns: Vec<String>,
+    /// Project-wide watch-ignore globs, for the tier-1 graph registration
+    /// this item's re-query rewrites alongside its own.
+    pub(crate) global_watch_ignore: Vec<String>,
 }
 
-pub(crate) struct GraphRequeryOutcomeItem {
-    pub(crate) name: String,
-    pub(crate) watch_enabled: bool,
-    pub(crate) ignore_patterns: Vec<String>,
-    pub(crate) result: Result<crate::build_tool::ResolvedBuildInfo, String>,
+struct GraphRequeryOutcomeItem {
+    name: String,
+    watch_enabled: bool,
+    ignore_patterns: Vec<String>,
+    kind: ProcessKind,
+    global_watch_ignore: Vec<String>,
+    result: Result<crate::build_tool::ResolvedBuildInfo, String>,
+}
+
+/// What a re-query decided about one item, delivered to its supervisor.
+///
+/// The watch registrations it produces are applied before this is sent — the
+/// build manager owns watch-path resolution, and pushing them is the same
+/// step it already runs after a preparation build. What is left for the
+/// supervisor is the only part that depends on lifecycle: whether the
+/// process it is running should be rebuilt from the graph that just moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequeryOutcome {
+    /// Watch patterns were re-resolved and registered.
+    Updated,
+    /// The re-query failed; the existing patterns still stand.
+    Failed,
 }
 
 /// Snapshot of a service or task that needs its artifact built. Owned — the
@@ -231,10 +252,19 @@ pub(crate) async fn send_watch_update(
     }
 }
 
+/// Re-query the build tool for these items, register the watch patterns it
+/// resolves, and report per item.
+///
+/// The registration half runs here rather than at the call site for the same
+/// reason it does in [`run_batch_build_chain`]: watch paths are resolved *by*
+/// this query, so the thing that resolves them is the thing that should
+/// deliver them. What comes back is only the part that depends on lifecycle.
 pub(crate) async fn run_graph_requery_worker(
     items: Vec<GraphRequeryRequestItem>,
     emitter: crate::output::LifecycleEmitter,
-) -> Vec<GraphRequeryOutcomeItem> {
+    watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+    base_dir: PathBuf,
+) -> Vec<(String, RequeryOutcome)> {
     let mut outcomes: Vec<Option<GraphRequeryOutcomeItem>> =
         std::iter::repeat_with(|| None).take(items.len()).collect();
     let mut bazel_groups: HashMap<PathBuf, Vec<(usize, GraphRequeryRequestItem)>> = HashMap::new();
@@ -245,6 +275,8 @@ pub(crate) async fn run_graph_requery_worker(
                 name: item.name,
                 watch_enabled: false,
                 ignore_patterns: item.ignore_patterns,
+                kind: item.kind,
+                global_watch_ignore: item.global_watch_ignore,
                 result: Ok(crate::build_tool::ResolvedBuildInfo {
                     watch_paths: Vec::new(),
                     graph_definition_globs: Vec::new(),
@@ -284,6 +316,8 @@ pub(crate) async fn run_graph_requery_worker(
                         name: item.name,
                         watch_enabled: item.watch_enabled,
                         ignore_patterns: item.ignore_patterns,
+                        kind: item.kind,
+                        global_watch_ignore: item.global_watch_ignore,
                         result,
                     });
                 }
@@ -295,6 +329,8 @@ pub(crate) async fn run_graph_requery_worker(
                         name: item.name,
                         watch_enabled: item.watch_enabled,
                         ignore_patterns: item.ignore_patterns,
+                        kind: item.kind,
+                        global_watch_ignore: item.global_watch_ignore,
                         result: Err(message.clone()),
                     });
                 }
@@ -302,7 +338,61 @@ pub(crate) async fn run_graph_requery_worker(
         }
     }
 
-    outcomes.into_iter().flatten().collect()
+    let mut delivered = Vec::new();
+    for outcome in outcomes.into_iter().flatten() {
+        let info = match outcome.result {
+            Ok(info) => info,
+            Err(e) => {
+                emitter.service_error_event(
+                    &outcome.name,
+                    &format!("build tool re-query failed: {e} — keeping existing watch patterns"),
+                );
+                delivered.push((outcome.name, RequeryOutcome::Failed));
+                continue;
+            }
+        };
+        let count = info.watch_paths.len();
+        emitter.service_event(
+            &outcome.name,
+            &format!(
+                "updated watch paths ({count} path{})",
+                if count == 1 { "" } else { "s" }
+            ),
+        );
+        if outcome.watch_enabled
+            && let Some(ref tx) = watch_update_tx
+        {
+            let watch_kind = match outcome.kind {
+                ProcessKind::Service => crate::watch::WatchItemKind::Service,
+                ProcessKind::Task => crate::watch::WatchItemKind::Task,
+            };
+            send_watch_update(
+                tx,
+                outcome.name.clone(),
+                watch_kind,
+                info.watch_paths,
+                outcome.ignore_patterns,
+                base_dir.clone(),
+            )
+            .await;
+            send_watch_update(
+                tx,
+                format!("{}__graph", outcome.name),
+                crate::watch::WatchItemKind::BuildGraph,
+                info.graph_definition_globs,
+                crate::process::paths::resolve_watch_ignore_patterns(
+                    &base_dir,
+                    &[],
+                    &base_dir,
+                    &outcome.global_watch_ignore,
+                ),
+                base_dir.clone(),
+            )
+            .await;
+        }
+        delivered.push((outcome.name, RequeryOutcome::Updated));
+    }
+    delivered
 }
 
 /// Run the full artifact-preparation chain: optional watch resolution →
@@ -790,6 +880,7 @@ mod tests {
         let outcomes = run_graph_requery_worker(
             vec![GraphRequeryRequestItem {
                 name: "api".to_string(),
+                kind: ProcessKind::Service,
                 bazel: Some(BazelConfig {
                     target: "//services/api:api".to_string(),
                     watch: false,
@@ -797,15 +888,20 @@ mod tests {
                 watch_enabled: false,
                 working_dir: PathBuf::from("."),
                 ignore_patterns: Vec::new(),
+                global_watch_ignore: Vec::new(),
             }],
             output.clone_lifecycle_emitter(),
+            // No watcher: an item with watching disabled must resolve
+            // nothing, so there is nothing to register either.
+            None,
+            PathBuf::from("."),
         )
         .await;
 
-        assert_eq!(outcomes.len(), 1);
-        assert!(!outcomes[0].watch_enabled);
-        let info = outcomes[0].result.as_ref().unwrap();
-        assert!(info.watch_paths.is_empty());
-        assert!(info.graph_definition_globs.is_empty());
+        assert_eq!(
+            outcomes,
+            vec![("api".to_string(), RequeryOutcome::Updated)],
+            "a watch-disabled item settles without querying the build tool"
+        );
     }
 }

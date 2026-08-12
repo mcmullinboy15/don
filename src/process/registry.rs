@@ -90,6 +90,19 @@ impl<M> ProcessRegistry<M> {
         self.get(name).is_some_and(ProcessHandle::is_busy)
     }
 
+    /// Send one message to every process of this kind, built fresh per
+    /// recipient. Returns whether anything received it.
+    ///
+    /// For the facts that are not about one process — a workspace-level
+    /// build-graph change is the only one today.
+    pub(crate) fn broadcast(&self, message: impl Fn() -> M) -> bool {
+        let mut delivered = false;
+        for handle in self.handles.values() {
+            delivered |= handle.request(message());
+        }
+        delivered
+    }
+
     /// Names with work queued or in progress.
     pub(crate) fn busy_names(&self) -> impl Iterator<Item = &str> {
         self.handles

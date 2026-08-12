@@ -44,9 +44,9 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
 use super::batch::{
-    BatchBuildItem, BazelRebuildItem, GraphRequeryOutcomeItem, GraphRequeryRequestItem,
-    PrepareBatchOutcome, PrepareOutcome, RebuildBatchOutcome, RebuildBatchRequest,
-    run_batch_build_chain, run_graph_requery_worker, run_rebuild_batch_worker,
+    BatchBuildItem, BazelRebuildItem, GraphRequeryRequestItem, PrepareBatchOutcome, PrepareOutcome,
+    RebuildBatchOutcome, RebuildBatchRequest, RequeryOutcome, run_batch_build_chain,
+    run_graph_requery_worker, run_rebuild_batch_worker,
 };
 use crate::build_tool::manager::{BatchDue, BuildBatcher};
 use crate::output::LifecycleEmitter;
@@ -111,8 +111,13 @@ pub(crate) enum BatchRequest {
         spec: RebuildSpec,
         outcome: mpsc::UnboundedSender<RebuildItemOutcome>,
     },
-    /// Queue a build-graph re-query and (re)open its window.
-    QueueRequery { item: GraphRequeryRequestItem },
+    /// Queue a build-graph re-query and (re)open its window. The outcome
+    /// goes back to `outcome`, which is the requesting supervisor's own
+    /// channel — the watch registrations it produces are applied here first.
+    QueueRequery {
+        item: GraphRequeryRequestItem,
+        outcome: mpsc::UnboundedSender<RequeryOutcome>,
+    },
     /// Run a forced rebuild for one item immediately, bypassing the window.
     /// Replies with an error if a batch is already in flight, preserving the
     /// hard-restart path's synchronous "already in progress" answer.
@@ -125,21 +130,11 @@ pub(crate) enum BatchRequest {
     Shutdown { done: oneshot::Sender<()> },
 }
 
-/// A finished batch of build-graph re-queries, forwarded to the runner.
-///
-/// Rebuild outcomes do not come this way: they fan out per item to the
-/// supervisors that asked for them. A re-query's result is cross-item by
-/// nature (it rewrites watch registrations and can fan one graph change out
-/// to several processes), so it stays a scheduler concern.
-pub(crate) enum BatchOutcome {
-    Requeries(Vec<GraphRequeryOutcomeItem>),
-}
-
 /// What the detached workers hand back to the actor.
 enum WorkerDone {
     Prepares(PrepareBatchOutcome),
     Rebuilds(RebuildBatchOutcome),
-    Requeries(Vec<GraphRequeryOutcomeItem>),
+    Requeries(Vec<(String, RequeryOutcome)>),
 }
 
 /// The workspace facts every preparation batch needs, fixed at construction.
@@ -150,26 +145,26 @@ pub(crate) struct WorkspaceContext {
     pub(crate) global_watch_ignore: Vec<String>,
 }
 
-/// Spawn the batcher task. Returns its mailbox, the outcome channel the
-/// runner folds, and the task handle (joined bounded at shutdown).
+/// Spawn the batcher task. Returns its mailbox and the task handle (joined
+/// bounded at shutdown).
+///
+/// Nothing comes back to the scheduler: every kind of batch fans out per
+/// item, to the supervisor that asked for it.
 pub(crate) fn spawn(
     state: StateReader,
     emitter: LifecycleEmitter,
     workspace: WorkspaceContext,
 ) -> (
     mpsc::UnboundedSender<BatchRequest>,
-    mpsc::UnboundedReceiver<BatchOutcome>,
     tokio::task::JoinHandle<()>,
 ) {
     let (request_tx, request_rx) = mpsc::unbounded_channel();
-    let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
-    let handle = tokio::spawn(run(request_rx, outcome_tx, state, emitter, workspace));
-    (request_tx, outcome_rx, handle)
+    let handle = tokio::spawn(run(request_rx, state, emitter, workspace));
+    (request_tx, handle)
 }
 
 async fn run(
     mut request_rx: mpsc::UnboundedReceiver<BatchRequest>,
-    outcome_tx: mpsc::UnboundedSender<BatchOutcome>,
     state: StateReader,
     emitter: LifecycleEmitter,
     workspace: WorkspaceContext,
@@ -181,6 +176,8 @@ async fn run(
     let mut rebuild_outcomes: HashMap<String, mpsc::UnboundedSender<RebuildItemOutcome>> =
         HashMap::new();
     let mut requery_specs: HashMap<String, GraphRequeryRequestItem> = HashMap::new();
+    let mut requery_outcomes: HashMap<String, mpsc::UnboundedSender<RequeryOutcome>> =
+        HashMap::new();
     let mut prepare_specs: HashMap<String, BatchBuildItem> = HashMap::new();
     let mut prepare_outcomes: HashMap<String, mpsc::UnboundedSender<PrepareOutcome>> =
         HashMap::new();
@@ -214,8 +211,9 @@ async fn run(
                     rebuild_outcomes.insert(spec.name().to_string(), outcome);
                     rebuild_specs.insert(spec.name().to_string(), spec);
                 }
-                Some(BatchRequest::QueueRequery { item }) => {
+                Some(BatchRequest::QueueRequery { item, outcome }) => {
                     scheduler.queue_requery(item.name.clone());
+                    requery_outcomes.insert(item.name.clone(), outcome);
                     requery_specs.insert(item.name.clone(), item);
                 }
                 Some(BatchRequest::ForceRebuild {
@@ -267,9 +265,12 @@ async fn run(
                     }
                     WorkerDone::Requeries(outcomes) => {
                         scheduler.finish_requery_batch();
-                        if outcome_tx.send(BatchOutcome::Requeries(outcomes)).is_err() {
-                            scheduler.abort_in_flight().await;
-                            return;
+                        for (name, outcome) in outcomes {
+                            if let Some(tx) = requery_outcomes.get(&name)
+                                && tx.send(outcome).is_err()
+                            {
+                                requery_outcomes.remove(&name);
+                            }
                         }
                     }
                 }
@@ -293,6 +294,8 @@ async fn run(
                 BatchDue::Requeries => flush_requeries(
                     &mut scheduler,
                     &mut requery_specs,
+                    watch_updates.as_ref().and_then(Clone::clone),
+                    &workspace,
                     &emitter,
                     &worker_tx,
                 ),
@@ -480,9 +483,12 @@ fn spawn_rebuild_batch(
     }));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_requeries(
     scheduler: &mut BuildBatcher,
     specs: &mut HashMap<String, GraphRequeryRequestItem>,
+    watch_updates: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+    workspace: &WorkspaceContext,
     emitter: &LifecycleEmitter,
     worker_tx: &mpsc::UnboundedSender<WorkerDone>,
 ) {
@@ -509,8 +515,9 @@ fn flush_requeries(
 
     let emitter = emitter.clone();
     let worker_tx = worker_tx.clone();
+    let base_dir = workspace.base_dir.clone();
     scheduler.set_requery_batch(tokio::spawn(async move {
-        let outcomes = run_graph_requery_worker(items, emitter).await;
+        let outcomes = run_graph_requery_worker(items, emitter, watch_updates, base_dir).await;
         let _ = worker_tx.send(WorkerDone::Requeries(outcomes));
     }));
 }
@@ -551,13 +558,12 @@ mod tests {
     ) -> (
         StateWriter,
         mpsc::UnboundedSender<BatchRequest>,
-        mpsc::UnboundedReceiver<BatchOutcome>,
         tokio::task::JoinHandle<()>,
     ) {
         let (writer, reader) = state_store::channel(StateSnapshot::default());
         writer.publish_processes(initial);
         let emitter = test_emitter().await;
-        let (tx, outcome_rx, handle) = spawn(
+        let (tx, handle) = spawn(
             reader,
             emitter,
             WorkspaceContext {
@@ -565,7 +571,7 @@ mod tests {
                 global_watch_ignore: Vec::new(),
             },
         );
-        (writer, tx, outcome_rx, handle)
+        (writer, tx, handle)
     }
 
     fn queue(
@@ -606,7 +612,7 @@ mod tests {
     /// every target, not one invocation per service.
     #[tokio::test(start_paused = true)]
     async fn preparations_park_until_the_watcher_is_ready_then_leave_as_one_batch() {
-        let (_writer, tx, _outcome_rx, handle) = spawn_actor(Vec::new()).await;
+        let (_writer, tx, handle) = spawn_actor(Vec::new()).await;
         let (api_tx, mut api_rx) = mpsc::unbounded_channel();
         let (web_tx, mut web_rx) = mpsc::unbounded_channel();
 
@@ -647,7 +653,7 @@ mod tests {
     /// window closes.
     #[tokio::test(start_paused = true)]
     async fn a_burst_of_rebuild_requests_becomes_one_batch() {
-        let (_writer, tx, _outcome_rx, handle) = spawn_actor(service_statuses(&[
+        let (_writer, tx, handle) = spawn_actor(service_statuses(&[
             ("api", ServiceState::Ready),
             ("web", ServiceState::Ready),
         ]))
@@ -687,7 +693,7 @@ mod tests {
     /// finished last.
     #[tokio::test(start_paused = true)]
     async fn rebuild_during_build_is_deferred_not_dropped() {
-        let (writer, tx, _outcome_rx, handle) =
+        let (writer, tx, handle) =
             spawn_actor(service_statuses(&[("api", ServiceState::Building)])).await;
         let (item_tx, mut item_rx) = mpsc::unbounded_channel();
 
@@ -712,7 +718,7 @@ mod tests {
     /// batch is in flight is refused, not queued.
     #[tokio::test(start_paused = true)]
     async fn force_rebuild_is_refused_while_a_batch_runs() {
-        let (_writer, tx, _outcome_rx, handle) =
+        let (_writer, tx, handle) =
             spawn_actor(service_statuses(&[("api", ServiceState::Ready)])).await;
         let (item_tx, mut item_rx) = mpsc::unbounded_channel();
 

@@ -20,12 +20,6 @@ use crate::watch::{WatchDispatch, WatchItemKind};
 pub(crate) struct SupervisorDispatch {
     services: ProcessRegistry<service_supervisor::ServiceCommand>,
     tasks: ProcessRegistry<task_supervisor::TaskCommand>,
-    /// Build-graph re-queries are the build manager's, not a supervisor's:
-    /// they are coalesced across items and answered per item.
-    batcher: tokio::sync::mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
-    /// Per-item re-query specs, precomputed from resolved config. Config is
-    /// fixed after construction, so this cannot go stale.
-    requeries: std::collections::HashMap<String, crate::build_tool::batch::GraphRequeryRequestItem>,
     emitter: crate::output::LifecycleEmitter,
 }
 
@@ -33,41 +27,33 @@ impl SupervisorDispatch {
     pub(crate) fn new(
         services: ProcessRegistry<service_supervisor::ServiceCommand>,
         tasks: ProcessRegistry<task_supervisor::TaskCommand>,
-        batcher: tokio::sync::mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
-        requeries: std::collections::HashMap<
-            String,
-            crate::build_tool::batch::GraphRequeryRequestItem,
-        >,
         emitter: crate::output::LifecycleEmitter,
     ) -> Self {
         Self {
             services,
             tasks,
-            batcher,
-            requeries,
             emitter,
         }
     }
 
-    /// Queue a re-query for one item, or for every item when the workspace's
-    /// own graph definition changed.
-    fn requery(&self, name: &str) -> bool {
-        let items: Vec<_> = if name == crate::watch::WORKSPACE_GRAPH_ITEM_NAME {
-            self.requeries.values().cloned().collect()
-        } else {
-            self.requeries.get(name).cloned().into_iter().collect()
-        };
-        let queued = !items.is_empty();
-        for item in items {
-            if self
-                .batcher
-                .send(crate::build_tool::batcher::BatchRequest::QueueRequery { item })
-                .is_err()
-            {
-                return false;
-            }
+    /// Tell supervisors their build graph moved.
+    ///
+    /// Each one asks the build manager to re-query its own patterns, the way
+    /// it asks for its own builds — this only says who is affected. The
+    /// workspace sentinel affects everyone.
+    fn graph_changed(&self, name: &str) -> bool {
+        if name != crate::watch::WORKSPACE_GRAPH_ITEM_NAME {
+            return self.services.get(name).is_some_and(|handle| {
+                handle.request(service_supervisor::ServiceCommand::BuildGraphChanged)
+            }) || self.tasks.get(name).is_some_and(|handle| {
+                handle.request(task_supervisor::TaskCommand::BuildGraphChanged)
+            });
         }
-        queued
+        self.services
+            .broadcast(|| service_supervisor::ServiceCommand::BuildGraphChanged)
+            | self
+                .tasks
+                .broadcast(|| task_supervisor::TaskCommand::BuildGraphChanged)
     }
 }
 
@@ -92,7 +78,7 @@ impl WatchDispatch for SupervisorDispatch {
                 .tasks
                 .get(name)
                 .is_some_and(|handle| handle.request(task_supervisor::TaskCommand::Rerun)),
-            WatchItemKind::BuildGraph => self.requery(name),
+            WatchItemKind::BuildGraph => self.graph_changed(name),
         };
         if !delivered {
             // Either the name is not one we supervise, or teardown has

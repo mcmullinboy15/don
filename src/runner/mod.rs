@@ -8,7 +8,6 @@
 mod events;
 mod graph;
 mod lazy;
-mod rebuild;
 mod runtime_ports;
 mod service_commands;
 mod service_health;
@@ -31,11 +30,11 @@ pub use crate::command::{CommandError, CommandResult};
 // the state projection and its `ProcessStatus` vocabulary at the crate root.
 // Aliases keep the runner's internal paths and the public `don::runner::…`
 // surface stable.
-pub(in crate::runner) use crate::build_tool::{batch as build_tools, batcher as build_batcher};
+pub(in crate::runner) use crate::build_tool::batcher as build_batcher;
 pub use crate::param_completions::CompletionError;
 pub(in crate::runner) use crate::process::{
-    Demand, ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, paths,
-    service_supervisor, service_worker, task_supervisor, task_worker,
+    Demand, ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, service_supervisor,
+    service_worker, task_supervisor, task_worker,
 };
 pub(crate) use crate::process::{ProcessKind, ProcessReport};
 pub use crate::process::{ServiceState, TaskState};
@@ -62,13 +61,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[cfg(test)]
-use self::build_tools::bazel_graph_requery_group_dir;
-#[cfg(test)]
 use self::graph::compute_depths;
 use self::graph::topological_sort;
-#[cfg(test)]
-use self::paths::any_glob_path_changed_since;
 use self::support::check_gitignore;
+#[cfg(test)]
+use crate::build_tool::batch::bazel_graph_requery_group_dir;
+#[cfg(test)]
+use crate::process::paths::any_glob_path_changed_since;
 use crate::signals::shutdown_requested;
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -81,18 +80,6 @@ const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 /// cannot drift.
 pub(in crate::runner) fn refusing_connections(state: ServiceState, live: bool) -> bool {
     matches!(state, ServiceState::Failed | ServiceState::DependencyFailed) && !live
-}
-
-/// Whether a build-graph re-query should trigger a rebuild for this service.
-///
-/// Only a service that is actually up: a lazy service nobody has connected to
-/// yet sits in `Lazy`, and cold-starting it because a BUILD file moved would
-/// build — and run — something the user never asked for.
-fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {
-    matches!(
-        service.state(),
-        ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
-    )
 }
 
 /// A command sent to the runner via its public `mpsc` channel.
@@ -301,8 +288,6 @@ pub struct Runner {
     /// decides *what* a rebuild means — outcomes come back on
     /// [`Self::batch_outcome_rx`] and are applied here.
     batcher_tx: tokio::sync::mpsc::UnboundedSender<build_batcher::BatchRequest>,
-    /// Finished batches from the batcher actor, folded in the run loop.
-    batch_outcome_rx: tokio::sync::mpsc::UnboundedReceiver<build_batcher::BatchOutcome>,
     /// The batcher task itself; joined (bounded) during shutdown.
     batcher_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -382,7 +367,7 @@ impl Runner {
             &base_dir,
             &config.watch_ignore,
         );
-        let (batcher_tx, batch_outcome_rx, batcher_handle) = build_batcher::spawn(
+        let (batcher_tx, batcher_handle) = build_batcher::spawn(
             state_reader,
             output_manager.clone_lifecycle_emitter(),
             build_batcher::WorkspaceContext {
@@ -584,7 +569,6 @@ impl Runner {
             service_starts,
             task_supervisors,
             batcher_tx,
-            batch_outcome_rx,
             batcher_handle: Some(batcher_handle),
             completions,
             endpoints,
@@ -1013,8 +997,6 @@ impl Runner {
             Box::new(crate::process::watch_dispatch::SupervisorDispatch::new(
                 self.service_starts.registry().clone(),
                 self.task_supervisors.registry().clone(),
-                self.batcher_tx.clone(),
-                self.requery_catalog(),
                 self.output_manager.clone_lifecycle_emitter(),
             ));
         let emitter_for_watch = self.output_manager.clone_lifecycle_emitter();
@@ -1273,17 +1255,6 @@ impl Runner {
                             } => {
                                 self.handle_task_run_prepared(&name, &task_cfg, intent, result)
                                     .await;
-                            }
-                        }
-                    }
-                    // Finished batches from the batcher actor. The actor has
-                    // already released its slot, so anything applied here can
-                    // queue follow-up work without being deferred behind a
-                    // batch that has already finished.
-                    Some(outcome) = self.batch_outcome_rx.recv() => {
-                        match outcome {
-                            build_batcher::BatchOutcome::Requeries(outcomes) => {
-                                self.handle_graph_requery_complete(outcomes).await;
                             }
                         }
                     }
@@ -2345,82 +2316,6 @@ mod tests {
         assert_eq!(rt.failed_dependencies(), ["setup"]);
         assert_eq!(rt.set_state(TaskState::Pending), Some(TaskState::Pending));
         assert!(rt.failed_dependencies().is_empty());
-    }
-
-    #[test]
-    fn test_should_rebuild_after_graph_requery() {
-        use crate::config::service::ResolvedService;
-        use crate::config::types::{LogConfig, LogFilterConfig};
-        use std::collections::HashMap;
-
-        struct Case {
-            name: &'static str,
-            state: ServiceState,
-            lazy: bool,
-            expected: bool,
-        }
-
-        let cases = vec![
-            Case {
-                name: "ready non-lazy rebuilds",
-                state: ServiceState::Ready,
-                lazy: false,
-                expected: true,
-            },
-            Case {
-                name: "running non-lazy rebuilds",
-                state: ServiceState::Running,
-                lazy: false,
-                expected: true,
-            },
-            Case {
-                name: "untouched lazy service does not cold start",
-                state: ServiceState::Lazy,
-                lazy: true,
-                expected: false,
-            },
-            Case {
-                name: "pending service does not rebuild",
-                state: ServiceState::Pending,
-                lazy: false,
-                expected: false,
-            },
-        ];
-
-        for case in cases {
-            let service = RuntimeService::new(
-                ResolvedService {
-                    dir: None,
-                    env: HashMap::new(),
-                    env_file: Vec::new(),
-                    watch: Vec::new(),
-                    ignore: Vec::new(),
-                    debounce: None,
-                    depends_on: Vec::new(),
-                    proxy: Vec::new(),
-                    lazy: case.lazy,
-                    download: None,
-                    ready: None,
-                    shutdown: None,
-                    log: LogConfig::Stdout,
-                    log_filter: LogFilterConfig::default(),
-                    reload: true,
-                    tty: true,
-                    on_failure: crate::config::OnFailure::Notify,
-                    auto_filter_on_failure: None,
-                    kind: None,
-                    resolved_binary_path: None,
-                },
-                case.state,
-            );
-
-            assert_eq!(
-                should_rebuild_after_graph_requery(&service),
-                case.expected,
-                "case: {}",
-                case.name
-            );
-        }
     }
 
     #[test]

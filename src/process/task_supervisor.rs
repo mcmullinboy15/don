@@ -66,6 +66,10 @@ pub(crate) enum TaskCommand {
     /// is still being built. The scheduler used to answer all three, which
     /// meant the file watcher had to wait to hear how it went.
     Rerun,
+    /// This task's build-graph definition files changed, so the watch
+    /// patterns resolved from them may no longer be right. The supervisor
+    /// asks the build manager to re-query and re-runs if they moved.
+    BuildGraphChanged,
     /// End the run in flight, if any, then run again with the parameters the
     /// last run used.
     ///
@@ -141,6 +145,35 @@ pub(crate) fn spawn_supervisors<'a>(
     })
 }
 
+/// Ask the build manager to re-resolve this task's watch paths.
+fn request_requery(
+    name: &str,
+    task_cfg: &crate::config::Task,
+    ctx: &super::task_worker::TaskWorkerContext,
+    batcher_tx: &mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
+    outcome: &mpsc::UnboundedSender<crate::build_tool::batch::RequeryOutcome>,
+) {
+    let working_dir = working_dir_for(&ctx.base_dir, task_cfg.dir.as_deref());
+    let ignore_patterns = resolve_watch_ignore_patterns(
+        &working_dir,
+        &task_cfg.ignore,
+        &ctx.base_dir,
+        &ctx.global_watch_ignore,
+    );
+    let _ = batcher_tx.send(crate::build_tool::batcher::BatchRequest::QueueRequery {
+        item: crate::build_tool::batch::GraphRequeryRequestItem {
+            name: name.to_string(),
+            kind: super::ProcessKind::Task,
+            bazel: task_cfg.bazel.clone(),
+            watch_enabled: task_cfg.build_tool_watch_enabled(),
+            working_dir,
+            ignore_patterns,
+            global_watch_ignore: ctx.global_watch_ignore.clone(),
+        },
+        outcome: outcome.clone(),
+    });
+}
+
 /// Ask the build manager for this task's artifact, and tell the scheduler a
 /// build is under way. Returns whether a request is now outstanding.
 ///
@@ -206,6 +239,8 @@ pub(crate) struct StartupConfig {
 enum Ask {
     /// Start this run.
     Run(RunRequest),
+    /// Ask the build manager to re-resolve this task's watch paths.
+    Requery,
     /// Do not run; park the task for a manual trigger and say why.
     ///
     /// Reported as an ordinary prepared-run outcome, so the scheduler folds
@@ -242,6 +277,7 @@ fn resolve_command(
     match command {
         TaskCommand::Run(request) => Ask::Run(request),
         TaskCommand::Kill { done } => Ask::Cancel { then: None, done },
+        TaskCommand::BuildGraphChanged => Ask::Requery,
         TaskCommand::Rerun => {
             let Some(startup) = startup else {
                 return Ask::Nothing;
@@ -378,6 +414,10 @@ async fn supervise(
     // bazel target needs it built before it runs, exactly like a service.
     let (prepare_tx, mut prepare_rx) =
         mpsc::unbounded_channel::<crate::build_tool::batch::PrepareOutcome>();
+    // Where the build manager delivers this task's share of a build-graph
+    // re-query.
+    let (requery_tx, mut requery_rx) =
+        mpsc::unbounded_channel::<crate::build_tool::batch::RequeryOutcome>();
     let mut awaiting_artifact = match startup.as_ref() {
         Some(startup) if startup.task_cfg.bazel.is_some() => request_artifact(
             &name,
@@ -468,6 +508,18 @@ async fn supervise(
                                             }
                                             continue;
                                         }
+                                        Ask::Requery => {
+                                            if let Some(startup) = startup.as_ref() {
+                                                request_requery(
+                                                    &name,
+                                                    &startup.task_cfg,
+                                                    &ctx,
+                                                    &batcher_tx,
+                                                    &requery_tx,
+                                                );
+                                            }
+                                            continue;
+                                        }
                                         Ask::Park(message) => {
                                             if report_tx
                                                 .send(super::ProcessReport::TaskRunPrepared {
@@ -502,6 +554,34 @@ async fn supervise(
                                     gate = None;
                                 }
                                 continue;
+                            }
+                            // A re-query this supervisor asked for. The new
+                            // patterns are already registered; a graph that
+                            // moved means the task should run against it.
+                            outcome = requery_rx.recv() => {
+                                use crate::build_tool::batch::RequeryOutcome;
+                                if outcome != Some(RequeryOutcome::Updated) {
+                                    continue;
+                                }
+                                ctx.emitter
+                                    .service_event(&name, "build graph changed — re-running");
+                                // Same policy a watched-file change goes
+                                // through: auto_run and declared params still
+                                // decide whether this means a run.
+                                match resolve_command(
+                                    TaskCommand::Rerun,
+                                    &name,
+                                    startup.as_ref(),
+                                    &last_params,
+                                    awaiting_artifact,
+                                ) {
+                                    Ask::Run(request) => {
+                                        busy.store(true, Ordering::Relaxed);
+                                        demand = super::Demand::None;
+                                        request
+                                    }
+                                    _ => continue,
+                                }
                             }
                             // This task's artifact, from the build manager.
                             outcome = prepare_rx.recv() => {
@@ -620,8 +700,10 @@ async fn supervise(
                                 cancel_done = done.or(cancel_done);
                             }
                             // A run is already being prepared, so there is
-                            // nothing to park — it will settle on its own.
-                            Ask::Park(_) | Ask::Nothing => {}
+                            // nothing to park — it will settle on its own —
+                            // and a graph change it should react to arrives
+                            // again as its own re-query outcome.
+                            Ask::Park(_) | Ask::Requery | Ask::Nothing => {}
                         }
                     }
                     // Guarded so a closed mailbox doesn't spin this select:
@@ -803,7 +885,7 @@ async fn supervise(
                                 pending = then;
                             }
                             // Running now; nothing to park.
-                            Ask::Park(_) | Ask::Nothing => {}
+                            Ask::Park(_) | Ask::Requery | Ask::Nothing => {}
                         }
                     }
                     None => mailbox_closed = true,
@@ -1209,6 +1291,7 @@ mod tests {
                     ..
                 } => ("cancel-then-run", Some(request.params.clone())),
                 Ask::Park(_) => ("park", None),
+                Ask::Requery => ("requery", None),
                 Ask::Nothing => ("nothing", None),
             };
             assert_eq!(got, case.want, "{}", case.name);

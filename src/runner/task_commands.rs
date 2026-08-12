@@ -198,14 +198,6 @@ impl Runner {
             .then_some(done_rx)
     }
 
-    /// Tell a task's supervisor its watched inputs changed. Whether that
-    /// means a run is its answer, not this one's.
-    pub(in crate::runner) fn send_task_rerun(&self, name: &str) {
-        if let Some(handle) = self.task_supervisors.registry().get(name) {
-            let _ = handle.request(task_supervisor::TaskCommand::Rerun);
-        }
-    }
-
     /// Queue a triggered run on this task's supervisor. Used by the
     /// file-watch path ([`handle_task_rerun`]) and the explicit-run paths
     /// (`don run <name>`, `don run --all-pending`).
