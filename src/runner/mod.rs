@@ -1205,8 +1205,7 @@ impl Runner {
                             }
                             RunnerCommand::Restart { name, reply } => {
                                 if self.tasks.contains_key(&name) {
-                                    let result = self.handle_restart_task_cmd(&name).await;
-                                    let _ = reply.send(result);
+                                    self.send_task_restart(&name, reply);
                                 } else {
                                     self.handle_restart_service_cmd(&name, reply).await;
                                 }
@@ -1257,6 +1256,9 @@ impl Runner {
                             }
                             ProcessReport::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
+                            }
+                            ProcessReport::TaskStarting { name, message } => {
+                                self.handle_task_starting(&name, &message);
                             }
                             ProcessReport::RebuildCycleDone { name, success } => {
                                 // The supervisor ran the whole cycle; this
@@ -2376,7 +2378,6 @@ mod tests {
         );
 
         assert_eq!(rt.state(), TaskState::Pending);
-        assert!(rt.pgid.is_none());
         assert_eq!(rt.config.cmd, "echo");
 
         assert!(rt.mark_dependency_failed(vec!["setup".to_string()]));

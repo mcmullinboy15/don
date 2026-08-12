@@ -11,20 +11,13 @@ use tokio::sync::oneshot;
 impl Runner {
     /// Queue a run on this task's supervisor.
     ///
-    /// Returns the run's generation, which now has exactly one remaining job:
-    /// identifying which run a `don run --wait` reply belongs to. Deciding
-    /// whether a *prepared* run is still current is no longer a question the
-    /// runner asks — the supervisor is the only thing that emits
-    /// `TaskRunPrepared` for its task, and only for the run it is committed
-    /// to.
+    /// Whether a *prepared* run is still current is not a question the runner
+    /// asks — the supervisor is the only thing that emits `TaskRunPrepared`
+    /// for its task, and only for the run it is committed to.
     pub(in crate::runner) fn spawn_task_worker(
         &mut self,
         name: &str,
-        task_cfg: crate::config::Task,
-        params: HashMap<String, String>,
-        mode: TaskRunMode,
-        intent: TaskRunIntent,
-        wait: Option<task_supervisor::RunWait>,
+        request: task_supervisor::RunRequest,
     ) -> Result<(), CommandError> {
         // The registry is built from the task map, so a hit here is proof the
         // task exists — no separate existence check needed.
@@ -34,14 +27,7 @@ impl Runner {
             });
         };
 
-        let queued = handle.request(task_supervisor::RunRequest {
-            task_cfg: Box::new(task_cfg),
-            params,
-            mode,
-            intent,
-            wait,
-        });
-        if !queued {
+        if !handle.request(task_supervisor::TaskCommand::Run(request)) {
             return Err(CommandError::Failed {
                 name: name.to_string(),
                 message: "task supervisor is shutting down".to_string(),
@@ -93,12 +79,8 @@ impl Runner {
                         &format!("waiting for input — run 'don attach {name}'"),
                     );
                 }
-                // The supervisor holds the process, the reader, and the
-                // scheduler answer; this side keeps the shadows attach and
-                // status read, and makes the runner-only state transition.
-                if let Some(rt) = self.tasks.get_mut(name) {
-                    rt.pgid = Some(wired.pgid);
-                }
+                // The supervisor holds the process; for runtime detail the
+                // snapshot is the record, not a copy of one.
                 self.state.set_task_pid(name, Some(wired.pgid));
                 self.begin_task_run(name, intent, Some("running..."));
             }
@@ -175,70 +157,54 @@ impl Runner {
         }
     }
 
-    async fn stop_task_pgid(&mut self, name: &str, pgid: i32) -> CommandResult {
-        if let Some(writer) = self.output_manager.service_writer(name) {
-            writer.close_follow_sinks().await;
+    /// Route a task restart to its supervisor.
+    ///
+    /// Everything a restart needs — the run in flight, the parameters the
+    /// last one used, and the process group to end — belongs to the
+    /// supervisor, so all this does is address it. The reply rides down with
+    /// the command and is answered there.
+    pub(in crate::runner) fn send_task_restart(
+        &self,
+        name: &str,
+        reply: oneshot::Sender<CommandResult>,
+    ) {
+        if self.shutting_down {
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "shutdown in progress".to_string(),
+            }));
+            return;
         }
-
-        self.output_manager
-            .service_event(name, "stopping... (requested)");
-        self.output_manager
-            .service_event(name, &format!("send SIGKILL to task pgid {pgid}"));
-
-        match nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pgid),
-            nix::sys::signal::Signal::SIGKILL,
-        ) {
-            Ok(()) | Err(nix::Error::ESRCH) => {}
-            Err(e) => {
-                return Err(CommandError::Failed {
-                    name: name.to_string(),
-                    message: format!("failed to kill task pgid {pgid}: {e}"),
-                });
-            }
+        let mut carried = Some(reply);
+        let sent = self
+            .task_supervisors
+            .registry()
+            .get(name)
+            .is_some_and(|handle| {
+                handle.request(task_supervisor::TaskCommand::Restart {
+                    reply: carried.take(),
+                })
+            });
+        if !sent && let Some(reply) = carried {
+            let _ = reply.send(Err(CommandError::UnknownTask {
+                name: name.to_string(),
+            }));
         }
-
-        Ok(())
     }
 
-    pub(in crate::runner) async fn handle_restart_task_cmd(&mut self, name: &str) -> CommandResult {
-        let (task_cfg, last_params, state, pgid) = match self.tasks.get(name) {
-            Some(rt) => (
-                rt.config.clone(),
-                rt.last_params.clone(),
-                rt.state(),
-                rt.pgid,
-            ),
-            None => {
-                return Err(CommandError::UnknownTask {
-                    name: name.to_string(),
-                });
-            }
-        };
-
-        if !task_cfg.params.is_empty() && last_params.len() < task_cfg.params.len() {
-            return Err(CommandError::InvalidState {
-                name: name.to_string(),
-                message: "task has params and no previous invocation to restart; use `don run`"
-                    .to_string(),
-            });
-        }
-
-        if matches!(state, TaskState::Running | TaskState::Building)
-            && let Some(pgid) = pgid
-        {
-            self.stop_task_pgid(name, pgid).await?;
-        }
-
-        self.spawn_task_rerun(
-            name,
-            &task_cfg,
-            &last_params,
-            "restarting (manual trigger)",
-            None,
-        )
-        .await;
-        Ok(())
+    /// Ask a task's supervisor to end the run it is holding, if any.
+    ///
+    /// Returns the done-signal to join on. Teardown must: the supervisors are
+    /// aborted right after, and aborting one that has not read this yet would
+    /// leave its child unreaped.
+    pub(in crate::runner) fn send_task_kill(&self, name: &str) -> Option<oneshot::Receiver<()>> {
+        let handle = self.task_supervisors.registry().get(name)?;
+        let (done_tx, done_rx) = oneshot::channel();
+        handle
+            .request(task_supervisor::TaskCommand::Kill {
+                done: Some(done_tx),
+            })
+            .then_some(done_rx)
     }
 
     /// Handle a file-watch-triggered task re-run.
@@ -328,10 +294,12 @@ impl Runner {
         .await;
     }
 
-    /// Actually spawn a task re-run: release any attach lock, flip to
-    /// `Running`, spawn, and wire output. Used by both the file-watch path
-    /// ([`handle_task_rerun`]) and the explicit-run paths (`don run <name>`,
-    /// `don run --all-pending`).
+    /// Queue a triggered run on this task's supervisor. Used by the
+    /// file-watch path ([`handle_task_rerun`]) and the explicit-run paths
+    /// (`don run <name>`, `don run --all-pending`).
+    ///
+    /// `start_message` is what the supervisor announces when it picks the run
+    /// up; the flip to `Running` follows from that report, not from here.
     ///
     /// `params` is the user-supplied value map; empty for param-less tasks.
     /// Values are substituted into the task's `cmd`/`args`/`env`/`dir` via
@@ -344,21 +312,6 @@ impl Runner {
         start_message: &str,
         wait_reply: Option<(oneshot::Sender<CommandResult>, Option<String>)>,
     ) {
-        if let Some(rt) = self.tasks.get_mut(name) {
-            rt.last_params = params.clone();
-            rt.set_needs_run_now(true);
-        }
-        // Close follow sinks so any active follower exits cleanly before
-        // the new process starts. (Attach cleanup is the supervisor's now.)
-        if let Some(writer) = self.output_manager.service_writer(name) {
-            writer.close_follow_sinks().await;
-        }
-
-        self.output_manager.service_event(name, start_message);
-        self.set_task_state(name, TaskState::Running);
-
-        self.output_manager
-            .service_debug_event(name, "spawning process...");
         let wait = wait_reply.map(|(reply, timeout)| task_supervisor::RunWait {
             reply,
             // An unparseable spelling waits indefinitely, as it did when the
@@ -372,11 +325,14 @@ impl Runner {
         let mut carried = Some(wait);
         match self.spawn_task_worker(
             name,
-            task_cfg.clone(),
-            params.clone(),
-            TaskRunMode::Triggered,
-            TaskRunIntent::Background,
-            carried.take().flatten(),
+            task_supervisor::RunRequest {
+                task_cfg: Box::new(task_cfg.clone()),
+                params: params.clone(),
+                mode: TaskRunMode::Triggered,
+                intent: TaskRunIntent::Background,
+                wait: carried.take().flatten(),
+                start_message: Some(start_message.to_string()),
+            },
         ) {
             Ok(()) => {}
             Err(e) => {

@@ -296,42 +296,39 @@ impl Runner {
             self.send_unjoined_stop(&name);
         }
 
-        // Kill any still-running task process groups.
-        let running_task_pgids: Vec<(String, i32)> = self
-            .tasks
+        // End any still-running task run. The supervisor holds the process and
+        // is parked on its exit, so it is the one that signals — this says
+        // which tasks, and waits for the kills to land before the supervisors
+        // are ended below.
+        let running_tasks: Vec<String> = self
+            .state
+            .current()
+            .processes
             .iter()
-            .filter_map(|(name, rt)| rt.pgid.map(|pgid| (name.clone(), pgid)))
+            .filter_map(|status| match status {
+                crate::state_store::ProcessStatus::Task { name, pid, .. } => {
+                    pid.map(|_| name.clone())
+                }
+                _ => None,
+            })
             .collect();
-        if !running_task_pgids.is_empty() {
+        if !running_tasks.is_empty() {
             self.output_manager.lifecycle_event(&format!(
                 "killing {} running task{}",
-                running_task_pgids.len(),
-                if running_task_pgids.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+                running_tasks.len(),
+                if running_tasks.len() == 1 { "" } else { "s" }
             ));
-            for (name, pgid) in &running_task_pgids {
-                self.output_manager
-                    .service_event(name, &format!("send SIGKILL to task pgid {pgid}"));
-                if let Err(e) = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(*pgid),
-                    nix::sys::signal::Signal::SIGKILL,
-                ) {
-                    // ESRCH = already dead, which is fine.
-                    if e != nix::Error::ESRCH {
-                        self.output_manager.service_error_event(
-                            name,
-                            &format!("failed to kill task pgid {pgid}: {e}"),
-                        );
-                    }
-                }
-                if let Some(rt) = self.tasks.get_mut(name) {
-                    rt.pgid = None;
-                }
+            let mut done: Vec<tokio::sync::oneshot::Receiver<()>> = Vec::new();
+            for name in &running_tasks {
+                done.extend(self.send_task_kill(name));
                 self.state.set_task_pid(name, None);
             }
+            // Bounded once for the whole set, not once per task.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                futures_util::future::join_all(done),
+            )
+            .await;
         }
 
         // Every stop has been executed and joined, and the task pgid sweep
@@ -440,16 +437,14 @@ impl Runner {
         let Ok(super::task_supervisor::TaskRunReport::Running(wired)) = result else {
             return;
         };
-        // The supervisor holds the process and is waiting on its exit; kill
-        // the group and let that wait complete. The reader drains inside
-        // the supervisor before it reports.
+        // The supervisor holds the process and is parked on its exit; ask it
+        // to end the run. It signals the group and drains the reader before
+        // answering, which is what this waits for.
+        let _ = wired;
         self.output_manager
             .service_event(&name, "run cancelled by shutdown");
-        self.output_manager
-            .service_event(&name, &format!("send SIGKILL to task pgid {}", wired.pgid));
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(wired.pgid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+        if let Some(done) = self.send_task_kill(&name) {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), done).await;
+        }
     }
 }

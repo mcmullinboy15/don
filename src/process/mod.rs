@@ -45,7 +45,6 @@ pub(crate) enum TaskRunIntent {
 
 pub(crate) struct TaskExit {
     pub(crate) name: String,
-    pub(crate) pgid: i32,
     pub(crate) success: bool,
     pub(crate) message: Option<String>,
     pub(crate) elapsed: Option<std::time::Duration>,
@@ -168,6 +167,13 @@ pub(crate) enum ProcessReport {
         /// dependency.
         reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
     },
+    /// A task's supervisor picked up a triggered run and is preparing it.
+    ///
+    /// The task-side twin of [`ServiceStarting`](Self::ServiceStarting):
+    /// preparation hashes inputs and resolves downloads, so a run that said
+    /// nothing until it spawned would look ignored. The scheduler folds it
+    /// into `Running` and says what the supervisor asked it to say.
+    TaskStarting { name: String, message: String },
     /// A task's supervisor settled a run request.
     TaskRunPrepared {
         name: String,

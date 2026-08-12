@@ -26,6 +26,13 @@ pub(crate) struct RunRequest {
     pub(crate) intent: super::TaskRunIntent,
     /// Someone waiting for this run to finish (`don run --wait`).
     pub(crate) wait: Option<RunWait>,
+    /// What to say when this run is picked up, before preparing it.
+    ///
+    /// Preparation hashes files and resolves downloads, so a triggered run
+    /// that said nothing until it was ready to spawn would look ignored.
+    /// `None` for the startup sweep, which the scheduler is already
+    /// narrating.
+    pub(crate) start_message: Option<String>,
 }
 
 /// A caller blocked on a run's outcome.
@@ -41,10 +48,38 @@ pub(crate) struct RunWait {
     pub(crate) timeout: Option<(std::time::Duration, String)>,
 }
 
+/// What a task's supervisor can be asked to do.
+///
+/// A run used to be the only thing in this mailbox, because killing a run and
+/// restarting one were done *to* the task by the scheduler: it kept the run's
+/// pgid and the parameters the last run used, and signalled the process group
+/// itself. Both of those are things the owner of the run already has, so both
+/// arrive here now and the scheduler keeps neither.
+pub(crate) enum TaskCommand {
+    /// Run this task. A run already in flight is superseded.
+    Run(RunRequest),
+    /// End the run in flight, if any, then run again with the parameters the
+    /// last run used.
+    ///
+    /// The "no previous invocation to restart" check comes with it: the
+    /// parameters it reads about are held here.
+    Restart {
+        reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+    },
+    /// End the run in flight, if any, and do not run again — teardown.
+    ///
+    /// `done` fires once the run is gone. Teardown waits on it: the
+    /// supervisors are aborted immediately afterwards, and aborting one that
+    /// has not read this yet would drop a live process on the floor.
+    Kill {
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+}
+
 /// Owner half for tasks. See [`Supervisors`].
 ///
 /// [`Supervisors`]: super::registry::Supervisors
-pub(crate) type TaskSupervisors = super::registry::Supervisors<RunRequest>;
+pub(crate) type TaskSupervisors = super::registry::Supervisors<TaskCommand>;
 
 /// What the runner receives for a spawned, wired run. The supervisor keeps
 /// the process handle and the output reader; this is what the runner's
@@ -154,6 +189,104 @@ pub(crate) struct StartupConfig {
     pub(crate) has_dependents: bool,
 }
 
+/// What a command means once resolved against what this supervisor holds —
+/// the task's config and the parameters its last run used.
+///
+/// Resolving up front is what stops the three places a command can arrive
+/// (idle, mid-preparation, mid-run) from each re-deriving "what does a
+/// restart mean here".
+enum Ask {
+    /// Start this run.
+    Run(RunRequest),
+    /// End the run in hand; start `then` once it is gone, and fire `done`
+    /// when it is.
+    Cancel {
+        then: Option<RunRequest>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    /// Nothing to do. Any reply has already been answered.
+    Nothing,
+}
+
+/// Answer a command's reply channel, if it had one.
+fn answer(
+    reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+    result: crate::command::CommandResult,
+) {
+    if let Some(reply) = reply {
+        let _ = reply.send(result);
+    }
+}
+
+fn resolve_command(
+    command: TaskCommand,
+    name: &str,
+    startup: Option<&StartupConfig>,
+    last_params: &std::collections::HashMap<String, String>,
+) -> Ask {
+    match command {
+        TaskCommand::Run(request) => Ask::Run(request),
+        TaskCommand::Kill { done } => Ask::Cancel { then: None, done },
+        TaskCommand::Restart { reply } => {
+            let Some(startup) = startup else {
+                answer(
+                    reply,
+                    Err(crate::command::CommandError::UnknownTask {
+                        name: name.to_string(),
+                    }),
+                );
+                return Ask::Nothing;
+            };
+            // A param'd task has nothing to reuse until it has been run once
+            // with values supplied.
+            if !startup.task_cfg.params.is_empty()
+                && last_params.len() < startup.task_cfg.params.len()
+            {
+                answer(
+                    reply,
+                    Err(crate::command::CommandError::InvalidState {
+                        name: name.to_string(),
+                        message:
+                            "task has params and no previous invocation to restart; use `don run`"
+                                .to_string(),
+                    }),
+                );
+                return Ask::Nothing;
+            }
+            // Accepted: answered now, as it was when the scheduler executed
+            // the restart itself. The run's own outcome travels separately.
+            answer(reply, Ok(()));
+            Ask::Cancel {
+                done: None,
+                then: Some(RunRequest {
+                    task_cfg: startup.task_cfg.clone(),
+                    params: last_params.clone(),
+                    mode: super::task_worker::TaskRunMode::Triggered,
+                    intent: super::TaskRunIntent::Background,
+                    wait: None,
+                    start_message: Some("restarting (manual trigger)".to_string()),
+                }),
+            }
+        }
+    }
+}
+
+/// SIGKILL a run this supervisor is holding.
+///
+/// The supervisor owns the process, so it signals the group directly rather
+/// than asking anyone: the pgid is its own, and the `wait` it is already
+/// parked on is what reaps the result.
+fn kill_run(emitter: &crate::output::LifecycleEmitter, name: &str, pgid: i32) {
+    emitter.service_event(name, &format!("send SIGKILL to task pgid {pgid}"));
+    if let Err(e) = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    ) && e != nix::Error::ESRCH
+    {
+        emitter.service_error_event(name, &format!("failed to kill task pgid {pgid}: {e}"));
+    }
+}
+
 /// Drive one task's runs, strictly in order.
 ///
 /// The shape that matters is that a superseded run is **finished, not
@@ -164,7 +297,7 @@ pub(crate) struct StartupConfig {
 #[allow(clippy::too_many_arguments)]
 async fn supervise(
     name: String,
-    mut rx: mpsc::UnboundedReceiver<RunRequest>,
+    mut rx: mpsc::UnboundedReceiver<TaskCommand>,
     ctx: super::task_worker::TaskWorkerContext,
     output: Option<crate::output::ProcessOutput>,
     report_tx: mpsc::UnboundedSender<super::ProcessReport>,
@@ -177,6 +310,11 @@ async fn supervise(
     let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<RunRequest> = None;
     let mut mailbox_closed = false;
+    // The parameters the last run used, for a restart to reuse. Held here
+    // because a restart is executed here; the scheduler kept a copy only to
+    // hand it back on the way in.
+    let mut last_params: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     // Where the build manager delivers this task's artifact. A task with a
     // bazel target needs it built before it runs, exactly like a service.
     let (prepare_tx, mut prepare_rx) =
@@ -232,6 +370,7 @@ async fn supervise(
                                 has_dependents: startup.has_dependents,
                             },
                             intent: super::TaskRunIntent::Scheduled,
+                            start_message: None,
                         }
                     });
                 match permitted {
@@ -242,13 +381,32 @@ async fn supervise(
                     None => {
                         tokio::select! {
                             received = rx.recv() => match received {
-                                Some(request) => {
-                                    busy.store(true, Ordering::Relaxed);
-                                    // A mailbox run supersedes standing
-                                    // demand; withdrawing it here keeps the
-                                    // task from running twice.
-                                    demand = super::Demand::None;
-                                    request
+                                Some(command) => {
+                                    // Nothing is in hand, so a cancel has
+                                    // nothing to kill — only its follow-up
+                                    // run, if it has one, survives.
+                                    match resolve_command(
+                                        command, &name, startup.as_ref(), &last_params,
+                                    ) {
+                                        Ask::Run(request)
+                                        | Ask::Cancel { then: Some(request), .. } => {
+                                            busy.store(true, Ordering::Relaxed);
+                                            // A mailbox run supersedes standing
+                                            // demand; withdrawing it here keeps
+                                            // the task from running twice.
+                                            demand = super::Demand::None;
+                                            request
+                                        }
+                                        Ask::Cancel { then: None, done } => {
+                                            // Nothing in hand: the kill is
+                                            // already true.
+                                            if let Some(done) = done {
+                                                let _ = done.send(());
+                                            }
+                                            continue;
+                                        }
+                                        Ask::Nothing => continue,
+                                    }
                                 }
                                 None => return,
                             },
@@ -317,7 +475,31 @@ async fn supervise(
             mode,
             intent,
             wait: request_wait,
+            start_message,
         } = request;
+
+        // A triggered run announces itself before preparing, and takes over
+        // as the run a restart would reuse. Both used to happen on the
+        // scheduler, which is why it kept a copy of the parameters.
+        if matches!(intent, super::TaskRunIntent::Background) {
+            last_params = params.clone();
+        }
+        if let Some(message) = start_message {
+            // Any follower of the previous run should end cleanly before the
+            // next process starts writing.
+            if let Some(writer) = service_writer.as_ref() {
+                writer.close_follow_sinks().await;
+            }
+            if report_tx
+                .send(super::ProcessReport::TaskStarting {
+                    name: name.clone(),
+                    message,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
 
         let task_cfg_for_worker = task_cfg.clone();
         let worker = super::task_worker::run_task_worker(
@@ -329,14 +511,29 @@ async fn supervise(
         );
         tokio::pin!(worker);
 
-        // Watch for a newer request while the current one prepares, keeping
+        // Watch for a newer command while the current run prepares, keeping
         // only the most recent — anything older is already superseded too.
         let mut superseded: Option<RunRequest> = None;
+        // A cancel that lands mid-preparation cannot stop the spawn (dropping
+        // the worker would take the handle with it), so it is recorded and
+        // paid out below once preparation has finished.
+        let mut abandoned = false;
+        let mut cancel_done: Option<tokio::sync::oneshot::Sender<()>> = None;
         let result = loop {
             tokio::select! {
                 result = &mut worker => break result,
                 next = rx.recv(), if !mailbox_closed => match next {
-                    Some(next) => superseded = Some(next),
+                    Some(command) => {
+                        match resolve_command(command, &name, startup.as_ref(), &last_params) {
+                            Ask::Run(request) => superseded = Some(request),
+                            Ask::Cancel { then, done } => {
+                                abandoned = true;
+                                superseded = then;
+                                cancel_done = done.or(cancel_done);
+                            }
+                            Ask::Nothing => {}
+                        }
+                    }
                     // Guarded so a closed mailbox doesn't spin this select:
                     // `recv` on a closed channel returns immediately, forever.
                     None => mailbox_closed = true,
@@ -344,11 +541,14 @@ async fn supervise(
             }
         };
 
-        if let Some(next) = superseded {
+        if abandoned || superseded.is_some() {
             if let Ok(prepared) = result {
                 kill_superseded_spawn(&ctx.emitter, &name, prepared);
             }
-            pending = Some(next);
+            if let Some(done) = cancel_done {
+                let _ = done.send(());
+            }
+            pending = superseded;
             continue;
         }
 
@@ -454,6 +654,10 @@ async fn supervise(
         let Some(outcome) = outcome else { continue };
         let timeout = task_cfg.timeout.clone();
         let start = std::time::Instant::now();
+        // Captured before the wait borrows the handle: a cancel arriving
+        // mid-run signals the group this supervisor owns.
+        let pgid = outcome.pgid;
+        let mut cancelled = false;
         let wait = super::task::wait_for_task(&mut handle, timeout.as_deref());
         tokio::pin!(wait);
         let deadline = wait_deadline
@@ -487,7 +691,29 @@ async fn supervise(
                     }
                 }
                 next = rx.recv(), if !mailbox_closed => match next {
-                    Some(next) => pending = Some(next),
+                    Some(command) => {
+                        match resolve_command(command, &name, startup.as_ref(), &last_params) {
+                            // A run queued behind this one starts strictly
+                            // after it — owning the exit is what makes that
+                            // ordering structural rather than checked.
+                            Ask::Run(request) => pending = Some(request),
+                            Ask::Cancel { then, done } => {
+                                if !cancelled {
+                                    cancelled = true;
+                                    // A cancel that runs again narrates the
+                                    // stop; teardown narrates in bulk.
+                                    if then.is_some() {
+                                        ctx.emitter
+                                            .service_event(&name, "stopping... (requested)");
+                                    }
+                                    kill_run(&ctx.emitter, &name, pgid);
+                                }
+                                cancel_done = done.or(cancel_done);
+                                pending = then;
+                            }
+                            Ask::Nothing => {}
+                        }
+                    }
                     None => mailbox_closed = true,
                 },
             }
@@ -503,6 +729,23 @@ async fn supervise(
         // muted stdout resumes before the completion message lands.
         if let Some(output) = output.as_ref() {
             output.clear_attach().await;
+        }
+        if cancelled {
+            // A run somebody ended is not an outcome to fold: its exit status
+            // describes the SIGKILL, not the task, and the kill was narrated
+            // where it happened. Nothing is recorded either — the scheduler
+            // used to reach the same result by dropping the exit report,
+            // having compared its pgid against a copy it kept.
+            if let Some(reply) = waiter.take() {
+                let _ = reply.send(Err(crate::command::CommandError::Failed {
+                    name: name.clone(),
+                    message: "task run was cancelled".to_string(),
+                }));
+            }
+            if let Some(done) = cancel_done.take() {
+                let _ = done.send(());
+            }
+            continue;
         }
         outcome.finish(result, start.elapsed(), waiter.take()).await;
     }
@@ -748,7 +991,6 @@ impl TaskRunOutcome {
             .report_tx
             .send(super::ProcessReport::TaskExited(TaskExit {
                 name: self.name,
-                pgid: self.pgid,
                 success,
                 message,
                 elapsed: Some(elapsed),
@@ -769,6 +1011,132 @@ mod tests {
     fn test_task() -> crate::config::Task {
         let config: crate::config::Config = "[tasks.build]\ncmd = \"true\"\n".parse().unwrap();
         config.tasks.get("build").unwrap().clone()
+    }
+
+    /// A task declaring one required param, for the restart-reuse rules.
+    fn param_task() -> crate::config::Task {
+        let config: crate::config::Config =
+            "[tasks.seed]\ncmd = \"true\"\n[[tasks.seed.params]]\nname = \"env\"\nrequired = true\n"
+                .parse()
+                .unwrap();
+        config.tasks.get("seed").unwrap().clone()
+    }
+
+    /// Every command, resolved against what the supervisor holds. This is the
+    /// whole of what moved off the scheduler: a restart's meaning depends on
+    /// the parameters of the last run, which live here now.
+    #[tokio::test]
+    async fn commands_resolve_against_what_the_supervisor_holds() {
+        struct Case {
+            name: &'static str,
+            command: fn(
+                Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+            ) -> TaskCommand,
+            task: crate::config::Task,
+            last_params: Vec<(&'static str, &'static str)>,
+            want: &'static str,
+            /// Parameters the resolved run carries, when it makes one.
+            want_params: Vec<(&'static str, &'static str)>,
+            want_reply: Option<bool>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a run is a run",
+                command: |_| {
+                    TaskCommand::Run(RunRequest {
+                        task_cfg: Box::new(test_task()),
+                        params: std::collections::HashMap::new(),
+                        mode: super::super::task_worker::TaskRunMode::Triggered,
+                        intent: super::super::TaskRunIntent::Background,
+                        wait: None,
+                        start_message: None,
+                    })
+                },
+                task: test_task(),
+                last_params: vec![],
+                want: "run",
+                want_params: vec![],
+                want_reply: None,
+            },
+            Case {
+                name: "a kill cancels and does not run again",
+                command: |_| TaskCommand::Kill { done: None },
+                task: test_task(),
+                last_params: vec![],
+                want: "cancel-only",
+                want_params: vec![],
+                want_reply: None,
+            },
+            Case {
+                name: "a param-less restart reuses nothing and is accepted",
+                command: |reply| TaskCommand::Restart { reply },
+                task: test_task(),
+                last_params: vec![],
+                want: "cancel-then-run",
+                want_params: vec![],
+                want_reply: Some(true),
+            },
+            Case {
+                name: "a param'd task with a previous run reuses its values",
+                command: |reply| TaskCommand::Restart { reply },
+                task: param_task(),
+                last_params: vec![("env", "staging")],
+                want: "cancel-then-run",
+                want_params: vec![("env", "staging")],
+                want_reply: Some(true),
+            },
+            Case {
+                // The check that used to read the scheduler's copy of the
+                // parameters. Nothing to reuse means nothing to restart.
+                name: "a param'd task with no previous run is refused",
+                command: |reply| TaskCommand::Restart { reply },
+                task: param_task(),
+                last_params: vec![],
+                want: "nothing",
+                want_params: vec![],
+                want_reply: Some(false),
+            },
+        ];
+
+        for case in cases {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let command = (case.command)(Some(reply_tx));
+            let startup = StartupConfig {
+                task_cfg: Box::new(case.task),
+                has_dependents: false,
+            };
+            let last_params: std::collections::HashMap<String, String> = case
+                .last_params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+
+            let ask = resolve_command(command, "seed", Some(&startup), &last_params);
+            let (got, params) = match &ask {
+                Ask::Run(request) => ("run", Some(request.params.clone())),
+                Ask::Cancel { then: None, .. } => ("cancel-only", None),
+                Ask::Cancel {
+                    then: Some(request),
+                    ..
+                } => ("cancel-then-run", Some(request.params.clone())),
+                Ask::Nothing => ("nothing", None),
+            };
+            assert_eq!(got, case.want, "{}", case.name);
+            if let Some(params) = params {
+                let want: std::collections::HashMap<String, String> = case
+                    .want_params
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect();
+                assert_eq!(params, want, "{}: reused params", case.name);
+            }
+            match case.want_reply {
+                Some(ok) => assert_eq!(reply_rx.await.unwrap().is_ok(), ok, "{}: reply", case.name),
+                // Nothing answered it, so the sender dropped with the command.
+                None => assert!(reply_rx.await.is_err(), "{}: unexpected reply", case.name),
+            }
+        }
     }
 
     fn outcome(
@@ -918,13 +1286,14 @@ mod tests {
         }
         let handle = registry.get("build").unwrap().clone();
         assert!(
-            !handle.request(RunRequest {
+            !handle.request(TaskCommand::Run(RunRequest {
                 wait: None,
                 task_cfg: Box::new(test_task()),
                 params: std::collections::HashMap::new(),
                 mode: super::super::task_worker::TaskRunMode::Triggered,
                 intent: super::super::TaskRunIntent::Background,
-            }),
+                start_message: None,
+            })),
             "a handle to a stopped supervisor must report the failure"
         );
     }
@@ -1000,7 +1369,6 @@ mod tests {
                 panic!("{}: expected a TaskExited", case.name);
             };
             assert_eq!(exit.name, "build", "{}", case.name);
-            assert_eq!(exit.pgid, 4242, "{}", case.name);
             assert_eq!(exit.success, case.want_success, "{}", case.name);
             assert_eq!(exit.message.as_deref(), case.want_message, "{}", case.name);
             assert_eq!(exit.rerun, case.rerun, "{}", case.name);

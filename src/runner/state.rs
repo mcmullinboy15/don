@@ -16,7 +16,6 @@
 
 use super::{ServiceState, TaskState};
 use crate::config::TaskAutoRun;
-use std::collections::HashMap;
 
 /// All per-service runtime state, consolidated into a single struct.
 ///
@@ -105,11 +104,6 @@ pub(crate) struct RuntimeTask {
     failed_dependencies: Vec<String>,
     /// The task config (stored once, no repeated lookups).
     pub config: crate::config::task::Task,
-    /// Params used for the most recent spawned run. Empty for param-less
-    /// tasks and startup/watch-triggered runs.
-    pub last_params: HashMap<String, String>,
-    /// Process group ID of the running task (for shutdown kills).
-    pub pgid: Option<i32>,
     /// Whether the task has ever completed successfully.
     pub has_success: bool,
     /// Metadata for the most recent process run, including failures.
@@ -133,8 +127,6 @@ impl RuntimeTask {
             state: initial_state,
             failed_dependencies: Vec::new(),
             config,
-            last_params: HashMap::new(),
-            pgid: None,
             has_success,
             last_run,
             dependency_evaluated: false,
