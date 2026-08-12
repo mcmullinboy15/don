@@ -9,15 +9,15 @@
 //! ring buffer and fans out to the service's current sinks. The ring buffer persists
 //! across restarts, and [`ServiceWriter`] is cloneable for reuse.
 
+mod actor;
 pub mod attach;
 pub(crate) mod emulator;
 pub(crate) mod osc;
 pub(crate) mod ring_buffer;
 pub(crate) mod sanitize;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
-use ring_buffer::RingBuffer;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -104,18 +104,18 @@ pub(crate) fn spawn_pty_gate(mut pty_write: pty_process::OwnedWritePty) -> mpsc:
 /// restart replaces the process's handle, and dropping the old one removes its
 /// sink and releases its gate sender.
 pub struct OscSinkHandle {
-    /// Our copy of the sender. Dropping it *and* removing the service's copy
+    /// Our copy of the sender. Dropping it *and* removing the process's copy
     /// from the sinks list closes the channel, stopping the task.
     handle: Option<SinkHandle>,
     /// The scanner task, which holds a gate sender until its channel closes.
     join: Option<JoinHandle<()>>,
-    service_state: Arc<Mutex<ServiceOutputState>>,
+    output: actor::OutputHandle,
 }
 
 impl Drop for OscSinkHandle {
     /// Stop the scanner when the handle is dropped — e.g. when a restart
     /// replaces `osc_sink` or a service stops. Without this the task lives
-    /// on (the service's copy of the channel sender stays in the sinks
+    /// on (the process's copy of the channel sender stays in the sinks
     /// list, so the channel never closes), keeping a gate sender alive and
     /// with it one PTY master per restart.
     fn drop(&mut self) {
@@ -123,19 +123,28 @@ impl Drop for OscSinkHandle {
         if let Some(join) = self.join.take() {
             join.abort();
         }
-        // Remove the service's lingering copy of our sender so the dead sink
-        // stops receiving lines. The sinks list is behind an async lock, so
-        // hand the removal to a task — there is always a runtime on the runner
-        // loop, where these handles are dropped.
+        // Remove the process's lingering copy of our sender so the dead sink
+        // stops receiving lines. This used to need a spawned task purely to
+        // take the sinks lock from a `Drop`; posting a message needs neither
+        // a runtime nor an await.
         if let Some(handle) = self.handle.take() {
-            let service_state = Arc::clone(&self.service_state);
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                rt.spawn(async move {
-                    let mut state = service_state.lock().await;
-                    state.sinks.retain(|s| !s.same_channel(&handle));
-                });
-            }
+            self.output.remove_sink(handle);
         }
+    }
+}
+
+/// Register an OSC response sink on a process and start its scanner.
+///
+/// The sink uses bounded-drop semantics so it never blocks the output
+/// pipeline.
+fn spawn_osc_sink(output: actor::OutputHandle, pty_input: mpsc::Sender<PtyInput>) -> OscSinkHandle {
+    let (tx, rx) = mpsc::channel::<SinkLine>(16);
+    let handle = SinkHandle::BoundedDrop(tx);
+    output.add_sink(handle.clone());
+    OscSinkHandle {
+        handle: Some(handle),
+        join: Some(tokio::spawn(osc_sink_task(rx, pty_input))),
+        output,
     }
 }
 
@@ -362,84 +371,6 @@ enum StdoutTarget<W: tokio::io::AsyncWrite + Unpin + Send> {
     Writer(W),
 }
 
-/// Per-service output state. Owned by OutputManager, never removed.
-struct ServiceOutputState {
-    /// Service/task name — stamped onto every emitted `SinkLine` so the TUI
-    /// can filter without having to reverse-map the prefix bytes.
-    name: String,
-    prefix: Bytes,
-    ring_buffer: RingBuffer,
-    log_keep_filter: CompiledLogKeepFilter,
-    filter_pending: BytesMut,
-    /// Dynamic list of sinks this service writes to.
-    sinks: Vec<SinkHandle>,
-    /// True while the stdout sink is temporarily removed (during attach).
-    /// Used to ensure `resume_stdout_sink` only restores it if it was
-    /// actually present before the pause.
-    stdout_paused: bool,
-    /// The live spawn's PTY input-gate sender, registered by the supervisor
-    /// at wire time and cleared at reap. `None` = nothing attachable
-    /// (stopped, docker, or pipe mode). See [`attach`].
-    attach_pty: Option<mpsc::Sender<PtyInput>>,
-    /// Attached clients, counted by [`attach::AttachControl`]; drives the
-    /// stdout-sink pause. Reset by the supervisor's reap clear.
-    attach_clients: usize,
-}
-
-impl ServiceOutputState {
-    fn output_chunks(&mut self, chunk: Bytes) -> Vec<Bytes> {
-        if self.log_keep_filter.is_empty() {
-            self.ring_buffer.push_chunk(chunk.as_ref());
-            return vec![chunk];
-        }
-
-        self.filter_chunk(chunk.as_ref(), false)
-    }
-
-    fn flush_output(&mut self) -> Vec<Bytes> {
-        if self.log_keep_filter.is_empty() {
-            self.ring_buffer.flush_pending();
-            return Vec::new();
-        }
-
-        self.filter_chunk(&[], true)
-    }
-
-    fn filter_chunk(&mut self, chunk: &[u8], flush: bool) -> Vec<Bytes> {
-        self.filter_pending.extend_from_slice(chunk);
-        let mut accepted = Vec::new();
-
-        loop {
-            let end = if let Some(pos) = self.filter_pending.iter().position(|&b| b == b'\n') {
-                pos + 1
-            } else if self.filter_pending.len() >= MAX_FILTER_PENDING {
-                MAX_FILTER_PENDING
-            } else {
-                break;
-            };
-
-            let line = self.filter_pending.split_to(end).freeze();
-            self.accept_line(line, &mut accepted);
-        }
-
-        if flush && !self.filter_pending.is_empty() {
-            let line = self.filter_pending.split().freeze();
-            self.accept_line(line, &mut accepted);
-            self.ring_buffer.flush_pending();
-        }
-
-        accepted
-    }
-
-    fn accept_line(&mut self, line: Bytes, accepted: &mut Vec<Bytes>) {
-        if !self.log_keep_filter.keeps(line.as_ref()) {
-            return;
-        }
-        self.ring_buffer.push_chunk(line.as_ref());
-        accepted.push(line);
-    }
-}
-
 /// Per-service handle for writing output. Cloneable, reusable across restarts.
 ///
 /// Holds an `Arc` to the service's state in `OutputManager`. Multiple
@@ -447,7 +378,7 @@ impl ServiceOutputState {
 /// sharing the same ring buffer.
 #[derive(Clone)]
 pub struct ServiceWriter {
-    state: Arc<Mutex<ServiceOutputState>>,
+    output: actor::OutputHandle,
 }
 
 impl ServiceWriter {
@@ -468,42 +399,18 @@ impl ServiceWriter {
         loop {
             match read_chunk(&mut reader, &mut buf).await {
                 Ok(0) => break, // EOF
-                Ok(n) => {
-                    let chunk = Bytes::copy_from_slice(&buf[..n]);
-
-                    // Lock: push to ring buffer + snapshot sinks. Released before sends.
-                    // Prune closed sinks (e.g. disconnected follow clients) inline.
-                    let (name, prefix, sinks, chunks) = {
-                        let mut state = self.state.lock().await;
-                        state.sinks.retain(|s| !s.is_closed());
-                        let chunks = state.output_chunks(chunk);
-                        (
-                            state.name.clone(),
-                            state.prefix.clone(),
-                            state.sinks.clone(),
-                            chunks,
-                        )
-                    };
-
-                    self.send_chunks(name, prefix, sinks, chunks).await;
-                }
+                // Awaiting the send is the backpressure: a child that
+                // outruns its own output actor is made to wait, exactly as
+                // it waited on the lock this replaced.
+                Ok(n) => self.output.chunk(Bytes::copy_from_slice(&buf[..n])).await,
                 Err(e) => return Err(e),
             }
         }
 
-        // Flush any partial line remaining in the ring buffer.
-        let (name, prefix, sinks, chunks) = {
-            let mut state = self.state.lock().await;
-            let chunks = state.flush_output();
-            (
-                state.name.clone(),
-                state.prefix.clone(),
-                state.sinks.clone(),
-                chunks,
-            )
-        };
-        self.send_chunks(name, prefix, sinks, chunks).await;
-
+        // Flush any partial line remaining in the ring buffer, and wait for
+        // it: whoever awaits this reader is entitled to assume the process's
+        // output has landed, not merely been queued.
+        self.output.flush().await;
         Ok(())
     }
 
@@ -514,8 +421,7 @@ impl ServiceWriter {
     /// Only removes transient sinks (follow/OSC). Persistent sinks (stdout,
     /// file) are kept for the next process lifecycle.
     pub async fn close_follow_sinks(&self) {
-        let mut state = self.state.lock().await;
-        state.sinks.retain(|s| !s.is_transient());
+        self.output.close_follow_sinks();
     }
 
     /// Write a single line to the ring buffer and sinks.
@@ -524,52 +430,7 @@ impl ServiceWriter {
     /// as individual text lines rather than a byte stream. Appends `\n` to
     /// the data so sinks can flush immediately.
     pub async fn write_line(&self, line: &str) {
-        let data = Bytes::from(format!("{line}\n"));
-        let (name, prefix, sinks, chunks) = {
-            let mut state = self.state.lock().await;
-            state.sinks.retain(|s| !s.is_closed());
-            let chunks = state.output_chunks(data);
-            (
-                state.name.clone(),
-                state.prefix.clone(),
-                state.sinks.clone(),
-                chunks,
-            )
-        };
-        self.send_chunks(name, prefix, sinks, chunks).await;
-    }
-
-    async fn send_chunks(
-        &self,
-        name: String,
-        prefix: Bytes,
-        sinks: Vec<SinkHandle>,
-        chunks: Vec<Bytes>,
-    ) {
-        if chunks.is_empty() {
-            return;
-        }
-        let mut dropped: Vec<SinkHandle> = Vec::new();
-        for chunk in chunks {
-            for sink in &sinks {
-                let msg = SinkLine {
-                    prefix: prefix.clone(),
-                    line: chunk.clone(),
-                    name: name.clone(),
-                    is_lifecycle: false,
-                    is_verbose: false,
-                };
-                if sink.send(msg).is_err() {
-                    dropped.push(sink.clone());
-                }
-            }
-        }
-        if !dropped.is_empty() {
-            let mut state = self.state.lock().await;
-            state
-                .sinks
-                .retain(|s| !dropped.iter().any(|d| d.same_channel(s)));
-        }
+        self.output.line(Bytes::from(format!("{line}\n"))).await;
     }
 }
 
@@ -651,66 +512,6 @@ fn format_prefix(name: &str, color: Color, max_name_len: usize) -> Bytes {
     ))
 }
 
-/// Read the last N ring-buffer lines from one service's output state,
-/// joined by newlines (trailing newline stripped).
-async fn read_logs_from(state_arc: &Arc<Mutex<ServiceOutputState>>, n: usize) -> Bytes {
-    let state = state_arc.lock().await;
-    let parts: Vec<&[u8]> = state.ring_buffer.last_n(n).collect();
-    // Entries include `\n` delimiters — concatenate directly.
-    let mut result: Vec<u8> = Vec::new();
-    for part in &parts {
-        result.extend_from_slice(part);
-    }
-    // Strip trailing `\n` for clean output.
-    if result.last() == Some(&b'\n') {
-        result.pop();
-    }
-    Bytes::from(result)
-}
-
-/// Attach a follow sink to one service's output state: a freshly-created mpsc
-/// channel preloaded with the last N buffered lines, then registered as a
-/// sink. New lines are delivered until the receiver is dropped (or the client
-/// is too slow and the sink's buffer fills — it then gets disconnected).
-async fn follow_sink_from(
-    state_arc: Arc<Mutex<ServiceOutputState>>,
-    last_n: usize,
-    live_capacity: usize,
-) -> mpsc::Receiver<SinkLine> {
-    // Channel must hold the preloaded snapshot AND live headroom without
-    // blocking (or dropping the freshly-connected client immediately).
-    let capacity = last_n.saturating_add(live_capacity).max(1);
-    let (tx, rx) = mpsc::channel::<SinkLine>(capacity);
-    let mut state = state_arc.lock().await;
-    let svc_name = state.name.clone();
-    let prefix = state.prefix.clone();
-    // Preload last N ring buffer lines. Channel has `capacity` slots and
-    // is empty, so try_send is safe here.
-    for line in state.ring_buffer.last_n(last_n) {
-        // Ring-buffer entries keep their trailing `\n`, but `SinkLine.line`
-        // is contractually newline-free (the follow route embeds it in a
-        // JSON "line" value and the client adds its own newline). Strip it
-        // so the replayed snapshot doesn't render a blank line per entry.
-        let line = line.strip_suffix(b"\n").unwrap_or(line);
-        let sink_line = SinkLine {
-            prefix: prefix.clone(),
-            line: Bytes::copy_from_slice(line),
-            name: svc_name.clone(),
-            // Ring-buffer replays mostly carry raw service stdout. Even
-            // if a few lifecycle events are mixed in, marking them all
-            // as non-lifecycle is correct for follow consumers, which
-            // don't have a TUI filter to short-circuit anyway.
-            is_lifecycle: false,
-            is_verbose: false,
-        };
-        if tx.try_send(sink_line).is_err() {
-            break;
-        }
-    }
-    state.sinks.push(SinkHandle::BoundedDrop(tx));
-    rx
-}
-
 /// A cloneable, read-only handle to every process's buffered output.
 ///
 /// This is to logs what [`StateReader`](crate::state_store::StateReader) is
@@ -721,7 +522,7 @@ async fn follow_sink_from(
 /// visible to handles minted before it existed.
 #[derive(Clone)]
 pub struct LogReader {
-    services: watch::Receiver<Arc<HashMap<String, Arc<Mutex<ServiceOutputState>>>>>,
+    services: watch::Receiver<Arc<HashMap<String, actor::OutputHandle>>>,
 }
 
 impl LogReader {
@@ -737,8 +538,8 @@ impl LogReader {
     /// Read the last N lines from a process's ring buffer, joined by
     /// newlines. `None` if the name is not registered.
     pub async fn read_logs(&self, name: &str, n: usize) -> Option<Bytes> {
-        let state_arc = self.services.borrow().get(name)?.clone();
-        Some(read_logs_from(&state_arc, n).await)
+        let output = self.services.borrow().get(name)?.clone();
+        Some(output.read_logs(n).await)
     }
 
     /// Attach a follow sink (see [`OutputManager::add_follow_sink`]).
@@ -749,8 +550,8 @@ impl LogReader {
         last_n: usize,
         live_capacity: usize,
     ) -> Option<mpsc::Receiver<SinkLine>> {
-        let state_arc = self.services.borrow().get(name)?.clone();
-        Some(follow_sink_from(state_arc, last_n, live_capacity).await)
+        let output = self.services.borrow().get(name)?.clone();
+        output.follow_sink(last_n, live_capacity).await
     }
 }
 
@@ -758,11 +559,11 @@ impl LogReader {
 /// and provides lifecycle event formatting.
 pub struct OutputManager {
     /// Per-service output state, retained for the lifetime of the program.
-    services: HashMap<String, Arc<Mutex<ServiceOutputState>>>,
+    services: HashMap<String, actor::OutputHandle>,
     /// The same registry, republished for [`LogReader`] handles. Almost
     /// always set once at construction; `register_service` republishes for
     /// the rare late registration (the build-tool prefix).
-    services_watch: watch::Sender<Arc<HashMap<String, Arc<Mutex<ServiceOutputState>>>>>,
+    services_watch: watch::Sender<Arc<HashMap<String, actor::OutputHandle>>>,
     /// The sink senders [`attach::AttachControl`] borrows, published so
     /// [`Self::shutdown`] can take them back before flushing — see
     /// `AttachSinks`.
@@ -1004,17 +805,13 @@ impl OutputManager {
 
             service_map.insert(
                 name.to_string(),
-                Arc::new(Mutex::new(ServiceOutputState {
-                    name: name.to_string(),
+                actor::spawn(
+                    (*name).to_string(),
                     prefix,
-                    ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
-                    log_keep_filter,
-                    filter_pending: BytesMut::new(),
                     sinks,
-                    stdout_paused: false,
-                    attach_pty: None,
-                    attach_clients: 0,
-                })),
+                    stdout_sink.clone(),
+                    log_keep_filter,
+                ),
             );
         }
 
@@ -1028,7 +825,6 @@ impl OutputManager {
 
         let (services_watch, _) = watch::channel(Arc::new(service_map.clone()));
         let (attach_sinks, _) = watch::channel(Some(attach::AttachSinks {
-            stdout_sink: stdout_sink.clone(),
             emitter: LifecycleEmitter {
                 don_prefix: don_prefix.clone(),
                 stdout_sink: stdout_sink.clone(),
@@ -1086,12 +882,10 @@ impl OutputManager {
     pub async fn register_build_tool(&mut self, name: &str) {
         self.register_service(name, &crate::config::LogConfig::Stdout)
             .await;
-        let prefix = if let Some(state_arc) = self.services.get(name) {
-            let state = state_arc.lock().await;
-            Some(state.prefix.clone())
-        } else {
-            None
-        };
+        let prefix = self
+            .services
+            .get(name)
+            .map(|output| output.prefix().clone());
         match name {
             "bazel" => self.bazel_prefix = prefix,
             _ => debug_assert!(false, "register_build_tool: unknown tool '{name}'"),
@@ -1125,7 +919,7 @@ impl OutputManager {
         self.services
             .get(name)
             .cloned()
-            .map(|state| ServiceWriter { state })
+            .map(|output| ServiceWriter { output })
     }
 
     /// Attach a follow sink: a freshly-created mpsc channel preloaded with
@@ -1143,8 +937,8 @@ impl OutputManager {
         last_n: usize,
         live_capacity: usize,
     ) -> Option<mpsc::Receiver<SinkLine>> {
-        let state_arc = self.services.get(name)?.clone();
-        Some(follow_sink_from(state_arc, last_n, live_capacity).await)
+        let output = self.services.get(name)?;
+        output.follow_sink(last_n, live_capacity).await
     }
 
     /// A handle to the emulator thread, for the server's resize path.
@@ -1164,27 +958,16 @@ impl OutputManager {
         name: &str,
         pty_input: mpsc::Sender<PtyInput>,
     ) -> Option<OscSinkHandle> {
-        let state_arc = self.services.get(name)?.clone();
-        let (tx, rx) = mpsc::channel::<SinkLine>(16);
-        let handle = SinkHandle::BoundedDrop(tx);
-        {
-            let mut state = state_arc.lock().await;
-            state.sinks.push(handle.clone());
-        }
-        let join = tokio::spawn(osc_sink_task(rx, pty_input));
-        Some(OscSinkHandle {
-            handle: Some(handle),
-            join: Some(join),
-            service_state: state_arc,
-        })
+        let output = self.services.get(name)?.clone();
+        Some(spawn_osc_sink(output, pty_input))
     }
 
     /// Read the last N lines from a service's ring buffer, joined by newlines.
     ///
     /// Returns `None` if the service is not registered.
     pub async fn read_logs(&self, name: &str, n: usize) -> Option<Bytes> {
-        let state_arc = self.services.get(name)?;
-        Some(read_logs_from(state_arc, n).await)
+        let output = self.services.get(name)?;
+        Some(output.read_logs(n).await)
     }
 
     /// Register a service that wasn't known at OutputManager construction
@@ -1227,17 +1010,13 @@ impl OutputManager {
 
         self.services.insert(
             name.to_string(),
-            Arc::new(Mutex::new(ServiceOutputState {
-                name: name.to_string(),
+            actor::spawn(
+                name.to_string(),
                 prefix,
-                ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_CAPACITY),
-                log_keep_filter: CompiledLogKeepFilter::default(),
-                filter_pending: BytesMut::new(),
                 sinks,
-                stdout_paused: false,
-                attach_pty: None,
-                attach_clients: 0,
-            })),
+                self.stdout_sink.clone(),
+                CompiledLogKeepFilter::default(),
+            ),
         );
         let _ = self.services_watch.send(Arc::new(self.services.clone()));
     }
@@ -1272,10 +1051,9 @@ impl OutputManager {
     pub fn process_output(&self, name: &str) -> Option<ProcessOutput> {
         Some(ProcessOutput {
             name: name.to_string(),
-            state: Arc::clone(self.services.get(name)?),
+            output: self.services.get(name)?.clone(),
             events: self.clone_lifecycle_emitter(),
             emulator: self.emulator.clone(),
-            stdout_sink: self.stdout_sink.clone(),
         })
     }
 
@@ -1373,16 +1151,8 @@ impl OutputManager {
     /// The ring buffer continues to be fed. No-op if the service is unknown
     /// or the stdout sink is not present.
     pub async fn pause_stdout_sink(&self, name: &str) {
-        if let Some(state_arc) = self.services.get(name) {
-            let mut state = state_arc.lock().await;
-            let had_stdout = state
-                .sinks
-                .iter()
-                .any(|s| s.same_channel(&self.stdout_sink));
-            if had_stdout {
-                state.sinks.retain(|s| !s.same_channel(&self.stdout_sink));
-                state.stdout_paused = true;
-            }
+        if let Some(output) = self.services.get(name) {
+            output.pause_stdout();
         }
     }
 
@@ -1391,18 +1161,8 @@ impl OutputManager {
     /// `pause_stdout_sink` — services with `log = "ignore"` won't
     /// accidentally start writing to stdout.
     pub async fn resume_stdout_sink(&self, name: &str) {
-        if let Some(state_arc) = self.services.get(name) {
-            let mut state = state_arc.lock().await;
-            if state.stdout_paused {
-                state.stdout_paused = false;
-                let already_present = state
-                    .sinks
-                    .iter()
-                    .any(|s| s.same_channel(&self.stdout_sink));
-                if !already_present {
-                    state.sinks.push(self.stdout_sink.clone());
-                }
-            }
+        if let Some(output) = self.services.get(name) {
+            output.resume_stdout();
         }
     }
 
@@ -1428,9 +1188,8 @@ impl OutputManager {
         // there would keep the writer channels open and cost the full 2s
         // straggler wait below on every shutdown.
         let _ = self.attach_sinks.send(None);
-        for state_arc in self.services.values() {
-            let mut state = state_arc.lock().await;
-            state.sinks.clear();
+        for output in self.services.values() {
+            output.clear_sinks();
         }
         drop(self.stdout_sink);
         drop(self.services);
@@ -1468,11 +1227,9 @@ impl OutputManager {
 #[derive(Clone)]
 pub struct ProcessOutput {
     name: String,
-    state: Arc<Mutex<ServiceOutputState>>,
+    output: actor::OutputHandle,
     events: LifecycleEmitter,
     emulator: emulator::EmulatorHandle,
-    /// For restoring the prefixed stdout sink in [`Self::clear_attach`].
-    stdout_sink: SinkHandle,
 }
 
 impl ProcessOutput {
@@ -1487,25 +1244,14 @@ impl ProcessOutput {
     /// reader has finished draining); they share one ring buffer.
     pub fn writer(&self) -> ServiceWriter {
         ServiceWriter {
-            state: Arc::clone(&self.state),
+            output: self.output.clone(),
         }
     }
 
     /// Attach an OSC response sink so terminal queries from the child reach
     /// its PTY. See [`OutputManager::add_osc_sink`].
     pub async fn add_osc_sink(&self, pty_input: mpsc::Sender<PtyInput>) -> OscSinkHandle {
-        let (tx, rx) = mpsc::channel::<SinkLine>(16);
-        let handle = SinkHandle::BoundedDrop(tx);
-        {
-            let mut state = self.state.lock().await;
-            state.sinks.push(handle.clone());
-        }
-        let join = tokio::spawn(osc_sink_task(rx, pty_input));
-        OscSinkHandle {
-            handle: Some(handle),
-            join: Some(join),
-            service_state: Arc::clone(&self.state),
-        }
+        spawn_osc_sink(self.output.clone(), pty_input)
     }
 
     /// (Re)register this process's server-side screen and route its output
@@ -1513,8 +1259,7 @@ impl ProcessOutput {
     /// Register the live spawn's PTY input-gate sender for attach. Call at
     /// wire time for PTY spawns; cleared by [`Self::clear_attach`] at reap.
     pub async fn set_attach_pty(&self, pty_input: mpsc::Sender<PtyInput>) {
-        let mut state = self.state.lock().await;
-        state.attach_pty = Some(pty_input);
+        self.output.set_attach_pty(Some(pty_input));
     }
 
     /// The spawn is gone: drop the attach registration, reset the client
@@ -1522,28 +1267,13 @@ impl ProcessOutput {
     /// bridges themselves end on their own when the output sinks close;
     /// their late detach notifications no-op against a zero count.
     pub async fn clear_attach(&self) {
-        let mut state = self.state.lock().await;
-        state.attach_pty = None;
-        state.attach_clients = 0;
-        if state.stdout_paused {
-            state.stdout_paused = false;
-            let already_present = state
-                .sinks
-                .iter()
-                .any(|s| s.same_channel(&self.stdout_sink));
-            if !already_present {
-                state.sinks.push(self.stdout_sink.clone());
-            }
-        }
+        self.output.clear_attach();
     }
 
     pub async fn register_emulator(&self, cols: u16, rows: u16) {
         self.emulator.register(&self.name, cols, rows);
-        let feed = SinkHandle::Emulator(self.emulator.feed_sender());
-        let mut state = self.state.lock().await;
-        if !state.sinks.iter().any(|sink| sink.same_channel(&feed)) {
-            state.sinks.push(feed);
-        }
+        self.output
+            .add_sink_once(SinkHandle::Emulator(self.emulator.feed_sender()));
     }
 
     /// Emit a `[don]` event tagged with this process's name.
@@ -2649,8 +2379,8 @@ mod tests {
             .await
             .unwrap();
 
-        let state = mgr.services.get("api").unwrap().clone();
-        let before = state.lock().await.sinks.len();
+        let output = mgr.services.get("api").unwrap().clone();
+        let before = output.sink_count().await;
 
         // Hand a real PTY's write half to a gate, and its sender to the
         // scanner — the shape every PTY-backed wire produces.
@@ -2659,18 +2389,19 @@ mod tests {
         let pty_input = spawn_pty_gate(write);
         let handle = mgr.add_osc_sink("api", pty_input).await.unwrap();
         assert_eq!(
-            state.lock().await.sinks.len(),
+            output.sink_count().await,
             before + 1,
             "osc sink should be registered"
         );
 
         drop(handle);
 
-        // Drop aborts the task and spawns the sink removal; let it run.
+        // Drop aborts the task and posts the sink removal; let the actor
+        // apply it.
         let mut removed = false;
         for _ in 0..50 {
             tokio::task::yield_now().await;
-            if state.lock().await.sinks.len() == before {
+            if output.sink_count().await == before {
                 removed = true;
                 break;
             }

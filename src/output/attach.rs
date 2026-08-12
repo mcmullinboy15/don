@@ -18,12 +18,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 
-use super::{
-    LifecycleEmitter, PtyInput, ServiceOutputState, SinkHandle, SinkLine, emulator,
-    follow_sink_from,
-};
+use super::actor::OutputHandle;
+use super::{LifecycleEmitter, PtyInput, SinkLine, emulator};
 use crate::command::CommandError;
 
 /// An active attach session, returned to the server's upgrade handler.
@@ -52,19 +50,22 @@ impl Drop for AttachGuard {
     }
 }
 
-/// The sink senders attach needs, held behind a `watch` so they can be
-/// *released* at shutdown.
+/// The emitter attach narrates through, held behind a `watch` so it can be
+/// *released* at shutdown — and doubling as the "is output still up?" signal.
 ///
-/// This is load-bearing, not indirection for its own sake: a `SinkHandle`
-/// or `LifecycleEmitter` clone keeps the stdout writer's channel open, and
+/// This is load-bearing, not indirection for its own sake: a
+/// `LifecycleEmitter` clone keeps the stdout writer's channel open, and
 /// [`OutputManager::shutdown`](super::OutputManager::shutdown) waits (2s,
 /// then aborts) for those writers to finish. `AttachControl` lives in the
 /// API server's state, which outlives the output flush, so holding the
-/// senders directly would put that 2s stall on every shutdown. The manager
-/// publishes `None` before flushing, which drops them.
+/// emitter directly would put that 2s stall on every shutdown. The manager
+/// publishes `None` before flushing, which drops it.
+///
+/// The stdout sink used to be here too, for the pause each first client
+/// causes. That belongs to the process's own output actor now, which is the
+/// only thing that touches its sink list.
 #[derive(Clone)]
 pub(super) struct AttachSinks {
-    pub(super) stdout_sink: SinkHandle,
     pub(super) emitter: LifecycleEmitter,
 }
 
@@ -76,7 +77,7 @@ pub(super) struct AttachSinks {
 /// spawns its own detach worker.
 #[derive(Clone)]
 pub struct AttachControl {
-    services: watch::Receiver<Arc<HashMap<String, Arc<Mutex<ServiceOutputState>>>>>,
+    services: watch::Receiver<Arc<HashMap<String, OutputHandle>>>,
     sinks: watch::Receiver<Option<AttachSinks>>,
     emulator: emulator::EmulatorHandle,
     detach_tx: mpsc::UnboundedSender<String>,
@@ -84,7 +85,7 @@ pub struct AttachControl {
 
 impl AttachControl {
     pub(super) fn spawn(
-        services: watch::Receiver<Arc<HashMap<String, Arc<Mutex<ServiceOutputState>>>>>,
+        services: watch::Receiver<Arc<HashMap<String, OutputHandle>>>,
         sinks: watch::Receiver<Option<AttachSinks>>,
         emulator: emulator::EmulatorHandle,
     ) -> Self {
@@ -104,7 +105,7 @@ impl AttachControl {
         control
     }
 
-    fn state_for(&self, name: &str) -> Option<Arc<Mutex<ServiceOutputState>>> {
+    fn output_for(&self, name: &str) -> Option<OutputHandle> {
         self.services.borrow().get(name).cloned()
     }
 
@@ -122,7 +123,7 @@ impl AttachControl {
     /// events. Waiting for a process that isn't running yet is the client's
     /// job (it retries); this answers immediately.
     pub async fn attach(&self, name: &str, pid: u32) -> Result<AttachSession, CommandError> {
-        let Some(state_arc) = self.state_for(name) else {
+        let Some(output) = self.output_for(name) else {
             return Err(CommandError::UnknownService {
                 name: name.to_string(),
             });
@@ -135,29 +136,14 @@ impl AttachControl {
             });
         };
 
-        // Count + pause under one lock, so the "first client mutes stdout"
-        // transition can never race a concurrent attach or the reap clear.
-        let (pty_input, count) = {
-            let mut state = state_arc.lock().await;
-            let Some(pty_input) = state.attach_pty.clone() else {
-                return Err(CommandError::InvalidState {
-                    name: name.to_string(),
-                    message: "no attachable process (not running, or no PTY)".to_string(),
-                });
-            };
-            state.attach_clients += 1;
-            let count = state.attach_clients;
-            if count == 1 {
-                let had_stdout = state
-                    .sinks
-                    .iter()
-                    .any(|s| s.same_channel(&sinks.stdout_sink));
-                if had_stdout {
-                    state.sinks.retain(|s| !s.same_channel(&sinks.stdout_sink));
-                    state.stdout_paused = true;
-                }
-            }
-            (pty_input, count)
+        // One message, so the "first client mutes stdout" transition cannot
+        // race a concurrent attach or the reap clear — the actor applies it
+        // as a unit, which is what taking the lock once used to buy.
+        let Some((pty_input, count)) = output.attach().await else {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "no attachable process (not running, or no PTY)".to_string(),
+            });
         };
 
         // Preload the client with a coherent repaint of the process's current
@@ -165,23 +151,15 @@ impl AttachControl {
         // whose screen never registered (emulator backend unavailable) fall
         // back to the last ring-buffer lines.
         let output_rx = match self.emulator.repaint(name).await {
-            Some(frame) => {
-                // Headroom for live bytes on top of the repaint frame.
-                let (tx, rx) = mpsc::channel::<SinkLine>(256);
-                let mut state = state_arc.lock().await;
-                let sink_line = SinkLine {
-                    prefix: Bytes::new(),
-                    line: Bytes::from(frame.bytes),
-                    name: state.name.clone(),
-                    is_lifecycle: false,
-                    is_verbose: false,
-                };
-                // Channel is empty and capacity >= 2, so this cannot fail.
-                let _ = tx.try_send(sink_line);
-                state.sinks.push(SinkHandle::BoundedDrop(tx));
-                rx
-            }
-            None => follow_sink_from(state_arc.clone(), 50, 256).await,
+            // Headroom for live bytes on top of the repaint frame.
+            Some(frame) => output.repaint_sink(Bytes::from(frame.bytes), 256).await,
+            None => output.follow_sink(50, 256).await,
+        };
+        let Some(output_rx) = output_rx else {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "process output is shutting down".to_string(),
+            });
         };
 
         sinks.emitter.service_event(
@@ -205,33 +183,18 @@ impl AttachControl {
     /// One bridge ended (its guard dropped). Only bookkeeping remains — the
     /// bridge's gate sender and output sink are already gone.
     async fn detach(&self, name: &str) {
-        let Some(state_arc) = self.state_for(name) else {
+        let Some(output) = self.output_for(name) else {
             return;
         };
-        // Output already shut down: the sinks are gone and every
-        // ServiceOutputState was cleared, so there is nothing to restore.
+        // Output already shut down: the sinks are gone and every process's
+        // state was cleared, so there is nothing to restore.
         let Some(sinks) = self.sinks() else {
             return;
         };
-        let remaining = {
-            let mut state = state_arc.lock().await;
-            if state.attach_clients == 0 {
-                // A late notification after the reap clear already reset the
-                // count (and resumed output).
-                return;
-            }
-            state.attach_clients -= 1;
-            if state.attach_clients == 0 && state.stdout_paused {
-                state.stdout_paused = false;
-                let already_present = state
-                    .sinks
-                    .iter()
-                    .any(|s| s.same_channel(&sinks.stdout_sink));
-                if !already_present {
-                    state.sinks.push(sinks.stdout_sink.clone());
-                }
-            }
-            state.attach_clients
+        // `None` is a late notification after the reap clear already reset
+        // the count (and resumed output).
+        let Some(remaining) = output.detach().await else {
+            return;
         };
         if remaining == 0 {
             sinks.emitter.service_event(name, "detached");
