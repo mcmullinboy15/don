@@ -185,45 +185,49 @@ log = "ignore"
 | `watch` | list of globs | File patterns — task only re-runs if these changed since last success. Empty = always runs |
 | `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
-| `terminal` | string or table | `"muxed"` (default) routes through Don output; `"foreground"` gives the task exclusive terminal ownership |
+| `interactive` | bool | `false` (default). `true` says the task waits for a human at its terminal |
 | `headless` | table | Optional `cmd` and/or `args` overrides for non-TUI runs |
 
-Foreground terminal tasks are for interactive commands that need stdin and an
-unprefixed terminal, such as REPLs, editors, interactive migrations, or test
-watchers:
+Every task runs on a PTY and every task can be reached with `don attach`, so
+`interactive` changes nothing about how a task is spawned or where its output
+goes. It exists because it is the one thing Don cannot work out for itself: a
+task blocked reading stdin looks exactly like a task that has hung. Declaring
+it is what lets Don say `waiting for input — run 'don attach <task>'` instead
+of leaving the user to guess. Use it for REPLs, editors, interactive
+migrations, and prompting deploy scripts:
 
 ```toml
 [tasks.console]
 cmd = "rails"
 args = ["console"]
-terminal = "foreground"
+interactive = true
 ```
 
-`terminal = "foreground"` enters the terminal alternate screen by default.
-Use a table to choose the main screen explicitly:
-
-```toml
-terminal = { mode = "foreground", screen = "main" }
-```
-
-During startup, a foreground task is exclusive. When it becomes ready, Don
-does not start other newly-ready services/tasks until that task exits. Already
-running dependencies continue to run, and their output is still captured in
-ring buffers and log files while visible Don output is paused. Watch-triggered
-foreground tasks may also steal the terminal during development.
-
-Foreground tasks can provide a non-interactive command variant for
+An interactive task can provide a non-interactive command variant for
 `--no-tui`, redirected-output, and detached runs. Fields omitted from
-`headless` inherit their normal values, and headless execution uses muxed
-output instead of foreground terminal ownership:
+`headless` inherit their normal values. Applying the override also clears
+`interactive`, because nothing is going to attach in that mode:
 
 ```toml
 [tasks.push]
 cmd = "scurry"
 args = ["push"]
-terminal = "foreground"
+interactive = true
 headless = { args = ["push", "--force"] }
 ```
+
+> `terminal = "muxed" | "foreground"` was the earlier spelling, back when a
+> foreground task took exclusive ownership of Don's terminal. Per-task PTYs and
+> `don attach` replaced that; the key is rejected with a message pointing here.
+
+Independently of `interactive`, the stdout writer tracks the alternate-screen
+private modes (`?1049`, `?1047`, `?47`) per process. A process holding the
+screen is emitting frames — cursor moves and clears with no line boundaries —
+so the multiplexed view would otherwise show one endless line of concatenated
+frames, and show it only once the process exited. Instead Don emits `entered
+full-screen mode — run 'don attach <name>' to see it` once and suppresses
+output until the screen is handed back. Ring buffers, file sinks and the
+server-side emulator behind `don attach` are fed upstream and lose nothing.
 
 #### Task State Tracking
 
@@ -1000,7 +1004,6 @@ Commands:
   ports                     Show configured and actual runtime ports
   logs <name>               Tail the logs for a specific service
   run <name>                Run a specific task (bypasses auto_run)
-  run --all-pending         Run every task currently in pending_run
   exec <cmd> [args...]      Run a command with .don/bin on PATH
   attach <name>             Interactively attach stdin/stdout to a running service
   cleanup                   Kill orphaned processes, remove stale sockets/containers

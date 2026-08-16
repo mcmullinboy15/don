@@ -265,7 +265,7 @@ fn integration_task_depends_on_service() {
 }
 
 #[test]
-fn integration_headless_task_uses_command_override_without_foreground_terminal() {
+fn integration_headless_task_uses_command_override_and_is_not_interactive() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("headless-task-override");
         let output_path = dir.path().join("task-output.txt");
@@ -274,7 +274,7 @@ fn integration_headless_task_uses_command_override_without_foreground_terminal()
 [tasks.push]
 cmd = "sh"
 args = ["-c", "printf interactive > {}"]
-terminal = "foreground"
+interactive = true
 headless = {{ args = ["-c", "printf headless > {}"] }}
 log = "ignore"
 "#,
@@ -329,7 +329,7 @@ fn integration_manual_task_dependency_unblocks_service_after_run() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -347,17 +347,11 @@ fn integration_manual_task_dependency_unblocks_service_after_run() {
             "api should remain blocked before migrate runs: {output}"
         );
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "migrate".to_string(),
-                params: std::collections::HashMap::new(),
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        control
+            .run_task("migrate", std::collections::HashMap::new(), false, None)
+            .await
+            .unwrap()
             .unwrap();
-        reply_rx.await.unwrap().unwrap();
 
         wait_for_substr(&buf, "api: starting", Duration::from_secs(5)).await;
         assert!(
@@ -1104,6 +1098,7 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1112,15 +1107,9 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
         wait_for_substr(&buf, "retries", Duration::from_secs(8)).await;
 
         std::fs::write(&ready_file, "ok").unwrap();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "badsvc".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        let restarted = control.restart("badsvc").await.unwrap();
         assert!(
-            reply_rx.await.unwrap().is_ok(),
+            restarted.is_ok(),
             "manual restart should accept a failed service"
         );
 
@@ -1377,6 +1366,7 @@ fn integration_restart_crashed_service_without_ready_check() {
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1389,15 +1379,9 @@ fn integration_restart_crashed_service_without_ready_check() {
         .await;
 
         std::fs::write(&gate_file, "ok").unwrap();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "crashy".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        let restarted = control.restart("crashy").await.unwrap();
         assert!(
-            reply_rx.await.unwrap().is_ok(),
+            restarted.is_ok(),
             "manual restart should accept a crashed service"
         );
 
@@ -1567,7 +1551,7 @@ fn integration_non_blocking_dependency_unblocks_when_dependency_is_stopped() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1581,15 +1565,8 @@ fn integration_non_blocking_dependency_unblocks_when_dependency_is_stopped() {
             read_buf(&buf)
         );
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "dep".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
         assert!(
-            reply_rx.await.unwrap().is_ok(),
+            control.stop("dep").await.unwrap().is_ok(),
             "stopping dep should succeed"
         );
 
@@ -1695,6 +1672,7 @@ while True: time.sleep(60)\n\
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1735,14 +1713,7 @@ while True: time.sleep(60)\n\
         .await;
 
         std::fs::write(&gate_file, "ok").unwrap();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "db".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
-        let restart_result = reply_rx.await.unwrap();
+        let restart_result = control.restart("db").await.unwrap();
         assert!(
             restart_result.is_ok(),
             "manual db restart should succeed, got {restart_result:?}. output: {}",
@@ -1817,6 +1788,7 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1829,12 +1801,10 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
         .await;
 
         std::fs::write(&db_gate, "ok").unwrap();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "db".to_string(),
-                reply: tokio::sync::oneshot::channel().0,
-            })
-            .unwrap();
+        tokio::spawn({
+            let control = control.clone();
+            async move { control.restart("db").await }
+        });
         wait_for_substr(&buf, "DB_RECOVERING", Duration::from_secs(5)).await;
 
         let mut cleared_recovered_root = false;
@@ -1869,12 +1839,10 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
             read_buf(&buf)
         );
 
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "cache".to_string(),
-                reply: tokio::sync::oneshot::channel().0,
-            })
-            .unwrap();
+        tokio::spawn({
+            let control = control.clone();
+            async move { control.restart("cache").await }
+        });
         wait_for_substr(&buf, "CACHE_FAIL", Duration::from_secs(5)).await;
 
         let mut refreshed = false;
@@ -1910,12 +1878,10 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
         );
 
         std::fs::write(&cache_gate, "ok").unwrap();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "cache".to_string(),
-                reply: tokio::sync::oneshot::channel().0,
-            })
-            .unwrap();
+        tokio::spawn({
+            let control = control.clone();
+            async move { control.restart("cache").await }
+        });
         wait_for_substr(&buf, "api: started", Duration::from_secs(10)).await;
 
         let _ = shutdown_tx.send(()).await;

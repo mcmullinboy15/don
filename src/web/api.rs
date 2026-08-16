@@ -50,7 +50,6 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/projects/{id}/stop/{name}", post(post_stop))
         .route("/projects/{id}/restart/{name}", post(post_restart))
         .route("/projects/{id}/run/{name}", post(post_run))
-        .route("/projects/{id}/run-pending", post(post_run_pending))
         .route(
             "/projects/{id}/completions/{task}/{param}",
             post(post_completions),
@@ -245,16 +244,6 @@ async fn post_run(
             )
             .await
     })
-    .await
-}
-
-/// `POST /api/projects/:id/run-pending` — run every task awaiting a trigger.
-async fn post_run_pending(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
-    control(
-        &state,
-        &id,
-        |client| async move { client.run_pending().await },
-    )
     .await
 }
 

@@ -60,10 +60,6 @@ struct ServiceOutputState {
     filter_pending: BytesMut,
     /// Dynamic list of sinks this service writes to.
     sinks: Vec<SinkHandle>,
-    /// True while the stdout sink is temporarily removed (during attach).
-    /// Used to ensure `resume_stdout_sink` only restores it if it was
-    /// actually present before the pause.
-    stdout_paused: bool,
     /// The live spawn's PTY input-gate sender, registered by the supervisor
     /// at wire time and cleared at reap. `None` = nothing attachable
     /// (stopped, docker, or pipe mode). See [`attach`].
@@ -141,8 +137,6 @@ enum OutputMsg {
     RemoveSink(SinkHandle),
     /// Add a sink unless an equal one is already registered.
     AddSinkOnce(SinkHandle),
-    PauseStdout,
-    ResumeStdout,
     /// Register (or clear) the live spawn's PTY input gate.
     SetAttachPty(Option<mpsc::Sender<PtyInput>>),
     /// The spawn is gone: forget the gate, reset the client count, and undo
@@ -240,14 +234,6 @@ impl OutputHandle {
         self.send(OutputMsg::RemoveSink(sink));
     }
 
-    pub(super) fn pause_stdout(&self) {
-        self.send(OutputMsg::PauseStdout);
-    }
-
-    pub(super) fn resume_stdout(&self) {
-        self.send(OutputMsg::ResumeStdout);
-    }
-
     pub(super) fn set_attach_pty(&self, pty: Option<mpsc::Sender<PtyInput>>) {
         self.send(OutputMsg::SetAttachPty(pty));
     }
@@ -320,6 +306,7 @@ pub(super) fn spawn(
     prefix: Bytes,
     sinks: Vec<SinkHandle>,
     stdout_sink: SinkHandle,
+    mute: super::StdoutMuteControl,
     log_keep_filter: CompiledLogKeepFilter,
 ) -> OutputHandle {
     let (output_tx, output_rx) = mpsc::channel(CHUNK_QUEUE_DEPTH);
@@ -331,14 +318,13 @@ pub(super) fn spawn(
         log_keep_filter,
         filter_pending: BytesMut::new(),
         sinks,
-        stdout_paused: false,
         attach_pty: None,
         attach_clients: 0,
     };
     // Detached: the actor ends when its channels close, which happens when
     // the last handle drops — or immediately on `ClearSinks`, which is how
     // shutdown releases the sink senders the writer tasks are waiting on.
-    tokio::spawn(run(state, stdout_sink, output_rx, control_rx));
+    tokio::spawn(run(state, stdout_sink, mute, output_rx, control_rx));
     OutputHandle {
         prefix,
         output: output_tx,
@@ -350,6 +336,7 @@ pub(super) fn spawn(
 async fn run(
     mut state: ServiceOutputState,
     stdout_sink: SinkHandle,
+    mute: super::StdoutMuteControl,
     mut output: mpsc::Receiver<Output>,
     mut control: mpsc::UnboundedReceiver<OutputMsg>,
 ) {
@@ -359,7 +346,7 @@ async fn run(
             // never wait out a backlog of output. See the module docs.
             biased;
             Some(msg) = control.recv() => {
-                if !state.apply(msg, &stdout_sink) {
+                if !state.apply(msg, &mute) {
                     return;
                 }
             }
@@ -371,6 +358,9 @@ async fn run(
                 Output::Flush { ack } => {
                     let emitted = state.flush_output();
                     state.fan_out(emitted);
+                    // Ordered after the fan-out: the marker means "everything
+                    // this run wrote is already past you".
+                    state.mark_stream_end(&stdout_sink);
                     let _ = ack.send(());
                 }
             },
@@ -411,28 +401,38 @@ impl ServiceOutputState {
         self.sinks.retain(|s| !s.is_closed());
     }
 
-    /// Restore the prefixed stdout sink if a pause put it away.
-    fn resume_stdout(&mut self, stdout_sink: &SinkHandle) {
-        if !self.stdout_paused {
-            return;
-        }
-        self.stdout_paused = false;
-        if !self.sinks.iter().any(|s| s.same_channel(stdout_sink)) {
-            self.sinks.push(stdout_sink.clone());
-        }
-    }
-
-    /// Take the prefixed stdout sink away, remembering that we did — so a
-    /// service with `log = "ignore"` never gains one on resume.
-    fn pause_stdout(&mut self, stdout_sink: &SinkHandle) {
-        if self.sinks.iter().any(|s| s.same_channel(stdout_sink)) {
-            self.sinks.retain(|s| !s.same_channel(stdout_sink));
-            self.stdout_paused = true;
-        }
+    /// Tell the stdout writer that the process writing here has stopped.
+    ///
+    /// A zero-length line is the marker, and only the stdout sink is ever sent
+    /// one: [`Self::fan_out`] carries non-empty read chunks, `line()` appends a
+    /// newline, and lifecycle events carry text — so nothing else can produce
+    /// it. Sent directly rather than through `self.sinks` so a paused stdout
+    /// still gets it; it is a control marker, not output.
+    ///
+    /// The writer keeps state per process across runs, and some of it a run can
+    /// end without unwinding: a process SIGKILLed while it owned the alternate
+    /// screen never sends the sequence that gives the screen back, and its
+    /// successor's output would be swallowed too. This is where that is
+    /// dropped, and where a final partial line gets flushed.
+    fn mark_stream_end(&self, stdout_sink: &SinkHandle) {
+        let _ = stdout_sink.send(SinkLine {
+            prefix: self.prefix.clone(),
+            line: Bytes::new(),
+            name: self.name.clone(),
+            is_lifecycle: false,
+            is_verbose: false,
+        });
     }
 
     /// Apply one control message. Returns `false` when the actor should end.
-    fn apply(&mut self, msg: OutputMsg, stdout_sink: &SinkHandle) -> bool {
+    ///
+    /// An attach *mutes* this process's terminal output rather than unwiring
+    /// its stdout sink: the sink is how the merged log tap is fed, and every
+    /// client reads that. Unwiring it would blind them all for the duration of
+    /// somebody else's attach. A service with `log = "ignore"` is muted by
+    /// configuration, which is a separate set, so releasing an attach can never
+    /// hand it a terminal it was never meant to have.
+    fn apply(&mut self, msg: OutputMsg, mute: &super::StdoutMuteControl) -> bool {
         match msg {
             OutputMsg::CloseFollowSinks => self.sinks.retain(|s| !s.is_transient()),
             OutputMsg::AddSink(sink) => self.sinks.push(sink),
@@ -442,19 +442,17 @@ impl ServiceOutputState {
                 }
             }
             OutputMsg::RemoveSink(sink) => self.sinks.retain(|s| !s.same_channel(&sink)),
-            OutputMsg::PauseStdout => self.pause_stdout(stdout_sink),
-            OutputMsg::ResumeStdout => self.resume_stdout(stdout_sink),
             OutputMsg::SetAttachPty(pty) => self.attach_pty = pty,
             OutputMsg::ClearAttach => {
                 self.attach_pty = None;
                 self.attach_clients = 0;
-                self.resume_stdout(stdout_sink);
+                mute.release(&self.name);
             }
             OutputMsg::Attach { reply } => {
                 let answer = self.attach_pty.clone().map(|pty| {
                     self.attach_clients += 1;
                     if self.attach_clients == 1 {
-                        self.pause_stdout(stdout_sink);
+                        mute.attach(&self.name);
                     }
                     (pty, self.attach_clients)
                 });
@@ -466,7 +464,7 @@ impl ServiceOutputState {
                 } else {
                     self.attach_clients -= 1;
                     if self.attach_clients == 0 {
-                        self.resume_stdout(stdout_sink);
+                        mute.release(&self.name);
                     }
                     Some(self.attach_clients)
                 };

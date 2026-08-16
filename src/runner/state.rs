@@ -1,94 +1,24 @@
-//! Per-service and per-task runtime state holders.
+//! Per-service and per-task config holders.
 //!
-//! The `state` fields are deliberately **private to this submodule** so the
-//! rest of the runner cannot bypass [`RuntimeService::set_state`] /
-//! [`RuntimeTask::set_state`]. Those setters return `Option<…State>` marked
-//! `#[must_use]`: forgetting to broadcast the resulting event is a clippy
-//! error rather than a silent bug.
+//! Neither keeps a phase. A process's phase, its custody, whether it has a
+//! retry armed, and whether it satisfies its dependents all belong to its
+//! supervisor, which publishes them (see [`crate::facts`]) — so there is no
+//! shadow of any of them to drift.
 //!
-//! Use the [`Runner::set_service_state`] and [`Runner::set_task_state`]
-//! helpers in the parent module for the common case — they look up the
-//! entry, call `set_state`, and broadcast the [`RunnerEvent`] in one step.
-//!
-//! [`Runner::set_service_state`]: super::Runner::set_service_state
-//! [`Runner::set_task_state`]: super::Runner::set_task_state
-//! [`RunnerEvent`]: super::RunnerEvent
-
-use super::{ServiceState, TaskState};
-use crate::config::TaskAutoRun;
+//! What is left is the config the root resolved once at construction, and the
+//! two values it read out of `.don/task-state` to seed a task's supervisor.
 
 /// All per-service runtime state, consolidated into a single struct.
 ///
 /// Each running service gets one `RuntimeService` in `Runner::services`.
 pub(crate) struct RuntimeService {
-    /// Lifecycle state. Private so every mutation routes through
-    /// [`set_state`](Self::set_state) and gets broadcast.
-    state: ServiceState,
-    /// Direct dependencies that caused the current `DependencyFailed` state.
-    /// Cleared on every transition out of that state.
-    failed_dependencies: Vec<String>,
     /// The fully resolved service config (platform overrides applied once).
     pub resolved: crate::config::service::ResolvedService,
-    /// Whether the current start was asked for by the dependency sweep —
-    /// its ready outcome then drives the sweep-visible transition and the
-    /// "ready" lifecycle line; manual/rebuild starts instead close the
-    /// watch cycle with `RebuildComplete`.
-    pub(in crate::runner) scheduled_start: bool,
-    /// Whether this service's supervisor has an auto-restart armed. A
-    /// projection of the policy decision it reported, not a decision — the
-    /// scheduler reads it so a stack sitting in a backoff still counts as
-    /// having work in flight.
-    pub restart_pending: bool,
 }
 
 impl RuntimeService {
-    pub(crate) fn new(
-        resolved: crate::config::service::ResolvedService,
-        initial_state: ServiceState,
-    ) -> Self {
-        Self {
-            state: initial_state,
-            failed_dependencies: Vec::new(),
-            resolved,
-
-            scheduled_start: false,
-            restart_pending: false,
-        }
-    }
-
-    pub(crate) fn state(&self) -> ServiceState {
-        self.state
-    }
-
-    pub(crate) fn failed_dependencies(&self) -> &[String] {
-        &self.failed_dependencies
-    }
-
-    /// Atomically enter `DependencyFailed` with the supplied root causes.
-    pub(crate) fn mark_dependency_failed(&mut self, dependencies: Vec<String>) -> bool {
-        if self.state == ServiceState::DependencyFailed && self.failed_dependencies == dependencies
-        {
-            return false;
-        }
-        self.state = ServiceState::DependencyFailed;
-        self.failed_dependencies = dependencies;
-        true
-    }
-
-    /// Transition to `new_state`. Returns `Some(new_state)` when the state
-    /// actually changed — the caller **must** broadcast a
-    /// `RunnerEvent::ServiceStateChanged` for that value. Returns `None`
-    /// when already at `new_state`.
-    #[must_use = "state changes must be broadcast via RunnerEvent::ServiceStateChanged — use Runner::set_service_state or forward the returned state to event_tx.send"]
-    pub(crate) fn set_state(&mut self, new_state: ServiceState) -> Option<ServiceState> {
-        if self.state == new_state {
-            return None;
-        }
-        self.state = new_state;
-        if new_state != ServiceState::DependencyFailed {
-            self.failed_dependencies.clear();
-        }
-        Some(new_state)
+    pub(crate) fn new(resolved: crate::config::service::ResolvedService) -> Self {
+        Self { resolved }
     }
 }
 
@@ -96,128 +26,26 @@ impl RuntimeService {
 ///
 /// Each task gets one `RuntimeTask` in `Runner::tasks`.
 pub(crate) struct RuntimeTask {
-    /// Lifecycle state. Private so every mutation routes through
-    /// [`set_state`](Self::set_state) and gets broadcast.
-    state: TaskState,
-    /// Direct dependencies that caused the current `DependencyFailed` state.
-    /// Cleared on every transition out of that state.
-    failed_dependencies: Vec<String>,
     /// The task config (stored once, no repeated lookups).
     pub config: crate::config::task::Task,
-    /// Whether the task has ever completed successfully.
+    /// Whether the task has ever completed successfully, read from
+    /// `.don/task-state` at construction and handed to its supervisor, which
+    /// owns it from then on.
     pub has_success: bool,
-    /// Metadata for the most recent process run, including failures.
+    /// Metadata for the most recent run, likewise read once and handed on.
     pub last_run: Option<crate::task_state::TaskRunInfo>,
-    /// Whether the runner has finished the initial startup dependency-gate
-    /// evaluation for this task.
-    pub dependency_evaluated: bool,
-    /// Whether the task currently needs another run to bring its watched
-    /// inputs up to date.
-    pub needs_run_now: bool,
 }
 
 impl RuntimeTask {
     pub(crate) fn new(
         config: crate::config::task::Task,
-        initial_state: TaskState,
         has_success: bool,
         last_run: Option<crate::task_state::TaskRunInfo>,
     ) -> Self {
         Self {
-            state: initial_state,
-            failed_dependencies: Vec::new(),
             config,
             has_success,
             last_run,
-            dependency_evaluated: false,
-            needs_run_now: false,
         }
-    }
-
-    pub(crate) fn state(&self) -> TaskState {
-        self.state
-    }
-
-    pub(crate) fn failed_dependencies(&self) -> &[String] {
-        &self.failed_dependencies
-    }
-
-    /// Atomically enter `DependencyFailed` with the supplied root causes.
-    pub(crate) fn mark_dependency_failed(&mut self, dependencies: Vec<String>) -> bool {
-        if self.state == TaskState::DependencyFailed && self.failed_dependencies == dependencies {
-            return false;
-        }
-        self.state = TaskState::DependencyFailed;
-        self.failed_dependencies = dependencies;
-        true
-    }
-
-    /// Transition to `new_state`. Returns `Some(new_state)` when the state
-    /// actually changed — the caller **must** broadcast a
-    /// `RunnerEvent::TaskStateChanged` for that value.
-    #[must_use = "state changes must be broadcast via RunnerEvent::TaskStateChanged — use Runner::set_task_state or forward the returned state to event_tx.send"]
-    pub(crate) fn set_state(&mut self, new_state: TaskState) -> Option<TaskState> {
-        if self.state == new_state {
-            return None;
-        }
-        self.state = new_state;
-        if new_state != TaskState::DependencyFailed {
-            self.failed_dependencies.clear();
-        }
-        Some(new_state)
-    }
-
-    pub(crate) fn set_needs_run_now(&mut self, needs_run_now: bool) {
-        self.dependency_evaluated = true;
-        self.needs_run_now = needs_run_now;
-    }
-
-    pub(crate) fn mark_success(&mut self) {
-        self.has_success = true;
-        self.dependency_evaluated = true;
-        self.needs_run_now = false;
-    }
-
-    pub(crate) fn dependency_satisfied(&self) -> bool {
-        if matches!(self.state, TaskState::DependencyFailed) {
-            return false;
-        }
-        if !self.dependency_evaluated && self.state == TaskState::Pending {
-            return false;
-        }
-        if !self.has_success {
-            return false;
-        }
-        if self.needs_run_now
-            && self.config.params.is_empty()
-            && matches!(self.config.auto_run, TaskAutoRun::Always)
-        {
-            return false;
-        }
-        true
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::{RuntimeTask, TaskState};
-
-    /// The dependency gate reads `needs_run_now`: a task with a successful
-    /// history but an outstanding run is *not* satisfied, so dependents wait
-    /// rather than starting against stale output. This is the runner half of
-    /// the background-failure bug the task supervisor's `NoSpawnOutcome`
-    /// classifier tests pin from the process side.
-    #[test]
-    fn an_outstanding_run_blocks_dependents_despite_a_successful_history() {
-        let config: crate::config::Config = "[tasks.build]\ncmd = \"true\"\n".parse().unwrap();
-        let task = config.tasks.get("build").unwrap().clone();
-        let mut rt = RuntimeTask::new(task, TaskState::Completed, true, None);
-        assert!(rt.dependency_satisfied(), "a completed task satisfies deps");
-        rt.set_needs_run_now(true);
-        assert!(
-            !rt.dependency_satisfied(),
-            "an outstanding run must block dependents"
-        );
     }
 }

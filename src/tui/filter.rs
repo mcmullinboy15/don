@@ -194,14 +194,6 @@ impl FilterState {
         self.reset_edit_state();
     }
 
-    /// True when the active selection differs from the selection captured
-    /// when the modal opened.
-    pub(crate) fn selection_changed_from_snapshot(&self) -> bool {
-        self.snapshot_selected
-            .as_ref()
-            .is_some_and(|snapshot| snapshot != &self.active_selected)
-    }
-
     /// Abandon the edit session and restore the selection from when the modal
     /// opened.
     pub(crate) fn cancel_edit(&mut self) {

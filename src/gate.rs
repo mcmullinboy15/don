@@ -1,9 +1,17 @@
-//! Permission to run, published per process by the scheduler.
+//! Permission to run: what a process's dependencies allow.
 //!
-//! The runner does not start anything. It decides *whether a process is
-//! allowed to start* — dependencies satisfied, not shutting down, nothing
-//! else in flight — and publishes that decision. Each supervisor watches its
-//! own gate and starts itself when it is both permitted and idle.
+//! [`level`] is the whole of it — a pure function from this process's
+//! `depends_on` list and a [`FactsSnapshot`] to how far it may go. Each
+//! supervisor calls it against its own dependencies and starts itself when it
+//! is both permitted and idle. Nothing publishes permission, because nothing
+//! knows anything a supervisor cannot read for itself.
+//!
+//! # Why it reads a snapshot rather than each peer
+//!
+//! `api` depending on `db` and `cache` must see both as of one instant, or it
+//! can act on `db` as it was a moment ago next to `cache` as it is now. The
+//! merge in [`crate::facts`] is what provides that instant; this function just
+//! reads it.
 //!
 //! # Why a level, not an event
 //!
@@ -73,17 +81,8 @@
 //! so the map needs no lock, for the reason
 //! [`crate::process::registry`] documents.
 
-use std::collections::HashMap;
-use tokio::sync::watch;
-
-/// A published level, stamped with the scheduler pass that produced it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Grant {
-    pub(crate) level: Gate,
-    /// The scheduler pass this was published by. Monotonic across all
-    /// processes, so "published after my demand arose" is a comparison.
-    pub(crate) rev: u64,
-}
+use crate::config::Dependency;
+use crate::facts::FactsSnapshot;
 
 /// How far a process's dependencies let it go.
 ///
@@ -95,222 +94,266 @@ pub(crate) enum Gate {
     Blocked,
     /// Every dependency has settled, but not all are satisfied: something
     /// failed, stopped, or is parked waiting for a human. Waiting will not
-    /// end, so a process someone asked for *by name* may proceed; the
-    /// scheduler's own starts may not.
+    /// end, so a process someone asked for *by name* may proceed; a start the
+    /// graph would have made on its own may not.
     Degraded,
     /// Every dependency is satisfied.
     Open,
 }
 
-/// The write half: the scheduler's answer for every process.
+/// Whether one `depends_on` edge still blocks its dependent.
 ///
-/// Not `Clone` — it is moved into the runner at construction, so no other
-/// component can grant permission.
-pub(crate) struct GateWriter {
-    txs: HashMap<String, watch::Sender<Grant>>,
-    /// Bumped once per scheduler pass and stamped onto every level published
-    /// in it. See the module doc: this is what lets a supervisor tell a level
-    /// computed *after* its demand from one computed before.
-    rev: u64,
-    /// Publishing is a no-op until armed. Transitions during construction and
-    /// setup therefore cannot grant permission.
-    armed: bool,
+/// A blocking edge opens only when the dependency is satisfied. A non-blocking
+/// edge is ordering-only: it also opens once the dependency has settled into a
+/// failed or stopped state, so the dependent still starts *after* it, but is
+/// not held hostage by it.
+fn edge_open(dep: &Dependency, snapshot: &FactsSnapshot) -> bool {
+    snapshot.satisfied(&dep.name) || (!dep.blocking && snapshot.settled(&dep.name))
 }
 
-impl GateWriter {
-    /// Go live. Called once, when the scheduler starts scheduling.
-    pub(crate) fn arm(&mut self) {
-        self.armed = true;
+/// How far `deps` let a process go, as of `snapshot`.
+///
+/// Three-valued because "may I run?" has two different answers depending on
+/// who is asking. A process the graph brings up starts only when everything it
+/// needs is actually *up*; a user who names one explicitly is willing to
+/// proceed past a dependency that has stopped making progress, because waiting
+/// for it would never end. See [`crate::process::Demand::permitted_by`].
+///
+/// Reads only the *dependencies'* facts — never the asking process's own.
+/// That is what keeps every influence edge a dependency edge, and the
+/// dependency graph is a validated DAG.
+pub(crate) fn level(deps: &[Dependency], snapshot: &FactsSnapshot) -> Gate {
+    if deps.iter().all(|dep| edge_open(dep, snapshot)) {
+        return Gate::Open;
     }
-
-    /// Begin a scheduler pass. Every level published until the next call is
-    /// stamped with the same revision.
-    pub(crate) fn begin_pass(&mut self) {
-        self.rev += 1;
+    // Not all satisfied. If every unsatisfied one has *settled*, waiting will
+    // not help — an explicit request may still proceed.
+    if deps
+        .iter()
+        .all(|dep| snapshot.satisfied(&dep.name) || snapshot.settled(&dep.name))
+    {
+        return Gate::Degraded;
     }
+    Gate::Blocked
+}
 
-    /// Publish one process's level. Returns whether the *level* changed —
-    /// the revision always advances, so holders can always tell freshness.
-    pub(crate) fn set(&mut self, name: &str, level: Gate) -> bool {
-        if !self.armed {
-            return false;
-        }
-        let Some(tx) = self.txs.get(name) else {
-            return false;
+/// The root failures these dependencies strand their dependent behind.
+///
+/// Resolved transitively without walking the graph: a stranded dependency has
+/// already inherited *its* dependencies' roots, so reading one hop reads the
+/// whole chain. `api -> worker -> db` reports `db`.
+///
+/// Non-blocking edges are ignored: their whole point is that a failure on the
+/// other end must not cascade.
+pub(crate) fn failed_roots(deps: &[Dependency], snapshot: &FactsSnapshot) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for dep in deps.iter().filter(|dep| dep.blocking) {
+        let inherited = snapshot.failed_roots(&dep.name);
+        // A root failure reports itself; anything that inherited roots
+        // contributes those instead, which is what collapses the chain.
+        let contributed = if inherited.is_empty() {
+            continue;
+        } else {
+            inherited
         };
-        let changed = tx.borrow().level != level;
-        tx.send_replace(Grant {
-            level,
-            rev: self.rev,
-        });
-        changed
+        for root in contributed {
+            if !roots.iter().any(|existing| existing == root) {
+                roots.push(root.clone());
+            }
+        }
     }
+    roots
 }
 
-/// The read half, one per process.
+/// The non-blocking dependencies a process is deliberately not waiting for.
 ///
-/// A level read is correct after missing any number of changes, which is the
-/// point: a supervisor busy through a docker pull or a build sees the current
-/// answer when it finishes, not a notification it slept through.
-#[derive(Debug)]
-pub(crate) struct GateReader {
-    rx: watch::Receiver<Grant>,
-}
-
-impl GateReader {
-    /// The current grant: what dependencies allow, and when that was decided.
-    pub(crate) fn get(&self) -> Grant {
-        *self.rx.borrow()
-    }
-
-    /// The revision now, for stamping demand as it arises.
-    pub(crate) fn rev(&self) -> u64 {
-        self.rx.borrow().rev
-    }
-
-    /// Wait for the next change. Cancel-safe, so it can be a `select!` arm.
-    ///
-    /// `None` once the scheduler is gone — treat that as "blocked forever",
-    /// not as an error, and stop selecting on this gate. A `watch::Receiver`
-    /// whose sender has dropped returns `Err` immediately and *forever*, so a
-    /// caller that keeps polling spins at 100% CPU.
-    pub(crate) async fn changed(&mut self) -> Option<()> {
-        self.rx.changed().await.ok()
-    }
-}
-
-/// Create the writer plus one reader per process.
-///
-/// The name set is fixed here, for the same reason
-/// [`crate::process::registry::ProcessRegistry`]'s is: the process set is
-/// decided at construction, so there is nothing to synchronise.
-pub(crate) fn channel<'a>(
-    names: impl Iterator<Item = &'a String>,
-) -> (GateWriter, HashMap<String, GateReader>) {
-    let mut txs = HashMap::new();
-    let mut readers = HashMap::new();
-    for name in names {
-        let (tx, rx) = watch::channel(Grant {
-            level: Gate::Blocked,
-            rev: 0,
-        });
-        txs.insert(name.clone(), tx);
-        readers.insert(name.clone(), GateReader { rx });
-    }
-    (
-        GateWriter {
-            txs,
-            rev: 0,
-            armed: false,
-        },
-        readers,
-    )
+/// Reported when it starts anyway, so a start that follows a visible failure
+/// doesn't look like don ignored the graph.
+pub(crate) fn skipped_non_blocking(deps: &[Dependency], snapshot: &FactsSnapshot) -> Vec<String> {
+    deps.iter()
+        .filter(|dep| !dep.blocking)
+        .filter(|dep| !snapshot.satisfied(&dep.name) && snapshot.settled(&dep.name))
+        .map(|dep| dep.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::facts::ProcessFacts;
+    use crate::process::ServiceState;
 
-    fn one(name: &str) -> (GateWriter, GateReader) {
-        let names = [name.to_string()];
-        let (mut writer, mut readers) = channel(names.iter());
-        writer.arm();
-        let reader = readers.remove(name).unwrap();
-        (writer, reader)
+    /// A dependency's facts, reduced to the two booleans the pure functions
+    /// actually read.
+    fn facts(satisfied: bool, settled: bool, roots: &[&str]) -> ProcessFacts {
+        ProcessFacts {
+            satisfied,
+            settled,
+            failed_roots: roots.iter().map(|r| (*r).to_string()).collect(),
+            ..ProcessFacts::for_service("dep", ServiceState::Pending, None, Vec::new())
+        }
     }
 
-    fn publish(writer: &mut GateWriter, name: &str, level: Gate) {
-        writer.begin_pass();
-        writer.set(name, level);
+    fn snapshot(entries: &[(&str, ProcessFacts)]) -> FactsSnapshot {
+        FactsSnapshot::from_pairs(
+            entries
+                .iter()
+                .map(|(name, facts)| ((*name).to_string(), facts.clone())),
+        )
     }
 
-    #[test]
-    fn nothing_is_permitted_before_the_scheduler_arms() {
-        let names = ["api".to_string()];
-        let (mut writer, mut readers) = channel(names.iter());
-        let reader = readers.remove("api").unwrap();
-        publish(&mut writer, "api", Gate::Open);
-        assert_eq!(reader.get().level, Gate::Blocked);
-
-        writer.arm();
-        publish(&mut writer, "api", Gate::Open);
-        assert_eq!(reader.get().level, Gate::Open);
-    }
-
-    #[test]
-    fn a_level_survives_not_being_looked_at() {
-        // The point of a level: a supervisor busy through the changes sees
-        // the current answer when it finishes, not a missed notification.
-        let (mut writer, reader) = one("api");
-        publish(&mut writer, "api", Gate::Open);
-        publish(&mut writer, "api", Gate::Blocked);
-        publish(&mut writer, "api", Gate::Degraded);
-        assert_eq!(reader.get().level, Gate::Degraded);
+    fn dep(name: &str, blocking: bool) -> Dependency {
+        Dependency {
+            name: name.to_string(),
+            blocking,
+        }
     }
 
     #[test]
-    fn set_reports_only_real_level_changes() {
-        let (mut writer, _reader) = one("api");
-        writer.begin_pass();
-        assert!(writer.set("api", Gate::Open));
-        writer.begin_pass();
-        assert!(
-            !writer.set("api", Gate::Open),
-            "republishing is not a change"
-        );
-        writer.begin_pass();
-        assert!(writer.set("api", Gate::Degraded));
-        assert!(
-            !writer.set("ghost", Gate::Open),
-            "unknown names change nothing"
-        );
+    fn dependency_levels_table() {
+        struct Case {
+            name: &'static str,
+            deps: Vec<Dependency>,
+            world: Vec<(&'static str, ProcessFacts)>,
+            want: Gate,
+        }
+
+        let up = facts(true, false, &[]);
+        let coming_up = facts(false, false, &[]);
+        let dead = facts(false, true, &["db"]);
+
+        let cases = vec![
+            Case {
+                name: "no dependencies is always open",
+                deps: vec![],
+                world: vec![],
+                want: Gate::Open,
+            },
+            Case {
+                name: "every blocking dependency satisfied",
+                deps: vec![dep("db", true), dep("cache", true)],
+                world: vec![("db", up.clone()), ("cache", up.clone())],
+                want: Gate::Open,
+            },
+            Case {
+                name: "one dependency still coming up blocks",
+                deps: vec![dep("db", true), dep("cache", true)],
+                world: vec![("db", up.clone()), ("cache", coming_up.clone())],
+                want: Gate::Blocked,
+            },
+            Case {
+                name: "a settled blocking dependency degrades rather than blocks",
+                deps: vec![dep("db", true)],
+                world: vec![("db", dead.clone())],
+                want: Gate::Degraded,
+            },
+            Case {
+                name: "a settled non-blocking dependency opens the edge outright",
+                deps: vec![dep("db", false)],
+                world: vec![("db", dead.clone())],
+                want: Gate::Open,
+            },
+            Case {
+                name: "a non-blocking dependency still coming up is still worth waiting for",
+                deps: vec![dep("db", false)],
+                world: vec![("db", coming_up.clone())],
+                want: Gate::Blocked,
+            },
+            Case {
+                name: "one settled and one still coming up blocks",
+                deps: vec![dep("db", true), dep("cache", true)],
+                world: vec![("db", dead.clone()), ("cache", coming_up.clone())],
+                want: Gate::Blocked,
+            },
+            Case {
+                name: "a dependency outside the active process set never satisfies",
+                deps: vec![dep("ghost", true)],
+                world: vec![],
+                want: Gate::Blocked,
+            },
+        ];
+
+        for case in cases {
+            let got = level(&case.deps, &snapshot(&case.world));
+            assert_eq!(got, case.want, "{}", case.name);
+        }
     }
 
-    /// The revision is what stops a supervisor acting on a level that was
-    /// decided before its demand existed — the race that splitting demand
-    /// from permission introduces. See the module doc.
     #[test]
-    fn a_republished_level_still_advances_the_revision() {
-        let (mut writer, reader) = one("api");
-        publish(&mut writer, "api", Gate::Open);
-        let first = reader.rev();
+    fn failed_roots_table() {
+        struct Case {
+            name: &'static str,
+            deps: Vec<Dependency>,
+            world: Vec<(&'static str, ProcessFacts)>,
+            want: Vec<&'static str>,
+        }
 
-        // Same level, new pass: a holder whose demand arose during the first
-        // pass must be able to tell this one is newer.
-        publish(&mut writer, "api", Gate::Open);
-        assert!(
-            reader.rev() > first,
-            "an unchanged level must still carry a fresh revision"
-        );
+        let cases = vec![
+            Case {
+                name: "a healthy dependency contributes nothing",
+                deps: vec![dep("db", true)],
+                world: vec![("db", facts(true, false, &[]))],
+                want: vec![],
+            },
+            Case {
+                name: "a root failure reports itself",
+                deps: vec![dep("db", true)],
+                world: vec![("db", facts(false, true, &["db"]))],
+                want: vec!["db"],
+            },
+            Case {
+                name: "a stranded dependency collapses to the root it inherited",
+                deps: vec![dep("worker", true)],
+                world: vec![("worker", facts(false, true, &["db"]))],
+                want: vec!["db"],
+            },
+            Case {
+                name: "two paths to one root report it once",
+                deps: vec![dep("worker", true), dep("api", true)],
+                world: vec![
+                    ("worker", facts(false, true, &["db"])),
+                    ("api", facts(false, true, &["db"])),
+                ],
+                want: vec!["db"],
+            },
+            Case {
+                name: "a non-blocking edge never cascades",
+                deps: vec![dep("metrics", false)],
+                world: vec![("metrics", facts(false, true, &["metrics"]))],
+                want: vec![],
+            },
+        ];
+
+        for case in cases {
+            let got = failed_roots(&case.deps, &snapshot(&case.world));
+            assert_eq!(got, case.want, "{}", case.name);
+        }
     }
 
     #[test]
-    fn one_pass_stamps_every_process_alike() {
-        let names = ["api".to_string(), "db".to_string()];
-        let (mut writer, mut readers) = channel(names.iter());
-        writer.arm();
-        let api = readers.remove("api").unwrap();
-        let db = readers.remove("db").unwrap();
-
-        writer.begin_pass();
-        writer.set("api", Gate::Open);
-        writer.set("db", Gate::Degraded);
-        assert_eq!(api.get().rev, db.get().rev, "one pass, one revision");
+    fn skipped_non_blocking_names_only_what_was_given_up_on() {
+        let world = snapshot(&[
+            ("dead", facts(false, true, &["dead"])),
+            ("up", facts(true, false, &[])),
+            ("coming", facts(false, false, &[])),
+        ]);
+        let deps = vec![
+            dep("dead", false),
+            dep("up", false),
+            dep("coming", false),
+            // A blocking edge is never "skipped" — it was waited for.
+            dep("dead", true),
+        ];
+        assert_eq!(skipped_non_blocking(&deps, &world), ["dead".to_string()]);
     }
 
-    /// The ordering is the permission rule: a scheduled start needs `Open`, an
-    /// explicitly requested one is content with `Degraded`.
+    /// The ordering *is* the permission rule: a start the graph makes on its
+    /// own needs `Open`, an explicitly requested one is content with
+    /// `Degraded`. See [`crate::process::Demand::permitted_by`].
     #[test]
     fn levels_are_ordered_by_how_much_they_permit() {
         assert!(Gate::Blocked < Gate::Degraded);
         assert!(Gate::Degraded < Gate::Open);
-    }
-
-    #[tokio::test]
-    async fn a_dropped_scheduler_ends_the_wait_rather_than_spinning() {
-        let (writer, mut reader) = one("api");
-        drop(writer);
-        assert_eq!(reader.changed().await, None);
     }
 }

@@ -19,13 +19,19 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// One request to run a task, as handed to its supervisor.
+///
+/// It carries no copy of the task's config: the supervisor was built from it
+/// and holds it for as long as it lives, so a request that brought its own
+/// would be offering a second opinion about a fact the recipient already owns.
 pub(crate) struct RunRequest {
-    pub(crate) task_cfg: Box<crate::config::Task>,
+    /// User-supplied parameter values, *unresolved*. Defaults, unknown keys
+    /// and missing required values are settled by the supervisor, against the
+    /// config it holds.
     pub(crate) params: std::collections::HashMap<String, String>,
     pub(crate) mode: super::task_worker::TaskRunMode,
     pub(crate) intent: super::TaskRunIntent,
-    /// Someone waiting for this run to finish (`don run --wait`).
-    pub(crate) wait: Option<RunWait>,
+    /// Someone waiting to hear how this went.
+    pub(crate) reply: Option<RunReply>,
     /// What to say when this run is picked up, before preparing it.
     ///
     /// Preparation hashes files and resolves downloads, so a triggered run
@@ -33,6 +39,36 @@ pub(crate) struct RunRequest {
     /// `None` for the startup sweep, which the scheduler is already
     /// narrating.
     pub(crate) start_message: Option<String>,
+}
+
+/// A caller waiting to hear how a run request went, and when they expect the
+/// answer.
+pub(crate) enum RunReply {
+    /// Answered the moment the run is admitted — `don run`. The run's own
+    /// outcome travels separately, as lifecycle output.
+    OnStart(tokio::sync::oneshot::Sender<crate::command::CommandResult>),
+    /// Answered when the run finishes — `don run --wait`.
+    OnExit(RunWait),
+}
+
+impl RunReply {
+    /// Answer now, whichever timing was asked for. A request that is refused,
+    /// or that settles without spawning, collapses the two cases: there is no
+    /// exit left to wait for.
+    fn settle(self, result: crate::command::CommandResult) {
+        let _ = match self {
+            RunReply::OnStart(reply) => reply,
+            RunReply::OnExit(wait) => wait.reply,
+        }
+        .send(result);
+    }
+}
+
+/// Answer a run request now, if anyone was listening.
+fn settle_run(reply: Option<RunReply>, result: crate::command::CommandResult) {
+    if let Some(reply) = reply {
+        reply.settle(result);
+    }
 }
 
 /// A caller blocked on a run's outcome.
@@ -56,7 +92,12 @@ pub(crate) struct RunWait {
 /// itself. Both of those are things the owner of the run already has, so both
 /// arrive here now and the scheduler keeps neither.
 pub(crate) enum TaskCommand {
-    /// Run this task. A run already in flight is superseded.
+    /// Run this task.
+    ///
+    /// Every pre-check `don run` used to get from the scheduler is answered
+    /// here instead: whether a run is already in flight, and whether the
+    /// parameters supplied resolve against the ones this task declares. Both
+    /// are about things this supervisor holds.
     Run(RunRequest),
     /// This task's watched files changed.
     ///
@@ -121,15 +162,19 @@ pub(crate) fn spawn_supervisors<'a>(
     ctx: &super::task_worker::TaskWorkerContext,
     outputs: &dyn Fn(&str) -> Option<crate::output::ProcessOutput>,
     config: &dyn Fn(&str) -> Option<StartupConfig>,
+    dependents: &dyn Fn(&str) -> Vec<String>,
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
-    gates: &mut std::collections::HashMap<String, crate::gate::GateReader>,
+    facts: &crate::facts::FactsReader,
+    publishers: &mut std::collections::HashMap<String, crate::facts::FactsPublisher>,
+    released: &tokio::sync::watch::Receiver<bool>,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
     batcher_tx: &mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
 ) -> TaskSupervisors {
     TaskSupervisors::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
         let startup = config(&name);
-        let gate = gates.remove(&name);
+        let publisher = publishers.remove(&name);
+        let dependents = dependents(&name);
         supervise(
             name,
             rx,
@@ -138,7 +183,10 @@ pub(crate) fn spawn_supervisors<'a>(
             report_tx.clone(),
             busy,
             startup,
-            gate,
+            dependents,
+            facts.clone(),
+            publisher,
+            released.clone(),
             shutdown_rx.clone(),
             batcher_tx.clone(),
         )
@@ -185,19 +233,8 @@ fn request_artifact(
     task_cfg: &crate::config::Task,
     ctx: &super::task_worker::TaskWorkerContext,
     outcome: &mpsc::UnboundedSender<crate::build_tool::batch::PrepareOutcome>,
-    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     batcher_tx: &mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
 ) -> bool {
-    if report_tx
-        .send(super::ProcessReport::ArtifactBuild {
-            name: name.to_string(),
-            kind: super::ProcessKind::Task,
-            status: super::ArtifactBuildStatus::Started,
-        })
-        .is_err()
-    {
-        return false;
-    }
     let working_dir = working_dir_for(&ctx.base_dir, task_cfg.dir.as_deref());
     let ignore = resolve_watch_ignore_patterns(
         &working_dir,
@@ -228,6 +265,12 @@ pub(crate) struct StartupConfig {
     /// a manual task as "required by dependents" and then block the very
     /// dependent that did not care. Fixed at construction, like the name set.
     pub(crate) has_dependents: bool,
+    /// Whether this task has ever completed successfully, read from
+    /// `.don/task-state` at construction. A task that succeeded in a previous
+    /// session satisfies its dependents without re-running.
+    pub(crate) has_success: bool,
+    /// Metadata for the most recent run, likewise carried across sessions.
+    pub(crate) last_run: Option<TaskRunInfo>,
 }
 
 /// What a command means once resolved against what this supervisor holds —
@@ -267,15 +310,80 @@ fn answer(
     }
 }
 
+/// `phase` and `holding` are what admission reads: the phase this supervisor
+/// has published, and whether it has a run in hand right now. Together they
+/// are exactly the pair the scheduler used to consult — a state map plus a
+/// busy flag — except that here both belong to the thing being asked.
 fn resolve_command(
     command: TaskCommand,
     name: &str,
     startup: Option<&StartupConfig>,
     last_params: &std::collections::HashMap<String, String>,
     awaiting_artifact: bool,
+    phase: super::TaskState,
+    holding: bool,
 ) -> Ask {
     match command {
-        TaskCommand::Run(request) => Ask::Run(request),
+        TaskCommand::Run(request) => {
+            let Some(startup) = startup else {
+                settle_run(
+                    request.reply,
+                    Err(crate::command::CommandError::UnknownTask {
+                        name: name.to_string(),
+                    }),
+                );
+                return Ask::Nothing;
+            };
+            let RunRequest {
+                params,
+                mode,
+                intent,
+                reply,
+                start_message,
+            } = request;
+
+            if holding
+                || matches!(
+                    phase,
+                    super::TaskState::Running | super::TaskState::Building
+                )
+            {
+                // Two runs of one task at once would interleave their output
+                // unpredictably. A watch trigger supersedes because it is the
+                // same run again; an explicit one is refused, because the
+                // caller asked for a run that would not be theirs.
+                settle_run(
+                    reply,
+                    Err(crate::command::CommandError::InvalidState {
+                        name: name.to_string(),
+                        message: "task is already running".to_string(),
+                    }),
+                );
+                return Ask::Nothing;
+            }
+
+            // Apply defaults, reject unknown keys, reject missing required
+            // values, validate per kind — against this task's own declaration.
+            match crate::process::params::resolve_task_params(name, &startup.task_cfg, params) {
+                Ok(params) => Ask::Run(RunRequest {
+                    params,
+                    mode,
+                    intent,
+                    reply,
+                    start_message,
+                }),
+                Err(message) => {
+                    settle_run(
+                        reply,
+                        Err(crate::command::CommandError::InvalidParams {
+                            name: name.to_string(),
+                            message,
+                        }),
+                    );
+                    Ask::Nothing
+                }
+            }
+        }
         TaskCommand::Kill { done } => Ask::Cancel { then: None, done },
         TaskCommand::BuildGraphChanged => Ask::Requery,
         TaskCommand::Rerun => {
@@ -314,11 +422,10 @@ fn resolve_command(
             // changed. That check exists for startup, to skip a task whose
             // inputs have not moved since its last run.
             Ask::Run(RunRequest {
-                task_cfg: startup.task_cfg.clone(),
                 params: std::collections::HashMap::new(),
                 mode: super::task_worker::TaskRunMode::Triggered,
                 intent: super::TaskRunIntent::Background,
-                wait: None,
+                reply: None,
                 start_message: Some("re-running (file changed)".to_string()),
             })
         }
@@ -354,11 +461,12 @@ fn resolve_command(
             Ask::Cancel {
                 done: None,
                 then: Some(RunRequest {
-                    task_cfg: startup.task_cfg.clone(),
+                    // Already resolved: these are the values the last run
+                    // actually used.
                     params: last_params.clone(),
                     mode: super::task_worker::TaskRunMode::Triggered,
                     intent: super::TaskRunIntent::Background,
-                    wait: None,
+                    reply: None,
                     start_message: Some("restarting (manual trigger)".to_string()),
                 }),
             }
@@ -398,10 +506,38 @@ async fn supervise(
     report_tx: mpsc::UnboundedSender<super::ProcessReport>,
     busy: Arc<AtomicBool>,
     startup: Option<StartupConfig>,
-    mut gate: Option<crate::gate::GateReader>,
+    dependents: Vec<String>,
+    world: crate::facts::FactsReader,
+    facts: Option<crate::facts::FactsPublisher>,
+    mut released_rx: tokio::sync::watch::Receiver<bool>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     batcher_tx: mpsc::UnboundedSender<crate::build_tool::batcher::BatchRequest>,
 ) {
+    // Names come from the same map the configs do, so `None` is unreachable;
+    // ending the supervisor beats panicking.
+    let (Some(facts), Some(startup_cfg)) = (facts, startup.as_ref()) else {
+        return;
+    };
+    // The config, held once for as long as this supervisor lives. Every run
+    // uses it, so no request needs to bring a copy.
+    let task_cfg = startup_cfg.task_cfg.clone();
+    // This task's phase is this supervisor's to answer for. It starts
+    // `Pending` with whatever history `.don/task-state` carried across from a
+    // previous session.
+    let mut owner = TaskPhaseOwner {
+        name: name.clone(),
+        deps: startup_cfg.task_cfg.depends_on.clone(),
+        config: (*startup_cfg.task_cfg).clone(),
+        world: world.clone(),
+        facts,
+        phase: crate::process::TaskState::Pending,
+        has_success: startup_cfg.has_success,
+        needs_run_now: false,
+        evaluated: false,
+        pid: None,
+        last_run: startup_cfg.last_run.clone(),
+    };
+    owner.publish();
     let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<RunRequest> = None;
     let mut mailbox_closed = false;
@@ -418,23 +554,24 @@ async fn supervise(
     // re-query.
     let (requery_tx, mut requery_rx) =
         mpsc::unbounded_channel::<crate::build_tool::batch::RequeryOutcome>();
+    // Asked for after the owner exists, so the `Building` phase this enters is
+    // published by the thing that entered it.
     let mut awaiting_artifact = match startup.as_ref() {
-        Some(startup) if startup.task_cfg.bazel.is_some() => request_artifact(
-            &name,
-            &startup.task_cfg,
-            &ctx,
-            &prepare_tx,
-            &report_tx,
-            &batcher_tx,
-        ),
+        Some(startup) if startup.task_cfg.bazel.is_some() => {
+            owner.set(crate::process::TaskState::Building);
+            request_artifact(&name, &startup.task_cfg, &ctx, &prepare_tx, &batcher_tx)
+        }
         _ => false,
     };
     // A task is wanted from the moment it exists; its startup evaluation
     // decides whether it actually needs to run.
     let mut demand = super::Demand::Scheduled;
-    // See `crate::gate`: a level decided before this demand arose cannot have
-    // accounted for it.
-    let demand_rev: u64 = 0;
+    // What every peer says about itself, and whether setup has released the
+    // stack. Both are read at the level check below rather than delivered, so
+    // demand and permission are never out of step — see `current_level`.
+    let mut world = world;
+    let mut watching_world = true;
+    let mut stack_released = *released_rx.borrow();
     // Whoever is blocked on the run in hand, if anyone.
     let mut waiter: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>> = None;
 
@@ -451,19 +588,19 @@ async fn supervise(
                 let permitted = startup
                     .as_ref()
                     .filter(|_| !awaiting_artifact)
-                    .filter(|_| {
-                        gate.as_ref().is_some_and(|g| {
-                            let grant = g.get();
-                            grant.rev > demand_rev && demand.permitted_by(grant.level)
-                        })
+                    .filter(|startup| {
+                        demand.permitted_by(current_level(
+                            stack_released,
+                            &world,
+                            &startup.task_cfg.depends_on,
+                        ))
                     })
                     .map(|startup| {
                         // One-shot, like the service side: a run is spent
                         // here, and only a fresh demand re-arms it.
                         demand = super::Demand::None;
                         RunRequest {
-                            wait: None,
-                            task_cfg: startup.task_cfg.clone(),
+                            reply: None,
                             params: std::collections::HashMap::new(),
                             mode: super::task_worker::TaskRunMode::Startup {
                                 has_dependents: startup.has_dependents,
@@ -490,6 +627,8 @@ async fn supervise(
                                         startup.as_ref(),
                                         &last_params,
                                         awaiting_artifact,
+                                        owner.phase,
+                                        false,
                                     ) {
                                         Ask::Run(request)
                                         | Ask::Cancel { then: Some(request), .. } => {
@@ -521,17 +660,22 @@ async fn supervise(
                                             continue;
                                         }
                                         Ask::Park(message) => {
+                                            // Waiting for a human, not for a
+                                            // dependency. Say so, then publish
+                                            // — in that order, so the line
+                                            // cannot land behind a dependent
+                                            // the phase just unblocked.
+                                            let outcome =
+                                                NoSpawnOutcome::pending_run(message.clone());
+                                            outcome.emit(&ctx.emitter, &name);
+                                            if let Some(needs) = outcome.needs_run_now() {
+                                                owner.set_needs_run_now(needs);
+                                            }
+                                            owner.set(outcome.state);
                                             if report_tx
                                                 .send(super::ProcessReport::TaskRunPrepared {
                                                     name: name.clone(),
-                                                    task_cfg: match startup.as_ref() {
-                                                        Some(startup) => {
-                                                            startup.task_cfg.clone()
-                                                        }
-                                                        // `Park` is only ever
-                                                        // resolved with one.
-                                                        None => continue,
-                                                    },
+                                                    task_cfg: task_cfg.clone(),
                                                     intent: super::TaskRunIntent::Background,
                                                     result: Ok(TaskRunReport::PendingRun {
                                                         message,
@@ -548,11 +692,33 @@ async fn supervise(
                                 }
                                 None => return,
                             },
-                            // Permission changed; loop back to the level read.
-                            changed = wait_gate(&mut gate), if gate.is_some() => {
+                            // A peer's facts moved, or setup released the
+                            // stack; loop back to the level read. Both waits
+                            // end permanently once their sender is gone, so a
+                            // `None` means stop selecting rather than spin.
+                            changed = world.changed(), if watching_world => {
                                 if changed.is_none() {
-                                    gate = None;
+                                    watching_world = false;
                                 }
+                                // A blocking dependency may have failed while
+                                // this task was waiting on it — or recovered.
+                                match owner.reconcile_dependencies() {
+                                    Some(message) if message.is_empty() => {
+                                        ctx.emitter.service_debug_event(
+                                            &name,
+                                            "dependency recovered; re-queued",
+                                        );
+                                    }
+                                    Some(message) => {
+                                        ctx.emitter.service_error_event(&name, &message);
+                                    }
+                                    None => {}
+                                }
+                                continue;
+                            }
+                            released = released_rx.changed(), if !stack_released => {
+                                stack_released =
+                                    released.is_err() || *released_rx.borrow();
                                 continue;
                             }
                             // A re-query this supervisor asked for. The new
@@ -574,6 +740,8 @@ async fn supervise(
                                     startup.as_ref(),
                                     &last_params,
                                     awaiting_artifact,
+                                    owner.phase,
+                                    false,
                                 ) {
                                     Ask::Run(request) => {
                                         busy.store(true, Ordering::Relaxed);
@@ -587,16 +755,19 @@ async fn supervise(
                             outcome = prepare_rx.recv() => {
                                 use crate::build_tool::batch::PrepareOutcome;
                                 let Some(outcome) = outcome else { continue };
-                                let status = match outcome {
+                                match outcome {
                                     // Nothing to record: a task runs the
                                     // command it was configured with, and the
                                     // build only had to make the target exist.
                                     PrepareOutcome::Ready { .. } => {
                                         awaiting_artifact = false;
-                                        super::ArtifactBuildStatus::Ready
+                                        if owner.phase == crate::process::TaskState::Building {
+                                            owner.set(crate::process::TaskState::Pending);
+                                        }
                                     }
                                     // Sources changed mid-build; the build
-                                    // manager said so. Ask again.
+                                    // manager said so. Ask again. The task
+                                    // stays `Building` throughout.
                                     PrepareOutcome::Stale => {
                                         awaiting_artifact = match startup.as_ref() {
                                             Some(startup) => request_artifact(
@@ -604,29 +775,21 @@ async fn supervise(
                                                 &startup.task_cfg,
                                                 &ctx,
                                                 &prepare_tx,
-                                                &report_tx,
                                                 &batcher_tx,
                                             ),
                                             None => false,
                                         };
-                                        continue;
                                     }
                                     PrepareOutcome::Failed(message) => {
                                         awaiting_artifact = false;
                                         // Not retried — see the service side.
                                         demand = super::Demand::None;
-                                        super::ArtifactBuildStatus::Failed(message)
+                                        ctx.emitter.service_error_event(
+                                            &name,
+                                            &format!("build failed: {message}"),
+                                        );
+                                        owner.set(crate::process::TaskState::Failed);
                                     }
-                                };
-                                if report_tx
-                                    .send(super::ProcessReport::ArtifactBuild {
-                                        name: name.clone(),
-                                        kind: super::ProcessKind::Task,
-                                        status,
-                                    })
-                                    .is_err()
-                                {
-                                    return;
                                 }
                                 continue;
                             }
@@ -636,13 +799,23 @@ async fn supervise(
             }
         };
         let RunRequest {
-            task_cfg,
             params,
             mode,
             intent,
-            wait: request_wait,
+            reply,
             start_message,
         } = request;
+        // Admitted. `don run` is answered here and stops caring; `don run
+        // --wait` keeps its channel and is answered by whatever this run
+        // settles into.
+        let request_wait = match reply {
+            Some(RunReply::OnStart(reply)) => {
+                let _ = reply.send(Ok(()));
+                None
+            }
+            Some(RunReply::OnExit(wait)) => Some(wait),
+            None => None,
+        };
 
         // A triggered run announces itself before preparing, and takes over
         // as the run a restart would reuse. Both used to happen on the
@@ -656,6 +829,11 @@ async fn supervise(
             if let Some(writer) = service_writer.as_ref() {
                 writer.close_follow_sinks().await;
             }
+            // A triggered run is outstanding from here, and `Running` is what
+            // this task now is. Published before the report, so a dependent
+            // reading the snapshot cannot see it as still satisfied.
+            owner.set_needs_run_now(true);
+            owner.set(crate::process::TaskState::Running);
             if report_tx
                 .send(super::ProcessReport::TaskStarting {
                     name: name.clone(),
@@ -667,11 +845,10 @@ async fn supervise(
             }
         }
 
-        let task_cfg_for_worker = task_cfg.clone();
         let worker = super::task_worker::run_task_worker(
             ctx.clone(),
             &name,
-            task_cfg_for_worker.as_ref(),
+            task_cfg.as_ref(),
             &params,
             mode,
         );
@@ -691,7 +868,8 @@ async fn supervise(
                 next = rx.recv(), if !mailbox_closed => match next {
                     Some(command) => {
                         match resolve_command(
-                            command, &name, startup.as_ref(), &last_params, false,
+                            command, &name, startup.as_ref(), &last_params, false, owner.phase,
+                            true,
                         ) {
                             Ask::Run(request) => superseded = Some(request),
                             Ask::Cancel { then, done } => {
@@ -789,6 +967,40 @@ async fn supervise(
             report_tx: report_tx.clone(),
         });
 
+        // Land the phase this run settled into. A run that spawned is `Running`
+        // with a pid until its exit half lands above; one that never spawned is
+        // classified by `NoSpawnOutcome`.
+        let settled: Option<NoSpawnOutcome> = match &report {
+            Ok(TaskRunReport::Running(wired)) => {
+                owner.set_needs_run_now(true);
+                owner.set_pid(Some(wired.pgid));
+                owner.set(crate::process::TaskState::Running);
+                None
+            }
+            Ok(TaskRunReport::PendingRun { message }) => {
+                Some(NoSpawnOutcome::pending_run(message.clone()))
+            }
+            Ok(TaskRunReport::Skipped { message }) => Some(NoSpawnOutcome::skipped(
+                message.clone().unwrap_or_else(|| "skipped".to_string()),
+            )),
+            Err(message) => Some(NoSpawnOutcome::failed(message.clone())),
+        };
+        // What a `--wait` caller is owed if this run never spawns: there is no
+        // exit coming, so the outcome that settled it is the answer.
+        let no_spawn = settled
+            .as_ref()
+            .map(|outcome| (outcome.success, outcome.message.clone()));
+        if let Some(outcome) = settled {
+            // Say why *before* publishing. Publishing is what unblocks this
+            // task's dependents, and their supervisors decide the moment they
+            // see it — a line emitted afterwards lands behind the "starting..."
+            // it was supposed to explain.
+            outcome.emit(&ctx.emitter, &name);
+            if let Some(needs_run_now) = outcome.needs_run_now() {
+                owner.set_needs_run_now(needs_run_now);
+            }
+            owner.set(outcome.state);
+        }
         if report_tx
             .send(super::ProcessReport::TaskRunPrepared {
                 name: name.clone(),
@@ -806,6 +1018,18 @@ async fn supervise(
         // start early, which is the race the old `run_requested` flag and
         // duplicate-pgid guard papered over.
         let Some((mut handle, reader, osc)) = run else {
+            // Nothing spawned. Answer the waiter here rather than dropping the
+            // channel — a dropped one reads as "the stack went away", which is
+            // not what a task that failed to prepare should look like.
+            if let Some(run_wait) = request_wait {
+                let _ = run_wait.reply.send(match no_spawn {
+                    Some((false, message)) => Err(crate::command::CommandError::Failed {
+                        name: name.clone(),
+                        message,
+                    }),
+                    _ => Ok(()),
+                });
+            }
             continue;
         };
         // This run supersedes whatever the last one's waiter was told to
@@ -829,6 +1053,10 @@ async fn supervise(
         // mid-run signals the group this supervisor owns.
         let pgid = outcome.pgid;
         let mut cancelled = false;
+        // Teardown runs once per run: a second pass would re-signal a group
+        // that is already dying.
+        let mut tearing_down = false;
+        let mut force_rx = crate::signals::force_watch();
         let wait = super::task::wait_for_task(&mut handle, timeout.as_deref());
         tokio::pin!(wait);
         let deadline = wait_deadline
@@ -849,22 +1077,39 @@ async fn supervise(
                         }));
                     }
                 }
-                // Teardown: answer the caller now, while there is still a
-                // channel to answer on.
-                _ = shutdown_rx.changed(), if waiter.is_some() => {
-                    if *shutdown_rx.borrow()
-                        && let Some(reply) = waiter.take()
-                    {
-                        let _ = reply.send(Err(crate::command::CommandError::Failed {
-                            name: name.clone(),
-                            message: "run cancelled by shutdown".to_string(),
-                        }));
+                // Teardown. Answer the caller now, while there is still a
+                // channel to answer on, then end this run — but only once the
+                // processes that depend on this task are gone, which is what
+                // makes teardown reverse-dependency ordered without anything
+                // sequencing it.
+                _ = shutdown_rx.changed(), if !tearing_down => {
+                    if *shutdown_rx.borrow() {
+                        tearing_down = true;
+                        if let Some(reply) = waiter.take() {
+                            let _ = reply.send(Err(crate::command::CommandError::Failed {
+                                name: name.clone(),
+                                message: "run cancelled by shutdown".to_string(),
+                            }));
+                        }
+                        super::await_dependents_gone(
+                            &name,
+                            &ctx.emitter,
+                            &mut world,
+                            &dependents,
+                            &mut force_rx,
+                        )
+                        .await;
+                        if !cancelled {
+                            cancelled = true;
+                            kill_run(&ctx.emitter, &name, pgid);
+                        }
                     }
                 }
                 next = rx.recv(), if !mailbox_closed => match next {
                     Some(command) => {
                         match resolve_command(
-                            command, &name, startup.as_ref(), &last_params, false,
+                            command, &name, startup.as_ref(), &last_params, false, owner.phase,
+                            true,
                         ) {
                             // A run queued behind this one starts strictly
                             // after it — owning the exit is what makes that
@@ -910,6 +1155,13 @@ async fn supervise(
             // where it happened. Nothing is recorded either — the scheduler
             // used to reach the same result by dropping the exit report,
             // having compared its pgid against a copy it kept.
+            //
+            // Custody is still published, though. Whether the *exit* means
+            // anything and whether this supervisor still *holds* a process are
+            // different questions, and teardown waits on the second one — a
+            // cancelled run that never said it let go would hold the whole
+            // stack open.
+            owner.set_pid(None);
             if let Some(reply) = waiter.take() {
                 let _ = reply.send(Err(crate::command::CommandError::Failed {
                     name: name.clone(),
@@ -921,7 +1173,20 @@ async fn supervise(
             }
             continue;
         }
-        outcome.finish(result, start.elapsed(), waiter.take()).await;
+        outcome
+            .finish(
+                result,
+                start.elapsed(),
+                waiter.take(),
+                |success, last_run| {
+                    if success {
+                        owner.complete(last_run);
+                    } else {
+                        owner.fail(last_run);
+                    }
+                },
+            )
+            .await;
     }
 }
 
@@ -933,13 +1198,162 @@ async fn wait_until(deadline: &Option<tokio::time::Instant>) {
     }
 }
 
-/// Wait on a gate slot, parking forever when there is none — so an absent
-/// gate never completes and never consumes its `select!` branch.
-async fn wait_gate(gate: &mut Option<crate::gate::GateReader>) -> Option<()> {
-    match gate.as_mut() {
-        Some(gate) => gate.changed().await,
-        None => std::future::pending().await,
+/// This task's phase, and the write end that tells the rest of the stack
+/// about it.
+///
+/// The task-side twin of `service_supervisor::PhaseOwner`, with one extra job:
+/// whether a task *satisfies* a dependent is not readable from its phase. A
+/// `Completed` task with an outstanding re-run does not satisfy one, and that
+/// depends on its run history, its `auto_run` policy, and whether it declares
+/// params a file change cannot supply. All three live here, so the conclusion
+/// is computed here and published rather than left for every dependent to
+/// re-derive.
+struct TaskPhaseOwner {
+    name: String,
+    deps: Vec<crate::config::Dependency>,
+    /// Read for `auto_run` and `params` when deciding satisfaction.
+    config: crate::config::Task,
+    world: crate::facts::FactsReader,
+    facts: crate::facts::FactsPublisher,
+    phase: crate::process::TaskState,
+    /// Whether this task has ever completed successfully.
+    has_success: bool,
+    /// Whether it needs another run to bring its watched inputs up to date.
+    needs_run_now: bool,
+    /// Whether its startup dependency evaluation has happened at all. Until it
+    /// has, a `Pending` task satisfies nobody — otherwise a dependent would
+    /// start against a task that has not yet decided whether it must run.
+    evaluated: bool,
+    pid: Option<i32>,
+    last_run: Option<TaskRunInfo>,
+}
+
+impl TaskPhaseOwner {
+    /// Whether a blocking dependent may treat this task as done.
+    fn satisfied(&self) -> bool {
+        use crate::config::TaskAutoRun;
+        use crate::process::TaskState;
+
+        if self.phase == TaskState::DependencyFailed {
+            return false;
+        }
+        if !self.evaluated && self.phase == TaskState::Pending {
+            return false;
+        }
+        if !self.has_success {
+            return false;
+        }
+        // An outstanding run of an unconditional, param-less task means the
+        // dependent would start against stale output.
+        if self.needs_run_now
+            && self.config.params.is_empty()
+            && matches!(self.config.auto_run, TaskAutoRun::Always)
+        {
+            return false;
+        }
+        true
     }
+
+    fn publish(&mut self) {
+        let stranded = if self.phase == crate::process::TaskState::DependencyFailed {
+            crate::gate::failed_roots(&self.deps, &self.world.snapshot())
+        } else {
+            Vec::new()
+        };
+        self.facts.publish(crate::facts::ProcessFacts::for_task(
+            &self.name,
+            self.phase,
+            self.satisfied(),
+            self.pid,
+            self.last_run.clone(),
+            stranded,
+        ));
+    }
+
+    fn set(&mut self, phase: crate::process::TaskState) {
+        self.phase = phase;
+        self.publish();
+    }
+
+    /// Record that a run is outstanding (or no longer is). Also marks the
+    /// startup evaluation as having happened — reaching this point *is* that
+    /// evaluation.
+    fn set_needs_run_now(&mut self, needs_run_now: bool) {
+        self.evaluated = true;
+        self.needs_run_now = needs_run_now;
+        self.publish();
+    }
+
+    fn set_pid(&mut self, pid: Option<i32>) {
+        self.pid = pid;
+        self.publish();
+    }
+
+    /// A run succeeded: history recorded, nothing outstanding, phase settled.
+    /// One publication — a reader that saw `Completed` against a stale
+    /// `needs_run_now` would conclude this task still blocks its dependents.
+    fn complete(&mut self, last_run: Option<TaskRunInfo>) {
+        self.has_success = true;
+        self.evaluated = true;
+        self.needs_run_now = false;
+        self.last_run = last_run;
+        self.pid = None;
+        self.phase = crate::process::TaskState::Completed;
+        self.publish();
+    }
+
+    /// A run failed: still outstanding, so dependents stay blocked.
+    fn fail(&mut self, last_run: Option<TaskRunInfo>) {
+        self.evaluated = true;
+        self.needs_run_now = true;
+        self.last_run = last_run;
+        self.pid = None;
+        self.phase = crate::process::TaskState::Failed;
+        self.publish();
+    }
+
+    /// Reconcile against the dependencies' current facts. See
+    /// `service_supervisor::PhaseOwner::reconcile_dependencies`.
+    fn reconcile_dependencies(&mut self) -> Option<String> {
+        use crate::process::TaskState;
+        if !matches!(self.phase, TaskState::Pending | TaskState::DependencyFailed) {
+            return None;
+        }
+        let roots = crate::gate::failed_roots(&self.deps, &self.world.snapshot());
+        if !roots.is_empty() {
+            let was_stranded = self.phase == TaskState::DependencyFailed;
+            let previous = self.facts.current_roots().to_vec();
+            self.set(TaskState::DependencyFailed);
+            if was_stranded && previous == roots {
+                return None;
+            }
+            return Some(match roots.as_slice() {
+                [one] => format!("skipped (dependency '{one}' failed)"),
+                many => format!("skipped (dependencies '{}' failed)", many.join("', '")),
+            });
+        }
+        if self.phase == TaskState::DependencyFailed {
+            self.set(TaskState::Pending);
+            return Some(String::new());
+        }
+        None
+    }
+}
+
+/// How far this task's dependencies currently let it go.
+///
+/// Read at the moment it is needed rather than delivered, which is what makes
+/// the old revision stamp unnecessary: demand and permission are both held by
+/// this loop, so neither can be staler than the other.
+fn current_level(
+    released: bool,
+    world: &crate::facts::FactsReader,
+    depends_on: &[crate::config::Dependency],
+) -> crate::gate::Gate {
+    if !released {
+        return crate::gate::Gate::Blocked;
+    }
+    crate::gate::level(depends_on, &world.snapshot())
 }
 
 /// Join the finished reader, bounded — a wedged sink must not hold the
@@ -1119,11 +1533,18 @@ impl TaskRunOutcome {
     /// the next startup can skip it when nothing changed; a failed one records
     /// only the run info, leaving the previous input hashes stale on purpose
     /// so the task is not skipped next time.
+    ///
+    /// Returns the run info so the caller can publish this task's phase
+    /// *before* the report goes out. That ordering is load-bearing: the
+    /// scheduler drains facts before handling any report, which only makes
+    /// "the reply implies the phase is visible" true if the facts were sent
+    /// first.
     pub(crate) async fn finish(
         self,
         result: Result<std::process::ExitStatus, super::task::TaskError>,
         elapsed: Duration,
         reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+        publish: impl FnOnce(bool, Option<TaskRunInfo>),
     ) {
         let (success, exit_code, message) = match result {
             Ok(status) if status.success() => (true, status.code(), None),
@@ -1158,6 +1579,8 @@ impl TaskRunOutcome {
             let _ = task_state.record_run(&self.name, &last_run).await;
         }
 
+        // Phase first, then the report that carries the reply.
+        publish(success, Some(last_run.clone()));
         let _ = self
             .report_tx
             .send(super::ProcessReport::TaskExited(TaskExit {
@@ -1192,18 +1615,46 @@ mod tests {
         config.tasks.get("seed").unwrap().clone()
     }
 
+    /// A run request as a client sends one: unresolved params, and a reply
+    /// waiting to hear whether it was admitted.
+    fn run(
+        params: Vec<(&'static str, &'static str)>,
+    ) -> impl Fn(Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>) -> TaskCommand
+    {
+        move |reply| {
+            TaskCommand::Run(RunRequest {
+                params: params
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                mode: super::super::task_worker::TaskRunMode::Triggered,
+                intent: super::super::TaskRunIntent::Background,
+                reply: reply.map(RunReply::OnStart),
+                start_message: None,
+            })
+        }
+    }
+
     /// Every command, resolved against what the supervisor holds. This is the
-    /// whole of what moved off the scheduler: a restart's meaning depends on
-    /// the parameters of the last run, which live here now.
+    /// whole of what moved off the scheduler: whether a run is admitted at all
+    /// depends on the phase this supervisor published and the run it has in
+    /// hand, and a restart's meaning depends on the parameters of the last run.
+    /// All three live here now.
     #[tokio::test]
     async fn commands_resolve_against_what_the_supervisor_holds() {
         struct Case {
             name: &'static str,
-            command: fn(
-                Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
-            ) -> TaskCommand,
+            command: Box<
+                dyn Fn(
+                    Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+                ) -> TaskCommand,
+            >,
             task: crate::config::Task,
             last_params: Vec<(&'static str, &'static str)>,
+            /// The phase this supervisor has published for itself.
+            phase: super::super::TaskState,
+            /// Whether it has a run in hand right now.
+            holding: bool,
             want: &'static str,
             /// Parameters the resolved run carries, when it makes one.
             want_params: Vec<(&'static str, &'static str)>,
@@ -1212,46 +1663,93 @@ mod tests {
 
         let cases = vec![
             Case {
-                name: "a run is a run",
-                command: |_| {
-                    TaskCommand::Run(RunRequest {
-                        task_cfg: Box::new(test_task()),
-                        params: std::collections::HashMap::new(),
-                        mode: super::super::task_worker::TaskRunMode::Triggered,
-                        intent: super::super::TaskRunIntent::Background,
-                        wait: None,
-                        start_message: None,
-                    })
-                },
+                name: "an idle task admits a run",
+                command: Box::new(run(vec![])),
                 task: test_task(),
                 last_params: vec![],
+                phase: super::super::TaskState::Pending,
+                holding: false,
                 want: "run",
                 want_params: vec![],
+                // Admission is not the answer: `don run` is told it was
+                // accepted only once the run is picked up.
                 want_reply: None,
             },
             Case {
-                name: "a kill cancels and does not run again",
-                command: |_| TaskCommand::Kill { done: None },
+                // The check that used to be `is_busy` on the scheduler.
+                name: "a task already holding a run refuses a second",
+                command: Box::new(run(vec![])),
                 task: test_task(),
                 last_params: vec![],
+                phase: super::super::TaskState::Pending,
+                holding: true,
+                want: "nothing",
+                want_params: vec![],
+                want_reply: Some(false),
+            },
+            Case {
+                // …and the check that used to read the scheduler's state map.
+                name: "a running task refuses a run",
+                command: Box::new(run(vec![])),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Running,
+                holding: false,
+                want: "nothing",
+                want_params: vec![],
+                want_reply: Some(false),
+            },
+            Case {
+                name: "params are resolved against the task's own declaration",
+                command: Box::new(run(vec![("env", "staging")])),
+                task: param_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Pending,
+                holding: false,
+                want: "run",
+                want_params: vec![("env", "staging")],
+                want_reply: None,
+            },
+            Case {
+                name: "a missing required param is refused, not run",
+                command: Box::new(run(vec![])),
+                task: param_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Pending,
+                holding: false,
+                want: "nothing",
+                want_params: vec![],
+                want_reply: Some(false),
+            },
+            Case {
+                name: "a kill cancels and does not run again",
+                command: Box::new(|_| TaskCommand::Kill { done: None }),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Running,
+                holding: true,
                 want: "cancel-only",
                 want_params: vec![],
                 want_reply: None,
             },
             Case {
                 name: "a param-less restart reuses nothing and is accepted",
-                command: |reply| TaskCommand::Restart { reply },
+                command: Box::new(|reply| TaskCommand::Restart { reply }),
                 task: test_task(),
                 last_params: vec![],
+                phase: super::super::TaskState::Completed,
+                holding: false,
                 want: "cancel-then-run",
                 want_params: vec![],
                 want_reply: Some(true),
             },
             Case {
                 name: "a param'd task with a previous run reuses its values",
-                command: |reply| TaskCommand::Restart { reply },
+                command: Box::new(|reply| TaskCommand::Restart { reply }),
                 task: param_task(),
                 last_params: vec![("env", "staging")],
+                phase: super::super::TaskState::Completed,
+                holding: false,
                 want: "cancel-then-run",
                 want_params: vec![("env", "staging")],
                 want_reply: Some(true),
@@ -1260,9 +1758,11 @@ mod tests {
                 // The check that used to read the scheduler's copy of the
                 // parameters. Nothing to reuse means nothing to restart.
                 name: "a param'd task with no previous run is refused",
-                command: |reply| TaskCommand::Restart { reply },
+                command: Box::new(|reply| TaskCommand::Restart { reply }),
                 task: param_task(),
                 last_params: vec![],
+                phase: super::super::TaskState::Completed,
+                holding: false,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
@@ -1275,6 +1775,8 @@ mod tests {
             let startup = StartupConfig {
                 task_cfg: Box::new(case.task),
                 has_dependents: false,
+                has_success: false,
+                last_run: None,
             };
             let last_params: std::collections::HashMap<String, String> = case
                 .last_params
@@ -1282,7 +1784,15 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect();
 
-            let ask = resolve_command(command, "seed", Some(&startup), &last_params, false);
+            let ask = resolve_command(
+                command,
+                "seed",
+                Some(&startup),
+                &last_params,
+                false,
+                case.phase,
+                case.holding,
+            );
             let (got, params) = match &ask {
                 Ask::Run(request) => ("run", Some(request.params.clone())),
                 Ask::Cancel { then: None, .. } => ("cancel-only", None),
@@ -1294,6 +1804,10 @@ mod tests {
                 Ask::Requery => ("requery", None),
                 Ask::Nothing => ("nothing", None),
             };
+            // An admitted run still holds the reply — it is answered when the
+            // run is picked up, not here. Drop it so "nobody answered" is a
+            // closed channel rather than a wait that never ends.
+            drop(ask);
             assert_eq!(got, case.want, "{}", case.name);
             if let Some(params) = params {
                 let want: std::collections::HashMap<String, String> = case
@@ -1301,7 +1815,7 @@ mod tests {
                     .iter()
                     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                     .collect();
-                assert_eq!(params, want, "{}: reused params", case.name);
+                assert_eq!(params, want, "{}: run params", case.name);
             }
             match case.want_reply {
                 Some(ok) => assert_eq!(reply_rx.await.unwrap().is_ok(), ok, "{}: reply", case.name),
@@ -1393,6 +1907,77 @@ mod tests {
         }
     }
 
+    fn owner_for(task_toml: &str, has_success: bool) -> TaskPhaseOwner {
+        let config: crate::config::Config = task_toml.parse().unwrap();
+        let (name, task) = config.tasks.iter().next().unwrap();
+        let (aggregator, mut publishers, reader) = crate::facts::channel(std::iter::once((
+            name.clone(),
+            crate::facts::ProcessFacts::for_task(
+                name,
+                crate::process::TaskState::Pending,
+                false,
+                None,
+                None,
+                Vec::new(),
+            ),
+        )));
+        std::mem::forget(aggregator);
+        TaskPhaseOwner {
+            name: name.clone(),
+            deps: task.depends_on.clone(),
+            config: task.clone(),
+            world: reader,
+            facts: publishers.remove(name).unwrap(),
+            phase: crate::process::TaskState::Completed,
+            has_success,
+            needs_run_now: false,
+            evaluated: true,
+            pid: None,
+            last_run: None,
+        }
+    }
+
+    /// Satisfaction is not readable from the phase: a `Completed` task with an
+    /// outstanding run must still block its dependents, or they start against
+    /// stale output. The task supervisor's `NoSpawnOutcome` classifier tests
+    /// pin the other half of this — what *makes* a run outstanding.
+    #[test]
+    fn an_outstanding_run_blocks_dependents_despite_a_successful_history() {
+        let mut owner = owner_for("[tasks.build]\ncmd = \"true\"\n", true);
+        assert!(owner.satisfied(), "a completed task satisfies dependents");
+
+        owner.set_needs_run_now(true);
+        assert!(
+            !owner.satisfied(),
+            "an outstanding run must block dependents"
+        );
+    }
+
+    /// …but only for a task that would re-run on its own. A param'd task, or
+    /// one that is not `auto_run = always`, is waiting for a human — holding
+    /// its dependents for that would deadlock startup.
+    #[test]
+    fn an_outstanding_run_on_a_manual_task_does_not_block_dependents() {
+        for toml in [
+            "[tasks.build]\ncmd = \"true\"\nauto_run = false\n",
+            "[tasks.build]\ncmd = \"true\"\n[[tasks.build.params]]\nname = \"target\"\n",
+        ] {
+            let mut owner = owner_for(toml, true);
+            owner.set_needs_run_now(true);
+            assert!(
+                owner.satisfied(),
+                "a task waiting for a human must not block its dependents: {toml}"
+            );
+        }
+    }
+
+    /// A task that has never succeeded satisfies nobody, whatever its phase.
+    #[test]
+    fn a_task_with_no_successful_history_satisfies_nobody() {
+        let owner = owner_for("[tasks.build]\ncmd = \"true\"\n", false);
+        assert!(!owner.satisfied());
+    }
+
     /// The registry is the addressing half and nothing more: a clone can
     /// reach a task, and an unknown name is `None` rather than something
     /// created on demand. If lookups ever started inserting, the map would
@@ -1417,16 +2002,24 @@ mod tests {
         };
         let names = ["build".to_string(), "migrate".to_string()];
         let (report_tx, _report_rx) = mpsc::unbounded_channel();
-        let mut gates = std::collections::HashMap::new();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         std::mem::forget(shutdown_tx);
+        let (facts_aggregator, facts_publishers, facts) = crate::facts::channel(std::iter::empty());
+        // Keep the write ends alive for the reader's lifetime.
+        std::mem::forget(facts_aggregator);
+        let mut facts_publishers = facts_publishers;
+        let (released_tx, released_rx) = tokio::sync::watch::channel(true);
+        std::mem::forget(released_tx);
         let mut supervisors = spawn_supervisors(
             names.iter(),
             &ctx,
             &|_| None,
             &|_| None,
+            &|_| Vec::new(),
             &report_tx,
-            &mut gates,
+            &facts,
+            &mut facts_publishers,
+            &released_rx,
             &shutdown_rx,
             &{
                 let (tx, rx) = mpsc::unbounded_channel();
@@ -1457,8 +2050,7 @@ mod tests {
         let handle = registry.get("build").unwrap().clone();
         assert!(
             !handle.request(TaskCommand::Run(RunRequest {
-                wait: None,
-                task_cfg: Box::new(test_task()),
+                reply: None,
                 params: std::collections::HashMap::new(),
                 mode: super::super::task_worker::TaskRunMode::Triggered,
                 intent: super::super::TaskRunIntent::Background,
@@ -1527,7 +2119,7 @@ mod tests {
             let (report_tx, mut report_rx) = mpsc::unbounded_channel();
 
             outcome("build", temp.path(), report_tx)
-                .finish(Ok(case.status), Duration::from_millis(5), None)
+                .finish(Ok(case.status), Duration::from_millis(5), None, |_, _| {})
                 .await;
 
             let Ok(super::super::ProcessReport::TaskExited(exit)) = report_rx.try_recv() else {
@@ -1555,7 +2147,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let (report_tx, _report_rx) = mpsc::unbounded_channel();
             outcome("build", temp.path(), report_tx)
-                .finish(Ok(status), Duration::from_millis(1), None)
+                .finish(Ok(status), Duration::from_millis(1), None, |_, _| {})
                 .await;
 
             let state = TaskStateStore::new(temp.path().join(".don").join("task-state"));

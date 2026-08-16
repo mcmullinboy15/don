@@ -4,7 +4,7 @@
 //! based on the current [`ViewMode`](super::app::ViewMode). This keeps the
 //! input pump oblivious to UI state, which avoids the Arc<Mutex<_>> dance.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::client::{CompletionError, ProcessStatus};
 
@@ -13,6 +13,10 @@ use crate::client::{CompletionError, ProcessStatus};
 pub(crate) enum AppEvent {
     /// A key press (release events are filtered out upstream).
     Key(KeyEvent),
+    /// A mouse click, drag, release or wheel tick. Bare motion is filtered out
+    /// upstream; its column and row are screen coordinates, which only the
+    /// renderer's layout can turn into "which pane, which row".
+    Mouse(MouseEvent),
     /// Terminal was resized. Ratatui picks up the new size on the next draw;
     /// this event just triggers an immediate repaint.
     Resize,

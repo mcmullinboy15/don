@@ -1,44 +1,50 @@
 //! Interactive terminal UI for `don start`.
 //!
-//! The TUI owns stdout when we're attached to a real terminal. Log lines
-//! stream into the terminal's native scrollback via [`Terminal::insert_before`],
-//! and a persistent inline viewport at the bottom renders the status bar.
-//! Pipe mode (non-TTY) bypasses this module entirely — [`OutputManager`]
-//! still writes prefixed bytes directly to stdout in that case.
+//! The TUI owns the whole screen: raw mode, the alternate screen, one ratatui
+//! [`Terminal`] with a full-screen viewport. Pipe mode (non-TTY) bypasses this
+//! module entirely — [`OutputManager`] still writes prefixed bytes directly to
+//! stdout in that case.
 //!
 //! Heavy formatting (color prefix, ANSI sanitization, verbose timestamps) is
 //! already done upstream; we parse those pre-rendered ANSI bytes back into
-//! a styled [`Text`] via `ansi-to-tui` so ratatui can render them into its
-//! buffer model.
+//! styled [`Line`]s via `ansi-to-tui` so ratatui can render them.
 //!
-//! ## Viewport model
+//! ## Why one screen
 //!
-//! The inline [`Terminal`] is created once at startup with `Viewport::Inline(1)`
-//! and never rebuilt. All non-Normal modes (Filter, task/service tables) render
-//! into a separate alt-screen [`Terminal`] ([`Modal`]) that overlays the main
-//! screen. Leaving the modal restores the main screen's previous contents;
-//! new log lines received during the modal are inserted afterward so the
-//! user sees what happened without replaying the whole retained log buffer.
+//! This used to be a hybrid: logs went into the terminal's *native* scrollback
+//! through `Terminal::insert_before`, a one-row inline viewport held the status
+//! bar, and every full-screen view rendered into a **second** alt-screen
+//! `Terminal` layered on top. Two screens meant two histories, and the seam
+//! between them needed constant repair — replay checkpoints to re-emit lines
+//! that arrived while a modal was up, a clear-and-replay pass on every filter
+//! change, and a backend wrapper whose entire job was dodging the cursor-position
+//! query that an inline viewport forces.
 //!
-//! Avoiding inline rebuilds sidesteps a nasty crossterm race: `get_cursor_position`
-//! reads stdin for the DSR response, and racing with the input task's
-//! `EventStream` produces either a 2-second block or a misplaced viewport.
+//! None of that exists here. There is one buffer, and [`LogStore`] is the only
+//! history. A filter change is a different *view* of the same store rather than
+//! a screen wipe and a replay, which is what makes it impossible for the log to
+//! drift out of sync with what the user asked to see.
 //!
 //! ## Concurrency
 //!
-//! One `tokio::select!` loop owns [`App`], the ratatui [`Terminal`], [`LogStore`],
-//! and the `Option<Modal>`. Three side channels feed it:
-//! - Log lines from the upstream [`OutputManager`].
+//! One `tokio::select!` loop owns [`App`], the [`Terminal`] and the
+//! [`LogStore`]. Its arms never draw — they mutate state and mark it dirty, and
+//! a single rate-capped arm draws the whole screen. So a burst of ten thousand
+//! log lines costs one repaint rather than ten thousand writes, and no arm has
+//! to know what any other arm would have wanted redrawn.
+//!
+//! Four side channels feed it:
+//! - Merged log events from [`OutputManager`], carrying don's own [`LogId`]s.
 //! - [`RunnerEvent`]s from the runner broadcast (consumed directly, no side task).
-//! - Raw key events from the input task (interpretation is mode-dependent).
+//! - Input events from the input task (interpretation is mode-dependent).
+//! - A timer, for the spinner and relative timestamps.
 //!
 //! [`OutputManager`]: crate::output::OutputManager
 //! [`Terminal`]: ratatui::Terminal
-//! [`Terminal::insert_before`]: ratatui::Terminal::insert_before
-//! [`Text`]: ratatui::text::Text
+//! [`LogId`]: crate::output::LogId
+//! [`Line`]: ratatui::text::Line
 
 mod app;
-mod backend;
 mod events;
 mod failure_summary;
 mod filter;
@@ -46,23 +52,23 @@ mod form;
 mod fuzzy;
 mod input;
 mod log_store;
+mod logs;
+mod panes;
 mod render;
+mod selection;
 mod status_table;
 
 use ansi_to_tui::IntoText;
-use crossterm::cursor::MoveTo;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::execute;
-use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::style::Print;
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::text::Text;
-use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
 use tokio::sync::mpsc;
-
-use backend::FixedBottomBackend;
 
 use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot};
 use crate::config::ParamKind;
@@ -80,23 +86,79 @@ pub enum TuiError {
     Io(#[from] std::io::Error),
 }
 
-/// RAII guard that leaves raw mode on drop.
-struct RawModeGuard;
+/// Owns the terminal for as long as the TUI does.
+///
+/// Raw mode and the alternate screen go up together and come down together in
+/// reverse order, from `Drop` — so a `?` anywhere in the loop still gives the
+/// user their terminal back, and so does a panic unwinding through it.
+struct TerminalGuard;
 
-impl RawModeGuard {
+impl TerminalGuard {
     fn enter() -> Result<Self, TuiError> {
         crossterm::terminal::enable_raw_mode()?;
+        execute!(std::io::stdout(), EnterAlternateScreen, Print(MOUSE_ON))?;
         Ok(Self)
+    }
+
+    /// Hand the terminal back for something else to use — `don attach`
+    /// bridging the user into a process's PTY.
+    ///
+    /// Returns a token that must be used to take it again, so the two halves
+    /// cannot drift apart: there is no way to release without a plan to
+    /// re-acquire, and no way to re-acquire twice.
+    fn release(&self) -> Result<ReleasedTerminal, TuiError> {
+        execute!(std::io::stdout(), Print(MOUSE_OFF), LeaveAlternateScreen)?;
+        crossterm::terminal::disable_raw_mode()?;
+        Ok(ReleasedTerminal)
     }
 }
 
-impl Drop for RawModeGuard {
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), Print(MOUSE_OFF), LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
-type TuiTerminal = Terminal<FixedBottomBackend<std::io::Stdout>>;
+/// Proof that the terminal is currently somebody else's.
+#[must_use = "the terminal stays released until this is retaken"]
+struct ReleasedTerminal;
+
+impl ReleasedTerminal {
+    fn retake(self) -> Result<(), TuiError> {
+        crossterm::terminal::enable_raw_mode()?;
+        execute!(std::io::stdout(), EnterAlternateScreen, Print(MOUSE_ON))?;
+        Ok(())
+    }
+}
+
+/// The mouse reporting modes don actually uses.
+///
+/// Deliberately *not* crossterm's `EnableMouseCapture`, which also turns on
+/// `?1003h` — "report every motion event". don has no hover behaviour, so every
+/// one of those reports is parsed and thrown away; what they cost is a flood of
+/// input for as long as the pointer merely crosses the window. That is enough
+/// to fill the input channel and leave a keystroke queued behind hundreds of
+/// events nobody wanted, which reads as the UI ignoring you.
+///
+/// `?1000h` reports press and release. `?1002h` adds motion *while a button is
+/// held*, which is what drag-select and the divider drag need and all they
+/// need. `?1006h` asks for SGR coordinates so columns past 223 are reportable —
+/// crossterm also sets the older `?1015h` (RXVT) alongside it, which some
+/// terminals answer in *both* encodings.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// The same modes, reset in reverse.
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+type TuiTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+/// Shortest gap between full repaints.
+///
+/// The loop marks state dirty and this decides when that becomes pixels. Under
+/// a log flood the cost of the TUI is therefore bounded by the frame rate
+/// rather than by the line rate — which is the property the old
+/// `insert_before` model could not have, since every line was a write.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Whether this TUI shares a process with the runner or attached over the
 /// socket. The two differ in exactly two keys:
@@ -124,97 +186,32 @@ struct TuiControls {
     mode: TuiMode,
 }
 
-/// Alt-screen full-screen terminal used by Filter, Palette, and Overlay
-/// modes. RAII: entering/leaving alt screen is tied to construction/drop,
-/// so an error mid-draw still restores the main screen.
+/// Flatten one merged-stream event into the batch the render loop consumes.
 ///
-/// A Fullscreen viewport avoids `compute_inline_size`'s cursor-position
-/// probe, which would race with the input task's stdin reader. Because
-/// of that, modals don't need the [`FixedBottomBackend`] wrapper the
-/// inline terminal uses.
-struct Modal {
-    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
-    replay_checkpoint: u64,
-}
-
-impl Modal {
-    fn enter(replay_checkpoint: u64) -> Result<Self, TuiError> {
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(std::io::stdout());
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fullscreen,
-            },
-        )?;
-        Ok(Self {
-            terminal,
-            replay_checkpoint,
-        })
-    }
-
-    fn draw(&mut self, app: &mut App) -> Result<(), TuiError> {
-        let size = self.terminal.size()?;
-        let area: Rect = size.into();
-        app.sync_log_popup_scroll(render::log_popup_visible_rows(area));
-        if app.view_mode == ViewMode::Failures {
-            let max_scroll = render::failure_summary_max_scroll(area, app);
-            app.sync_failure_summary_scroll(max_scroll);
+/// A drop is rendered as a lifecycle line so it lands in the log where the
+/// missing lines would have been, rather than in a corner of the status bar.
+/// It carries the id the stream resumed at, so its position in the store is
+/// the truth about where the hole is.
+fn push_merged_event(
+    batch: &mut Vec<(crate::output::LogId, FormattedLogLine)>,
+    event: crate::output::MergedEvent,
+) {
+    match event {
+        crate::output::MergedEvent::Line(entry) => {
+            batch.push((entry.id, (*entry.line).clone()));
         }
-        self.terminal.draw(|f| render::draw_modal(f, app))?;
-        Ok(())
-    }
-}
-
-impl Drop for Modal {
-    fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-    }
-}
-
-/// Bundle of terminal-side state owned only while the TUI controls the
-/// terminal. Torn down when a foreground task acquires the terminal and
-/// rebuilt when it releases. State that has to survive the handoff
-/// (`App`, [`LogStore`], the input channel) lives outside this struct.
-struct ActiveTerm {
-    _raw_guard: RawModeGuard,
-    terminal: TuiTerminal,
-    modal: Option<Modal>,
-    input_handle: tokio::task::JoinHandle<()>,
-}
-
-impl ActiveTerm {
-    fn enter(input_tx: &mpsc::Sender<AppEvent>) -> Result<Self, TuiError> {
-        let raw_guard = RawModeGuard::enter()?;
-        let terminal = build_inline_terminal()?;
-        let input_handle = tokio::spawn(input::run(input_tx.clone()));
-        Ok(Self {
-            _raw_guard: raw_guard,
-            terminal,
-            modal: None,
-            input_handle,
-        })
-    }
-
-    /// Tear down terminal-side state cleanly so a foreground task can take
-    /// the tty. `_raw_guard`'s Drop disables raw mode after `terminal.clear`
-    /// flushes the inline viewport wipe.
-    async fn tear_down(self) -> Result<(), TuiError> {
-        self.input_handle.abort();
-        // Wait until EventStream is dropped so stdin has a single owner
-        // before the foreground task or rebuilt TUI starts reading it.
-        let _ = self.input_handle.await;
-        // `modal` drops first (LeaveAlternateScreen) before we touch the main
-        // screen below.
-        drop(self.modal);
-        let mut terminal = self.terminal;
-        // Clear the inline viewport rows so the foreground task doesn't
-        // start writing on top of a stale status bar.
-        let _ = terminal.clear();
-        // Drop the terminal explicitly so any pending writes flush before
-        // we disable raw mode (via `_raw_guard.drop`).
-        drop(terminal);
-        Ok(())
+        crate::output::MergedEvent::Dropped { count, resumed_at } => batch.push((
+            resumed_at,
+            FormattedLogLine {
+                name: crate::output::LIFECYCLE_EVENT_NAME.to_string(),
+                is_lifecycle: true,
+                is_verbose: false,
+                bytes: format!(
+                    "{count} log line(s) dropped — history did not reach back far enough"
+                )
+                .into_bytes(),
+            },
+        )),
     }
 }
 
@@ -225,7 +222,7 @@ impl ActiveTerm {
 /// two-Ctrl+C force-kill escalation).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
-    mut log_rx: mpsc::UnboundedReceiver<FormattedLogLine>,
+    mut log_rx: mpsc::UnboundedReceiver<crate::output::MergedEvent>,
     client: Client,
     mode: TuiMode,
     verbosity: VerbosityControl,
@@ -289,328 +286,203 @@ pub async fn run_tui(
     // so the select loop doesn't busy-spin on a perpetually-ready None.
     let mut input_open = true;
 
-    // Terminal-side state — Some while the TUI owns the terminal.
-    let mut active: Option<ActiveTerm> = Some(ActiveTerm::enter(&input_tx)?);
-    // Snapshot of `LogStore::next_id` taken when we hand the terminal to a
-    // foreground task. On resume we replay only entries with id ≥ this so
-    // pre-pause lines (already in the user's scrollback) aren't repeated.
-    // Lines that arrived during the pause get rendered above the new
-    // viewport via `insert_before`, preserving the foreground task's
-    // output that's already in scrollback above them.
-    if let Some(act) = active.as_mut() {
-        // Seed the viewport so the terminal reserves the bottom region
-        // before the first `insert_before` call. Raw `draw` (not the
-        // park-then-draw helper) avoids moving the cursor away from where
-        // FixedBottomBackend just placed it.
-        act.terminal.draw(|f| render::draw_bar(f, &app))?;
-        // Seed the height the resize handler compares against, so the first
-        // resize knows whether the height actually changed.
-        app.last_screen_height = act.terminal.size()?.height;
-    }
+    // The terminal, owned for as long as the TUI runs. Torn down and rebuilt
+    // only around an attach bridge, which needs the tty to itself.
+    let _guard = TerminalGuard::enter()?;
+    let mut terminal = build_terminal()?;
+    let mut input_handle = tokio::spawn(input::run(input_tx.clone()));
 
-    // Drives the spinner and any other time-based UI. Skip-on-miss so the
-    // spinner doesn't catch up in a burst after a slow render.
+    // Drives the spinner and relative timestamps ("5s ago"), which move
+    // without any event arriving.
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Relative timestamps in modals ("5s ago") need wall-clock invalidation
-    // even when no runner/key event arrives.
-    let mut wall_clock_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-    wall_clock_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Cached terminal width — refreshed at the start of each log batch.
-    // Avoids a syscall per rendered log line, which becomes a real
-    // bottleneck under noisy services (one syscall × thousands of lines/sec
-    // stalls the TUI loop long enough that runner_events / shutdown
-    // signaling can't keep up). Initialized lazily; the first log batch
-    // refreshes it before the first `insert_line` call.
-    #[allow(unused_assignments)]
-    let mut cached_width: u16 = 80;
+    // Nothing below draws. Arms mutate `app` and set this; one arm turns it
+    // into pixels, no more often than `FRAME_INTERVAL`. That is what bounds
+    // the TUI's cost by frame rate rather than by log rate, and what stops
+    // each arm having to know what any other arm would have wanted redrawn.
+    let mut dirty = true;
+    // One timer, reset after each frame — not a fresh `sleep_until` per loop
+    // iteration. `select!` builds every branch's future each time round, so a
+    // new sleep meant registering and cancelling a timer entry per iteration,
+    // and under a log flood the loop goes round tens of thousands of times a
+    // second.
+    let frame = tokio::time::sleep_until(tokio::time::Instant::now());
+    tokio::pin!(frame);
 
-    // Cap on log lines drained per `tokio::select!` round. Picked so that:
-    //  - large bursts (kafka spam, build output) still drain in a few rounds
-    //  - the runner_events / input arms still get a turn often enough that
-    //    state transitions (Stopping/Stopped) and Ctrl+C remain snappy.
-    const LOG_BATCH_LIMIT: usize = 64;
+    // Cap on log events drained per select round. Large bursts still clear in
+    // a few rounds, while runner events and input keep getting a turn — so
+    // Ctrl+C stays responsive under a flood.
+    const LOG_BATCH_LIMIT: usize = 512;
 
     loop {
-        let active_present = active.is_some();
         tokio::select! {
-            maybe_line = log_rx.recv() => {
-                match maybe_line {
+            maybe_event = log_rx.recv() => {
+                match maybe_event {
                     Some(first) => {
-                        if let Some(act) = active.as_mut() {
-                            cached_width = act.terminal.size()?.width.max(1);
-                        }
-
-                        // Drain up to LOG_BATCH_LIMIT lines without yielding
-                        // back to select. Each `insert_before` is a stdout
-                        // write; batching lets us amortize the bar redraw
-                        // (the *expensive* part — full back-buffer rebuild)
-                        // across many lines instead of one redraw per line.
-                        let mut batch: Vec<FormattedLogLine> = Vec::with_capacity(LOG_BATCH_LIMIT);
-                        batch.push(first);
+                        let mut batch: Vec<(crate::output::LogId, FormattedLogLine)> =
+                            Vec::with_capacity(LOG_BATCH_LIMIT);
+                        push_merged_event(&mut batch, first);
                         while batch.len() < LOG_BATCH_LIMIT {
                             match log_rx.try_recv() {
-                                Ok(line) => batch.push(line),
+                                Ok(event) => push_merged_event(&mut batch, event),
                                 Err(_) => break,
                             }
                         }
-
-                        let mut bar_dirty = false;
-                        let mut modal_dirty = false;
-                        for line in batch {
+                        if !batch.is_empty() && app.log_scroll == logs::Scroll::Follow {
+                            // Following means every row shifts up; the
+                            // selection's screen coordinates now point at
+                            // different text, so it is no longer a selection.
+                            app.log_selection.clear();
+                        }
+                        for (id, line) in batch {
                             if is_shutdown_start_line(&line) && !app.shutdown_started {
                                 app.begin_shutdown();
-                                if let Some(act) = active.as_mut() {
-                                    act.modal = None;
-                                }
-                                bar_dirty = true;
                             }
-                            // Only render to the terminal if we own it.
-                            // While paused, the line still lands in
-                            // `LogStore` so it can be replayed on resume.
-                            if let Some(act) = active.as_mut()
-                                && act.modal.is_none()
-                                && app.should_render_log(&line.name, line.is_lifecycle, line.is_verbose)
-                            {
-                                insert_line(&mut act.terminal, &line, cached_width)?;
-                                bar_dirty = true;
-                            }
-                            modal_dirty |= app.append_log_popup_line(&line);
-                            let _ = store.push(line);
+                            app.append_log_popup_line(&line);
+                            store.push(id, line);
                         }
-                        if let Some(act) = active.as_mut() {
-                            if modal_dirty {
-                                if let Some(m) = act.modal.as_mut() {
-                                    m.draw(&mut app)?;
-                                }
-                            } else if bar_dirty {
-                                draw_inline_bar(&mut act.terminal, &app)?;
-                            }
-                        }
+                        dirty = true;
                     }
                     None => break, // runner closed the log channel — shut down
                 }
             }
             runner_result = events_rx.recv() => {
-                // `Some(filter_changed)` when the view moved and needs a
-                // redraw; `None` when there is nothing to draw.
-                let redraw = match runner_result {
+                match runner_result {
                     Some(EventStreamItem::Event(RunnerEvent::ShutdownStarted)) => {
-                        if let Some(act) = active.as_mut() {
-                            enter_shutdown_mode(&mut app, &mut act.terminal, &mut act.modal)?;
-                        } else if !app.shutdown_started {
+                        if !app.shutdown_started {
                             app.begin_shutdown();
                         }
-                        None
                     }
                     Some(EventStreamItem::Event(event)) => {
-                        Some(apply_runner_event(event, &mut app))
+                        apply_runner_event(event, &mut app);
                     }
                     Some(EventStreamItem::Snapshot { processes, startup_complete }) => {
-                        // The stream's opening record — the authoritative
-                        // state at connect time. Later events are newer or
-                        // equal, so applying them after this is safe.
+                        // The stream's opening record — the authoritative state
+                        // at connect time. Later events are newer or equal, so
+                        // applying them after this is safe.
                         app.resync_from(&StateSnapshot { processes, startup_complete });
-                        Some(false)
                     }
                     Some(EventStreamItem::Lagged(_)) => {
-                        // Transitions were dropped, so the incremental view
-                        // is wrong about an unknown set of processes and would
-                        // stay wrong. Refetch the projection off-loop and
-                        // inject it as an input event — awaiting here would
-                        // wedge rendering behind a slow server.
+                        // Transitions were dropped, so the incremental view is
+                        // wrong about an unknown set of processes and would stay
+                        // wrong. Refetch off-loop and inject the result as an
+                        // input event; awaiting here would wedge rendering
+                        // behind a slow server.
                         spawn_state_resync(&client);
-                        Some(false)
                     }
-                    None => None,
-                };
-                if let Some(filter_changed) = redraw {
-                    let lazy: std::collections::HashSet<String> = app
-                        .services_state
-                        .iter()
-                        .filter(|(_, s)| matches!(s, ServiceState::Lazy))
-                        .map(|(n, _)| n.clone())
-                        .collect();
-                    app.filter.set_hidden_from_display(lazy);
-                    if let Some(act) = active.as_mut() {
-                        if let Some(m) = act.modal.as_mut() {
-                            m.draw(&mut app)?;
-                        } else if filter_changed {
-                            clear_and_replay(&mut act.terminal, &store, &app)?;
-                        } else {
-                            draw_inline_bar(&mut act.terminal, &app)?;
-                        }
-                    }
+                    None => {}
                 }
+                let lazy: std::collections::HashSet<String> = app
+                    .services_state
+                    .iter()
+                    .filter(|(_, s)| matches!(s, ServiceState::Lazy))
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                app.filter.set_hidden_from_display(lazy);
+                dirty = true;
             }
-            maybe_event = input_rx.recv(), if input_open && active_present => {
+            maybe_event = input_rx.recv(), if input_open => {
                 match maybe_event {
                     Some(event) => {
-                        if let Some(act) = active.as_mut() {
-                            handle_app_event(
-                                event,
-                                &mut app,
-                                &mut act.terminal,
-                                &mut store,
-                                &client,
-                                &controls,
-                                &mut act.modal,
-                            )?;
+                        handle_app_event(event, &mut app, &mut store, &client, &controls)?;
+                        // Input arrives in bursts — a drag reports once per cell
+                        // the pointer crosses — and handling one per `select!`
+                        // round means a round trip each, so a burst spreads
+                        // across frames and the UI lags behind the hand moving
+                        // it. Draining what is already queued keeps a burst
+                        // inside one frame.
+                        loop {
+                            if app.exit_requested || app.bridge_request.is_some() {
+                                break;
+                            }
+                            match input_rx.try_recv() {
+                                Ok(event) => handle_app_event(
+                                    event, &mut app, &mut store, &client, &controls,
+                                )?,
+                                Err(_) => break,
+                            }
                         }
+                        dirty = true;
                         if app.exit_requested {
                             break;
                         }
-                        if let Some(name) = app.bridge_request.take()
-                            && let Some(act) = active.take()
-                        {
-                            let checkpoint = store.next_id();
-                            act.tear_down().await?;
+                        if let Some(name) = app.bridge_request.take() {
+                            // The bridge needs the tty to itself: stop reading
+                            // stdin, give the screen back, run it, then take
+                            // both again. Nothing is replayed on return — the
+                            // store kept every line, so the next draw simply
+                            // paints the current truth.
+                            input_handle.abort();
+                            let _ = (&mut input_handle).await;
+                            let released = _guard.release()?;
                             let end = run_bridge(&client, &name).await;
-                            // Rebuild the inline TUI where the bridge left
-                            // the cursor and replay only what arrived while
-                            // it was down — the Release-path pattern.
-                            let mut act = ActiveTerm::enter(&input_tx)?;
-                            act.terminal.draw(|f| render::draw_bar(f, &app))?;
-                            cached_width = act.terminal.size()?.width.max(1);
-                            let mut replayed_any = false;
-                            for entry in store.iter_since(checkpoint) {
-                                if app.should_render_log(&entry.line.name, entry.line.is_lifecycle, entry.line.is_verbose)
-                                {
-                                    insert_line(&mut act.terminal, &entry.line, cached_width)?;
-                                    replayed_any = true;
-                                }
-                            }
-                            if replayed_any {
-                                draw_inline_bar(&mut act.terminal, &app)?;
-                            }
-                            active = Some(act);
+                            released.retake()?;
+                            terminal = build_terminal()?;
+                            terminal.clear()?;
+                            input_handle = tokio::spawn(input::run(input_tx.clone()));
                             if let Some(message) = end {
                                 controls.lifecycle_emitter.lifecycle_event(&message);
                             }
                         }
                     }
-                    None => {
-                        input_open = false;
-                    }
+                    None => input_open = false,
                 }
             }
-            _ = ticker.tick(), if active_present => {
+            _ = ticker.tick() => {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
-                if let Some(act) = active.as_mut()
-                    && act.modal.is_none()
-                {
-                    draw_inline_bar(&mut act.terminal, &app)?;
-                }
+                dirty = true;
             }
-            _ = wall_clock_ticker.tick(), if active_present => {
-                if app.view_mode.needs_wall_clock_redraw()
-                    && let Some(act) = active.as_mut()
-                    && let Some(m) = act.modal.as_mut()
-                {
-                    m.draw(&mut app)?;
-                }
+            () = &mut frame, if dirty => {
+                draw(&mut terminal, &mut app, &mut store)?;
+                dirty = false;
+                frame
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + FRAME_INTERVAL);
             }
         }
     }
 
-    if let Some(act) = active.take() {
-        act.tear_down().await?;
-    }
+    // One last frame so the final state — "shutdown complete" — is on screen
+    // before the guard puts the user's terminal back.
+    let _ = draw(&mut terminal, &mut app, &mut store);
+    input_handle.abort();
+    let _ = input_handle.await;
     Ok(())
 }
 
-/// Build the persistent inline terminal used for log flow + bar.
+/// Build the full-screen terminal.
 ///
-/// Reserves [`render::BAR_VIEWPORT_HEIGHT`] rows at the bottom of the screen:
-/// one blank buffer row, plus a bordered status box (top border + content
-/// row + bottom border).
-///
-/// Note: no cursor parking here. [`FixedBottomBackend`] does a real DSR
-/// on its first `get_cursor_position` call (inside `Terminal::with_options`)
-/// so the viewport anchors right below the shell's pre-start output. That
-/// keeps scrollback gap-free — the trade-off is that the bar starts at the
-/// cursor row and drifts to the bottom as the first few log lines flow in.
-fn build_inline_terminal() -> Result<TuiTerminal, TuiError> {
-    let inner = CrosstermBackend::new(std::io::stdout());
-    let backend = FixedBottomBackend::new(inner);
-    let term = Terminal::with_options(
+/// `Viewport::Fullscreen` never probes the cursor position, so there is no DSR
+/// response to race the input task's stdin reader for — the whole reason the
+/// old inline viewport needed a backend wrapper around
+/// `get_cursor_position`.
+fn build_terminal() -> Result<TuiTerminal, TuiError> {
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let terminal = Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(render::BAR_VIEWPORT_HEIGHT),
+            viewport: Viewport::Fullscreen,
         },
     )?;
-    Ok(term)
+    Ok(terminal)
 }
 
-/// Move the real cursor to `(0, screen_height - 1)`. Used before any
-/// operation that may trigger ratatui's `autoresize` (which calls
-/// `compute_inline_size` → `get_cursor_position` → [`FixedBottomBackend`])
-/// so the fake "bottom of screen" cursor the wrapper reports actually
-/// matches where `\n`s from `append_lines` will land and scroll.
-fn park_cursor_at_bottom() -> Result<(), TuiError> {
-    let (_cols, rows) = crossterm::terminal::size()?;
-    let bottom = rows.saturating_sub(1);
-    execute!(std::io::stdout(), MoveTo(0, bottom))?;
-    Ok(())
-}
-
-/// Draw the inline bar, first parking the real cursor at the screen's
-/// bottom row. If `terminal.draw`'s internal `autoresize` fires because
-/// the terminal was resized since the last draw, the wrapper's fake
-/// cursor (bottom of screen) and the real cursor will be at the same row
-/// so `append_lines` scrolls correctly.
-fn draw_inline_bar(terminal: &mut TuiTerminal, app: &App) -> Result<(), TuiError> {
-    park_cursor_at_bottom()?;
-    terminal.draw(|f| render::draw_bar(f, app))?;
-    Ok(())
-}
-
-/// Reposition and redraw the inline bar after a terminal resize.
+/// Paint the whole screen from `app` and `store`.
 ///
-/// Unlike [`clear_and_replay`], this does **not** re-emit the retained log
-/// history: a resize doesn't change which lines are visible, and the terminal
-/// emulator reflows its own scrollback. Replaying here is what produced the
-/// multi-second "scrollback takeover" on resize with a large history.
-///
-/// When `clear_for_ghost` is set, we first issue a `Clear(ClearType::All)`
-/// (`\x1b[2J`) — *not* `Purge` (`\x1b[3J`). `2J` wipes the visible screen,
-/// erasing any ghost of the bar that ratatui's autoresize left at its previous
-/// row (its internal `clear()` only repaints the *new* viewport region), while
-/// leaving the terminal's scrollback buffer intact so the user can still scroll
-/// back through the full history. The caller only sets this on a height change:
-/// a width-only resize keeps the bar on the same bottom row, so there is no
-/// ghost to erase and we preserve the on-screen logs. [`draw_inline_bar`] then
-/// re-anchors the viewport at the new bottom.
-fn resize_inline_bar(
-    terminal: &mut TuiTerminal,
-    app: &App,
-    clear_for_ghost: bool,
-) -> Result<(), TuiError> {
-    if clear_for_ghost {
-        execute!(std::io::stdout(), Clear(ClearType::All))?;
-    }
-    draw_inline_bar(terminal, app)?;
+/// The store is reflowed to the log pane's width first: row counts have to be
+/// current before the view can place its scroll anchor, and a resize is the
+/// only time that costs anything.
+fn draw(terminal: &mut TuiTerminal, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
+    let area: Rect = terminal.size()?.into();
+    store.reflow(render::log_pane_width(area, app.status_pane));
+    terminal.draw(|frame| render::draw(frame, app, store))?;
     Ok(())
 }
 
 fn is_shutdown_start_line(line: &FormattedLogLine) -> bool {
     line.name == crate::output::LIFECYCLE_EVENT_NAME
         && String::from_utf8_lossy(&line.bytes).contains("shutting down gracefully")
-}
-
-fn enter_shutdown_mode(
-    app: &mut App,
-    terminal: &mut TuiTerminal,
-    modal: &mut Option<Modal>,
-) -> Result<(), TuiError> {
-    if app.shutdown_started {
-        return Ok(());
-    }
-    app.begin_shutdown();
-    *modal = None;
-    draw_inline_bar(terminal, app)?;
-    Ok(())
 }
 
 /// Apply one [`RunnerEvent`] to the cached state on [`App`].
@@ -644,126 +516,23 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
     }
 }
 
-/// Wipe the entire visible area and replay every [`LogStore`] entry that
-/// passes the current filter. Used after a filter commit/clear and when
-/// returning from any modal that may have hidden new log lines.
-///
-/// Scrollback *buffer* (history above the visible area, managed by the
-/// terminal emulator) is preserved — only on-screen pixels get wiped. So
-/// the user can still scroll up to see their full log history including
-/// pre-filter content.
-fn clear_and_replay(
-    terminal: &mut TuiTerminal,
-    store: &LogStore,
-    app: &App,
-) -> Result<(), TuiError> {
-    // Move the real cursor to (0, 0) and tell the wrapper to report the
-    // same from its next `get_cursor_position` call. The subsequent
-    // `terminal.resize` anchors the inline viewport at the top of the
-    // screen; `insert_before` will then fill rows 0..N with replayed
-    // log lines while the bar drifts downward, rather than pinning the
-    // bar to the bottom with blank space above the replay content.
-    execute!(std::io::stdout(), MoveTo(0, 0))?;
-    terminal.backend_mut().force_next_cursor_top();
-    // Re-place the viewport using the override. `resize` unconditionally
-    // recomputes viewport placement (autoresize would skip when size is
-    // unchanged) and its internal `self.clear()` wipes the visible
-    // screen and resets ratatui's back buffer.
-    let size = terminal.size()?;
-    let area = Rect {
-        x: 0,
-        y: 0,
-        width: size.width,
-        height: size.height,
-    };
-    terminal.resize(area)?;
-    // `resize` cleared the *visible* area but not the scrollback buffer.
-    // Purge it (`\x1b[3J`) so pre-clear content and blank bands from
-    // past `insert_before` scroll_ups don't linger when the user scrolls
-    // up. Supported by most modern terminals; older ones silently ignore.
-    execute!(std::io::stdout(), Clear(ClearType::Purge))?;
-    let width = terminal.size()?.width.max(1);
-    for entry in store.iter() {
-        if app.should_render_log(
-            &entry.line.name,
-            entry.line.is_lifecycle,
-            entry.line.is_verbose,
-        ) {
-            insert_line(terminal, &entry.line, width)?;
-        }
-    }
-    terminal.draw(|f| render::draw_bar(f, app))?;
-    Ok(())
-}
-
-/// Leave the alt screen and insert only logs that arrived while it was open.
-///
-/// This preserves the user's current scrollback instead of clearing the
-/// screen and replaying the whole retained [`LogStore`]. Filter commits still
-/// use [`clear_and_replay`] when the active selection changed, because that is
-/// the case where visible lines may need to disappear.
-fn close_modal_and_replay_new_logs(
-    terminal: &mut TuiTerminal,
-    store: &LogStore,
-    app: &App,
-    modal: &mut Option<Modal>,
-) -> Result<(), TuiError> {
-    let Some(since) = modal.take().map(|m| m.replay_checkpoint) else {
-        draw_inline_bar(terminal, app)?;
-        return Ok(());
-    };
-
-    let width = terminal.size()?.width.max(1);
-    for entry in store.iter_since(since) {
-        if app.should_render_log(
-            &entry.line.name,
-            entry.line.is_lifecycle,
-            entry.line.is_verbose,
-        ) {
-            insert_line(terminal, &entry.line, width)?;
-        }
-    }
-    draw_inline_bar(terminal, app)?;
-    Ok(())
-}
-
 /// Dispatch an input or resize event.
 fn handle_app_event(
     event: AppEvent,
     app: &mut App,
-    terminal: &mut TuiTerminal,
     store: &mut LogStore,
     client: &std::sync::Arc<Client>,
     controls: &TuiControls,
-    modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     match event {
         AppEvent::Resize => {
-            // `terminal.size()` already reflects the new geometry by the time
-            // this event is dispatched.
-            let new_height = terminal.size()?.height;
-            if let Some(m) = modal.as_mut() {
-                m.draw(app)?;
-            } else {
-                // A resize changes geometry, not content: the active filter and
-                // the set of visible lines are unchanged, and the terminal
-                // emulator already reflows its own scrollback for us. Running
-                // the full `clear_and_replay` here (purge scrollback + re-emit
-                // every retained line via `insert_before`) floods the screen
-                // for seconds on a large history and needlessly destroys the
-                // user's real, larger scrollback. Just re-place and redraw the
-                // inline bar. Only a height change moves the bar's bottom row
-                // (and can leave a ghost of it behind), so only then do we
-                // clear; a width-only resize keeps the reflowed logs on screen.
-                resize_inline_bar(terminal, app, new_height != app.last_screen_height)?;
-            }
-            app.last_screen_height = new_height;
-            // Caller-side state (cached_width in run_tui) is refreshed on the
-            // next iteration via terminal.size() — handle_app_event doesn't
-            // own that cache. The autoresize path inside ratatui has already
-            // adopted the new size by this point.
+            // Nothing to do but redraw, which the caller has already asked for
+            // by marking the frame dirty. Geometry is read fresh every frame
+            // and the store reflows itself when the width moves; the scroll
+            // anchor is a line id, so it means the same thing at any size.
         }
-        AppEvent::Key(key) => handle_key(key, app, terminal, store, client, controls, modal)?,
+        AppEvent::Key(key) => handle_key(key, app, store, client, controls)?,
+        AppEvent::Mouse(mouse) => handle_mouse(mouse, app, store),
         AppEvent::CompletionsReady {
             param,
             request_id,
@@ -771,7 +540,6 @@ fn handle_app_event(
         } => {
             if let Some(form) = app.form.as_mut() {
                 form.apply_completions(&param, request_id, result);
-                redraw_modal(modal, app)?;
             }
         }
         AppEvent::StateResync {
@@ -782,11 +550,6 @@ fn handle_app_event(
                 processes,
                 startup_complete,
             });
-            if let Some(m) = modal.as_mut() {
-                m.draw(app)?;
-            } else {
-                draw_inline_bar(terminal, app)?;
-            }
         }
     }
     Ok(())
@@ -795,11 +558,9 @@ fn handle_app_event(
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
-    terminal: &mut TuiTerminal,
     store: &mut LogStore,
     client: &std::sync::Arc<Client>,
     controls: &TuiControls,
-    modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     // Ctrl+C: belt-and-suspenders shutdown. We both send a `Shutdown` command
     // directly down the runner channel AND raise SIGINT. The direct command
@@ -830,7 +591,6 @@ fn handle_key(
                         nix::sys::signal::Signal::SIGINT,
                     );
                 }
-                enter_shutdown_mode(app, terminal, modal)?;
             }
             // Detach: leave the stack running, exit this client. Only
             // meaningful for a remote TUI — see [`TuiMode`].
@@ -849,7 +609,6 @@ fn handle_key(
                 } else {
                     "verbose logging disabled"
                 });
-                redraw_current_view(app, terminal, modal)?;
             }
             _ => {}
         }
@@ -861,96 +620,232 @@ fn handle_key(
     }
 
     match app.view_mode {
-        ViewMode::Normal => handle_normal_key(key, app, terminal, store, modal)?,
-        ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
-        ViewMode::Tasks => handle_tasks_key(key, app, terminal, store, client, modal)?,
+        ViewMode::Normal => handle_normal_key(key, app, store)?,
+        ViewMode::Filter => handle_filter_key(key, app, store)?,
+        ViewMode::Tasks => handle_tasks_key(key, app, store, client)?,
         ViewMode::Services => {
-            handle_services_key(key, app, terminal, store, client, controls, modal)?;
+            handle_services_key(key, app, store, client, controls)?;
         }
-        ViewMode::Failures => handle_failure_summary_key(key, app, terminal, store, modal)?,
-        ViewMode::Form => handle_form_key(key, app, terminal, store, client, modal)?,
+        ViewMode::Failures => handle_failure_summary_key(key, app, store)?,
+        ViewMode::Form => handle_form_key(key, app, store, client)?,
     }
     Ok(())
 }
 
-fn redraw_current_view(
-    app: &mut App,
-    terminal: &mut TuiTerminal,
-    modal: &mut Option<Modal>,
-) -> Result<(), TuiError> {
-    if let Some(m) = modal.as_mut() {
-        m.draw(app)?;
-    } else {
-        draw_inline_bar(terminal, app)?;
-    }
-    Ok(())
-}
-
-fn handle_normal_key(
-    key: KeyEvent,
-    app: &mut App,
-    terminal: &mut TuiTerminal,
-    store: &mut LogStore,
-    modal: &mut Option<Modal>,
-) -> Result<(), TuiError> {
+fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
     match key.code {
         KeyCode::Enter => {
-            terminal.insert_before(1, |_buf| {})?;
-            draw_inline_bar(terminal, app)?;
-            let _ = store.push(FormattedLogLine {
-                name: String::new(),
-                is_verbose: false,
-                is_lifecycle: false,
-                bytes: Vec::new(),
-            });
+            // A local artifact, not a stream line: it borrows the id the next
+            // real line is expected to have so replay keeps it in place.
+            store.push(
+                store.next_id(),
+                FormattedLogLine {
+                    name: String::new(),
+                    is_verbose: false,
+                    is_lifecycle: false,
+                    bytes: Vec::new(),
+                },
+            );
         }
         KeyCode::Char('l') => {
             app.filter.enter_edit();
             app.view_mode = ViewMode::Filter;
-            let mut m = Modal::enter(store.next_id())?;
-            m.draw(app)?;
-            *modal = Some(m);
         }
         KeyCode::Char('t') => {
             app.tasks_table.reset();
             app.view_mode = ViewMode::Tasks;
-            let mut m = Modal::enter(store.next_id())?;
-            m.draw(app)?;
-            *modal = Some(m);
         }
         KeyCode::Char('s') => {
             app.services_table.reset();
             app.view_mode = ViewMode::Services;
-            let mut m = Modal::enter(store.next_id())?;
-            m.draw(app)?;
-            *modal = Some(m);
         }
         KeyCode::Char('i') if app.has_failure_summary() => {
             app.open_failure_summary();
-            let mut m = Modal::enter(store.next_id())?;
-            m.draw(app)?;
-            *modal = Some(m);
         }
-        KeyCode::Char('R') if app.filter.reset_to_defaults() => {
-            clear_and_replay(terminal, store, app)?;
+        KeyCode::Char('R') => {
+            app.filter.reset_to_defaults();
+        }
+        // Scrolling the log. The pane's own history is the only history now,
+        // so these are load-bearing rather than a convenience over the
+        // terminal's scrollback.
+        KeyCode::Up => scroll_log(app, store, -1),
+        KeyCode::Down => scroll_log(app, store, 1),
+        KeyCode::PageUp => scroll_log(app, store, -log_page(app)),
+        KeyCode::PageDown => scroll_log(app, store, log_page(app)),
+        KeyCode::Home => scroll_log(app, store, isize::MIN / 2),
+        KeyCode::End => {
+            app.log_selection.clear();
+            app.log_scroll = logs::Scroll::Follow;
+        }
+        // Ctrl+C is shutdown and cannot double as copy, so the keyboard route
+        // to the clipboard is `y` — vi's yank, over the current selection.
+        KeyCode::Char('y') => copy_selection(app),
+        KeyCode::Esc => app.log_selection.clear(),
+        // The status pane sits *beside* the log rather than replacing it, so
+        // opening it is not a mode change and does not interrupt reading.
+        KeyCode::Char('p') => {
+            app.status_pane.open = !app.status_pane.open;
+            if !app.status_pane.open {
+                app.focus = panes::Focus::Logs;
+            }
+        }
+        KeyCode::Char('P') if app.status_pane.open => {
+            app.status_pane.side = app.status_pane.side.toggled();
+            // Extents mean different things on the two axes; start from the
+            // default for the new one rather than carrying a column count over
+            // into rows.
+            app.status_pane.extent = match app.status_pane.side {
+                panes::PaneSide::Right => 42,
+                panes::PaneSide::Bottom => 12,
+            };
+        }
+        KeyCode::Tab if app.status_pane.open => {
+            app.focus = match app.focus {
+                panes::Focus::Logs => panes::Focus::Status,
+                panes::Focus::Status => panes::Focus::Logs,
+            };
         }
         _ => {}
     }
     Ok(())
 }
 
+/// Rows a single wheel tick moves the log.
+///
+/// Three is the near-universal terminal default; matching it is what makes the
+/// pane feel like the scrollback it replaced rather than like a widget.
+const WHEEL_ROWS: isize = 3;
+
+/// Apply a mouse event.
+///
+/// Wheel scrolling works in every mode: a full-screen table on top does not
+/// mean the user has stopped caring where the log is, and moving it costs
+/// nothing while it is hidden.
+fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => scroll_log(app, store, -WHEEL_ROWS),
+        MouseEventKind::ScrollDown => scroll_log(app, store, WHEEL_ROWS),
+        // A click in the log pane takes focus back from any overlay, which is
+        // the gesture people reach for before they remember `esc`.
+        MouseEventKind::Down(MouseButton::Left) => {
+            // The divider is checked first: it is one cell wide and sits
+            // between two panes, so "did they mean to drag it" has to be
+            // answered before "which pane did they click".
+            if app.panes.on_divider(mouse.column, mouse.row) {
+                app.dragging_divider = true;
+                return;
+            }
+            if let Some(focus) = app.panes.hit(mouse.column, mouse.row) {
+                app.focus = focus;
+                if focus == panes::Focus::Logs && app.view_mode == ViewMode::Normal {
+                    app.log_selection.begin(mouse.column, mouse.row);
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.dragging_divider {
+                let area = ratatui::layout::Rect::new(
+                    0,
+                    0,
+                    app.panes.logs.width + app.panes.status.map_or(0, |s| s.width + 1),
+                    app.panes.logs.height + app.panes.status.map_or(0, |s| s.height + 1),
+                );
+                app.status_pane.extent =
+                    panes::extent_from_drag(area, app.status_pane.side, mouse.column, mouse.row);
+                return;
+            }
+            app.log_selection.extend(mouse.column, mouse.row);
+        }
+        // Copy on release, the way a terminal's own selection behaves — asking
+        // for a second keystroke to confirm what was just dragged would be a
+        // step backwards from what the alternate screen took away.
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.dragging_divider {
+                app.dragging_divider = false;
+                return;
+            }
+            app.log_selection.finish();
+            copy_selection(app);
+        }
+        _ => {}
+    }
+}
+
+/// The width of don's `name    | ` prefix, which a multi-row copy leaves out.
+///
+/// Read from the rendered rows rather than recomputed: the prefix is built
+/// upstream from the longest process name, and re-deriving it here would be a
+/// second opinion about a number that is already on screen.
+fn log_prefix_width(app: &App) -> u16 {
+    app.log_visible_rows
+        .iter()
+        .find_map(|row| row.find("| ").map(|idx| idx + 2))
+        .and_then(|width| u16::try_from(width).ok())
+        .unwrap_or(0)
+}
+
+/// Put the current selection on the clipboard, and say so.
+fn copy_selection(app: &mut App) {
+    let prefix = log_prefix_width(app);
+    let Some(text) = selection::selected_text(
+        &app.log_selection,
+        &app.log_visible_rows,
+        app.log_pane_origin,
+        prefix,
+    ) else {
+        return;
+    };
+    let lines = text.lines().count();
+    app.copy_notice = Some(match selection::copy_to_clipboard(&text) {
+        // OSC 52 is a request with no reply: a terminal that has it turned off
+        // discards it silently. Reporting what was sent is the only honest
+        // thing available — "copied" here means "asked the terminal to".
+        Ok(()) => format!("copied {lines} line(s)"),
+        Err(e) => format!("copy failed: {e}"),
+    });
+}
+
+/// One screenful, minus a row of overlap so the reader keeps their place.
+fn log_page(app: &App) -> isize {
+    isize::from(app.log_pane_height.saturating_sub(1).max(1) as i16)
+}
+
+/// Move the log view by `delta` rows.
+///
+/// Geometry comes from what the last frame measured — only the renderer knows
+/// how tall the pane came out and how much admitted content there is at this
+/// width. A resize between then and now costs one imprecise scroll, which the
+/// next frame corrects.
+fn scroll_log(app: &mut App, store: &LogStore, delta: isize) {
+    // The selection is in screen coordinates, so it stops meaning anything the
+    // moment different content is under those cells — same as a terminal drops
+    // its own selection when you scroll.
+    app.log_selection.clear();
+    app.log_scroll = logs::scrolled(
+        store,
+        |entry| {
+            app.should_render_log(
+                &entry.line.name,
+                entry.line.is_lifecycle,
+                entry.line.is_verbose,
+            )
+        },
+        app.log_rows_above,
+        app.log_total_rows,
+        app.log_pane_height,
+        delta,
+    );
+}
+
 fn handle_failure_summary_key(
     key: KeyEvent,
     app: &mut App,
-    terminal: &mut TuiTerminal,
-    store: &mut LogStore,
-    modal: &mut Option<Modal>,
+    _store: &mut LogStore,
 ) -> Result<(), TuiError> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => {
             app.view_mode = ViewMode::Normal;
             app.failure_summary_scroll = 0;
-            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
             return Ok(());
         }
         KeyCode::Up | KeyCode::Char('k') => app.scroll_failure_summary_by(-1),
@@ -961,53 +856,33 @@ fn handle_failure_summary_key(
         KeyCode::End | KeyCode::Char('G') => app.scroll_failure_summary_to_bottom(),
         _ => return Ok(()),
     }
-    redraw_current_view(app, terminal, modal)?;
     Ok(())
 }
 
-fn handle_filter_key(
-    key: KeyEvent,
-    app: &mut App,
-    terminal: &mut TuiTerminal,
-    store: &mut LogStore,
-    modal: &mut Option<Modal>,
-) -> Result<(), TuiError> {
+fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Result<(), TuiError> {
     if app.filter.query_editing() {
         match key.code {
             KeyCode::Enter => {
                 let close_after_apply = app.filter.query_has_single_match();
                 app.filter.apply_query();
-                let filter_changed = app.filter.selection_changed_from_snapshot();
                 app.filter.end_query_edit();
                 if close_after_apply {
                     app.filter.commit();
                     app.view_mode = ViewMode::Normal;
-                    if filter_changed {
-                        *modal = None;
-                        clear_and_replay(terminal, store, app)?;
-                    } else {
-                        close_modal_and_replay_new_logs(terminal, store, app, modal)?;
-                    }
-                } else {
-                    redraw_modal(modal, app)?;
                 }
             }
             KeyCode::Tab => {
                 app.filter.end_query_edit();
-                redraw_modal(modal, app)?;
             }
             KeyCode::Backspace => {
                 app.filter.pop_query_char();
-                redraw_modal(modal, app)?;
             }
             KeyCode::Char(c) => {
                 app.filter.push_query_char(c);
-                redraw_modal(modal, app)?;
             }
             KeyCode::Esc => {
                 app.filter.cancel_edit();
                 app.view_mode = ViewMode::Normal;
-                close_modal_and_replay_new_logs(terminal, store, app, modal)?;
             }
             _ => {}
         }
@@ -1016,48 +891,33 @@ fn handle_filter_key(
 
     match key.code {
         KeyCode::Enter => {
-            let filter_changed = app.filter.selection_changed_from_snapshot();
             app.filter.commit();
             app.view_mode = ViewMode::Normal;
-            if filter_changed {
-                *modal = None; // drops, leaves alt screen
-                clear_and_replay(terminal, store, app)?;
-            } else {
-                close_modal_and_replay_new_logs(terminal, store, app, modal)?;
-            }
         }
         KeyCode::Esc => {
             app.filter.cancel_edit();
             app.view_mode = ViewMode::Normal;
-            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
         }
         KeyCode::Char('R') => {
             app.filter.reset_edit_to_defaults();
-            redraw_modal(modal, app)?;
         }
         KeyCode::Char(' ') => {
             app.filter.toggle_highlighted();
-            redraw_modal(modal, app)?;
         }
         KeyCode::Char('o') => {
             app.filter.select_only_highlighted();
-            redraw_modal(modal, app)?;
         }
         KeyCode::Char('/') => {
             app.filter.begin_query_edit();
-            redraw_modal(modal, app)?;
         }
         KeyCode::Tab => {
             app.filter.begin_query_edit();
-            redraw_modal(modal, app)?;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.filter.highlight_prev();
-            redraw_modal(modal, app)?;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.filter.highlight_next();
-            redraw_modal(modal, app)?;
         }
         _ => {}
     }
@@ -1067,25 +927,20 @@ fn handle_filter_key(
 fn handle_tasks_key(
     key: KeyEvent,
     app: &mut App,
-    terminal: &mut TuiTerminal,
     store: &mut LogStore,
     client: &std::sync::Arc<Client>,
-    modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
     if app.log_popup.is_some() {
         handle_log_popup_key(key, app);
-        redraw_modal(modal, app)?;
         return Ok(());
     }
     match app.tasks_table.handle_key(key, total) {
         StatusTableKeyOutcome::Redraw => {
-            redraw_modal(modal, app)?;
             return Ok(());
         }
         StatusTableKeyOutcome::Close => {
             app.view_mode = ViewMode::Normal;
-            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
             return Ok(());
         }
         StatusTableKeyOutcome::None => {}
@@ -1100,18 +955,16 @@ fn handle_tasks_key(
         }
         if item.has_params {
             open_form_for_task(app, &item.name, client)?;
-            redraw_modal(modal, app)?;
         } else {
             let task_name = item.name;
             dispatch_run_task(client, task_name.clone());
-            return_to_logs_after_task_run(&task_name, app, terminal, store, modal)?;
+            return_to_logs_after_task_run(&task_name, app, store)?;
         }
     } else if key.code == KeyCode::Char('l') {
         let Some(item) = highlighted_task_item(app) else {
             return Ok(());
         };
         open_log_popup_for_name(app, store, item.name);
-        redraw_modal(modal, app)?;
     } else if key.code == KeyCode::Char('a') {
         // Bridge into the highlighted task's PTY — the interactive-task flow.
         if let Some(item) = highlighted_task_item(app) {
@@ -1124,26 +977,21 @@ fn handle_tasks_key(
 fn handle_services_key(
     key: KeyEvent,
     app: &mut App,
-    terminal: &mut TuiTerminal,
     store: &mut LogStore,
     client: &std::sync::Arc<Client>,
     controls: &TuiControls,
-    modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     let total = app.service_items().len();
     if app.log_popup.is_some() {
         handle_log_popup_key(key, app);
-        redraw_modal(modal, app)?;
         return Ok(());
     }
     match app.services_table.handle_key(key, total) {
         StatusTableKeyOutcome::Redraw => {
-            redraw_modal(modal, app)?;
             return Ok(());
         }
         StatusTableKeyOutcome::Close => {
             app.view_mode = ViewMode::Normal;
-            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
             return Ok(());
         }
         StatusTableKeyOutcome::None => {}
@@ -1175,7 +1023,6 @@ fn handle_services_key(
                 return Ok(());
             };
             open_log_popup_for_name(app, store, item.name);
-            redraw_modal(modal, app)?;
         }
         KeyCode::Char('a') => {
             // Bridge into the highlighted service's PTY.
@@ -1400,30 +1247,18 @@ fn spawn_state_resync(client: &std::sync::Arc<Client>) {
     });
 }
 
-fn redraw_modal(modal: &mut Option<Modal>, app: &mut App) -> Result<(), TuiError> {
-    if let Some(m) = modal.as_mut() {
-        m.draw(app)?;
-    }
-    Ok(())
-}
-
 fn return_to_logs_after_task_run(
     task_name: &str,
     app: &mut App,
-    terminal: &mut TuiTerminal,
-    store: &LogStore,
-    modal: &mut Option<Modal>,
+    _store: &LogStore,
 ) -> Result<(), TuiError> {
     let filter_changed = app.filter.select_name(task_name);
     app.view_mode = ViewMode::Normal;
     app.log_popup = None;
 
-    if filter_changed {
-        *modal = None;
-        clear_and_replay(terminal, store, app)?;
-    } else {
-        close_modal_and_replay_new_logs(terminal, store, app, modal)?;
-    }
+    // Nothing to redraw here: the filter change is a different view over the
+    // same store, and the loop paints it on the next frame.
+    let _ = filter_changed;
     Ok(())
 }
 
@@ -1556,10 +1391,8 @@ fn app_input_tx() -> Option<&'static mpsc::Sender<AppEvent>> {
 fn handle_form_key(
     key: KeyEvent,
     app: &mut App,
-    terminal: &mut TuiTerminal,
     store: &mut LogStore,
     client: &std::sync::Arc<Client>,
-    modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     // Grab these up front so later `app.form` borrows don't conflict.
     let task_name = match app.form.as_ref() {
@@ -1572,12 +1405,11 @@ fn handle_form_key(
         KeyCode::Esc => {
             app.form = None;
             app.view_mode = ViewMode::Normal;
-            close_modal_and_replay_new_logs(terminal, store, app, modal)?;
             return Ok(());
         }
         KeyCode::Enter if ctrl => {
             // Submit regardless of focused field.
-            try_submit_form(app, client, terminal, store, modal)?;
+            try_submit_form(app, client, store)?;
             return Ok(());
         }
         KeyCode::Enter => {
@@ -1592,7 +1424,7 @@ fn handle_form_key(
             if let Some(form) = app.form.as_ref()
                 && form.focus + 1 >= form.fields.len()
             {
-                try_submit_form(app, client, terminal, store, modal)?;
+                try_submit_form(app, client, store)?;
                 return Ok(());
             }
             if let Some(form) = app.form.as_mut() {
@@ -1709,7 +1541,6 @@ fn handle_form_key(
         }
         _ => {}
     }
-    redraw_modal(modal, app)?;
     Ok(())
 }
 
@@ -1719,9 +1550,7 @@ fn handle_form_key(
 fn try_submit_form(
     app: &mut App,
     client: &std::sync::Arc<Client>,
-    terminal: &mut TuiTerminal,
     store: &mut LogStore,
-    modal: &mut Option<Modal>,
 ) -> Result<(), TuiError> {
     let (task_name, params) = {
         let Some(form) = app.form.as_mut() else {
@@ -1734,43 +1563,14 @@ fn try_submit_form(
             }
             Err(msg) => {
                 form.submit_error = Some(msg);
-                redraw_modal(modal, app)?;
                 return Ok(());
             }
         }
     };
     dispatch_run_task_with_params(client, task_name.clone(), params);
     app.form = None;
-    return_to_logs_after_task_run(&task_name, app, terminal, store, modal)?;
+    return_to_logs_after_task_run(&task_name, app, store)?;
     Ok(())
-}
-
-/// Insert a single formatted log line into the scrollback above the inline
-/// viewport. Returns the number of terminal rows actually consumed.
-fn insert_line(
-    terminal: &mut TuiTerminal,
-    line: &FormattedLogLine,
-    width: u16,
-) -> Result<u16, TuiError> {
-    let text = parse_ansi(&line.bytes);
-    let height = Paragraph::new(text.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-        .max(1) as u16;
-
-    terminal.insert_before(height, |buf| {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: buf.area.width,
-            height: buf.area.height,
-        };
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
-    })?;
-
-    Ok(height)
 }
 
 /// Parse pre-rendered ANSI bytes into a styled ratatui [`Text`]. On parse
@@ -1781,6 +1581,21 @@ fn parse_ansi(bytes: &[u8]) -> Text<'static> {
         Ok(text) => text,
         Err(_) => Text::raw(String::from_utf8_lossy(bytes).into_owned()),
     }
+}
+
+/// Parse one upstream-formatted line into its styled form.
+///
+/// Upstream guarantees one line per message, so a multi-line parse result can
+/// only come from embedded newlines that sanitization let through; joining them
+/// keeps the store's "one entry, one logical line" invariant, which the scroll
+/// anchor depends on.
+pub(crate) fn parse_ansi_line(bytes: &[u8]) -> ratatui::text::Line<'static> {
+    let text = parse_ansi(bytes);
+    let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+    for line in text.lines {
+        spans.extend(line.spans);
+    }
+    ratatui::text::Line::from(spans)
 }
 
 #[cfg(test)]

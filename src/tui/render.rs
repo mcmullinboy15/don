@@ -1,20 +1,17 @@
-//! Rendering primitives for the TUI.
+//! Rendering for the TUI.
 //!
-//! Two entry points:
-//! - [`draw_bar`] fills the single-row inline viewport with the status bar.
-//!   It's called on every state change while the inline terminal is active.
-//! - [`draw_modal`] renders full-screen content (filter, task/service tables,
-//!   form) into an alt-screen [`Terminal`]. It's called whenever the
-//!   modal's app state changes.
+//! One entry point, [`draw`], which paints the whole screen every frame: the
+//! log pane, the status bar, and whichever full-screen view or overlay the
+//! current mode calls for. All of it is a pure function of [`App`], the
+//! [`LogStore`] and the frame size — no cursor math, no incremental writes, no
+//! knowledge of what changed since last time.
 //!
-//! All UI output is a pure function of the [`App`] state plus the frame size —
-//! no cursor math, no incremental writes.
+//! That last part is the point. The old renderer had two entry points against
+//! two different terminals, and every caller had to decide which one to invoke
+//! and whether the log flow underneath needed replaying. Painting everything,
+//! every frame, from one source of truth removes the question.
 //!
-//! Log lines are *not* rendered here; they go into scrollback above the inline
-//! viewport via [`Terminal::insert_before`].
-//!
-//! [`Terminal`]: ratatui::Terminal
-//! [`Terminal::insert_before`]: ratatui::Terminal::insert_before
+//! [`LogStore`]: super::log_store::LogStore
 
 use std::collections::HashMap;
 
@@ -36,27 +33,308 @@ use super::status_table::{StatusTableView, draw_status_table};
 use crate::client::{ServiceState, TaskState};
 use crate::task_state::TaskRunInfo;
 
-/// Total rows the inline viewport reserves: 1 blank buffer row + 3 rows
-/// for the bordered status box (top border + content + bottom border).
-pub(crate) const BAR_VIEWPORT_HEIGHT: u16 = 4;
+/// Rows the status bar occupies at the bottom of the screen: top border,
+/// content, bottom border.
+pub(crate) const BAR_HEIGHT: u16 = 3;
+
+/// Width available to log text, which is what the store wraps against.
+pub(crate) fn log_pane_width(area: Rect, status: super::panes::StatusPane) -> u16 {
+    super::panes::layout(area, BAR_HEIGHT, status)
+        .logs
+        .width
+        .max(1)
+}
+
+/// Paint the whole screen.
+pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_store::LogStore) {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let panes = super::panes::layout(area, BAR_HEIGHT, app.status_pane);
+    app.panes = panes;
+
+    // Clamp the scroll positions the overlays own before drawing them: they are
+    // bounded by geometry only this function knows.
+    app.sync_log_popup_scroll(log_popup_visible_rows(area));
+    if app.view_mode == ViewMode::Failures {
+        let max_scroll = failure_summary_max_scroll(area, app);
+        app.sync_failure_summary_scroll(max_scroll);
+    }
+
+    draw_log_pane(frame, app, store, panes.logs);
+    if let Some(status_area) = panes.status {
+        draw_status_pane(frame, app, status_area);
+    }
+    if let Some(divider) = panes.divider {
+        draw_divider(frame, divider, app.status_pane.side);
+    }
+    draw_bar(frame, app, panes.bar);
+
+    // Full-screen views replace the log pane rather than living on a second
+    // terminal. They must wipe what is under them first: their old home was a
+    // blank alt-screen buffer, and now it is whatever the log pane just drew.
+    // Leaving one still cannot lose log lines — nothing was hidden to show it,
+    // only painted over, and the store never stopped filling.
+    if app.view_mode != ViewMode::Normal {
+        frame.render_widget(Clear, area);
+    }
+    match app.view_mode {
+        ViewMode::Filter => draw_filter_modal(frame, app),
+        ViewMode::Tasks => draw_tasks_table(frame, app),
+        ViewMode::Services => draw_services_table(frame, app),
+        ViewMode::Failures => draw_failure_summary(frame, app),
+        ViewMode::Form => draw_form_modal(frame, app),
+        ViewMode::Normal => {}
+    }
+    // The per-process log popup is a centred overlay and clears its own rect.
+    draw_log_popup(frame, app);
+}
+
+/// Render the visible slice of the log, plus a scroll indicator when the view
+/// is not pinned to the newest line.
+fn draw_log_pane(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    store: &super::log_store::LogStore,
+    area: Rect,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let view = super::logs::build_view(
+        store,
+        |entry| {
+            app.should_render_log(
+                &entry.line.name,
+                entry.line.is_lifecycle,
+                entry.line.is_verbose,
+            )
+        },
+        app.log_scroll,
+        area.width,
+        area.height,
+    );
+    // Remembered for the input layer: scrolling needs to know how far it can
+    // go, and only the renderer knows how tall the pane came out.
+    app.log_rows_above = view.rows_above;
+    app.log_total_rows = view.total_rows;
+    app.log_pane_height = area.height;
+
+    // Top-aligned: a log shorter than the pane starts at the top and grows
+    // down, the way a terminal does. Bottom-anchoring it would leave the first
+    // line of a fresh run stranded under a screenful of blanks.
+    let following = view.following;
+    let rows_below = view
+        .total_rows
+        .saturating_sub(view.rows_above + area.height as usize);
+
+    // The plain text of what is about to be on screen, kept so a copy resolves
+    // against exactly the rows the user dragged across — after wrapping, after
+    // filtering, after scrolling, with no need to re-derive any of it.
+    app.log_visible_rows = view
+        .rows
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    app.log_pane_origin = (area.x, area.y);
+
+    let selection = app.log_selection;
+    let rows: Vec<Line<'_>> = if selection.is_empty() {
+        view.rows
+    } else {
+        view.rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let row = area.y + u16::try_from(index).unwrap_or(u16::MAX);
+                highlight_selected(line, &selection, area.x, row)
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(rows), area);
+
+    if !following {
+        draw_scroll_badge(frame, area, rows_below);
+    }
+}
+
+/// A compact always-visible summary of every process, beside the log.
+///
+/// Deliberately thinner than the full-screen tables: this is for keeping half
+/// an eye on things while reading output, and anything that needs a column of
+/// its own belongs in `[s]` or `[t]`, which have the whole screen for it.
+fn draw_status_pane(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let focused = app.focus == super::panes::Focus::Status;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
+        .title(" status — [tab] focus  [p] close  [P] dock ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut services: Vec<(&String, &ServiceState)> = app.services_state.iter().collect();
+    services.sort_by_key(|(name, _)| (*name).clone());
+    if !services.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "SERVICES",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (name, state) in services {
+            lines.push(status_row(
+                name,
+                service_state_label(*state, &[]),
+                service_state_color(*state),
+            ));
+        }
+    }
+
+    let mut tasks: Vec<(&String, &TaskState)> = app.tasks_state.iter().collect();
+    tasks.sort_by_key(|(name, _)| (*name).clone());
+    if !tasks.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "TASKS",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (name, state) in tasks {
+            lines.push(status_row(
+                name,
+                task_state_label(*state, &[]),
+                task_state_color(*state),
+            ));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One `name … state` row, with the state right-aligned by padding rather than
+/// by a table so the pane can be any width without reflowing columns.
+fn status_row(name: &str, label: Cow<'static, str>, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(format!("{name} ")),
+        Span::styled(label.into_owned(), Style::default().fg(color)),
+    ])
+}
+
+/// The one-cell line between the panes. Drawn as a rule so it reads as a
+/// grab handle rather than as a gap.
+fn draw_divider(frame: &mut Frame<'_>, area: Rect, side: super::panes::PaneSide) {
+    // Dotted rather than solid so it reads as a grab handle and not as a
+    // second copy of the status pane's own border, which sits right beside it.
+    let glyph = match side {
+        super::panes::PaneSide::Right => "┊",
+        super::panes::PaneSide::Bottom => "┄",
+    };
+    let lines: Vec<Line<'static>> = match side {
+        super::panes::PaneSide::Right => (0..area.height)
+            .map(|_| Line::from(Span::styled(glyph, Style::default().fg(Color::DarkGray))))
+            .collect(),
+        super::panes::PaneSide::Bottom => vec![Line::from(Span::styled(
+            glyph.repeat(area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Re-style the cells of one row that fall inside the selection.
+///
+/// Splits spans at the selection boundary rather than styling whole spans: a
+/// selection almost never lines up with where the upstream formatter changed
+/// colour, and highlighting the whole span would make the selection look like
+/// it covers more than it does.
+fn highlight_selected<'a>(
+    line: Line<'a>,
+    selection: &super::selection::Selection,
+    origin_x: u16,
+    row: u16,
+) -> Line<'a> {
+    let mut out: Vec<Span<'a>> = Vec::with_capacity(line.spans.len());
+    let mut column = origin_x;
+    for span in line.spans {
+        let mut run = String::new();
+        let mut run_selected: Option<bool> = None;
+        for ch in span.content.chars() {
+            let selected = selection.contains(column, row);
+            if run_selected != Some(selected) && !run.is_empty() {
+                out.push(styled_run(&run, span.style, run_selected == Some(true)));
+                run.clear();
+            }
+            run_selected = Some(selected);
+            run.push(ch);
+            column = column.saturating_add(1);
+        }
+        if !run.is_empty() {
+            out.push(styled_run(&run, span.style, run_selected == Some(true)));
+        }
+    }
+    Line::from(out)
+}
+
+fn styled_run(text: &str, style: Style, selected: bool) -> Span<'static> {
+    if selected {
+        Span::styled(text.to_string(), style.add_modifier(Modifier::REVERSED))
+    } else {
+        Span::styled(text.to_string(), style)
+    }
+}
+
+/// A small right-aligned marker saying the view is held above the live tail.
+///
+/// Without it, a scrolled-up pane during a quiet period is indistinguishable
+/// from a stalled one.
+fn draw_scroll_badge(frame: &mut Frame<'_>, area: Rect, rows_below: usize) {
+    let label = format!(" ↑ scrolled — {rows_below} row(s) below · [end] follow ");
+    let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+    if width >= area.width {
+        return;
+    }
+    let badge = Rect::new(
+        area.x + area.width - width,
+        area.y + area.height.saturating_sub(1),
+        width,
+        1,
+    );
+    frame.render_widget(Clear, badge);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        badge,
+    );
+}
 
 /// Spinner frames — the standard "dots" set. Rotate with `app.spinner_frame`.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Draw the status bar (blank buffer row + bordered box) into the inline
-/// viewport.
-pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
-    if area.height < BAR_VIEWPORT_HEIGHT || area.width < 2 {
+/// Draw the status bar into the rows reserved for it.
+fn draw_bar(frame: &mut Frame<'_>, app: &App, box_area: Rect) {
+    if box_area.height < BAR_HEIGHT || box_area.width < 2 {
         return;
     }
-    // Row 0 (blank) gives breathing room between scrollback logs and the box.
-    // Rows 1..=3 render the bordered box.
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(3)])
-        .split(area);
-    let box_area = layout[1];
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -91,9 +369,23 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
             app.has_failure_summary(),
         )
     };
-    let update_badge = (!app.shutdown_started)
-        .then(|| app.update_badge.as_ref().map(update_badge_line))
-        .flatten();
+    // OSC 52 has no acknowledgement, so this line is the only sign a copy
+    // happened. It takes the right-hand slot over the update badge: the user
+    // just acted, and an answer to that beats a background notice.
+    let copy_badge = app.copy_notice.as_ref().map(|notice| {
+        Line::from(Span::styled(
+            format!(" {notice} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ))
+    });
+    let update_badge = copy_badge.or_else(|| {
+        (!app.shutdown_started)
+            .then(|| app.update_badge.as_ref().map(update_badge_line))
+            .flatten()
+    });
 
     if let Some(right_line) = update_badge {
         let right_width = u16::try_from(line_width(&right_line)).unwrap_or(u16::MAX);
@@ -115,20 +407,6 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
     }
 
     frame.render_widget(Paragraph::new(left_line), inner);
-}
-
-/// Dispatch to the full-screen render function for the current view mode.
-/// Callers should only invoke this when `app.view_mode != Normal`.
-pub(crate) fn draw_modal(frame: &mut Frame<'_>, app: &App) {
-    match app.view_mode {
-        ViewMode::Filter => draw_filter_modal(frame, app),
-        ViewMode::Tasks => draw_tasks_table(frame, app),
-        ViewMode::Services => draw_services_table(frame, app),
-        ViewMode::Failures => draw_failure_summary(frame, app),
-        ViewMode::Form => draw_form_modal(frame, app),
-        ViewMode::Normal => {}
-    }
-    draw_log_popup(frame, app);
 }
 
 fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
@@ -683,7 +961,8 @@ fn normal_bar_line(
     }
 
     spans.push(separator());
-    spans.push(dim("[l] logs"));
+    spans.push(dim("[p] status"));
+    spans.push(dim("  [l] logs"));
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
         spans.push(dim("  [R] reset"));
@@ -1444,7 +1723,10 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(width, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        let store = super::super::log_store::LogStore::with_capacity(0);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &store))
+            .unwrap();
         terminal
             .backend()
             .buffer()
@@ -1480,7 +1762,10 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(45, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        let store = super::super::log_store::LogStore::with_capacity(0);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &store))
+            .unwrap();
         let rendered = terminal
             .backend()
             .buffer()

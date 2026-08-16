@@ -40,6 +40,21 @@ impl ServiceState {
         matches!(self, Self::Ready | Self::Lazy | Self::Unhealthy)
     }
 
+    /// Whether a service in this state, with `live` custody, should have its
+    /// proxy refuse connections rather than queue them.
+    ///
+    /// A service that failed *and* has no process left has nothing to queue
+    /// for — a client would hang on a socket nobody will read. The liveness
+    /// half matters: `Failed` does not imply the process is gone, because a
+    /// failed ready check under `on_failure = "notify"` leaves it running and
+    /// possibly serving.
+    ///
+    /// Shared by the supervisor that sets the policy and the `status -v` line
+    /// that explains it, so the two cannot drift.
+    pub(crate) fn refuses_connections(self, live: bool) -> bool {
+        matches!(self, Self::Failed | Self::DependencyFailed) && !live
+    }
+
     /// Valid transitions from one state to another.
     #[cfg(test)]
     pub(crate) fn can_transition_to(&self, next: Self) -> bool {

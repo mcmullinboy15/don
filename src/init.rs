@@ -67,7 +67,7 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # watch = ["db/migrations/**/*.sql"]
 
 # Set auto_run = false to defer execution — when the task needs to run,
-# trigger it with `don run <name>` or `don run --all-pending`.
+# trigger it with `don run <name>`.
 # [tasks.seed]
 # cmd = "./scripts/seed-db"
 # auto_run = false

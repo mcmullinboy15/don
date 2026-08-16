@@ -48,10 +48,6 @@ export function ProjectView({ project, onBack }: Props) {
     }
   }
 
-  const pendingRun = processes.filter(
-    (process) => process.kind === "task" && process.state === "pending_run",
-  );
-
   return (
     <div className="project-view">
       <header className="page-header">
@@ -67,12 +63,6 @@ export function ProjectView({ project, onBack }: Props) {
             {project.pid}
           </p>
         </div>
-        {pendingRun.length > 0 && (
-          <button onClick={() => act(() => api.runPending(project.id))}>
-            run {pendingRun.length} pending task
-            {pendingRun.length === 1 ? "" : "s"}
-          </button>
-        )}
       </header>
 
       {error && <p className="error">{error}</p>}

@@ -1,274 +1,135 @@
 #!/usr/bin/env python3
-"""Drive `don start` under a real PTY and exercise terminal RESIZE.
+"""Check that resizing does not move the log out from under the reader.
 
-Companion to `tui_drive.py`, which covers the shutdown path. This one
-targets the resize path specifically: it starts don, waits for steady
-state (a large log burst has filled the in-memory `LogStore`), then
-sends a sequence of real window-size changes (`ioctl(TIOCSWINSZ)` +
-`SIGWINCH`) and measures:
+Why this exists
+---------------
+The log pane wraps to its own width, so how many *rows* a line occupies
+changes with the terminal. That makes a row-counted scroll offset mean
+something different after every resize — the view jumps, sometimes by
+screenfuls, and the line someone was reading is gone.
 
-  - resize_bytes: how many bytes don writes to the terminal in response
-    to the resizes. A full clear+replay of the LogStore shows up here as
-    a multi-MB spike; a bar-only redraw is a few KB.
-  - ghost bars: the captured stream is replayed into a `pyte` screen
-    (resized at the same offsets the real PTY was) and the final on-screen
-    state is inspected. The status bar carries the marker "[s] services";
-    if it appears on more than one row, or the box border (┌──) appears
-    more than once, a stale "ghost" copy of the bar lingered after resize.
+`src/tui/logs.rs` anchors instead to a log id plus an offset within that line,
+which is stable across resizes by construction. This drives the real binary to
+check the construction actually holds end to end: scroll up, resize, and
+confirm the line at the top of the pane is still the same line.
 
-Usage:
-    python3 tools/tui_drive_resize.py <don binary> <cwd>
+It also watches the byte cost of a resize. The old inline-viewport TUI replayed
+its entire retained history on resize, which showed up as multi-megabyte spikes
+and seconds of screen churn; a full repaint should cost one screenful.
 
-Exit code 0 = clean (don exited 0, no ghost). Non-zero otherwise.
-Requires `pyte` for the ghost check; without it, only byte accounting
-is reported.
+Requires a project whose services produce plenty of distinguishable output —
+the stress config generator is ideal:
+
+    python3 tools/gen_stress_config.py /tmp/don-stress
+    cargo build --release
+    rm -rf /tmp/don-stress/.don
+    python3 tools/tui_drive_resize.py target/release/don /tmp/don-stress
+
+Override the size sequence with DON_RESIZE_SIZES, e.g. "50x140,50x100" for a
+width-only resize.
 """
 
 import os
-import pty
-import re
-import select
-import signal
-import struct
 import sys
 import time
-import fcntl
-import termios
 
-if len(sys.argv) < 3:
-    print(f"usage: {sys.argv[0]} <don binary> <cwd>", file=sys.stderr)
-    sys.exit(2)
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from tui_emulator import HAVE_PYTE, Session  # noqa: E402
 
-DON = os.path.realpath(sys.argv[1])
-CWD = sys.argv[2]
-if not os.access(DON, os.X_OK):
-    print(f"binary not found or not executable: {DON}", file=sys.stderr)
-    sys.exit(2)
+READY = "all services running"
+DEFAULT_SIZES = "60x200,45x120,45x90,60x200"
 
-try:
-    import pyte
-    HAVE_PYTE = True
-except ImportError:
-    HAVE_PYTE = False
 
-ANSI = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07")
-DSR = re.compile(rb"\x1b\[6n")
-READY_NEEDLE = b"all services running"
-SHUTDOWN_NEEDLE = b"shutdown complete"
+def tlog(start, message):
+    print("[%6.0fms] %s" % ((time.time() - start) * 1000, message), file=sys.stderr)
 
-# (rows, cols) sequence. Index 0 is the initial size; the rest are the
-# resizes applied after steady state, in order. Override with the env var
-# DON_RESIZE_SIZES, e.g. "50x140,50x100" for a single width-only resize.
-SIZES = [(50, 120), (40, 100), (55, 150), (44, 90)]
-if os.environ.get("DON_RESIZE_SIZES"):
-    SIZES = [tuple(int(x) for x in pair.split("x"))
-             for pair in os.environ["DON_RESIZE_SIZES"].split(",")]
 
-start = time.monotonic()
-def tlog(msg):
-    sys.stderr.write(f"[{int((time.monotonic() - start) * 1000)}ms] {msg}\n")
-    sys.stderr.flush()
+def anchor_line(session):
+    """The topmost non-blank row of the log pane — what the reader is looking at.
 
-def set_winsize(fd, rows, cols):
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    Compared as text rather than by id because the id is don's internal state;
+    what matters to the user is that the same *line* is still there.
+    """
+    for line in session.screen.display():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
 
-pid, fd = pty.fork()
-if pid == 0:
-    os.chdir(CWD)
-    os.environ["TERM"] = "xterm-256color"
-    os.environ["COLUMNS"] = str(SIZES[0][1])
-    os.environ["LINES"] = str(SIZES[0][0])
-    os.execvp(DON, [DON, "start"])
-    os._exit(127)
 
-tlog(f"spawned don pid={pid}")
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    binary, project = sys.argv[1], sys.argv[2]
+    sizes = os.environ.get("DON_RESIZE_SIZES", DEFAULT_SIZES)
+    sequence = []
+    for spec in sizes.split(","):
+        rows, cols = spec.strip().lower().split("x")
+        sequence.append((int(cols), int(rows)))
 
-flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-set_winsize(fd, *SIZES[0])
+    start = time.time()
+    session = Session(binary, project, cols=sequence[0][0], rows=sequence[0][1])
+    tlog(start, "spawned don pid=%d (pyte: %s)" % (session.pid, HAVE_PYTE))
 
-captured = bytearray()
-# (byte_offset_in_captured, (rows, cols)) for replaying into pyte.
-resize_marks = []
-saw_ready = False
-ready_at = None
-saw_shutdown = False
-shutdown_seen_at = None
-sigint_sent = False
-sigint_at = None
-pre_sigint_offset = None
-exit_code = None
+    if not session.wait_for_screen(READY, 90.0):
+        tlog(start, "FAIL: startup never settled")
+        session.kill()
+        return 1
 
-# Resize state machine, driven once steady-state is reached.
-resize_phase = 0           # index into SIZES[1:]
-pre_resize_offset = None
-post_resize_offset = None
-last_resize_at = None
-RESIZE_GAP = 0.6           # seconds between resizes
-STEADY_LINGER = 3.0        # seconds after ready before first resize
+    # Let a decent backlog build so there is something to scroll through.
+    session.pump(4.0)
 
-deadline = time.monotonic() + 90
+    # Scroll up out of follow mode. PageUp twice puts the reader well clear of
+    # the live tail, so any drift is visible rather than masked by new output.
+    session.send(b"\x1b[5~\x1b[5~")
+    session.pump(0.6)
+    before = anchor_line(session)
+    tlog(start, "scrolled up; top line: %r" % before[:70])
+    if not before:
+        tlog(start, "FAIL: nothing on screen after scrolling")
+        session.kill()
+        return 1
 
-def drain_reads():
-    """Read whatever is available; answer DSR. Returns False on EOF."""
-    try:
-        data = os.read(fd, 65536)
-    except OSError as e:
-        if getattr(e, "errno", None) == 5:
-            return False
-        return False
-    if not data:
-        return False
-    captured.extend(data)
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
-    for _ in DSR.finditer(data):
-        try:
-            os.write(fd, b"\x1b[1;1R")
-        except OSError:
-            pass
-    return True
+    failures = []
+    for cols, rows in sequence[1:]:
+        mark = len(session.raw)
+        session.set_size(cols, rows)
+        session.pump(1.0)
+        cost = len(session.raw) - mark
+        after = anchor_line(session)
+        screenful = cols * rows * 4  # a generous per-cell allowance with styling
+        tlog(
+            start,
+            "resize -> %dx%d: %d bytes (budget %d), top line: %r"
+            % (rows, cols, cost, screenful, after[:70]),
+        )
+        # The anchor is a whole logical line; a narrower terminal wraps it, so
+        # the top row can be a prefix of what it was. Requiring containment
+        # either way catches a jump without failing on legitimate rewrapping.
+        held = before.startswith(after[: min(len(after), 30)]) or after.startswith(
+            before[: min(len(before), 30)]
+        )
+        if not held:
+            failures.append("resize to %dx%d moved the view: %r -> %r" % (rows, cols, before, after))
+        if cost > screenful:
+            failures.append(
+                "resize to %dx%d wrote %d bytes, over a %d budget — replaying history?"
+                % (rows, cols, cost, screenful)
+            )
+        before = after
 
-while True:
-    try:
-        rlist, _, _ = select.select([fd], [], [], 0.05)
-    except (OSError, select.error):
-        break
+    session.interrupt()
+    code = session.wait_exit(30.0)
+    if code is None:
+        failures.append("don did not exit after Ctrl+C")
+        session.kill()
 
-    if rlist:
-        if not drain_reads():
-            tlog("EOF on master")
-            break
-        plain = ANSI.sub(b"", bytes(captured))
-        if not saw_ready and READY_NEEDLE in plain:
-            saw_ready = True
-            ready_at = time.monotonic()
-            tlog(f"saw '{READY_NEEDLE.decode()}'")
-        if not saw_shutdown and SHUTDOWN_NEEDLE in plain:
-            saw_shutdown = True
-            shutdown_seen_at = time.monotonic()
-            tlog(f"saw '{SHUTDOWN_NEEDLE.decode()}'")
+    for failure in failures:
+        tlog(start, "FAIL: %s" % failure)
+    tlog(start, "RESULT: %s" % ("ok" if not failures else "FAIL"))
+    return 0 if not failures else 1
 
-    now = time.monotonic()
 
-    # Once steady (ready + linger so the burst is fully flushed), walk the
-    # resize sequence.
-    if saw_ready and not sigint_sent and now - ready_at >= STEADY_LINGER:
-        if pre_resize_offset is None:
-            pre_resize_offset = len(captured)
-            last_resize_at = 0  # fire first resize immediately
-            tlog(f"steady; pre_resize_offset={pre_resize_offset}")
-        if resize_phase < len(SIZES) - 1 and now - last_resize_at >= RESIZE_GAP:
-            rows, cols = SIZES[1 + resize_phase]
-            try:
-                set_winsize(fd, rows, cols)
-                os.kill(pid, signal.SIGWINCH)
-                resize_marks.append((len(captured), (rows, cols)))
-                tlog(f"resize -> {rows}x{cols}")
-            except Exception as e:
-                tlog(f"resize failed: {e}")
-            resize_phase += 1
-            last_resize_at = now
-        elif resize_phase >= len(SIZES) - 1 and now - last_resize_at >= 1.0:
-            # All resizes sent + settled. Snapshot, then SIGINT.
-            post_resize_offset = len(captured)
-            pre_sigint_offset = len(captured)
-            tlog(f"post_resize_offset={post_resize_offset} "
-                 f"resize_bytes={post_resize_offset - pre_resize_offset}")
-            tlog(f"sending SIGINT to {pid}")
-            os.kill(pid, signal.SIGINT)
-            sigint_sent = True
-            sigint_at = now
-
-    if shutdown_seen_at is not None and now - shutdown_seen_at > 8:
-        tlog("HANG: 'shutdown complete' fired but don alive 8s later")
-        os.kill(pid, signal.SIGKILL)
-
-    try:
-        wpid, status = os.waitpid(pid, os.WNOHANG)
-    except ChildProcessError:
-        wpid, status = pid, 0
-    if wpid:
-        if os.WIFEXITED(status):
-            exit_code = os.WEXITSTATUS(status)
-            tlog(f"don exited normally code={exit_code}")
-        elif os.WIFSIGNALED(status):
-            exit_code = -os.WTERMSIG(status)
-            tlog(f"don killed by signal {os.WTERMSIG(status)}")
-        break
-
-    if now > deadline:
-        tlog("driver deadline; killing don")
-        os.kill(pid, signal.SIGKILL)
-    if sigint_at is not None and now - sigint_at > 30:
-        tlog("30s after SIGINT — killing")
-        os.kill(pid, signal.SIGKILL)
-
-# Drain trailing bytes.
-end_drain = time.monotonic() + 0.5
-while time.monotonic() < end_drain:
-    try:
-        rlist, _, _ = select.select([fd], [], [], 0.05)
-    except (OSError, select.error):
-        break
-    if not rlist or not drain_reads():
-        break
-
-if exit_code is None:
-    grace = time.monotonic() + 2.0
-    while time.monotonic() < grace:
-        try:
-            wpid, status = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            break
-        if wpid:
-            if os.WIFEXITED(status):
-                exit_code = os.WEXITSTATUS(status)
-            elif os.WIFSIGNALED(status):
-                exit_code = -os.WTERMSIG(status)
-            break
-        time.sleep(0.05)
-
-# ---- Ghost analysis via pyte ----
-ghost = None
-bar_rows = None
-if HAVE_PYTE and pre_sigint_offset:
-    # Replay the stream up to just before SIGINT, resizing the emulated
-    # screen at the same byte offsets the real PTY was resized. The final
-    # screen state should show the bar exactly once, at the bottom.
-    final_rows, final_cols = SIZES[-1]
-    screen = pyte.Screen(SIZES[0][1], SIZES[0][0])
-    stream = pyte.ByteStream(screen)
-    cursor = 0
-    for off, (rows, cols) in resize_marks:
-        off = min(off, pre_sigint_offset)
-        stream.feed(bytes(captured[cursor:off]))
-        screen.resize(rows, cols)
-        cursor = off
-    stream.feed(bytes(captured[cursor:pre_sigint_offset]))
-
-    lines = screen.display
-    bar_rows = [i for i, ln in enumerate(lines) if "[s] services" in ln]
-    border_rows = [i for i, ln in enumerate(lines) if "┌" in ln or "┐" in ln]
-    ghost = len(bar_rows) > 1 or len(border_rows) > 1
-    tlog(f"pyte final {final_rows}x{final_cols}: bar marker rows={bar_rows} "
-         f"top-border rows={border_rows}")
-
-plain = ANSI.sub(b"", bytes(captured))
-text = plain.decode("utf-8", errors="replace")
-
-tlog("=== resize driver summary ===")
-tlog(f"don exit code:   {exit_code}")
-tlog(f"saw ready:       {saw_ready}")
-tlog(f"saw shutdown:    {saw_shutdown}")
-if pre_resize_offset is not None and post_resize_offset is not None:
-    tlog(f"resize_bytes:    {post_resize_offset - pre_resize_offset} "
-         f"(over {len(SIZES) - 1} resizes)")
-tlog(f"captured bytes:  {len(captured)}")
-if HAVE_PYTE:
-    tlog(f"ghost bar:       {ghost}  (bar marker rows={bar_rows})")
-else:
-    tlog("ghost bar:       (pyte not installed — skipped)")
-
-ok = exit_code == 0 and (ghost is False or ghost is None)
-sys.exit(0 if ok else 1)
+if __name__ == "__main__":
+    sys.exit(main())

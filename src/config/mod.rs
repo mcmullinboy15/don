@@ -24,9 +24,7 @@ pub use self::profile::Profile;
 pub use self::service::{
     DockerBuildConfig, DockerConfig, ResolvedService, RustConfig, Service, ServiceKind,
 };
-pub use self::task::{
-    Task, TaskAutoRun, TaskHeadless, TaskTerminal, TaskTerminalMode, TaskTerminalScreen,
-};
+pub use self::task::{Task, TaskAutoRun, TaskHeadless};
 pub use self::types::{
     BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
     ShutdownConfig,
@@ -105,11 +103,20 @@ impl std::str::FromStr for Config {
 /// whose `don.toml` still says `turbo.task = "dev"` is told the service
 /// "must have one of: bazel, docker, rust, go, or run" — true, and useless
 /// about why a config that worked yesterday doesn't today.
-const REMOVED_KEYS: &[(&str, &str)] = &[(
-    "turbo",
-    "Turborepo support has been removed. Replace it with a `run` command \
-     (plus `build` if you need one), or use the bazel preset.",
-)];
+const REMOVED_KEYS: &[(&str, &str)] = &[
+    (
+        "turbo",
+        "Turborepo support has been removed. Replace it with a `run` command \
+         (plus `build` if you need one), or use the bazel preset.",
+    ),
+    (
+        "terminal",
+        "Every task runs on a PTY and any task can be reached with \
+         `don attach`, so there is no terminal to hand over. Use \
+         `interactive = true` to say a task waits for a human, which is what \
+         `terminal = \"foreground\"` had come to mean.",
+    ),
+];
 
 /// Reject a config that still uses a removed key, by name and location.
 fn reject_removed_keys(value: &toml::Value) -> Result<(), String> {
@@ -942,7 +949,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// config-parse time so the collision is caught before the user tries to
 /// invoke the task.
 const RESERVED_PARAM_NAMES: &[&str] = &[
-    "all-pending",
     "no-prompt",
     "wait",
     "timeout",
@@ -3148,6 +3154,21 @@ mod tests {
                 name: "turbo task",
                 input: "[tasks.build]\ncmd = \"true\"\nturbo.task = \"build\"\n",
                 want_fragment: Some("task 'build': 'turbo' is no longer supported"),
+            },
+            Case {
+                name: "the terminal key, in either spelling",
+                input: "[tasks.console]\ncmd = \"true\"\nterminal = \"foreground\"\n",
+                want_fragment: Some("task 'console': 'terminal' is no longer supported"),
+            },
+            Case {
+                name: "the terminal key as a table",
+                input: "[tasks.console]\ncmd = \"true\"\nterminal = { mode = \"muxed\" }\n",
+                want_fragment: Some("`interactive = true`"),
+            },
+            Case {
+                name: "the key that replaced it parses",
+                input: "[tasks.console]\ncmd = \"true\"\ninteractive = true\n",
+                want_fragment: None,
             },
             Case {
                 name: "bazel is untouched",

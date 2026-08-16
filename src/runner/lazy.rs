@@ -1,43 +1,30 @@
-//! Just-in-time activation helpers for lazy services.
+//! Narration for a lazy service's first connection.
 //!
-//! `Lazy` means no connection has requested the service yet. The first
-//! connection transitions it to `Pending`, after which the normal dependency
-//! scheduler owns it just like any other service.
+//! `Lazy` means no connection has requested the service yet. Its supervisor
+//! moves itself to `Pending` in the same step it takes the demand — this only
+//! explains the wait that follows, if there is one.
 
-use super::{Runner, ServiceState};
+use super::Runner;
 
 impl Runner {
-    /// Record the first proxy connection for a lazy service.
-    ///
-    /// Moving to `Pending` is the request: no parallel name set is needed, and
-    /// the normal pending-process scheduler can wait, cascade dependency failure,
-    /// and start the service when its dependencies become ready.
     /// A supervisor reports that something now wants it running.
     ///
-    /// The supervisor owns the demand itself; this only projects it, so
-    /// `don status` can say `Pending` and dependents keep waiting. A process
-    /// that already holds a live one has an authoritative state already, and
-    /// says nothing here.
+    /// Demand is only ever raised by a lazy service's proxy, so there is no
+    /// task case. A process already holding a live one says nothing: its phase
+    /// is authoritative and a duplicate trigger changes nothing.
     pub(in crate::runner) fn handle_demand(&mut self, name: &str, _demand: super::Demand) {
-        // Already holding a live process: its state is authoritative.
         if self.service_runtime(name).is_some() {
             return;
         }
         if self.services.contains_key(name) {
             self.narrate_lazy_demand(name);
-            self.set_service_state(name, ServiceState::Pending);
-            // Whether an artifact has to be built first is the supervisor's
-            // business: it asked for the build the moment it saw this same
-            // demand, and reports its progress like any other build.
-        } else if self.tasks.contains_key(name) {
-            self.set_task_state(name, super::TaskState::Pending);
         }
     }
 
     /// Say why a first connection is or isn't about to start the service.
     fn narrate_lazy_demand(&mut self, name: &str) {
         let deps = match self.services.get(name) {
-            Some(rs) if rs.state() == ServiceState::Lazy => rs.resolved.depends_on.clone(),
+            Some(rs) => rs.resolved.depends_on.clone(),
             _ => return,
         };
 

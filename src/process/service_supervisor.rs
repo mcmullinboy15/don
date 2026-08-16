@@ -49,7 +49,6 @@ pub(crate) struct StartRequest {
 /// replaces it. As one mailbox item it also cannot interleave with anything
 /// else this service was asked to do.
 pub(crate) struct RestartRequest {
-    pub(crate) config: ShutdownConfig,
     pub(crate) wait_full_exit: bool,
     /// See [`StopRequest::interrupt`].
     pub(crate) interrupt: Option<tokio::sync::watch::Receiver<bool>>,
@@ -122,25 +121,6 @@ pub(crate) enum ServiceCommand {
     /// The reply waits for the output reader to drain, so "stopped" can
     /// never outrun the process's last lines.
     Stop(StopRequest),
-    /// Adjust the owned proxy. Applied immediately, even while a start is
-    /// being prepared — a proxy directive is never a supersession.
-    Proxy(ProxyDirective),
-}
-
-/// What the runner may ask a supervisor to do with its proxy.
-///
-/// The runner stays the *decider* — connection policy is derived from
-/// lifecycle state it folds, and backend activation on ready is gated by a
-/// ready outcome it resolves — but the proxy itself lives here, so decisions
-/// arrive as directives. Mailbox FIFO gives the only ordering that matters:
-/// a `ClearBackend` sent before a `Stop` is applied before the stop runs.
-pub(crate) enum ProxyDirective {
-    /// Set the connection policy (serve / lazy-trigger / refuse).
-    SetPolicy(crate::proxy::ConnectionPolicy),
-    /// Point forwarding backends at their configured addresses.
-    SetBackend,
-    /// Stop listening entirely — teardown is beginning.
-    Shutdown,
 }
 
 /// A service's bound proxy and its lazy-demand channel, handed to the
@@ -173,8 +153,12 @@ pub(crate) struct ServiceWired {
 }
 
 /// Parameters for [`ServiceCommand::Stop`].
+///
+/// No shutdown config: how long this service's grace period is, and which
+/// signal starts it, is merged from its own config over the workspace default
+/// by the supervisor that holds it. Every caller used to compute the same
+/// merge and hand back an answer the owner already had.
 pub(crate) struct StopRequest {
-    pub(crate) config: ShutdownConfig,
     /// Skip the graceful signal entirely (force-shutdown path).
     pub(crate) force: bool,
     pub(crate) wait_full_exit: bool,
@@ -228,6 +212,14 @@ pub(crate) struct StartEnv {
     /// Project-wide watch-ignore patterns, for the build spec this supervisor
     /// hands the build manager.
     pub(crate) global_watch_ignore: Vec<String>,
+    /// What every process says about itself. This supervisor computes its own
+    /// permission from its dependencies' entries — see [`crate::gate::level`].
+    pub(crate) facts: crate::facts::FactsReader,
+    /// Set once setup is far enough along for anything to start. A supervisor
+    /// answers its own "may I run?", and a service with no dependencies is
+    /// permitted from the moment its facts exist — which is before the
+    /// watcher does.
+    pub(crate) released: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Owner half for services.
@@ -235,20 +227,23 @@ pub(crate) type ServiceStarts = super::registry::Supervisors<ServiceCommand>;
 
 /// Start one start-supervisor per service, each taking ownership of its
 /// bound proxy (if any) from `proxies`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_supervisors<'a>(
     names: impl Iterator<Item = &'a String>,
     env: &StartEnv,
     outputs: &dyn Fn(&str) -> Option<ProcessOutput>,
     resolved: &dyn Fn(&str) -> Option<crate::config::ResolvedService>,
+    dependents: &dyn Fn(&str) -> Vec<String>,
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     proxies: &mut std::collections::HashMap<String, ProxyAssets>,
-    gates: &mut std::collections::HashMap<String, crate::gate::GateReader>,
+    publishers: &mut std::collections::HashMap<String, crate::facts::FactsPublisher>,
 ) -> ServiceStarts {
     ServiceStarts::spawn_all(names, |name, rx, busy| {
         let output = outputs(&name);
         let assets = proxies.remove(&name);
         let resolved = resolved(&name);
-        let gate = gates.remove(&name);
+        let dependents = dependents(&name);
+        let facts = publishers.remove(&name);
         supervise(
             name,
             rx,
@@ -258,7 +253,8 @@ pub(crate) fn spawn_supervisors<'a>(
             busy,
             assets,
             resolved,
-            gate,
+            dependents,
+            facts,
         )
     })
 }
@@ -289,13 +285,146 @@ fn build_context(
     }))
 }
 
-/// Wait on a gate slot, parking forever when there is none — so an absent
-/// gate never completes and never consumes its `select!` branch.
-async fn wait_gate(gate: &mut Option<crate::gate::GateReader>) -> Option<()> {
-    match gate.as_mut() {
-        Some(gate) => gate.changed().await,
-        None => std::future::pending().await,
+/// Land a failed service in the phase its restart policy implies.
+///
+/// A lazy service that may still retry returns to `Lazy` so its proxy re-arms;
+/// everything else — including a lazy service past the crash ceiling — stays
+/// `Failed`.
+fn apply_failure_phase(owner: &mut PhaseOwner, policy: &super::health::PolicyOutcome) {
+    let phase = match policy {
+        super::health::PolicyOutcome::LazyRearm { give_up: false, .. } => {
+            crate::process::ServiceState::Lazy
+        }
+        _ => crate::process::ServiceState::Failed,
+    };
+    owner.transition(phase, policy.restart_pending());
+}
+
+/// This service's phase, and the write end that tells the rest of the stack
+/// about it.
+///
+/// Bundled because the three things that make up a service's published facts —
+/// what phase it is in, what it holds, whether it has a retry armed — change at
+/// different moments but must always be published *together*: a reader that saw
+/// a new phase against a stale pid would draw the wrong conclusion about
+/// liveness. Every mutator here republishes the whole value.
+///
+/// `DependencyFailed` is resolved here rather than passed in: it is a fact
+/// about this process's own dependencies, and the roots come from the same
+/// snapshot every other question is answered from.
+struct PhaseOwner {
+    name: String,
+    deps: Vec<crate::config::Dependency>,
+    world: crate::facts::FactsReader,
+    facts: crate::facts::FactsPublisher,
+    phase: crate::process::ServiceState,
+    runtime: Option<crate::state_store::ServiceRuntime>,
+    restart_pending: bool,
+}
+
+impl PhaseOwner {
+    fn publish(&mut self) {
+        let stranded = if self.phase == crate::process::ServiceState::DependencyFailed {
+            crate::gate::failed_roots(&self.deps, &self.world.snapshot())
+        } else {
+            Vec::new()
+        };
+        self.facts.publish(
+            crate::facts::ProcessFacts::for_service(
+                &self.name,
+                self.phase,
+                self.runtime.clone(),
+                stranded,
+            )
+            .with_restart_pending(self.restart_pending),
+        );
     }
+
+    /// Enter `phase`. Idempotent — the publisher drops a republish that says
+    /// nothing new, which is what keeps the merge cycle from spinning.
+    fn set(&mut self, phase: crate::process::ServiceState) {
+        self.phase = phase;
+        self.publish();
+    }
+
+    /// Record what this supervisor now holds. Published independently of any
+    /// phase change: a wire can land while the service is already `Running`,
+    /// and custody is the liveness answer every reader wants.
+    fn set_runtime(&mut self, runtime: Option<crate::state_store::ServiceRuntime>) {
+        self.runtime = runtime;
+        self.publish();
+    }
+
+    fn set_restart_pending(&mut self, restart_pending: bool) {
+        self.restart_pending = restart_pending;
+        self.publish();
+    }
+
+    /// Enter `phase` and record what the restart policy decided, in **one**
+    /// publication.
+    ///
+    /// Two would let a reader observe the failure before the retry that is
+    /// already armed beside it — and a reader asking "is anything still coming
+    /// up?" would answer no, and tear the stack down. Publishing them together
+    /// is what the scheduler's old single-threaded fold gave for free.
+    fn transition(&mut self, phase: crate::process::ServiceState, restart_pending: bool) {
+        self.phase = phase;
+        self.restart_pending = restart_pending;
+        self.publish();
+    }
+
+    /// Reconcile against the dependencies' current facts.
+    ///
+    /// Only a process that is waiting — or already stranded — has anything to
+    /// reconcile: one that is building, starting, running or stopped is past
+    /// the point where a dependency's failure retroactively strands it.
+    /// Returns what to narrate, if anything.
+    fn reconcile_dependencies(&mut self) -> Option<String> {
+        use crate::process::ServiceState;
+        if !matches!(
+            self.phase,
+            ServiceState::Pending | ServiceState::DependencyFailed
+        ) {
+            return None;
+        }
+        let roots = crate::gate::failed_roots(&self.deps, &self.world.snapshot());
+        if !roots.is_empty() {
+            let was_stranded = self.phase == ServiceState::DependencyFailed;
+            let previous = self.facts.current_roots().to_vec();
+            self.set(ServiceState::DependencyFailed);
+            if was_stranded && previous == roots {
+                return None;
+            }
+            return Some(match roots.as_slice() {
+                [one] => format!("skipped (dependency '{one}' failed)"),
+                many => format!("skipped (dependencies '{}' failed)", many.join("', '")),
+            });
+        }
+        if self.phase == ServiceState::DependencyFailed {
+            // A lazy service reaches here only after a connection moved it out
+            // of `Lazy`; `Pending` preserves that queued request.
+            self.set(ServiceState::Pending);
+            return Some(String::new());
+        }
+        None
+    }
+}
+
+/// How far this service's dependencies currently let it go.
+///
+/// Read at the moment it is needed rather than delivered, which is what makes
+/// the old revision stamp unnecessary: demand and permission are now both held
+/// by this loop, so there is no window in which one can be staler than the
+/// other. Nothing may go anywhere until setup releases the stack.
+fn current_level(
+    released: bool,
+    world: &crate::facts::FactsReader,
+    resolved: &crate::config::ResolvedService,
+) -> crate::gate::Gate {
+    if !released {
+        return crate::gate::Gate::Blocked;
+    }
+    crate::gate::level(&resolved.depends_on, &world.snapshot())
 }
 
 /// Stop a service brought up by a start that has since been superseded.
@@ -345,25 +474,28 @@ async fn supervise(
     busy: Arc<AtomicBool>,
     proxy_assets: Option<ProxyAssets>,
     resolved: Option<crate::config::ResolvedService>,
-    mut gate: Option<crate::gate::GateReader>,
+    dependents: Vec<String>,
+    facts: Option<crate::facts::FactsPublisher>,
 ) {
     // Names come from the same map the configs do, so `None` is unreachable;
     // ending the supervisor beats panicking, and callers already treat a dead
     // mailbox as "supervisor is gone".
     let Some(mut resolved) = resolved else { return };
+    let Some(facts) = facts else { return };
     let service_writer = output.as_ref().map(|output| output.writer());
+    // What every peer says about itself, and whether the stack is open for
+    // business yet. Both are read at the top of the idle loop — the single
+    // place demand is spent — and merely woken from the select below.
+    let mut world = env.facts.clone();
+    let mut watching_world = true;
+    let mut released_rx = env.released.clone();
+    let mut stack_released = *released_rx.borrow();
     // Whether the build manager has produced this service's artifact, so the
     // per-service build inside `start_service_worker` must not run again.
     let mut batch_built = false;
     // Where the build manager delivers this service's artifact.
     let (prepare_tx, mut prepare_rx) =
         mpsc::unbounded_channel::<crate::build_tool::batch::PrepareOutcome>();
-    // An artifact request is outstanding. A supervisor that needs an artifact
-    // does not spawn until it has one, whatever its gate says — an artifact is
-    // as much a precondition as a dependency, and getting it is its own job.
-    let mut awaiting_artifact = resolved.is_build_tool_managed()
-        && !resolved.lazy
-        && request_artifact(&name, &resolved, &env, &prepare_tx, &report_tx);
     // Whether anything wants this service running. One-shot: see `Demand`.
     // A lazy service starts life unwanted and is demanded by its first
     // connection; everything else is wanted from the moment it exists.
@@ -372,11 +504,6 @@ async fn supervise(
     } else {
         super::Demand::Scheduled
     };
-    // The revision current when this demand arose. A level published before
-    // it cannot have taken it into account, so it is not safe to act on —
-    // see `crate::gate`. Starts at 0 so the initial set waits for the
-    // scheduler's first pass.
-    let mut demand_rev: u64 = 0;
     // The docker host-port mapping this supervisor's last spawn got. Retained
     // across stops so the next start can request the same ports.
     let mut last_docker_bindings: Vec<crate::docker::DockerPortBinding> = Vec::new();
@@ -387,6 +514,34 @@ async fn supervise(
     let (mut proxy, mut demand_rx) = match proxy_assets {
         Some(assets) => (Some(assets.proxy), assets.demand_rx),
         None => (None, None),
+    };
+    // This service's phase is this supervisor's to answer for, because every
+    // input it depends on is observed here. A lazy service with a bound proxy
+    // starts life merely listening; everything else starts life wanted.
+    let mut owner = PhaseOwner {
+        name: name.clone(),
+        deps: resolved.depends_on.clone(),
+        world: world.clone(),
+        facts,
+        phase: if resolved.lazy && proxy.is_some() {
+            super::ServiceState::Lazy
+        } else {
+            super::ServiceState::Pending
+        },
+        runtime: None,
+        restart_pending: false,
+    };
+    owner.publish();
+    // An artifact request is outstanding. A supervisor that needs an artifact
+    // does not spawn until it has one, whatever its dependencies allow — an
+    // artifact is as much a precondition as a dependency, and getting it is
+    // its own job.
+    //
+    // Asked for *after* the owner exists, so the `Building` phase this puts
+    // the service into is published by the thing that entered it.
+    let mut awaiting_artifact = resolved.is_build_tool_managed() && !resolved.lazy && {
+        owner.set(super::ServiceState::Building);
+        request_artifact(&name, &resolved, &env, &prepare_tx)
     };
     // The process this supervisor currently owns, from wire to reap/stop.
     let mut held: Option<service::ServiceHandle> = None;
@@ -442,12 +597,104 @@ async fn supervise(
     // producer, one channel). Cleared on Start/Stop so a superseded run's
     // outcome can never be forwarded after a newer prepared.
     let mut ready_pending: Option<tokio::sync::oneshot::Receiver<ReadyOutcome>> = None;
+    // How to narrate this spawn's ready check, resolved at wire time against
+    // the proxy and docker state the probe will actually run against.
+    let mut ready_description = String::from("started");
+    // Whether the start in flight is one the dependency graph asked for. A
+    // manual `don start` or a rebuild's respawn narrates differently, and
+    // nothing is waiting on its outcome.
+    let mut scheduled_start = false;
+    // Teardown runs exactly once. A second pass would re-stop a process that
+    // is already gone and re-publish a phase nothing changed.
+    let mut torn_down = false;
+    // Watched as a `select!` arm, not just polled: without it the supervisor
+    // sleeps through the shutdown signal until some unrelated event happens to
+    // wake it.
+    let mut teardown_rx = env.shutdown_rx.clone();
+    // The escalation watch: a second Ctrl+C cuts every grace period short,
+    // including the wait for dependents.
+    let mut force_rx = crate::signals::force_watch();
 
     loop {
+        sync_connection_policy(&name, &env.emitter, &mut proxy, &owner);
         let command = match pending.take() {
             Some(command) => command,
             None => loop {
+                sync_connection_policy(&name, &env.emitter, &mut proxy, &owner);
                 busy.store(false, Ordering::Relaxed);
+                // Teardown, decided here rather than sequenced from outside:
+                // wait for the processes that depend on this one to be gone,
+                // then end what this one holds. Runs once — after it, the
+                // supervisor has nothing left to own.
+                if *env.shutdown_rx.borrow() && !torn_down {
+                    torn_down = true;
+                    busy.store(true, Ordering::Relaxed);
+                    demand = super::Demand::None;
+                    backoff = None;
+                    super::await_dependents_gone(
+                        &name,
+                        &env.emitter,
+                        &mut world,
+                        &dependents,
+                        &mut force_rx,
+                    )
+                    .await;
+                    reader_eof = None;
+                    monitor_cancel = None;
+                    osc_sink = None;
+                    ready_pending = None;
+                    // Narrated by the process it is happening to, and only
+                    // when there is something to stop. Its position in the log
+                    // *is* the teardown order — `shutdown_test` reads exactly
+                    // that to prove dependents go first.
+                    let was_holding = held.is_some();
+                    if was_holding {
+                        owner.set(super::ServiceState::Stopping);
+                        env.emitter.service_event(&name, "stopping...");
+                    }
+                    let shutdown_config = effective_shutdown(&resolved, &env);
+                    // Read out, not borrowed across the await: a `watch::Ref`
+                    // held over one is the hazard `state_store` documents.
+                    let forced = *force_rx.borrow();
+                    let result = run_stop(
+                        &name,
+                        &env,
+                        output.as_ref(),
+                        &mut held,
+                        &mut reader,
+                        &shutdown_config,
+                        forced,
+                        true,
+                        Some(force_rx.clone()),
+                    )
+                    .await;
+                    owner.set_runtime(None);
+                    owner.transition(
+                        match &result {
+                            Ok(()) => super::ServiceState::Stopped,
+                            Err(_) => super::ServiceState::Failed,
+                        },
+                        false,
+                    );
+                    if was_holding {
+                        match &result {
+                            Ok(()) => env.emitter.service_event(&name, "stopped"),
+                            Err(message) => env.emitter.service_error_event(&name, message),
+                        }
+                    }
+                    // The listener outlived individual processes; it does not
+                    // outlive the stack.
+                    if let Some(p) = proxy.take() {
+                        p.shutdown();
+                    }
+                    let _ = report_tx.send(super::ProcessReport::ServiceStopComplete {
+                        name: name.clone(),
+                        result,
+                        reply: None,
+                    });
+                    busy.store(false, Ordering::Relaxed);
+                    continue;
+                }
                 // Start when something wants this running, its dependencies
                 // allow it, and it is holding nothing. The level is read here
                 // rather than waited on, so a grant published while this
@@ -459,28 +706,27 @@ async fn supervise(
                 if held.is_none()
                     && !awaiting_artifact
                     && !*env.shutdown_rx.borrow()
-                    && gate.as_ref().is_some_and(|reader| {
-                        let grant = reader.get();
-                        // Only a level decided *after* this demand arose can
-                        // be trusted to have accounted for it.
-                        grant.rev > demand_rev && demand.permitted_by(grant.level)
-                    })
+                    && demand.permitted_by(current_level(stack_released, &world, &resolved))
                 {
                     demand = super::Demand::None;
                     env.emitter
                         .service_debug_event(&name, "start triggered (deps satisfied)");
-                    // Tell the scheduler a start is under way, so it can fold
-                    // Pending -> Starting. Only this supervisor knows when
-                    // demand is actually spent.
-                    if report_tx
-                        .send(super::ProcessReport::ServiceStarting {
-                            name: name.clone(),
-                            restarting: false,
-                        })
-                        .is_err()
+                    // Say which non-blocking dependencies we are deliberately
+                    // not waiting for, so a start that follows a visible
+                    // failure doesn't look like don ignored the graph.
+                    for skipped in
+                        crate::gate::skipped_non_blocking(&resolved.depends_on, &world.snapshot())
                     {
-                        return;
+                        env.emitter.service_event(
+                            &name,
+                            &format!("starting without non-blocking dependency '{skipped}'"),
+                        );
                     }
+                    // The phase moves in the same synchronous step demand is
+                    // spent, so nothing can observe a service that is starting
+                    // but still says it is pending.
+                    owner.set(super::ServiceState::Starting);
+                    env.emitter.service_event(&name, "starting...");
                     busy.store(true, Ordering::Relaxed);
                     break ServiceCommand::Start(StartRequest {
                         mode: ServiceStartMode::Full,
@@ -514,6 +760,7 @@ async fn supervise(
                         }
                         if reap_and_report(
                             &name,
+                            &mut owner,
                             &mut held,
                             &report_tx,
                             &env,
@@ -569,18 +816,42 @@ async fn supervise(
                                 }
                                 decided
                             };
-                            if report_tx
-                                .send(super::ProcessReport::ServiceReady {
-                                    name: name.clone(),
-                                    success: outcome.success,
-                                    message: outcome.message,
-                                    had_check: outcome.had_check,
-                                    policy: policy_outcome,
-                                })
-                                .is_err()
-                            {
-                                return;
+                            // Only a service still `Running` is settling its
+                            // own ready check: a crash's reap already moved it.
+                            if owner.phase == super::ServiceState::Running {
+                                if outcome.success {
+                                    // Re-assert the backend on ready. This
+                                    // supervisor owns the listener, so it is a
+                                    // call rather than a directive that could
+                                    // land after the start it belongs to.
+                                    if scheduled_start
+                                        && let Some(proxy) = proxy.as_ref()
+                                    {
+                                        proxy.set_backend();
+                                    }
+                                    owner.transition(super::ServiceState::Ready, false);
+                                    if scheduled_start {
+                                        env.emitter.service_event(&name, &ready_description);
+                                    } else if !outcome.had_check {
+                                        // A checkless restart announces itself;
+                                        // "restarting..." already said a cycle
+                                        // began.
+                                        env.emitter.service_event(&name, "restarted");
+                                    }
+                                } else {
+                                    apply_failure_phase(&mut owner, &policy_outcome);
+                                    if scheduled_start
+                                        && matches!(
+                                            policy_outcome,
+                                            super::health::PolicyOutcome::None
+                                        )
+                                        && let Some(ref message) = outcome.message
+                                    {
+                                        env.emitter.service_error_event(&name, message);
+                                    }
+                                }
                             }
+                            scheduled_start = false;
                         }
                         continue;
                     }
@@ -602,15 +873,10 @@ async fn supervise(
                                 if let Some(path) = binary_path {
                                     resolved.resolved_binary_path = Some(path);
                                 }
-                                if report_tx
-                                    .send(super::ProcessReport::ArtifactBuild {
-                                        name: name.clone(),
-                                        kind: super::ProcessKind::Service,
-                                        status: super::ArtifactBuildStatus::Ready,
-                                    })
-                                    .is_err()
-                                {
-                                    return;
+                                // The artifact exists; back to waiting on
+                                // dependencies like anything else.
+                                if owner.phase == super::ServiceState::Building {
+                                    owner.set(super::ServiceState::Pending);
                                 }
                             }
                             // A watched file changed while the build ran, so
@@ -620,7 +886,7 @@ async fn supervise(
                             // against it.
                             PrepareOutcome::Stale => {
                                 awaiting_artifact = request_artifact(
-                                    &name, &resolved, &env, &prepare_tx, &report_tx,
+                                    &name, &resolved, &env, &prepare_tx,
                                 );
                             }
                             PrepareOutcome::Failed(message) => {
@@ -630,16 +896,9 @@ async fn supervise(
                                 // broken sources, so withdrawing demand here is
                                 // what keeps this away from the restart policy.
                                 demand = super::Demand::None;
-                                if report_tx
-                                    .send(super::ProcessReport::ArtifactBuild {
-                                        name: name.clone(),
-                                        kind: super::ProcessKind::Service,
-                                        status: super::ArtifactBuildStatus::Failed(message),
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
+                                env.emitter
+                                    .service_error_event(&name, &format!("build failed: {message}"));
+                                owner.set(super::ServiceState::Failed);
                             }
                         }
                         continue;
@@ -678,7 +937,6 @@ async fn supervise(
                             CycleNext::Again => break rebuild_again(),
                             CycleNext::Restart => {
                                 break ServiceCommand::Restart(Box::new(RestartRequest {
-                                    config: effective_shutdown(&resolved, &env),
                                     wait_full_exit: resolved.requires_full_exit_on_restart(),
                                     interrupt: None,
                                     // Connections arriving mid-restart queue
@@ -716,15 +974,26 @@ async fn supervise(
                             arm_backoff(&name, &env, &decided, &mut backoff, Some("unhealthy"));
                             decided
                         };
-                        if report_tx
-                            .send(super::ProcessReport::HealthChanged {
-                                name: name.clone(),
-                                healthy,
-                                policy: policy_outcome,
-                            })
-                            .is_err()
-                        {
-                            return;
+                        // Only these two phases participate: a probe that
+                        // settles after a stop or restart is about a process
+                        // this supervisor no longer holds.
+                        if healthy && owner.phase == super::ServiceState::Unhealthy {
+                            owner.transition(super::ServiceState::Ready, false);
+                            env.emitter
+                                .service_event(&name, "recovered (health check passing)");
+                        } else if !healthy && owner.phase == super::ServiceState::Ready {
+                            owner.transition(
+                                super::ServiceState::Unhealthy,
+                                policy_outcome.restart_pending(),
+                            );
+                            if matches!(policy_outcome, super::health::PolicyOutcome::None) {
+                                // `notify`: nothing was scheduled, so this line
+                                // is the only thing that will say so.
+                                env.emitter
+                                    .service_error_event(&name, "unhealthy (health check failing)");
+                            }
+                        } else {
+                            owner.set_restart_pending(policy_outcome.restart_pending());
                         }
                         continue;
                     }
@@ -737,7 +1006,6 @@ async fn supervise(
                         env.emitter
                             .service_event(&name, &format!("auto-restart firing (attempt {attempt})"));
                         break ServiceCommand::Restart(Box::new(RestartRequest {
-                            config: effective_shutdown(&resolved, &env),
                             wait_full_exit: false,
                             interrupt: None,
                             clear_backend_first: false,
@@ -751,16 +1019,37 @@ async fn supervise(
                             reset_policy: false,
                         }));
                     }
-                    // Permission changed. Nothing is decided here: the level
-                    // is read at the top of this loop, which is the single
-                    // place a grant is spent.
-                    changed = wait_gate(&mut gate), if gate.is_some() => {
-                        // The scheduler is gone. A `watch::Receiver` with no
-                        // sender errors immediately and forever, so drop the
-                        // slot rather than spin the select.
+                    // A peer's facts moved, or setup released the stack.
+                    // Nothing is decided here: the level is recomputed at the
+                    // top of this loop, which is the single place demand is
+                    // spent. Both waits end permanently once their sender is
+                    // gone, so a `None` means stop selecting rather than spin.
+                    // Teardown began. Nothing is decided here: the check at the
+                    // top of this loop is the single place it runs, and this
+                    // is only what wakes the loop to reach it.
+                    _ = teardown_rx.changed(), if !torn_down => {
+                        continue;
+                    }
+                    changed = world.changed(), if watching_world => {
                         if changed.is_none() {
-                            gate = None;
+                            watching_world = false;
                         }
+                        // A blocking dependency may have failed while this
+                        // service was waiting on it — or recovered.
+                        match owner.reconcile_dependencies() {
+                            Some(message) if message.is_empty() => {
+                                env.emitter.service_debug_event(
+                                    &name,
+                                    "dependency recovered; re-queued",
+                                );
+                            }
+                            Some(message) => env.emitter.service_error_event(&name, &message),
+                            None => {}
+                        }
+                        continue;
+                    }
+                    released = released_rx.changed(), if !stack_released => {
+                        stack_released = released.is_err() || *released_rx.borrow();
                         continue;
                     }
                     // The lazy proxy saw a connection: demand. The runner
@@ -769,7 +1058,9 @@ async fn supervise(
                         match trigger {
                             Some(_) => {
                                 demand = demand.max(super::Demand::Scheduled);
-                                demand_rev = gate.as_ref().map_or(0, |g| g.rev());
+                                if owner.phase == super::ServiceState::Lazy {
+                                    owner.set(super::ServiceState::Pending);
+                                }
                                 let _ = report_tx.send(super::ProcessReport::Demand {
                                     name: name.clone(),
                                     demand,
@@ -788,7 +1079,7 @@ async fn supervise(
                                         "first connection — building before start",
                                     );
                                     awaiting_artifact = request_artifact(
-                                        &name, &resolved, &env, &prepare_tx, &report_tx,
+                                        &name, &resolved, &env, &prepare_tx,
                                     );
                                 }
                             }
@@ -801,21 +1092,55 @@ async fn supervise(
                 }
             },
         };
-        let StartRequest {
-            mode,
-            intent,
-            fresh_backend_ports,
-        } = match command {
-            ServiceCommand::Start(request) => request,
-            ServiceCommand::Proxy(directive) => {
-                apply_proxy_directive(&name, &env.emitter, &mut proxy, directive);
-                continue;
+        let start_request = match command {
+            ServiceCommand::Start(request) => {
+                // A start someone asked for by name is admitted here, by the
+                // only thing that knows whether it can be honoured. The
+                // scheduler used to answer this from a shadow of the phase and
+                // a shared busy flag, and then this loop re-checked anyway.
+                match admit_requested_start(
+                    &name,
+                    &owner,
+                    held.is_some(),
+                    &resolved.depends_on,
+                    current_level(stack_released, &world, &resolved),
+                    &world,
+                    &request.intent,
+                ) {
+                    Ok(()) => request,
+                    Err(refusal) => {
+                        if let super::ServiceStartIntent::Reply { reply } = request.intent {
+                            let _ = reply.send(Err(refusal));
+                        }
+                        continue;
+                    }
+                }
             }
             ServiceCommand::BuildGraphChanged => {
                 request_requery(&name, &resolved, &env, &requery_tx);
                 continue;
             }
             ServiceCommand::Rebuild(request) => {
+                // A hard restart asked for by name is admitted here, for the
+                // same reason a start is: the phase it would interrupt is this
+                // supervisor's.
+                if request.source == RebuildSource::Requested
+                    && request.reply.is_some()
+                    && matches!(
+                        owner.phase,
+                        super::ServiceState::Building
+                            | super::ServiceState::Starting
+                            | super::ServiceState::Stopping
+                    )
+                {
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(Err(crate::command::CommandError::InvalidState {
+                            name: name.clone(),
+                            message: format!("cannot hard restart while {:?}", owner.phase),
+                        }));
+                    }
+                    continue;
+                }
                 // A change that arrives while a cycle is running does not
                 // start a second one: the artifact this cycle is about to
                 // produce is already out of date, so the cycle records that
@@ -884,11 +1209,6 @@ async fn supervise(
                                         let _ = reply.send(Ok(()));
                                     }
                                 }
-                                Some(ServiceCommand::Proxy(directive)) => {
-                                    apply_proxy_directive(
-                                        &name, &env.emitter, &mut proxy, directive,
-                                    );
-                                }
                                 Some(next) => {
                                     // Superseded: drop the build and take the
                                     // newer command.
@@ -924,7 +1244,6 @@ async fn supervise(
                         }
                         CycleNext::Restart => {
                             pending = Some(ServiceCommand::Restart(Box::new(RestartRequest {
-                                config: effective_shutdown(&resolved, &env),
                                 wait_full_exit: resolved.requires_full_exit_on_restart(),
                                 interrupt: None,
                                 clear_backend_first: true,
@@ -955,6 +1274,41 @@ async fn supervise(
                 continue;
             }
             ServiceCommand::Stop(request) => {
+                // A stop someone asked for is admitted here. Holding nothing
+                // is only an error if there was nothing to clear either: a
+                // lazy service that never triggered, or one parked in a
+                // failure, is *stoppable* — that is how a user clears it —
+                // and `run_stop` below is a no-op that lands `Stopped`.
+                if let StopNotify::Reply(Some(_)) = &request.notify
+                    && held.is_none()
+                    && !matches!(
+                        owner.phase,
+                        super::ServiceState::Lazy
+                            | super::ServiceState::Pending
+                            | super::ServiceState::Failed
+                            | super::ServiceState::DependencyFailed
+                    )
+                {
+                    if let StopNotify::Reply(Some(reply)) = request.notify {
+                        let _ = reply.send(Err(crate::command::CommandError::InvalidState {
+                            name: name.clone(),
+                            message: "not running".to_string(),
+                        }));
+                    }
+                    continue;
+                }
+                if let StopNotify::Reply(Some(_)) = &request.notify {
+                    env.emitter.service_event(
+                        &name,
+                        match (held.is_some(), owner.phase) {
+                            (false, super::ServiceState::Lazy | super::ServiceState::Pending) => {
+                                "stopped before lazy start"
+                            }
+                            (false, _) => "stopped (was failed)",
+                            (true, _) => "stopping... (requested)",
+                        },
+                    );
+                }
                 reader_eof = None;
                 monitor_cancel = None;
                 osc_sink = None;
@@ -969,21 +1323,30 @@ async fn supervise(
                 // Whatever the policy had queued is moot: this process is
                 // going away by request.
                 backoff = None;
+                owner.set_restart_pending(false);
                 spawned_at = None;
                 reached_ready = false;
                 ready_failed = false;
+                // Say so before the grace period, not after: a user watching
+                // `don status` during a slow shutdown is asking exactly this.
+                owner.set(super::ServiceState::Stopping);
                 let result = run_stop(
                     &name,
                     &env,
                     output.as_ref(),
                     &mut held,
                     &mut reader,
-                    &request.config,
+                    &effective_shutdown(&resolved, &env),
                     request.force,
                     request.wait_full_exit,
                     request.interrupt,
                 )
                 .await;
+                owner.set_runtime(None);
+                owner.set(match &result {
+                    Ok(()) => super::ServiceState::Stopped,
+                    Err(_) => super::ServiceState::Failed,
+                });
                 match request.notify {
                     StopNotify::Reply(reply) => {
                         if report_tx
@@ -1004,6 +1367,39 @@ async fn supervise(
                 continue;
             }
             ServiceCommand::Restart(request) => {
+                // A restart asked for by name, admitted the same way a start
+                // is. `Pending` *is* refused here, unlike a start: a restart
+                // means "replace what is running", and there is nothing to
+                // replace while the graph is still waiting.
+                if request.reply.is_some()
+                    && matches!(
+                        owner.phase,
+                        super::ServiceState::Pending
+                            | super::ServiceState::Building
+                            | super::ServiceState::Starting
+                            | super::ServiceState::Stopping
+                    )
+                {
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(Err(crate::command::CommandError::InvalidState {
+                            name: name.clone(),
+                            message: format!("cannot restart while {:?}", owner.phase),
+                        }));
+                    }
+                    continue;
+                }
+                if request.reply.is_some() {
+                    env.emitter.service_event(
+                        &name,
+                        if held.is_some() {
+                            "stopping... (requested restart)"
+                        } else {
+                            // Nothing to replace: the stop below is a no-op and
+                            // this is really just a start.
+                            "starting..."
+                        },
+                    );
+                }
                 reader_eof = None;
                 monitor_cancel = None;
                 osc_sink = None;
@@ -1013,9 +1409,11 @@ async fn supervise(
                     policy.reset();
                 }
                 backoff = None;
+                owner.set_restart_pending(false);
                 spawned_at = None;
                 reached_ready = false;
                 ready_failed = false;
+                owner.set(super::ServiceState::Stopping);
                 // Owning the proxy makes this a call rather than a mailbox
                 // hop, so it cannot arrive after the stop it must precede.
                 if request.clear_backend_first
@@ -1023,13 +1421,16 @@ async fn supervise(
                 {
                     proxy.clear_backend();
                 }
+                // Bound outside the future: `run_stop` borrows it, and a
+                // temporary would not outlive the `select!` below.
+                let shutdown_config = effective_shutdown(&resolved, &env);
                 let stop = run_stop(
                     &name,
                     &env,
                     output.as_ref(),
                     &mut held,
                     &mut reader,
-                    &request.config,
+                    &shutdown_config,
                     false,
                     request.wait_full_exit,
                     request.interrupt,
@@ -1054,11 +1455,6 @@ async fn supervise(
                                     let _ = reply.send(Ok(()));
                                 }
                             }
-                            Some(ServiceCommand::Proxy(directive)) => {
-                                apply_proxy_directive(
-                                    &name, &env.emitter, &mut proxy, directive,
-                                );
-                            }
                             Some(next) => {
                                 pending = Some(next);
                                 break (&mut stop).await;
@@ -1077,6 +1473,14 @@ async fn supervise(
                 // A failed stop leaves nothing safe to start over, and a
                 // teardown that began mid-restart wants no new process.
                 let restarting = result.is_ok() && !stale_now && !*env.shutdown_rx.borrow();
+                // The stop half lands its own phase, so the pair a restart has
+                // always shown — Stopped then Starting — is two publications
+                // from one owner rather than two folds in another actor.
+                owner.set_runtime(None);
+                owner.set(match &result {
+                    Ok(()) => super::ServiceState::Stopped,
+                    Err(_) => super::ServiceState::Failed,
+                });
                 if report_tx
                     .send(super::ProcessReport::ServiceStopComplete {
                         name: name.clone(),
@@ -1090,18 +1494,15 @@ async fn supervise(
                 if !restarting {
                     continue;
                 }
-                // Reported separately from the stop so the scheduler folds
-                // Stopped before Starting — the transition pair a restart has
-                // always shown.
-                if report_tx
-                    .send(super::ProcessReport::ServiceStarting {
-                        name: name.clone(),
-                        restarting: request.announce_restarting,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
+                owner.set(super::ServiceState::Starting);
+                env.emitter.service_event(
+                    &name,
+                    if request.announce_restarting {
+                        "restarting..."
+                    } else {
+                        "starting..."
+                    },
+                );
                 // Committing to a spawn brings the process up to the current
                 // artifact.
                 artifact_ahead = false;
@@ -1113,6 +1514,16 @@ async fn supervise(
                 }
             }
         };
+        // However this start arrived — spent demand, a restart's second half,
+        // or a command from a client — it is `Starting` from here. Idempotent:
+        // the paths that announce themselves have already said so.
+        let StartRequest {
+            mode,
+            intent,
+            fresh_backend_ports,
+        } = start_request;
+        owner.set(super::ServiceState::Starting);
+        scheduled_start = matches!(intent, super::ServiceStartIntent::Scheduled);
 
         // A new start supersedes the previous run's in-flight ready
         // outcome; forwarding it after this run's prepared report would be
@@ -1138,12 +1549,14 @@ async fn supervise(
                             super::health::PolicyOutcome::None
                         }
                     };
+                    // This start is over before it began, so land the phase
+                    // here — nothing further in this loop will.
+                    apply_failure_phase(&mut owner, &decided);
                     if report_tx
                         .send(super::ProcessReport::ServiceStartPrepared {
                             name: name.clone(),
                             intent,
                             result: Err(message),
-                            policy: decided,
                         })
                         .is_err()
                     {
@@ -1170,12 +1583,12 @@ async fn supervise(
                         super::health::PolicyOutcome::None
                     }
                 };
+                apply_failure_phase(&mut owner, &decided);
                 if report_tx
                     .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
                         intent,
                         result: Err(message),
-                        policy: decided,
                     })
                     .is_err()
                 {
@@ -1216,9 +1629,6 @@ async fn supervise(
                     // one order-sensitive pair the runner sends is
                     // ClearBackend-then-Stop, and that order is preserved
                     // because the directive comes first in the mailbox.
-                    Some(ServiceCommand::Proxy(directive)) => {
-                        apply_proxy_directive(&name, &env.emitter, &mut proxy, directive);
-                    }
                     Some(next) => superseded = Some(next),
                     // Guarded so a closed mailbox doesn't spin this select.
                     None => mailbox_closed = true,
@@ -1259,6 +1669,8 @@ async fn supervise(
                             proxy.as_ref(),
                             &wired.docker_port_bindings,
                         );
+                        // Captured now, while the probe target is resolved.
+                        ready_description = describe_ready(ready.as_ref());
                         // Remember the mapping so a restart can request the
                         // same host ports. This supervisor produced them, so
                         // its copy is the authoritative one.
@@ -1291,21 +1703,36 @@ async fn supervise(
                     }
                     (Ok(_), _) => super::health::PolicyOutcome::None,
                 };
+                // Custody and phase move together. `Running` means "this
+                // supervisor holds a process"; the runtime detail beside it is
+                // the record of *which*, not a copy of one.
+                match &wired {
+                    Ok(w) => {
+                        owner.set_runtime(Some(crate::state_store::ServiceRuntime {
+                            pid: w.pgid,
+                            docker: w.identity == super::ServiceHandleIdentity::Docker,
+                            docker_ports: crate::docker::describe_port_bindings(
+                                &w.docker_port_bindings,
+                            ),
+                        }));
+                        owner.set(super::ServiceState::Running);
+                    }
+                    Err(_) => apply_failure_phase(&mut owner, &prepare_policy),
+                }
                 if report_tx
                     .send(super::ProcessReport::ServiceStartPrepared {
                         name: name.clone(),
                         intent,
                         result: wired.map_err(|failure| failure.message),
-                        policy: prepare_policy,
                     })
                     .is_err()
                 {
                     return;
                 }
-                // Start the ready check — or, with none configured, report
-                // ready now. Both flow after the prepared report above on
-                // the same channel from this same loop, so the fold always
-                // sees prepared first.
+                // Start the ready check — or, with none configured, be ready
+                // now. A service with no check has nothing to wait for, so the
+                // phase moves here rather than through a probe that would
+                // report success immediately.
                 match ready_parts {
                     Some((Some(ready), exit_rx, cancel_rx)) => {
                         ready_pending = Some(spawn_ready_racer(
@@ -1315,20 +1742,24 @@ async fn supervise(
                             health_tx.clone(),
                         ));
                     }
-                    Some((None, _exit_rx, _cancel_rx))
-                        if report_tx
-                            .send(super::ProcessReport::ServiceReady {
-                                name: name.clone(),
-                                success: true,
-                                message: None,
-                                had_check: false,
-                                policy: super::health::PolicyOutcome::None,
-                            })
-                            .is_err() =>
-                    {
-                        return;
+                    Some((None, ..)) => {
+                        policy.on_ready();
+                        backoff = None;
+                        reached_ready = true;
+                        if scheduled_start && let Some(proxy) = proxy.as_ref() {
+                            proxy.set_backend();
+                        }
+                        owner.transition(super::ServiceState::Ready, false);
+                        if scheduled_start {
+                            env.emitter.service_event(&name, &ready_description);
+                        } else {
+                            // A checkless restart announces itself;
+                            // "restarting..." already said a cycle began.
+                            env.emitter.service_event(&name, "restarted");
+                        }
+                        scheduled_start = false;
                     }
-                    Some((None, ..)) | None => {}
+                    None => {}
                 }
             }
         }
@@ -1374,18 +1805,7 @@ fn request_artifact(
     resolved: &crate::config::ResolvedService,
     env: &StartEnv,
     outcome: &mpsc::UnboundedSender<crate::build_tool::batch::PrepareOutcome>,
-    report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
 ) -> bool {
-    if report_tx
-        .send(super::ProcessReport::ArtifactBuild {
-            name: name.to_string(),
-            kind: super::ProcessKind::Service,
-            status: super::ArtifactBuildStatus::Started,
-        })
-        .is_err()
-    {
-        return false;
-    }
     let working_dir = super::paths::working_dir_for(&env.base_dir, resolved.dir.as_deref());
     let ignore = super::paths::resolve_watch_ignore_patterns(
         &working_dir,
@@ -1637,38 +2057,119 @@ async fn run_stop(
 /// Whether a policy is a *change* is answered by the proxy itself rather than
 /// by a shadow of what was last commanded — the owner knows. Narrating the
 /// refusal edge belongs here for the same reason.
-fn apply_proxy_directive(
+/// Keep the listener's connection policy in step with the service.
+///
+/// Queuing connections is right while a service is starting or restarting — a
+/// client waits a moment and gets served. It is wrong once the service has
+/// failed *with no process left*: nothing is going to read that socket, so the
+/// connection is refused instead of left hanging.
+///
+/// The liveness half matters. `Failed` does not imply "the process is gone": a
+/// service whose ready check fails keeps running under the default
+/// `on_failure = "notify"` and may well be serving traffic. Don must not close
+/// its clients' connections — and in listenfd mode must not race that live
+/// child for accepts. Only a service that has both failed and lost its process
+/// refuses.
+///
+/// Derived from the two things this supervisor already owns, which is why it
+/// is a call and not a directive: a directive computed elsewhere could arrive
+/// after the start it was meant to describe.
+/// Whether a start someone asked for by name can be honoured.
+///
+/// Only [`ServiceStartIntent::Reply`] starts are admitted: the graph's own
+/// starts already waited for permission, and a restart's second half is part
+/// of an operation this supervisor is already committed to.
+///
+/// Every input is this supervisor's own — the phase it published, the process
+/// it holds, the level it computes. The scheduler used to answer this from a
+/// copy of the first, a projection of the second and a shared `AtomicBool`,
+/// and this loop re-checked it anyway.
+///
+/// [`ServiceStartIntent::Reply`]: super::ServiceStartIntent::Reply
+fn admit_requested_start(
+    name: &str,
+    owner: &PhaseOwner,
+    holding: bool,
+    deps: &[crate::config::Dependency],
+    level: crate::gate::Gate,
+    world: &crate::facts::FactsReader,
+    intent: &super::ServiceStartIntent,
+) -> Result<(), crate::command::CommandError> {
+    use crate::command::CommandError;
+    use crate::process::ServiceState;
+
+    if !matches!(intent, super::ServiceStartIntent::Reply { .. }) {
+        return Ok(());
+    }
+    // `Pending` is deliberately absent. It does not mean "busy", it means
+    // "wanted, waiting for dependencies" — and overriding that wait is exactly
+    // what an explicit start is for. It falls through to the dependency rule.
+    if matches!(
+        owner.phase,
+        ServiceState::Building | ServiceState::Starting | ServiceState::Stopping
+    ) {
+        return Err(CommandError::InvalidState {
+            name: name.to_string(),
+            message: format!("cannot start while {:?}", owner.phase),
+        });
+    }
+    if holding {
+        return Err(CommandError::InvalidState {
+            name: name.to_string(),
+            message: "already running".to_string(),
+        });
+    }
+    // An explicit start honours the dependency graph, on the *relaxed* rule: a
+    // dependency still coming up is worth waiting for, so refuse and say so;
+    // one that has settled never will be, so proceed — they asked for this by
+    // name.
+    if !super::Demand::Requested.permitted_by(level) {
+        let snapshot = world.snapshot();
+        let waiting: Vec<&str> = deps
+            .iter()
+            .filter(|dep| !snapshot.satisfied(&dep.name) && !snapshot.settled(&dep.name))
+            .map(|dep| dep.name.as_str())
+            .collect();
+        return Err(CommandError::InvalidState {
+            name: name.to_string(),
+            message: format!("waiting for dependency '{}'", waiting.join("', '")),
+        });
+    }
+    Ok(())
+}
+
+fn connection_policy_for(
+    phase: crate::process::ServiceState,
+    live: bool,
+) -> crate::proxy::ConnectionPolicy {
+    if phase == crate::process::ServiceState::Lazy {
+        crate::proxy::ConnectionPolicy::LazyTrigger
+    } else if phase.refuses_connections(live) {
+        crate::proxy::ConnectionPolicy::Refuse
+    } else {
+        crate::proxy::ConnectionPolicy::Serve
+    }
+}
+
+fn sync_connection_policy(
     name: &str,
     emitter: &LifecycleEmitter,
     proxy: &mut Option<crate::proxy::ServiceProxy>,
-    directive: ProxyDirective,
+    owner: &PhaseOwner,
 ) {
-    match directive {
-        ProxyDirective::SetPolicy(policy) => {
-            let Some(p) = proxy.as_mut() else { return };
-            if !p.set_policy(policy) {
-                return;
-            }
-            // Only the refusal edge is worth a line, and it belongs in the
-            // normal log: a dev staring at `ECONNRESET` in their browser
-            // shouldn't have to rerun with `--verbose` to find out why.
-            match policy {
-                crate::proxy::ConnectionPolicy::Refuse => {
-                    emitter.service_error_event(name, "proxy refusing connections (service failed)")
-                }
-                _ => emitter.service_event(name, "proxy accepting connections again"),
-            }
+    let Some(p) = proxy.as_mut() else { return };
+    let policy = connection_policy_for(owner.phase, owner.runtime.is_some());
+    if !p.set_policy(policy) {
+        return;
+    }
+    // Only the refusal edge is worth a line, and it belongs in the normal log:
+    // a dev staring at `ECONNRESET` in their browser shouldn't have to rerun
+    // with `--verbose` to find out why.
+    match policy {
+        crate::proxy::ConnectionPolicy::Refuse => {
+            emitter.service_error_event(name, "proxy refusing connections (service failed)");
         }
-        ProxyDirective::SetBackend => {
-            if let Some(p) = proxy.as_ref() {
-                p.set_backend();
-            }
-        }
-        ProxyDirective::Shutdown => {
-            if let Some(p) = proxy.take() {
-                p.shutdown();
-            }
-        }
+        _ => emitter.service_event(name, "proxy accepting connections again"),
     }
 }
 
@@ -1824,6 +2325,26 @@ async fn wait_ready(
 
 /// Resolve this spawn's ready check against its live proxy and docker
 /// state — the same algorithm the runner's status path runs over shadows.
+/// How to describe a ready check that just passed, in terms of what was
+/// actually probed rather than what the config asked for.
+///
+/// Said by the supervisor that ran the probe. It used to be assembled by the
+/// scheduler from the endpoint projection, which meant re-deriving what this
+/// loop already resolved — and, once phase moved here, reading a phase that
+/// had not arrived yet.
+fn describe_ready(ready: Option<&crate::config::ReadyCheck>) -> String {
+    match ready {
+        Some(r) if r.tcp.is_some() => {
+            format!("ready (tcp {})", r.tcp.as_deref().unwrap_or("unknown"))
+        }
+        Some(r) if r.http.is_some() => {
+            format!("ready (http {})", r.http.as_deref().unwrap_or("unknown"))
+        }
+        Some(r) if r.exec.is_some() => "ready (exec)".to_string(),
+        _ => "started".to_string(),
+    }
+}
+
 fn resolve_supervisor_ready(
     resolved: &crate::config::ResolvedService,
     proxy: Option<&crate::proxy::ServiceProxy>,
@@ -1889,6 +2410,7 @@ fn spawn_ready_racer(
 #[allow(clippy::too_many_arguments)]
 async fn reap_and_report(
     name: &str,
+    owner: &mut PhaseOwner,
     held: &mut Option<service::ServiceHandle>,
     report_tx: &mpsc::UnboundedSender<super::ProcessReport>,
     env: &StartEnv,
@@ -1904,7 +2426,7 @@ async fn reap_and_report(
     let Some(service::ServiceHandle::Process(mut proc)) = held.take() else {
         return Ok(());
     };
-    let pgid = proc.pgid();
+    let _pgid = proc.pgid();
     // The reader already hit end-of-stream, so this wait returns promptly.
     let status = proc.wait().await.ok();
     let clean = status.as_ref().is_some_and(|s| s.success());
@@ -1929,12 +2451,21 @@ async fn reap_and_report(
         arm_backoff(name, env, &decided, backoff, Some(&message));
         decided
     };
+    // Custody is over either way. A service can sit in `Failed` with its
+    // process still alive — a ready check that failed under `notify` — so a
+    // phase that is already `Failed` stays put and only the runtime clears.
+    owner.set_runtime(None);
+    if clean {
+        owner.transition(crate::process::ServiceState::Stopped, false);
+        env.emitter.service_event(name, "exited cleanly (status 0)");
+    } else if owner.phase != crate::process::ServiceState::Failed {
+        apply_failure_phase(owner, &decided);
+    } else {
+        owner.set_restart_pending(decided.restart_pending());
+    }
     report_tx
         .send(super::ProcessReport::ServiceExited {
             name: name.to_string(),
-            pgid,
-            status,
-            policy: decided,
         })
         .map_err(|_| ())
 }
@@ -2040,10 +2571,12 @@ mod tests {
     use crate::build_tool::batcher::BatchRequest;
     use crate::config::{LogConfig, Platform, ProxyEntry, ProxyMode};
     use crate::output::OutputManager;
-    use crate::proxy::{ConnectionPolicy, ServiceProxy};
+    use crate::proxy::ServiceProxy;
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
 
+    /// An env that has *not* been released, matching a supervisor spawned
+    /// before setup finishes: it holds its own permission back, so nothing
+    /// self-starts and a test sees only what it asks for.
     async fn test_env() -> StartEnv {
         test_env_with_batcher().await.0
     }
@@ -2051,12 +2584,36 @@ mod tests {
     /// The same env, with the build manager's mailbox handed back so a test
     /// can see what this supervisor asks for — and answer it.
     async fn test_env_with_batcher() -> (StartEnv, mpsc::UnboundedReceiver<BatchRequest>) {
+        let (env, batcher_rx, shutdown_tx) = env_with_batcher(false).await;
+        std::mem::forget(shutdown_tx);
+        (env, batcher_rx)
+    }
+
+    /// A released env: setup is done, so a service whose dependencies are
+    /// satisfied — including one that declares none — may start itself.
+    async fn released_env_with_batcher() -> (StartEnv, mpsc::UnboundedReceiver<BatchRequest>) {
+        let (env, batcher_rx, shutdown_tx) = env_with_batcher(true).await;
+        std::mem::forget(shutdown_tx);
+        (env, batcher_rx)
+    }
+
+    /// The shutdown sender is returned rather than leaked: teardown is driven
+    /// by this signal now, so a test that wants to exercise it needs to be
+    /// able to raise it.
+    async fn env_with_batcher(
+        released: bool,
+    ) -> (
+        StartEnv,
+        mpsc::UnboundedReceiver<BatchRequest>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
         let log_config = LogConfig::Stdout;
         let services = [("svc", &log_config)];
         let output_manager = OutputManager::new(&services, tokio::io::sink())
             .await
             .unwrap();
         let (batcher_tx, batcher_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let env = StartEnv {
             batcher_tx,
             base_dir: std::env::temp_dir(),
@@ -2067,11 +2624,7 @@ mod tests {
             shutdown: ShutdownConfig::default(),
             fallback_ports: false,
             global_watch_ignore: Vec::new(),
-            shutdown_rx: {
-                let (tx, rx) = tokio::sync::watch::channel(false);
-                std::mem::forget(tx);
-                rx
-            },
+            shutdown_rx: shutdown_rx.clone(),
             endpoints: {
                 let (writer, reader) = crate::endpoints::channel();
                 writer.seed(std::iter::once("svc".to_string()));
@@ -2079,8 +2632,363 @@ mod tests {
                 std::mem::forget(writer);
                 reader
             },
+            facts: {
+                let (aggregator, publishers, reader) = crate::facts::channel(std::iter::once((
+                    "svc".to_string(),
+                    crate::facts::ProcessFacts::for_service(
+                        "svc",
+                        crate::process::ServiceState::Pending,
+                        None,
+                        Vec::new(),
+                    ),
+                )));
+                // Keep the write ends alive for the reader's lifetime.
+                std::mem::forget(aggregator);
+                std::mem::forget(publishers);
+                reader
+            },
+            released: {
+                let (tx, rx) = tokio::sync::watch::channel(released);
+                std::mem::forget(tx);
+                rx
+            },
         };
-        (env, batcher_rx)
+        (env, batcher_rx, shutdown_tx)
+    }
+
+    /// A `PhaseOwner` over a world the test controls, so the cascade can be
+    /// driven by what the dependencies say rather than by running them.
+    fn owner_over(
+        deps: &[(&str, bool)],
+        world: &[(&str, crate::facts::ProcessFacts)],
+    ) -> (PhaseOwner, crate::facts::FactsReader) {
+        let (aggregator, mut publishers, reader) = crate::facts::channel(
+            std::iter::once((
+                "api".to_string(),
+                crate::facts::ProcessFacts::for_service(
+                    "api",
+                    crate::process::ServiceState::Pending,
+                    None,
+                    Vec::new(),
+                ),
+            ))
+            .chain(
+                world
+                    .iter()
+                    .map(|(name, facts)| ((*name).to_string(), facts.clone())),
+            ),
+        );
+        std::mem::forget(aggregator);
+        let owner = PhaseOwner {
+            name: "api".to_string(),
+            deps: deps
+                .iter()
+                .map(|(name, blocking)| crate::config::Dependency {
+                    name: (*name).to_string(),
+                    blocking: *blocking,
+                })
+                .collect(),
+            world: reader.clone(),
+            facts: publishers.remove("api").unwrap(),
+            phase: crate::process::ServiceState::Pending,
+            runtime: None,
+            restart_pending: false,
+        };
+        (owner, reader)
+    }
+
+    fn stranded(roots: &[&str]) -> crate::facts::ProcessFacts {
+        crate::facts::ProcessFacts::for_service(
+            "dep",
+            crate::process::ServiceState::Failed,
+            None,
+            Vec::new(),
+        )
+        .stranded_behind(roots.iter().map(|r| (*r).to_string()).collect())
+    }
+
+    fn up() -> crate::facts::ProcessFacts {
+        crate::facts::ProcessFacts::for_service(
+            "dep",
+            crate::process::ServiceState::Ready,
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// Neither satisfied nor settled: still making progress, so waiting on it
+    /// will end.
+    fn coming_up() -> crate::facts::ProcessFacts {
+        crate::facts::ProcessFacts::for_service(
+            "dep",
+            crate::process::ServiceState::Starting,
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// Failure blocking as the user sees it: a chain reports the ROOT cause,
+    /// non-blocking edges never cascade, and a recovered root returns the
+    /// dependent to waiting. Each supervisor answers for itself, reading one
+    /// hop — the chain is already collapsed by the time it gets here.
+    #[test]
+    fn a_supervisor_strands_itself_behind_the_root_cause() {
+        struct Case {
+            name: &'static str,
+            deps: Vec<(&'static str, bool)>,
+            world: Vec<(&'static str, crate::facts::ProcessFacts)>,
+            want_phase: crate::process::ServiceState,
+            want_roots: Vec<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a healthy dependency leaves it waiting",
+                deps: vec![("db", true)],
+                world: vec![("db", up())],
+                want_phase: crate::process::ServiceState::Pending,
+                want_roots: vec![],
+            },
+            Case {
+                name: "a failed dependency strands it, naming the root",
+                deps: vec![("db", true)],
+                world: vec![("db", stranded(&["db"]))],
+                want_phase: crate::process::ServiceState::DependencyFailed,
+                want_roots: vec!["db"],
+            },
+            Case {
+                name: "a stranded dependency collapses to the root it inherited",
+                deps: vec![("worker", true)],
+                world: vec![("worker", stranded(&["db"]))],
+                want_phase: crate::process::ServiceState::DependencyFailed,
+                want_roots: vec!["db"],
+            },
+            Case {
+                name: "a non-blocking edge never cascades",
+                deps: vec![("worker", false)],
+                world: vec![("worker", stranded(&["db"]))],
+                want_phase: crate::process::ServiceState::Pending,
+                want_roots: vec![],
+            },
+        ];
+
+        for case in cases {
+            let (mut owner, _reader) = owner_over(&case.deps, &case.world);
+            owner.reconcile_dependencies();
+            assert_eq!(owner.phase, case.want_phase, "{}", case.name);
+            assert_eq!(
+                owner.facts.current_roots(),
+                case.want_roots
+                    .iter()
+                    .map(|r| (*r).to_string())
+                    .collect::<Vec<_>>(),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    /// A root that recovers returns its dependents to waiting, rather than
+    /// leaving them stranded behind a failure that is over.
+    #[test]
+    fn a_recovered_root_returns_a_stranded_dependent_to_waiting() {
+        let (mut owner, _reader) = owner_over(&[("db", true)], &[("db", stranded(&["db"]))]);
+        owner.reconcile_dependencies();
+        assert_eq!(owner.phase, crate::process::ServiceState::DependencyFailed);
+
+        // The same supervisor, now reading a world where the root is back.
+        let (mut recovered, _reader) = owner_over(&[("db", true)], &[("db", up())]);
+        recovered.phase = crate::process::ServiceState::DependencyFailed;
+        let narration = recovered.reconcile_dependencies();
+        assert_eq!(recovered.phase, crate::process::ServiceState::Pending);
+        assert_eq!(
+            narration,
+            Some(String::new()),
+            "recovery narrates as a re-queue, not a failure"
+        );
+    }
+
+    /// A start asked for by name is admitted by the supervisor, from the phase
+    /// it published, the process it holds and the level it computes. The
+    /// scheduler used to answer this from a shadow of all three.
+    #[test]
+    fn a_requested_start_is_admitted_by_the_supervisor() {
+        use crate::command::CommandError;
+        use crate::process::ServiceState;
+
+        struct Case {
+            name: &'static str,
+            phase: ServiceState,
+            holding: bool,
+            world: Vec<(&'static str, crate::facts::ProcessFacts)>,
+            want: Option<&'static str>,
+        }
+
+        let deps = [("db", true)];
+        let cases = vec![
+            Case {
+                name: "stopped with its dependency up",
+                phase: ServiceState::Stopped,
+                holding: false,
+                world: vec![("db", up())],
+                want: None,
+            },
+            Case {
+                // `Pending` means "wanted, waiting" — overriding that wait is
+                // exactly what an explicit start is for.
+                name: "pending is not busy",
+                phase: ServiceState::Pending,
+                holding: false,
+                world: vec![("db", up())],
+                want: None,
+            },
+            Case {
+                name: "mid-build",
+                phase: ServiceState::Building,
+                holding: false,
+                world: vec![("db", up())],
+                want: Some("cannot start while Building"),
+            },
+            Case {
+                name: "already stopping",
+                phase: ServiceState::Stopping,
+                holding: true,
+                world: vec![("db", up())],
+                want: Some("cannot start while Stopping"),
+            },
+            Case {
+                name: "already holding a process",
+                phase: ServiceState::Ready,
+                holding: true,
+                world: vec![("db", up())],
+                want: Some("already running"),
+            },
+            Case {
+                // Worth waiting for: the wait will end.
+                name: "a dependency still coming up is refused, and named",
+                phase: ServiceState::Stopped,
+                holding: false,
+                world: vec![("db", coming_up())],
+                want: Some("waiting for dependency 'db'"),
+            },
+            Case {
+                // Waiting would never end, and they asked for it by name.
+                name: "a settled dependency does not block an explicit start",
+                phase: ServiceState::Stopped,
+                holding: false,
+                world: vec![("db", stranded(&["db"]))],
+                want: None,
+            },
+        ];
+
+        for case in cases {
+            let (mut owner, world) = owner_over(&deps, &case.world);
+            owner.phase = case.phase;
+            let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+            let got = admit_requested_start(
+                "api",
+                &owner,
+                case.holding,
+                &owner.deps.clone(),
+                crate::gate::level(&owner.deps.clone(), &world.snapshot()),
+                &world,
+                &super::super::ServiceStartIntent::Reply { reply: reply_tx },
+            );
+            match (got, case.want) {
+                (Ok(()), None) => {}
+                (Err(CommandError::InvalidState { message, .. }), Some(want)) => {
+                    assert_eq!(message, want, "{}", case.name);
+                }
+                (got, want) => panic!("{}: got {got:?} wanted {want:?}", case.name),
+            }
+        }
+    }
+
+    /// Queue-vs-refuse-vs-trigger, derived from the two things the supervisor
+    /// owns. This used to be computed by the scheduler and sent as a
+    /// directive, which meant a policy describing a start could arrive after
+    /// that start had been superseded.
+    #[test]
+    fn the_connection_policy_follows_phase_and_custody() {
+        use crate::process::ServiceState;
+        use crate::proxy::ConnectionPolicy;
+
+        struct Case {
+            name: &'static str,
+            phase: ServiceState,
+            live: bool,
+            want: ConnectionPolicy,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a listening lazy service triggers on connect",
+                phase: ServiceState::Lazy,
+                live: false,
+                want: ConnectionPolicy::LazyTrigger,
+            },
+            Case {
+                name: "a starting service queues — the client waits and is served",
+                phase: ServiceState::Starting,
+                live: false,
+                want: ConnectionPolicy::Serve,
+            },
+            Case {
+                name: "a ready service serves",
+                phase: ServiceState::Ready,
+                live: true,
+                want: ConnectionPolicy::Serve,
+            },
+            Case {
+                // Nothing is going to read that socket, so hanging the client
+                // is worse than refusing it.
+                name: "failed with no process left refuses",
+                phase: ServiceState::Failed,
+                live: false,
+                want: ConnectionPolicy::Refuse,
+            },
+            Case {
+                // The liveness half: a ready check that failed under the
+                // default `notify` leaves the process running and possibly
+                // serving. Don must not close its clients' connections.
+                name: "failed but still holding a process keeps serving",
+                phase: ServiceState::Failed,
+                live: true,
+                want: ConnectionPolicy::Serve,
+            },
+            Case {
+                name: "stranded behind a failed dependency refuses",
+                phase: ServiceState::DependencyFailed,
+                live: false,
+                want: ConnectionPolicy::Refuse,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                connection_policy_for(case.phase, case.live),
+                case.want,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    /// A write end for the harness, with the merge kept alive behind it so
+    /// publishing succeeds and nothing has to drain it.
+    fn test_publisher() -> crate::facts::FactsPublisher {
+        let (aggregator, mut publishers, reader) = crate::facts::channel(std::iter::once((
+            "svc".to_string(),
+            crate::facts::ProcessFacts::for_service(
+                "svc",
+                crate::process::ServiceState::Pending,
+                None,
+                Vec::new(),
+            ),
+        )));
+        std::mem::forget(aggregator);
+        std::mem::forget(reader);
+        publishers.remove("svc").unwrap()
     }
 
     /// A minimal service config for the supervisor harness.
@@ -2128,7 +3036,8 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             assets,
             Some(test_resolved()),
-            None,
+            Vec::new(),
+            Some(test_publisher()),
         ));
         Harness {
             tx,
@@ -2217,9 +3126,8 @@ mod tests {
                     demand_rx: Some(demand_rx),
                 }),
                 Some(bazel_resolved(case.lazy)),
-                // No gate at all: permission never arrives, and the request
-                // must not be waiting on it.
-                None,
+                Vec::new(),
+                Some(test_publisher()),
             ));
 
             let eager = next_prepare(&mut batcher_rx).await;
@@ -2254,13 +3162,10 @@ mod tests {
     /// supervisor does not move until that outcome arrives.
     #[tokio::test]
     async fn an_open_gate_does_not_start_a_service_still_waiting_on_its_build() {
-        let (env, mut batcher_rx) = test_env_with_batcher().await;
-        let names = ["svc".to_string()];
-        let (mut gate_writer, mut gate_readers) = crate::gate::channel(names.iter());
-        gate_writer.arm();
-        gate_writer.begin_pass();
-        gate_writer.set("svc", crate::gate::Gate::Open);
-
+        // Released, and this service declares no dependencies, so its level
+        // is `Open` throughout — the hold under test is the artifact's, not
+        // the graph's.
+        let (env, mut batcher_rx) = released_env_with_batcher().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let (report_tx, mut report_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(supervise(
@@ -2272,47 +3177,31 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             None,
             Some(bazel_resolved(false)),
-            gate_readers.remove("svc"),
+            Vec::new(),
+            Some(test_publisher()),
         ));
 
-        assert!(
-            matches!(
-                report_rx.recv().await,
-                Some(super::super::ProcessReport::ArtifactBuild {
-                    status: super::super::ArtifactBuildStatus::Started,
-                    ..
-                })
-            ),
-            "a build must be announced before anything else happens"
-        );
+        // Asking the build manager is the *first* thing it does — before any
+        // report, because there is nothing to report until the artifact
+        // exists.
         let (_, outcome) = next_prepare(&mut batcher_rx)
             .await
             .expect("a bazel service must ask for its artifact");
 
-        // The gate is Open and demand is standing, yet nothing may spawn.
+        // Dependencies allow it and demand is standing, yet nothing may spawn.
         assert!(
             tokio::time::timeout(Duration::from_secs(2), report_rx.recv())
                 .await
                 .is_err(),
-            "an open gate must not start a service whose artifact does not exist yet"
+            "a satisfied dependency must not start a service whose artifact does not exist yet"
         );
 
         outcome
             .send(PrepareOutcome::Ready { binary_path: None })
             .unwrap();
 
-        assert!(
-            matches!(
-                report_rx.recv().await,
-                Some(super::super::ProcessReport::ArtifactBuild {
-                    status: super::super::ArtifactBuildStatus::Ready,
-                    ..
-                })
-            ),
-            "expected the artifact to be reported ready"
-        );
         match tokio::time::timeout(Duration::from_secs(5), report_rx.recv()).await {
-            Ok(Some(super::super::ProcessReport::ServiceStarting { name, .. })) => {
+            Ok(Some(super::super::ProcessReport::ServiceStartPrepared { name, .. })) => {
                 assert_eq!(name, "svc");
             }
             _ => panic!("the start should follow the artifact, in that order"),
@@ -2474,11 +3363,27 @@ mod tests {
 
         for case in cases {
             let mut harness = spawn_harness(None).await;
+            // Settle into `Stopped` first. A restart someone asked for is
+            // refused while the service is still `Pending` — it means "replace
+            // what is running", and nothing is. `Done` notification skips
+            // admission entirely, which is what teardown uses.
+            let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+            harness
+                .tx
+                .send(ServiceCommand::Stop(StopRequest {
+                    force: false,
+                    wait_full_exit: false,
+                    interrupt: None,
+                    notify: StopNotify::Done(settled_tx),
+                    reset_policy: true,
+                }))
+                .unwrap();
+            settled_rx.await.unwrap();
+
             let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
             harness
                 .tx
                 .send(ServiceCommand::Restart(Box::new(RestartRequest {
-                    config: ShutdownConfig::default(),
                     wait_full_exit: false,
                     interrupt: None,
                     clear_backend_first: case.clear_backend_first,
@@ -2520,7 +3425,7 @@ mod tests {
             drop(carried);
 
             match harness.report_rx.recv().await {
-                Some(super::super::ProcessReport::ServiceStarting { name, .. }) => {
+                Some(super::super::ProcessReport::ServiceStartPrepared { name, .. }) => {
                     assert_eq!(name, "svc", "{}", case.name);
                 }
                 _ => panic!("{}: expected the start to be announced", case.name),
@@ -2529,125 +3434,83 @@ mod tests {
         }
     }
 
-    /// The supervisor applies each proxy directive to the proxy it owns —
-    /// observable from the outside as connection behavior on the public
-    /// address.
+    /// A supervisor tears itself down on the shutdown signal, and the listener
+    /// it owns goes with it.
+    ///
+    /// Nothing asks it to. The proxy outlives individual processes — that is
+    /// what makes zero-downtime restart possible — but it does not outlive the
+    /// stack, and the only thing that can end it is the supervisor holding it.
     #[tokio::test]
-    async fn proxy_directives_drive_the_owned_listener() {
-        enum Expect {
-            /// The connection is closed cleanly (refusal).
-            Refused,
-            /// Bytes flow through to a live backend.
-            Forwarded,
-            /// The listener itself is gone.
-            ConnectFails,
-        }
-        struct Case {
-            name: &'static str,
-            directives: Vec<ProxyDirective>,
-            expect: Expect,
-        }
-        let cases = vec![
-            Case {
-                name: "refuse policy closes connections",
-                directives: vec![ProxyDirective::SetPolicy(ConnectionPolicy::Refuse)],
-                expect: Expect::Refused,
-            },
-            Case {
-                name: "set backend forwards to the service",
-                directives: vec![ProxyDirective::SetBackend],
-                expect: Expect::Forwarded,
-            },
-            Case {
-                name: "shutdown drops the listener",
-                directives: vec![ProxyDirective::Shutdown],
-                expect: Expect::ConnectFails,
-            },
-        ];
-
-        for case in cases {
-            // The proxy's ephemeral backend port is allocated bind-and-drop,
-            // so any other process (or parallel test) can steal it before the
-            // stand-in backend below rebinds it. A steal is a setup failure,
-            // not a regression — retry with a fresh proxy.
-            const SETUP_ATTEMPTS: usize = 10;
-            let mut attempt = 0;
-            let (proxy, backend) = loop {
-                attempt += 1;
-                let proxy = bind_env_proxy(None).await;
-                let backend_port: u16 = proxy.env_vars().get("PORT").unwrap().parse().unwrap();
-                match tokio::net::TcpListener::bind(("127.0.0.1", backend_port)).await {
-                    Ok(listener) => break (proxy, listener),
-                    Err(error) => assert!(
+    async fn a_supervisor_drops_its_listener_when_the_stack_shuts_down() {
+        // The proxy's ephemeral backend port is allocated bind-and-drop, so
+        // any other process (or parallel test) can steal it before the
+        // stand-in backend below rebinds it. A steal is a setup failure, not a
+        // regression — retry with a fresh proxy.
+        const SETUP_ATTEMPTS: usize = 10;
+        let mut attempt = 0;
+        let (proxy, backend) = loop {
+            attempt += 1;
+            let proxy = bind_env_proxy(None).await;
+            let backend_port: u16 = proxy.env_vars().get("PORT").unwrap().parse().unwrap();
+            match tokio::net::TcpListener::bind(("127.0.0.1", backend_port)).await {
+                Ok(listener) => break (proxy, listener),
+                Err(error) => {
+                    assert!(
                         attempt < SETUP_ATTEMPTS,
-                        "{}: could not claim backend port: {error}",
-                        case.name
-                    ),
+                        "could not claim backend port: {error}"
+                    );
                 }
-            };
-            let view = proxy.view();
-            let public_addr = view.bindings[0].bound_addr;
+            }
+        };
+        let public_addr = proxy.view().bindings[0].bound_addr;
 
-            // A stand-in service on the ephemeral backend port that writes
-            // one byte to every connection.
-            let backend_task = tokio::spawn(async move {
-                while let Ok((mut conn, _)) = backend.accept().await {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = conn.write_all(b"x").await;
-                }
-            });
-
-            let harness = spawn_harness(Some(ProxyAssets {
+        // A stand-in service on the ephemeral backend port.
+        let backend_task = tokio::spawn(async move {
+            while let Ok((mut conn, _)) = backend.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = conn.write_all(b"x").await;
+            }
+        });
+        let (env, _batcher_rx, shutdown_tx) = env_with_batcher(false).await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (report_tx, _report_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(supervise(
+            "svc".to_string(),
+            rx,
+            env,
+            None,
+            report_tx,
+            Arc::new(AtomicBool::new(false)),
+            Some(ProxyAssets {
                 proxy,
                 demand_rx: None,
-            }))
-            .await;
-            for directive in case.directives {
-                harness.tx.send(ServiceCommand::Proxy(directive)).unwrap();
-            }
+            }),
+            Some(test_resolved()),
+            // No dependents, so nothing to wait for.
+            Vec::new(),
+            Some(test_publisher()),
+        ));
 
-            // Directive application is asynchronous, so a connection can be
-            // served under an *intermediate* state of a multi-directive
-            // sequence (e.g. accepted after SetBackend but before the
-            // ClearBackend behind it). Poll fresh connections until the
-            // final state is observed; only never settling is a failure.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "{}: directives never took effect",
-                    case.name
-                );
-                match case.expect {
-                    Expect::Refused | Expect::Forwarded => {
-                        let mut conn = match tokio::net::TcpStream::connect(public_addr).await {
-                            Ok(conn) => conn,
-                            Err(_) => panic!("{}: listener vanished", case.name),
-                        };
-                        let mut buf = [0u8; 1];
-                        let read =
-                            tokio::time::timeout(Duration::from_millis(500), conn.read(&mut buf))
-                                .await;
-                        match (&case.expect, read) {
-                            (Expect::Refused, Ok(Ok(0))) => break,
-                            (Expect::Forwarded, Ok(Ok(read))) if &buf[..read] == b"x" => break,
-                            // Parked, served under a stale intermediate
-                            // state, or errored — not settled yet.
-                            _ => {}
-                        }
-                    }
-                    Expect::ConnectFails => {
-                        if tokio::net::TcpStream::connect(public_addr).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+        assert!(
+            tokio::net::TcpStream::connect(public_addr).await.is_ok(),
+            "the listener should be up before shutdown"
+        );
+        shutdown_tx.send(true).unwrap();
 
-            backend_task.abort();
-            harness.handle.abort();
+        // Teardown is asynchronous; poll until the listener is gone.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the listener outlived the shutdown signal"
+            );
+            if tokio::net::TcpStream::connect(public_addr).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        backend_task.abort();
+        handle.abort();
     }
 
     /// A lazy proxy's trigger reaches the runner as a demand report, and a
@@ -2672,18 +3535,10 @@ mod tests {
             _ => panic!("expected a demand report"),
         }
 
-        // Dropping every trigger sender must not end the supervisor: it
-        // still owns the proxy and must keep answering directives. The
-        // proxy holds a sender clone, so shut it down first.
-        harness
-            .tx
-            .send(ServiceCommand::Proxy(ProxyDirective::Shutdown))
-            .unwrap();
+        // Dropping every trigger sender must not end the supervisor: it still
+        // has a mailbox to answer.
         drop(lazy_tx);
-        harness
-            .tx
-            .send(ServiceCommand::Proxy(ProxyDirective::SetBackend))
-            .unwrap();
+        harness.tx.send(ServiceCommand::BuildGraphChanged).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !harness.handle.is_finished(),

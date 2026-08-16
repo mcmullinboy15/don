@@ -27,6 +27,62 @@ pub use state::{ServiceState, TaskState};
 pub(crate) use state::{Demand, ProcessKind, ServiceHandleIdentity};
 use tokio::sync::oneshot;
 
+/// Wait until every dependent is holding nothing, so this process can end
+/// without pulling the rug from under something still talking to it.
+///
+/// This is teardown's reverse-dependency order, expressed as each process
+/// waiting rather than one actor sequencing everyone. The graph is a validated
+/// DAG, so something always has no dependents and goes first; the rest follow.
+///
+/// Two escapes, both necessary. A second Ctrl+C means the user has stopped
+/// caring about graceful order — `force` fires and everyone stops at once. And
+/// a dependent whose supervisor has already ended publishes nothing further,
+/// which is why the predicate is *holds nothing* rather than a phase: it stays
+/// true of a process that is simply gone.
+pub(crate) async fn await_dependents_gone(
+    name: &str,
+    emitter: &crate::output::LifecycleEmitter,
+    world: &mut crate::facts::FactsReader,
+    dependents: &[String],
+    force: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    if dependents.is_empty() {
+        return;
+    }
+    let mut announced = false;
+    loop {
+        let snapshot = world.snapshot();
+        if snapshot.all_hold_nothing(dependents.iter()) {
+            return;
+        }
+        if *force.borrow() {
+            emitter.service_debug_event(name, "forced: stopping without waiting for dependents");
+            return;
+        }
+        if !announced {
+            announced = true;
+            let waiting: Vec<&str> = dependents
+                .iter()
+                .filter(|dep| !snapshot.get(dep).is_none_or(|f| f.holds_nothing()))
+                .map(String::as_str)
+                .collect();
+            emitter.service_debug_event(
+                name,
+                &format!("waiting for dependents to stop: {}", waiting.join(", ")),
+            );
+        }
+        tokio::select! {
+            changed = world.changed() => {
+                if changed.is_none() {
+                    // Nothing will publish again; waiting cannot end.
+                    return;
+                }
+            }
+            _ = force.changed() => {}
+        }
+    }
+}
+
 pub(crate) enum ServiceStartIntent {
     /// The dependency sweep asked for this start; the ready outcome drives
     /// the sweep-visible transition.
@@ -55,20 +111,6 @@ pub(crate) struct TaskExit {
     pub(crate) reply: Option<oneshot::Sender<crate::command::CommandResult>>,
 }
 
-/// Where a process's artifact build has got to. See
-/// [`ProcessReport::ArtifactBuild`].
-pub(crate) enum ArtifactBuildStatus {
-    /// A build was requested and is now in the build manager's hands.
-    Started,
-    /// The artifact exists; the process may run.
-    Ready,
-    /// The build failed. Never retried: recompiling sources that have not
-    /// changed cannot change the answer, so this never reaches the restart
-    /// policy — it is the end of the road for this process until someone
-    /// asks for it by name.
-    Failed(String),
-}
-
 /// Runner-private messages emitted by detached workers.
 /// What an process tells the scheduler, on the lossless report channel.
 ///
@@ -83,69 +125,22 @@ pub(crate) enum ProcessReport {
     /// service has dependencies, and starting it is a scheduling decision
     /// like any other.
     Demand { name: String, demand: Demand },
-    /// A service's process died and its supervisor reaped it. `status` is
-    /// the reaped exit status (`None` when the wait itself failed).
-    ServiceExited {
-        name: String,
-        pgid: i32,
-        status: Option<std::process::ExitStatus>,
-        /// What the supervisor's restart policy decided about it. Already
-        /// narrated and already armed where it applies — the scheduler folds
-        /// this only to keep its own view of "is anything still coming up"
-        /// honest, and to know which state a lazy re-arm lands in.
-        policy: health::PolicyOutcome,
-    },
-    /// The health monitor observed a transition. State-guarded on fold; the
-    /// monitor itself dies with custody (its cancel lives in the supervisor),
-    /// so it cannot outlive its process by more than a probe.
-    HealthChanged {
-        name: String,
-        healthy: bool,
-        policy: health::PolicyOutcome,
-    },
+    /// A service's process died, its supervisor reaped it, and the phase that
+    /// followed is already published.
+    ///
+    /// Carries nothing but the name: the exit status, the policy verdict and
+    /// the resulting phase were all decided and published by the supervisor.
+    /// This exists only to end the projections that span process generations —
+    /// endpoints, the ports manifest, the follow sinks.
+    ServiceExited { name: String },
     /// A task process exited after an explicit run/restart.
     TaskExited(TaskExit),
-    /// A supervisor's artifact build changed state.
-    ///
-    /// The build manager owns building; this exists only so the scheduler's
-    /// projection can say `Building`, so `initial_startup_settled` stays open
-    /// while one runs, and so a rebuild queued mid-build is deferred rather
-    /// than raced. Whether the build *happens* is never the scheduler's call.
-    ArtifactBuild {
-        name: String,
-        kind: ProcessKind,
-        status: ArtifactBuildStatus,
-    },
-    /// A supervisor spent its start permission and is beginning a start.
-    ///
-    /// This is the ack that makes a level-triggered permission single-use
-    /// across the channel boundary: the runner folds it into `Starting`,
-    /// which closes the gate.
-    ServiceStarting {
-        name: String,
-        /// A rebuild cycle's spawn, which announces itself as "restarting"
-        /// rather than "starting" — the user asked for a rebuild, not a
-        /// start, and the log should say what they asked for.
-        restarting: bool,
-    },
     /// A service's supervisor settled a start request — wired (metadata
     /// only; custody stays with the supervisor) or failed to prepare.
     ServiceStartPrepared {
         name: String,
         intent: ServiceStartIntent,
         result: Result<Box<service_supervisor::ServiceWired>, String>,
-        /// Set when `result` is an error and the policy chose to retry.
-        policy: health::PolicyOutcome,
-    },
-    /// A service's ready check settled — or reported immediately when no
-    /// check is configured (`had_check: false`). Forwarded by the
-    /// supervisor loop, so it always trails its own prepared report.
-    ServiceReady {
-        name: String,
-        success: bool,
-        message: Option<String>,
-        had_check: bool,
-        policy: health::PolicyOutcome,
     },
     /// A service's supervisor finished executing a stop.
     ///

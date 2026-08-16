@@ -326,6 +326,75 @@ impl LogFilterControl {
     }
 }
 
+/// Which processes must not reach the terminal's stdout.
+///
+/// Two questions used to be one: what don *records* for its clients, and what
+/// it *writes to the terminal*. They were answered together by sink wiring — a
+/// service with `log = "file"` simply had no stdout sink — which meant it never
+/// reached the stdout writer, and therefore never reached the merged log tap
+/// either. Every client except the TUI could see that service (the ring buffer
+/// is filled upstream of any sink), so the TUI was the one consumer with an
+/// incomplete record.
+///
+/// Now every process feeds the writer, and the terminal decision happens at the
+/// end, after the tap has already been told. Two sources feed it: `log = "file"`
+/// and `log = "ignore"`, fixed at construction; and processes with a client
+/// attached, muted for as long as the attach lasts so the attached terminal is
+/// the only one drawing them.
+/// The two sets are kept apart on purpose: a config mute is permanent, an
+/// attach mute is for the length of the attach, and a process can be under
+/// both. Merging them would let a detach hand a `log = "ignore"` service a
+/// terminal it was never meant to have — which is exactly the bug the old
+/// `stdout_paused` flag existed to prevent.
+#[derive(Clone, Default)]
+struct StdoutMuteControl {
+    by_config: Arc<std::sync::RwLock<HashSet<String>>>,
+    attached: Arc<std::sync::RwLock<HashSet<String>>>,
+}
+
+impl StdoutMuteControl {
+    fn new(by_config: HashSet<String>) -> Self {
+        Self {
+            by_config: Arc::new(std::sync::RwLock::new(by_config)),
+            attached: Arc::new(std::sync::RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Whether this process's output should be kept off the terminal.
+    ///
+    /// Two uncontended read locks per emitted line, against an async publish
+    /// and a formatted-byte build in the same function — not a hot path worth
+    /// contorting for. A poisoned lock reads as "not muted": showing too much
+    /// beats silently swallowing the terminal's output.
+    fn is_muted(&self, name: &str) -> bool {
+        let contains = |set: &std::sync::RwLock<HashSet<String>>| {
+            set.read().map(|set| set.contains(name)).unwrap_or(false)
+        };
+        contains(&self.by_config) || contains(&self.attached)
+    }
+
+    /// Mute a process added after construction with `log = "ignore"`.
+    fn mute_by_config(&self, name: &str) {
+        if let Ok(mut set) = self.by_config.write() {
+            set.insert(name.to_string());
+        }
+    }
+
+    /// Mute `name` while a client holds its terminal.
+    fn attach(&self, name: &str) {
+        if let Ok(mut set) = self.attached.write() {
+            set.insert(name.to_string());
+        }
+    }
+
+    /// Give `name` back to the terminal.
+    fn release(&self, name: &str) {
+        if let Ok(mut set) = self.attached.write() {
+            set.remove(name);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct CompiledLogKeepFilter {
     patterns: Vec<regex::bytes::Regex>,
@@ -572,6 +641,9 @@ pub struct OutputManager {
     don_prefix: String,
     /// Stdout sink sender — used for lifecycle events and service output.
     stdout_sink: SinkHandle,
+    /// Which processes are kept off the terminal. Held so services added after
+    /// construction can join the set.
+    mute: StdoutMuteControl,
     /// Writer task JoinHandles for clean shutdown.
     writer_handles: Vec<JoinHandle<()>>,
     /// Shared runtime verbose mode — enables extra diagnostic lifecycle events
@@ -595,71 +667,299 @@ pub struct OutputManager {
     log_tap: MergedLogTap,
 }
 
-/// The merged log stream's fan-out point: a broadcast of every line
-/// [`stdout_sink_task`] emits (post filter, post sanitize), plus a bounded
-/// history of the same lines so a late-connecting follower can preload.
+/// A line's place in the merged stream.
 ///
-/// History and broadcast carry the *same* `Arc`s — one allocation per line —
-/// which is also what makes preload/live dedupe exact: a follower that
-/// subscribes first and snapshots second can drop live lines already seen in
-/// the snapshot by pointer identity, no sequence numbers needed.
-#[derive(Clone)]
-pub struct MergedLogTap {
-    tx: broadcast::Sender<Arc<FormattedLogLine>>,
-    history: Arc<Mutex<std::collections::VecDeque<Arc<FormattedLogLine>>>>,
+/// Assigned once, at publish, by the single producer — so every client numbers
+/// the same line the same way. That is what makes "all clients see the same
+/// view" a checkable claim rather than an aspiration: two clients can compare
+/// cursors, a client can say exactly where it stopped, and a gap can be
+/// measured instead of guessed at.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct LogId(pub u64);
+
+impl LogId {
+    /// The id before any line has been published.
+    pub const ZERO: LogId = LogId(0);
+
+    fn next(self) -> LogId {
+        LogId(self.0.saturating_add(1))
+    }
 }
 
-/// How many merged lines a late joiner can preload. Smaller than the
-/// per-service rings (which serve `don logs <name>`): this covers "what was
-/// happening just before I attached", not deep history.
-const MERGED_HISTORY_CAPACITY: usize = 2_000;
+impl std::fmt::Display for LogId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One line of the merged stream, with its place in it.
+#[derive(Clone, Debug)]
+pub struct MergedLine {
+    pub id: LogId,
+    pub line: Arc<FormattedLogLine>,
+}
+
+/// What the tap still holds from some point onward.
+pub struct Catchup {
+    /// Lines from the requested point that survived eviction, oldest first.
+    pub lines: Vec<MergedLine>,
+    /// The oldest id still held. Greater than what the caller asked for means
+    /// the head was evicted and the difference is gone for good.
+    pub first_id: LogId,
+    /// The id the next published line will receive.
+    pub next_id: LogId,
+}
+
+/// How many merged lines the tap holds by default.
+///
+/// This is the TUI's scrollback as well as a late joiner's preload, so it is
+/// sized for "scroll back through this morning's startup", not just "what was
+/// happening as I connected". The per-service rings behind `don logs <name>`
+/// answer a different question — one service, deeper — and are bounded
+/// separately.
+pub const DEFAULT_MERGED_HISTORY_CAPACITY: usize = 50_000;
+
+struct MergedHistory {
+    entries: std::collections::VecDeque<MergedLine>,
+    capacity: usize,
+    next_id: LogId,
+}
+
+/// The merged log stream's fan-out point: a broadcast of every line
+/// [`stdout_sink_task`] emits (post filter, post sanitize), plus a bounded
+/// history of the same lines.
+///
+/// History and broadcast carry the *same* `Arc`s — one allocation per line.
+/// They also carry the same [`LogId`], which is what lets a follower that
+/// subscribed first and snapshotted second splice the two exactly, and lets a
+/// follower that fell behind ask for precisely what it missed. See
+/// [`MergedLogCursor`], which does both.
+#[derive(Clone)]
+pub struct MergedLogTap {
+    tx: broadcast::Sender<MergedLine>,
+    history: Arc<Mutex<MergedHistory>>,
+}
 
 impl MergedLogTap {
-    fn new() -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         // Broadcast capacity trades memory for how far a slow follower may
-        // fall behind before it must resync; entries are pointers.
+        // fall behind before the tap's history has to cover for it; entries
+        // are a pointer and an id.
         let (tx, _) = broadcast::channel(4096);
         Self {
             tx,
-            history: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
-                MERGED_HISTORY_CAPACITY,
-            ))),
+            history: Arc::new(Mutex::new(MergedHistory {
+                entries: std::collections::VecDeque::new(),
+                capacity,
+                next_id: LogId::ZERO,
+            })),
         }
     }
 
-    /// Record and fan out one line.
-    async fn publish(&self, line: Arc<FormattedLogLine>) {
-        {
+    /// Record and fan out one line, returning the id it was given.
+    ///
+    /// The id is assigned under the history lock, so ids and history order can
+    /// never disagree.
+    async fn publish(&self, line: Arc<FormattedLogLine>) -> LogId {
+        let entry = {
             let mut history = self.history.lock().await;
-            if history.len() == MERGED_HISTORY_CAPACITY {
-                history.pop_front();
+            let id = history.next_id;
+            history.next_id = id.next();
+            let entry = MergedLine { id, line };
+            if history.capacity == 0 {
+                return id;
             }
-            history.push_back(line.clone());
-        }
+            while history.entries.len() >= history.capacity {
+                history.entries.pop_front();
+            }
+            history.entries.push_back(entry.clone());
+            entry
+        };
         // Send on a receiver-less broadcast is a cheap no-op.
-        let _ = self.tx.send(line);
+        let id = entry.id;
+        let _ = self.tx.send(entry);
+        id
     }
 
-    /// Subscribe to lines from now on.
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<FormattedLogLine>> {
+    /// Subscribe to lines from now on. Prefer [`Self::cursor`], which heals
+    /// its own gaps.
+    pub fn subscribe(&self) -> broadcast::Receiver<MergedLine> {
         self.tx.subscribe()
+    }
+
+    /// A gap-healing cursor over the stream, starting from `since`.
+    ///
+    /// `None` starts at the tail: the last `tail` lines, then live.
+    pub async fn cursor(&self, since: Option<LogId>, tail: usize) -> MergedLogCursor {
+        // Subscribe *before* reading history, so anything published in between
+        // arrives on the receiver rather than falling into the seam.
+        let rx = self.tx.subscribe();
+        let catchup = match since {
+            Some(since) => self.catch_up(since).await,
+            None => self.tail(tail).await,
+        };
+        let next = catchup
+            .lines
+            .last()
+            .map(|entry| entry.id.next())
+            .unwrap_or(catchup.next_id);
+        MergedLogCursor {
+            // The history handle, deliberately not the whole tap: holding a
+            // tap clone would keep its broadcast sender alive, so the cursor
+            // could never see the stream close — and every consumer that ends
+            // when its log channel ends would hang instead.
+            history: Arc::clone(&self.history),
+            rx,
+            next,
+            pending: catchup.lines.into(),
+        }
     }
 
     /// An empty tap for tests that need an `ApiState` without an
     /// `OutputManager`.
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
-        Self::new()
+        Self::with_capacity(DEFAULT_MERGED_HISTORY_CAPACITY)
+    }
+
+    /// Everything still held with `id >= since`.
+    pub async fn catch_up(&self, since: LogId) -> Catchup {
+        catch_up_from(&self.history, since).await
     }
 
     /// The last `n` lines, oldest first.
-    pub async fn history(&self, n: usize) -> Vec<Arc<FormattedLogLine>> {
+    pub async fn tail(&self, n: usize) -> Catchup {
         let history = self.history.lock().await;
-        history
+        let skip = history.entries.len().saturating_sub(n);
+        Catchup {
+            lines: history.entries.iter().skip(skip).cloned().collect(),
+            first_id: history
+                .entries
+                .front()
+                .map(|e| e.id)
+                .unwrap_or(history.next_id),
+            next_id: history.next_id,
+        }
+    }
+}
+
+/// Everything a history still holds with `id >= since`.
+async fn catch_up_from(history: &Mutex<MergedHistory>, since: LogId) -> Catchup {
+    let history = history.lock().await;
+    Catchup {
+        lines: history
+            .entries
             .iter()
-            .skip(history.len().saturating_sub(n))
+            .filter(|entry| entry.id >= since)
             .cloned()
-            .collect()
+            .collect(),
+        first_id: history
+            .entries
+            .front()
+            .map(|entry| entry.id)
+            .unwrap_or(history.next_id),
+        next_id: history.next_id,
+    }
+}
+
+/// What a [`MergedLogCursor`] hands back.
+#[derive(Clone, Debug)]
+pub enum MergedEvent {
+    /// The next line in the stream.
+    Line(MergedLine),
+    /// The cursor fell behind and the tap's history had already moved past the
+    /// gap, so `count` lines are gone for good. Reported rather than papered
+    /// over: a client that silently thins its log is worse than one that says
+    /// where the hole is.
+    Dropped { count: u64, resumed_at: LogId },
+}
+
+/// A cursor over the merged stream that heals its own gaps.
+///
+/// A broadcast receiver that falls behind loses lines permanently, and every
+/// consumer used to deal with that alone — the TUI wrote "log stream lagged"
+/// into its own output and carried on with a hole; the API told the client a
+/// number and no way to act on it. But the tap's history almost always still
+/// has those lines. This re-reads them, so falling behind is invisible unless
+/// the history itself has moved on.
+pub struct MergedLogCursor {
+    history: Arc<Mutex<MergedHistory>>,
+    rx: broadcast::Receiver<MergedLine>,
+    /// The id this cursor expects next. Everything below it has been handed
+    /// out; everything at or above it has not.
+    next: LogId,
+    pending: std::collections::VecDeque<MergedLine>,
+}
+
+impl MergedLogCursor {
+    /// The next event, or `None` once the stream has closed and the buffered
+    /// lines are exhausted.
+    pub async fn recv(&mut self) -> Option<MergedEvent> {
+        loop {
+            if let Some(entry) = self.pending.pop_front() {
+                self.next = entry.id.next();
+                return Some(MergedEvent::Line(entry));
+            }
+            match self.rx.recv().await {
+                Ok(entry) => {
+                    // Already handed out — the subscribe/snapshot overlap. Ids
+                    // make this exact; it used to be pointer identity.
+                    if entry.id < self.next {
+                        continue;
+                    }
+                    self.next = entry.id.next();
+                    return Some(MergedEvent::Line(entry));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let catchup = catch_up_from(&self.history, self.next).await;
+                    if catchup.first_id > self.next {
+                        let count = catchup.first_id.0.saturating_sub(self.next.0);
+                        self.next = catchup.first_id;
+                        self.pending = catchup.lines.into();
+                        return Some(MergedEvent::Dropped {
+                            count,
+                            resumed_at: catchup.first_id,
+                        });
+                    }
+                    self.pending = catchup.lines.into();
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// Whatever is already in hand, without waiting for more.
+    ///
+    /// For draining at shutdown: the tap has published its last lines and they
+    /// are sitting in this receiver, but nothing further is coming, so
+    /// [`Self::recv`] would park forever. Healing a gap needs an await, so a
+    /// lag here is reported rather than repaired — a best-effort flush is the
+    /// right shape for a stream that is closing anyway.
+    pub fn try_recv(&mut self) -> Option<MergedEvent> {
+        loop {
+            if let Some(entry) = self.pending.pop_front() {
+                self.next = entry.id.next();
+                return Some(MergedEvent::Line(entry));
+            }
+            match self.rx.try_recv() {
+                Ok(entry) => {
+                    if entry.id < self.next {
+                        continue;
+                    }
+                    self.next = entry.id.next();
+                    return Some(MergedEvent::Line(entry));
+                }
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    return Some(MergedEvent::Dropped {
+                        count,
+                        resumed_at: self.next,
+                    });
+                }
+                Err(_) => return None,
+            }
+        }
     }
 }
 
@@ -753,15 +1053,31 @@ impl OutputManager {
         let log_filter = LogFilterControl::default();
         let emulator = emulator::spawn_emulator_thread();
 
+        // What the terminal must not show. Everything still reaches the
+        // writer, and therefore the merged tap — see [`StdoutMuteControl`].
+        let mute = StdoutMuteControl::new(
+            services
+                .iter()
+                .filter(|(_, config)| {
+                    matches!(
+                        config,
+                        crate::config::LogConfig::File(_) | crate::config::LogConfig::Ignore
+                    )
+                })
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+        );
+
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
-        let log_tap = MergedLogTap::new();
+        let log_tap = MergedLogTap::with_capacity(DEFAULT_MERGED_HISTORY_CAPACITY);
         let stdout_handle = tokio::spawn(stdout_sink_task(
             stdout_rx,
             target,
             verbosity.clone(),
             log_filter.clone(),
             log_tap.clone(),
+            mute.clone(),
         ));
         let stdout_sink = SinkHandle::Unbounded(stdout_tx);
 
@@ -783,18 +1099,18 @@ impl OutputManager {
         // Build per-service state.
         let mut service_map = HashMap::new();
         for (name, config) in services {
-            let sinks = match config {
-                crate::config::LogConfig::Stdout => vec![stdout_sink.clone()],
-                crate::config::LogConfig::File(path) => {
-                    // File sink always gets the raw line. The stdout sink is not
-                    // added for file-mode services (output goes to file only).
-                    match file_sinks.get(path).cloned() {
-                        Some(sink) => vec![sink],
-                        None => vec![], // Shouldn't happen — file sinks are created from the same config.
-                    }
+            // Every process feeds the stdout writer, whatever its `log`
+            // setting: that is the only path to the merged tap, and the tap is
+            // what every client reads. Whether the *terminal* sees a line is
+            // decided at the far end, by `StdoutMuteControl`.
+            let mut sinks = vec![stdout_sink.clone()];
+            if let crate::config::LogConfig::File(path) = config {
+                // The file sink gets the raw line, unprefixed and unsanitized.
+                // Always present: the file sinks were created from this list.
+                if let Some(sink) = file_sinks.get(path).cloned() {
+                    sinks.push(sink);
                 }
-                crate::config::LogConfig::Ignore => vec![],
-            };
+            }
 
             let color = color_map.get(*name).copied().unwrap_or(Color::White);
             let prefix = format_prefix(name, color, max_name_len);
@@ -810,6 +1126,7 @@ impl OutputManager {
                     prefix,
                     sinks,
                     stdout_sink.clone(),
+                    mute.clone(),
                     log_keep_filter,
                 ),
             );
@@ -837,6 +1154,7 @@ impl OutputManager {
             attach_sinks,
             don_prefix,
             stdout_sink,
+            mute,
             writer_handles,
             verbosity,
             emulator,
@@ -997,16 +1315,14 @@ impl OutputManager {
             .unwrap_or(Color::White);
         let prefix = format_prefix(name, color, max_name_len);
 
-        let sinks = match log_config {
-            crate::config::LogConfig::Stdout => vec![self.stdout_sink.clone()],
-            crate::config::LogConfig::File(_) => {
-                // For simplicity, new file-mode services log to stdout.
-                // Full file-sink creation would require opening the file and
-                // spawning a task, which can be added later if needed.
-                vec![self.stdout_sink.clone()]
-            }
-            crate::config::LogConfig::Ignore => vec![],
-        };
+        // Every process feeds the writer — that is the only path to the merged
+        // tap. A file-mode service added at runtime gets no file sink (opening
+        // one would mean spawning a task here), but it is recorded like any
+        // other; `log = "ignore"` is muted at the terminal, not unwired.
+        let sinks = vec![self.stdout_sink.clone()];
+        if matches!(log_config, crate::config::LogConfig::Ignore) {
+            self.mute.mute_by_config(name);
+        }
 
         self.services.insert(
             name.to_string(),
@@ -1015,6 +1331,7 @@ impl OutputManager {
                 prefix,
                 sinks,
                 self.stdout_sink.clone(),
+                self.mute.clone(),
                 CompiledLogKeepFilter::default(),
             ),
         );
@@ -1144,26 +1461,6 @@ impl OutputManager {
             is_lifecycle: true,
             is_verbose: false,
         });
-    }
-
-    /// Temporarily remove the stdout sink from a service so its output
-    /// doesn't appear in the don terminal (e.g. during interactive attach).
-    /// The ring buffer continues to be fed. No-op if the service is unknown
-    /// or the stdout sink is not present.
-    pub async fn pause_stdout_sink(&self, name: &str) {
-        if let Some(output) = self.services.get(name) {
-            output.pause_stdout();
-        }
-    }
-
-    /// Re-add the stdout sink to a service after an attach session ends.
-    /// Only restores the sink if it was previously paused via
-    /// `pause_stdout_sink` — services with `log = "ignore"` won't
-    /// accidentally start writing to stdout.
-    pub async fn resume_stdout_sink(&self, name: &str) {
-        if let Some(output) = self.services.get(name) {
-            output.resume_stdout();
-        }
     }
 
     /// Shut down the output system. Clears all sink lists, drops senders,
@@ -1408,6 +1705,24 @@ impl LifecycleEmitter {
     }
 }
 
+/// Private-mode sequences that take the alternate screen. `47` is the
+/// original, `1047` and `1049` the xterm refinements; applications in the wild
+/// still emit all three, and `1049` is what anything modern uses.
+const ALT_SCREEN_ENTER: [&[u8]; 3] = [b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
+/// The same modes, reset — the process handing the screen back.
+const ALT_SCREEN_LEAVE: [&[u8]; 3] = [b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
+/// Trailing bytes to keep while suppressing: enough to recognise the longest
+/// sequence above, which is what ends the suppression.
+const ALT_SCREEN_SCAN: usize = 8;
+
+/// The length of whichever candidate `acc` ends with, if any.
+fn ends_with_any(acc: &[u8], candidates: &[&[u8]]) -> Option<usize> {
+    candidates
+        .iter()
+        .find(|candidate| acc.ends_with(candidate))
+        .map(|candidate| candidate.len())
+}
+
 /// Stdout sink writer task. Receives raw byte chunks and accumulates
 /// per-service until `\n` or overflow, then emits the formatted line to
 /// the configured target (pipe writer or TUI channel).
@@ -1421,6 +1736,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     verbosity: VerbosityControl,
     filter: LogFilterControl,
     tap: MergedLogTap,
+    mute: StdoutMuteControl,
 ) {
     use bytes::BytesMut;
 
@@ -1434,6 +1750,9 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     // follows a \r, the resulting empty line is suppressed — the \r already
     // flushed the content.
     let mut cr_flushed: HashSet<Bytes> = HashSet::new();
+    // Processes that have taken the alternate screen and not yet given it
+    // back. See the suppression below.
+    let mut alt_screen: HashSet<Bytes> = HashSet::new();
 
     while let Some(msg) = rx.recv().await {
         // Drop messages whose source service isn't in the active allowlist.
@@ -1444,12 +1763,118 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
         if !filter.passes(&msg.name) {
             accumulators.remove(&msg.prefix);
             cr_flushed.remove(&msg.prefix);
+            alt_screen.remove(&msg.prefix);
             continue;
         }
+
+        // The end of a process's stream — see
+        // `ServiceOutputState::mark_stream_end`. Flush whatever it left
+        // mid-line, then drop every piece of state that run built up so the
+        // next one starts clean.
+        if msg.line.is_empty() && !msg.is_lifecycle {
+            let held = accumulators.remove(&msg.prefix);
+            cr_flushed.remove(&msg.prefix);
+            let owned_screen = alt_screen.remove(&msg.prefix);
+            // A process that died holding the screen leaves escape fragments,
+            // not a line anyone wants to read.
+            if let Some(acc) = held
+                && !acc.is_empty()
+                && !owned_screen
+            {
+                let sanitized = if msg.prefix.is_empty() {
+                    acc.to_vec()
+                } else {
+                    sanitize::sanitize_terminal_output(&acc)
+                };
+                emit_line(
+                    &mut target,
+                    &tap,
+                    &mute,
+                    &msg.name,
+                    &msg.prefix,
+                    &sanitized,
+                    msg.is_lifecycle,
+                    msg.is_verbose,
+                    &verbosity,
+                    start,
+                )
+                .await;
+            }
+            continue;
+        }
+
         let acc = accumulators.entry(msg.prefix.clone()).or_default();
 
         for &byte in msg.line.iter() {
+            // While a process owns the alternate screen its output is frames,
+            // not lines: cursor moves and clears, with no `\n` or `\r` between
+            // them. Sanitizing strips the positioning and the line splitter
+            // never sees a boundary, so the multiplexed view would show one
+            // endless line of concatenated frames — and show nothing at all
+            // until the process exits. Say where to watch it properly instead.
+            // The ring buffer, file sinks and the emulator behind `don attach`
+            // are fed upstream of here and lose nothing.
+            if alt_screen.contains(&msg.prefix) {
+                acc.extend_from_slice(&[byte]);
+                if byte == b'l' && ends_with_any(acc, &ALT_SCREEN_LEAVE).is_some() {
+                    alt_screen.remove(&msg.prefix);
+                    acc.clear();
+                } else if acc.len() > ALT_SCREEN_SCAN {
+                    // Keep only enough trailing bytes to recognise the
+                    // sequence that ends this; the rest is a frame nobody
+                    // here can render.
+                    let stale = acc.len() - ALT_SCREEN_SCAN;
+                    bytes::Buf::advance(acc, stale);
+                }
+                continue;
+            }
+
             acc.extend_from_slice(&[byte]);
+
+            if byte == b'h'
+                && let Some(len) = ends_with_any(acc, &ALT_SCREEN_ENTER)
+            {
+                acc.truncate(acc.len() - len);
+                // Whatever preceded the switch is a real partial line.
+                if !acc.is_empty() {
+                    let sanitized = sanitize::sanitize_terminal_output(acc);
+                    emit_line(
+                        &mut target,
+                        &tap,
+                        &mute,
+                        &msg.name,
+                        &msg.prefix,
+                        &sanitized,
+                        msg.is_lifecycle,
+                        msg.is_verbose,
+                        &verbosity,
+                        start,
+                    )
+                    .await;
+                }
+                acc.clear();
+                let notice = format!(
+                    "entered full-screen mode — run 'don attach {}' to see it",
+                    msg.name
+                );
+                emit_line(
+                    &mut target,
+                    &tap,
+                    &mute,
+                    &msg.name,
+                    &msg.prefix,
+                    notice.as_bytes(),
+                    true,
+                    false,
+                    &verbosity,
+                    start,
+                )
+                .await;
+                alt_screen.insert(msg.prefix.clone());
+                cr_flushed.remove(&msg.prefix);
+                continue;
+            }
+
             if byte == b'\n' {
                 // Complete line — strip \r\n, sanitize, emit prefixed output.
                 acc.truncate(acc.len() - 1); // remove \n
@@ -1469,6 +1894,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     emit_line(
                         &mut target,
                         &tap,
+                        &mute,
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
@@ -1494,6 +1920,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     emit_line(
                         &mut target,
                         &tap,
+                        &mute,
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
@@ -1519,6 +1946,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     emit_line(
                         &mut target,
                         &tap,
+                        &mute,
                         &msg.name,
                         &msg.prefix,
                         &sanitized,
@@ -1539,7 +1967,9 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     // lines arrive at the TUI with an empty name (unfilterable). Partial
     // lines at shutdown are rare and the user probably wants to see them.
     for (prefix, acc) in &accumulators {
-        if !acc.is_empty() {
+        // A process still holding the alternate screen has escape fragments
+        // in hand, not a line.
+        if !acc.is_empty() && !alt_screen.contains(prefix) {
             let sanitized = if prefix.is_empty() {
                 acc.to_vec()
             } else {
@@ -1553,6 +1983,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             emit_line(
                 &mut target,
                 &tap,
+                &mute,
                 "",
                 prefix,
                 &sanitized,
@@ -1595,6 +2026,7 @@ fn build_formatted_bytes(
 async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     target: &mut StdoutTarget<W>,
     tap: &MergedLogTap,
+    mute: &StdoutMuteControl,
     name: &str,
     prefix: &[u8],
     line: &[u8],
@@ -1614,6 +2046,17 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     }))
     .await;
     if is_verbose && !verbosity.is_enabled() {
+        return;
+    }
+    // Everything below is about the *terminal*, and only the terminal. The
+    // record above is already complete — see [`StdoutMuteControl`].
+    //
+    // Lifecycle lines are exempt. `log = "ignore"` and an attach both silence a
+    // process's *output*; don's narration about it — "api: starting…", "send
+    // SIGTERM" — is don speaking, not the process, and the user still needs it.
+    // The old wiring got this for free: muting meant unwiring the service's own
+    // sinks, and lifecycle lines never travelled through those.
+    if !is_lifecycle && mute.is_muted(name) {
         return;
     }
     match target {
@@ -1854,6 +2297,113 @@ mod tests {
         }
     }
 
+    /// A process that takes the alternate screen writes frames, not lines —
+    /// cursor moves and clears with no `\n` between them. Sanitizing strips the
+    /// positioning and the splitter never sees a boundary, so without this the
+    /// multiplexed view shows one endless line of concatenated frames, and
+    /// shows it only once the process exits.
+    #[tokio::test]
+    async fn alternate_screen_output_is_replaced_by_a_pointer_at_attach() {
+        struct Case {
+            name: &'static str,
+            stream: &'static [u8],
+            want: Vec<&'static str>,
+            unwanted: Vec<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "frames are suppressed, output after the handback is not",
+                stream: b"before\n\x1b[?1049h\x1b[2J\x1b[HFRAME 1\x1b[HFRAME 2\x1b[?1049lafter\n",
+                want: vec!["before", "entered full-screen mode", "after"],
+                unwanted: vec!["FRAME 1", "FRAME 2"],
+            },
+            Case {
+                name: "a partial line before the switch is still flushed",
+                stream: b"mid-line\x1b[?1049hFRAME\x1b[?1049l\n",
+                want: vec!["mid-line", "entered full-screen mode"],
+                unwanted: vec!["FRAME"],
+            },
+            Case {
+                name: "the older 47 and 1047 spellings count too",
+                stream: b"\x1b[?47hFRAME\x1b[?47l\x1b[?1047hOTHER\x1b[?1047ldone\n",
+                want: vec!["entered full-screen mode", "done"],
+                unwanted: vec!["FRAME", "OTHER"],
+            },
+            Case {
+                name: "a process that never switches is untouched",
+                stream: b"plain one\nplain two\n",
+                want: vec!["plain one", "plain two"],
+                unwanted: vec!["full-screen"],
+            },
+        ];
+
+        for case in cases {
+            let (writer, buf) = TestBuffer::new();
+            let config = crate::config::LogConfig::Stdout;
+            let mgr = OutputManager::new(&[("api", &config)], writer)
+                .await
+                .unwrap();
+            let svc = mgr.service_writer("api").unwrap();
+            svc.process_stream(std::io::Cursor::new(case.stream.to_vec()))
+                .await
+                .unwrap();
+            mgr.shutdown().await;
+
+            let output = read_buf(&buf);
+            for fragment in case.want {
+                assert!(
+                    output.contains(fragment),
+                    "{}: expected {fragment:?} in {output:?}",
+                    case.name
+                );
+            }
+            for fragment in case.unwanted {
+                assert!(
+                    !output.contains(fragment),
+                    "{}: did not expect {fragment:?} in {output:?}",
+                    case.name
+                );
+            }
+        }
+    }
+
+    /// The alternate screen is given back by a sequence a killed process never
+    /// sends. The writer keeps its state per process across runs, so without an
+    /// end-of-stream reset the *next* run's output would be suppressed too —
+    /// `don restart` on an interactive task would silence it for good.
+    #[tokio::test]
+    async fn a_run_that_dies_holding_the_screen_does_not_silence_the_next_one() {
+        let (writer, buf) = TestBuffer::new();
+        let config = crate::config::LogConfig::Stdout;
+        let mgr = OutputManager::new(&[("api", &config)], writer)
+            .await
+            .unwrap();
+        let svc = mgr.service_writer("api").unwrap();
+
+        // A run killed mid-frame: it takes the screen and never gives it back.
+        svc.process_stream(std::io::Cursor::new(
+            b"\x1b[?1049h\x1b[2J\x1b[HHOLDING".to_vec(),
+        ))
+        .await
+        .unwrap();
+        // The next run, on the same process's output.
+        svc.process_stream(std::io::Cursor::new(b"second run speaks\n".to_vec()))
+            .await
+            .unwrap();
+        mgr.shutdown().await;
+
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("second run speaks"),
+            "the next run must not inherit the dead one's screen: {output:?}"
+        );
+        assert!(
+            !output.contains("HOLDING"),
+            "the dead run's frame is not a line: {output:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_line_buffering_complete_lines() {
         let (writer, buf) = TestBuffer::new();
@@ -2009,6 +2559,118 @@ mod tests {
         assert!(output.is_empty(), "ignore mode should not write to stdout");
     }
 
+    /// What don records for its clients must not depend on what it shows the
+    /// terminal. A service logging to a file and one told to be quiet are both
+    /// silent on stdout — and both used to be silent in the merged stream too,
+    /// because the merged stream is published from inside the stdout writer and
+    /// neither was wired to it. The TUI reads that stream, so the TUI was the
+    /// one client with an incomplete record.
+    #[tokio::test]
+    async fn the_merged_record_is_complete_whatever_the_terminal_shows() {
+        struct Case {
+            label: &'static str,
+            config: crate::config::LogConfig,
+            want_on_stdout: bool,
+        }
+
+        let dir = std::env::temp_dir().join(format!("don-mute-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cases = vec![
+            Case {
+                label: "log = stdout",
+                config: crate::config::LogConfig::Stdout,
+                want_on_stdout: true,
+            },
+            Case {
+                label: "log = ignore",
+                config: crate::config::LogConfig::Ignore,
+                want_on_stdout: false,
+            },
+            Case {
+                label: "log = file",
+                config: crate::config::LogConfig::File(dir.join("svc.log")),
+                want_on_stdout: false,
+            },
+        ];
+
+        for case in cases {
+            let (writer, buf) = TestBuffer::new();
+            let mgr = OutputManager::new(&[("svc", &case.config)], writer)
+                .await
+                .unwrap();
+            let mut tap = mgr.log_stream_sender().subscribe();
+            let svc = mgr.service_writer("svc").unwrap();
+            svc.process_stream(std::io::Cursor::new(b"recorded\n".to_vec()))
+                .await
+                .unwrap();
+
+            // Read the tap before shutdown drops the sender.
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), tap.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{}: nothing reached the merged tap", case.label))
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&line.line.bytes).contains("recorded"),
+                "{}: the merged record must carry the line",
+                case.label
+            );
+
+            // Muting a process must not mute don talking *about* it.
+            mgr.clone_lifecycle_emitter()
+                .service_event("svc", "starting...");
+            mgr.shutdown().await;
+
+            let output = read_buf(&buf);
+            assert_eq!(
+                output.contains("recorded"),
+                case.want_on_stdout,
+                "{}: terminal output",
+                case.label
+            );
+            assert!(
+                output.contains("svc: starting..."),
+                "{}: lifecycle narration is don speaking, not the process",
+                case.label
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A config mute is permanent and an attach mute lasts as long as the
+    /// attach. Keeping them in one set would let a detach hand a `log =
+    /// "ignore"` service a terminal it was never meant to have.
+    #[test]
+    fn mute_sources_do_not_leak_into_each_other() {
+        let mute = StdoutMuteControl::new(HashSet::from(["quiet".to_string()]));
+
+        assert!(mute.is_muted("quiet"), "config mute applies immediately");
+        assert!(!mute.is_muted("noisy"), "nothing else is muted");
+
+        mute.attach("noisy");
+        mute.attach("quiet");
+        assert!(
+            mute.is_muted("noisy"),
+            "an attached process leaves the terminal"
+        );
+        assert!(mute.is_muted("quiet"), "and stays muted if it already was");
+
+        mute.release("noisy");
+        mute.release("quiet");
+        assert!(!mute.is_muted("noisy"), "detaching gives the terminal back");
+        assert!(
+            mute.is_muted("quiet"),
+            "but a detach must not undo what the config asked for"
+        );
+
+        mute.mute_by_config("added-later");
+        assert!(
+            mute.is_muted("added-later"),
+            "services can join after construction"
+        );
+    }
+
     #[tokio::test]
     async fn test_lifecycle_event_format() {
         let (writer, buf) = TestBuffer::new();
@@ -2023,6 +2685,98 @@ mod tests {
         let output = read_buf(&buf);
         let stripped = strip_ansi(output.as_bytes());
         assert!(stripped.contains("[don]") && stripped.contains("loading don.toml"));
+    }
+
+    /// Every client numbers the same line the same way, and a client that
+    /// falls behind is caught up from the tap's own history instead of being
+    /// handed a hole. Only when history has itself moved past the gap does a
+    /// client hear about it — and then it hears exactly how much is missing
+    /// and where the stream resumes.
+    #[tokio::test]
+    async fn a_cursor_that_falls_behind_is_caught_up_not_cut_short() {
+        struct Case {
+            label: &'static str,
+            capacity: usize,
+            published: u64,
+            /// How many lines the cursor should still receive.
+            want_lines: usize,
+            want_dropped: Option<u64>,
+        }
+
+        // The broadcast holds 4096, so publishing past that with nobody
+        // reading is what forces a lag.
+        let cases = vec![
+            Case {
+                label: "history covers the gap, so the client never learns of it",
+                capacity: 50_000,
+                published: 6_000,
+                want_lines: 6_000,
+                want_dropped: None,
+            },
+            Case {
+                label: "history moved on: the client is told exactly what it lost",
+                capacity: 1_000,
+                published: 6_000,
+                want_lines: 1_000,
+                want_dropped: Some(5_000),
+            },
+        ];
+
+        for case in cases {
+            let tap = MergedLogTap::with_capacity(case.capacity);
+            let mut cursor = tap.cursor(None, 0).await;
+
+            for n in 0..case.published {
+                tap.publish(Arc::new(FormattedLogLine {
+                    name: "api".to_string(),
+                    is_lifecycle: false,
+                    is_verbose: false,
+                    bytes: format!("line {n}").into_bytes(),
+                }))
+                .await;
+            }
+            drop(tap); // so the cursor ends rather than parking
+
+            let mut lines = Vec::new();
+            let mut dropped = None;
+            while let Some(event) = cursor.recv().await {
+                match event {
+                    MergedEvent::Line(entry) => lines.push(entry.id),
+                    MergedEvent::Dropped { count, resumed_at } => {
+                        dropped = Some((count, resumed_at));
+                    }
+                }
+            }
+
+            assert_eq!(lines.len(), case.want_lines, "{}: lines", case.label);
+            assert_eq!(
+                dropped.map(|(count, _)| count),
+                case.want_dropped,
+                "{}: dropped",
+                case.label
+            );
+            // Whatever survived is contiguous and ends at the newest line:
+            // healing must not reorder or duplicate.
+            assert!(
+                lines.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1),
+                "{}: ids must stay contiguous",
+                case.label
+            );
+            assert_eq!(
+                lines.last().copied(),
+                Some(LogId(case.published - 1)),
+                "{}: the newest line must arrive",
+                case.label
+            );
+            if let Some((_, resumed_at)) = dropped {
+                assert_eq!(
+                    Some(resumed_at),
+                    lines.first().copied(),
+                    "{}: the stream resumes where the drop said it would",
+                    case.label
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2066,13 +2820,13 @@ mod tests {
             mgr.shutdown().await;
 
             let line = tap.recv().await.unwrap();
-            assert_eq!(line.name, case.want_name, "{}: name", case.name);
+            assert_eq!(line.line.name, case.want_name, "{}: name", case.name);
             assert_eq!(
-                line.is_lifecycle, case.want_lifecycle,
+                line.line.is_lifecycle, case.want_lifecycle,
                 "{}: lifecycle flag",
                 case.name
             );
-            let text = strip_ansi(&line.bytes);
+            let text = strip_ansi(&line.line.bytes);
             assert!(
                 text.contains(case.want_contains),
                 "{}: expected {:?} in {:?}",

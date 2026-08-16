@@ -11,28 +11,31 @@
 //! which addresses supervisors directly and leaves the runner's mailbox to
 //! the things that are genuinely scheduling decisions.
 //!
-//! # What still goes through the runner
+//! # Who answers what
 //!
-//! The lifecycle verbs still do, and deliberately. Two things pin them there.
-//! A reply is a happens-after marker for a runner fold — `socket_test` treats
-//! a stop reply as "this is no longer a satisfied dependency", which is only
-//! true once the runner has folded `Stopped` — so the reply must ride the
-//! fold whichever way the request travels. And the pre-checks (`cannot start
-//! while Stopping`, `waiting for dependency 'x'`, `not running`) read
-//! fold-current state, which a projection would race.
+//! `start` and `stop` are addressed straight at the supervisor. Every
+//! pre-check they need — `cannot start while Stopping`, `already running`,
+//! `not running`, `waiting for dependency 'x'` — is about the phase it
+//! published, the process it holds, or the level it computes. The scheduler
+//! used to answer all three from copies, and the supervisor re-checked anyway.
 //!
-//! What this module removes is the part that never needed the loop: deciding
-//! whether a name exists at all, and what kind of process it is. A typo
-//! answers 404 without waking the scheduler.
+//! The reply still rides *down* with the request and comes back up on the
+//! report channel, so it keeps meaning what it always meant: the scheduler has
+//! applied this. `socket_test` reads a stop reply as "no longer a satisfied
+//! dependency", and that is only true once the merge has absorbed `Stopped` —
+//! which the runner guarantees by draining facts before handling any report.
 //!
-//! Execution has left, even though the request has not: a verb reaches the
-//! supervisor as one command, and the client's oneshot rides down with it and
-//! comes back on the report channel. That is the shape
-//! `ServiceStartIntent::Reply` already proved.
+//! Name resolution never needed the loop either: a typo answers 404 from
+//! [`ProcessCatalog`] without waking anything.
+//!
+//! Every verb is addressed at a supervisor now. `Status` and `Shutdown` are
+//! all that is left of the runner's mailbox: a read of the projection, and
+//! "begin teardown".
 
 use std::collections::{HashMap, HashSet};
 
 use crate::command::{CommandError, CommandResult};
+use crate::process::task_supervisor;
 use crate::runner::RunnerCommand;
 
 /// Every configured process name and what kind it is.
@@ -126,39 +129,97 @@ pub type ControlResult = Result<CommandResult, Unavailable>;
 #[derive(Clone)]
 pub struct ProcessControl {
     catalog: std::sync::Arc<ProcessCatalog>,
+    services: crate::process::registry::ProcessRegistry<
+        crate::process::service_supervisor::ServiceCommand,
+    >,
+    tasks: crate::process::registry::ProcessRegistry<crate::process::task_supervisor::TaskCommand>,
+    /// Set once teardown begins. Rides down with a manual stop so don shutting
+    /// down cuts an in-flight grace period short instead of waiting it out —
+    /// a stop with a 10s grace must not hold exit hostage for 10s.
+    shutting_down: tokio::sync::watch::Receiver<bool>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<RunnerCommand>,
 }
 
 impl ProcessControl {
     pub(crate) fn new(
         catalog: std::sync::Arc<ProcessCatalog>,
+        services: crate::process::registry::ProcessRegistry<
+            crate::process::service_supervisor::ServiceCommand,
+        >,
+        tasks: crate::process::registry::ProcessRegistry<
+            crate::process::task_supervisor::TaskCommand,
+        >,
+        shutting_down: tokio::sync::watch::Receiver<bool>,
         cmd_tx: tokio::sync::mpsc::UnboundedSender<RunnerCommand>,
     ) -> Self {
-        Self { catalog, cmd_tx }
+        Self {
+            catalog,
+            services,
+            tasks,
+            shutting_down,
+            cmd_tx,
+        }
     }
 
     /// Start a stopped service.
+    ///
+    /// Addressed straight at the supervisor, which admits or refuses it from
+    /// the phase, the process and the dependency level it already owns. The
+    /// reply rides down with the request and comes back on the report channel,
+    /// so it still means what it always meant: the scheduler has applied this.
     pub async fn start(&self, name: &str) -> ControlResult {
         if let Err(e) = self.catalog.require_service(name) {
             return Ok(Err(e));
         }
-        self.request(|reply| RunnerCommand::Start {
-            name: name.to_string(),
-            reply,
-        })
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sent = self.services.get(name).is_some_and(|handle| {
+            handle.request(crate::process::service_supervisor::ServiceCommand::Start(
+                crate::process::service_supervisor::StartRequest {
+                    mode: crate::process::service_worker::ServiceStartMode::Full,
+                    intent: crate::process::ServiceStartIntent::Reply { reply: tx },
+                    fresh_backend_ports: false,
+                },
+            ))
+        });
+        if !sent {
+            // Configured but not in this profile's active set, so no
+            // supervisor exists to ask. "Not running" is the pinned answer.
+            return Ok(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "not running".to_string(),
+            }));
+        }
+        rx.await.map_err(|_| Unavailable)
     }
 
     /// Stop a running service.
+    ///
+    /// Like [`Self::start`], addressed at the supervisor: whether there is
+    /// anything to stop, and whether stopping it is meaningful, are questions
+    /// about the process it holds.
     pub async fn stop(&self, name: &str) -> ControlResult {
         if let Err(e) = self.catalog.require_service(name) {
             return Ok(Err(e));
         }
-        self.request(|reply| RunnerCommand::Stop {
-            name: name.to_string(),
-            reply,
-        })
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sent = self.services.get(name).is_some_and(|handle| {
+            handle.request(crate::process::service_supervisor::ServiceCommand::Stop(
+                crate::process::service_supervisor::StopRequest {
+                    force: false,
+                    wait_full_exit: false,
+                    interrupt: Some(self.shutting_down.clone()),
+                    notify: crate::process::service_supervisor::StopNotify::Reply(Some(tx)),
+                    reset_policy: true,
+                },
+            ))
+        });
+        if !sent {
+            return Ok(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "not running".to_string(),
+            }));
+        }
+        rx.await.map_err(|_| Unavailable)
     }
 
     /// Restart a service, or re-run a task with its last parameters.
@@ -168,11 +229,43 @@ impl ProcessControl {
         {
             return Ok(Err(e));
         }
-        self.request(|reply| RunnerCommand::Restart {
-            name: name.to_string(),
-            reply,
-        })
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // A task re-runs with the parameters its supervisor still holds; a
+        // service stops what it holds and starts again. Both are one mailbox
+        // item to the owner, which is what stops either interleaving with
+        // anything else that process was asked to do.
+        let sent = if self.catalog.is_task(name) {
+            self.tasks.get(name).is_some_and(|handle| {
+                handle.request(crate::process::task_supervisor::TaskCommand::Restart {
+                    reply: Some(tx),
+                })
+            })
+        } else {
+            self.services.get(name).is_some_and(|handle| {
+                handle.request(crate::process::service_supervisor::ServiceCommand::Restart(
+                    Box::new(crate::process::service_supervisor::RestartRequest {
+                        wait_full_exit: false,
+                        interrupt: Some(self.shutting_down.clone()),
+                        clear_backend_first: false,
+                        start_mode: crate::process::service_worker::ServiceStartMode::Full,
+                        fresh_backend_ports: false,
+                        intent: crate::process::ServiceStartIntent::Background,
+                        reply: Some(tx),
+                        announce_restarting: false,
+                        // An explicit request clears the failure history;
+                        // only the policy's own retry keeps it.
+                        reset_policy: true,
+                    }),
+                ))
+            })
+        };
+        if !sent {
+            return Ok(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "not running".to_string(),
+            }));
+        }
+        rx.await.map_err(|_| Unavailable)
     }
 
     /// Force a rebuild, then restart.
@@ -180,14 +273,32 @@ impl ProcessControl {
         if let Err(e) = self.catalog.require_service(name) {
             return Ok(Err(e));
         }
-        self.request(|reply| RunnerCommand::HardRestart {
-            name: name.to_string(),
-            reply,
-        })
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sent = self.services.get(name).is_some_and(|handle| {
+            handle.request(crate::process::service_supervisor::ServiceCommand::Rebuild(
+                crate::process::service_supervisor::RebuildRequest {
+                    forced: true,
+                    source: crate::process::service_supervisor::RebuildSource::Requested,
+                    reply: Some(tx),
+                },
+            ))
+        });
+        if !sent {
+            return Ok(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "not running".to_string(),
+            }));
+        }
+        rx.await.map_err(|_| Unavailable)
     }
 
     /// Run a task, optionally waiting for it to finish.
+    ///
+    /// Addressed at the supervisor, which owns every remaining pre-check: it
+    /// holds the run that would make this one a duplicate, and the config the
+    /// supplied params are resolved against. What is settled here is only what
+    /// needs no state at all — the name, and whether the `--wait` spelling
+    /// parses.
     pub async fn run_task(
         &self,
         name: &str,
@@ -198,20 +309,46 @@ impl ProcessControl {
         if let Err(e) = self.catalog.require_task(name) {
             return Ok(Err(e));
         }
-        self.request(|reply| RunnerCommand::RunTask {
-            name: name.to_string(),
-            params,
-            wait,
-            wait_timeout,
-            reply,
-        })
-        .await
-    }
+        let wait = wait || wait_timeout.is_some();
+        let timeout = match wait_timeout {
+            Some(spelling) => match crate::duration::parse_duration(&spelling) {
+                Ok(duration) => Some((duration, spelling)),
+                Err(e) => {
+                    return Ok(Err(CommandError::InvalidParams {
+                        name: name.to_string(),
+                        message: format!("invalid wait timeout: {e}"),
+                    }));
+                }
+            },
+            None => None,
+        };
 
-    /// Run every task parked in `PendingRun`.
-    pub async fn run_pending(&self) -> ControlResult {
-        self.request(|reply| RunnerCommand::RunPendingTasks { reply })
-            .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let reply = if wait {
+            // The answer rides the run to its exit, which is what `--wait`
+            // asked for.
+            task_supervisor::RunReply::OnExit(task_supervisor::RunWait { reply: tx, timeout })
+        } else {
+            task_supervisor::RunReply::OnStart(tx)
+        };
+        let sent = self.tasks.get(name).is_some_and(|handle| {
+            handle.request(task_supervisor::TaskCommand::Run(
+                task_supervisor::RunRequest {
+                    params,
+                    mode: crate::process::task_worker::TaskRunMode::Triggered,
+                    intent: crate::process::TaskRunIntent::Background,
+                    reply: Some(reply),
+                    start_message: Some("running (manual trigger)".to_string()),
+                },
+            ))
+        });
+        if !sent {
+            return Ok(Err(CommandError::Failed {
+                name: name.to_string(),
+                message: "task supervisor is shutting down".to_string(),
+            }));
+        }
+        rx.await.map_err(|_| Unavailable)
     }
 
     /// Begin graceful shutdown. Fire-and-forget: teardown narrates itself.
@@ -235,17 +372,11 @@ impl ProcessControl {
                 active_services: HashSet::new(),
                 active_tasks: HashSet::new(),
             }),
+            crate::process::registry::ProcessRegistry::empty(),
+            crate::process::registry::ProcessRegistry::empty(),
+            tokio::sync::watch::channel(false).1,
             cmd_tx,
         )
-    }
-
-    async fn request(
-        &self,
-        build: impl FnOnce(tokio::sync::oneshot::Sender<CommandResult>) -> RunnerCommand,
-    ) -> ControlResult {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx.send(build(tx)).map_err(|_| Unavailable)?;
-        rx.await.map_err(|_| Unavailable)
     }
 }
 
@@ -332,28 +463,76 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_dead_runner_is_unavailable_not_a_command_failure() {
+    fn dead_control() -> ProcessControl {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(cmd_rx);
-        let control = ProcessControl::new(std::sync::Arc::new(catalog()), cmd_tx);
-        assert!(
-            control.start("api").await.is_err(),
-            "a real request needs the runner"
-        );
-        // …but a bad name is answered locally, and as the command's own
-        // error rather than as the runner being unavailable — otherwise a
-        // typo would report 503 instead of 404.
-        let answered = control
-            .start("ghost")
+        ProcessControl::new(
+            std::sync::Arc::new(catalog()),
+            crate::process::registry::ProcessRegistry::empty(),
+            crate::process::registry::ProcessRegistry::empty(),
+            tokio::sync::watch::channel(false).1,
+            cmd_tx,
+        )
+    }
+
+    /// What a client can be told without waking anything: whether the name
+    /// exists, and whether the `--wait` spelling parses. Neither reads state,
+    /// so neither may report the stack as unavailable — a typo answering 503
+    /// instead of 404 is the failure this pins.
+    #[tokio::test]
+    async fn checks_that_need_no_state_are_answered_locally() {
+        let answered = dead_control()
+            .run_task("ghost", HashMap::new(), false, None)
             .await
-            .expect("a name check must not need the runner");
+            .expect("a name check must not need a supervisor");
+        assert!(
+            answered.unwrap_err().to_string().contains("unknown task"),
+            "a typo must answer as the command's error, not as 503"
+        );
+
+        let answered = dead_control()
+            .run_task("setup", HashMap::new(), true, Some("banana".to_string()))
+            .await
+            .expect("parsing a duration must not need a supervisor");
         assert!(
             answered
                 .unwrap_err()
                 .to_string()
-                .contains("unknown service"),
-            "a typo must answer as the command's error, not as 503"
+                .contains("invalid wait timeout"),
+            "an unparseable --wait spelling is the caller's error"
+        );
+    }
+
+    /// Every verb is addressed at a supervisor now, so a process this profile
+    /// left out — or a stack that has already torn its supervisors down — has
+    /// nothing to ask, and a dead runner is not what went wrong. Each answers
+    /// as the command's own error rather than 503, which is the asymmetry
+    /// `server_test` pins.
+    #[tokio::test]
+    async fn a_verb_with_no_supervisor_answers_as_a_command_error() {
+        for answered in [
+            dead_control().start("excluded").await,
+            dead_control().stop("excluded").await,
+            dead_control().restart("excluded").await,
+            dead_control().hard_restart("excluded").await,
+        ] {
+            let answered =
+                answered.expect("a missing supervisor must not read as the runner being gone");
+            assert!(
+                answered.unwrap_err().to_string().contains("not running"),
+                "a service outside the active profile is not running"
+            );
+        }
+
+        // A *task* resolves against the active set, so a missing mailbox here
+        // means the supervisor has gone rather than never existed.
+        let answered = dead_control()
+            .run_task("setup", HashMap::new(), false, None)
+            .await
+            .expect("a missing supervisor must not read as the runner being gone");
+        assert!(
+            answered.unwrap_err().to_string().contains("shutting down"),
+            "an active task with no mailbox has a supervisor that ended"
         );
     }
 }

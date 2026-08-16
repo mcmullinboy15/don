@@ -127,38 +127,41 @@ Don manages external resources (child processes, PID files, sockets, docker cont
 ### Testing the TUI
 
 Pipe-mode integration tests cover the runner and `OutputManager`, but they
-don't exercise ratatui rendering, the inline-viewport DSR setup, the input
-task, or the broadcast/log-channel interplay that the TUI loop sits in the
-middle of. Several of the worst regressions in this codebase have been
-TUI-only — pipe mode fine, TUI hangs / loses lifecycle events / freezes the
-status bar under load. **If you touch `src/tui/`, `src/output/`, or the
-runner's shutdown path, you need to validate against a real PTY.**
+don't exercise ratatui rendering, the input task, mouse handling, or the
+interplay between those and the merged log stream. Several of the worst
+regressions in this codebase have been TUI-only — pipe mode fine, TUI hangs /
+loses lifecycle events / freezes under load. **If you touch `src/tui/`,
+`src/output/`, or the runner's shutdown path, you need to validate against a
+real PTY.**
 
-There are three complementary tools in `tools/`:
+**Assert on the rendered screen, never on the raw byte stream.** The TUI owns
+the alternate screen, so its output is cursor moves and styled cells: a message
+arrives split across escape sequences, a repainted region arrives twice, and a
+line that scrolled away an hour ago is still in the byte stream. Grepping the
+bytes gives both false negatives and false positives. The tools below render
+the stream into a screen and assert on that.
 
-- **`tools/tui_drive.py`** — runs `don start` under a real PTY (`pty.fork`),
-  intercepts and answers DSR cursor queries on the master side (so the TUI
-  starts cleanly the way it would in a normal terminal), waits for "all
-  services running", sends SIGINT after a configurable linger, watches for
-  "shutdown complete", and force-kills + reports HANG if the process
-  doesn't exit promptly. Captures the full ANSI byte stream on stdout and
-  writes a structured summary to stderr (lifecycle event counts, captured
-  byte total, exit code).
+There are four tools in `tools/`:
+
+- **`tools/tui_emulator.py`** — the shared harness: a PTY session plus a
+  terminal emulator (uses `pyte` when installed, falls back to a built-in
+  subset of CUP/ED/EL/SGR/alt-screen otherwise). The other three import it.
+- **`tools/tui_drive.py`** — runs `don start` under a real PTY, waits for
+  "all services running" *on screen*, lingers, sends Ctrl+C, and checks that
+  shutdown narrates itself, that don exits promptly, and that the alternate
+  screen is handed back. Prints a structured summary on stderr and the raw
+  stream on stdout.
+- **`tools/tui_drive_resize.py`** — scrolls up out of follow mode, then
+  resizes several times and checks the line at the top of the pane is still
+  the same line. That is the property the scroll anchor in `src/tui/logs.rs`
+  exists for: rows are a function of width, so a row-counted offset would move
+  the view on every resize. Also budgets the bytes each resize costs, which
+  catches a repaint turning into a history replay. Override the sequence with
+  `DON_RESIZE_SIZES` (e.g. `"50x140,50x100"`).
 - **`tools/gen_stress_config.py`** — generates a synthetic `don.toml` plus
-  per-service shell scripts that mirror the shape of a busy monorepo:
-  hidden infra services with one of them spamming on SIGTERM, hidden
-  consumers with TERM-trap floods, dozens of lazy `app-NN` services with
-  `listenfd` proxies. This is the load shape that exposes TUI render-rate
-  bugs.
-- **`tools/tui_drive_resize.py`** — drives the *resize* path: waits for
-  steady state (a large log burst has filled the `LogStore`), then sends a
-  sequence of real `SIGWINCH` resizes (`ioctl(TIOCSWINSZ)`), accounts for
-  the bytes don writes per resize (a replay-on-resize regression shows up as
-  a multi-MB spike), and replays the captured stream into a `pyte` screen to
-  detect "ghost" bars left behind. Override the size sequence with
-  `DON_RESIZE_SIZES` (e.g. `"50x140,50x100"` for a width-only resize, which
-  must preserve on-screen logs and emit no `\x1b[2J`). Requires `pyte` for
-  the ghost check.
+  per-service scripts mirroring a busy monorepo: hidden infra services, TERM-trap
+  floods, dozens of lazy `app-NN` services with `listenfd` proxies. This is the
+  load shape that exposes render-rate bugs.
 
 The standard workflow:
 
@@ -166,41 +169,40 @@ The standard workflow:
 # Build (release — debug is too slow to expose perf issues at scale).
 cargo build --release
 
-# Generate a stress config in a scratch dir.
 python3 tools/gen_stress_config.py /tmp/don-stress
-
-# Drive don in TUI mode, send Ctrl+C 4s after steady-state.
 rm -rf /tmp/don-stress/.don
 python3 tools/tui_drive.py target/release/don /tmp/don-stress 4 \
     > /tmp/tui-stdout.bin 2> /tmp/tui-stderr.log
-
-# Healthy run: every running (non-lazy) service shows
-# `: stopping`, `send SIGTERM`, and `: stopped`; "shutdown complete"
-# appears; exit code is 0; total runtime well under 10 s.
 tail -15 /tmp/tui-stderr.log
+
+rm -rf /tmp/don-stress/.don
+python3 tools/tui_drive_resize.py target/release/don /tmp/don-stress
 ```
 
-Things to look for in the stderr summary:
+Both print `RESULT: ok` or `RESULT: FAIL` and exit accordingly. Things worth
+reading in the summary:
 
-- `saw shutdown: True` — `shutdown complete` reached the TUI.
-- `lifecycle 'stopping' / 'send SIGTERM' / 'stopped' events: N` — should
-  equal the number of running (non-lazy) services. A drop here means
-  lifecycle events were dropped or the runner skipped its shutdown loop.
-- `don exit code: 0` — clean exit. `None` + a `HANG` line means the
-  driver had to SIGKILL.
-- `captured bytes` — useful regression signal. A jump from tens of KB to
-  multiple MB without a config change means the TUI started rendering
-  log lines that should have stayed filtered.
+- `reached 'all services running' on screen` — startup settled.
+- `alternate screen entered` / `handed back` — a TUI that exits without
+  restoring the main screen looks to the user like their scrollback vanished.
+- `bytes written during 2s idle` — should be small and roughly constant. The
+  loop marks state dirty and draws at most once per frame, so an idle screen
+  costs almost nothing. Growth here means something is dirtying every tick.
+- `captured bytes total` — a jump from tens of KB to megabytes without a config
+  change means the TUI is repainting far more than it should.
+- `don exit code: 0` and no `HANG` line.
 
-To exercise even harder, edit `tools/gen_stress_config.py` and bump the
-spam loop counts inside the noisy services' TERM traps. The current shape
-is calibrated to surface the render-rate bug we fixed; if you're chasing
-something different (lots of state events, deep dep chains, etc.) tweak
-the shape rather than reaching for a one-off shell script.
+For a quick look at what the TUI actually renders — for instance while working
+on layout — `tools/tui_screen.py <binary> <dir> [linger] [keys]` prints the
+screen, optionally after sending some keys:
 
-When TUI behavior changes, this is the test of record. A `cargo test`
-green run is necessary but not sufficient — also run the driver and
-include before/after stderr summaries in the change description.
+```sh
+python3 tools/tui_screen.py target/release/don /tmp/don-stress 4 "p"
+```
+
+When TUI behavior changes, these are the tests of record. A `cargo test` green
+run is necessary but not sufficient — run the drivers and include before/after
+summaries in the change description.
 
 ### Code Organization
 
@@ -254,8 +256,18 @@ src/
   output/
     mod.rs                  # line buffering, service name prefixing, color assignment, sink management
     attach.rs               # attach sessions over the live spawn's PTY gate; detach = guard drop
+    actor.rs                # per-process output actor: ring buffer, sink fan-out, attach state
     ring_buffer.rs          # bounded per-service output buffer
     sanitize.rs             # ANSI escape sequence filtering (strip cursor/screen, keep colors)
+  tui/
+    mod.rs                  # the one select! loop: arms mark dirty, one rate-capped arm draws
+    app.rs                  # all view state; nothing else mutates it
+    render.rs               # one `draw` for the whole screen — log pane, status pane, bar, overlays
+    logs.rs                 # the log view: wrapping, the (LogId, row) scroll anchor, follow mode
+    log_store.rs            # this client's copy of the merged stream, parsed and measured once
+    panes.rs                # pane rectangles, focus, divider drag — computed once, read by all
+    selection.rs            # drag selection over rendered rows, and OSC 52 copy
+    input.rs                # crossterm events → AppEvent; no interpretation
   client/
     mod.rs                  # HTTP-over-unix-socket client for CLI ↔ daemon communication
   server/

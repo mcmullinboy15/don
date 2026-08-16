@@ -190,14 +190,11 @@ enum Commands {
     },
     /// Run a task (bypasses auto_run)
     Run {
-        /// Name of a specific task to run (mutually exclusive with --all-pending)
-        name: Option<String>,
-        /// Run all tasks currently in pending_run state
-        #[arg(long, conflicts_with = "name")]
-        all_pending: bool,
+        /// Name of the task to run
+        name: String,
         /// Never prompt for missing required params — error instead. Implicit
         /// when stdin isn't a TTY. Useful in scripts / CI.
-        #[arg(long, conflicts_with = "all_pending")]
+        #[arg(long)]
         no_prompt: bool,
         /// Wait until the task exits before returning
         #[arg(long)]
@@ -385,25 +382,11 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
         Commands::Run {
             name,
-            all_pending,
             raw,
             no_prompt,
             wait,
             timeout,
-        } => match (name, all_pending) {
-            (Some(n), _) => run_run_task(&config_path, n, raw, no_prompt, wait, timeout).await,
-            (None, true) => {
-                if wait || timeout.is_some() {
-                    errln("don run --all-pending does not support --wait or --timeout");
-                    return 2;
-                }
-                run_client(&config_path, |c| async move { c.run_pending().await }).await
-            }
-            (None, false) => {
-                errln("don run: provide a task name or --all-pending");
-                1
-            }
-        },
+        } => run_run_task(&config_path, name, raw, no_prompt, wait, timeout).await,
         Commands::Completions { shell } => {
             let mut out = std::io::stdout();
             match don::completions::emit_script::<_, Cli>(shell, "don", &mut out) {
@@ -1691,7 +1674,10 @@ async fn attach_tui_inner(
         .map_err(|e| format!("Error: {e}"))?;
     let verbosity = local_output.verbosity_control();
     let lifecycle_emitter = local_output.clone_lifecycle_emitter();
-    let mut local_tap = local_output.log_stream_sender().subscribe();
+    // Local narration this client generates itself (bridge notices, errors).
+    // A cursor rather than a raw subscription so the two sides of the merge
+    // behave the same way when either falls behind.
+    let mut local_tap = local_output.log_stream_sender().cursor(None, 0).await;
 
     // A long-lived runner can outlive a `don` upgrade. Warn about skew as a
     // rendered line rather than misbehaving quietly.
@@ -1716,7 +1702,7 @@ async fn attach_tui_inner(
         let follow = Client::new(&base);
         tokio::spawn(async move {
             let _ = follow
-                .logs_follow_all(|event| {
+                .logs_follow_all(None, |event| {
                     remote_tx
                         .send(event)
                         .map_err(|_| don::client::ClientError::Invalid("tui closed".into()))
@@ -1733,40 +1719,44 @@ async fn attach_tui_inner(
         loop {
             tokio::select! {
                 remote = remote_rx.recv() => match remote {
-                    Some(LogStreamEvent::Line { name, lifecycle, verbose, line }) => {
-                        let line = don::output::FormattedLogLine {
-                            name,
-                            is_lifecycle: lifecycle,
-                            is_verbose: verbose,
-                            bytes: line.into_bytes(),
-                        };
-                        if log_tx.send(line).is_err() {
+                    Some(LogStreamEvent::Line { id, name, lifecycle, verbose, line }) => {
+                        let event = don::output::MergedEvent::Line(don::output::MergedLine {
+                            id,
+                            line: std::sync::Arc::new(don::output::FormattedLogLine {
+                                name,
+                                is_lifecycle: lifecycle,
+                                is_verbose: verbose,
+                                bytes: line.into_bytes(),
+                            }),
+                        });
+                        if log_tx.send(event).is_err() {
                             return;
                         }
                     }
-                    Some(LogStreamEvent::Lagged { lagged }) => {
-                        let notice = don::output::FormattedLogLine {
-                            name: don::output::LIFECYCLE_EVENT_NAME.to_string(),
-                            is_lifecycle: true,
-                            is_verbose: false,
-                            bytes: format!("log stream lagged — {lagged} lines dropped")
-                                .into_bytes(),
-                        };
-                        if log_tx.send(notice).is_err() {
+                    Some(LogStreamEvent::Dropped { dropped, resumed_at }) => {
+                        // The server already tried its own history; if it is
+                        // telling us, the lines are genuinely gone.
+                        if log_tx
+                            .send(don::output::MergedEvent::Dropped {
+                                count: dropped,
+                                resumed_at,
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                     }
                     None => return,
                 },
                 local = local_tap.recv() => match local {
-                    Ok(line) => {
-                        if log_tx.send((*line).clone()).is_err() {
+                    Some(event) => {
+                        if log_tx.send(event).is_err() {
                             return;
                         }
                     }
                     // Local feedback is best-effort; the remote stream is
                     // the one whose end must end the session.
-                    Err(_) => continue,
+                    None => continue,
                 },
             }
         }
@@ -2655,25 +2645,17 @@ async fn run_start(
         .await
         .map_err(|e| format!("Error creating output manager: {e}"))?;
         let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut tap = output_manager.log_stream_sender().subscribe();
+        // A cursor, not a raw subscription: falling behind is repaired from the
+        // tap's own history rather than punched into the TUI's log as a hole.
+        // The remote TUI is fed the same `MergedEvent`s off the wire, so the
+        // two clients differ in transport and nothing else.
+        let mut tap = output_manager
+            .log_stream_sender()
+            .cursor(None, don::output::DEFAULT_MERGED_HISTORY_CAPACITY)
+            .await;
         tokio::spawn(async move {
-            loop {
-                let line = match tap.recv().await {
-                    Ok(line) => (*line).clone(),
-                    // The TUI's old private channel was unbounded and could
-                    // not lag; the shared tap can. Surface the gap as a
-                    // lifecycle line rather than silently thinning the log.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        don::output::FormattedLogLine {
-                            name: don::output::LIFECYCLE_EVENT_NAME.to_string(),
-                            is_lifecycle: true,
-                            is_verbose: false,
-                            bytes: format!("log stream lagged — {n} lines dropped").into_bytes(),
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                };
-                if log_tx.send(line).is_err() {
+            while let Some(event) = tap.recv().await {
+                if log_tx.send(event).is_err() {
                     return; // TUI is gone; stop following.
                 }
             }

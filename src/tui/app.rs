@@ -242,11 +242,37 @@ pub(crate) struct App {
     pub(crate) form: Option<FormState>,
     /// Active service/task log popup shown over the services/tasks table.
     pub(crate) log_popup: Option<LogPopup>,
-    /// Terminal height the inline bar was last drawn at. The resize handler
-    /// compares against this to decide whether a resize changed the height
-    /// (and thus moved the bar, requiring a screen clear to erase the ghost)
-    /// or only the width (where the reflowed logs can stay on screen).
-    pub(crate) last_screen_height: u16,
+    /// Where the panes ended up in the last frame. Written by the renderer and
+    /// read by mouse handling, so a click resolves against the rectangles that
+    /// were actually drawn rather than a second computation of them.
+    pub(crate) panes: super::panes::Panes,
+    /// The optional status pane beside the log: open, docked, sized.
+    pub(crate) status_pane: super::panes::StatusPane,
+    /// Which pane takes keys both could claim.
+    pub(crate) focus: super::panes::Focus,
+    /// Set while the divider is being dragged, so motion resizes instead of
+    /// selecting text.
+    pub(crate) dragging_divider: bool,
+    /// Where the log pane is looking. `Follow` until the user scrolls away.
+    pub(crate) log_scroll: super::logs::Scroll,
+    /// The drag in progress, or the last one that settled. Screen coordinates,
+    /// so it is discarded whenever the view moves under it.
+    pub(crate) log_selection: super::selection::Selection,
+    /// What the last copy did, shown in the status bar. OSC 52 gets no reply,
+    /// so saying "copied" is the only feedback there can be.
+    pub(crate) copy_notice: Option<String>,
+    /// The plain text of the rows the last frame drew, and where the pane
+    /// started. Written by the renderer so a copy resolves against exactly what
+    /// was on screen rather than re-deriving wrapping, filtering and scroll.
+    pub(crate) log_visible_rows: Vec<String>,
+    pub(crate) log_pane_origin: (u16, u16),
+    /// Geometry the last frame produced, so the input layer can move the
+    /// scroll anchor without re-deriving what only the renderer knows: how
+    /// tall the pane came out and how much admitted content there is at this
+    /// width. Written by the renderer, read by key and mouse handling.
+    pub(crate) log_rows_above: usize,
+    pub(crate) log_total_rows: usize,
+    pub(crate) log_pane_height: u16,
 }
 
 pub(crate) struct AppInit {
@@ -322,7 +348,18 @@ impl App {
             auto_filter_on_failure_names,
             form: None,
             log_popup: None,
-            last_screen_height: 0,
+            panes: super::panes::Panes::empty(),
+            status_pane: super::panes::StatusPane::default(),
+            focus: super::panes::Focus::Logs,
+            dragging_divider: false,
+            log_scroll: super::logs::Scroll::Follow,
+            log_selection: super::selection::Selection::default(),
+            copy_notice: None,
+            log_visible_rows: Vec::new(),
+            log_pane_origin: (0, 0),
+            log_rows_above: 0,
+            log_total_rows: 0,
+            log_pane_height: 0,
         }
     }
 
@@ -668,12 +705,6 @@ pub(crate) fn line_matches_log_popup(name: &str, line: &FormattedLogLine) -> boo
         return false;
     }
     String::from_utf8_lossy(&line.bytes).contains(&format!("{name}:"))
-}
-
-impl ViewMode {
-    pub(crate) fn needs_wall_clock_redraw(self) -> bool {
-        matches!(self, Self::Tasks)
-    }
 }
 
 #[cfg(test)]
@@ -1304,44 +1335,5 @@ mod tests {
 
         assert_eq!(got, vec!["failed", "pending-run", "running", "completed"]);
         assert_eq!(items[3].last_run.as_ref().unwrap().duration_ms, Some(42));
-    }
-
-    #[test]
-    fn only_task_table_needs_wall_clock_redraws() {
-        struct Case {
-            mode: ViewMode,
-            want: bool,
-        }
-
-        let cases = vec![
-            Case {
-                mode: ViewMode::Tasks,
-                want: true,
-            },
-            Case {
-                mode: ViewMode::Services,
-                want: false,
-            },
-            Case {
-                mode: ViewMode::Failures,
-                want: false,
-            },
-            Case {
-                mode: ViewMode::Normal,
-                want: false,
-            },
-            Case {
-                mode: ViewMode::Filter,
-                want: false,
-            },
-            Case {
-                mode: ViewMode::Form,
-                want: false,
-            },
-        ];
-
-        for case in cases {
-            assert_eq!(case.mode.needs_wall_clock_redraw(), case.want);
-        }
     }
 }

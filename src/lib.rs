@@ -10,6 +10,7 @@ pub mod download;
 pub mod duration;
 pub(crate) mod endpoints;
 pub mod exec;
+pub(crate) mod facts;
 pub(crate) mod gate;
 pub(crate) mod globwalk;
 pub mod init;

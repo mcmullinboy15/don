@@ -4,14 +4,14 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::ports::{manifest_path, read_manifest};
-use don::runner::{Runner, RunnerCommand};
+use don::runner::Runner;
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
@@ -1021,7 +1021,7 @@ fn integration_a_stopped_service_does_not_restart_itself_off_a_standing_gate() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1032,14 +1032,8 @@ fn integration_a_stopped_service_does_not_restart_itself_off_a_standing_gate() {
             read_buf(&buf)
         );
 
-        let (stop_tx, stop_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "keeper".to_string(),
-                reply: stop_tx,
-            })
-            .unwrap();
-        stop_rx
+        control
+            .stop("keeper")
             .await
             .unwrap()
             .expect("stopping keeper should succeed");
@@ -1077,7 +1071,7 @@ fn integration_explicit_start_waits_for_a_working_dep_but_not_a_settled_one() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1090,14 +1084,8 @@ fn integration_explicit_start_waits_for_a_working_dep_but_not_a_settled_one() {
         );
 
         // Still coming up: refuse, and name the dependency.
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Start {
-                name: "api".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
-        let err = reply_rx
+        let err = control
+            .start("api")
             .await
             .unwrap()
             .expect_err("a dependency that is still coming up must be waited for");
@@ -1113,26 +1101,14 @@ fn integration_explicit_start_waits_for_a_working_dep_but_not_a_settled_one() {
 
         // Settle the dependency by stopping it. Waiting can no longer help,
         // so the same request now succeeds.
-        let (stop_tx, stop_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "slow".to_string(),
-                reply: stop_tx,
-            })
-            .unwrap();
-        stop_rx
+        control
+            .stop("slow")
             .await
             .unwrap()
             .expect("stopping slow should succeed");
 
-        let (retry_tx, retry_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Start {
-                name: "api".to_string(),
-                reply: retry_tx,
-            })
-            .unwrap();
-        retry_rx
+        control
+            .start("api")
             .await
             .unwrap()
             .expect("a settled dependency must not block an explicit start");
@@ -1232,10 +1208,16 @@ fn integration_lazy_dep_rerun_failure_after_startup_blocks_start() {
 
         // First run (startup) succeeds instantly; the second run (our triggered
         // rerun) prints SETUP_RERUN, lingers, then fails.
+        //
+        // The marker is split so it appears only in the task's *output*, never
+        // in the `spawn bash -c '...'` line that echoes the command back. An
+        // unsplit marker matches that line during startup, so the wait below
+        // returns immediately and the connection races the rerun instead of
+        // following it.
         let setup_cmd = format!(
             "N=$(cat {ctr} 2>/dev/null || echo 0); N=$((N + 1)); echo $N > {ctr}; \
              if [ $N -eq 1 ]; then echo SETUP_OK; exit 0; fi; \
-             echo SETUP_RERUN; sleep 2; exit 1",
+             echo SETUP_'RERUN'; sleep 2; exit 1",
             ctr = counter.display()
         );
         let toml = ConfigBuilder::new()
@@ -1251,7 +1233,7 @@ fn integration_lazy_dep_rerun_failure_after_startup_blocks_start() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1264,13 +1246,15 @@ fn integration_lazy_dep_rerun_failure_after_startup_blocks_start() {
         );
 
         // Re-run `setup` post-startup. auto_run = always makes an in-flight
-        // rerun count as unsatisfied, so a connection now defers.
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "setup".to_string(),
-                reply: tokio::sync::oneshot::channel().0,
-            })
-            .unwrap();
+        // rerun count as unsatisfied, so a connection now defers. Detached:
+        // the reply lands when the re-run finishes, and the test wants to
+        // connect while it is still going.
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.restart("setup").await;
+            }
+        });
         assert!(
             wait_for_output(&buf, "SETUP_RERUN", Duration::from_secs(5)).await,
             "expected setup to re-run. output: {}",
@@ -1336,7 +1320,7 @@ fn integration_lazy_starts_when_service_dep_recovers_off_startup() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1349,15 +1333,8 @@ fn integration_lazy_starts_when_service_dep_recovers_off_startup() {
 
         // Stop `dep`; the reply confirms it reached Stopped (no longer a
         // satisfied dependency).
-        let (stop_tx, stop_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "dep".to_string(),
-                reply: stop_tx,
-            })
-            .unwrap();
         assert!(
-            stop_rx.await.unwrap().is_ok(),
+            control.stop("dep").await.unwrap().is_ok(),
             "expected dep to stop. output: {}",
             read_buf(&buf)
         );
@@ -1381,14 +1358,15 @@ fn integration_lazy_starts_when_service_dep_recovers_off_startup() {
         );
 
         // Restart dep off the startup loop; its recovery must re-fire the
-        // deferred lazy start via the pending sweep.
-        let (start_tx, _start_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Start {
-                name: "dep".to_string(),
-                reply: start_tx,
-            })
-            .unwrap();
+        // deferred lazy start via the pending sweep. Detached: the reply only
+        // lands once the start has settled, and the assertion below is what
+        // this test is actually waiting for.
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.start("dep").await;
+            }
+        });
         assert!(
             wait_for_output(&buf, "api: ready", Duration::from_secs(10)).await,
             "expected api to start once dep recovered. output: {}",
@@ -1438,7 +1416,7 @@ fn integration_lazy_service_dep_failure_after_startup_blocks_start() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1449,22 +1427,14 @@ fn integration_lazy_service_dep_failure_after_startup_blocks_start() {
             read_buf(&buf)
         );
 
-        let (stop_tx, stop_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "dep".to_string(),
-                reply: stop_tx,
-            })
-            .unwrap();
-        assert!(stop_rx.await.unwrap().is_ok());
+        assert!(control.stop("dep").await.unwrap().is_ok());
 
-        let (start_tx, _start_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Start {
-                name: "dep".to_string(),
-                reply: start_tx,
-            })
-            .unwrap();
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.start("dep").await;
+            }
+        });
         assert!(
             wait_for_output(&buf, "DEP_RUN_2", Duration::from_secs(5)).await,
             "expected the failing second dep run. output: {}",

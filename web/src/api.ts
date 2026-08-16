@@ -85,9 +85,6 @@ export const api = {
       body: JSON.stringify({ params }),
     }),
 
-  runPending: (projectId: string) =>
-    request<void>(`/projects/${projectId}/run-pending`, { method: "POST" }),
-
   completions: (
     projectId: string,
     task: string,

@@ -19,29 +19,29 @@ impl Runner {
         detail_name: Option<&str>,
     ) -> Vec<ProcessStatus> {
         let mut statuses = Vec::new();
-        for (name, rs) in &self.services {
+        for name in self.services.keys() {
             if detail_name.is_some_and(|want| want != name) {
                 continue;
             }
             statuses.push(ProcessStatus::Service {
                 name: name.clone(),
-                state: rs.state(),
-                failed_dependencies: rs.failed_dependencies().to_vec(),
+                state: self.service_state(name),
+                failed_dependencies: self.failed_dependencies(name),
                 // Absent so the merge in `publish_processes` carries forward
                 // what custody reported; the fold does not know pids.
                 runtime: None,
                 verbose: None,
             });
         }
-        for (name, rt) in &self.tasks {
+        for name in self.tasks.keys() {
             if detail_name.is_some_and(|want| want != name) {
                 continue;
             }
             statuses.push(ProcessStatus::Task {
                 name: name.clone(),
-                state: rt.state(),
-                failed_dependencies: rt.failed_dependencies().to_vec(),
-                last_run: rt.last_run.clone(),
+                state: self.task_state(name),
+                failed_dependencies: self.failed_dependencies(name),
+                last_run: self.task_last_run(name),
                 pid: None,
                 verbose: None,
             });
@@ -172,7 +172,7 @@ impl Runner {
                             // A failed service's listeners still exist, so
                             // say why they are closing connections instead of
                             // leaving the address looking healthy.
-                            if super::refusing_connections(rs.state(), live) {
+                            if self.service_state(name).refuses_connections(live) {
                                 for entry in &mut entries {
                                     entry.push_str(" — refusing (service failed)");
                                 }
@@ -203,8 +203,8 @@ impl Runner {
             };
             statuses.push(ProcessStatus::Service {
                 name: name.clone(),
-                state: rs.state(),
-                failed_dependencies: rs.failed_dependencies().to_vec(),
+                state: self.service_state(name),
+                failed_dependencies: self.failed_dependencies(name),
                 runtime: self.service_runtime(name),
                 verbose: verbose_info,
             });
@@ -282,9 +282,9 @@ impl Runner {
             };
             statuses.push(ProcessStatus::Task {
                 name: name.clone(),
-                state: rt.state(),
-                failed_dependencies: rt.failed_dependencies().to_vec(),
-                last_run: rt.last_run.clone(),
+                state: self.task_state(name),
+                failed_dependencies: self.failed_dependencies(name),
+                last_run: self.task_last_run(name),
                 pid: self.task_pid(name),
                 verbose: verbose_info,
             });

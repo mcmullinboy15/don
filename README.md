@@ -75,20 +75,35 @@ Don will:
 
 ### Interactive TUI
 
-When stdout is a TTY, `don start` runs a ratatui-driven interface: logs stream into native scrollback while a bordered status bar pinned to the bottom shows ready counts, running tasks, a spinner during transitions, and contextual key hints.
+When stdout is a TTY, `don start` runs a ratatui-driven full-screen interface: a
+scrollable log pane, an optional status pane beside it, and a bordered bar along
+the bottom with ready counts, running tasks, a spinner during transitions and
+contextual key hints.
+
+Don keeps its own copy of every log line — the same stream, with the same line
+numbering, that `don logs` and the web UI read — so filtering only changes what
+is *shown*. Widening a filter reveals history that was there all along, and
+nothing is lost by opening an overlay.
 
 | Key | Action |
 |-----|--------|
+| `↑` `↓` `PgUp` `PgDn` `Home` | Scroll the log |
+| `End` | Jump back to following the live tail |
+| wheel | Scroll the log |
+| drag | Select text — copied on release, without the `name \| ` prefix |
+| `y` | Re-copy the current selection |
+| `p` / `P` | Toggle the status pane / move it between right and bottom |
+| `Tab` | Move focus between panes |
 | `l` | Filter services/tasks — space toggles, enter commits, esc clears |
-| `s` | Full-screen service status overlay |
-| `t` | Full-screen task status overlay |
-| `Enter` | Insert a blank line separator into scrollback |
+| `s` | Full-screen service status |
+| `t` | Full-screen task status |
 | `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
 
+Copying goes through OSC 52, so it reaches your system clipboard over ssh and
+inside tmux. Terminals with OSC 52 disabled ignore it silently — the status bar
+reports what was sent, which is the only acknowledgement the protocol allows.
+
 Pipe mode (non-TTY) writes prefixed lines directly to stdout unchanged.
-Configs with active foreground terminal tasks also use plain prefixed output
-instead of the TUI so those tasks can own stdin without competing with Don's
-keyboard handler.
 
 Pass `--log-filter=<name1,name2,...>` to scope visible output to a subset of
 services or tasks — useful in pipe mode (CI, log capture) and as a way to
@@ -162,7 +177,7 @@ auto_run = false
 depends_on = ["migrate"]
 ```
 
-Run deferred tasks with `don run --all-pending` or from the TUI action palette.
+Run deferred tasks with `don run <name>`, or from the TUI's task view (`t`).
 
 Set `auto_run = "once"` to run a task automatically on startup until it has
 one successful run, then require manual triggers forever after:
@@ -174,31 +189,34 @@ auto_run = "once"
 depends_on = ["postgres"]
 ```
 
-Some tasks need the real terminal: REPLs, editors, interactive migrations, test
-watchers, or anything that expects stdin and unprefixed output. Mark those as
-foreground terminal tasks:
+Some tasks wait for a human: REPLs, editors, interactive migrations, test
+watchers, or anything that prompts on stdin. Say so:
 
 ```toml
 [tasks.console]
 cmd = "rails"
 args = ["console"]
 depends_on = ["postgres"]
-terminal = "foreground"
+interactive = true
 ```
 
-Foreground tasks run as part of normal startup and file-watch re-runs. When one
-becomes ready, Don pauses visible Don output, gives the task stdin/stdout/stderr,
-and waits for it to exit before starting other newly-ready services or tasks.
-Already-running dependencies keep running, and their output is still captured in
-ring buffers and log files.
+Every task already runs on a PTY and any task can be reached with `don attach
+<task>`, so this doesn't change how the task runs. It changes what Don *says*:
+a task blocked on input is indistinguishable from a task that has hung, so
+Don announces `waiting for input — run 'don attach console'` rather than
+letting it sit there looking stuck.
 
-`terminal = "foreground"` uses the alternate screen by default, giving the task a
-clean full-screen workspace that disappears when it exits. Use the main screen
-when you want the task's output to remain in normal scrollback:
+A process that takes the terminal's **alternate screen** — vim, htop, lazygit,
+anything full-screen — is detected regardless of how it's configured. Its
+frames can't be rendered in a multiplexed line-oriented view, so Don writes one
+line and stops:
 
-```toml
-terminal = { mode = "foreground", screen = "main" }
 ```
+console | entered full-screen mode — run 'don attach console' to see it
+```
+
+Output resumes when the process hands the screen back. Nothing is lost: `don
+logs` and `don attach` are fed upstream of this and see every byte.
 
 Tasks can also declare parameters. Parametrized tasks are interactive: values are supplied at run time via `don run <task> --<name>=<value>` or the TUI form, then substituted into `cmd`, `args`, `env`, and `dir` via `{{name}}` placeholders.
 
@@ -660,7 +678,6 @@ don attach <name>            # attach stdin/stdout to a running service
 don run <name>               # run a specific task (bypasses auto_run)
 don run <name> --wait        # run a task and wait for it to finish
 don run <name> --timeout 30s # wait up to 30s without stopping the task
-don run --all-pending        # run all tasks sitting in pending_run
 don exec <cmd> [args...]     # run a command with .don/bin on PATH
 don validate                 # check config without starting
 don cleanup                  # remove stale state from a crashed run
@@ -732,7 +749,6 @@ POST /start/:name            → start a stopped service
 POST /stop/:name             → stop a service
 POST /restart/:name          → restart a service
 POST /run/:name              → run a specific task (body: {"params": {...}, "wait": true})
-POST /run-pending            → run all tasks in pending_run state
 GET  /logs/:name?last=N      → ring buffer output
 GET  /logs/:name?follow=true → streaming NDJSON
 GET  /attach/:name           → raw-stream attach (stdin/stdout)
@@ -787,9 +803,7 @@ See [`examples/`](examples/) for complete working configs.
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
 | `reload` | bool | Service-level master switch for Don-managed watches, rebuilds, and restarts (default: true) |
 | `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
-| `terminal` | string or table | (tasks) `"muxed"` default, or `"foreground"` for exclusive stdin/stdout/stderr ownership |
-| `terminal.mode` | string | (tasks) `"muxed"` or `"foreground"` |
-| `terminal.screen` | string | (tasks) `"alternate"` default for foreground, or `"main"` to keep output in scrollback |
+| `interactive` | bool | (tasks) `true` when the task waits for a human at its terminal (default: false) |
 | `params` | [[table]] | (tasks) Declare run-time parameters for interactive tasks |
 | `params.name` | string | Parameter name, referenced as `{{name}}` and passed as `--name=value` |
 | `params.prompt` | string | Optional prompt shown in the TUI form |

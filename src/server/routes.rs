@@ -28,7 +28,6 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/logs/{name}", get(get_logs))
         .route("/attach/{name}", get(super::attach::attach_handler))
         .route("/attach/{name}/resize", post(super::attach::resize_handler))
-        .route("/run-pending", post(post_run_pending))
         .route("/run/{name}", post(post_run_task))
         .route(
             "/completions/{task}/{param}",
@@ -308,6 +307,10 @@ struct LogsQuery {
     last: usize,
     #[serde(default)]
     follow: bool,
+    /// Resume the merged stream from this id. A client that was disconnected
+    /// asks for exactly what it missed instead of guessing with `last`.
+    #[serde(default)]
+    since: Option<u64>,
 }
 
 fn default_last() -> usize {
@@ -354,21 +357,21 @@ async fn get_logs(
 /// process plus `[don]` lifecycle events, in arrival order, exactly what the
 /// terminal sees. NDJSON, one record per line:
 ///
-/// - `{"name":"api","lifecycle":false,"line":"..."}` — a log line. `name`
-///   is the owning process; `lifecycle` is true for `[don]` events. `line` is
-///   the formatted bytes (ANSI colors included) as lossy UTF-8, no trailing
-///   newline.
-/// - `{"lagged":n}` — this follower fell `n` lines behind and they are
-///   gone; resync from `/status` if state matters. Emitted instead of
-///   silently dropping, for the same reason the watcher's outcome channel
-///   carries `Lagged` — a gap you can see beats a stream you wrongly trust.
+/// - `{"id":42,"name":"api","lifecycle":false,"line":"..."}` — a log line.
+///   `id` is its place in the merged stream, the same number every client sees
+///   for that line. `name` is the owning process; `lifecycle` is true for
+///   `[don]` events. `line` is the formatted bytes (ANSI colors included) as
+///   lossy UTF-8, no trailing newline.
+/// - `{"dropped":n,"resumed_at":500}` — `n` lines are gone for good and the
+///   stream continues from `resumed_at`. Only emitted when the server's own
+///   history could not cover the gap; an ordinary slow reader is caught up
+///   silently. A gap you can see beats a stream you wrongly trust.
 ///
-/// `last=N` (default 100) preloads the tail of the merged history, so a
-/// late joiner sees what was happening just before it attached. Preload and
-/// live stream are deduplicated exactly: both carry the same `Arc`s, so a
-/// line that lands in both is dropped from the live side by pointer
-/// identity (the subscription opens before the history snapshot, so nothing
-/// is ever *missing* — only briefly doubled, and the dedupe eats that).
+/// `since=<id>` resumes exactly where a disconnected client stopped. Without
+/// it, `last=N` (default 100) preloads the tail of the merged history, so a
+/// late joiner sees what was happening just before it attached. The overlap
+/// between preload and live is spliced by id, so nothing is doubled and
+/// nothing is missing.
 async fn get_all_logs(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<LogsQuery>,
@@ -380,69 +383,49 @@ async fn get_all_logs(
         )
             .into_response();
     }
-    // Subscribe first, snapshot second — see the dedupe note above.
-    let mut tap = state.log_tap.subscribe();
-    let preload = state.log_tap.history(query.last).await;
-    // Bridge broadcast → mpsc so lag is translated, not panicked over, and
-    // a gone client (send error) tears the forwarder down. Ends on the
-    // shutdown signal too — see `ApiState::shutdown`.
+    // One cursor covers preload, live, the overlap between them, and its own
+    // lag — see `MergedLogCursor`.
+    let mut cursor = state
+        .log_tap
+        .cursor(query.since.map(crate::output::LogId), query.last)
+        .await;
+    // Bridge cursor → mpsc so a gone client (send error) tears the forwarder
+    // down. Ends on the shutdown signal too — see `ApiState::shutdown`.
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
     let mut shutdown = state.shutdown.clone();
     tokio::spawn(async move {
-        fn record(line: &crate::output::FormattedLogLine) -> bytes::Bytes {
-            let mut chunk = serde_json::to_vec(&serde_json::json!({
-                "name": line.name,
-                "lifecycle": line.is_lifecycle,
-                "verbose": line.is_verbose,
-                "line": String::from_utf8_lossy(&line.bytes),
-            }))
-            .unwrap_or_default();
+        fn record(event: crate::output::MergedEvent) -> bytes::Bytes {
+            let value = match event {
+                crate::output::MergedEvent::Line(entry) => serde_json::json!({
+                    "id": entry.id,
+                    "name": entry.line.name,
+                    "lifecycle": entry.line.is_lifecycle,
+                    "verbose": entry.line.is_verbose,
+                    "line": String::from_utf8_lossy(&entry.line.bytes),
+                }),
+                crate::output::MergedEvent::Dropped { count, resumed_at } => serde_json::json!({
+                    "dropped": count,
+                    "resumed_at": resumed_at,
+                }),
+            };
+            let mut chunk = serde_json::to_vec(&value).unwrap_or_default();
             chunk.push(b'\n');
             bytes::Bytes::from(chunk)
         }
 
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for line in &preload {
-            seen.insert(Arc::as_ptr(line) as usize);
-            if tx.send(record(line)).await.is_err() {
-                return;
-            }
-        }
         loop {
-            let chunk = tokio::select! {
-                process = tap.recv() => match process {
-                    Ok(line) => {
-                        // Already sent in the preload — the subscription
-                        // opened before the snapshot, so the overlap window
-                        // shows up here, not as a gap.
-                        if !seen.is_empty() && seen.remove(&(Arc::as_ptr(&line) as usize)) {
-                            continue;
-                        }
-                        // Past the overlap window: nothing older can arrive
-                        // on the live side again, so stop checking.
-                        seen.clear();
-                        record(&line)
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        let mut chunk =
-                            serde_json::to_vec(&serde_json::json!({ "lagged": n }))
-                                .unwrap_or_default();
-                        chunk.push(b'\n');
-                        bytes::Bytes::from(chunk)
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            let event = tokio::select! {
+                event = cursor.recv() => match event {
+                    Some(event) => event,
+                    None => return,
                 },
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        // Same contract as the events stream: the final
-                        // lines are already in this receiver's buffer, so
-                        // deliver them before closing.
-                        while let Ok(line) = tap.try_recv() {
-                            if !seen.is_empty() && seen.remove(&(Arc::as_ptr(&line) as usize)) {
-                                continue;
-                            }
-                            seen.clear();
-                            if tx.send(record(&line)).await.is_err() {
+                        // Same contract as the events stream: the final lines
+                        // are already buffered in the cursor, so deliver them
+                        // before closing.
+                        while let Some(event) = cursor.try_recv() {
+                            if tx.send(record(event)).await.is_err() {
                                 return;
                             }
                         }
@@ -451,7 +434,7 @@ async fn get_all_logs(
                     continue;
                 }
             };
-            if tx.send(chunk).await.is_err() {
+            if tx.send(record(event)).await.is_err() {
                 return;
             }
         }
@@ -625,31 +608,6 @@ fn completion_error_body(e: &CompletionError) -> serde_json::Value {
         "error": e.message,
         "log_path": e.log_path,
     })
-}
-
-/// `POST /run-pending` — run all tasks in PendingRun state.
-async fn post_run_pending(State(state): State<Arc<ApiState>>) -> Response {
-    // Same reasoning as `post_run_task`: "which tasks are pending" isn't
-    // knowable until the sweep has decided.
-    if !await_startup_settled(&state).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(error_body(
-                "runner is still starting up — it hasn't finished working out \
-                 which tasks need to run yet",
-            )),
-        )
-            .into_response();
-    }
-    match state.control.run_pending().await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(error_body(&e.to_string())),
-        )
-            .into_response(),
-        Err(_) => runner_unavailable(),
-    }
 }
 
 // --- helpers ---

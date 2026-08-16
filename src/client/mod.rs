@@ -109,6 +109,9 @@ pub struct LogsResponse {
 pub enum LogStreamEvent {
     /// A formatted log line, ANSI colors included, no trailing newline.
     Line {
+        /// This line's place in the merged stream — the same number every
+        /// client sees for it. Resume from `id + 1` after a disconnect.
+        id: crate::output::LogId,
         /// Owning process name; `[don]` lifecycle events carry their own
         /// sentinel name (see [`crate::output::LIFECYCLE_EVENT_NAME`]).
         name: String,
@@ -120,9 +123,13 @@ pub enum LogStreamEvent {
         verbose: bool,
         line: String,
     },
-    /// This follower fell `lagged` lines behind and they are gone —
-    /// resync from `/status` if state matters.
-    Lagged { lagged: u64 },
+    /// `dropped` lines are gone for good and the stream continues from
+    /// `resumed_at`. Only sent when the server's own history could not cover
+    /// the gap — an ordinary slow reader is caught up silently.
+    Dropped {
+        dropped: u64,
+        resumed_at: crate::output::LogId,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -266,15 +273,6 @@ impl Client {
         Err(classify_error(status, &body))
     }
 
-    /// `POST /run-pending` — trigger all tasks in PendingRun state.
-    pub async fn run_pending(&self) -> Result<(), ClientError> {
-        let (status, body) = self.request("POST", "/run-pending", false).await?;
-        if status == 204 {
-            return Ok(());
-        }
-        Err(classify_error(status, &body))
-    }
-
     /// `POST /run/:name` — run a specific task, bypassing auto_run.
     ///
     /// `params` is the user-supplied param map (empty for tasks without
@@ -383,11 +381,21 @@ impl Client {
     /// plus `[don]` lifecycle events, in arrival order, with the metadata
     /// a renderer needs to filter and color. Returns when the server closes
     /// the stream or the callback returns `Err`.
-    pub async fn logs_follow_all<F>(&self, mut on_event: F) -> Result<(), ClientError>
+    /// `since` resumes exactly where a previous session stopped; `None` starts
+    /// from the tail of the server's history.
+    pub async fn logs_follow_all<F>(
+        &self,
+        since: Option<crate::output::LogId>,
+        mut on_event: F,
+    ) -> Result<(), ClientError>
     where
         F: FnMut(LogStreamEvent) -> Result<(), ClientError>,
     {
-        self.follow_ndjson("/logs?follow=true", |line| {
+        let path = match since {
+            Some(since) => format!("/logs?follow=true&since={since}"),
+            None => "/logs?follow=true".to_string(),
+        };
+        self.follow_ndjson(&path, |line| {
             let event: LogStreamEvent = serde_json::from_str(line)?;
             on_event(event)
         })

@@ -1,4 +1,4 @@
-use super::{RunnerError, RuntimeService, RuntimeTask, ServiceState, TaskState};
+use super::{RunnerError, RuntimeService, RuntimeTask};
 use crate::config::profile::resolve_profile_processes_for_platform;
 use crate::config::{Config, Platform, ServiceKind};
 use crate::output::OutputManager;
@@ -174,10 +174,7 @@ pub(in crate::runner) async fn build_runtime_maps(
         if active_services.contains(name) {
             let mut resolved = svc.resolve(platform);
             resolved.depends_on = config.effective_depends_on(name, &resolved.depends_on);
-            services.insert(
-                name.clone(),
-                RuntimeService::new(resolved, ServiceState::Pending),
-            );
+            services.insert(name.clone(), RuntimeService::new(resolved));
         }
     }
 
@@ -192,10 +189,7 @@ pub(in crate::runner) async fn build_runtime_maps(
             }
             let has_success = task_state.has_success(name).await.unwrap_or(false);
             let last_run = task_state.last_run(name).await.unwrap_or(None);
-            tasks.insert(
-                name.clone(),
-                RuntimeTask::new(task, TaskState::Pending, has_success, last_run),
-            );
+            tasks.insert(name.clone(), RuntimeTask::new(task, has_success, last_run));
         }
     }
     (services, tasks)

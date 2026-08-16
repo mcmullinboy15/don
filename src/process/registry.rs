@@ -79,6 +79,15 @@ impl<M> Clone for ProcessRegistry<M> {
 }
 
 impl<M> ProcessRegistry<M> {
+    /// A registry addressing nothing, for tests that need a control plane
+    /// without a running stack behind it.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            handles: Arc::new(HashMap::new()),
+        }
+    }
+
     /// The mailbox for `name`, or `None` if it isn't an process of this kind.
     pub(crate) fn get(&self, name: &str) -> Option<&ProcessHandle<M>> {
         self.handles.get(name)

@@ -63,90 +63,6 @@ impl<'de> Deserialize<'de> for TaskAutoRun {
     }
 }
 
-/// How a task is connected to the user's terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TaskTerminal {
-    /// Whether the task uses Don's log multiplexer or takes over the terminal.
-    pub mode: TaskTerminalMode,
-    /// Which terminal screen a foreground task should use.
-    pub screen: TaskTerminalScreen,
-}
-
-impl Default for TaskTerminal {
-    fn default() -> Self {
-        Self {
-            mode: TaskTerminalMode::Muxed,
-            screen: TaskTerminalScreen::Main,
-        }
-    }
-}
-
-impl TaskTerminal {
-    /// Returns true when this task takes exclusive ownership of the terminal.
-    pub fn is_foreground(self) -> bool {
-        matches!(self.mode, TaskTerminalMode::Foreground)
-    }
-}
-
-impl<'de> Deserialize<'de> for TaskTerminal {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum RawTaskTerminal {
-            String(String),
-            Table(TaskTerminalTable),
-        }
-
-        match RawTaskTerminal::deserialize(deserializer)? {
-            RawTaskTerminal::String(value) => match value.as_str() {
-                "muxed" => Ok(Self::default()),
-                "foreground" => Ok(Self {
-                    mode: TaskTerminalMode::Foreground,
-                    screen: TaskTerminalScreen::Alternate,
-                }),
-                _ => Err(serde::de::Error::custom(format!(
-                    "unknown terminal value '{value}', expected \"muxed\" or \"foreground\""
-                ))),
-            },
-            RawTaskTerminal::Table(table) => Ok(Self {
-                mode: table.mode,
-                screen: table.screen.unwrap_or(match table.mode {
-                    TaskTerminalMode::Muxed => TaskTerminalScreen::Main,
-                    TaskTerminalMode::Foreground => TaskTerminalScreen::Alternate,
-                }),
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct TaskTerminalTable {
-    mode: TaskTerminalMode,
-    #[serde(default)]
-    screen: Option<TaskTerminalScreen>,
-}
-
-/// Task terminal ownership mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TaskTerminalMode {
-    /// Route output through Don's prefixed log multiplexer.
-    Muxed,
-    /// Run the task alone with stdin/stdout/stderr attached to the user's terminal.
-    Foreground,
-}
-
-/// Screen used while a foreground task owns the terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TaskTerminalScreen {
-    /// Use the current terminal screen.
-    Main,
-    /// Enter the terminal alternate screen for the task, then restore the main screen.
-    Alternate,
-}
-
 /// Command overrides used when a task runs without the interactive TUI.
 ///
 /// Omitted fields inherit from the task's top-level `cmd` and `args`. An
@@ -192,18 +108,21 @@ pub struct Task {
     /// Where to send stdout/stderr. Defaults to stdout.
     #[serde(default)]
     pub log: LogConfig,
-    /// How the task is connected to the terminal.
+    /// Whether this task expects a human at its terminal.
     ///
-    /// Defaults to `muxed`, which routes output through Don's prefixed log
-    /// pipeline. `foreground` gives the task exclusive terminal ownership
-    /// while it runs.
+    /// Every task runs on a PTY and every task can be reached with `don
+    /// attach`, so this changes nothing about how the task is spawned or where
+    /// its output goes. It is a declaration, because it is the one thing don
+    /// cannot work out for itself: a task blocked reading stdin looks exactly
+    /// like a task that has hung. Saying so is what lets don point the user at
+    /// `don attach` instead of leaving them to guess.
     #[serde(default)]
-    pub terminal: TaskTerminal,
+    pub interactive: bool,
     /// Command overrides to use in non-TUI runs.
     ///
-    /// When present, the task uses muxed output instead of taking foreground
-    /// terminal ownership. Omitted `cmd` or `args` fields inherit their
-    /// top-level values.
+    /// When present, the task is not interactive — there is no client to
+    /// attach — and omitted `cmd` or `args` fields inherit their top-level
+    /// values.
     pub headless: Option<TaskHeadless>,
     /// Whether the task runs automatically.
     ///
@@ -258,7 +177,9 @@ impl Task {
         if let Some(args) = &headless.args {
             self.args.clone_from(args);
         }
-        self.terminal = TaskTerminal::default();
+        // Running headless means nothing is going to attach, so a prompt to do
+        // so would send the user after a client that does not exist.
+        self.interactive = false;
     }
 
     /// Resolve the task's command path, using the cached download binary
@@ -292,73 +213,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_defaults_to_muxed() {
-        let task: Task = toml::from_str(r#"cmd = "true""#).unwrap();
-        assert_eq!(task.terminal.mode, TaskTerminalMode::Muxed);
-        assert_eq!(task.terminal.screen, TaskTerminalScreen::Main);
+    fn a_task_is_not_interactive_unless_it_says_so() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            want: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "the default is a task nobody has to watch",
+                toml: r#"cmd = "true""#,
+                want: false,
+            },
+            Case {
+                name: "declared",
+                toml: "cmd = \"vim\"\ninteractive = true",
+                want: true,
+            },
+            Case {
+                name: "declared false is the default said out loud",
+                toml: "cmd = \"vim\"\ninteractive = false",
+                want: false,
+            },
+        ];
+
+        for case in cases {
+            let task: Task = toml::from_str(case.toml).unwrap();
+            assert_eq!(task.interactive, case.want, "{}", case.name);
+        }
     }
 
+    /// The headless override is what a non-TUI run gets. Nothing can attach in
+    /// that mode, so the interactivity claim has to come off with it —
+    /// otherwise the run points the user at a client that will not be there.
     #[test]
-    fn terminal_foreground_string_uses_alternate_screen() {
-        let task: Task = toml::from_str(
-            r#"
-            cmd = "vim"
-            terminal = "foreground"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(task.terminal.mode, TaskTerminalMode::Foreground);
-        assert_eq!(task.terminal.screen, TaskTerminalScreen::Alternate);
-    }
+    fn the_headless_override_replaces_the_command_and_clears_interactivity() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            want_cmd: &'static str,
+            want_args: Vec<&'static str>,
+        }
 
-    #[test]
-    fn terminal_foreground_table_can_use_main_screen() {
-        let task: Task = toml::from_str(
-            r#"
-            cmd = "vim"
-            terminal = { mode = "foreground", screen = "main" }
-            "#,
-        )
-        .unwrap();
-        assert_eq!(task.terminal.mode, TaskTerminalMode::Foreground);
-        assert_eq!(task.terminal.screen, TaskTerminalScreen::Main);
-    }
+        let cases = vec![
+            Case {
+                name: "an omitted cmd inherits, args are replaced",
+                toml: r#"
+                    cmd = "scurry"
+                    args = ["push"]
+                    interactive = true
+                    headless = { args = ["push", "--force"] }
+                "#,
+                want_cmd: "scurry",
+                want_args: vec!["push", "--force"],
+            },
+            Case {
+                name: "an explicit cmd replaces, an empty args list clears",
+                toml: r#"
+                    cmd = "prompt-me"
+                    args = ["one"]
+                    interactive = true
+                    headless = { cmd = "batch", args = [] }
+                "#,
+                want_cmd: "batch",
+                want_args: vec![],
+            },
+        ];
 
-    #[test]
-    fn headless_override_inherits_omitted_command_and_replaces_args() {
-        let mut task: Task = toml::from_str(
-            r#"
-            cmd = "scurry"
-            args = ["push"]
-            terminal = "foreground"
-            headless = { args = ["push", "--force"] }
-            "#,
-        )
-        .unwrap();
+        for case in cases {
+            let mut task: Task = toml::from_str(case.toml).unwrap();
+            task.apply_headless_override();
 
-        task.apply_headless_override();
-
-        assert_eq!(task.cmd, "scurry");
-        assert_eq!(task.args, vec!["push", "--force"]);
-        assert_eq!(task.terminal, TaskTerminal::default());
-    }
-
-    #[test]
-    fn headless_override_can_replace_command_and_clear_args() {
-        let mut task: Task = toml::from_str(
-            r#"
-            cmd = "interactive"
-            args = ["one"]
-            terminal = "foreground"
-            headless = { cmd = "batch", args = [] }
-            "#,
-        )
-        .unwrap();
-
-        task.apply_headless_override();
-
-        assert_eq!(task.cmd, "batch");
-        assert!(task.args.is_empty());
-        assert_eq!(task.terminal, TaskTerminal::default());
+            assert_eq!(task.cmd, case.want_cmd, "{}: cmd", case.name);
+            assert_eq!(task.args, case.want_args, "{}: args", case.name);
+            assert!(!task.interactive, "{}: interactivity", case.name);
+        }
     }
 }

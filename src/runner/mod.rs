@@ -32,11 +32,11 @@ pub use crate::command::{CommandError, CommandResult};
 // surface stable.
 pub(in crate::runner) use crate::build_tool::batcher as build_batcher;
 pub use crate::param_completions::CompletionError;
+pub(crate) use crate::process::ProcessReport;
 pub(in crate::runner) use crate::process::{
     Demand, ServiceHandleIdentity, ServiceStartIntent, TaskExit, TaskRunIntent, service_supervisor,
-    service_worker, task_supervisor, task_worker,
+    task_supervisor, task_worker,
 };
-pub(crate) use crate::process::{ProcessKind, ProcessReport};
 pub use crate::process::{ServiceState, TaskState};
 pub(in crate::runner) use crate::state_store;
 pub use crate::state_store::{
@@ -44,11 +44,8 @@ pub use crate::state_store::{
 };
 pub use crate::watch::report::{WatchDir, WatchReport, WatchReportItem};
 
-pub(crate) use crate::process::params::resolve_task_params;
-
-use crate::config::{Config, Platform, ShutdownConfig};
+use crate::config::{Config, Platform};
 use crate::output::OutputManager;
-use crate::proxy::ConnectionPolicy;
 use crate::sys::pid_file::PidFile;
 use crate::watch::WatchManager;
 use std::collections::HashMap;
@@ -72,68 +69,30 @@ use crate::signals::shutdown_requested;
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-/// Whether a service's proxy is closing connections rather than queuing them.
-///
-/// A service that failed *and* has no process left has nothing to queue for —
-/// a client would hang on a socket nobody will read. Shared by the policy the
-/// runner commands and the `status -v` line that explains it, so the two
-/// cannot drift.
-pub(in crate::runner) fn refusing_connections(state: ServiceState, live: bool) -> bool {
-    matches!(state, ServiceState::Failed | ServiceState::DependencyFailed) && !live
-}
 
-/// A command sent to the runner via its public `mpsc` channel.
+/// A command sent to the root via its public `mpsc` channel.
 ///
-/// **Admission test for new variants:** a command belongs here only if its
-/// handler mutates scheduling state or must serialize with the fold. Pure
-/// reads go through a projection ([`StateReader`], [`crate::output::LogReader`],
-/// [`crate::watch::report::WatchStatusReader`]); mechanism that only needs
-/// fixed-at-construction config belongs to whoever calls it (see
-/// [`crate::param_completions::CompletionResolver`]); and the runner's own
-/// deferred ticks are internal, not commands.
+/// Two things are left in it, and neither is about a single process. Asking a
+/// *process* to do something — start, stop, restart, run — is addressed at its
+/// supervisor ([`crate::control::ProcessControl`]), because everything such a
+/// request has to be checked against is something that supervisor holds.
+///
+/// **Admission test for new variants:** a command belongs here only if no one
+/// process can answer it. Pure reads go through a projection ([`StateReader`],
+/// [`crate::output::LogReader`], [`crate::watch::report::WatchStatusReader`]);
+/// mechanism that only needs fixed-at-construction config belongs to whoever
+/// calls it (see [`crate::param_completions::CompletionResolver`]); and the
+/// root's own deferred ticks are internal, not commands.
 pub enum RunnerCommand {
-    /// Start a stopped service.
-    Start {
-        name: String,
-        reply: oneshot::Sender<CommandResult>,
-    },
-    /// Stop a running service.
-    Stop {
-        name: String,
-        reply: oneshot::Sender<CommandResult>,
-    },
-    /// Restart a service.
-    Restart {
-        name: String,
-        reply: oneshot::Sender<CommandResult>,
-    },
-    /// Force a rebuild, then start or restart a service.
-    HardRestart {
-        name: String,
-        reply: oneshot::Sender<CommandResult>,
-    },
     /// Query the status of all services and tasks. When `name` is `Some`, only
-    /// that process is returned, with its full resolved watch path list included.
+    /// that process is returned, with its full resolved watch path list
+    /// included. Needs a round trip because verbose status resolves ready
+    /// checks and watch paths, which the projection deliberately does not
+    /// carry.
     Status {
         verbose: bool,
         name: Option<String>,
         reply: oneshot::Sender<Vec<ProcessStatus>>,
-    },
-    /// Run all tasks currently in PendingRun state.
-    RunPendingTasks {
-        reply: oneshot::Sender<CommandResult>,
-    },
-    /// Run a specific task by name, bypassing the `auto_run` gate. Used by
-    /// `don run <name>` and the TUI action palette. `params` carries the
-    /// user-supplied values for the task's declared params — empty for
-    /// tasks that don't declare any. When `wait` is true, the reply is held
-    /// until the task process exits.
-    RunTask {
-        name: String,
-        params: HashMap<String, String>,
-        wait: bool,
-        wait_timeout: Option<String>,
-        reply: oneshot::Sender<CommandResult>,
     },
     /// Initiate graceful shutdown.
     Shutdown,
@@ -241,13 +200,14 @@ pub struct Runner {
     /// writer, and [`state_store`] enforces that by ownership rather than by
     /// convention.
     state: state_store::StateWriter,
-    /// Per-process permission to run — the scheduler's whole output. See
-    /// [`crate::gate`].
-    start_gates: crate::gate::GateWriter,
-    /// A start-pending sweep is due. Set by fold transitions (see
-    /// `schedule_gate_recompute`), consumed at the top of the main loop —
-    /// the runner's own deferred tick, invisible to clients by construction.
-    gate_recompute_scheduled: bool,
+    /// The merge of what every process says about itself. Every dependency
+    /// question in the stack is answered from the snapshot this publishes —
+    /// see [`crate::facts`].
+    facts: crate::facts::Aggregator,
+    /// Flipped once setup is far enough along for anything to start. A
+    /// supervisor computes its own permission, so without this a process with
+    /// no dependencies would start before the watcher existed.
+    released_tx: tokio::sync::watch::Sender<bool>,
 
     // Shutdown signal receiver — wakes the select loop when Ctrl+C is pressed.
     // `Option` because `run()` takes it out at the top to consume in the
@@ -417,10 +377,48 @@ impl Runner {
             tasks.keys().cloned().collect(),
         ));
 
-        // One gate per process, created before any supervisor so each can be
-        // handed its own reader at spawn.
-        let gate_names: Vec<String> = services.keys().chain(tasks.keys()).cloned().collect();
-        let (start_gates, mut gate_readers) = crate::gate::channel(gate_names.iter());
+        // Every process's facts, seeded with the phase it starts in, so a
+        // supervisor reading before anything has published sees the truth
+        // rather than an absence. Created before any supervisor exists,
+        // because each is handed the read end at spawn.
+        let (facts, mut facts_publishers, facts_reader) = crate::facts::channel(
+            services
+                .keys()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        crate::facts::ProcessFacts::for_service(
+                            name,
+                            ServiceState::Pending,
+                            None,
+                            Vec::new(),
+                        ),
+                    )
+                })
+                .chain(tasks.iter().map(|(name, rt)| {
+                    (
+                        name.clone(),
+                        crate::facts::ProcessFacts::for_task(
+                            name,
+                            TaskState::Pending,
+                            // Not satisfied until its supervisor has evaluated
+                            // whether it must run — which it republishes the
+                            // moment it starts.
+                            false,
+                            None,
+                            rt.last_run.clone(),
+                            Vec::new(),
+                        ),
+                    )
+                })),
+        );
+
+        // Nothing may start until setup says so. A supervisor computes its own
+        // permission from the facts above, and a process with no dependencies
+        // is permitted the moment its supervisor exists — which is before the
+        // watcher is running. This is what `GateWriter::arm` used to be, moved
+        // to where the decision is now made.
+        let (released_tx, released_rx) = tokio::sync::watch::channel(false);
 
         // Publish endpoints before binding: the key set decides which
         // `$(name.key)` tokens count as runtime references at all, and proxy
@@ -480,6 +478,25 @@ impl Runner {
             }
         }
 
+        // Reverse edges, computed once. Teardown runs in reverse dependency
+        // order, and the only thing that can decide when a process may end is
+        // the process itself — so each supervisor is told who depends on it
+        // and waits for them. Group refs are already expanded by
+        // `build_runtime_maps`, so this cannot go stale.
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, deps) in services
+            .iter()
+            .map(|(name, rs)| (name, &rs.resolved.depends_on))
+            .chain(tasks.iter().map(|(name, rt)| (name, &rt.config.depends_on)))
+        {
+            for dep in deps {
+                dependents
+                    .entry(dep.name.clone())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+
         // One supervisor per service, likewise immutable once built.
         let service_starts = service_supervisor::spawn_supervisors(
             services.keys(),
@@ -495,12 +512,15 @@ impl Runner {
                 endpoints: endpoints_reader,
                 shutdown_rx: shutdown_flag_tx.subscribe(),
                 global_watch_ignore: global_watch_ignore.clone(),
+                facts: facts_reader.clone(),
+                released: released_rx.clone(),
             },
             &|name| output_manager.process_output(name),
             &|name| services.get(name).map(|rs| rs.resolved.clone()),
+            &|name| dependents.get(name).cloned().unwrap_or_default(),
             &report_tx,
             &mut proxies,
-            &mut gate_readers,
+            &mut facts_publishers,
         );
 
         // One supervisor per task, started before the runner exists so the
@@ -531,10 +551,15 @@ impl Runner {
                 tasks.get(name).map(|rt| task_supervisor::StartupConfig {
                     task_cfg: Box::new(rt.config.clone()),
                     has_dependents: blocking_dependents.contains(name),
+                    has_success: rt.has_success,
+                    last_run: rt.last_run.clone(),
                 })
             },
+            &|name| dependents.get(name).cloned().unwrap_or_default(),
             &report_tx,
-            &mut gate_readers,
+            &facts_reader,
+            &mut facts_publishers,
+            &released_rx,
             &shutdown_flag_tx.subscribe(),
             &batcher_tx,
         );
@@ -559,9 +584,9 @@ impl Runner {
             update_rx,
             event_tx,
             state,
-            start_gates,
+            facts,
+            released_tx,
             catalog,
-            gate_recompute_scheduled: false,
             shutdown_rx: Some(shutdown_rx),
             _don_pid_file: Some(don_pid_file),
             watch: None,
@@ -596,109 +621,144 @@ impl Runner {
         self.state.publish_processes(self.status_projection(None));
     }
 
-    /// Get a sender for sending commands to this runner.
-    /// Transition a service to a new state and broadcast the change.
+    /// Every process's facts, for the pure dependency functions in
+    /// [`crate::gate`].
     ///
-    /// The broadcast is the whole point — `RuntimeService::set_state` is
-    /// `#[must_use]` precisely so the event can't be forgotten. No-op if
-    /// the service is unknown or already at `new_state`.
-    pub(crate) fn set_service_state(&mut self, name: &str, new_state: ServiceState) {
-        let previous_state = self.services.get(name).map(RuntimeService::state);
-        let changed = self
-            .services
-            .get_mut(name)
-            .and_then(|rs| rs.set_state(new_state));
-        if let Some(state) = changed {
-            self.sync_proxy_policy(name);
-            self.broadcast_service_state(name, state);
-            // Every transition, not a chosen subset. A gate is derived
-            // purely from peers' states now, so any state change can move
-            // some dependent's level — and a level that goes stale is a
-            // start that should not have happened. Recomputing is a cheap
-            // pure pass that publishes nothing when nothing changed.
-            self.schedule_gate_recompute();
-            let _ = previous_state;
+    /// Assembled from the scheduler's maps *for now*. The shape is the
+    /// destination: [`crate::facts`] merges the same values published by the
+    /// supervisors that own them, at which point this becomes a snapshot read
+    /// rather than a construction and the maps behind it go away.
+    pub(in crate::runner) fn facts_snapshot(&self) -> &crate::facts::FactsSnapshot {
+        self.facts.snapshot()
+    }
+
+    /// A service's phase, as its own supervisor last published it.
+    ///
+    /// The scheduler keeps no copy. Everything it does with a phase — narrate,
+    /// project, decide whether a command is admissible — reads it from here,
+    /// so there is no second opinion to drift.
+    pub(in crate::runner) fn service_state(&self, name: &str) -> ServiceState {
+        match self.facts_snapshot().get(name).map(|facts| facts.phase) {
+            Some(crate::facts::Phase::Service(state)) => state,
+            // Only reachable for a name that is not a service of this stack;
+            // callers have already established that it is.
+            _ => ServiceState::Stopped,
         }
     }
 
-    /// Keep the proxy's connection policy in step with the service.
-    ///
-    /// Queuing connections is right while a service is starting or
-    /// restarting — the client waits a moment and gets served. It is wrong
-    /// once the service has failed *with no process left*: nothing is going
-    /// to read that socket, so the connection is refused instead of left
-    /// hanging.
-    ///
-    /// The liveness half matters. `Failed` does not imply "the process is
-    /// gone": a service whose ready check fails keeps running under the
-    /// default `on_failure = "notify"` and may well be serving traffic. Don
-    /// must not close its clients' connections — and in listenfd mode must
-    /// not race that live child for accepts. Only a service that has both
-    /// failed and lost its process refuses.
-    ///
-    /// Call this after any change to a service's state *or* its process
-    /// handle. It is idempotent.
-    fn sync_proxy_policy(&mut self, name: &str) {
-        let live = self.service_runtime(name).is_some();
-        let Some(rs) = self.services.get(name) else {
-            return;
-        };
-        let policy = if rs.state() == ServiceState::Lazy {
-            ConnectionPolicy::LazyTrigger
-        } else if refusing_connections(rs.state(), live) {
-            ConnectionPolicy::Refuse
-        } else {
-            ConnectionPolicy::Serve
-        };
-        if rs.resolved.proxy.is_empty() {
-            return;
+    /// A task's phase, as its own supervisor last published it.
+    pub(in crate::runner) fn task_state(&self, name: &str) -> TaskState {
+        match self.facts_snapshot().get(name).map(|facts| facts.phase) {
+            Some(crate::facts::Phase::Task(state)) => state,
+            // Only reachable for a name that is not a task of this stack;
+            // callers have already established that it is.
+            _ => TaskState::Pending,
         }
-        // Sent unconditionally: the proxy answers whether this is a change,
-        // and narrates the refusal edge. Deduping here would need a shadow of
-        // a value the owner already has.
-        self.send_proxy_directive(name, service_supervisor::ProxyDirective::SetPolicy(policy));
     }
 
-    /// Hand a proxy decision to the service's supervisor, which owns the
-    /// listeners. Fire-and-forget: a closed mailbox means teardown is ahead
-    /// of us and the proxy is already gone.
-    pub(in crate::runner) fn send_proxy_directive(
+    /// A task's most recent run, as its supervisor published it.
+    pub(in crate::runner) fn task_last_run(
         &self,
         name: &str,
-        directive: service_supervisor::ProxyDirective,
-    ) {
-        if let Some(handle) = self.service_starts.registry().get(name) {
-            let _ = handle.request(service_supervisor::ServiceCommand::Proxy(directive));
+    ) -> Option<crate::task_state::TaskRunInfo> {
+        match self.facts_snapshot().get(name).map(|facts| &facts.detail) {
+            Some(crate::facts::Detail::Task { last_run, .. }) => last_run.clone(),
+            _ => None,
         }
     }
 
-    /// Atomically mark a service as dependency-failed and broadcast changes
-    /// to either its lifecycle state or its root-cause detail.
-    pub(crate) fn mark_service_dependency_failed(
+    /// The root failures a process is stranded behind, as it published them.
+    pub(in crate::runner) fn failed_dependencies(&self, name: &str) -> Vec<String> {
+        self.facts_snapshot().failed_roots(name).to_vec()
+    }
+
+    /// Whether a service's supervisor has an auto-restart armed.
+    pub(in crate::runner) fn restart_pending(&self, name: &str) -> bool {
+        self.facts_snapshot()
+            .get(name)
+            .is_some_and(|facts| facts.restart_pending)
+    }
+
+    /// Apply everything that follows from a process's facts changing.
+    ///
+    /// Projections only, and every one of them is a *consequence* rather than
+    /// a decision: the event stream, the state projection, the ports manifest.
+    /// Whoever published the facts had already decided.
+    /// Absorb whatever processes have published but the loop has not read.
+    ///
+    /// The command loop drains this continuously; teardown does not run that
+    /// loop, so without this the `Stopping`/`Stopped` a supervisor publishes on
+    /// its way out would sit in the queue and never reach the event stream a
+    /// client is watching the shutdown on.
+    pub(in crate::runner) fn drain_facts(&mut self) {
+        while let Ok((name, facts)) = self.facts.try_recv() {
+            let previous = self.facts_snapshot().get(&name).map(|facts| facts.phase);
+            if self.facts.apply(name.clone(), facts) {
+                self.absorb_facts(&name, previous);
+            }
+        }
+    }
+
+    fn absorb_facts(&mut self, name: &str, previous: Option<crate::facts::Phase>) {
+        let current = self.facts_snapshot().get(name).map(|facts| facts.phase);
+        if self.services.contains_key(name) {
+            // Queue-vs-refuse is not decided here: the supervisor derives it
+            // from the same phase and custody it just published, against the
+            // listener it owns.
+            if previous != current
+                && let Some(crate::facts::Phase::Service(state)) = current
+            {
+                self.broadcast_service_state(name, state);
+            } else {
+                // Custody moved without a phase change — a wire landing while
+                // the service is already `Running`. The projection still has
+                // to say so.
+                self.publish_state();
+            }
+            self.refresh_runtime_port_manifest();
+        } else if previous != current
+            && let Some(crate::facts::Phase::Task(state)) = current
+        {
+            self.broadcast_task_state(name, state);
+        } else {
+            self.publish_state();
+        }
+    }
+
+    /// Publish a service phase as its supervisor would.
+    ///
+    /// Tests only: in production a service's write end lives in its own
+    /// supervisor, so there is deliberately no way for the scheduler to do
+    /// this. Exercising the scheduler's *reaction* to a phase still needs one.
+    #[cfg(test)]
+    pub(in crate::runner) fn set_service_state(&mut self, name: &str, state: ServiceState) {
+        self.publish_service_facts(name, state, Vec::new());
+    }
+
+    #[cfg(test)]
+    fn publish_service_facts(
         &mut self,
         name: &str,
-        dependencies: Vec<String>,
-    ) -> bool {
-        let Some(rs) = self.services.get_mut(name) else {
-            return false;
-        };
-        let state_changed = rs.state() != ServiceState::DependencyFailed;
-        if !rs.mark_dependency_failed(dependencies) {
-            return false;
+        state: ServiceState,
+        stranded_behind: Vec<String>,
+    ) {
+        let facts = crate::facts::ProcessFacts::for_service(
+            name,
+            state,
+            self.service_runtime(name),
+            stranded_behind,
+        );
+        let previous = self.facts_snapshot().get(name).map(|facts| facts.phase);
+        if self.facts.apply(name.to_string(), facts) {
+            self.absorb_facts(name, previous);
         }
-        self.sync_proxy_policy(name);
-        self.broadcast_service_state(name, ServiceState::DependencyFailed);
-        if state_changed {
-            self.schedule_gate_recompute();
-        }
-        state_changed
     }
 
     fn broadcast_service_state(&self, name: &str, state: ServiceState) {
-        let Some(rs) = self.services.get(name) else {
+        if !self.services.contains_key(name) {
             return;
-        };
-        let failed_dependencies = rs.failed_dependencies().to_vec();
+        }
+        let failed_dependencies = self.failed_dependencies(name);
         self.publish_state();
         // The pid comes from the projection the custody funnels write, so the
         // event and the snapshot cannot disagree about what is running.
@@ -710,44 +770,6 @@ impl Runner {
         });
     }
 
-    /// Transition a task to a new state and broadcast the change.
-    pub(crate) fn set_task_state(&mut self, name: &str, new_state: TaskState) {
-        let previous_state = self.tasks.get(name).map(RuntimeTask::state);
-        let changed = self
-            .tasks
-            .get_mut(name)
-            .and_then(|rt| rt.set_state(new_state));
-        if let Some(state) = changed {
-            self.broadcast_task_state(name, state);
-            // Every transition — see `set_service_state`. A task in the
-            // middle of a re-run stops satisfying its dependents, and that
-            // must reach their gates before anything acts on a stale level.
-            self.schedule_gate_recompute();
-            let _ = previous_state;
-        }
-    }
-
-    /// Atomically mark a task as dependency-failed and broadcast changes to
-    /// either its lifecycle state or its root-cause detail.
-    pub(crate) fn mark_task_dependency_failed(
-        &mut self,
-        name: &str,
-        dependencies: Vec<String>,
-    ) -> bool {
-        let Some(rt) = self.tasks.get_mut(name) else {
-            return false;
-        };
-        let state_changed = rt.state() != TaskState::DependencyFailed;
-        if !rt.mark_dependency_failed(dependencies) {
-            return false;
-        }
-        self.broadcast_task_state(name, TaskState::DependencyFailed);
-        if state_changed {
-            self.schedule_gate_recompute();
-        }
-        state_changed
-    }
-
     fn broadcast_task_state(&self, name: &str, state: TaskState) {
         let Some(rt) = self.tasks.get(name) else {
             return;
@@ -757,20 +779,12 @@ impl Runner {
             name: name.to_string(),
             state,
             last_run: rt.last_run.clone(),
-            failed_dependencies: rt.failed_dependencies().to_vec(),
+            failed_dependencies: self.failed_dependencies(name),
         });
     }
 
     pub fn command_sender(&self) -> mpsc::UnboundedSender<RunnerCommand> {
         self.cmd_tx.clone()
-    }
-
-    pub(crate) fn effective_shutdown_config(&self, name: &str) -> ShutdownConfig {
-        self.services
-            .get(name)
-            .and_then(|rs| rs.resolved.shutdown.clone())
-            .map(|shutdown| shutdown.merged_over(&self.config.shutdown))
-            .unwrap_or_else(|| self.config.shutdown.clone())
     }
 
     /// Subscribe to runner events.
@@ -821,7 +835,13 @@ impl Runner {
 
     /// The control plane for clients: see [`crate::control::ProcessControl`].
     pub fn process_control(&self) -> crate::control::ProcessControl {
-        crate::control::ProcessControl::new(self.catalog.clone(), self.cmd_tx.clone())
+        crate::control::ProcessControl::new(
+            self.catalog.clone(),
+            self.service_starts.registry().clone(),
+            self.task_supervisors.registry().clone(),
+            self.shutdown_flag_tx.subscribe(),
+            self.cmd_tx.clone(),
+        )
     }
 
     /// Mint the attach handle for the API server; see
@@ -962,19 +982,9 @@ impl Runner {
             self.output_manager.register_build_tool("bazel").await;
         }
 
-        // The proxies were bound during construction (fail-fast) and belong
-        // to the supervisors. Set lazy services to `Lazy` here — they won't
-        // enter the startup flow until a connection demands them — and
-        // publish the initial ports manifest.
-        let lazy_names: Vec<String> = self
-            .services
-            .iter()
-            .filter(|(_, rs)| rs.resolved.lazy && !rs.resolved.proxy.is_empty())
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in lazy_names {
-            self.set_service_state(&name, ServiceState::Lazy);
-        }
+        // Lazy services are `Lazy` from birth — their supervisors published
+        // that at construction, because a supervisor holding a bound proxy and
+        // no demand is exactly what the phase means.
         self.refresh_runtime_port_manifest();
 
         // Start file watchers before spawning services so we don't miss
@@ -1088,16 +1098,13 @@ impl Runner {
         let dep_map = self.build_dep_name_map();
         topological_sort(&dep_map).map_err(|cycle| RunnerError::Cycle { cycle })?;
 
-        // Channel for dependency-scheduled completion notifications. Store the
-        // sender on `self` so services requested later use the same path.
-        // From here on, decisions are published. Before it, `GateWriter`
-        // swallows them — construction and setup cannot grant permission.
-        self.start_gates.arm();
+        // Open for business. Until now every supervisor has been holding its
+        // own permission back: a process with no dependencies is permitted the
+        // moment its facts say so, and that is true from construction — long
+        // before the watcher above existed to receive the registrations its
+        // build resolved.
+        let _ = self.released_tx.send(true);
 
-        // Initial non-lazy processes already occupy Pending. A lazy connection
-        // performs the same state transition and can join this scheduler at
-        // any point, including while this first sweep is running.
-        self.publish_start_gates().await;
         let mut startup_complete = false;
 
         // Main loop: wait for completions, commands, and signals.
@@ -1122,37 +1129,47 @@ impl Runner {
                     self.state.set_startup_complete(true);
                     let _ = self.event_tx.send(RunnerEvent::StartupSettled);
                     let starts = self.service_starts.registry();
-                    let has_running_services = self.services.iter().any(|(name, rs)| {
+                    let has_running_services = self.services.iter().any(|(name, _rs)| {
                         matches!(
-                            rs.state(),
+                            self.service_state(name),
                             ServiceState::Pending
                                 | ServiceState::Building
                                 | ServiceState::Running
                                 | ServiceState::Ready
                                 | ServiceState::Starting
                                 | ServiceState::Lazy
-                        ) || rs.restart_pending
+                        ) || self.restart_pending(name)
                             || starts.is_busy(name)
                     });
 
                     if has_running_services {
                         self.output_manager.lifecycle_event("all services running");
-                    } else {
+                    } else if self.report_rx.is_empty() {
                         // No services to keep alive — exit.
                         break;
+                    } else {
+                        // Settled, but reports are still queued. A supervisor
+                        // publishes its phase *before* the report that narrates
+                        // it, so the phase that made this look settled can
+                        // arrive before the words explaining it. Exiting now
+                        // would swallow them — take another turn instead.
+                        startup_complete = false;
                     }
-                }
-
-                // Deferred scheduling tick: fold transitions request a sweep
-                // rather than recursing into one mid-handler; it runs here,
-                // between messages, exactly once per batch of transitions.
-                if self.gate_recompute_scheduled {
-                    self.gate_recompute_scheduled = false;
-                    self.publish_start_gates().await;
                 }
 
                 tokio::select! {
                     Some(cmd) = self.cmd_rx.recv() => {
+                        // Answer against the freshest facts, not whatever this
+                        // loop happened to absorb first.
+                        //
+                        // A supervisor publishes its phase *before* sending the
+                        // report that carries a command's reply. So once a
+                        // client has seen a reply, the facts behind it are
+                        // already queued here — and draining now is what makes
+                        // "`don stop` returned" mean "no longer a satisfied
+                        // dependency" for the very next command, across two
+                        // channels that are otherwise unordered.
+                        self.drain_facts();
                         match cmd {
                             RunnerCommand::Shutdown => {
                                 self.initiate_shutdown().await;
@@ -1162,41 +1179,38 @@ impl Runner {
                                 let statuses = self.collect_status(verbose, name.as_deref()).await;
                                 let _ = reply.send(statuses);
                             }
-                            RunnerCommand::Start { name, reply } => {
-                                self.handle_start_service_cmd(&name, reply).await;
-                            }
-                            RunnerCommand::Stop { name, reply } => {
-                                self.handle_stop_cmd(&name, reply).await;
-                            }
-                            RunnerCommand::Restart { name, reply } => {
-                                if self.tasks.contains_key(&name) {
-                                    self.send_task_restart(&name, reply);
-                                } else {
-                                    self.handle_restart_service_cmd(&name, reply).await;
-                                }
-                            }
-                            RunnerCommand::HardRestart { name, reply } => {
-                                self.handle_hard_restart_service_cmd(&name, reply).await;
-                            }
-                            RunnerCommand::RunPendingTasks { reply } => {
-                                self.handle_run_pending_tasks(reply).await;
-                            }
-                            RunnerCommand::RunTask {
-                                name,
-                                params,
-                                wait,
-                                wait_timeout,
-                                reply,
-                            } => {
-                                self.handle_run_task(&name, params, wait, wait_timeout, reply)
-                                    .await;
-                            }
                         }
                     }
                     Some(update) = self.update_rx.recv() => {
                         self.broadcast_update_check(update);
                     }
+                    // A process published something new about itself. This is
+                    // the *only* way a service's phase reaches the scheduler
+                    // now — everything below is projection, not decision.
+                    Some((name, facts)) = self.facts.recv() => {
+                        let previous = self
+                            .facts_snapshot()
+                            .get(&name)
+                            .map(|facts| facts.phase);
+                        if self.facts.apply(name.clone(), facts) {
+                            self.absorb_facts(&name, previous);
+                        }
+                    }
                     Some(report) = self.report_rx.recv() => {
+                        // A supervisor publishes its facts *before* sending
+                        // any report about the same event, and both channels
+                        // are unbounded — so by the time a report is dequeued
+                        // here, the facts behind it are already queued.
+                        // Draining first makes that an invariant: handling a
+                        // report implies every fact published before it is
+                        // visible.
+                        //
+                        // Load-bearing for replies. `handle_service_stop_
+                        // complete` answers a client, and that answer means
+                        // "no longer a satisfied dependency" — which is only
+                        // true once `Stopped` is in the snapshot the next
+                        // start will read.
+                        self.drain_facts();
                         match report {
                             // Only the first connection acts: it moves Lazy →
                             // Pending, and the normal dependency scheduler
@@ -1204,11 +1218,8 @@ impl Runner {
                             ProcessReport::Demand { name, demand } => {
                                 self.handle_demand(&name, demand);
                             }
-                            ProcessReport::ServiceExited { name, pgid, status, policy } => {
-                                self.handle_service_exited(&name, pgid, status, policy).await;
-                            }
-                            ProcessReport::HealthChanged { name, healthy, policy } => {
-                                self.handle_service_health_changed(&name, healthy, policy).await;
+                            ProcessReport::ServiceExited { name } => {
+                                self.handle_service_exited(&name).await;
                             }
                             ProcessReport::TaskExited(exit) => {
                                 self.handle_task_exit(exit);
@@ -1216,32 +1227,13 @@ impl Runner {
                             ProcessReport::TaskStarting { name, message } => {
                                 self.handle_task_starting(&name, &message);
                             }
-                            ProcessReport::ArtifactBuild { name, kind, status } => {
-                                self.handle_artifact_build(&name, kind, status);
-                            }
-                            ProcessReport::ServiceStarting { name, restarting } => {
-                                self.handle_service_starting(&name, restarting);
-                            }
                             ProcessReport::ServiceStartPrepared {
                                 name,
                                 intent,
                                 result,
-                                policy,
                             } => {
-                                self.handle_service_start_prepared(&name, intent, result, policy)
+                                self.handle_service_start_prepared(&name, intent, result)
                                     .await;
-                            }
-                            ProcessReport::ServiceReady {
-                                name,
-                                success,
-                                message,
-                                had_check,
-                                policy,
-                            } => {
-                                self.handle_service_ready_report(
-                                    &name, success, message, had_check, policy,
-                                )
-                                .await;
                             }
                             ProcessReport::ServiceStopComplete { name, result, reply, .. } => {
                                 self.handle_service_stop_complete(&name, result, reply)
@@ -1268,6 +1260,9 @@ impl Runner {
 
         // Wait for any remaining service exits during shutdown.
         self.wait_for_shutdown().await;
+        // Last word: anything a supervisor published as it ended still has to
+        // reach the projections and the event stream before `run` returns.
+        self.drain_facts();
 
         if let Some(handle) = self.update_check_handle.take() {
             handle.abort();
@@ -1539,51 +1534,6 @@ mod tests {
         }
     }
 
-    /// Failure blocking as the user sees it: a chain reports the ROOT cause,
-    /// non-blocking edges never cascade, and a recovered root returns its
-    /// descendants to the scheduler.
-    #[tokio::test(flavor = "current_thread")]
-    async fn failure_roots_collapse_and_recover() {
-        let temp = tempfile::tempdir().unwrap();
-        let toml = "\
-[services.db]\nrun = { cmd = \"sleep\", args = [\"1\"] }\n\
-[services.worker]\nrun = { cmd = \"sleep\", args = [\"1\"] }\ndepends_on = [\"db\"]\n\
-[services.api]\nrun = { cmd = \"sleep\", args = [\"1\"] }\ndepends_on = [\"worker\"]\n\
-[services.observer]\nrun = { cmd = \"sleep\", args = [\"1\"] }\ndepends_on = [{ name = \"worker\", blocking = false }]\n";
-        let (mut runner, _shutdown_tx) = runner_from_toml(toml, temp.path()).await;
-
-        runner.set_service_state("db", ServiceState::Failed);
-        runner.publish_start_gates().await;
-
-        // The whole blocking chain collapses to the root cause.
-        for name in ["worker", "api"] {
-            let rs = runner.services.get(name).unwrap();
-            assert_eq!(rs.state(), ServiceState::DependencyFailed, "{name}: state");
-            assert_eq!(
-                rs.failed_dependencies(),
-                &["db".to_string()],
-                "{name}: roots collapse transitively to the first cause"
-            );
-        }
-        // A non-blocking edge never cascades.
-        assert_eq!(
-            runner.services.get("observer").unwrap().state(),
-            ServiceState::Pending,
-            "non-blocking dependents are not failed by their dependency"
-        );
-
-        // Recovery: the root becoming satisfied re-queues the descendants.
-        runner.set_service_state("db", ServiceState::Ready);
-        runner.publish_start_gates().await;
-        for name in ["worker", "api"] {
-            assert_ne!(
-                runner.services.get(name).unwrap().state(),
-                ServiceState::DependencyFailed,
-                "{name}: returns to the scheduler once the root recovers"
-            );
-        }
-    }
-
     /// Startup-settled as a table over the state space.
     #[tokio::test(flavor = "current_thread")]
     async fn startup_settled_table() {
@@ -1643,254 +1593,6 @@ mod tests {
                 case.settled,
                 "case '{}'",
                 case.name
-            );
-        }
-    }
-
-    async fn single_bazel_runner(temp: &std::path::Path) -> (Runner, mpsc::Sender<()>) {
-        use crate::config::service::{Service, ServiceKind};
-        use crate::config::types::{BazelConfig, LogConfig, LogFilterConfig};
-
-        let config = Config {
-            services: [(
-                "api".to_string(),
-                Service {
-                    dir: None,
-                    env: HashMap::new(),
-                    env_file: Vec::new(),
-                    watch: Vec::new(),
-                    ignore: Vec::new(),
-                    debounce: None,
-                    depends_on: Vec::new(),
-                    proxy: Vec::new(),
-                    lazy: false,
-                    download: None,
-                    ready: None,
-                    shutdown: None,
-                    log: LogConfig::Stdout,
-                    log_filter: LogFilterConfig::default(),
-                    reload: true,
-                    tty: true,
-                    on_failure: crate::config::OnFailure::Notify,
-                    platform: HashMap::new(),
-                    hidden: false,
-                    auto_filter_on_failure: None,
-                    kind: Some(ServiceKind::Bazel(BazelConfig {
-                        target: "//api:api".to_string(),
-                        watch: true,
-                    })),
-                },
-            )]
-            .into_iter()
-            .collect(),
-            service_groups: HashMap::new(),
-            tasks: HashMap::new(),
-            profiles: HashMap::new(),
-            default_profile: None,
-            watch_ignore: Vec::new(),
-            shutdown: crate::config::ShutdownConfig::default(),
-            log_filter: LogFilterConfig::default(),
-            auto_filter_on_failure: true,
-            fallback_ports: false,
-        };
-        let output_manager = crate::output::OutputManager::new_verbose(
-            &[("api", &LogConfig::Stdout)],
-            tokio::io::sink(),
-            false,
-        )
-        .await
-        .unwrap();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let runner = Runner::new(
-            config,
-            Platform::LinuxX86_64,
-            output_manager,
-            temp.to_path_buf(),
-            None,
-            shutdown_rx,
-            true,
-        )
-        .await
-        .unwrap();
-        (runner, shutdown_tx)
-    }
-
-    /// The scheduler's whole part in a build, as a table: it records what
-    /// the supervisor tells it and decides nothing. A `Ready` for a process
-    /// that has moved on since — stopped, restarted — is inert; the artifact
-    /// is simply there when that process next needs it.
-    #[tokio::test(flavor = "current_thread")]
-    async fn artifact_build_reports_only_move_a_process_still_waiting() {
-        struct Case {
-            name: &'static str,
-            before: ServiceState,
-            status: crate::process::ArtifactBuildStatus,
-            want: ServiceState,
-        }
-
-        let cases = vec![
-            Case {
-                name: "a requested build shows as Building",
-                before: ServiceState::Pending,
-                status: crate::process::ArtifactBuildStatus::Started,
-                want: ServiceState::Building,
-            },
-            Case {
-                name: "a lazy service demanded then built returns to the scheduler",
-                before: ServiceState::Building,
-                status: crate::process::ArtifactBuildStatus::Ready,
-                want: ServiceState::Pending,
-            },
-            Case {
-                // Never retried: the restart policy is for failures where
-                // waiting can change the answer, and a compile is not one.
-                name: "a build failure is terminal",
-                before: ServiceState::Building,
-                status: crate::process::ArtifactBuildStatus::Failed("boom".to_string()),
-                want: ServiceState::Failed,
-            },
-            Case {
-                name: "a service stopped mid-build stays stopped",
-                before: ServiceState::Stopped,
-                status: crate::process::ArtifactBuildStatus::Ready,
-                want: ServiceState::Stopped,
-            },
-        ];
-
-        for case in cases {
-            let temp = tempfile::tempdir().unwrap();
-            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-            runner.set_service_state("api", case.before);
-
-            runner.handle_artifact_build("api", ProcessKind::Service, case.status);
-
-            assert_eq!(
-                runner.services.get("api").map(|service| service.state()),
-                Some(case.want),
-                "case '{}'",
-                case.name,
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn service_commands_reject_during_lazy_build() {
-        #[derive(Clone, Copy)]
-        enum Operation {
-            Start,
-            Restart,
-        }
-
-        struct Case {
-            name: &'static str,
-            operation: Operation,
-            expected_message: &'static str,
-        }
-
-        let cases = vec![
-            Case {
-                name: "start",
-                operation: Operation::Start,
-                expected_message: "cannot start while Building",
-            },
-            Case {
-                name: "restart",
-                operation: Operation::Restart,
-                expected_message: "cannot restart while Building",
-            },
-        ];
-
-        for case in cases {
-            let temp = tempfile::tempdir().unwrap();
-            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-            runner.set_service_state("api", ServiceState::Building);
-            let (reply_tx, reply_rx) = oneshot::channel();
-
-            match case.operation {
-                Operation::Start => runner.handle_start_service_cmd("api", reply_tx).await,
-                Operation::Restart => runner.handle_restart_service_cmd("api", reply_tx).await,
-            }
-
-            let result = reply_rx.await.unwrap();
-            assert!(
-                matches!(
-                    &result,
-                    Err(CommandError::InvalidState { message, .. })
-                        if message == case.expected_message
-                ),
-                "case '{}' returned {result:?}",
-                case.name,
-            );
-            assert_eq!(
-                runner.services.get("api").map(|service| service.state()),
-                Some(ServiceState::Building),
-                "case '{}'",
-                case.name,
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn ready_report_folds_only_in_running_state() {
-        struct Case {
-            name: &'static str,
-            state: ServiceState,
-            success: bool,
-            expected: ServiceState,
-        }
-
-        // Staleness by generation is unrepresentable now: the supervisor
-        // clears a pending outcome on any newer Start/Stop, and outcomes
-        // arrive after their own wired report on one channel. What is left
-        // to guard is state: a crash's exit report folding first moves the
-        // service out of Running, and the outcome must then be inert.
-        let cases = vec![
-            Case {
-                name: "stopped service ignores a completion",
-                state: ServiceState::Stopped,
-                success: true,
-                expected: ServiceState::Stopped,
-            },
-            Case {
-                name: "failed service ignores a completion",
-                state: ServiceState::Failed,
-                success: true,
-                expected: ServiceState::Failed,
-            },
-            Case {
-                name: "running service accepts success",
-                state: ServiceState::Running,
-                success: true,
-                expected: ServiceState::Ready,
-            },
-            Case {
-                name: "running service accepts failure",
-                state: ServiceState::Running,
-                success: false,
-                expected: ServiceState::Failed,
-            },
-        ];
-
-        for case in cases {
-            let temp = tempfile::tempdir().unwrap();
-            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
-            runner.set_service_state("api", case.state);
-
-            runner
-                .handle_service_ready_report(
-                    "api",
-                    case.success,
-                    None,
-                    true,
-                    crate::process::health::PolicyOutcome::None,
-                )
-                .await;
-
-            assert_eq!(
-                runner.services.get("api").map(|service| service.state()),
-                Some(case.expected),
-                "case '{}'",
-                case.name,
             );
         }
     }
@@ -2204,118 +1906,6 @@ mod tests {
         assert_eq!(depths["b"], 1);
         assert_eq!(depths["c"], 1);
         assert_eq!(depths["d"], 2);
-    }
-
-    #[test]
-    fn runtime_service_default_state() {
-        use crate::config::service::ResolvedService;
-        use crate::config::types::{LogConfig, LogFilterConfig};
-        use std::collections::HashMap;
-
-        let mut rs = RuntimeService::new(
-            ResolvedService {
-                dir: None,
-                env: HashMap::new(),
-                env_file: Vec::new(),
-                watch: Vec::new(),
-                ignore: Vec::new(),
-                debounce: None,
-                depends_on: Vec::new(),
-                proxy: Vec::new(),
-                lazy: false,
-                download: None,
-                ready: None,
-                shutdown: None,
-                log: LogConfig::Stdout,
-                log_filter: LogFilterConfig::default(),
-                reload: true,
-                tty: true,
-                on_failure: crate::config::OnFailure::Notify,
-                auto_filter_on_failure: None,
-                kind: None,
-                resolved_binary_path: None,
-            },
-            ServiceState::Pending,
-        );
-
-        assert_eq!(rs.state(), ServiceState::Pending);
-        assert!(rs.resolved.kind.is_none());
-
-        struct Case {
-            name: &'static str,
-            dependencies: Vec<String>,
-            want_changed: bool,
-        }
-        let cases = vec![
-            Case {
-                name: "enter dependency failure",
-                dependencies: vec!["db".to_string()],
-                want_changed: true,
-            },
-            Case {
-                name: "refresh root cause without a state change",
-                dependencies: vec!["cache".to_string()],
-                want_changed: true,
-            },
-            Case {
-                name: "identical failure is a no-op",
-                dependencies: vec!["cache".to_string()],
-                want_changed: false,
-            },
-        ];
-        for case in cases {
-            assert_eq!(
-                rs.mark_dependency_failed(case.dependencies),
-                case.want_changed,
-                "case: {}",
-                case.name
-            );
-        }
-        assert_eq!(rs.failed_dependencies(), ["cache"]);
-        assert_eq!(
-            rs.set_state(ServiceState::Pending),
-            Some(ServiceState::Pending)
-        );
-        assert!(rs.failed_dependencies().is_empty());
-    }
-
-    #[test]
-    fn runtime_task_default_state() {
-        use crate::config::types::LogConfig;
-        use std::collections::HashMap;
-
-        let mut rt = RuntimeTask::new(
-            crate::config::task::Task {
-                cmd: "echo".to_string(),
-                args: vec!["hello".to_string()],
-                dir: None,
-                env: HashMap::new(),
-                depends_on: Vec::new(),
-                watch: Vec::new(),
-                ignore: Vec::new(),
-                timeout: None,
-                log: LogConfig::Stdout,
-                terminal: crate::config::TaskTerminal::default(),
-                headless: None,
-                auto_run: crate::config::TaskAutoRun::Always,
-                download: None,
-                bazel: None,
-                params: Vec::new(),
-                hidden: false,
-                auto_filter_on_failure: None,
-            },
-            TaskState::Pending,
-            false,
-            None,
-        );
-
-        assert_eq!(rt.state(), TaskState::Pending);
-        assert_eq!(rt.config.cmd, "echo");
-
-        assert!(rt.mark_dependency_failed(vec!["setup".to_string()]));
-        assert_eq!(rt.failed_dependencies(), ["setup"]);
-        assert_eq!(rt.set_state(TaskState::Pending), Some(TaskState::Pending));
-        assert!(rt.failed_dependencies().is_empty());
     }
 
     #[test]

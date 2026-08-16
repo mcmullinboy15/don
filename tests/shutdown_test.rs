@@ -5,14 +5,14 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, RunnerCommand, RunnerEvent, ServiceState};
+use don::runner::{Runner, RunnerEvent, ServiceState};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
@@ -415,9 +415,13 @@ fn shutdown_kills_running_task() {
         handle.await.unwrap();
 
         let output = read_buf(&buf);
+        // The task's own supervisor signals it and says so. There is no
+        // aggregate "killing N tasks" line any more — that was the runner
+        // speaking on everyone's behalf, which is exactly what teardown
+        // stopped doing.
         assert!(
-            output.contains("killing") && output.contains("task"),
-            "expected task kill message. output: {output}"
+            output.contains("slow: send SIGKILL to task pgid"),
+            "expected the task's supervisor to signal its own run. output: {output}"
         );
         assert!(output.contains("shutdown complete"), "output: {output}");
     });
@@ -514,20 +518,19 @@ fn shutdown_interrupts_manual_stop_worker() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
 
         assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "stubborn".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        // Detached: this stop is deliberately slow, and the point of the test
+        // is what a shutdown does while it is still in flight.
+        let stop = tokio::spawn({
+            let control = control.clone();
+            async move { control.stop("stubborn").await }
+        });
 
         assert!(wait_for_output(&buf, "stopping... (requested)", Duration::from_secs(2)).await);
 
@@ -535,7 +538,7 @@ fn shutdown_interrupts_manual_stop_worker() {
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
         let elapsed = start.elapsed();
-        let _ = reply_rx.await;
+        let _ = stop.await;
 
         let output = read_buf(&buf);
         assert!(output.contains("shutdown complete"), "output: {output}");
@@ -563,20 +566,19 @@ fn shutdown_interrupts_manual_restart_worker() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
 
         assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "stubborn".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        // Detached: this restart's stop half is deliberately slow, and the
+        // test is about what shutdown does while it is still in flight.
+        let restart = tokio::spawn({
+            let control = control.clone();
+            async move { control.restart("stubborn").await }
+        });
 
         assert!(
             wait_for_output(
@@ -591,7 +593,7 @@ fn shutdown_interrupts_manual_restart_worker() {
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
         let elapsed = start.elapsed();
-        let _ = reply_rx.await;
+        let _ = restart.await;
 
         let output = read_buf(&buf);
         assert!(output.contains("shutdown complete"), "output: {output}");
@@ -618,20 +620,21 @@ fn shutdown_interrupts_manual_start_worker() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
 
         assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
 
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Start {
-                name: "lazy-builder".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        // Detached: the reply only lands once the start has settled, and this
+        // test is waiting for the build it kicks off.
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.start("lazy-builder").await;
+            }
+        });
 
         assert!(
             wait_for_output(
@@ -678,7 +681,7 @@ fn shutdown_interrupts_rebuild_worker() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
@@ -688,13 +691,14 @@ fn shutdown_interrupts_rebuild_worker() {
         std::fs::write(dir.path().join("slow-build"), "1").unwrap();
 
         // A rebuild by name — the same cycle a watched file starts, minus
-        // waiting for the debounce.
-        cmd_tx
-            .send(RunnerCommand::HardRestart {
-                name: "builder".to_string(),
-                reply: tokio::sync::oneshot::channel().0,
-            })
-            .unwrap();
+        // waiting for the debounce. Detached: the reply lands when the build
+        // is accepted, and this test is watching what the build then does.
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.hard_restart("builder").await;
+            }
+        });
 
         assert!(
             wait_for_output(
