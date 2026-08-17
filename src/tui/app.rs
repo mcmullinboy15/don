@@ -258,9 +258,19 @@ pub(crate) struct App {
     /// The drag in progress, or the last one that settled. Screen coordinates,
     /// so it is discarded whenever the view moves under it.
     pub(crate) log_selection: super::selection::Selection,
-    /// What the last copy did, shown in the status bar. OSC 52 gets no reply,
-    /// so saying "copied" is the only feedback there can be.
-    pub(crate) copy_notice: Option<String>,
+    /// What the last copy did, and when it was said. OSC 52 gets no reply, so
+    /// this is the only feedback there can be — and it is transient, because a
+    /// badge that never leaves stops reading as an answer to what you just did
+    /// and starts reading as part of the furniture.
+    pub(crate) copy_notice: Option<(String, std::time::Instant)>,
+    /// A click's position, time and how many clicks have landed there in a
+    /// row. Double- and triple-click are the same button event as a single
+    /// one; only the gap between them tells them apart.
+    pub(crate) last_click: Option<(u16, u16, std::time::Instant, u8)>,
+    /// Set when a selection paused following, so clearing it can resume.
+    /// Without this, `esc` after selecting would strand a reader who had
+    /// deliberately scrolled up before selecting.
+    pub(crate) follow_paused_for_selection: bool,
     /// The plain text of the rows the last frame drew, and where the pane
     /// started. Written by the renderer so a copy resolves against exactly what
     /// was on screen rather than re-deriving wrapping, filtering and scroll.
@@ -355,6 +365,8 @@ impl App {
             log_scroll: super::logs::Scroll::Follow,
             log_selection: super::selection::Selection::default(),
             copy_notice: None,
+            last_click: None,
+            follow_paused_for_selection: false,
             log_visible_rows: Vec::new(),
             log_pane_origin: (0, 0),
             log_rows_above: 0,

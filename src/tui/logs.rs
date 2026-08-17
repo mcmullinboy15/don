@@ -209,6 +209,31 @@ where
     }
 }
 
+/// The anchor for whichever line currently owns row `rows_above`.
+///
+/// The same walk [`scrolled`] does, without its "at the bottom means follow"
+/// shortcut — because pinning the view *while* it sits at the bottom is exactly
+/// what this is for. Selecting text freezes the view, so that the rows under
+/// the selection stay the rows the user dragged across; without the freeze,
+/// one line of new output invalidates the whole thing.
+pub(crate) fn anchor_at<F>(store: &LogStore, admits: F, rows_above: usize) -> Scroll
+where
+    F: Fn(&super::log_store::StoredLogLine) -> bool,
+{
+    let mut seen = 0usize;
+    for entry in store.iter().filter(|entry| admits(entry)) {
+        let rows = entry.wrapped_rows().max(1);
+        if seen + rows > rows_above {
+            return Scroll::At {
+                id: entry.id,
+                row: u16::try_from(rows_above - seen).unwrap_or(0),
+            };
+        }
+        seen += rows;
+    }
+    Scroll::Follow
+}
+
 /// Move the anchor by `delta` rows, clamping at both ends.
 ///
 /// Scrolling to the bottom re-enters [`Scroll::Follow`] rather than anchoring

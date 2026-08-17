@@ -367,12 +367,13 @@ fn draw_bar(frame: &mut Frame<'_>, app: &App, box_area: Rect) {
             total_services,
             app.verbose_enabled,
             app.has_failure_summary(),
+            !app.log_selection.is_empty(),
         )
     };
     // OSC 52 has no acknowledgement, so this line is the only sign a copy
     // happened. It takes the right-hand slot over the update badge: the user
     // just acted, and an answer to that beats a background notice.
-    let copy_badge = app.copy_notice.as_ref().map(|notice| {
+    let copy_badge = app.copy_notice.as_ref().map(|(notice, _)| {
         Line::from(Span::styled(
             format!(" {notice} "),
             Style::default()
@@ -918,6 +919,7 @@ fn format_task_duration(duration_ms: Option<u64>) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normal_bar_line(
     counts: &StatusCounts,
     filter: &FilterState,
@@ -926,6 +928,7 @@ fn normal_bar_line(
     total_services: usize,
     verbose_enabled: bool,
     has_failure_summary: bool,
+    has_selection: bool,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -961,6 +964,18 @@ fn normal_bar_line(
     }
 
     spans.push(separator());
+    if has_selection {
+        // Copying is explicit now, so the key that does it has to be visible
+        // at the moment there is something to copy.
+        spans.push(Span::styled(
+            "[y] copy",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(dim("  [esc] clear"));
+        spans.push(separator());
+    }
     spans.push(dim("[p] status"));
     spans.push(dim("  [l] logs"));
     if filter.is_active() {
@@ -1529,6 +1544,7 @@ mod tests {
             0,
             false,
             false,
+            false,
         );
         let star = line
             .spans
@@ -1559,6 +1575,7 @@ mod tests {
             0,
             0,
             0,
+            false,
             false,
             false,
         );
@@ -1593,6 +1610,7 @@ mod tests {
             0,
             1,
             2,
+            false,
             false,
             false,
         ));
@@ -1640,6 +1658,7 @@ mod tests {
                 2,
                 false,
                 true,
+                false,
             ));
 
             assert!(text.contains(case.want), "case: {}", case.name);

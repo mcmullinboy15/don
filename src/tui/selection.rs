@@ -106,6 +106,43 @@ impl Selection {
     }
 }
 
+/// The half-open column range of the word under `column`, if there is one.
+///
+/// Whitespace-delimited, which is what a log wants: paths, ids, durations and
+/// bracketed levels all come out whole, and the alternative — a table of
+/// "word characters" — argues with itself over `/`, `-`, `:` and `.`, every
+/// one of which appears inside something a reader means to grab as a unit.
+///
+/// `None` when the column is on whitespace or past the end of the row, so a
+/// double-click on empty space selects nothing rather than something arbitrary.
+pub(crate) fn word_at(row: &str, column: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = row.chars().collect();
+    if column >= chars.len() || chars[column].is_whitespace() {
+        return None;
+    }
+    let start = chars[..column]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map_or(0, |idx| idx + 1);
+    let end = chars[column..]
+        .iter()
+        .position(|c| c.is_whitespace())
+        .map_or(chars.len(), |idx| column + idx);
+    Some((start, end))
+}
+
+/// The half-open column range of everything on the row, ignoring the padding a
+/// pane row carries. `None` for a blank row.
+pub(crate) fn line_extent(row: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = row.chars().collect();
+    let start = chars.iter().position(|c| !c.is_whitespace())?;
+    let end = chars
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(start, |idx| idx + 1);
+    Some((start, end))
+}
+
 /// Pull the selected text out of the rows the renderer laid out.
 ///
 /// `rows` are the pane's rows in order, `origin` is the pane's top-left corner,
@@ -370,5 +407,114 @@ mod tests {
             selected_text(&selection, &rows, (0, 0), 9).unwrap(),
             "only line"
         );
+    }
+
+    /// Double-click picks out a word. Whitespace-delimited is what a log wants:
+    /// a path, a duration or a bracketed level comes out whole, and clicking
+    /// empty space selects nothing rather than something arbitrary.
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        struct Case {
+            name: &'static str,
+            row: &'static str,
+            column: usize,
+            want: Option<&'static str>,
+        }
+
+        let row = "api    | GET /v1/users 200 in 12.4ms";
+        let cases = vec![
+            Case {
+                name: "the process name",
+                row,
+                column: 1,
+                want: Some("api"),
+            },
+            Case {
+                name: "a path, kept whole through its slashes",
+                row,
+                column: 16,
+                want: Some("/v1/users"),
+            },
+            Case {
+                name: "a duration, kept whole through its dot",
+                row,
+                column: 32,
+                want: Some("12.4ms"),
+            },
+            Case {
+                name: "the first character of a word",
+                row,
+                column: 9,
+                want: Some("GET"),
+            },
+            Case {
+                name: "whitespace selects nothing",
+                row,
+                column: 4,
+                want: None,
+            },
+            Case {
+                name: "past the end selects nothing",
+                row,
+                column: 500,
+                want: None,
+            },
+            Case {
+                name: "a blank row selects nothing",
+                row: "          ",
+                column: 3,
+                want: None,
+            },
+        ];
+
+        for case in cases {
+            let got = word_at(case.row, case.column).map(|(start, end)| {
+                case.row
+                    .chars()
+                    .skip(start)
+                    .take(end - start)
+                    .collect::<String>()
+            });
+            assert_eq!(got.as_deref(), case.want, "{}", case.name);
+        }
+    }
+
+    /// Triple-click takes the row, minus the padding a pane row carries.
+    #[test]
+    fn triple_click_selects_the_line_without_its_padding() {
+        struct Case {
+            name: &'static str,
+            row: &'static str,
+            want: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "trailing pane padding is not content",
+                row: "api    | started            ",
+                want: Some("api    | started"),
+            },
+            Case {
+                name: "leading space is skipped too",
+                row: "   indented line",
+                want: Some("indented line"),
+            },
+            Case {
+                name: "a blank row has no extent",
+                row: "        ",
+                want: None,
+            },
+        ];
+
+        for case in cases {
+            let got = line_extent(case.row).map(|(start, end)| {
+                case.row
+                    .chars()
+                    .skip(start)
+                    .take(end - start)
+                    .collect::<String>()
+            });
+            assert_eq!(got.as_deref(), case.want, "{}", case.name);
+        }
     }
 }

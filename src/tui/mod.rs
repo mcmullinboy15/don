@@ -431,6 +431,17 @@ pub async fn run_tui(
             }
             _ = ticker.tick() => {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                // The copy badge answers something the user just did; once it
+                // has been read it is only taking up the slot the update notice
+                // wants. OSC 52 never replies, so time is the only thing that
+                // can retire it.
+                if app
+                    .copy_notice
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() > COPY_NOTICE_TTL)
+                {
+                    app.copy_notice = None;
+                }
                 dirty = true;
             }
             () = &mut frame, if dirty => {
@@ -634,6 +645,12 @@ fn handle_key(
 
 fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
     match key.code {
+        // Held above the tail, Enter is the way back down — the gesture
+        // everyone tries first, and it costs nothing because the separator it
+        // would otherwise insert only makes sense at the bottom anyway.
+        KeyCode::Enter if app.log_scroll != logs::Scroll::Follow => {
+            resume_following(app);
+        }
         KeyCode::Enter => {
             // A local artifact, not a stream line: it borrows the id the next
             // real line is expected to have so replay keeps it in place.
@@ -675,12 +692,13 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         KeyCode::Home => scroll_log(app, store, isize::MIN / 2),
         KeyCode::End => {
             app.log_selection.clear();
+            app.follow_paused_for_selection = false;
             app.log_scroll = logs::Scroll::Follow;
         }
         // Ctrl+C is shutdown and cannot double as copy, so the keyboard route
         // to the clipboard is `y` — vi's yank, over the current selection.
         KeyCode::Char('y') => copy_selection(app),
-        KeyCode::Esc => app.log_selection.clear(),
+        KeyCode::Esc => clear_selection(app),
         // The status pane sits *beside* the log rather than replacing it, so
         // opening it is not a mode change and does not interrupt reading.
         KeyCode::Char('p') => {
@@ -735,10 +753,30 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
                 app.dragging_divider = true;
                 return;
             }
-            if let Some(focus) = app.panes.hit(mouse.column, mouse.row) {
-                app.focus = focus;
-                if focus == panes::Focus::Logs && app.view_mode == ViewMode::Normal {
+            let Some(focus) = app.panes.hit(mouse.column, mouse.row) else {
+                return;
+            };
+            app.focus = focus;
+            if focus != panes::Focus::Logs || app.view_mode != ViewMode::Normal {
+                return;
+            }
+            match click_count(app, mouse.column, mouse.row) {
+                // A drag is about to start, or a plain click clearing what was
+                // selected before.
+                1 => {
+                    clear_selection(app);
                     app.log_selection.begin(mouse.column, mouse.row);
+                }
+                2 => select_span(app, store, mouse.column, mouse.row, selection::word_at),
+                // Triple-click means "this log line", so it starts past don's
+                // own `name | ` chrome — the same thing a multi-row copy does,
+                // and the two disagreeing would be arbitrary.
+                _ => {
+                    let prefix = usize::from(log_prefix_width(app));
+                    select_span(app, store, mouse.column, mouse.row, move |row, _| {
+                        selection::line_extent(row)
+                            .map(|(start, end)| (start.max(prefix).min(end), end))
+                    })
                 }
             }
         }
@@ -754,21 +792,121 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
                     panes::extent_from_drag(area, app.status_pane.side, mouse.column, mouse.row);
                 return;
             }
+            // The rows under a selection have to stop moving, or output
+            // arriving mid-drag pulls the text out from under the pointer.
+            pause_following_for_selection(app, store);
             app.log_selection.extend(mouse.column, mouse.row);
         }
-        // Copy on release, the way a terminal's own selection behaves — asking
-        // for a second keystroke to confirm what was just dragged would be a
-        // step backwards from what the alternate screen took away.
         MouseEventKind::Up(MouseButton::Left) => {
-            if app.dragging_divider {
-                app.dragging_divider = false;
-                return;
-            }
+            app.dragging_divider = false;
             app.log_selection.finish();
-            copy_selection(app);
         }
         _ => {}
     }
+}
+
+/// How long two clicks may be apart and still count as a double click.
+///
+/// The usual desktop default. Long enough not to demand a fast hand, short
+/// enough that two deliberate clicks on the same word are not mistaken for one.
+const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long the copy badge stays up. Long enough to read, short enough that it
+/// is clearly about the thing you just pressed.
+const COPY_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How many clicks have now landed in the same place in a row: 1, 2 or 3.
+///
+/// Terminals report a double click as two ordinary presses; only the gap and
+/// the position tell them apart, so the counting has to happen here.
+fn click_count(app: &mut App, column: u16, row: u16) -> u8 {
+    let count = match app.last_click {
+        Some((last_col, last_row, at, count))
+            if last_row == row
+                && last_col.abs_diff(column) <= 1
+                && at.elapsed() <= MULTI_CLICK_WINDOW =>
+        {
+            // Past a triple, start over rather than inventing a quadruple
+            // click nothing has a meaning for.
+            if count >= 3 { 1 } else { count + 1 }
+        }
+        _ => 1,
+    };
+    app.last_click = Some((column, row, std::time::Instant::now(), count));
+    count
+}
+
+/// Select whatever `span` picks out of the clicked row.
+///
+/// Resolved against the rows the last frame drew, so a double click lands on
+/// the word actually under the pointer — after wrapping, filtering and scroll,
+/// none of which this has to know about.
+fn select_span(
+    app: &mut App,
+    store: &LogStore,
+    column: u16,
+    row: u16,
+    span: impl Fn(&str, usize) -> Option<(usize, usize)>,
+) {
+    let (origin_x, origin_y) = app.log_pane_origin;
+    let Some(index) = row.checked_sub(origin_y).map(usize::from) else {
+        return;
+    };
+    let Some(text) = app.log_visible_rows.get(index) else {
+        return;
+    };
+    let within = usize::from(column.saturating_sub(origin_x));
+    let Some((start, end)) = span(text, within) else {
+        clear_selection(app);
+        return;
+    };
+    // Same reason a drag freezes the view: the selection is screen
+    // coordinates, so the rows under it have to stop moving.
+    pause_following_for_selection(app, store);
+    let to_screen = |col: usize| origin_x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
+    app.log_selection.begin(to_screen(start), row);
+    app.log_selection.extend(to_screen(end), row);
+    app.log_selection.finish();
+}
+
+/// Hold the view still while a selection stands.
+///
+/// A selection is screen coordinates over the rows a frame drew. Following
+/// means those rows move, so a selection made while following would be
+/// pointing at different text a frame later — which is why copy used to have
+/// to happen on mouse-release. Freezing instead is what lets the copy be
+/// explicit: the selection stays exactly what the user dragged across until
+/// they act on it.
+fn pause_following_for_selection(app: &mut App, store: &LogStore) {
+    if app.log_scroll != logs::Scroll::Follow {
+        return;
+    }
+    app.log_scroll = logs::anchor_at(
+        store,
+        |entry| {
+            app.should_render_log(
+                &entry.line.name,
+                entry.line.is_lifecycle,
+                entry.line.is_verbose,
+            )
+        },
+        app.log_rows_above,
+    );
+    app.follow_paused_for_selection = true;
+}
+
+/// Drop the selection, and go back to the live tail if it was what stopped us
+/// following. A reader who had scrolled up on purpose stays where they were.
+fn clear_selection(app: &mut App) {
+    app.log_selection.clear();
+    if app.follow_paused_for_selection {
+        resume_following(app);
+    }
+}
+
+fn resume_following(app: &mut App) {
+    app.follow_paused_for_selection = false;
+    app.log_scroll = logs::Scroll::Follow;
 }
 
 /// The width of don's `name    | ` prefix, which a multi-row copy leaves out.
@@ -796,12 +934,13 @@ fn copy_selection(app: &mut App) {
         return;
     };
     let lines = text.lines().count();
+    let now = std::time::Instant::now();
     app.copy_notice = Some(match selection::copy_to_clipboard(&text) {
         // OSC 52 is a request with no reply: a terminal that has it turned off
         // discards it silently. Reporting what was sent is the only honest
         // thing available — "copied" here means "asked the terminal to".
-        Ok(()) => format!("copied {lines} line(s)"),
-        Err(e) => format!("copy failed: {e}"),
+        Ok(()) => (format!("copied {lines} line(s)"), now),
+        Err(e) => (format!("copy failed: {e}"), now),
     });
 }
 
@@ -819,8 +958,11 @@ fn log_page(app: &App) -> isize {
 fn scroll_log(app: &mut App, store: &LogStore, delta: isize) {
     // The selection is in screen coordinates, so it stops meaning anything the
     // moment different content is under those cells — same as a terminal drops
-    // its own selection when you scroll.
+    // its own selection when you scroll. Scrolling is also a deliberate choice
+    // of where to be, so it takes ownership of the view from the selection that
+    // paused it.
     app.log_selection.clear();
+    app.follow_paused_for_selection = false;
     app.log_scroll = logs::scrolled(
         store,
         |entry| {

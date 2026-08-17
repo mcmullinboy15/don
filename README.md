@@ -88,10 +88,11 @@ nothing is lost by opening an overlay.
 | Key | Action |
 |-----|--------|
 | `↑` `↓` `PgUp` `PgDn` `Home` | Scroll the log |
-| `End` | Jump back to following the live tail |
+| `End` or `Enter` | Jump back to following the live tail |
 | wheel | Scroll the log |
-| drag | Select text — copied on release, without the `name \| ` prefix |
-| `y` | Re-copy the current selection |
+| drag | Select text. Double-click selects a word, triple-click the line |
+| `y` | Copy the selection, without the `name \| ` prefix |
+| `Esc` | Clear the selection |
 | `p` / `P` | Toggle the status pane / move it between right and bottom |
 | `Tab` | Move focus between panes |
 | `l` | Filter services/tasks — space toggles, enter commits, esc clears |
@@ -99,9 +100,18 @@ nothing is lost by opening an overlay.
 | `t` | Full-screen task status |
 | `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
 
+Selecting holds the view still, so output arriving mid-drag doesn't pull the
+text out from under you; the log resumes following when you clear the selection.
+Copying is deliberate — `y`, never a side effect of releasing the mouse.
+
 Copying goes through OSC 52, so it reaches your system clipboard over ssh and
 inside tmux. Terminals with OSC 52 disabled ignore it silently — the status bar
 reports what was sent, which is the only acknowledgement the protocol allows.
+
+⌘ is not available to a terminal application: it has no encoding in the
+traditional input stream, and macOS terminals claim it for their own shortcuts
+before an application sees it. To use ⌘C, hold **Shift while dragging** — that
+bypasses don's mouse capture and gives you the terminal's own selection.
 
 Pipe mode (non-TTY) writes prefixed lines directly to stdout unchanged.
 
