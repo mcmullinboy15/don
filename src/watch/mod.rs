@@ -41,6 +41,32 @@ const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Synthetic watch item used for workspace-level build graph files.
 pub(crate) const WORKSPACE_GRAPH_ITEM_NAME: &str = "__workspace_graph__";
 
+/// Ignore globs don applies whatever the config says.
+///
+/// `.don/` is don's own state directory, and the runner writes every lifecycle
+/// line it emits into `.don/logs/runner.log`. A config whose watch globs reach
+/// the whole project — `**/*.ts`, and every monorepo has one — registers that
+/// directory like any other, and then don logging a line modifies runner.log,
+/// which fires a watch event, which don logs. That feedback loop feeds itself
+/// and settles at tens of thousands of lines a second.
+///
+/// `.git/` is not a loop, just noise, and a great deal of it: a fetch, a commit,
+/// or git's own background gc rewrites refs, logs and index locks, and none of
+/// it is a file anyone asked to watch.
+///
+/// Neither holds anyone's source, so there is no case for watching them and no
+/// reason to make every project remember to say so.
+const BUILTIN_WATCH_IGNORE: &[&str] = &[".don/**", ".git/**"];
+
+/// The config's `watch_ignore` with don's own built-ins in front.
+fn effective_watch_ignore(configured: &[String]) -> Vec<String> {
+    BUILTIN_WATCH_IGNORE
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .chain(configured.iter().cloned())
+        .collect()
+}
+
 /// Errors from the watch module.
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
@@ -342,8 +368,9 @@ impl WatchManager {
             base_dir.display(),
             canonicalize_started.elapsed()
         ));
+        let watch_ignore = effective_watch_ignore(&config.watch_ignore);
         let mut global_ignore_patterns: Vec<String> = Vec::new();
-        for pattern in &config.watch_ignore {
+        for pattern in &watch_ignore {
             global_ignore_patterns.push(
                 resolve_pattern(base_dir, pattern)
                     .to_string_lossy()
@@ -367,7 +394,7 @@ impl WatchManager {
         // canonical base dir. This is what prunes ignored subtrees when we walk
         // to decide which directories to register with the notify backend.
         let ignore_setup_started = Instant::now();
-        let overrides = build_watch_ignore_overrides(base_dir, &config.watch_ignore, &mut warnings);
+        let overrides = build_watch_ignore_overrides(base_dir, &watch_ignore, &mut warnings);
         emitter.debug_event(&format!(
             "watch: ignore setup complete resolved_patterns={} warnings={} elapsed={:?}",
             global_ignore_patterns.len(),
@@ -987,7 +1014,7 @@ impl WatchManager {
             let path_str = path.to_string_lossy();
             let mut matched_any = false;
             let mut ignored_by: Vec<String> = Vec::new();
-            let mut unmatched: Vec<String> = Vec::new();
+            let mut unmatched = 0usize;
             for (name, item) in &self.items {
                 let state = debounce_label(item);
                 if let Some(ig) = item
@@ -1026,31 +1053,28 @@ impl WatchManager {
                         affected.push(name.clone());
                     }
                 } else {
-                    unmatched.push(name.clone());
+                    unmatched += 1;
                 }
             }
             if !matched_any {
+                // One line, not one per item. This used to narrate every item
+                // that didn't match, but in the branch where it fired the
+                // reason was the same for all of them — the one the summary
+                // already gives — and the only per-item detail was a debounce
+                // label that says nothing about the path. On a stack with
+                // dozens of watch items that turned every stray write under
+                // the project into dozens of lines.
                 if ignored_by.is_empty() {
-                    self.emitter
-                        .debug_event(&format!("watch: no item matched {:?}", path));
+                    self.emitter.debug_event(&format!(
+                        "watch: no item matched {:?} ({} checked)",
+                        path, unmatched
+                    ));
                 } else {
                     self.emitter.debug_event(&format!(
                         "watch: no rebuild match for {:?} (ignored by {})",
                         path,
                         ignored_by.join(", ")
                     ));
-                }
-                for name in unmatched {
-                    if let Some(item) = self.items.get(&name) {
-                        self.emitter.service_debug_event(
-                            &name,
-                            &format!(
-                                "watch: did not match path={:?} state={} reason=no pattern matched",
-                                path,
-                                debounce_label(item)
-                            ),
-                        );
-                    }
                 }
             }
         }

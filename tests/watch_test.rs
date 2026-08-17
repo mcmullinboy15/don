@@ -1039,3 +1039,164 @@ fn integration_task_auto_run_once_runs_initially_then_goes_pending_on_change() {
         handle.await.unwrap();
     });
 }
+
+/// don's own state directory and git's are never watched, whatever the config's
+/// globs say.
+///
+/// `.don/` is the load-bearing one: the runner writes every lifecycle line it
+/// emits into `.don/logs/runner.log`, so a project-wide glob like `**/*.ts`
+/// made don's own logging fire watch events that don logged, at tens of
+/// thousands of lines a second. `.git/` is the same shape without the loop —
+/// ref and index churn nobody asked to watch.
+#[test]
+fn integration_don_and_git_directories_are_never_watched() {
+    struct Case {
+        name: &'static str,
+        /// Written relative to the project root, with parents created.
+        path: &'static str,
+        want_silent: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "don's own log is what made this a feedback loop",
+            path: ".don/logs/runner.log",
+            want_silent: true,
+        },
+        Case {
+            name: "git ref churn is noise, not source",
+            path: ".git/refs/remotes/origin/some-branch",
+            want_silent: true,
+        },
+        Case {
+            name: "an ordinary file the glob covers still reports",
+            path: "src/main.ts",
+            want_silent: false,
+        },
+    ];
+
+    for case in cases {
+        run_with_timeout(Duration::from_secs(15), async {
+            let dir = TempDir::new("watch-builtin-ignore");
+            let target = dir.path().join(case.path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&target, "initial").unwrap();
+            std::fs::create_dir_all(dir.path().join("src")).unwrap();
+            std::fs::write(dir.path().join("src/other.ts"), "initial").unwrap();
+
+            // A project-wide glob, which is what pulls the dot directories in.
+            let toml = r#"
+[services.app]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+watch = ["**/*"]
+debounce = "100ms"
+log = "ignore"
+ready.exec.cmd = "true"
+"#;
+
+            let (runner, shutdown_tx, buf) = make_runner_verbose(toml, dir.path()).await;
+            let handle = tokio::spawn(async move {
+                runner.run().await.unwrap();
+            });
+            assert!(
+                wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+                "{}: services did not start. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let before = read_buf(&buf).len();
+            std::fs::write(&target, "modified").unwrap();
+            tokio::time::sleep(Duration::from_millis(800)).await;
+
+            let after = read_buf(&buf);
+            let new_output = after.get(before..).unwrap_or_default();
+            let mentioned = new_output.contains(case.path);
+            assert_eq!(
+                !mentioned, case.want_silent,
+                "{}: writing {} produced: {new_output}",
+                case.name, case.path
+            );
+
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+        });
+    }
+}
+
+/// An event nothing matches costs one line, not one per watch item.
+///
+/// The per-item narration fired only in the branch where every item failed for
+/// the same reason the summary line already gives, so on a stack with dozens of
+/// services every stray write under the project turned into dozens of lines.
+#[test]
+fn integration_unmatched_event_does_not_narrate_every_item() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("watch-unmatched-fanout");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "initial").unwrap();
+        std::fs::write(dir.path().join("src/stray.txt"), "initial").unwrap();
+
+        // Three services watching the same thing: enough that a per-item
+        // fan-out is unmistakable in the count.
+        let toml = r#"
+[services.one]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+watch = ["src/**/*.rs"]
+debounce = "100ms"
+log = "ignore"
+ready.exec.cmd = "true"
+
+[services.two]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+watch = ["src/**/*.rs"]
+debounce = "100ms"
+log = "ignore"
+ready.exec.cmd = "true"
+
+[services.three]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+watch = ["src/**/*.rs"]
+debounce = "100ms"
+log = "ignore"
+ready.exec.cmd = "true"
+"#;
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(5)).await,
+            "services did not start. output: {}",
+            read_buf(&buf)
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let before = read_buf(&buf).len();
+        std::fs::write(dir.path().join("src/stray.txt"), "modified").unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let after = read_buf(&buf);
+        let new_output = after.get(before..).unwrap_or_default();
+        let mentions = new_output.matches("stray.txt").count();
+        assert!(
+            new_output.contains("no item matched"),
+            "the one summary line should still be emitted. output: {new_output}"
+        );
+        assert!(
+            mentions <= 2,
+            "expected the raw event line and one summary, got {mentions} mentions: {new_output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
