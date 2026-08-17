@@ -104,7 +104,20 @@ impl Runner {
                 docker_ports: crate::docker::describe_port_bindings(&docker_port_bindings),
             }),
         );
+        // Say so, because the wire lands *after* the transition that announced
+        // the start. A service with a ready check gets a second transition
+        // afterwards and its pid rides along on that; one without never does,
+        // so without this it would be pid-less on the event stream forever.
+        // That is why pids showed for some services and not others.
+        self.rebroadcast_service_runtime(name);
         self.refresh_runtime_port_manifest();
+    }
+
+    /// Re-announce a service's current state now that its runtime detail has
+    /// changed, so event consumers see the same thing the projection holds.
+    fn rebroadcast_service_runtime(&self, name: &str) {
+        let state = self.service_state(name);
+        self.broadcast_service_state(name, state);
     }
 
     /// Custody ended. Docker *bindings* are retained so a restart can request
@@ -113,6 +126,10 @@ impl Runner {
     pub(in crate::runner) fn clear_service_custody(&mut self, name: &str) {
         self.endpoints.clear_custody(name);
         self.state.set_service_runtime(name, None);
+        // No re-announcement here, unlike the wire above: custody only ends
+        // alongside a phase change, and that transition carries the cleared
+        // runtime with it. Saying it twice would put a second `Stopping` in
+        // front of `Stopped` and make teardown read as if it stalled.
         self.refresh_runtime_port_manifest();
     }
 

@@ -158,6 +158,21 @@ impl FilterState {
     /// True if the given log line name passes the currently-active filter.
     /// Blank spacer lines (empty name) always pass; real names must be in
     /// the active selection.
+    /// Feed everything [`Self::passes`] depends on into a hasher, so a caller
+    /// can tell whether the answer for *any* name may have changed.
+    pub(crate) fn fingerprint(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        // Order-independent: a set has none, and two runs must agree.
+        let mut sum: u64 = 0;
+        for name in &self.active_selected {
+            let mut one = std::collections::hash_map::DefaultHasher::new();
+            name.hash(&mut one);
+            sum = sum.wrapping_add(std::hash::Hasher::finish(&one));
+        }
+        sum.hash(hasher);
+        self.active_selected.len().hash(hasher);
+    }
+
     pub(crate) fn passes(&self, name: &str) -> bool {
         if name.is_empty() {
             return true;

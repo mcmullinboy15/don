@@ -40,7 +40,8 @@ pub(in crate::runner) use crate::process::{
 pub use crate::process::{ServiceState, TaskState};
 pub(in crate::runner) use crate::state_store;
 pub use crate::state_store::{
-    ParamInfo, ProcessStatus, StateReader, StateSnapshot, VerboseInfo, all_services_ready,
+    ParamInfo, ProcessStatus, ServiceRuntime, StateReader, StateSnapshot, VerboseInfo,
+    all_services_ready,
 };
 pub use crate::watch::report::{WatchDir, WatchReport, WatchReportItem};
 

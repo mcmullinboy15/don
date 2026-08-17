@@ -119,6 +119,22 @@ impl LogStore {
         self.entries.iter()
     }
 
+    /// The oldest id still held, for a reader deciding what it has missed.
+    pub(crate) fn oldest_id(&self) -> Option<LogId> {
+        self.entries.front().map(|entry| entry.id)
+    }
+
+    /// Iterate from the first entry with `id >= from`.
+    ///
+    /// A binary search rather than a scan: ids ascend, and the callers that
+    /// want this — the view index mending itself, the renderer taking the
+    /// visible window — would otherwise walk the whole store to reach a
+    /// screenful near the end of it.
+    pub(crate) fn iter_from(&self, from: LogId) -> impl Iterator<Item = &StoredLogLine> {
+        let at = self.entries.partition_point(|entry| entry.id < from);
+        self.entries.iter().skip(at)
+    }
+
     /// Id the next stream line is expected to have — what a reconnecting
     /// client asks to resume from.
     pub(crate) fn next_id(&self) -> LogId {

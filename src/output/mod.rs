@@ -743,7 +743,17 @@ pub struct OutputManager {
 /// cursors, a client can say exactly where it stopped, and a gap can be
 /// measured instead of guessed at.
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub struct LogId(pub u64);
 

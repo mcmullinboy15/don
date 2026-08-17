@@ -14,7 +14,8 @@ use serde::Deserialize;
 // types live there, but the *dependency* reads `crate::client`, which is
 // the module edge the TUI separation enforces.
 pub use crate::runner::{
-    CompletionError, ProcessStatus, RunnerEvent, ServiceState, StateSnapshot, TaskState,
+    CompletionError, ProcessStatus, RunnerEvent, ServiceRuntime, ServiceState, StateSnapshot,
+    TaskState,
 };
 
 /// One parsed record from `GET /events`.

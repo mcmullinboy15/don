@@ -57,6 +57,7 @@ mod panes;
 mod render;
 mod selection;
 mod status_table;
+mod view_index;
 
 use ansi_to_tui::IntoText;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -543,7 +544,7 @@ fn handle_app_event(
             // anchor is a line id, so it means the same thing at any size.
         }
         AppEvent::Key(key) => handle_key(key, app, store, client, controls)?,
-        AppEvent::Mouse(mouse) => handle_mouse(mouse, app, store),
+        AppEvent::Mouse(mouse) => handle_mouse(mouse, app),
         AppEvent::CompletionsReady {
             param,
             request_id,
@@ -670,10 +671,12 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         }
         KeyCode::Char('t') => {
             app.tasks_table.reset();
+            app.freeze_tasks_order();
             app.view_mode = ViewMode::Tasks;
         }
         KeyCode::Char('s') => {
             app.services_table.reset();
+            app.freeze_services_order();
             app.view_mode = ViewMode::Services;
         }
         KeyCode::Char('i') if app.has_failure_summary() => {
@@ -685,11 +688,11 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         // Scrolling the log. The pane's own history is the only history now,
         // so these are load-bearing rather than a convenience over the
         // terminal's scrollback.
-        KeyCode::Up => scroll_log(app, store, -1),
-        KeyCode::Down => scroll_log(app, store, 1),
-        KeyCode::PageUp => scroll_log(app, store, -log_page(app)),
-        KeyCode::PageDown => scroll_log(app, store, log_page(app)),
-        KeyCode::Home => scroll_log(app, store, isize::MIN / 2),
+        KeyCode::Up => scroll_log(app, -1),
+        KeyCode::Down => scroll_log(app, 1),
+        KeyCode::PageUp => scroll_log(app, -log_page(app)),
+        KeyCode::PageDown => scroll_log(app, log_page(app)),
+        KeyCode::Home => scroll_log(app, isize::MIN / 2),
         KeyCode::End => {
             app.log_selection.clear();
             app.follow_paused_for_selection = false;
@@ -739,10 +742,10 @@ const WHEEL_ROWS: isize = 3;
 /// Wheel scrolling works in every mode: a full-screen table on top does not
 /// mean the user has stopped caring where the log is, and moving it costs
 /// nothing while it is hidden.
-fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
+fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
-        MouseEventKind::ScrollUp => scroll_log(app, store, -WHEEL_ROWS),
-        MouseEventKind::ScrollDown => scroll_log(app, store, WHEEL_ROWS),
+        MouseEventKind::ScrollUp => scroll_log(app, -WHEEL_ROWS),
+        MouseEventKind::ScrollDown => scroll_log(app, WHEEL_ROWS),
         // A click in the log pane takes focus back from any overlay, which is
         // the gesture people reach for before they remember `esc`.
         MouseEventKind::Down(MouseButton::Left) => {
@@ -767,13 +770,13 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
                     clear_selection(app);
                     app.log_selection.begin(mouse.column, mouse.row);
                 }
-                2 => select_span(app, store, mouse.column, mouse.row, selection::word_at),
+                2 => select_span(app, mouse.column, mouse.row, selection::word_at),
                 // Triple-click means "this log line", so it starts past don's
                 // own `name | ` chrome — the same thing a multi-row copy does,
                 // and the two disagreeing would be arbitrary.
                 _ => {
                     let prefix = usize::from(log_prefix_width(app));
-                    select_span(app, store, mouse.column, mouse.row, move |row, _| {
+                    select_span(app, mouse.column, mouse.row, move |row, _| {
                         selection::line_extent(row)
                             .map(|(start, end)| (start.max(prefix).min(end), end))
                     })
@@ -794,7 +797,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
             }
             // The rows under a selection have to stop moving, or output
             // arriving mid-drag pulls the text out from under the pointer.
-            pause_following_for_selection(app, store);
+            pause_following_for_selection(app);
             app.log_selection.extend(mouse.column, mouse.row);
         }
         MouseEventKind::Up(MouseButton::Left) => {
@@ -843,7 +846,6 @@ fn click_count(app: &mut App, column: u16, row: u16) -> u8 {
 /// none of which this has to know about.
 fn select_span(
     app: &mut App,
-    store: &LogStore,
     column: u16,
     row: u16,
     span: impl Fn(&str, usize) -> Option<(usize, usize)>,
@@ -862,7 +864,7 @@ fn select_span(
     };
     // Same reason a drag freezes the view: the selection is screen
     // coordinates, so the rows under it have to stop moving.
-    pause_following_for_selection(app, store);
+    pause_following_for_selection(app);
     let to_screen = |col: usize| origin_x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
     app.log_selection.begin(to_screen(start), row);
     app.log_selection.extend(to_screen(end), row);
@@ -877,21 +879,11 @@ fn select_span(
 /// to happen on mouse-release. Freezing instead is what lets the copy be
 /// explicit: the selection stays exactly what the user dragged across until
 /// they act on it.
-fn pause_following_for_selection(app: &mut App, store: &LogStore) {
+fn pause_following_for_selection(app: &mut App) {
     if app.log_scroll != logs::Scroll::Follow {
         return;
     }
-    app.log_scroll = logs::anchor_at(
-        store,
-        |entry| {
-            app.should_render_log(
-                &entry.line.name,
-                entry.line.is_lifecycle,
-                entry.line.is_verbose,
-            )
-        },
-        app.log_rows_above,
-    );
+    app.log_scroll = logs::anchor_at(&app.view_index, app.log_rows_above);
     app.follow_paused_for_selection = true;
 }
 
@@ -955,7 +947,7 @@ fn log_page(app: &App) -> isize {
 /// how tall the pane came out and how much admitted content there is at this
 /// width. A resize between then and now costs one imprecise scroll, which the
 /// next frame corrects.
-fn scroll_log(app: &mut App, store: &LogStore, delta: isize) {
+fn scroll_log(app: &mut App, delta: isize) {
     // The selection is in screen coordinates, so it stops meaning anything the
     // moment different content is under those cells — same as a terminal drops
     // its own selection when you scroll. Scrolling is also a deliberate choice
@@ -964,14 +956,7 @@ fn scroll_log(app: &mut App, store: &LogStore, delta: isize) {
     app.log_selection.clear();
     app.follow_paused_for_selection = false;
     app.log_scroll = logs::scrolled(
-        store,
-        |entry| {
-            app.should_render_log(
-                &entry.line.name,
-                entry.line.is_lifecycle,
-                entry.line.is_verbose,
-            )
-        },
+        &app.view_index,
         app.log_rows_above,
         app.log_total_rows,
         app.log_pane_height,

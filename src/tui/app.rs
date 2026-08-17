@@ -253,6 +253,19 @@ pub(crate) struct App {
     /// Set while the divider is being dragged, so motion resizes instead of
     /// selecting text.
     pub(crate) dragging_divider: bool,
+    /// The row order each status table was opened with.
+    ///
+    /// The tables sort by state — failures first — which is what you want when
+    /// the view opens and exactly what you do not want afterwards: starting or
+    /// stopping something changes its bucket, so the row moves out from under
+    /// the cursor that acted on it. Capturing the order at open keeps the
+    /// useful sort and makes the list hold still. Empty means "sort by state",
+    /// which is how the first render populates it.
+    pub(crate) services_order: Vec<String>,
+    pub(crate) tasks_order: Vec<String>,
+    /// The admitted-lines index the pane positions itself with. Mended once a
+    /// frame; see [`super::view_index`] for why it is not recomputed.
+    pub(crate) view_index: super::view_index::ViewIndex,
     /// Where the log pane is looking. `Follow` until the user scrolls away.
     pub(crate) log_scroll: super::logs::Scroll,
     /// The drag in progress, or the last one that settled. Screen coordinates,
@@ -362,6 +375,9 @@ impl App {
             status_pane: super::panes::StatusPane::default(),
             focus: super::panes::Focus::Logs,
             dragging_divider: false,
+            services_order: Vec::new(),
+            tasks_order: Vec::new(),
+            view_index: super::view_index::ViewIndex::default(),
             log_scroll: super::logs::Scroll::Follow,
             log_selection: super::selection::Selection::default(),
             copy_notice: None,
@@ -398,6 +414,21 @@ impl App {
             current_version,
             latest_version,
         });
+    }
+
+    /// A fingerprint of everything [`Self::should_render_log`] consults.
+    ///
+    /// Hashed rather than hand-incremented on each mutation: the filter has
+    /// more mutators than anyone will remember to keep in step, and a missed
+    /// bump would leave the pane indexing against a filter the user has
+    /// already changed. Cost is the number of *process names*, not lines.
+    pub(crate) fn log_filter_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.verbose_enabled.hash(&mut hasher);
+        self.shutdown_started.hash(&mut hasher);
+        self.filter.fingerprint(&mut hasher);
+        hasher.finish()
     }
 
     pub(crate) fn should_render_log(
@@ -444,10 +475,22 @@ impl App {
             })
             .collect();
         retain_fuzzy_matches(&self.services_table.query, &mut items, OverlayItem::name);
+        let order = &self.services_order;
         items.sort_by(|a, b| {
-            a.sort_bucket()
-                .cmp(&b.sort_bucket())
-                .then_with(|| a.name().cmp(b.name()))
+            match (
+                Self::ordered_position(order, a.name()),
+                Self::ordered_position(order, b.name()),
+            ) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                // Anything the captured order does not know about goes after
+                // everything it does, so a new arrival cannot displace a row.
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a
+                    .sort_bucket()
+                    .cmp(&b.sort_bucket())
+                    .then_with(|| a.name().cmp(b.name())),
+            }
         });
         items
     }
@@ -472,12 +515,50 @@ impl App {
             })
             .collect();
         retain_fuzzy_matches(&self.tasks_table.query, &mut items, TaskStatusItem::name);
+        let order = &self.tasks_order;
         items.sort_by(|a, b| {
-            a.sort_bucket()
-                .cmp(&b.sort_bucket())
-                .then_with(|| a.name().cmp(b.name()))
+            match (
+                Self::ordered_position(order, a.name()),
+                Self::ordered_position(order, b.name()),
+            ) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a
+                    .sort_bucket()
+                    .cmp(&b.sort_bucket())
+                    .then_with(|| a.name().cmp(b.name())),
+            }
         });
         items
+    }
+
+    /// Where `name` sits in a captured order, or `None` if it arrived after
+    /// the view opened. Newcomers sort after everything remembered, so a
+    /// service that appears mid-session lands at the end instead of shuffling
+    /// the rows above it.
+    fn ordered_position(order: &[String], name: &str) -> Option<usize> {
+        order.iter().position(|held| held == name)
+    }
+
+    /// Capture the order the tables should hold, from the state sort. Called
+    /// when a table is opened.
+    pub(crate) fn freeze_services_order(&mut self) {
+        self.services_order.clear();
+        self.services_order = self
+            .service_items()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+    }
+
+    pub(crate) fn freeze_tasks_order(&mut self) {
+        self.tasks_order.clear();
+        self.tasks_order = self
+            .task_items()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
     }
 
     pub(crate) fn has_failure_summary(&self) -> bool {
@@ -578,15 +659,17 @@ impl App {
                     name,
                     state,
                     failed_dependencies,
+                    runtime,
                     ..
                 } => {
-                    // The projection carries no pid. Where the state moved
-                    // while we weren't looking the pid we hold is certainly
-                    // stale, so drop it rather than show a dead process;
-                    // where it didn't, it is still good.
-                    if self.services_state.get(name) != Some(state) {
-                        self.service_pids.insert(name.clone(), None);
-                    }
+                    // The snapshot is the record for runtime detail, so take
+                    // the pid from it rather than keeping whatever we last
+                    // saw on an event. This is the *only* way a client that
+                    // attached after startup learns a pid at all: state
+                    // events fire on transitions, and by the time a `don
+                    // start` TUI subscribes the spawns have already happened.
+                    self.service_pids
+                        .insert(name.clone(), runtime.as_ref().and_then(|rt| rt.pid));
                     self.services_state.insert(name.clone(), *state);
                     self.apply_failed_dependencies(name.clone(), failed_dependencies.clone());
                 }
@@ -766,9 +849,12 @@ mod tests {
     fn resync_from_replaces_drifted_state() {
         use crate::client::{ProcessStatus, StateSnapshot};
 
-        fn snapshot_service(name: &str, state: ServiceState) -> ProcessStatus {
+        fn snapshot_service(name: &str, state: ServiceState, pid: Option<i32>) -> ProcessStatus {
             ProcessStatus::Service {
-                runtime: None,
+                runtime: pid.map(|pid| crate::client::ServiceRuntime {
+                    pid: Some(pid),
+                    ..Default::default()
+                }),
                 name: name.to_string(),
                 state,
                 failed_dependencies: Vec::new(),
@@ -790,19 +876,38 @@ mod tests {
             Case {
                 name: "a dropped transition is picked up",
                 before: vec![("api", ServiceState::Starting, Some(42))],
-                snapshot: vec![snapshot_service("api", ServiceState::Ready)],
+                snapshot: vec![snapshot_service("api", ServiceState::Ready, Some(42))],
                 want_states: vec![("api", ServiceState::Ready)],
-                // The state moved while we weren't looking, so the pid we
-                // hold can't be trusted.
-                want_pids: vec![("api", None)],
+                want_pids: vec![("api", Some(42))],
                 want_counts_ready: 1,
             },
             Case {
-                name: "an unchanged item keeps its pid",
-                before: vec![("api", ServiceState::Ready, Some(42))],
-                snapshot: vec![snapshot_service("api", ServiceState::Ready)],
+                // The bug this path exists for: a client that subscribes
+                // after the spawns have happened sees no state transitions,
+                // so the snapshot is the only place a pid can come from.
+                name: "a pid we never saw an event for arrives with the snapshot",
+                before: vec![("api", ServiceState::Ready, None)],
+                snapshot: vec![snapshot_service("api", ServiceState::Ready, Some(42))],
                 want_states: vec![("api", ServiceState::Ready)],
                 want_pids: vec![("api", Some(42))],
+                want_counts_ready: 1,
+            },
+            Case {
+                name: "the snapshot's pid replaces a stale one",
+                before: vec![("api", ServiceState::Ready, Some(42))],
+                snapshot: vec![snapshot_service("api", ServiceState::Ready, Some(99))],
+                want_states: vec![("api", ServiceState::Ready)],
+                want_pids: vec![("api", Some(99))],
+                want_counts_ready: 1,
+            },
+            Case {
+                // No runtime means no local process — a docker service, or one
+                // that has stopped. Either way the pid we hold is a corpse.
+                name: "no runtime in the snapshot clears the pid",
+                before: vec![("api", ServiceState::Ready, Some(42))],
+                snapshot: vec![snapshot_service("api", ServiceState::Ready, None)],
+                want_states: vec![("api", ServiceState::Ready)],
+                want_pids: vec![("api", None)],
                 want_counts_ready: 1,
             },
             Case {
@@ -812,8 +917,8 @@ mod tests {
                     ("web", ServiceState::Starting, Some(2)),
                 ],
                 snapshot: vec![
-                    snapshot_service("api", ServiceState::Ready),
-                    snapshot_service("web", ServiceState::Failed),
+                    snapshot_service("api", ServiceState::Ready, Some(1)),
+                    snapshot_service("web", ServiceState::Failed, None),
                 ],
                 want_states: vec![("api", ServiceState::Ready), ("web", ServiceState::Failed)],
                 want_pids: vec![("api", Some(1)), ("web", None)],
@@ -1347,5 +1452,65 @@ mod tests {
 
         assert_eq!(got, vec!["failed", "pending-run", "running", "completed"]);
         assert_eq!(items[3].last_run.as_ref().unwrap().duration_ms, Some(42));
+    }
+
+    /// The tables sort by state so failures surface when the view opens — and
+    /// then must hold still, because acting on a row changes its state and
+    /// would otherwise move it out from under the cursor that acted.
+    #[test]
+    fn a_table_holds_the_order_it_opened_with() {
+        let mut app = App::new(AppInit {
+            service_names: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            task_names: Vec::new(),
+            build_tool_names: Vec::new(),
+            task_configs: HashMap::new(),
+            task_last_runs: HashMap::new(),
+            hidden_names: HashSet::new(),
+            auto_filter_on_failure_names: HashSet::new(),
+            cli_log_filter: None,
+            verbose_enabled: false,
+        });
+        // beta is broken, so it opens at the top.
+        apply_service(&mut app, "alpha", ServiceState::Ready, Some(1));
+        apply_service(&mut app, "beta", ServiceState::Failed, None);
+        apply_service(&mut app, "gamma", ServiceState::Ready, Some(3));
+
+        let opened: Vec<String> = app
+            .service_items()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(opened, vec!["beta", "alpha", "gamma"], "state sort on open");
+
+        app.freeze_services_order();
+
+        // Now act on things: beta recovers, alpha stops. Neither may move.
+        apply_service(&mut app, "beta", ServiceState::Ready, Some(2));
+        apply_service(&mut app, "alpha", ServiceState::Stopped, None);
+        let after: Vec<String> = app
+            .service_items()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(after, opened, "rows hold still once the view is open");
+
+        // A service that appears later joins at the end rather than displacing
+        // anything above it.
+        apply_service(&mut app, "delta", ServiceState::Failed, None);
+        let with_newcomer: Vec<String> = app
+            .service_items()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(with_newcomer, vec!["beta", "alpha", "gamma", "delta"]);
+
+        // Reopening re-sorts: alpha is stopped, delta failed.
+        app.freeze_services_order();
+        let reopened: Vec<String> = app
+            .service_items()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(reopened[0], "delta", "reopening surfaces the failure again");
     }
 }

@@ -76,7 +76,7 @@ pub enum ProcessStatus {
 /// Published by the fold straight from the wired report, so it is the one
 /// record of custody rather than a copy of one. Absent means the supervisor
 /// holds nothing — which is the liveness check every caller wants.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServiceRuntime {
     /// Process group id. `None` for docker services, which have no local
     /// process — so this being absent does not mean "not running".

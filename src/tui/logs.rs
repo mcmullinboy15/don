@@ -127,78 +127,48 @@ pub(crate) fn count_wrapped_rows(line: &Line<'_>, width: u16) -> usize {
 ///
 /// The store must have been reflowed to `width` first; row counts come from its
 /// cache, and only the rows that actually land on screen are wrapped.
-pub(crate) fn build_view<'a, F>(
+pub(crate) fn build_view<'a>(
     store: &'a LogStore,
-    admits: F,
+    index: &super::view_index::ViewIndex,
     scroll: Scroll,
     width: u16,
     height: u16,
-) -> LogView<'a>
-where
-    F: Fn(&super::log_store::StoredLogLine) -> bool,
-{
+) -> LogView<'a> {
     let height = height.max(1) as usize;
-
-    // Two passes over cached counts, then wrapping for the visible window only.
-    // Wrapping every retained line every frame would make frame cost a function
-    // of scrollback depth rather than of screen height.
-    let admitted: Vec<&'a super::log_store::StoredLogLine> =
-        store.iter().filter(|entry| admits(entry)).collect();
-    let total_rows: usize = admitted
-        .iter()
-        .map(|entry| entry.wrapped_rows().max(1))
-        .sum();
+    let total_rows = index.total_rows();
     let max_above = total_rows.saturating_sub(height);
 
     let rows_above = match scroll {
         Scroll::Follow => max_above,
-        Scroll::At { id, row } => {
-            let mut above = 0usize;
-            let mut found = false;
-            for entry in &admitted {
-                if entry.id >= id {
-                    found = true;
-                    break;
-                }
-                above += entry.wrapped_rows().max(1);
-            }
-            // The anchor was evicted or filtered away. Falling back to the tail
-            // is the honest answer: the position the user chose no longer
-            // exists, and pretending otherwise would put them somewhere
-            // arbitrary.
-            if found {
-                (above + row as usize).min(max_above)
-            } else {
-                max_above
-            }
-        }
+        Scroll::At { id, row } => match index.rows_above(id) {
+            Some(above) => (above + row as usize).min(max_above),
+            // The anchor was evicted or filtered away. The oldest line that
+            // survives is where the reader was heading, not the live tail —
+            // being yanked to the bottom because history aged out from under
+            // you is the "jumpy" a busy log produces once it is at capacity.
+            None => 0,
+        },
     };
 
+    // Only the visible window is wrapped, and only from the line that owns the
+    // top row — no walk of everything above it.
     let mut rows: Vec<Line<'a>> = Vec::with_capacity(height);
-    let mut seen = 0usize;
-    for entry in admitted {
-        let entry_rows = entry.wrapped_rows().max(1);
-        // Skip whole lines that finish above the top edge without wrapping them.
-        if seen + entry_rows <= rows_above {
-            seen += entry_rows;
-            continue;
-        }
-        let skip_within = rows_above.saturating_sub(seen);
-        for wrapped in wrap_line(&entry.parsed, width)
-            .into_iter()
-            .skip(skip_within)
-        {
-            rows.push(wrapped);
-            if rows.len() == height {
-                return LogView {
-                    rows,
-                    following: matches!(scroll, Scroll::Follow),
-                    rows_above,
-                    total_rows,
-                };
+    if let Some((first_id, skip_within)) = index.line_at(rows_above) {
+        let mut skip = usize::from(skip_within);
+        for entry in store.iter_from(first_id) {
+            for wrapped in wrap_line(&entry.parsed, width).into_iter().skip(skip) {
+                rows.push(wrapped);
+                if rows.len() == height {
+                    return LogView {
+                        rows,
+                        following: matches!(scroll, Scroll::Follow),
+                        rows_above,
+                        total_rows,
+                    };
+                }
             }
+            skip = 0;
         }
-        seen += entry_rows;
     }
 
     LogView {
@@ -211,27 +181,16 @@ where
 
 /// The anchor for whichever line currently owns row `rows_above`.
 ///
-/// The same walk [`scrolled`] does, without its "at the bottom means follow"
+/// The lookup [`scrolled`] does, without its "at the bottom means follow"
 /// shortcut — because pinning the view *while* it sits at the bottom is exactly
 /// what this is for. Selecting text freezes the view, so that the rows under
-/// the selection stay the rows the user dragged across; without the freeze,
-/// one line of new output invalidates the whole thing.
-pub(crate) fn anchor_at<F>(store: &LogStore, admits: F, rows_above: usize) -> Scroll
-where
-    F: Fn(&super::log_store::StoredLogLine) -> bool,
-{
-    let mut seen = 0usize;
-    for entry in store.iter().filter(|entry| admits(entry)) {
-        let rows = entry.wrapped_rows().max(1);
-        if seen + rows > rows_above {
-            return Scroll::At {
-                id: entry.id,
-                row: u16::try_from(rows_above - seen).unwrap_or(0),
-            };
-        }
-        seen += rows;
+/// the selection stay the rows the user dragged across; without the freeze, one
+/// line of new output invalidates the whole thing.
+pub(crate) fn anchor_at(index: &super::view_index::ViewIndex, rows_above: usize) -> Scroll {
+    match index.line_at(rows_above) {
+        Some((id, row)) => Scroll::At { id, row },
+        None => Scroll::Follow,
     }
-    Scroll::Follow
 }
 
 /// Move the anchor by `delta` rows, clamping at both ends.
@@ -239,38 +198,20 @@ where
 /// Scrolling to the bottom re-enters [`Scroll::Follow`] rather than anchoring
 /// at the last line — otherwise the view would sit one line behind forever
 /// once new output arrived, which reads as a freeze.
-pub(crate) fn scrolled<F>(
-    store: &LogStore,
-    admits: F,
+pub(crate) fn scrolled(
+    index: &super::view_index::ViewIndex,
     rows_above: usize,
     total_rows: usize,
     height: u16,
     delta: isize,
-) -> Scroll
-where
-    F: Fn(&super::log_store::StoredLogLine) -> bool,
-{
+) -> Scroll {
     let height = height.max(1) as usize;
     let max_above = total_rows.saturating_sub(height);
     let target = rows_above.saturating_add_signed(delta).min(max_above);
     if target >= max_above {
         return Scroll::Follow;
     }
-
-    // Walk the admitted lines to find which one owns row `target`, using the
-    // same cached counts the last frame measured with.
-    let mut seen = 0usize;
-    for entry in store.iter().filter(|entry| admits(entry)) {
-        let rows = entry.wrapped_rows().max(1);
-        if seen + rows > target {
-            return Scroll::At {
-                id: entry.id,
-                row: u16::try_from(target - seen).unwrap_or(0),
-            };
-        }
-        seen += rows;
-    }
-    Scroll::Follow
+    anchor_at(index, target)
 }
 
 #[cfg(test)]

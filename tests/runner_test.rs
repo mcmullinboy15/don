@@ -516,6 +516,77 @@ fn integration_tcp_ready_check() {
     });
 }
 
+/// A client watching only the event stream must learn every service's pid.
+///
+/// The wire that records custody lands *after* the transition that announced
+/// the start, so the "started" event cannot carry a pid. A service with a ready
+/// check gets a second transition afterwards and its pid rides along on that;
+/// one without never does. Both must end up announced, or the TUI's PID column
+/// is blank for exactly the services that are quickest to come up.
+#[test]
+fn integration_every_service_announces_its_pid_on_the_event_stream() {
+    struct Case {
+        name: &'static str,
+        service: &'static str,
+        ready_check: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "a second transition would have carried it anyway",
+            service: "checked",
+            ready_check: true,
+        },
+        Case {
+            name: "ready at start, so the wire is the only chance",
+            service: "plain",
+            ready_check: false,
+        },
+    ];
+
+    for case in cases {
+        run_with_timeout(Duration::from_secs(15), async {
+            let dir = TempDir::new("pid-events");
+            let mut builder = ConfigBuilder::new()
+                .add_custom_service(case.service, "sleep", &["60"])
+                .log("ignore");
+            if case.ready_check {
+                builder = builder.ready_exec("true", &[]);
+            }
+            let toml = builder.done().build();
+
+            let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+            let mut events = runner.subscribe();
+            let handle = tokio::spawn(async move {
+                let _ = runner.run().await;
+            });
+            wait_for_substr(&buf, "all services running", Duration::from_secs(5)).await;
+
+            let mut announced = None;
+            while announced.is_none() {
+                let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let don::runner::RunnerEvent::ServiceStateChanged { name, pid, .. } = event
+                    && name == case.service
+                {
+                    announced = pid;
+                }
+            }
+
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+            assert!(
+                announced.is_some_and(|pid| pid > 0),
+                "{}: {} never announced a pid",
+                case.name,
+                case.service
+            );
+        });
+    }
+}
+
 // --- Exec ready check ---
 
 #[test]

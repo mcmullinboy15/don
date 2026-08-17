@@ -102,19 +102,22 @@ fn draw_log_pane(
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let view = super::logs::build_view(
-        store,
-        |entry| {
-            app.should_render_log(
-                &entry.line.name,
-                entry.line.is_lifecycle,
-                entry.line.is_verbose,
-            )
-        },
-        app.log_scroll,
-        area.width,
-        area.height,
-    );
+    // Mend the index before reading it: this is the one place that knows the
+    // pane's width, and the filter may have moved since the last frame.
+    let key = super::view_index::ViewKey {
+        width: area.width,
+        filter: app.log_filter_fingerprint(),
+    };
+    let mut index = std::mem::take(&mut app.view_index);
+    index.sync(store, key, |entry| {
+        app.should_render_log(
+            &entry.line.name,
+            entry.line.is_lifecycle,
+            entry.line.is_verbose,
+        )
+    });
+    let view = super::logs::build_view(store, &index, app.log_scroll, area.width, area.height);
+    app.view_index = index;
     // Remembered for the input layer: scrolling needs to know how far it can
     // go, and only the renderer knows how tall the pane came out.
     app.log_rows_above = view.rows_above;
