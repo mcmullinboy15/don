@@ -196,6 +196,19 @@ pub(crate) enum SinkHandle {
     /// only the raw bytes; the emulator thread keys screens by the line's
     /// process name.
     Emulator(mpsc::UnboundedSender<emulator::EmulatorRequest>),
+    /// The stdout writer: unbounded, so an ordinary burst is never dropped and
+    /// a lifecycle event can always be sent from a sync context — but *metered*,
+    /// so the writer can tell a burst from a process that will outrun it
+    /// forever. Without the meter the queue is the only thing between a runaway
+    /// service and the machine's memory, and it has no bound at all.
+    Metered {
+        tx: mpsc::UnboundedSender<SinkLine>,
+        /// Bytes queued and not yet consumed. Added here, subtracted by
+        /// `stdout_sink_task` as it takes each line.
+        queued: Arc<std::sync::atomic::AtomicUsize>,
+        /// Lines shed since the writer last said so.
+        shed: Arc<std::sync::atomic::AtomicU64>,
+    },
 }
 
 impl SinkHandle {
@@ -211,6 +224,23 @@ impl SinkHandle {
                     bytes: msg.line.to_vec(),
                 })
                 .map_err(|_| ()),
+            Self::Metered { tx, queued, shed } => {
+                // Shed here rather than in the writer, because the writer may
+                // be parked inside a blocking write to a destination that has
+                // stopped draining — a terminal that has stopped reading, a
+                // pipe nobody is emptying. In that state it never reaches a
+                // check of its own, and the queue is the only thing between a
+                // runaway process and the machine's memory.
+                //
+                // don's own narration is never the flood and is always kept:
+                // losing it loses the explanation for what is happening.
+                if !msg.is_lifecycle && queued.load(Ordering::Relaxed) > SHED_HIGH_WATER {
+                    shed.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                queued.fetch_add(msg.line.len(), Ordering::Relaxed);
+                tx.send(msg).map_err(|_| ())
+            }
         }
     }
 
@@ -219,6 +249,7 @@ impl SinkHandle {
             Self::Unbounded(tx) => tx.is_closed(),
             Self::BoundedDrop(tx) => tx.is_closed(),
             Self::Emulator(tx) => tx.is_closed(),
+            Self::Metered { tx, .. } => tx.is_closed(),
         }
     }
 
@@ -227,6 +258,7 @@ impl SinkHandle {
             (Self::Unbounded(a), Self::Unbounded(b)) => a.same_channel(b),
             (Self::BoundedDrop(a), Self::BoundedDrop(b)) => a.same_channel(b),
             (Self::Emulator(a), Self::Emulator(b)) => a.same_channel(b),
+            (Self::Metered { tx: a, .. }, Self::Metered { tx: b, .. }) => a.same_channel(b),
             _ => false,
         }
     }
@@ -437,7 +469,43 @@ impl CompiledLogKeepFilter {
 /// The TUI is not a target: it follows [`OutputManager::log_stream_sender`]
 /// and TUI-mode callers pass a null writer.
 enum StdoutTarget<W: tokio::io::AsyncWrite + Unpin + Send> {
-    Writer(W),
+    Writer(tokio::io::BufWriter<W>),
+}
+
+/// How much output the writer batches before it has to hit the OS.
+///
+/// This used to be unbuffered: two `write_all` calls — the line, then the
+/// newline — per log line, so two syscalls each. A process logging faster than
+/// syscalls retire meant the writer fell permanently behind its queue, and the
+/// queue is unbounded. Buffering raises the ceiling by orders of magnitude and
+/// costs nothing, because the buffer is flushed the moment the writer catches
+/// up (see `stdout_sink_task`) — so output is never held back when someone is
+/// watching for it, only when there is already a backlog.
+const WRITE_BUFFER: usize = 64 * 1024;
+
+/// Queued output past which lines start being shed rather than enqueued.
+///
+/// Deliberately generous: a quarter of a gigabyte is far more than any burst a
+/// build or a test run produces, so nothing anyone wanted to read is ever at
+/// risk. It is a backstop against a process in a loop, not a throttle — a
+/// service is never slowed down, it just stops being able to add to a backlog
+/// nothing will ever read.
+const SHED_HIGH_WATER: usize = 256 * 1024 * 1024;
+
+impl<W: tokio::io::AsyncWrite + Unpin + Send> StdoutTarget<W> {
+    fn new(writer: W) -> Self {
+        Self::Writer(tokio::io::BufWriter::with_capacity(WRITE_BUFFER, writer))
+    }
+
+    /// Push buffered bytes to the OS. Called when the queue drains.
+    async fn flush(&mut self) {
+        use tokio::io::AsyncWriteExt;
+        match self {
+            Self::Writer(writer) => {
+                let _ = writer.flush().await;
+            }
+        }
+    }
 }
 
 /// Per-service handle for writing output. Cloneable, reusable across restarts.
@@ -1020,7 +1088,7 @@ impl OutputManager {
             services,
             &HashMap::new(),
             verbose,
-            StdoutTarget::Writer(writer),
+            StdoutTarget::new(writer),
         )
         .await
     }
@@ -1032,7 +1100,7 @@ impl OutputManager {
         writer: W,
         verbose: bool,
     ) -> Result<Self, OutputError> {
-        Self::new_inner(services, log_filters, verbose, StdoutTarget::Writer(writer)).await
+        Self::new_inner(services, log_filters, verbose, StdoutTarget::new(writer)).await
     }
 
     // The TUI has no dedicated constructor: it subscribes to
@@ -1070,6 +1138,8 @@ impl OutputManager {
 
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let log_tap = MergedLogTap::with_capacity(DEFAULT_MERGED_HISTORY_CAPACITY);
         let stdout_handle = tokio::spawn(stdout_sink_task(
             stdout_rx,
@@ -1078,8 +1148,14 @@ impl OutputManager {
             log_filter.clone(),
             log_tap.clone(),
             mute.clone(),
+            Arc::clone(&queued),
+            Arc::clone(&shed),
         ));
-        let stdout_sink = SinkHandle::Unbounded(stdout_tx);
+        let stdout_sink = SinkHandle::Metered {
+            tx: stdout_tx,
+            queued,
+            shed,
+        };
 
         // Spawn file sink tasks (deduplicated by path).
         let mut file_sinks: HashMap<PathBuf, SinkHandle> = HashMap::new();
@@ -1730,6 +1806,7 @@ fn ends_with_any(acc: &[u8], candidates: &[&[u8]]) -> Option<usize> {
 /// Each service's partial output is buffered independently so that
 /// interleaved chunks from different services don't produce garbled output.
 /// Runs until all senders are dropped.
+#[allow(clippy::too_many_arguments)]
 async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut rx: mpsc::UnboundedReceiver<SinkLine>,
     mut target: StdoutTarget<W>,
@@ -1737,6 +1814,8 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     filter: LogFilterControl,
     tap: MergedLogTap,
     mute: StdoutMuteControl,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    shed: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use bytes::BytesMut;
 
@@ -1753,8 +1832,47 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     // Processes that have taken the alternate screen and not yet given it
     // back. See the suppression below.
     let mut alt_screen: HashSet<Bytes> = HashSet::new();
+    loop {
+        let msg = match rx.try_recv() {
+            Ok(msg) => msg,
+            // Nothing queued: about to park, so push what is buffered first.
+            // Buffering exists to amortise syscalls against a backlog — with
+            // no backlog it must never hold a line back from someone watching
+            // for it. Flushing here rather than at the bottom of the loop also
+            // covers the paths that `continue` past it, one of which (the
+            // end-of-stream marker) is always the last message a run produces.
+            Err(_) => {
+                target.flush().await;
+                match rx.recv().await {
+                    Some(msg) => msg,
+                    None => break,
+                }
+            }
+        };
+        queued.fetch_sub(msg.line.len(), Ordering::Relaxed);
 
-    while let Some(msg) = rx.recv().await {
+        // Say what the send side had to drop. Reported from here so it lands
+        // in the stream in order, rather than from a sender that has no idea
+        // where in the output it is.
+        let dropped = shed.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            let notice =
+                format!("… {dropped} line(s) dropped — output outran what could be written\n");
+            emit_line(
+                &mut target,
+                &tap,
+                &mute,
+                &msg.name,
+                &msg.prefix,
+                notice.as_bytes(),
+                true,
+                false,
+                &verbosity,
+                start,
+            )
+            .await;
+        }
+
         // Drop messages whose source service isn't in the active allowlist.
         // Wipe any partial accumulator for that prefix too — carrying half a
         // line across a filter change would replay it the next time the
@@ -1995,6 +2113,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             .await;
         }
     }
+    target.flush().await;
 }
 
 /// Build the formatted line bytes (optional verbose timestamp + prefix + content).
@@ -2070,10 +2189,19 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
 
 /// File sink writer task. Receives raw byte chunks and writes them directly.
 /// Runs until all senders are dropped.
-async fn file_sink_task(mut rx: mpsc::UnboundedReceiver<SinkLine>, mut file: tokio::fs::File) {
+async fn file_sink_task(rx: mpsc::UnboundedReceiver<SinkLine>, file: tokio::fs::File) {
     use tokio::io::AsyncWriteExt;
+    let mut rx = rx;
+    // Buffered for the same reason as the stdout writer: a write per line is a
+    // syscall per line, and a process that outruns them leaves its output
+    // piling up in a queue with no bound. Flushed whenever the queue drains,
+    // so a quiet service's line still reaches the file immediately.
+    let mut file = tokio::io::BufWriter::with_capacity(WRITE_BUFFER, file);
     while let Some(msg) = rx.recv().await {
         let _ = file.write_all(&msg.line).await;
+        if rx.is_empty() {
+            let _ = file.flush().await;
+        }
     }
     let _ = file.flush().await;
 }
@@ -2636,6 +2764,66 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process that outruns the writer must not be able to consume the
+    /// machine. This is the bound, tested at the send side because that is the
+    /// only place that still works when the writer is parked inside a write to
+    /// a destination that has stopped draining — which is exactly the state
+    /// that took a 91 GB machine down before the bound existed.
+    #[test]
+    fn output_past_the_watermark_is_shed_rather_than_queued() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink = SinkHandle::Metered {
+            tx,
+            queued: Arc::clone(&queued),
+            shed: Arc::clone(&shed),
+        };
+
+        let line = |lifecycle: bool| SinkLine {
+            prefix: Bytes::from_static(b"svc | "),
+            line: Bytes::from(vec![b'x'; 1024]),
+            name: "svc".to_string(),
+            is_lifecycle: lifecycle,
+            is_verbose: false,
+        };
+
+        // Below the watermark everything is queued.
+        assert!(sink.send(line(false)).is_ok());
+        assert_eq!(queued.load(Ordering::Relaxed), 1024);
+        assert_eq!(shed.load(Ordering::Relaxed), 0);
+
+        // Simulate a writer that has stopped consuming: the backlog is past
+        // the watermark and nothing is draining it.
+        queued.store(SHED_HIGH_WATER + 1, Ordering::Relaxed);
+
+        for _ in 0..10 {
+            assert!(sink.send(line(false)).is_ok(), "shedding is not an error");
+        }
+        assert_eq!(shed.load(Ordering::Relaxed), 10, "every one was shed");
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            SHED_HIGH_WATER + 1,
+            "a shed line must not add to the backlog it was shed for"
+        );
+
+        // don's own narration is never the flood, and losing it loses the
+        // explanation for what is happening.
+        assert!(sink.send(line(true)).is_ok());
+        assert_eq!(shed.load(Ordering::Relaxed), 10, "lifecycle lines are kept");
+        assert!(queued.load(Ordering::Relaxed) > SHED_HIGH_WATER + 1);
+
+        drop(sink);
+        // One process line from before the watermark, plus the lifecycle line.
+        let received: Vec<SinkLine> = std::iter::from_fn({
+            let mut rx = rx;
+            move || rx.try_recv().ok()
+        })
+        .collect();
+        assert_eq!(received.len(), 2, "ten shed lines never reached the queue");
+        assert!(received[1].is_lifecycle);
     }
 
     /// A config mute is permanent and an attach mute lasts as long as the
