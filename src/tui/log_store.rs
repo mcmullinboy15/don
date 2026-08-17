@@ -135,6 +135,16 @@ impl LogStore {
         self.entries.iter().skip(at)
     }
 
+    /// The line stored under `id`, if it is still held.
+    ///
+    /// Ids ascend, so this is a binary search. Used by the pane to fetch the
+    /// lines the view index selected, rather than re-deciding which lines those
+    /// are — see [`super::logs::build_view`].
+    pub(crate) fn get(&self, id: LogId) -> Option<&StoredLogLine> {
+        let at = self.entries.partition_point(|entry| entry.id < id);
+        self.entries.get(at).filter(|entry| entry.id == id)
+    }
+
     /// Id the next stream line is expected to have — what a reconnecting
     /// client asks to resume from.
     pub(crate) fn next_id(&self) -> LogId {

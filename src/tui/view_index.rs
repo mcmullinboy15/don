@@ -140,6 +140,18 @@ impl ViewIndex {
         usize::try_from(entry.cum - self.base).ok()
     }
 
+    /// The admitted lines from `id` onwards, in order.
+    ///
+    /// This is what the pane draws from. Drawing by re-walking the store and
+    /// re-applying the filter is how the rows on screen and the rows this index
+    /// counted drifted apart — and a view that positions itself by one set of
+    /// row counts while painting another lands somewhere different from where
+    /// it says on every scroll.
+    pub(crate) fn ids_from(&self, id: LogId) -> impl Iterator<Item = LogId> + '_ {
+        let at = self.entries.partition_point(|entry| entry.id < id);
+        self.entries.iter().skip(at).map(|entry| entry.id)
+    }
+
     /// Which admitted line owns row `offset`, and how far into it that row is.
     pub(crate) fn line_at(&self, offset: usize) -> Option<(LogId, u16)> {
         let want = self.base + u64::try_from(offset).unwrap_or(u64::MAX);

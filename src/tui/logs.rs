@@ -120,10 +120,16 @@ pub(crate) fn count_wrapped_rows(line: &Line<'_>, width: u16) -> usize {
 
 /// Build the visible rows for a pane of `width` × `height`.
 ///
-/// `admits` is the filter, applied here rather than at ingest — the store keeps
-/// everything, so widening the filter reveals history that a render-time filter
-/// would have discarded. That is the whole reason a filter change no longer
-/// needs to wipe the screen and replay into it.
+/// Which lines are in view is the index's decision, not this function's: it
+/// selects the admitted lines and counts their rows, and this walks that
+/// selection and paints it. Deciding twice — counting rows from the index and
+/// then re-filtering the store while drawing — is how the two drifted apart,
+/// which reads as a view that jumps somewhere other than where it was scrolled.
+///
+/// The filter lives in the index rather than at ingest because the store keeps
+/// everything: widening the filter reveals history that a render-time filter
+/// would have thrown away, which is why a filter change no longer wipes the
+/// screen and replays into it.
 ///
 /// The store must have been reflowed to `width` first; row counts come from its
 /// cache, and only the rows that actually land on screen are wrapped.
@@ -155,7 +161,7 @@ pub(crate) fn build_view<'a>(
     let mut rows: Vec<Line<'a>> = Vec::with_capacity(height);
     if let Some((first_id, skip_within)) = index.line_at(rows_above) {
         let mut skip = usize::from(skip_within);
-        for entry in store.iter_from(first_id) {
+        for entry in index.ids_from(first_id).filter_map(|id| store.get(id)) {
             for wrapped in wrap_line(&entry.parsed, width).into_iter().skip(skip) {
                 rows.push(wrapped);
                 if rows.len() == height {
@@ -229,6 +235,48 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    /// The rows the pane draws must be the rows the index counted. If the view
+    /// renders lines the filter excludes while positioning itself by filtered
+    /// row counts, every scroll lands somewhere else than it says.
+    #[test]
+    fn the_view_draws_only_what_the_filter_admits() {
+        let mut store = LogStore::with_capacity(100);
+        store.reflow(40);
+        for (id, name, body) in [
+            (0u64, "api", "api one"),
+            (1, "web", "web one"),
+            (2, "api", "api two"),
+            (3, "web", "web two"),
+        ] {
+            store.push(
+                LogId(id),
+                crate::output::FormattedLogLine {
+                    name: name.to_string(),
+                    is_lifecycle: false,
+                    is_verbose: false,
+                    bytes: body.as_bytes().to_vec(),
+                },
+            );
+        }
+        let mut index = super::super::view_index::ViewIndex::default();
+        index.sync(
+            &store,
+            super::super::view_index::ViewKey {
+                width: 40,
+                filter: 0,
+            },
+            |entry| entry.line.name == "api",
+        );
+
+        let view = build_view(&store, &index, Scroll::Follow, 40, 10);
+        let text: Vec<String> = view.rows.iter().map(row_text).collect();
+        assert_eq!(
+            text,
+            vec!["api one".to_string(), "api two".to_string()],
+            "the pane drew lines the filter excludes"
+        );
     }
 
     /// Wrapping owns the row count, so it has to be exact: the pane places its
