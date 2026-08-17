@@ -118,6 +118,24 @@ async fn wait_for_task_state(
     }
 }
 
+/// Poll the output buffer until `needle` appears, then return the whole thing.
+///
+/// A state event and the lifecycle line that describes it travel by different
+/// routes — the broadcast, and the output actor's writer — so observing the
+/// event says nothing about the line having been written yet. Reading the
+/// buffer the instant the event lands is a race that only shows up when the
+/// machine is loaded enough to delay the sink task.
+async fn wait_for_buf(buf: &Arc<Mutex<Vec<u8>>>, needle: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let contents = read_buf(buf);
+        if contents.contains(needle) || tokio::time::Instant::now() >= deadline {
+            return contents;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_for_line_count(path: &std::path::Path, count: usize) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -261,7 +279,9 @@ default = "100"
             "task didn't reach Completed"
         );
 
-        let output = read_buf(&buf);
+        // The spawn line is emitted after the trigger line and carries the
+        // rendered params, so waiting for it covers all three assertions.
+        let output = wait_for_buf(&buf, "sync: spawn sh -c").await;
         assert!(
             output.contains("sync: running (manual trigger)"),
             "missing manual trigger line in {output:?}"

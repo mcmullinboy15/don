@@ -174,13 +174,23 @@ class Session:
         return alive
 
     def wait_for_screen(self, needle, timeout):
-        """Pump until `needle` appears *on screen*, or time runs out."""
+        """Pump until `needle` appears *on screen*, or time runs out.
+
+        `needle` is a substring, or a compiled regex to search each line with.
+        A regex is the better choice for anything the TUI renders from live
+        numbers — matching the literal wording of a status line means the
+        driver silently stops checking anything the day that wording changes.
+        """
+        if hasattr(needle, "search"):
+            hit = lambda line: needle.search(line) is not None  # noqa: E731
+        else:
+            hit = lambda line: needle in line  # noqa: E731
         end = time.time() + timeout
         while time.time() < end:
-            if any(needle in line for line in self.screen.display()):
+            if any(hit(line) for line in self.screen.display()):
                 return True
             if not self.pump(0.1):
-                return any(needle in line for line in self.screen.display())
+                return any(hit(line) for line in self.screen.display())
         return False
 
     def send(self, data):

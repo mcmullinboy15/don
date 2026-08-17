@@ -12,7 +12,7 @@ load.
 This drives the real thing under a PTY, renders its output into a screen (see
 `tui_emulator.py`), and asserts on what the user would actually see:
 
-  - the stack reaches "all services running"
+  - the stack reaches N/N services ready
   - Ctrl+C reaches the TUI and shutdown narrates itself
   - don exits promptly rather than wedging
   - the alternate screen is handed back on the way out
@@ -44,13 +44,23 @@ several MB without a config change means the TUI started repainting far more
 than it should.
 """
 
+import re
 import sys
 import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from tui_emulator import HAVE_PYTE, Session  # noqa: E402
 
-READY = "all services running"
+# The status bar counts ready services — "11/11 services ready". The
+# backreference is what makes this an assertion rather than a formality: it
+# only matches once every service the bar counts has come up, and requiring a
+# non-zero count keeps an empty "0/0" from matching before the config loads.
+#
+# Deliberately not the runner's "all services running" lifecycle line, which
+# this used to look for. That line is still emitted, but it lands in the log
+# pane and scrolls away under any real load — the check passed or failed
+# depending on how chatty the config was. The bar stays put.
+READY = re.compile(r"\b([1-9]\d*)/\1 services ready\b")
 SHUTTING_DOWN = "shutting down"
 STARTUP_TIMEOUT = 90.0
 SHUTDOWN_TIMEOUT = 30.0
@@ -72,7 +82,7 @@ def main():
     tlog(start, "spawned don pid=%d (pyte: %s)" % (session.pid, HAVE_PYTE))
 
     reached_ready = session.wait_for_screen(READY, STARTUP_TIMEOUT)
-    tlog(start, "reached %r on screen: %s" % (READY, reached_ready))
+    tlog(start, "reached %r on screen: %s" % (READY.pattern, reached_ready))
     if not reached_ready:
         tlog(start, "FAIL: startup never settled; last screen follows")
         print(session.text(), file=sys.stderr)

@@ -30,13 +30,16 @@ width-only resize.
 """
 
 import os
+import re
 import sys
 import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from tui_emulator import HAVE_PYTE, Session  # noqa: E402
 
-READY = "all services running"
+# See the note in tui_drive.py: matched as a pattern so that a reworded status
+# bar fails loudly instead of quietly never matching.
+READY = re.compile(r"\b([1-9]\d*)/\1 services ready\b")
 DEFAULT_SIZES = "60x200,45x120,45x90,60x200"
 
 
