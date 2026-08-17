@@ -803,6 +803,28 @@ struct MergedHistory {
     entries: std::collections::VecDeque<MergedLine>,
     capacity: usize,
     next_id: LogId,
+    /// Whether the newest entry is a progress frame that a later frame from the
+    /// same process may still overwrite. See [`MergedLogTap::publish_frame`].
+    last_was_frame: bool,
+}
+
+impl MergedHistory {
+    /// Give `line` the next id and retain it, evicting the oldest if full.
+    ///
+    /// Returns the entry to broadcast. A capacity of zero still assigns an id —
+    /// the stream is numbered whether or not anything is kept.
+    fn append(&mut self, line: Arc<FormattedLogLine>) -> MergedLine {
+        let id = self.next_id;
+        self.next_id = id.next();
+        let entry = MergedLine { id, line };
+        if self.capacity > 0 {
+            while self.entries.len() >= self.capacity {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(entry.clone());
+        }
+        entry
+    }
 }
 
 /// The merged log stream's fan-out point: a broadcast of every line
@@ -832,6 +854,7 @@ impl MergedLogTap {
                 entries: std::collections::VecDeque::new(),
                 capacity,
                 next_id: LogId::ZERO,
+                last_was_frame: false,
             })),
         }
     }
@@ -843,19 +866,50 @@ impl MergedLogTap {
     async fn publish(&self, line: Arc<FormattedLogLine>) -> LogId {
         let entry = {
             let mut history = self.history.lock().await;
-            let id = history.next_id;
-            history.next_id = id.next();
-            let entry = MergedLine { id, line };
-            if history.capacity == 0 {
-                return id;
-            }
-            while history.entries.len() >= history.capacity {
-                history.entries.pop_front();
-            }
-            history.entries.push_back(entry.clone());
-            entry
+            history.last_was_frame = false;
+            history.append(line)
         };
         // Send on a receiver-less broadcast is a cheap no-op.
+        let id = entry.id;
+        let _ = self.tx.send(entry);
+        id
+    }
+
+    /// Record and fan out one frame of an in-place progress redraw.
+    ///
+    /// A process that ends a line with a bare `\r` is repainting it, not adding
+    /// to the log — bazel, npm and cargo all do it several times a second. don
+    /// strips the cursor control that would make that work in a shared terminal,
+    /// so keeping every frame turned a progress bar into thousands of lines.
+    ///
+    /// A frame therefore *supersedes* the newest line rather than following it,
+    /// but only while that line is this process's own frame. If anything else
+    /// has logged since, this frame appends instead, so concurrent services
+    /// still interleave in the order things actually happened rather than one
+    /// service's progress bar swallowing another's output.
+    ///
+    /// Replacement re-publishes the existing id. That is the whole protocol: an
+    /// id names a slot in the stream, so a consumer that receives an id it
+    /// already holds replaces its copy, and one that connects later just sees
+    /// the current contents. Only ever the newest line changes, so no consumer
+    /// has to look further back than the line it last appended.
+    async fn publish_frame(&self, line: Arc<FormattedLogLine>) -> LogId {
+        let entry = {
+            let mut history = self.history.lock().await;
+            let superseding = history.last_was_frame
+                && history
+                    .entries
+                    .back()
+                    .is_some_and(|entry| entry.line.name == line.name);
+            history.last_was_frame = true;
+            match history.entries.back_mut().filter(|_| superseding) {
+                Some(back) => {
+                    back.line = line;
+                    back.clone()
+                }
+                None => history.append(line),
+            }
+        };
         let id = entry.id;
         let _ = self.tx.send(entry);
         id
@@ -1879,6 +1933,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 false,
                 &verbosity,
                 start,
+                false,
             )
             .await;
         }
@@ -1925,6 +1980,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     msg.is_verbose,
                     &verbosity,
                     start,
+                    false,
                 )
                 .await;
             }
@@ -1977,6 +2033,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_verbose,
                         &verbosity,
                         start,
+                        false,
                     )
                     .await;
                 }
@@ -1996,6 +2053,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     false,
                     &verbosity,
                     start,
+                    false,
                 )
                 .await;
                 alt_screen.insert(msg.prefix.clone());
@@ -2030,6 +2088,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_verbose,
                         &verbosity,
                         start,
+                        false,
                     )
                     .await;
                 }
@@ -2056,6 +2115,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_verbose,
                         &verbosity,
                         start,
+                        true,
                     )
                     .await;
                 }
@@ -2082,6 +2142,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_verbose,
                         &verbosity,
                         start,
+                        false,
                     )
                     .await;
                     acc.clear();
@@ -2119,6 +2180,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 false,
                 &verbosity,
                 start,
+                false,
             )
             .await;
         }
@@ -2163,17 +2225,22 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     is_verbose: bool,
     verbosity: &VerbosityControl,
     start: std::time::Instant,
+    is_frame: bool,
 ) {
     let bytes = build_formatted_bytes(prefix, line, verbosity, start);
-    // Feed the tap first, so history and followers see the line even if
-    // the writer below blocks.
-    tap.publish(Arc::new(FormattedLogLine {
+    let formatted = Arc::new(FormattedLogLine {
         name: name.to_string(),
         is_lifecycle,
         is_verbose,
         bytes: bytes.clone(),
-    }))
-    .await;
+    });
+    // Feed the tap first, so history and followers see the line even if
+    // the writer below blocks.
+    if is_frame {
+        tap.publish_frame(formatted).await;
+    } else {
+        tap.publish(formatted).await;
+    }
     if is_verbose && !verbosity.is_enabled() {
         return;
     }
@@ -2974,6 +3041,186 @@ mod tests {
                     case.label
                 );
             }
+        }
+    }
+
+    /// A progress frame overwrites the newest line, but only while that line is
+    /// still its own — otherwise one service repainting a progress bar would
+    /// swallow whatever another service logged in between.
+    #[tokio::test]
+    async fn a_progress_frame_only_supersedes_its_own_last_line() {
+        /// `(name, text, is_frame)`
+        type Publish = (&'static str, &'static str, bool);
+
+        struct Case {
+            label: &'static str,
+            publish: &'static [Publish],
+            /// Retained history afterwards, as `(name, text)`.
+            want: &'static [(&'static str, &'static str)],
+        }
+
+        let cases = [
+            Case {
+                label: "consecutive frames from one process collapse to the last",
+                publish: &[
+                    ("bazel", "10%", true),
+                    ("bazel", "50%", true),
+                    ("bazel", "90%", true),
+                ],
+                want: &[("bazel", "90%")],
+            },
+            Case {
+                label: "another process logging in between breaks the run",
+                publish: &[
+                    ("bazel", "10%", true),
+                    ("api", "listening", false),
+                    ("bazel", "90%", true),
+                ],
+                want: &[("bazel", "10%"), ("api", "listening"), ("bazel", "90%")],
+            },
+            Case {
+                label: "another process's frame breaks it too",
+                publish: &[
+                    ("bazel", "10%", true),
+                    ("npm", "fetching", true),
+                    ("bazel", "90%", true),
+                ],
+                want: &[("bazel", "10%"), ("npm", "fetching"), ("bazel", "90%")],
+            },
+            Case {
+                label: "a real line from the same process is kept, not overwritten",
+                publish: &[("bazel", "90%", true), ("bazel", "build succeeded", false)],
+                want: &[("bazel", "90%"), ("bazel", "build succeeded")],
+            },
+            Case {
+                label: "a frame after a real line appends rather than eating it",
+                publish: &[("bazel", "starting", false), ("bazel", "10%", true)],
+                want: &[("bazel", "starting"), ("bazel", "10%")],
+            },
+            Case {
+                label: "ordinary lines never collapse",
+                publish: &[("api", "one", false), ("api", "two", false)],
+                want: &[("api", "one"), ("api", "two")],
+            },
+        ];
+
+        for case in cases {
+            let tap = MergedLogTap::with_capacity(100);
+            for (name, text, is_frame) in case.publish {
+                let line = Arc::new(FormattedLogLine {
+                    name: (*name).to_string(),
+                    is_lifecycle: false,
+                    is_verbose: false,
+                    bytes: text.as_bytes().to_vec(),
+                });
+                if *is_frame {
+                    tap.publish_frame(line).await;
+                } else {
+                    tap.publish(line).await;
+                }
+            }
+
+            let got: Vec<(String, String)> = tap
+                .tail(100)
+                .await
+                .lines
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.line.name.clone(),
+                        String::from_utf8_lossy(&entry.line.bytes).into_owned(),
+                    )
+                })
+                .collect();
+            let want: Vec<(String, String)> = case
+                .want
+                .iter()
+                .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+                .collect();
+            assert_eq!(got, want, "{}", case.label);
+
+            // A superseded frame reuses its id rather than burning one, so
+            // consumers can key off the id to know it is the same slot.
+            let ids: Vec<u64> = tap.tail(100).await.lines.iter().map(|e| e.id.0).collect();
+            let expected: Vec<u64> = (0..case.want.len() as u64).collect();
+            assert_eq!(ids, expected, "{}: ids stay contiguous", case.label);
+        }
+    }
+
+    /// The same rule, driven from the bytes a process actually writes rather
+    /// than from the tap's own API — this is the path bazel takes.
+    #[tokio::test]
+    async fn carriage_return_progress_collapses_end_to_end() {
+        struct Case {
+            name: &'static str,
+            /// Raw bytes, as the child writes them.
+            emit: &'static [(&'static str, &'static [u8])],
+            want: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                name: "a progress bar repainting itself is one line",
+                emit: &[("builder", b"10%\r50%\r90%\r")],
+                want: &["90%"],
+            },
+            Case {
+                name: "the newline that ends it keeps the final frame",
+                emit: &[("builder", b"10%\r90%\rdone\n")],
+                want: &["90%", "done"],
+            },
+            Case {
+                name: "a second process interleaves instead of being overwritten",
+                emit: &[
+                    ("builder", b"10%\r"),
+                    ("api", b"listening\n"),
+                    ("builder", b"90%\r"),
+                ],
+                want: &["10%", "listening", "90%"],
+            },
+        ];
+
+        for case in cases {
+            let (writer, _buf) = TestBuffer::new();
+            let config = crate::config::LogConfig::Stdout;
+            let mgr = OutputManager::new(&[("builder", &config), ("api", &config)], writer)
+                .await
+                .unwrap();
+
+            for (name, bytes) in case.emit {
+                let service = mgr.service_writer(name).unwrap();
+                service
+                    .process_stream(std::io::Cursor::new(*bytes))
+                    .await
+                    .unwrap();
+                // Each write is a separate child flush; let the sink drain it
+                // so ordering between processes is the order they wrote in.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let tap = mgr.log_stream_sender().clone();
+            mgr.shutdown().await;
+
+            let got: Vec<String> = tap
+                .tail(100)
+                .await
+                .lines
+                .iter()
+                .map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned())
+                .collect();
+            for want in case.want {
+                assert!(
+                    got.iter().any(|line| line.contains(want)),
+                    "{}: expected a line containing {want:?}, got {got:?}",
+                    case.name
+                );
+            }
+            let frames = got.iter().filter(|line| line.contains('%')).count();
+            let want_frames = case.want.iter().filter(|w| w.contains('%')).count();
+            assert_eq!(
+                frames, want_frames,
+                "{}: intermediate frames should not survive. got {got:?}",
+                case.name
+            );
         }
     }
 

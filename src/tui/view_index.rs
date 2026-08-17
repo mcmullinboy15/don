@@ -88,9 +88,32 @@ impl ViewIndex {
             self.entries.clear();
             self.base = self.next_cum;
         }
+        // The newest line can change in place — a progress frame repainting
+        // itself keeps its id, so no append or eviction would notice, and a
+        // frame that grew or shrank would leave every row count behind it
+        // wrong. Cheap enough to just re-measure it every sync.
+        self.remeasure_last(store);
         // Append what has arrived.
         for entry in store.iter_from(self.next_id) {
             self.push(entry, &admits);
+        }
+    }
+
+    /// Bring the last entry's row count back in line with the store.
+    ///
+    /// Only correct for the *last* entry: nothing is indexed after it, so
+    /// `next_cum` is the only cumulative total that has to move.
+    fn remeasure_last(&mut self, store: &LogStore) {
+        let Some(last) = self.entries.back_mut() else {
+            return;
+        };
+        let Some(entry) = store.get(last.id) else {
+            return;
+        };
+        let rows = u32::try_from(entry.wrapped_rows().max(1)).unwrap_or(u32::MAX);
+        if rows != last.rows {
+            last.rows = rows;
+            self.next_cum = last.cum + u64::from(rows);
         }
     }
 
@@ -269,6 +292,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A progress frame repainting itself keeps its id, so nothing appends and
+    /// nothing evicts — but the line's height can change, and every row count
+    /// after it depends on that.
+    #[test]
+    fn a_line_replaced_in_place_is_remeasured() {
+        let mut store = LogStore::with_capacity(10);
+        store.reflow(10);
+        store.push(
+            LogId(0),
+            FormattedLogLine {
+                name: "bazel".to_string(),
+                is_lifecycle: false,
+                is_verbose: false,
+                bytes: b"short".to_vec(),
+            },
+        );
+
+        let mut index = ViewIndex::default();
+        index.sync(&store, key(10, 0), |_| true);
+        assert_eq!(index.total_rows(), 1);
+
+        // Same id, taller content: three rows at width 10.
+        store.push(
+            LogId(0),
+            FormattedLogLine {
+                name: "bazel".to_string(),
+                is_lifecycle: false,
+                is_verbose: false,
+                bytes: b"a much longer frame that wraps".to_vec(),
+            },
+        );
+        index.sync(&store, key(10, 0), |_| true);
+        assert_eq!(index.total_rows(), 3, "the taller frame is measured again");
+
+        // And a line after it starts where the taller frame ends.
+        store.push(
+            LogId(1),
+            FormattedLogLine {
+                name: "bazel".to_string(),
+                is_lifecycle: false,
+                is_verbose: false,
+                bytes: b"done".to_vec(),
+            },
+        );
+        index.sync(&store, key(10, 0), |_| true);
+        assert_eq!(index.rows_above(LogId(1)), Some(3));
+        assert_eq!(index.total_rows(), 4);
     }
 
     /// Changing the filter or the width invalidates everything, because both
