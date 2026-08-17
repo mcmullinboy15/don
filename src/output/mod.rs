@@ -777,6 +777,15 @@ impl std::fmt::Display for LogId {
 pub struct MergedLine {
     pub id: LogId,
     pub line: Arc<FormattedLogLine>,
+    /// This is a repaint of an id already broadcast, not a new line — see
+    /// [`MergedLogTap::publish_frame`].
+    ///
+    /// Consumers keyed on the id alone do not need this: they replace whatever
+    /// they hold under that id either way. A *cursor* does, because "an id at
+    /// or below the last one I handed out" is otherwise exactly how it
+    /// recognises the replay across a subscribe/snapshot overlap and skips it —
+    /// which would make a progress line freeze on its first frame.
+    pub supersedes: bool,
 }
 
 /// What the tap still holds from some point onward.
@@ -816,7 +825,11 @@ impl MergedHistory {
     fn append(&mut self, line: Arc<FormattedLogLine>) -> MergedLine {
         let id = self.next_id;
         self.next_id = id.next();
-        let entry = MergedLine { id, line };
+        let entry = MergedLine {
+            id,
+            line,
+            supersedes: false,
+        };
         if self.capacity > 0 {
             while self.entries.len() >= self.capacity {
                 self.entries.pop_front();
@@ -905,7 +918,13 @@ impl MergedLogTap {
             match history.entries.back_mut().filter(|_| superseding) {
                 Some(back) => {
                     back.line = line;
-                    back.clone()
+                    // Retained as a plain line — a client catching up later
+                    // wants the newest contents, not a repaint instruction.
+                    // Only the broadcast copy is marked.
+                    MergedLine {
+                        supersedes: true,
+                        ..back.clone()
+                    }
                 }
                 None => history.append(line),
             }
@@ -1037,8 +1056,10 @@ impl MergedLogCursor {
             match self.rx.recv().await {
                 Ok(entry) => {
                     // Already handed out — the subscribe/snapshot overlap. Ids
-                    // make this exact; it used to be pointer identity.
-                    if entry.id < self.next {
+                    // make this exact; it used to be pointer identity. A
+                    // repaint of the line we handed out last is the one thing
+                    // that legitimately arrives with an id we have seen.
+                    if entry.id < self.next && !self.is_repaint_of_last(&entry) {
                         continue;
                     }
                     self.next = entry.id.next();
@@ -1064,6 +1085,16 @@ impl MergedLogCursor {
 
     /// Whatever is already in hand, without waiting for more.
     ///
+    /// Whether this entry repaints the line this cursor handed out last.
+    ///
+    /// A progress frame supersedes the newest line in place, so it arrives with
+    /// an id already delivered. Without this the skip that de-duplicates the
+    /// subscribe/snapshot overlap would swallow every frame after the first and
+    /// the line would sit at its opening value until something else logged.
+    fn is_repaint_of_last(&self, entry: &MergedLine) -> bool {
+        entry.supersedes && entry.id.next() == self.next
+    }
+
     /// For draining at shutdown: the tap has published its last lines and they
     /// are sitting in this receiver, but nothing further is coming, so
     /// [`Self::recv`] would park forever. Healing a gap needs an await, so a
@@ -1077,7 +1108,7 @@ impl MergedLogCursor {
             }
             match self.rx.try_recv() {
                 Ok(entry) => {
-                    if entry.id < self.next {
+                    if entry.id < self.next && !self.is_repaint_of_last(&entry) {
                         continue;
                     }
                     self.next = entry.id.next();
@@ -3145,6 +3176,55 @@ mod tests {
             let expected: Vec<u64> = (0..case.want.len() as u64).collect();
             assert_eq!(ids, expected, "{}: ids stay contiguous", case.label);
         }
+    }
+
+    /// A cursor is what `don tui` and the `/logs` route read through, and it
+    /// skips ids it has already handed out to de-duplicate the subscribe /
+    /// snapshot overlap. A repaint arrives with exactly such an id, so without
+    /// care every frame after the first is swallowed and the progress line sits
+    /// at its opening value.
+    #[tokio::test]
+    async fn a_cursor_sees_every_repaint() {
+        let tap = MergedLogTap::with_capacity(100);
+        let mut cursor = tap.cursor(None, 0).await;
+
+        for text in ["10%", "50%", "90%"] {
+            tap.publish_frame(Arc::new(FormattedLogLine {
+                name: "bazel".to_string(),
+                is_lifecycle: false,
+                is_verbose: false,
+                bytes: text.as_bytes().to_vec(),
+            }))
+            .await;
+        }
+        tap.publish(Arc::new(FormattedLogLine {
+            name: "bazel".to_string(),
+            is_lifecycle: false,
+            is_verbose: false,
+            bytes: b"done".to_vec(),
+        }))
+        .await;
+        drop(tap); // so the cursor ends rather than parking
+
+        let mut seen = Vec::new();
+        while let Some(event) = cursor.recv().await {
+            if let MergedEvent::Line(entry) = event {
+                seen.push((
+                    entry.id.0,
+                    String::from_utf8_lossy(&entry.line.bytes).into_owned(),
+                ));
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (0, "10%".to_string()),
+                (0, "50%".to_string()),
+                (0, "90%".to_string()),
+                (1, "done".to_string()),
+            ],
+            "every frame must reach the client, all under the id it repaints"
+        );
     }
 
     /// The same rule, driven from the bytes a process actually writes rather
