@@ -806,7 +806,7 @@ fn handle_key(
             // when the filter is up: in the tables it opens the log popup for
             // the highlighted row, which the table handlers own.
             KeyCode::Char('s') if app.view_mode == ViewMode::Services => {
-                close_panel(app);
+                return_to_logs(app);
                 return Ok(());
             }
             KeyCode::Char('s') => {
@@ -814,7 +814,7 @@ fn handle_key(
                 return Ok(());
             }
             KeyCode::Char('t') if app.view_mode == ViewMode::Tasks => {
-                close_panel(app);
+                return_to_logs(app);
                 return Ok(());
             }
             KeyCode::Char('t') => {
@@ -822,7 +822,7 @@ fn handle_key(
                 return Ok(());
             }
             KeyCode::Char('l') if app.view_mode == ViewMode::Filter => {
-                close_panel(app);
+                return_to_logs(app);
                 return Ok(());
             }
             _ => {}
@@ -931,7 +931,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
         // and it should not need a focus switch first.
         KeyCode::Esc if app.panel_open() => {
             app.log_selection.clear();
-            close_panel(app);
+            return_to_logs(app);
         }
         KeyCode::Esc => clear_selection(app),
         KeyCode::Char('P') if app.panel_open() => {
@@ -1037,8 +1037,11 @@ fn end_attach(
     }
 }
 
-/// Close the side panel: back to the plain log, keys back to the log.
-fn close_panel(app: &mut App) {
+/// Leave whatever view is up: back to the plain log, keys back to the log.
+///
+/// One function for panels and full-screen views alike, because dismissing
+/// either means the same thing — there is nothing else to go back to.
+fn return_to_logs(app: &mut App) {
     app.view_mode = ViewMode::Normal;
     app.focus = panes::Focus::Logs;
 }
@@ -1415,7 +1418,7 @@ fn handle_failure_summary_key(
 ) -> Result<(), TuiError> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => {
-            close_panel(app);
+            return_to_logs(app);
             app.failure_summary_scroll = 0;
             return Ok(());
         }
@@ -1442,7 +1445,7 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
                 app.filter.apply_query();
                 app.filter.end_query_edit();
                 if close_after_apply {
-                    close_panel(app);
+                    return_to_logs(app);
                 }
             }
             KeyCode::Tab => {
@@ -1465,7 +1468,7 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
     }
 
     match key.code {
-        KeyCode::Enter | KeyCode::Esc => close_panel(app),
+        KeyCode::Enter | KeyCode::Esc => return_to_logs(app),
         KeyCode::Char('R') => {
             app.filter.reset_to_defaults();
         }
@@ -1505,7 +1508,7 @@ fn handle_tasks_key(
             return Ok(());
         }
         StatusTableKeyOutcome::Close => {
-            close_panel(app);
+            return_to_logs(app);
             return Ok(());
         }
         StatusTableKeyOutcome::None => {}
@@ -1523,7 +1526,7 @@ fn handle_tasks_key(
         } else {
             let task_name = item.name;
             dispatch_run_task(client, task_name.clone());
-            return_to_logs_after_task_run(&task_name, app, store)?;
+            after_task_run(&task_name, app, store)?;
         }
     } else if key.code == KeyCode::Char('l') {
         let Some(item) = highlighted_task_item(app) else {
@@ -1556,7 +1559,7 @@ fn handle_services_key(
             return Ok(());
         }
         StatusTableKeyOutcome::Close => {
-            close_panel(app);
+            return_to_logs(app);
             return Ok(());
         }
         StatusTableKeyOutcome::None => {}
@@ -1791,15 +1794,17 @@ fn spawn_state_resync(client: &std::sync::Arc<Client>) {
     });
 }
 
-fn return_to_logs_after_task_run(
-    task_name: &str,
-    app: &mut App,
-    _store: &LogStore,
-) -> Result<(), TuiError> {
+fn after_task_run(task_name: &str, app: &mut App, _store: &LogStore) -> Result<(), TuiError> {
+    // Make sure the task's own output is admitted, so pressing enter is
+    // followed by seeing something happen.
     let filter_changed = app.filter.select_name(task_name);
-    close_panel(app);
     app.log_popup = None;
 
+    // The panel stays open. This used to close it — right when the tasks
+    // table was full-screen and running something had to hand the logs back,
+    // wrong now that the logs are already beside it. Closing meant enter
+    // ran the task *and* dismissed the list you were running things from.
+    //
     // Nothing to redraw here: the filter change is a different view over the
     // same store, and the loop paints it on the next frame.
     let _ = filter_changed;
@@ -1948,7 +1953,7 @@ fn handle_form_key(
     match key.code {
         KeyCode::Esc => {
             app.form = None;
-            close_panel(app);
+            return_to_logs(app);
             return Ok(());
         }
         KeyCode::Enter if ctrl => {
@@ -2113,7 +2118,7 @@ fn try_submit_form(
     };
     dispatch_run_task_with_params(client, task_name.clone(), params);
     app.form = None;
-    return_to_logs_after_task_run(&task_name, app, store)?;
+    after_task_run(&task_name, app, store)?;
     Ok(())
 }
 
@@ -2480,6 +2485,74 @@ mod tests {
                 app.log_selection.span().is_some(),
                 case.want_selection,
                 "{}",
+                case.name
+            );
+        }
+    }
+
+    /// Acting on a row leaves the panel up. Running a task used to dismiss
+    /// it — correct when the table was full-screen and running something had
+    /// to hand the logs back, wrong once the logs are already beside it, and
+    /// surprising either way: enter ran the task *and* closed the list you
+    /// were running things from.
+    // Dispatch spawns the command onto the runtime, so this needs one.
+    #[tokio::test]
+    async fn acting_on_a_row_keeps_the_panel_open() {
+        struct Case {
+            name: &'static str,
+            mode: ViewMode,
+            key: KeyCode,
+        }
+
+        let cases = [
+            Case {
+                name: "running a task",
+                mode: ViewMode::Tasks,
+                key: KeyCode::Enter,
+            },
+            Case {
+                name: "starting or stopping a service",
+                mode: ViewMode::Services,
+                key: KeyCode::Enter,
+            },
+            Case {
+                name: "restarting a service",
+                mode: ViewMode::Services,
+                key: KeyCode::Char('r'),
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            app.apply_task_state(
+                "migrate".to_string(),
+                crate::client::TaskState::Pending,
+                None,
+                Vec::new(),
+            );
+            app.view_mode = case.mode;
+            app.focus = panes::Focus::Panel;
+            let mut store = LogStore::with_capacity(10);
+            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
+            let controls = TuiControls {
+                lifecycle_emitter: LifecycleEmitter::discarding(),
+                mode: TuiMode::InProcess,
+            };
+
+            handle_key(
+                KeyEvent::new(case.key, KeyModifiers::NONE),
+                &mut app,
+                &mut store,
+                &client,
+                &controls,
+            )
+            .unwrap();
+
+            assert_eq!(app.view_mode, case.mode, "{}: panel stays open", case.name);
+            assert_eq!(
+                app.focus,
+                panes::Focus::Panel,
+                "{}: and keeps the keys",
                 case.name
             );
         }
