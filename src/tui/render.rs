@@ -81,6 +81,16 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
     }
     let panes = super::panes::layout(area, BAR_HEIGHT, app.panel, app.panel_open());
     app.panes = panes;
+    // Write the extent the layout actually granted back to the stored one, so
+    // the two can never drift. A stored extent past what the terminal honours
+    // would make keyboard resizing dead for as many presses as the overshoot —
+    // adjusting a number the screen is not showing.
+    if let Some(rect) = panes.status {
+        app.panel.extent = match app.panel.side {
+            super::panes::PaneSide::Right => rect.width,
+            super::panes::PaneSide::Bottom => rect.height,
+        };
+    }
 
     // Clamp the scroll positions the overlays own before drawing them: they are
     // bounded by geometry only this function knows.
@@ -599,8 +609,30 @@ pub(crate) fn failure_summary_max_scroll(area: Rect, app: &App) -> usize {
 /// Render the full-screen services table — a table of every known service
 /// with its current state, sorted errors → running → exited → lazy then
 /// alphabetical within each bucket.
+/// Panel width below which the PID column is dropped.
+///
+/// A narrow panel is for names and states; a pid squeezed in leaves neither
+/// the name nor the failure detail room to say anything. Wide enough to want
+/// it back, it returns — the same shape the task table's columns follow.
+const SERVICES_PID_MIN_WIDTH: u16 = 60;
+
 fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let header = Row::new(vec!["NAME", "PID", "STATE"]).style(
+    let show_pid = area.width >= SERVICES_PID_MIN_WIDTH;
+    let labels = if show_pid {
+        vec!["NAME", "PID", "STATE"]
+    } else {
+        vec!["NAME", "STATE"]
+    };
+    let widths = if show_pid {
+        vec![
+            Constraint::Percentage(45),
+            Constraint::Length(10),
+            Constraint::Percentage(55),
+        ]
+    } else {
+        vec![Constraint::Percentage(45), Constraint::Percentage(55)]
+    };
+    let header = Row::new(labels).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(Color::Cyan),
@@ -609,7 +641,7 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let rows = app
         .service_items()
         .iter()
-        .map(|item| service_table_row(item, &name_colors))
+        .map(|item| service_table_row(item, &name_colors, show_pid))
         .collect();
     draw_status_table(
         frame,
@@ -619,11 +651,7 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
             border_style: panel_border_style(app),
             header,
             rows,
-            widths: vec![
-                Constraint::Percentage(45),
-                Constraint::Length(10),
-                Constraint::Percentage(55),
-            ],
+            widths,
             state: &app.services_table,
             empty_label: "(no services)",
             selected_hint: service_selected_hint(app),
@@ -720,12 +748,12 @@ fn parse_ansi_text(bytes: &[u8]) -> Text<'static> {
         .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(bytes).into_owned()))
 }
 
-fn service_table_row(item: &OverlayItem, name_colors: &HashMap<String, Color>) -> Row<'static> {
+fn service_table_row(
+    item: &OverlayItem,
+    name_colors: &HashMap<String, Color>,
+    show_pid: bool,
+) -> Row<'static> {
     let name = item.name.clone();
-    let pid = item
-        .pid
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".to_string());
     let state_cell = Cell::from(service_state_label(item.state, &item.failed_dependencies))
         .style(Style::default().fg(service_state_color(item.state)));
     let name_style = name_colors
@@ -733,11 +761,16 @@ fn service_table_row(item: &OverlayItem, name_colors: &HashMap<String, Color>) -
         .copied()
         .map(|color| Style::default().fg(color))
         .unwrap_or_default();
-    Row::new(vec![
-        Cell::from(name).style(name_style),
-        Cell::from(pid).style(Style::default().fg(Color::DarkGray)),
-        state_cell,
-    ])
+    let mut cells = vec![Cell::from(name).style(name_style)];
+    if show_pid {
+        let pid = item
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        cells.push(Cell::from(pid).style(Style::default().fg(Color::DarkGray)));
+    }
+    cells.push(state_cell);
+    Row::new(cells)
 }
 
 fn task_table_row(
@@ -1684,6 +1717,83 @@ mod tests {
 
             assert!(text.contains(case.want), "case: {}", case.name);
             assert!(!text.contains(case.reject), "case: {}", case.name);
+        }
+    }
+
+    /// A narrow panel drops the PID column: names and states are what a
+    /// glance needs, and a pid squeezed in leaves neither room to say
+    /// anything. Wide enough to want it back, it returns.
+    #[test]
+    fn services_pid_column_hides_below_the_width_threshold() {
+        struct Case {
+            width: u16,
+            want_pid: bool,
+        }
+
+        let cases = [
+            Case {
+                width: 48,
+                want_pid: false,
+            },
+            Case {
+                width: SERVICES_PID_MIN_WIDTH,
+                want_pid: true,
+            },
+            Case {
+                width: 90,
+                want_pid: true,
+            },
+        ];
+
+        for case in cases {
+            let mut app = App::new(AppInit {
+                service_names: vec!["api".to_string()],
+                task_names: Vec::new(),
+                build_tool_names: Vec::new(),
+                task_configs: HashMap::new(),
+                task_last_runs: HashMap::new(),
+                hidden_names: std::collections::HashSet::new(),
+                auto_filter_on_failure_names: std::collections::HashSet::new(),
+                cli_log_filter: None,
+            });
+            app.apply_service_runtime(
+                "api".to_string(),
+                ServiceState::Ready,
+                Some(4242),
+                Vec::new(),
+            );
+            app.view_mode = ViewMode::Services;
+
+            let backend = ratatui::backend::TestBackend::new(case.width, 8);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw_services_table(frame, &app, frame.area()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+
+            assert_eq!(
+                text.contains("PID"),
+                case.want_pid,
+                "width {}: PID header",
+                case.width
+            );
+            assert_eq!(
+                text.contains("4242"),
+                case.want_pid,
+                "width {}: the pid itself",
+                case.width
+            );
+            assert!(
+                text.contains("api") && text.contains("ready"),
+                "width {}: name and state always present",
+                case.width
+            );
         }
     }
 

@@ -725,6 +725,23 @@ fn handle_key(
             // each keeps its own scroll position, so coming back lands where
             // you left.
             KeyCode::Char('v') | KeyCode::Char('V') => app.swap_log_view(),
+            // Resize the split from the keyboard: the arrow moves the border
+            // in its own direction, whichever pane has focus. For a
+            // right-docked panel that is also "grow the pane you are in" from
+            // both sides — Ctrl+Right grows a focused log and shrinks a
+            // focused panel, which are the same motion.
+            KeyCode::Left if app.panel_open() && app.panel.side == panes::PaneSide::Right => {
+                nudge_panel(app, RESIZE_STEP_COLUMNS);
+            }
+            KeyCode::Right if app.panel_open() && app.panel.side == panes::PaneSide::Right => {
+                nudge_panel(app, -RESIZE_STEP_COLUMNS);
+            }
+            KeyCode::Up if app.panel_open() && app.panel.side == panes::PaneSide::Bottom => {
+                nudge_panel(app, RESIZE_STEP_ROWS);
+            }
+            KeyCode::Down if app.panel_open() && app.panel.side == panes::PaneSide::Bottom => {
+                nudge_panel(app, -RESIZE_STEP_ROWS);
+            }
             _ => {}
         }
         return Ok(());
@@ -907,6 +924,23 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
 fn close_panel(app: &mut App) {
     app.view_mode = ViewMode::Normal;
     app.focus = panes::Focus::Logs;
+}
+
+/// Columns one Ctrl+arrow press moves the split when docked right, and rows
+/// when docked bottom. Big enough that resizing does not feel like sanding,
+/// small enough to stop where you meant.
+const RESIZE_STEP_COLUMNS: i16 = 4;
+const RESIZE_STEP_ROWS: i16 = 2;
+
+/// Grow the panel by `delta` (shrink for negative).
+///
+/// The stored extent is safe to build on because the renderer writes the
+/// granted size back into it every frame — stored and on-screen cannot
+/// diverge. Nudging the *drawn* rectangle instead was the first version, and
+/// it collapsed a burst of presses into one: the rect only moves when a frame
+/// is drawn, so every press in the burst computed the same target.
+fn nudge_panel(app: &mut App, delta: i16) {
+    app.panel.extent = app.panel.extent.saturating_add_signed(delta).max(1);
 }
 
 fn open_services_panel(app: &mut App) {
@@ -2139,6 +2173,86 @@ mod tests {
 
             let (start, end) = app.log_selection.span().expect("a selection");
             assert_eq!((start.1, end.1), case.want, "{}: rows covered", case.name);
+        }
+    }
+
+    /// Ctrl+arrow moves the split border in the arrow's own direction, and a
+    /// burst of presses stacks — each builds on the last, not on whatever the
+    /// previous *frame* happened to draw. (The renderer writes the granted
+    /// size back into the stored extent each frame, which is what makes the
+    /// stored number safe to build on.)
+    #[test]
+    fn ctrl_arrows_resize_the_split_and_bursts_stack() {
+        struct Case {
+            name: &'static str,
+            side: panes::PaneSide,
+            start_extent: u16,
+            keys: &'static [KeyCode],
+            want_extent: u16,
+        }
+
+        let cases = [
+            Case {
+                name: "right dock: left grows the panel",
+                side: panes::PaneSide::Right,
+                start_extent: 40,
+                keys: &[KeyCode::Left],
+                want_extent: 44,
+            },
+            Case {
+                name: "right dock: right shrinks it",
+                side: panes::PaneSide::Right,
+                start_extent: 40,
+                keys: &[KeyCode::Right],
+                want_extent: 36,
+            },
+            Case {
+                name: "a burst of presses stacks, one step each",
+                side: panes::PaneSide::Right,
+                start_extent: 40,
+                keys: &[KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Left],
+                want_extent: 56,
+            },
+            Case {
+                name: "bottom dock: up grows the panel",
+                side: panes::PaneSide::Bottom,
+                start_extent: 8,
+                keys: &[KeyCode::Up],
+                want_extent: 10,
+            },
+            Case {
+                name: "bottom dock: down shrinks it",
+                side: panes::PaneSide::Bottom,
+                start_extent: 8,
+                keys: &[KeyCode::Down],
+                want_extent: 6,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            app.view_mode = ViewMode::Services;
+            app.panel.side = case.side;
+            app.panel.extent = case.start_extent;
+            let mut store = LogStore::with_capacity(10);
+            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
+            let controls = TuiControls {
+                lifecycle_emitter: LifecycleEmitter::discarding(),
+                mode: TuiMode::InProcess,
+            };
+
+            for key in case.keys {
+                handle_key(
+                    KeyEvent::new(*key, KeyModifiers::CONTROL),
+                    &mut app,
+                    &mut store,
+                    &client,
+                    &controls,
+                )
+                .unwrap();
+            }
+
+            assert_eq!(app.panel.extent, case.want_extent, "{}", case.name);
         }
     }
 
