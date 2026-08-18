@@ -43,8 +43,8 @@ pub(crate) const BAR_HEIGHT: u16 = 3;
 /// selection clamps against this origin, and the renderer paints inside it —
 /// three readers, and any two of them computing the inset independently is a
 /// one-cell disagreement that shows up as a selection off by a column.
-pub(crate) fn log_text_area(area: Rect, status: super::panes::StatusPane) -> Rect {
-    inner(super::panes::layout(area, BAR_HEIGHT, status).logs)
+pub(crate) fn log_text_area(area: Rect, panel: super::panes::Panel, panel_open: bool) -> Rect {
+    inner(super::panes::layout(area, BAR_HEIGHT, panel, panel_open).logs)
 }
 
 /// `Block::inner` for a plain full border, without needing the block.
@@ -59,14 +59,18 @@ fn inner(area: Rect) -> Rect {
 
 /// The log pane's top-left text corner, for a caller working in screen
 /// coordinates — the selection, which needs to know where column zero is.
-pub(crate) fn log_pane_origin(area: Rect, status: super::panes::StatusPane) -> (u16, u16) {
-    let text = log_text_area(area, status);
+pub(crate) fn log_pane_origin(
+    area: Rect,
+    panel: super::panes::Panel,
+    panel_open: bool,
+) -> (u16, u16) {
+    let text = log_text_area(area, panel, panel_open);
     (text.x, text.y)
 }
 
 /// Width available to log text, which is what the store wraps against.
-pub(crate) fn log_pane_width(area: Rect, status: super::panes::StatusPane) -> u16 {
-    log_text_area(area, status).width.max(1)
+pub(crate) fn log_pane_width(area: Rect, panel: super::panes::Panel, panel_open: bool) -> u16 {
+    log_text_area(area, panel, panel_open).width.max(1)
 }
 
 /// Paint the whole screen.
@@ -75,7 +79,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let panes = super::panes::layout(area, BAR_HEIGHT, app.status_pane);
+    let panes = super::panes::layout(area, BAR_HEIGHT, app.panel, app.panel_open());
     app.panes = panes;
 
     // Clamp the scroll positions the overlays own before drawing them: they are
@@ -87,29 +91,33 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
     }
 
     draw_log_pane(frame, app, store, panes.logs);
-    if let Some(status_area) = panes.status {
-        draw_status_pane(frame, app, status_area);
+
+    // The services, tasks and filter views live in the side panel, beside a
+    // log that keeps flowing — acting on a process and watching what it prints
+    // are one activity, and the old full-screen tables forced a choice.
+    // Cleared first because the widgets only paint the cells they use, and a
+    // shrinking table would otherwise leave its old rows behind.
+    if let Some(panel_area) = panes.status {
+        frame.render_widget(Clear, panel_area);
+        match app.view_mode {
+            ViewMode::Services => draw_services_table(frame, app, panel_area),
+            ViewMode::Tasks => draw_tasks_table(frame, app, panel_area),
+            ViewMode::Filter => draw_filter_modal(frame, app, panel_area),
+            _ => {}
+        }
     }
-    // No separate divider: the two panes' own borders are the lines between
-    // them, and `panes.divider` is only the drag-handle rectangle over the
-    // status pane's edge.
     draw_bar(frame, app, panes.bar);
 
-    // Full-screen views replace the log pane rather than living on a second
-    // terminal. They must wipe what is under them first: their old home was a
-    // blank alt-screen buffer, and now it is whatever the log pane just drew.
-    // Leaving one still cannot lose log lines — nothing was hidden to show it,
-    // only painted over, and the store never stopped filling.
-    if app.view_mode != ViewMode::Normal {
+    // The failure summary and the param form stay full-screen: both demand a
+    // decision, where a panel is for acting while still watching output. They
+    // wipe what is under them first — the widgets only paint their own cells.
+    if matches!(app.view_mode, ViewMode::Failures | ViewMode::Form) {
         frame.render_widget(Clear, area);
     }
     match app.view_mode {
-        ViewMode::Filter => draw_filter_modal(frame, app),
-        ViewMode::Tasks => draw_tasks_table(frame, app),
-        ViewMode::Services => draw_services_table(frame, app),
         ViewMode::Failures => draw_failure_summary(frame, app),
         ViewMode::Form => draw_form_modal(frame, app),
-        ViewMode::Normal => {}
+        _ => {}
     }
     // The per-process log popup is a centred overlay and clears its own rect.
     draw_log_popup(frame, app);
@@ -236,77 +244,6 @@ fn draw_log_pane(
     if !following {
         draw_scroll_badge(frame, area, rows_below);
     }
-}
-
-/// A compact always-visible summary of every process, beside the log.
-///
-/// Deliberately thinner than the full-screen tables: this is for keeping half
-/// an eye on things while reading output, and anything that needs a column of
-/// its own belongs in `[s]` or `[t]`, which have the whole screen for it.
-fn draw_status_pane(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let focused = app.focus == super::panes::Focus::Status;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        }))
-        .title(" status — [tab] focus  [p] close  [P] dock ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut services: Vec<(&String, &ServiceState)> = app.services_state.iter().collect();
-    services.sort_by_key(|(name, _)| (*name).clone());
-    if !services.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "SERVICES",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for (name, state) in services {
-            lines.push(status_row(
-                name,
-                service_state_label(*state, &[]),
-                service_state_color(*state),
-            ));
-        }
-    }
-
-    let mut tasks: Vec<(&String, &TaskState)> = app.tasks_state.iter().collect();
-    tasks.sort_by_key(|(name, _)| (*name).clone());
-    if !tasks.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "TASKS",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for (name, state) in tasks {
-            lines.push(status_row(
-                name,
-                task_state_label(*state, &[]),
-                task_state_color(*state),
-            ));
-        }
-    }
-
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// One `name … state` row, with the state right-aligned by padding rather than
-/// by a table so the pane can be any width without reflowing columns.
-fn status_row(name: &str, label: Cow<'static, str>, color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(format!("{name} ")),
-        Span::styled(label.into_owned(), Style::default().fg(color)),
-    ])
 }
 
 /// Give one row the hover wash: a faint background across the pane's full
@@ -486,22 +423,20 @@ fn draw_bar(frame: &mut Frame<'_>, app: &App, box_area: Rect) {
     frame.render_widget(Paragraph::new(left_line), inner);
 }
 
-fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
+fn draw_filter_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if area.height < 3 || area.width == 0 {
         return;
     }
 
-    // Border + title wraps the whole modal. Inside: list at top, bar at bottom.
+    // Border + title wraps the whole panel. Inside: list at top, bar at bottom.
     let title = match app.filter.focus() {
-        FilterFocus::List => {
-            " Filter logs — [j/k ↑↓] move  [space] toggle  [o] only this  [/] search  [enter] done  [esc] revert "
-        }
-        FilterFocus::Query => {
-            " Filter logs — [type] search  [enter] apply/close if single  [tab] back to list  [esc] revert "
-        }
+        FilterFocus::List => " filter — [space] toggle  [o] only  [/] search  [enter] done ",
+        FilterFocus::Query => " filter — [type] search  [enter] apply  [esc] revert ",
     };
-    let outer = Block::default().borders(Borders::ALL).title(title);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(panel_border_style(app))
+        .title(title);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -524,8 +459,7 @@ fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(bar, layout[2]);
 }
 
-fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
+fn draw_tasks_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let name_colors = log_name_colors(app);
     let items = app.task_items();
     let layout = task_table_layout(area.width);
@@ -542,8 +476,8 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
         frame,
         area,
         StatusTableView {
-            title: " don tasks — [j/k ↑↓] move  [enter] run/form  [a] attach  [l] logs  [/] filter  [esc] clear/dismiss "
-                .to_string(),
+            title: " tasks — [enter] run  [a] attach  [l] logs  [/] filter ".to_string(),
+            border_style: panel_border_style(app),
             header,
             rows,
             widths: layout.widths,
@@ -665,8 +599,7 @@ pub(crate) fn failure_summary_max_scroll(area: Rect, app: &App) -> usize {
 /// Render the full-screen services table — a table of every known service
 /// with its current state, sorted errors → running → exited → lazy then
 /// alphabetical within each bucket.
-fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
+fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let header = Row::new(vec!["NAME", "PID", "STATE"]).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
@@ -682,9 +615,8 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
         frame,
         area,
         StatusTableView {
-            title:
-                " don services — [j/k ↑↓] move  [enter] start/stop  [r] restart  [R] hard restart  [a] attach  [l] logs  [/] filter  [esc] clear/dismiss "
-                    .to_string(),
+            title: " services — [enter] start/stop  [r] restart  [a] attach  [l] logs ".to_string(),
+            border_style: panel_border_style(app),
             header,
             rows,
             widths: vec![
@@ -697,6 +629,16 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
             selected_hint: service_selected_hint(app),
         },
     );
+}
+
+/// The side panel's border: cyan when it has the keys, grey when the log does.
+/// The same rule the log pane uses, so focus is legible at a glance.
+fn panel_border_style(app: &App) -> Style {
+    Style::default().fg(if app.focus == super::panes::Focus::Panel {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    })
 }
 
 fn draw_log_popup(frame: &mut Frame<'_>, app: &App) {
@@ -1052,8 +994,7 @@ fn normal_bar_line(
         spans.push(dim("  [esc] clear"));
         spans.push(separator());
     }
-    spans.push(dim("[p] status"));
-    spans.push(dim("  [l] logs"));
+    spans.push(dim("[l] logs"));
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
         spans.push(dim("  [R] reset"));
@@ -1819,11 +1760,13 @@ mod tests {
         );
         app.view_mode = ViewMode::Tasks;
 
+        // The width under test is the *panel's* width now, not the terminal's:
+        // the table lives in the side panel and adapts its columns to however
+        // wide the user has dragged it.
         let backend = ratatui::backend::TestBackend::new(width, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let store = super::super::log_store::LogStore::with_capacity(0);
         terminal
-            .draw(|frame| draw(frame, &mut app, &store))
+            .draw(|frame| draw_tasks_table(frame, &app, frame.area()))
             .unwrap();
         terminal
             .backend()

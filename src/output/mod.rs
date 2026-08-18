@@ -1793,6 +1793,18 @@ pub struct LifecycleEmitter {
 }
 
 impl LifecycleEmitter {
+    /// An emitter whose lines go nowhere, for tests that need one as
+    /// plumbing rather than as the thing under test.
+    #[cfg(test)]
+    pub(crate) fn discarding() -> Self {
+        let (tx, _) = mpsc::unbounded_channel();
+        Self {
+            don_prefix: "[don] │ ".to_string(),
+            stdout_sink: SinkHandle::Unbounded(tx),
+            bazel_prefix: None,
+        }
+    }
+
     /// Emit a `[don]` lifecycle event.
     pub fn lifecycle_event(&self, message: &str) {
         let _ = self.stdout_sink.send(SinkLine {

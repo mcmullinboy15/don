@@ -565,25 +565,33 @@ fn force_full_repaint(terminal: &mut TuiTerminal, area: Rect) -> Result<(), TuiE
 /// only time that costs anything.
 fn draw(terminal: &mut TuiTerminal, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
     let area: Rect = terminal.size()?.into();
+    // No panel means the log has the keys — enforced here rather than at
+    // every site that closes a panel, of which there are many and will be
+    // more. A stale Panel focus with nothing focusable is unrepresentable on
+    // screen, so it should be unrepresentable in state.
+    if !app.panel_open() {
+        app.focus = panes::Focus::Logs;
+    }
+    let panel_open = app.panel_open();
     // A layout change moves what every cell means, and a diffing renderer only
     // rewrites the cells it believes changed — so whatever the old layout drew
     // outside the new one's reach stays on screen. Clearing costs a full
     // repaint, which is why it is done on the layout change rather than every
     // frame: opening, moving or resizing a pane is a thing people do
     // occasionally, not sixty times a second.
-    if app.painted_layout != Some(app.status_pane) || app.repaint_requested {
+    if app.painted_layout != Some((app.panel, panel_open)) || app.repaint_requested {
         force_full_repaint(terminal, area)?;
-        app.painted_layout = Some(app.status_pane);
+        app.painted_layout = Some((app.panel, panel_open));
         app.repaint_requested = false;
     }
-    store.reflow(render::log_pane_width(area, app.status_pane));
+    store.reflow(render::log_pane_width(area, app.panel, panel_open));
     // Hold history where the reader is looking, so a busy stack cannot evict
     // their place out from under them between frames.
     store.set_pin(app.log_scroll.anchor());
     // Selection may not reach into the name column. Refreshed here because both
     // the column's width and the pane's origin can move under it.
     app.log_selection.set_left_edge(
-        render::log_pane_origin(area, app.status_pane)
+        render::log_pane_origin(area, app.panel, panel_open)
             .0
             .saturating_add(u16::try_from(store.name_column()).unwrap_or(0)),
     );
@@ -726,6 +734,62 @@ fn handle_key(
         return Ok(());
     }
 
+    // The panel-management keys work from either side of the split, so they
+    // are handled before the per-view routing — with one carve-out: while a
+    // search box is being typed into (the filter's, or a table's `/` query),
+    // every character belongs to the query, and while the filter's query is
+    // up Tab already means "back to the list" there.
+    let typing = match app.view_mode {
+        ViewMode::Filter => app.filter.focus() == filter::FilterFocus::Query,
+        ViewMode::Services => app.services_table.filtering,
+        ViewMode::Tasks => app.tasks_table.filtering,
+        _ => false,
+    };
+    if app.panel_open() && !typing {
+        match key.code {
+            // Tab moves the keys between the log and the panel.
+            KeyCode::Tab => {
+                app.focus = match app.focus {
+                    panes::Focus::Logs => panes::Focus::Panel,
+                    panes::Focus::Panel => panes::Focus::Logs,
+                };
+                return Ok(());
+            }
+            // Each panel's own key is a toggle, and another panel's key
+            // switches — from either focus. `l` is only the filter's toggle
+            // when the filter is up: in the tables it opens the log popup for
+            // the highlighted row, which the table handlers own.
+            KeyCode::Char('s') if app.view_mode == ViewMode::Services => {
+                close_panel(app);
+                return Ok(());
+            }
+            KeyCode::Char('s') => {
+                open_services_panel(app);
+                return Ok(());
+            }
+            KeyCode::Char('t') if app.view_mode == ViewMode::Tasks => {
+                close_panel(app);
+                return Ok(());
+            }
+            KeyCode::Char('t') => {
+                open_tasks_panel(app);
+                return Ok(());
+            }
+            KeyCode::Char('l') if app.view_mode == ViewMode::Filter => {
+                close_panel(app);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // A panel does not take the log away, and it does not take the keyboard
+    // away either: focus decides. The log side keeps its whole vocabulary —
+    // scrolling, selection, verbose, even opening a different panel.
+    if app.panel_open() && app.focus == panes::Focus::Logs {
+        return handle_normal_key(key, app, store);
+    }
+
     match app.view_mode {
         ViewMode::Normal => handle_normal_key(key, app, store)?,
         ViewMode::Filter => handle_filter_key(key, app, store)?,
@@ -780,20 +844,13 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.repaint_requested = true;
         }
-        KeyCode::Char('l') => {
-            app.filter.enter_edit();
-            app.view_mode = ViewMode::Filter;
-        }
-        KeyCode::Char('t') => {
-            app.tasks_table.reset();
-            app.freeze_tasks_order();
-            app.view_mode = ViewMode::Tasks;
-        }
-        KeyCode::Char('s') => {
-            app.services_table.reset();
-            app.freeze_services_order();
-            app.view_mode = ViewMode::Services;
-        }
+        // The panel views. Opening one focuses it — the point of pressing the
+        // key is to use the thing. The toggles and switches for an
+        // already-open panel live in `handle_key`, before routing, so they
+        // work from either side of the split.
+        KeyCode::Char('l') => open_filter_panel(app),
+        KeyCode::Char('t') => open_tasks_panel(app),
+        KeyCode::Char('s') => open_services_panel(app),
         KeyCode::Char('i') if app.has_failure_summary() => {
             app.open_failure_summary();
         }
@@ -823,34 +880,92 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
         // Ctrl+C is shutdown and cannot double as copy, so the keyboard route
         // to the clipboard is `y` — vi's yank, over the current selection.
         KeyCode::Char('y') => copy_selection(app),
-        KeyCode::Esc => clear_selection(app),
-        // The status pane sits *beside* the log rather than replacing it, so
-        // opening it is not a mode change and does not interrupt reading.
-        KeyCode::Char('p') => {
-            app.status_pane.open = !app.status_pane.open;
-            if !app.status_pane.open {
-                app.focus = panes::Focus::Logs;
-            }
+        // With a panel open but the log focused, Esc means "done with the
+        // panel" — it is the dismiss key every panel view already answers to,
+        // and it should not need a focus switch first.
+        KeyCode::Esc if app.panel_open() => {
+            app.log_selection.clear();
+            close_panel(app);
         }
-        KeyCode::Char('P') if app.status_pane.open => {
-            app.status_pane.side = app.status_pane.side.toggled();
+        KeyCode::Esc => clear_selection(app),
+        KeyCode::Char('P') if app.panel_open() => {
+            app.panel.side = app.panel.side.toggled();
             // Extents mean different things on the two axes; start from the
             // default for the new one rather than carrying a column count over
             // into rows.
-            app.status_pane.extent = match app.status_pane.side {
-                panes::PaneSide::Right => 42,
+            app.panel.extent = match app.panel.side {
+                panes::PaneSide::Right => 48,
                 panes::PaneSide::Bottom => 12,
-            };
-        }
-        KeyCode::Tab if app.status_pane.open => {
-            app.focus = match app.focus {
-                panes::Focus::Logs => panes::Focus::Status,
-                panes::Focus::Status => panes::Focus::Logs,
             };
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Close the side panel: back to the plain log, keys back to the log.
+fn close_panel(app: &mut App) {
+    app.view_mode = ViewMode::Normal;
+    app.focus = panes::Focus::Logs;
+}
+
+fn open_services_panel(app: &mut App) {
+    app.services_table.reset();
+    app.freeze_services_order();
+    app.view_mode = ViewMode::Services;
+    app.focus = panes::Focus::Panel;
+}
+
+fn open_tasks_panel(app: &mut App) {
+    app.tasks_table.reset();
+    app.freeze_tasks_order();
+    app.view_mode = ViewMode::Tasks;
+    app.focus = panes::Focus::Panel;
+}
+
+fn open_filter_panel(app: &mut App) {
+    app.filter.enter_edit();
+    app.view_mode = ViewMode::Filter;
+    app.focus = panes::Focus::Panel;
+}
+
+/// Whether a screen position is inside the open side panel.
+fn over_panel(app: &App, column: u16, row: u16) -> bool {
+    app.panel_open() && app.panes.hit(column, row) == Some(panes::Focus::Panel)
+}
+
+/// Move the panel's highlight by one step — the wheel's version of j/k.
+fn panel_step(app: &mut App, delta: isize) {
+    match app.view_mode {
+        ViewMode::Services => {
+            let total = app.service_items().len();
+            step_table(&mut app.services_table, total, delta);
+        }
+        ViewMode::Tasks => {
+            let total = app.task_items().len();
+            step_table(&mut app.tasks_table, total, delta);
+        }
+        ViewMode::Filter => {
+            if delta < 0 {
+                app.filter.highlight_prev();
+            } else {
+                app.filter.highlight_next();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn step_table(table: &mut status_table::StatusTableState, total: usize, delta: isize) {
+    if total == 0 {
+        return;
+    }
+    let max = total - 1;
+    table.highlight = table
+        .highlight
+        .min(max)
+        .saturating_add_signed(delta)
+        .min(max);
 }
 
 /// Rows a single wheel tick moves the log.
@@ -866,6 +981,15 @@ const WHEEL_ROWS: isize = 3;
 /// nothing while it is hidden.
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
+        // The wheel works on whatever is under the pointer — scrolling the log
+        // that is hidden *behind* the panel you are pointing at is the kind of
+        // spooky action nobody wants.
+        MouseEventKind::ScrollUp if over_panel(app, mouse.column, mouse.row) => {
+            panel_step(app, -1);
+        }
+        MouseEventKind::ScrollDown if over_panel(app, mouse.column, mouse.row) => {
+            panel_step(app, 1);
+        }
         MouseEventKind::ScrollUp => scroll_log(app, |p| p.rows -= WHEEL_ROWS),
         MouseEventKind::ScrollDown => scroll_log(app, |p| p.rows += WHEEL_ROWS),
         // A click in the log pane takes focus back from any overlay, which is
@@ -909,8 +1033,8 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                     app.panes.logs.width + app.panes.status.map_or(0, |s| s.width + 1),
                     app.panes.logs.height + app.panes.status.map_or(0, |s| s.height + 1),
                 );
-                app.status_pane.extent =
-                    panes::extent_from_drag(area, app.status_pane.side, mouse.column, mouse.row);
+                app.panel.extent =
+                    panes::extent_from_drag(area, app.panel.side, mouse.column, mouse.row);
                 return;
             }
             // The rows under a selection have to stop moving, or output
@@ -1120,7 +1244,7 @@ fn handle_failure_summary_key(
 ) -> Result<(), TuiError> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => {
-            app.view_mode = ViewMode::Normal;
+            close_panel(app);
             app.failure_summary_scroll = 0;
             return Ok(());
         }
@@ -1144,7 +1268,7 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
                 app.filter.end_query_edit();
                 if close_after_apply {
                     app.filter.commit();
-                    app.view_mode = ViewMode::Normal;
+                    close_panel(app);
                 }
             }
             KeyCode::Tab => {
@@ -1158,7 +1282,7 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
             }
             KeyCode::Esc => {
                 app.filter.cancel_edit();
-                app.view_mode = ViewMode::Normal;
+                close_panel(app);
             }
             _ => {}
         }
@@ -1168,11 +1292,11 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
     match key.code {
         KeyCode::Enter => {
             app.filter.commit();
-            app.view_mode = ViewMode::Normal;
+            close_panel(app);
         }
         KeyCode::Esc => {
             app.filter.cancel_edit();
-            app.view_mode = ViewMode::Normal;
+            close_panel(app);
         }
         KeyCode::Char('R') => {
             app.filter.reset_edit_to_defaults();
@@ -1216,7 +1340,7 @@ fn handle_tasks_key(
             return Ok(());
         }
         StatusTableKeyOutcome::Close => {
-            app.view_mode = ViewMode::Normal;
+            close_panel(app);
             return Ok(());
         }
         StatusTableKeyOutcome::None => {}
@@ -1267,7 +1391,7 @@ fn handle_services_key(
             return Ok(());
         }
         StatusTableKeyOutcome::Close => {
-            app.view_mode = ViewMode::Normal;
+            close_panel(app);
             return Ok(());
         }
         StatusTableKeyOutcome::None => {}
@@ -1529,7 +1653,7 @@ fn return_to_logs_after_task_run(
     _store: &LogStore,
 ) -> Result<(), TuiError> {
     let filter_changed = app.filter.select_name(task_name);
-    app.view_mode = ViewMode::Normal;
+    close_panel(app);
     app.log_popup = None;
 
     // Nothing to redraw here: the filter change is a different view over the
@@ -1680,7 +1804,7 @@ fn handle_form_key(
     match key.code {
         KeyCode::Esc => {
             app.form = None;
-            app.view_mode = ViewMode::Normal;
+            close_panel(app);
             return Ok(());
         }
         KeyCode::Enter if ctrl => {
@@ -2015,6 +2139,80 @@ mod tests {
 
             let (start, end) = app.log_selection.span().expect("a selection");
             assert_eq!((start.1, end.1), case.want, "{}: rows covered", case.name);
+        }
+    }
+
+    /// The panel keys are toggles, focus follows the panel, and Esc always
+    /// finds its way out — the routing invariants a reader depends on without
+    /// thinking about them.
+    #[test]
+    fn panel_keys_toggle_and_route_focus() {
+        struct Case {
+            name: &'static str,
+            keys: &'static [KeyCode],
+            want_mode: ViewMode,
+            want_focus: panes::Focus,
+        }
+
+        let cases = [
+            Case {
+                name: "opening a panel focuses it",
+                keys: &[KeyCode::Char('s')],
+                want_mode: ViewMode::Services,
+                want_focus: panes::Focus::Panel,
+            },
+            Case {
+                name: "the same key closes it again",
+                keys: &[KeyCode::Char('t'), KeyCode::Char('t')],
+                want_mode: ViewMode::Normal,
+                want_focus: panes::Focus::Logs,
+            },
+            Case {
+                name: "tab hands the keys to the log and back",
+                keys: &[KeyCode::Char('s'), KeyCode::Tab, KeyCode::Tab],
+                want_mode: ViewMode::Services,
+                want_focus: panes::Focus::Panel,
+            },
+            Case {
+                name: "with the log focused, a panel key switches panels",
+                keys: &[KeyCode::Char('s'), KeyCode::Tab, KeyCode::Char('t')],
+                want_mode: ViewMode::Tasks,
+                want_focus: panes::Focus::Panel,
+            },
+            Case {
+                name: "esc from the panel side closes it",
+                keys: &[KeyCode::Char('s'), KeyCode::Esc],
+                want_mode: ViewMode::Normal,
+                want_focus: panes::Focus::Logs,
+            },
+            Case {
+                name: "esc from the log side closes it too",
+                keys: &[KeyCode::Char('s'), KeyCode::Tab, KeyCode::Esc],
+                want_mode: ViewMode::Normal,
+                want_focus: panes::Focus::Logs,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            let mut store = LogStore::with_capacity(10);
+            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
+            let controls = TuiControls {
+                lifecycle_emitter: LifecycleEmitter::discarding(),
+                mode: TuiMode::InProcess,
+            };
+            for key in case.keys {
+                handle_key(
+                    KeyEvent::new(*key, KeyModifiers::NONE),
+                    &mut app,
+                    &mut store,
+                    &client,
+                    &controls,
+                )
+                .unwrap();
+            }
+            assert_eq!(app.view_mode, case.want_mode, "{}: mode", case.name);
+            assert_eq!(app.focus, case.want_focus, "{}: focus", case.name);
         }
     }
 

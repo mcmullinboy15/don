@@ -307,15 +307,16 @@ pub(crate) struct App {
     /// read by mouse handling, so a click resolves against the rectangles that
     /// were actually drawn rather than a second computation of them.
     pub(crate) panes: super::panes::Panes,
-    /// The optional status pane beside the log: open, docked, sized.
-    pub(crate) status_pane: super::panes::StatusPane,
+    /// Where the side panel docks and how big it is. Whether it is *open* is
+    /// the view mode's fact — see [`Self::panel_open`].
+    pub(crate) panel: super::panes::Panel,
     /// The layout the screen was last painted with, and whether a full repaint
     /// has been asked for. A pane opening, moving or resizing changes which
     /// cells mean what, and a diffing renderer only rewrites cells it believes
     /// changed — so anything the old layout drew that the new one does not
     /// reach stays on screen. The divider is the visible case: a dashed rule
     /// left behind in the middle of the log.
-    pub(crate) painted_layout: Option<super::panes::StatusPane>,
+    pub(crate) painted_layout: Option<(super::panes::Panel, bool)>,
     /// Set by the redraw key, cleared by the next paint.
     pub(crate) repaint_requested: bool,
     /// Which pane takes keys both could claim.
@@ -487,7 +488,7 @@ impl App {
             form: None,
             log_popup: None,
             panes: super::panes::Panes::empty(),
-            status_pane: super::panes::StatusPane::default(),
+            panel: super::panes::Panel::default(),
             painted_layout: None,
             repaint_requested: false,
             focus: super::panes::Focus::Logs,
@@ -542,6 +543,20 @@ impl App {
     /// more mutators than anyone will remember to keep in step, and a missed
     /// bump would leave the pane indexing against a filter the user has
     /// already changed. Cost is the number of *process names*, not lines.
+    /// Whether the side panel is on screen.
+    ///
+    /// Derived from the view mode rather than stored: what the panel shows and
+    /// whether it is showing are one decision, and a second flag would let the
+    /// two drift. Failures and the param form are full-screen overlays, not
+    /// panels — they take the whole screen because they demand a decision,
+    /// where a panel is for acting while still watching output.
+    pub(crate) fn panel_open(&self) -> bool {
+        matches!(
+            self.view_mode,
+            ViewMode::Services | ViewMode::Tasks | ViewMode::Filter
+        )
+    }
+
     /// Bring the other log pane to the front, putting this one away as it is.
     ///
     /// A swap, not a rebuild. Each pane keeps its own index and its own scroll

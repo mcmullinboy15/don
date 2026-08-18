@@ -5,14 +5,14 @@
 //! drag to know what it is dragging. Two places computing the same layout is
 //! how a click ends up one row off from what it looks like it hit.
 //!
-//! The status pane is optional and resizable. It is *not* a mode: opening it
-//! does not take the log away, which is the whole difference between this and
-//! the full-screen tables. Those still exist for when you want the detail;
-//! this is for keeping half an eye on things while you read output.
+//! The side panel is optional and resizable, and holds whichever view was
+//! opened — services, tasks, or the log filter. It sits *beside* the log
+//! rather than replacing it: acting on a process and watching what it prints
+//! are one activity, and a full-screen table forced a choice between them.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-/// Which side of the screen the status pane occupies.
+/// Which side of the screen the side panel occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PaneSide {
     #[default]
@@ -34,13 +34,17 @@ impl PaneSide {
 pub(crate) enum Focus {
     #[default]
     Logs,
-    Status,
+    Panel,
 }
 
-/// The status pane's state: whether it is open, where, and how big.
+/// Where the side panel goes and how big it is.
+///
+/// Deliberately not *whether* it is open — that is the view mode's fact
+/// ([`super::app::App::panel_open`]), because what the panel shows and whether
+/// it is showing are one decision. Keeping a second `open` flag here meant two
+/// places could disagree about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StatusPane {
-    pub(crate) open: bool,
+pub(crate) struct Panel {
     pub(crate) side: PaneSide,
     /// Size along the split axis — columns when docked right, rows when
     /// docked bottom. Clamped at layout time rather than at assignment, so a
@@ -49,17 +53,16 @@ pub(crate) struct StatusPane {
     pub(crate) extent: u16,
 }
 
-impl Default for StatusPane {
+impl Default for Panel {
     fn default() -> Self {
         Self {
-            open: false,
             side: PaneSide::Right,
-            extent: 42,
+            extent: 48,
         }
     }
 }
 
-/// Smallest useful status pane, and the smallest log pane worth leaving.
+/// Smallest useful side panel, and the smallest log pane worth leaving.
 const MIN_STATUS: u16 = 16;
 const MIN_LOGS: u16 = 20;
 
@@ -67,10 +70,10 @@ const MIN_LOGS: u16 = 20;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Panes {
     pub(crate) logs: Rect,
-    /// `None` when the status pane is closed, or when the terminal is too
+    /// `None` when the panel is closed, or when the terminal is too
     /// small to split without starving the log.
     pub(crate) status: Option<Rect>,
-    /// The grab handle for the resize drag: the status pane's border edge
+    /// The grab handle for the resize drag: the panel's border edge
     /// facing the log. Not drawn separately — the pane's own `Block` border is
     /// the visible line, so there is exactly one rule between the panes
     /// instead of a hand-drawn divider stacked beside a border.
@@ -98,7 +101,7 @@ impl Panes {
                 && row < rect.y + rect.height
         };
         if self.status.is_some_and(inside) {
-            return Some(Focus::Status);
+            return Some(Focus::Panel);
         }
         if inside(self.logs) {
             return Some(Focus::Logs);
@@ -117,8 +120,11 @@ impl Panes {
     }
 }
 
-/// Split `area` into the log pane, the optional status pane, and the bar.
-pub(crate) fn layout(area: Rect, bar_height: u16, status: StatusPane) -> Panes {
+/// Split `area` into the log pane, the optional side panel, and the bar.
+///
+/// `open` comes from the view mode — the panel is on screen exactly when a
+/// panel view (services, tasks, filter) is active.
+pub(crate) fn layout(area: Rect, bar_height: u16, status: Panel, open: bool) -> Panes {
     if area.height <= bar_height {
         return Panes {
             logs: Rect::new(area.x, area.y, area.width, 0),
@@ -133,7 +139,7 @@ pub(crate) fn layout(area: Rect, bar_height: u16, status: StatusPane) -> Panes {
         .split(area);
     let (body, bar) = (rows[0], rows[1]);
 
-    if !status.open {
+    if !open {
         return Panes {
             logs: body,
             status: None,
@@ -145,7 +151,7 @@ pub(crate) fn layout(area: Rect, bar_height: u16, status: StatusPane) -> Panes {
     match status.side {
         PaneSide::Right => {
             // Too narrow to split: the log keeps the space. Silently refusing
-            // beats a two-column status pane and a five-column log.
+            // beats a two-column panel and a five-column log.
             if body.width < MIN_LOGS + MIN_STATUS {
                 return Panes {
                     logs: body,
@@ -210,7 +216,7 @@ pub(crate) fn layout(area: Rect, bar_height: u16, status: StatusPane) -> Panes {
 /// still live; clamping happens in [`layout`], which is the only place that
 /// knows the current terminal size.
 pub(crate) fn extent_from_drag(area: Rect, side: PaneSide, column: u16, row: u16) -> u16 {
-    // The border being dragged is part of the status pane's own extent, so the
+    // The border being dragged is part of the panel's own extent, so the
     // new extent runs from the pointer to the far screen edge inclusive.
     match side {
         PaneSide::Right => (area.x + area.width).saturating_sub(column),
@@ -233,67 +239,69 @@ mod tests {
         struct Case {
             name: &'static str,
             area: Rect,
-            status: StatusPane,
+            status: Panel,
+            open: bool,
             want_status: bool,
             want_log_width: Option<u16>,
         }
 
         let cases = vec![
             Case {
-                name: "closed by default",
+                name: "closed: the log keeps everything",
                 area: Rect::new(0, 0, 120, 40),
-                status: StatusPane::default(),
+                status: Panel::default(),
+                open: false,
                 want_status: false,
                 want_log_width: Some(120),
             },
             Case {
                 name: "docked right takes its extent, log keeps the rest",
                 area: Rect::new(0, 0, 120, 40),
-                status: StatusPane {
-                    open: true,
+                status: Panel {
                     side: PaneSide::Right,
                     extent: 40,
                 },
+                open: true,
                 want_status: true,
                 want_log_width: Some(80),
             },
             Case {
                 name: "an oversized extent is clamped, not honoured",
                 area: Rect::new(0, 0, 120, 40),
-                status: StatusPane {
-                    open: true,
+                status: Panel {
                     side: PaneSide::Right,
                     extent: 500,
                 },
+                open: true,
                 want_status: true,
                 want_log_width: Some(MIN_LOGS),
             },
             Case {
                 name: "too narrow to split at all: the log keeps everything",
                 area: Rect::new(0, 0, 30, 40),
-                status: StatusPane {
-                    open: true,
+                status: Panel {
                     side: PaneSide::Right,
                     extent: 40,
                 },
+                open: true,
                 want_status: false,
                 want_log_width: Some(30),
             },
             Case {
                 name: "too short to split vertically",
                 area: Rect::new(0, 0, 120, 11),
-                status: StatusPane {
-                    open: true,
+                status: Panel {
                     side: PaneSide::Bottom,
                     extent: 20,
                 },
+                open: true,
                 want_status: false,
                 want_log_width: Some(120),
             },
         ];
 
         for case in cases {
-            let panes = layout(case.area, BAR, case.status);
+            let panes = layout(case.area, BAR, case.status, case.open);
             assert_eq!(
                 panes.status.is_some(),
                 case.want_status,
@@ -322,20 +330,20 @@ mod tests {
         let panes = layout(
             area,
             BAR,
-            StatusPane {
-                open: true,
+            Panel {
                 side: PaneSide::Right,
                 extent: 40,
             },
+            true,
         );
         let status = panes.status.unwrap();
 
         assert_eq!(panes.hit(0, 0), Some(Focus::Logs));
         assert_eq!(panes.hit(panes.logs.width - 1, 5), Some(Focus::Logs));
-        assert_eq!(panes.hit(status.x, 5), Some(Focus::Status));
+        assert_eq!(panes.hit(status.x, 5), Some(Focus::Panel));
         assert_eq!(
             panes.hit(status.x + status.width - 1, 5),
-            Some(Focus::Status)
+            Some(Focus::Panel)
         );
         assert!(
             panes.on_divider(panes.logs.width, 5),
