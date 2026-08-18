@@ -490,6 +490,17 @@ fn build_terminal() -> Result<TuiTerminal, TuiError> {
 /// only time that costs anything.
 fn draw(terminal: &mut TuiTerminal, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
     let area: Rect = terminal.size()?.into();
+    // A layout change moves what every cell means, and a diffing renderer only
+    // rewrites the cells it believes changed — so whatever the old layout drew
+    // outside the new one's reach stays on screen. Clearing costs a full
+    // repaint, which is why it is done on the layout change rather than every
+    // frame: opening, moving or resizing a pane is a thing people do
+    // occasionally, not sixty times a second.
+    if app.painted_layout != Some(app.status_pane) || app.repaint_requested {
+        terminal.clear()?;
+        app.painted_layout = Some(app.status_pane);
+        app.repaint_requested = false;
+    }
     store.reflow(render::log_pane_width(area, app.status_pane));
     // Hold history where the reader is looking, so a busy stack cannot evict
     // their place out from under them between frames.
@@ -678,6 +689,13 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
                     bytes: Vec::new(),
                 },
             );
+        }
+        // The conventional "something has scribbled on my screen" key. An
+        // escape hatch, not a fix: anything that leaves the terminal and this
+        // renderer disagreeing is a bug, but the user should not have to
+        // restart the stack to get a clean screen back.
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.repaint_requested = true;
         }
         KeyCode::Char('l') => {
             app.filter.enter_edit();
@@ -1749,6 +1767,54 @@ mod tests {
         });
         app.apply_service_runtime("api".to_string(), state, None, Vec::new());
         app
+    }
+
+    /// A layout change has to force a full repaint, and the user needs a way to
+    /// ask for one — the ordering of the `l` arms decides whether Ctrl+L is
+    /// reachable at all, and an unguarded arm above it would silently swallow
+    /// the chord into the log filter.
+    #[test]
+    fn a_layout_change_or_ctrl_l_asks_for_a_full_repaint() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+
+        struct Case {
+            name: &'static str,
+            key: KeyEvent,
+            want_repaint: bool,
+            want_filter_open: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "ctrl+l asks for a repaint",
+                key: KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+                want_repaint: true,
+                want_filter_open: false,
+            },
+            Case {
+                name: "plain l still opens the log filter",
+                key: KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                want_repaint: false,
+                want_filter_open: true,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            let mut store = LogStore::with_capacity(10);
+            handle_normal_key(case.key, &mut app, &mut store).unwrap();
+            assert_eq!(
+                app.repaint_requested, case.want_repaint,
+                "{}: repaint requested",
+                case.name
+            );
+            assert_eq!(
+                app.view_mode == ViewMode::Filter,
+                case.want_filter_open,
+                "{}: filter opened",
+                case.name
+            );
+        }
     }
 
     /// Wheel events arrive in bursts, several per frame. Each has to build on

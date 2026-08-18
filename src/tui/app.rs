@@ -248,6 +248,15 @@ pub(crate) struct App {
     pub(crate) panes: super::panes::Panes,
     /// The optional status pane beside the log: open, docked, sized.
     pub(crate) status_pane: super::panes::StatusPane,
+    /// The layout the screen was last painted with, and whether a full repaint
+    /// has been asked for. A pane opening, moving or resizing changes which
+    /// cells mean what, and a diffing renderer only rewrites cells it believes
+    /// changed — so anything the old layout drew that the new one does not
+    /// reach stays on screen. The divider is the visible case: a dashed rule
+    /// left behind in the middle of the log.
+    pub(crate) painted_layout: Option<super::panes::StatusPane>,
+    /// Set by the redraw key, cleared by the next paint.
+    pub(crate) repaint_requested: bool,
     /// Which pane takes keys both could claim.
     pub(crate) focus: super::panes::Focus,
     /// Set while the divider is being dragged, so motion resizes instead of
@@ -373,6 +382,8 @@ impl App {
             log_popup: None,
             panes: super::panes::Panes::empty(),
             status_pane: super::panes::StatusPane::default(),
+            painted_layout: None,
+            repaint_requested: false,
             focus: super::panes::Focus::Logs,
             dragging_divider: false,
             services_order: Vec::new(),

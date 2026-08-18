@@ -38,7 +38,7 @@ pub(crate) enum Focus {
 }
 
 /// The status pane's state: whether it is open, where, and how big.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatusPane {
     pub(crate) open: bool,
     pub(crate) side: PaneSide,
