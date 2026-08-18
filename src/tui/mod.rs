@@ -135,21 +135,23 @@ impl ReleasedTerminal {
 
 /// The mouse reporting modes don actually uses.
 ///
-/// Deliberately *not* crossterm's `EnableMouseCapture`, which also turns on
-/// `?1003h` — "report every motion event". don has no hover behaviour, so every
-/// one of those reports is parsed and thrown away; what they cost is a flood of
-/// input for as long as the pointer merely crosses the window. That is enough
-/// to fill the input channel and leave a keystroke queued behind hundreds of
-/// events nobody wanted, which reads as the UI ignoring you.
+/// Deliberately *not* crossterm's `EnableMouseCapture`, though it now includes
+/// the same `?1003h` — the difference is what happens to the flood. `?1003h`
+/// reports every motion event for as long as the pointer crosses the window;
+/// forwarded raw, that fills the input channel and leaves a keystroke queued
+/// behind hundreds of events nobody wanted, which reads as the UI ignoring
+/// you. The input task therefore gates motion: only the moves shift-hover
+/// actually consumes are forwarded, and the rest die before the channel —
+/// see [`input::run`].
 ///
-/// `?1000h` reports press and release. `?1002h` adds motion *while a button is
-/// held*, which is what drag-select and the divider drag need and all they
-/// need. `?1006h` asks for SGR coordinates so columns past 223 are reportable —
-/// crossterm also sets the older `?1015h` (RXVT) alongside it, which some
-/// terminals answer in *both* encodings.
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// `?1000h` reports press and release. `?1002h` adds motion while a button is
+/// held (drag-select, the divider drag). `?1003h` adds motion with no button,
+/// which is what shift-hover needs. `?1006h` asks for SGR coordinates so
+/// columns past 223 are reportable — crossterm also sets the older `?1015h`
+/// (RXVT) alongside it, which some terminals answer in *both* encodings.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
 /// The same modes, reset in reverse.
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 type TuiTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -737,23 +739,39 @@ fn handle_key(
     Ok(())
 }
 
-fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
+fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Result<(), TuiError> {
+    // The half-finished `gg` chord: taken here so any key other than the
+    // second `g` clears it just by arriving.
+    let awaiting_second_g = std::mem::take(&mut app.pending_g);
     match key.code {
         // Held above the tail, Enter is the way back down — the gesture
-        // everyone tries first, and it costs nothing because the separator it
-        // would otherwise insert only makes sense at the bottom anyway.
-        KeyCode::Enter if app.log_scroll != logs::Scroll::Follow => {
+        // everyone tries first. Above means *actually* above: a view merely
+        // pinned at the tail (a selection does that) looks identical to
+        // following, and routing its Enter here would swallow the press —
+        // resume changes nothing visible, and the blank never happens.
+        KeyCode::Enter if app.log_scroll != logs::Scroll::Follow && !at_tail(app) => {
             resume_following(app);
         }
         KeyCode::Enter => {
-            // Mark the newest line as followed by a blank row, rather than
-            // pushing a blank line of its own. A pushed blank needs an id, and
-            // the only one going spare is the id the next real line will
-            // arrive with — see `App::blank_after`.
-            if let Some(id) = store.latest_id() {
+            // Mark the last line *on screen* as followed by a blank row.
+            //
+            // Not `store.latest_id()`: the store holds every process, and on a
+            // stack with hidden services the newest stored line is usually one
+            // the filter does not admit — a mark on an invisible line renders
+            // nothing, which reads as Enter being dead. The bottom visible row
+            // is, by definition, admitted.
+            //
+            // A mark rather than a pushed blank line, because a pushed blank
+            // needs an id and the only one going spare is the id the next real
+            // line will arrive with — see `App::blank_after`.
+            if let Some(&id) = app.log_visible_ids.last() {
                 let blanks = app.blank_after.entry(id).or_insert(0);
                 *blanks = blanks.saturating_add(1);
             }
+            // A pin left over from a settled selection would hold the view
+            // still while new output runs past it. Enter at the tail means
+            // "give me space for what comes next", so following resumes.
+            resume_following(app);
         }
         // The conventional "something has scribbled on my screen" key. An
         // escape hatch, not a fix: anything that leaves the terminal and this
@@ -785,12 +803,19 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         // Scrolling the log. The pane's own history is the only history now,
         // so these are load-bearing rather than a convenience over the
         // terminal's scrollback.
-        KeyCode::Up => scroll_log(app, |p| p.rows -= 1),
-        KeyCode::Down => scroll_log(app, |p| p.rows += 1),
+        KeyCode::Up | KeyCode::Char('k') => scroll_log(app, |p| p.rows -= 1),
+        KeyCode::Down | KeyCode::Char('j') => scroll_log(app, |p| p.rows += 1),
         KeyCode::PageUp => scroll_log(app, |p| p.pages -= 1),
         KeyCode::PageDown => scroll_log(app, |p| p.pages += 1),
+        // Vim's verticals. `gg` is a chord: the first press arms it, the
+        // second lands it, anything in between disarms it by arriving.
+        // Ctrl+D/Ctrl+U half-pages are deliberately absent — Ctrl+D is
+        // detach on a remote TUI, and a movement key that detaches you on
+        // one invocation and scrolls on the other is worse than no key.
+        KeyCode::Char('g') if awaiting_second_g => scroll_log(app, |p| p.to_top = true),
+        KeyCode::Char('g') => app.pending_g = true,
         KeyCode::Home => scroll_log(app, |p| p.to_top = true),
-        KeyCode::End => {
+        KeyCode::End | KeyCode::Char('G') => {
             app.log_selection.clear();
             app.follow_paused_for_selection = false;
             app.log_scroll = logs::Scroll::Follow;
@@ -897,6 +922,16 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             app.dragging_divider = false;
             app.log_selection.finish();
         }
+        // Only the moves shift-hover consumes get this far — the input task
+        // gates the rest. Where the pointer is, resolved to a message every
+        // frame by the renderer.
+        MouseEventKind::Moved => {
+            app.hover = if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                Some((mouse.column, mouse.row))
+            } else {
+                None
+            };
+        }
         _ => {}
     }
 }
@@ -949,20 +984,9 @@ fn select_message(app: &mut App, row: u16) {
     let Some(index) = row.checked_sub(origin_y).map(usize::from) else {
         return;
     };
-    let Some(&id) = app.log_visible_ids.get(index) else {
+    let Some((first, last)) = app::message_run(&app.log_visible_ids, index) else {
         return;
     };
-    // The run of visible rows sharing this id. Only what is on screen: the
-    // selection is screen coordinates, so a message running off the top or
-    // bottom is taken as far as it is visible.
-    let first = app.log_visible_ids[..index]
-        .iter()
-        .rposition(|other| *other != id)
-        .map_or(0, |before| before + 1);
-    let last = app.log_visible_ids[index..]
-        .iter()
-        .position(|other| *other != id)
-        .map_or(app.log_visible_ids.len() - 1, |after| index + after - 1);
 
     let end_col = app
         .log_visible_rows
@@ -1039,6 +1063,15 @@ fn clear_selection(app: &mut App) {
 fn resume_following(app: &mut App) {
     app.follow_paused_for_selection = false;
     app.log_scroll = logs::Scroll::Follow;
+}
+
+/// Whether the view's bottom edge is at the newest admitted content —
+/// following, or pinned in the place following would be.
+///
+/// From the geometry the last frame measured, which is the same answer the
+/// user is looking at.
+fn at_tail(app: &App) -> bool {
+    app.log_total_rows <= app.log_rows_above + usize::from(app.log_pane_height)
 }
 
 /// Put the current selection on the clipboard, and say so.
@@ -1982,6 +2015,200 @@ mod tests {
 
             let (start, end) = app.log_selection.span().expect("a selection");
             assert_eq!((start.1, end.1), case.want, "{}: rows covered", case.name);
+        }
+    }
+
+    /// Enter's blank goes after the last line the reader can *see*, and only
+    /// a view genuinely above the tail treats Enter as "take me back down".
+    ///
+    /// The failure modes this pins: marking the store's newest line put the
+    /// blank on a filtered-out line and rendered nothing, and a view pinned
+    /// at the tail by a settled selection swallowed the first Enter into a
+    /// visually inert "resume".
+    #[test]
+    fn enter_marks_the_last_visible_line() {
+        use crate::output::LogId;
+
+        struct Case {
+            name: &'static str,
+            scroll: logs::Scroll,
+            /// Geometry as the last frame measured it.
+            rows_above: usize,
+            total_rows: usize,
+            /// Ids of the rows on screen, bottom-most last.
+            visible: &'static [u64],
+            /// The id that should carry a blank mark afterwards, if any.
+            want_mark: Option<u64>,
+            want_follow: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "following: blank goes after the bottom visible row",
+                scroll: logs::Scroll::Follow,
+                rows_above: 80,
+                total_rows: 100,
+                visible: &[7, 9, 12],
+                want_mark: Some(12),
+                want_follow: true,
+            },
+            Case {
+                name: "pinned at the tail still adds the blank, then follows",
+                scroll: logs::Scroll::At {
+                    id: LogId(7),
+                    row: 0,
+                },
+                rows_above: 80,
+                total_rows: 100,
+                visible: &[7, 9, 12],
+                want_mark: Some(12),
+                want_follow: true,
+            },
+            Case {
+                name: "held above the tail, Enter is the way back down",
+                scroll: logs::Scroll::At {
+                    id: LogId(3),
+                    row: 0,
+                },
+                rows_above: 10,
+                total_rows: 100,
+                visible: &[3, 4, 5],
+                want_mark: None,
+                want_follow: true,
+            },
+            Case {
+                name: "an empty pane has nothing to mark",
+                scroll: logs::Scroll::Follow,
+                rows_above: 0,
+                total_rows: 0,
+                visible: &[],
+                want_mark: None,
+                want_follow: true,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            app.log_scroll = case.scroll;
+            app.log_rows_above = case.rows_above;
+            app.log_total_rows = case.total_rows;
+            app.log_pane_height = 20;
+            app.log_visible_ids = case.visible.iter().map(|id| LogId(*id)).collect();
+            let mut store = LogStore::with_capacity(10);
+
+            handle_normal_key(
+                KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+                &mut app,
+                &mut store,
+            )
+            .unwrap();
+
+            match case.want_mark {
+                Some(id) => assert_eq!(
+                    app.blank_after.get(&LogId(id)),
+                    Some(&1),
+                    "{}: the mark",
+                    case.name
+                ),
+                None => assert!(
+                    app.blank_after.is_empty(),
+                    "{}: nothing should be marked",
+                    case.name
+                ),
+            }
+            assert_eq!(
+                app.log_scroll == logs::Scroll::Follow,
+                case.want_follow,
+                "{}: following afterwards",
+                case.name
+            );
+        }
+    }
+
+    /// The vim verticals map onto the same intent the arrows record, and `gg`
+    /// is a chord — the cases that matter are the ones where the chord has to
+    /// disarm: a `g` followed by anything that is not another `g`.
+    #[test]
+    fn vim_keys_record_the_same_intent_as_the_arrows() {
+        use super::app::PendingScroll;
+        use crossterm::event::{KeyEvent, KeyModifiers};
+
+        struct Case {
+            name: &'static str,
+            keys: &'static [char],
+            want: PendingScroll,
+            /// Whether the view should have returned to following the tail.
+            want_follow: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "k is up one row",
+                keys: &['k'],
+                want: PendingScroll {
+                    rows: -1,
+                    ..PendingScroll::default()
+                },
+                want_follow: false,
+            },
+            Case {
+                name: "j is down one row",
+                keys: &['j'],
+                want: PendingScroll {
+                    rows: 1,
+                    ..PendingScroll::default()
+                },
+                want_follow: false,
+            },
+            Case {
+                name: "gg jumps to the top",
+                keys: &['g', 'g'],
+                want: PendingScroll {
+                    to_top: true,
+                    ..PendingScroll::default()
+                },
+                want_follow: false,
+            },
+            Case {
+                name: "a broken chord is just the second key",
+                keys: &['g', 'j'],
+                want: PendingScroll {
+                    rows: 1,
+                    ..PendingScroll::default()
+                },
+                want_follow: false,
+            },
+            Case {
+                name: "G returns to the tail",
+                keys: &['G'],
+                want: PendingScroll::default(),
+                want_follow: true,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            // Start held somewhere, so returning to the tail is observable.
+            app.log_scroll = logs::Scroll::At {
+                id: crate::output::LogId(3),
+                row: 0,
+            };
+            let mut store = LogStore::with_capacity(10);
+            for key in case.keys {
+                handle_normal_key(
+                    KeyEvent::new(KeyCode::Char(*key), KeyModifiers::NONE),
+                    &mut app,
+                    &mut store,
+                )
+                .unwrap();
+            }
+            assert_eq!(app.pending_scroll, case.want, "{}: intent", case.name);
+            assert_eq!(
+                app.log_scroll == logs::Scroll::Follow,
+                case.want_follow,
+                "{}: following",
+                case.name
+            );
         }
     }
 

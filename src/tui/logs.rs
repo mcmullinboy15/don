@@ -81,7 +81,7 @@ pub(crate) struct LogView<'a> {
 /// something that only exists on whichever rows happen to start a message.
 fn continuation_indent(prefix_cols: usize) -> String {
     match prefix_cols.checked_sub(2) {
-        Some(pad) => format!("{}| ", " ".repeat(pad)),
+        Some(pad) => format!("{}│ ", " ".repeat(pad)),
         None => " ".repeat(prefix_cols),
     }
 }
@@ -470,14 +470,14 @@ mod tests {
                 input: "api | abcdefghijkl",
                 prefix: 6,
                 width: 12,
-                want: vec!["api | abcdef", "    | ghijkl"],
+                want: vec!["api | abcdef", "    │ ghijkl"],
             },
             Case {
                 name: "three rows keep the same indent",
                 input: "api | abcdefghijklmnopqr",
                 prefix: 6,
                 width: 12,
-                want: vec!["api | abcdef", "    | ghijkl", "    | mnopqr"],
+                want: vec!["api | abcdef", "    │ ghijkl", "    │ mnopqr"],
             },
             Case {
                 name: "a short line is one row and is not padded out",

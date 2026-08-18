@@ -70,8 +70,10 @@ pub(crate) struct Panes {
     /// `None` when the status pane is closed, or when the terminal is too
     /// small to split without starving the log.
     pub(crate) status: Option<Rect>,
-    /// The one-cell line between them, for the resize drag. Empty when there
-    /// is no split.
+    /// The grab handle for the resize drag: the status pane's border edge
+    /// facing the log. Not drawn separately — the pane's own `Block` border is
+    /// the visible line, so there is exactly one rule between the panes
+    /// instead of a hand-drawn divider stacked beside a border.
     pub(crate) divider: Option<Rect>,
     pub(crate) bar: Rect,
 }
@@ -144,7 +146,7 @@ pub(crate) fn layout(area: Rect, bar_height: u16, status: StatusPane) -> Panes {
         PaneSide::Right => {
             // Too narrow to split: the log keeps the space. Silently refusing
             // beats a two-column status pane and a five-column log.
-            if body.width < MIN_LOGS + MIN_STATUS + 1 {
+            if body.width < MIN_LOGS + MIN_STATUS {
                 return Panes {
                     logs: body,
                     status: None,
@@ -152,24 +154,27 @@ pub(crate) fn layout(area: Rect, bar_height: u16, status: StatusPane) -> Panes {
                     bar,
                 };
             }
-            let width = status.extent.clamp(MIN_STATUS, body.width - MIN_LOGS - 1);
+            let width = status.extent.clamp(MIN_STATUS, body.width - MIN_LOGS);
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Min(MIN_LOGS),
-                    Constraint::Length(1),
-                    Constraint::Length(width),
-                ])
+                .constraints([Constraint::Min(MIN_LOGS), Constraint::Length(width)])
                 .split(body);
+            let status_rect = chunks[1];
             Panes {
                 logs: chunks[0],
-                divider: Some(chunks[1]),
-                status: Some(chunks[2]),
+                // The status block's left border column.
+                divider: Some(Rect::new(
+                    status_rect.x,
+                    status_rect.y,
+                    1,
+                    status_rect.height,
+                )),
+                status: Some(status_rect),
                 bar,
             }
         }
         PaneSide::Bottom => {
-            if body.height < 6 + 1 + 3 {
+            if body.height < 6 + 3 {
                 return Panes {
                     logs: body,
                     status: None,
@@ -177,19 +182,22 @@ pub(crate) fn layout(area: Rect, bar_height: u16, status: StatusPane) -> Panes {
                     bar,
                 };
             }
-            let height = status.extent.clamp(3, body.height - 6 - 1);
+            let height = status.extent.clamp(3, body.height - 6);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(6),
-                    Constraint::Length(1),
-                    Constraint::Length(height),
-                ])
+                .constraints([Constraint::Min(6), Constraint::Length(height)])
                 .split(body);
+            let status_rect = chunks[1];
             Panes {
                 logs: chunks[0],
-                divider: Some(chunks[1]),
-                status: Some(chunks[2]),
+                // The status block's top border row.
+                divider: Some(Rect::new(
+                    status_rect.x,
+                    status_rect.y,
+                    status_rect.width,
+                    1,
+                )),
+                status: Some(status_rect),
                 bar,
             }
         }
@@ -202,11 +210,11 @@ pub(crate) fn layout(area: Rect, bar_height: u16, status: StatusPane) -> Panes {
 /// still live; clamping happens in [`layout`], which is the only place that
 /// knows the current terminal size.
 pub(crate) fn extent_from_drag(area: Rect, side: PaneSide, column: u16, row: u16) -> u16 {
+    // The border being dragged is part of the status pane's own extent, so the
+    // new extent runs from the pointer to the far screen edge inclusive.
     match side {
-        PaneSide::Right => (area.x + area.width)
-            .saturating_sub(column)
-            .saturating_sub(1),
-        PaneSide::Bottom => (area.y + area.height).saturating_sub(row).saturating_sub(1),
+        PaneSide::Right => (area.x + area.width).saturating_sub(column),
+        PaneSide::Bottom => (area.y + area.height).saturating_sub(row),
     }
 }
 
@@ -247,7 +255,7 @@ mod tests {
                     extent: 40,
                 },
                 want_status: true,
-                want_log_width: Some(79),
+                want_log_width: Some(80),
             },
             Case {
                 name: "an oversized extent is clamped, not honoured",
@@ -273,7 +281,7 @@ mod tests {
             },
             Case {
                 name: "too short to split vertically",
-                area: Rect::new(0, 0, 120, 12),
+                area: Rect::new(0, 0, 120, 11),
                 status: StatusPane {
                     open: true,
                     side: PaneSide::Bottom,
@@ -331,7 +339,7 @@ mod tests {
         );
         assert!(
             panes.on_divider(panes.logs.width, 5),
-            "the gap between them"
+            "the status pane's border facing the log"
         );
         assert_eq!(panes.hit(0, 39), None, "the bar belongs to neither pane");
     }
@@ -341,12 +349,14 @@ mod tests {
     #[test]
     fn dragging_the_divider_resizes_toward_the_pointer() {
         let area = Rect::new(0, 0, 120, 40);
-        assert_eq!(extent_from_drag(area, PaneSide::Right, 80, 0), 39);
+        // The dragged border is part of the status pane, so the extent runs
+        // from the pointer to the far edge inclusive.
+        assert_eq!(extent_from_drag(area, PaneSide::Right, 80, 0), 40);
         assert_eq!(
             extent_from_drag(area, PaneSide::Right, 60, 0),
-            59,
+            60,
             "dragging further left gives the status pane more room"
         );
-        assert_eq!(extent_from_drag(area, PaneSide::Bottom, 0, 30), 9);
+        assert_eq!(extent_from_drag(area, PaneSide::Bottom, 0, 30), 10);
     }
 }

@@ -144,6 +144,28 @@ pub(crate) struct StashedView {
     pub(crate) blank_after: HashMap<crate::output::LogId, u16>,
 }
 
+/// The run of visible rows that belong to the same message as row `index`.
+///
+/// A message that wrapped is one thing to the reader, so both triple-click and
+/// shift-hover work on the run, not the row. One definition, because the two
+/// growing their own copies of "which rows are one message" is how a hover
+/// would highlight a different extent than a click selects.
+///
+/// Only what is on screen: a message running off an edge is taken as far as it
+/// is visible. Returns `None` when `index` is outside the row list.
+pub(crate) fn message_run(ids: &[crate::output::LogId], index: usize) -> Option<(usize, usize)> {
+    let id = *ids.get(index)?;
+    let first = ids[..index]
+        .iter()
+        .rposition(|other| *other != id)
+        .map_or(0, |before| before + 1);
+    let last = ids[index..]
+        .iter()
+        .position(|other| *other != id)
+        .map_or(ids.len() - 1, |after| index + after - 1);
+    Some((first, last))
+}
+
 /// A scroll the reader asked for, in units that do not need geometry to
 /// express: rows, pages, and the two ends.
 ///
@@ -301,6 +323,19 @@ pub(crate) struct App {
     /// Set while the divider is being dragged, so motion resizes instead of
     /// selecting text.
     pub(crate) dragging_divider: bool,
+    /// Where the pointer is while shift is held, in screen coordinates.
+    ///
+    /// The renderer maps it to a message each frame and gives that message a
+    /// faint background, so a long wrapped line can be read without losing
+    /// one's place. Position rather than a resolved message id: the view moves
+    /// under a still pointer, and re-resolving per frame makes the highlight
+    /// track what is actually under the cursor instead of chasing a line that
+    /// scrolled away.
+    pub(crate) hover: Option<(u16, u16)>,
+    /// A `g` was pressed and the next key decides: another `g` jumps to the
+    /// top, anything else is just itself. Vim's chord, minus the timeout —
+    /// a stale half-chord is cleared by whatever key comes next.
+    pub(crate) pending_g: bool,
     /// The row order each status table was opened with.
     ///
     /// The tables sort by state — failures first — which is what you want when
@@ -457,6 +492,8 @@ impl App {
             repaint_requested: false,
             focus: super::panes::Focus::Logs,
             dragging_divider: false,
+            hover: None,
+            pending_g: false,
             services_order: Vec::new(),
             tasks_order: Vec::new(),
             view_index: super::view_index::ViewIndex::default(),

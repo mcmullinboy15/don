@@ -244,6 +244,13 @@ impl LogStore {
     }
 
     /// Id of the most recently stored line, if any.
+    ///
+    /// Test-only. Enter's blank mark used it once, and marking the newest
+    /// *stored* line was the bug: with hidden services chattering, the newest
+    /// stored line is usually one the filter does not admit, so the mark
+    /// rendered nothing. What the display marks is the newest *visible* line,
+    /// which only the renderer knows.
+    #[cfg(test)]
     pub(crate) fn latest_id(&self) -> Option<LogId> {
         self.entries.back().map(|entry| entry.id)
     }
@@ -283,7 +290,7 @@ mod tests {
         store.reflow(80);
         store.push(LogId(0), line("api", "first"));
 
-        // What Enter does now: mark the newest line, touching nothing.
+        // What Enter does now: mark a line it can see, touching nothing.
         let marked = store.latest_id().unwrap();
         assert_eq!(marked, LogId(0));
         assert_eq!(store.next_id(), LogId(1), "the mark takes no id");

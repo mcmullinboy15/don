@@ -37,19 +37,36 @@ use crate::task_state::TaskRunInfo;
 /// content, bottom border.
 pub(crate) const BAR_HEIGHT: u16 = 3;
 
-/// Width available to log text, which is what the store wraps against.
-/// The log pane's top-left corner, for a caller working in screen coordinates
-/// — the selection, which needs to know where column zero of the log is.
-pub(crate) fn log_pane_origin(area: Rect, status: super::panes::StatusPane) -> (u16, u16) {
-    let logs = super::panes::layout(area, BAR_HEIGHT, status).logs;
-    (logs.x, logs.y)
+/// The rectangle log text actually occupies: the log pane minus its border.
+///
+/// The one definition of that inset. The store wraps against this width, the
+/// selection clamps against this origin, and the renderer paints inside it —
+/// three readers, and any two of them computing the inset independently is a
+/// one-cell disagreement that shows up as a selection off by a column.
+pub(crate) fn log_text_area(area: Rect, status: super::panes::StatusPane) -> Rect {
+    inner(super::panes::layout(area, BAR_HEIGHT, status).logs)
 }
 
+/// `Block::inner` for a plain full border, without needing the block.
+fn inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+/// The log pane's top-left text corner, for a caller working in screen
+/// coordinates — the selection, which needs to know where column zero is.
+pub(crate) fn log_pane_origin(area: Rect, status: super::panes::StatusPane) -> (u16, u16) {
+    let text = log_text_area(area, status);
+    (text.x, text.y)
+}
+
+/// Width available to log text, which is what the store wraps against.
 pub(crate) fn log_pane_width(area: Rect, status: super::panes::StatusPane) -> u16 {
-    super::panes::layout(area, BAR_HEIGHT, status)
-        .logs
-        .width
-        .max(1)
+    log_text_area(area, status).width.max(1)
 }
 
 /// Paint the whole screen.
@@ -73,9 +90,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
     if let Some(status_area) = panes.status {
         draw_status_pane(frame, app, status_area);
     }
-    if let Some(divider) = panes.divider {
-        draw_divider(frame, divider, app.status_pane.side);
-    }
+    // No separate divider: the two panes' own borders are the lines between
+    // them, and `panes.divider` is only the drag-handle rectangle over the
+    // status pane's edge.
     draw_bar(frame, app, panes.bar);
 
     // Full-screen views replace the log pane rather than living on a second
@@ -109,6 +126,29 @@ fn draw_log_pane(
     if area.height == 0 || area.width == 0 {
         return;
     }
+    // The pane is a bordered box like everything else on screen, so the lines
+    // between regions are all the same kind of line. Text lives in the inner
+    // rect; every geometry below uses it, and the standalone helpers
+    // (`log_text_area`) apply the same inset so the input layer agrees.
+    let focused = app.focus == super::panes::Focus::Logs;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
+        .title(if app.debug_view {
+            " don's log "
+        } else {
+            " logs "
+        });
+    let text_area = block.inner(area);
+    frame.render_widget(block, area);
+    if text_area.height == 0 || text_area.width == 0 {
+        return;
+    }
+    let area = text_area;
     // Mend the index before reading it: this is the one place that knows the
     // pane's width, and the filter may have moved since the last frame.
     let key = super::view_index::ViewKey {
@@ -164,7 +204,7 @@ fn draw_log_pane(
     app.log_pane_origin = (area.x, area.y);
 
     let selection = app.log_selection;
-    let rows: Vec<Line<'_>> = if selection.is_empty() {
+    let mut rows: Vec<Line<'_>> = if selection.is_empty() {
         view.rows
     } else {
         view.rows
@@ -176,6 +216,21 @@ fn draw_log_pane(
             })
             .collect()
     };
+    // Shift-hover: a faint band under the message the pointer is on, all of
+    // its wrapped rows, so a long line can be read without losing the place.
+    // Resolved against this frame's rows — the position is remembered, not
+    // the message, so scrolling under a still pointer highlights whatever is
+    // there now.
+    if let Some((column, row)) = app.hover
+        && column >= area.x
+        && column < area.x + area.width
+        && let Some(index) = row.checked_sub(area.y).map(usize::from)
+        && let Some((first, last)) = super::app::message_run(&view.row_ids, index)
+    {
+        for line in rows.get_mut(first..=last).unwrap_or_default() {
+            hover_wash(line, area.width);
+        }
+    }
     frame.render_widget(Paragraph::new(rows), area);
 
     if !following {
@@ -254,25 +309,27 @@ fn status_row(name: &str, label: Cow<'static, str>, color: Color) -> Line<'stati
     ])
 }
 
-/// The one-cell line between the panes. Drawn as a rule so it reads as a
-/// grab handle rather than as a gap.
-fn draw_divider(frame: &mut Frame<'_>, area: Rect, side: super::panes::PaneSide) {
-    // Dotted rather than solid so it reads as a grab handle and not as a
-    // second copy of the status pane's own border, which sits right beside it.
-    let glyph = match side {
-        super::panes::PaneSide::Right => "┊",
-        super::panes::PaneSide::Bottom => "┄",
-    };
-    let lines: Vec<Line<'static>> = match side {
-        super::panes::PaneSide::Right => (0..area.height)
-            .map(|_| Line::from(Span::styled(glyph, Style::default().fg(Color::DarkGray))))
-            .collect(),
-        super::panes::PaneSide::Bottom => vec![Line::from(Span::styled(
-            glyph.repeat(area.width as usize),
-            Style::default().fg(Color::DarkGray),
-        ))],
-    };
-    frame.render_widget(Paragraph::new(lines), area);
+/// Give one row the hover wash: a faint background across the pane's full
+/// width, under whatever styling the text already has.
+///
+/// The spans only cover the cells the text occupies, so the row is padded out
+/// with washed spaces — without that the band would end mid-row at the last
+/// character and read as a smear rather than a bar. Indexed 236 rather than
+/// the palette's `DarkGray`: this is a wash behind text of arbitrary colours,
+/// and the palette grey is bright enough on most themes to fight dim text for
+/// contrast.
+fn hover_wash(line: &mut Line<'_>, width: u16) {
+    const WASH: Color = Color::Indexed(236);
+    let mut used = 0usize;
+    for span in &mut line.spans {
+        used += span.content.chars().count();
+        span.style = span.style.bg(WASH);
+    }
+    let pad = usize::from(width).saturating_sub(used);
+    if pad > 0 {
+        line.spans
+            .push(Span::styled(" ".repeat(pad), Style::default().bg(WASH)));
+    }
 }
 
 /// Re-style the cells of one row that fall inside the selection.

@@ -653,9 +653,13 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Build a formatted prefix as bytes for a service name.
+///
+/// The separator is the box-drawing `│`, not the ASCII pipe: `│` fills the
+/// cell top to bottom, so a column of them down the pane joins into one solid
+/// rule, where `|` leaves a gap above and below and reads as a dashed line.
 fn format_prefix(name: &str, color: Color, max_name_len: usize) -> Bytes {
     Bytes::from(format!(
-        "{}{:width$}{} | ",
+        "{}{:width$}{} │ ",
         SetForegroundColor(color),
         name,
         ResetColor,
@@ -1318,7 +1322,7 @@ impl OutputManager {
         }
 
         let don_prefix = format!(
-            "{}{:width$}{} | ",
+            "{}{:width$}{} │ ",
             SetAttribute(Attribute::Bold),
             "[don]",
             SetAttribute(Attribute::Reset),
@@ -2567,7 +2571,7 @@ mod tests {
         for case in cases {
             let prefix = format_prefix(case.service_name, Color::Cyan, case.max_len);
             let stripped = strip_ansi(&prefix);
-            let expected = format!("{:width$} | ", case.service_name, width = case.max_len);
+            let expected = format!("{:width$} │ ", case.service_name, width = case.max_len);
             assert_eq!(stripped, expected, "case: {}", case.name);
         }
     }
@@ -3237,13 +3241,13 @@ mod tests {
             Case {
                 name: "a lifecycle event is spoken by don",
                 emit: |mgr| mgr.lifecycle_event("loading don.toml"),
-                want_prefix: "[don]    | ",
+                want_prefix: "[don]    │ ",
                 want_message: "loading don.toml",
             },
             Case {
                 name: "a service-scoped event is still don speaking",
                 emit: |mgr| mgr.service_event("postgres", "started"),
-                want_prefix: "[don]    | ",
+                want_prefix: "[don]    │ ",
                 want_message: "postgres: started",
             },
         ];

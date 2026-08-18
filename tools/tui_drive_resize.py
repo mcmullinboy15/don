@@ -48,14 +48,24 @@ def tlog(start, message):
 
 
 def anchor_line(session):
-    """The topmost non-blank row of the log pane — what the reader is looking at.
+    """The topmost content row of the log pane — what the reader is looking at.
 
     Compared as text rather than by id because the id is don's internal state;
     what matters to the user is that the same *line* is still there.
+
+    The log pane has a border now, and anchoring on a border row would make
+    this check pass trivially — every width's border starts with the same
+    corner, rule and title. Border rows are recognisable by their first
+    character: content rows start with the pane's left border `│` followed by
+    text, while pure border rows start with a corner or tee, so we strip one
+    leading `│` and skip anything that is still box-drawing or blank.
     """
+    box = set("┌┐└┘├┤┬┴┼─│┄┊")
     for line in session.screen.display():
         stripped = line.strip()
-        if stripped:
+        if stripped.startswith("│"):
+            stripped = stripped[1:].strip()
+        if stripped and stripped[0] not in box:
             return stripped
     return ""
 
