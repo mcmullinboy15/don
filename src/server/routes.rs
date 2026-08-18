@@ -401,6 +401,11 @@ async fn get_all_logs(
                     "name": entry.line.name,
                     "lifecycle": entry.line.is_lifecycle,
                     "verbose": entry.line.is_verbose,
+                    // The rendered name column, sent beside the message rather
+                    // than glued to it: a client that wants one string joins
+                    // them, one that lays the name out as a column already has
+                    // the split. See `FormattedLogLine::prefix`.
+                    "prefix": String::from_utf8_lossy(&entry.line.prefix),
                     "line": String::from_utf8_lossy(&entry.line.bytes),
                 }),
                 crate::output::MergedEvent::Dropped { count, resumed_at } => serde_json::json!({

@@ -122,6 +122,12 @@ pub enum LogStreamEvent {
         /// stream; the reader decides whether to display them.
         #[serde(default)]
         verbose: bool,
+        /// The rendered name column — padded, coloured, with its separator,
+        /// and the elapsed stamp when verbose. Empty from a runner that
+        /// predates the split, in which case `line` carries it inline.
+        #[serde(default)]
+        prefix: String,
+        /// The message, with whatever styling the process emitted. No prefix.
         line: String,
     },
     /// `dropped` lines are gone for good and the stream continues from

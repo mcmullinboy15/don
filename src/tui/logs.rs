@@ -66,32 +66,6 @@ pub(crate) struct LogView<'a> {
     pub(crate) total_rows: usize,
 }
 
-/// Where the `name | ` prefix ends, in columns.
-///
-/// don builds each line as a padded process name, a `| `, then the message, so
-/// the first `| ` is the column boundary. A process name cannot contain one, so
-/// taking the first is exact rather than a guess — and a message that contains
-/// `| ` later is unaffected.
-///
-/// Zero when there is no prefix at all, which is how a line with no owning
-/// process (or a stream-end marker) renders full width.
-pub(crate) fn prefix_columns(line: &Line<'_>) -> usize {
-    let mut before = 0usize;
-    let mut carry = false; // the previous span ended on a '|'
-    for span in &line.spans {
-        let text: &str = span.content.as_ref();
-        if carry && text.starts_with(' ') {
-            return before + 1;
-        }
-        if let Some(at) = text.find("| ") {
-            return before + text[..at].chars().count() + 2;
-        }
-        carry = text.ends_with('|');
-        before += text.chars().count();
-    }
-    0
-}
-
 /// The left column on a row that is a continuation of the row above.
 ///
 /// Blank where the name would be, but the separator is carried down, so the
@@ -343,6 +317,7 @@ mod tests {
                     name: name.to_string(),
                     is_lifecycle: false,
                     is_verbose: false,
+                    prefix: Vec::new(),
                     bytes: body.as_bytes().to_vec(),
                 },
             );
@@ -373,6 +348,9 @@ mod tests {
         struct Case {
             name: &'static str,
             input: &'static str,
+            /// Columns the name column takes — the sink tells the store this,
+            /// so a test states it rather than recovering it from the text.
+            prefix: usize,
             width: u16,
             want: Vec<&'static str>,
         }
@@ -383,30 +361,35 @@ mod tests {
                 // prefix "api | " is 6 columns, so the message column is 6 wide
                 // at width 12.
                 input: "api | abcdefghijkl",
+                prefix: 6,
                 width: 12,
                 want: vec!["api | abcdef", "    | ghijkl"],
             },
             Case {
                 name: "three rows keep the same indent",
                 input: "api | abcdefghijklmnopqr",
+                prefix: 6,
                 width: 12,
                 want: vec!["api | abcdef", "    | ghijkl", "    | mnopqr"],
             },
             Case {
                 name: "a short line is one row and is not padded out",
                 input: "api | hi",
+                prefix: 6,
                 width: 12,
                 want: vec!["api | hi"],
             },
             Case {
                 name: "no prefix means no column, and it wraps full width",
                 input: "abcdefghijklmn",
+                prefix: 0,
                 width: 12,
                 want: vec!["abcdefghijkl", "mn"],
             },
             Case {
                 name: "a pane too narrow for the column falls back to full width",
                 input: "api | abcdef",
+                prefix: 6,
                 width: 6,
                 want: vec!["api | ", "abcdef"],
             },
@@ -414,7 +397,7 @@ mod tests {
 
         for case in cases {
             let line = styled(case.input);
-            let prefix = prefix_columns(&line);
+            let prefix = case.prefix;
             let rows = wrap_line(&line, prefix, case.width);
             let got: Vec<String> = rows.iter().map(row_text).collect();
             assert_eq!(got, case.want, "{}", case.name);
@@ -424,59 +407,6 @@ mod tests {
                 "{}: the count must match what the wrap produced",
                 case.name
             );
-        }
-    }
-
-    /// The boundary is the first `| `, wherever the styling happens to split.
-    #[test]
-    fn the_prefix_column_ends_at_the_first_separator() {
-        struct Case {
-            name: &'static str,
-            spans: Vec<&'static str>,
-            want: usize,
-        }
-
-        let cases = vec![
-            Case {
-                name: "one span",
-                spans: vec!["api | hello"],
-                want: 6,
-            },
-            Case {
-                name: "coloured name, then the separator",
-                spans: vec!["api", " | ", "hello"],
-                want: 6,
-            },
-            Case {
-                name: "the separator itself split across spans",
-                spans: vec!["api |", " hello"],
-                want: 6,
-            },
-            Case {
-                name: "a pipe in the message does not count",
-                spans: vec!["api | a | b"],
-                want: 6,
-            },
-            Case {
-                name: "no separator at all",
-                spans: vec!["just a bare line"],
-                want: 0,
-            },
-            Case {
-                name: "padded names give a wider column",
-                spans: vec!["nodejs-install  | building"],
-                want: 18,
-            },
-        ];
-
-        for case in cases {
-            let line = Line::from(
-                case.spans
-                    .iter()
-                    .map(|text| Span::raw(text.to_string()))
-                    .collect::<Vec<_>>(),
-            );
-            assert_eq!(prefix_columns(&line), case.want, "{}", case.name);
         }
     }
 
@@ -643,7 +573,7 @@ mod tests {
             // Both with and without a prefix column: the count and the wrap
             // must agree either way, since the anchor is placed from one and
             // the content drawn from the other.
-            for prefix in [0, prefix_columns(&line)] {
+            for prefix in [0, 6] {
                 assert_eq!(
                     count_wrapped_rows(&line, prefix, case.width),
                     wrap_line(&line, prefix, case.width).len(),

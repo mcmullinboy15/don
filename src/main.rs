@@ -1719,13 +1719,14 @@ async fn attach_tui_inner(
         loop {
             tokio::select! {
                 remote = remote_rx.recv() => match remote {
-                    Some(LogStreamEvent::Line { id, name, lifecycle, verbose, line }) => {
+                    Some(LogStreamEvent::Line { id, name, lifecycle, verbose, prefix, line }) => {
                         let event = don::output::MergedEvent::Line(don::output::MergedLine {
                             id,
                             line: std::sync::Arc::new(don::output::FormattedLogLine {
                                 name,
                                 is_lifecycle: lifecycle,
                                 is_verbose: verbose,
+                                prefix: prefix.into_bytes(),
                                 bytes: line.into_bytes(),
                             }),
                             // The wire doesn't carry it and this side doesn't

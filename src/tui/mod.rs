@@ -207,6 +207,9 @@ fn push_merged_event(
                 name: crate::output::LIFECYCLE_EVENT_NAME.to_string(),
                 is_lifecycle: true,
                 is_verbose: false,
+                // The gap notice is the TUI's own, so it has no prefix from
+                // the sink to sit under.
+                prefix: Vec::new(),
                 bytes: format!(
                     "{count} log line(s) dropped — history did not reach back far enough"
                 )
@@ -664,6 +667,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
                     name: String::new(),
                     is_verbose: false,
                     is_lifecycle: false,
+                    prefix: Vec::new(),
                     bytes: Vec::new(),
                 },
             );

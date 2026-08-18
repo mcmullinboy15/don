@@ -289,8 +289,22 @@ pub struct FormattedLogLine {
     pub is_lifecycle: bool,
     /// True for verbose diagnostic messages; see [`SinkLine::is_verbose`].
     pub is_verbose: bool,
-    /// Fully formatted line bytes. Does NOT include a trailing newline —
-    /// the renderer appends one (or, for ratatui, treats it as one row).
+    /// The rendered left column: the padded, coloured process name and its
+    /// separator, plus the elapsed-time stamp when verbose is on. Empty for a
+    /// line that has no owning process.
+    ///
+    /// Sent beside the message rather than glued to the front of it. A consumer
+    /// that wants one string concatenates the two; one that wants to lay the
+    /// name out as a column — the TUI, which indents what wraps underneath it —
+    /// has the split already, instead of searching the text for a separator to
+    /// recover something the sink had just finished joining.
+    ///
+    /// Rendered here rather than at each consumer so that padding and colour
+    /// are decided once: pipe mode and the TUI cannot disagree about how wide
+    /// the column is or what colour a service gets.
+    pub prefix: Vec<u8>,
+    /// The message, sanitized, with whatever styling the process itself emitted.
+    /// No prefix and no trailing newline — the renderer supplies both.
     pub bytes: Vec<u8>,
 }
 
@@ -2281,7 +2295,14 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
         name: name.to_string(),
         is_lifecycle,
         is_verbose,
-        bytes: bytes.clone(),
+        // Everything `bytes` has that the message does not: the timestamp when
+        // verbose, then the prefix. Split rather than re-derived, so no
+        // consumer has to work out where one ends and the other begins.
+        prefix: bytes
+            .get(..bytes.len() - line.len())
+            .unwrap_or_default()
+            .to_vec(),
+        bytes: line.to_vec(),
     });
     // Feed the tap first, so history and followers see the line even if
     // the writer below blocks.
@@ -3045,6 +3066,7 @@ mod tests {
                     name: "api".to_string(),
                     is_lifecycle: false,
                     is_verbose: false,
+                    prefix: Vec::new(),
                     bytes: format!("line {n}").into_bytes(),
                 }))
                 .await;
@@ -3160,6 +3182,7 @@ mod tests {
                     name: (*name).to_string(),
                     is_lifecycle: false,
                     is_verbose: false,
+                    prefix: Vec::new(),
                     bytes: text.as_bytes().to_vec(),
                 });
                 if *is_frame {
@@ -3196,6 +3219,59 @@ mod tests {
         }
     }
 
+    /// The name travels as a rendered column beside the message, not glued to
+    /// the front of it. A consumer that wants the name as a column should not
+    /// have to search the text for a separator to recover something the sink
+    /// had just finished joining.
+    #[tokio::test]
+    async fn a_line_carries_its_prefix_and_message_apart() {
+        struct Case {
+            name: &'static str,
+            emit: fn(&OutputManager),
+            /// What the left column should read, once styling is stripped.
+            want_prefix: &'static str,
+            want_message: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "a lifecycle event is spoken by don",
+                emit: |mgr| mgr.lifecycle_event("loading don.toml"),
+                want_prefix: "[don]    | ",
+                want_message: "loading don.toml",
+            },
+            Case {
+                name: "a service-scoped event is still don speaking",
+                emit: |mgr| mgr.service_event("postgres", "started"),
+                want_prefix: "[don]    | ",
+                want_message: "postgres: started",
+            },
+        ];
+
+        for case in cases {
+            let (writer, _buf) = TestBuffer::new();
+            let config = crate::config::LogConfig::Stdout;
+            let mgr = OutputManager::new(&[("postgres", &config)], writer)
+                .await
+                .unwrap();
+            let mut tap = mgr.log_stream_sender().subscribe();
+            (case.emit)(&mgr);
+            mgr.shutdown().await;
+
+            let entry = tap.recv().await.unwrap();
+            let prefix = strip_ansi(&entry.line.prefix);
+            let message = strip_ansi(&entry.line.bytes);
+            assert_eq!(prefix, case.want_prefix, "{}: prefix", case.name);
+            assert_eq!(message, case.want_message, "{}: message", case.name);
+            // And the message must not still be carrying the name.
+            assert!(
+                !message.contains('|'),
+                "{}: the message still has the prefix in it: {message:?}",
+                case.name
+            );
+        }
+    }
+
     /// A cursor is what `don tui` and the `/logs` route read through, and it
     /// skips ids it has already handed out to de-duplicate the subscribe /
     /// snapshot overlap. A repaint arrives with exactly such an id, so without
@@ -3211,6 +3287,7 @@ mod tests {
                 name: "bazel".to_string(),
                 is_lifecycle: false,
                 is_verbose: false,
+                prefix: Vec::new(),
                 bytes: text.as_bytes().to_vec(),
             }))
             .await;
@@ -3219,6 +3296,7 @@ mod tests {
             name: "bazel".to_string(),
             is_lifecycle: false,
             is_verbose: false,
+            prefix: Vec::new(),
             bytes: b"done".to_vec(),
         }))
         .await;

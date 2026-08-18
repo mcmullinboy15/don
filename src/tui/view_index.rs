@@ -205,6 +205,7 @@ mod tests {
                     name: (*name).to_string(),
                     is_lifecycle: false,
                     is_verbose: false,
+                    prefix: Vec::new(),
                     bytes: body.as_bytes().to_vec(),
                 },
             );
@@ -270,6 +271,7 @@ mod tests {
                     is_lifecycle: false,
                     is_verbose: false,
                     // Lengths vary so row counts do too.
+                    prefix: Vec::new(),
                     bytes: "x".repeat(1 + (step as usize % 4) * 9).into_bytes(),
                 },
             );
@@ -307,6 +309,7 @@ mod tests {
                 name: "bazel".to_string(),
                 is_lifecycle: false,
                 is_verbose: false,
+                prefix: Vec::new(),
                 bytes: b"short".to_vec(),
             },
         );
@@ -322,6 +325,7 @@ mod tests {
                 name: "bazel".to_string(),
                 is_lifecycle: false,
                 is_verbose: false,
+                prefix: Vec::new(),
                 bytes: b"a much longer frame that wraps".to_vec(),
             },
         );
@@ -335,6 +339,7 @@ mod tests {
                 name: "bazel".to_string(),
                 is_lifecycle: false,
                 is_verbose: false,
+                prefix: Vec::new(),
                 bytes: b"done".to_vec(),
             },
         );

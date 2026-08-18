@@ -1207,18 +1207,21 @@ mod tests {
             name: "api".to_string(),
             is_lifecycle: false,
             is_verbose: false,
+            prefix: Vec::new(),
             bytes: b"api output".to_vec(),
         };
         let lifecycle = FormattedLogLine {
             name: LIFECYCLE_EVENT_NAME.to_string(),
             is_lifecycle: true,
             is_verbose: false,
+            prefix: Vec::new(),
             bytes: b"[don] api: started".to_vec(),
         };
         let other = FormattedLogLine {
             name: LIFECYCLE_EVENT_NAME.to_string(),
             is_lifecycle: true,
             is_verbose: false,
+            prefix: Vec::new(),
             bytes: b"[don] worker: started".to_vec(),
         };
 

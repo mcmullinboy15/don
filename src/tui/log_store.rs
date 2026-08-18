@@ -118,8 +118,18 @@ impl LogStore {
         if self.capacity == 0 {
             return;
         }
-        let parsed = super::parse_ansi_line(&line.bytes);
-        let prefix_cols = super::logs::prefix_columns(&parsed);
+        // The two halves arrive already separated, so the column boundary is
+        // known rather than recovered: parse the prefix on its own to measure
+        // it, then the whole row for rendering.
+        let prefix_cols = super::parse_ansi_line(&line.prefix)
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+        let mut joined = Vec::with_capacity(line.prefix.len() + line.bytes.len());
+        joined.extend_from_slice(&line.prefix);
+        joined.extend_from_slice(&line.bytes);
+        let parsed = super::parse_ansi_line(&joined);
         let wrapped_rows = match self.wrapped_at {
             Some(width) => super::logs::count_wrapped_rows(&parsed, prefix_cols, width),
             None => 1,
@@ -230,6 +240,7 @@ mod tests {
             name: name.to_string(),
             is_lifecycle: false,
             is_verbose: false,
+            prefix: Vec::new(),
             bytes: body.as_bytes().to_vec(),
         }
     }
