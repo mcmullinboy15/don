@@ -958,13 +958,21 @@ fn scroll_log(app: &mut App, delta: isize) {
     // paused it.
     app.log_selection.clear();
     app.follow_paused_for_selection = false;
-    app.log_scroll = logs::scrolled(
+    let (scroll, landed_on) = logs::scrolled(
         &app.view_index,
         app.log_rows_above,
         app.log_total_rows,
         app.log_pane_height,
         delta,
     );
+    app.log_scroll = scroll;
+    // Move the measured offset along with it. Wheel events arrive in bursts —
+    // several per frame when someone spins the wheel — and `log_rows_above` is
+    // only refreshed when a frame is drawn. Without this every event in a burst
+    // starts from the same stale offset and computes the same destination, so
+    // ten notches scroll exactly as far as one. The next frame overwrites this
+    // with the real measurement.
+    app.log_rows_above = landed_on;
 }
 
 fn handle_failure_summary_key(
@@ -1748,6 +1756,66 @@ mod tests {
         });
         app.apply_service_runtime("api".to_string(), state, None, Vec::new());
         app
+    }
+
+    /// Wheel events arrive in bursts, several per frame. Each has to build on
+    /// the last rather than on the offset the previous *frame* measured — or a
+    /// whole flick of the wheel scrolls exactly as far as one notch, which is
+    /// what made scrolling feel like it was ignoring you.
+    #[test]
+    fn a_burst_of_scrolls_accumulates_between_frames() {
+        struct Case {
+            name: &'static str,
+            /// Deltas delivered without a frame in between.
+            burst: &'static [isize],
+            start: usize,
+            want_rows_above: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "one notch moves one notch",
+                burst: &[-3],
+                start: 500,
+                want_rows_above: 497,
+            },
+            Case {
+                name: "ten notches move ten notches",
+                burst: &[-3, -3, -3, -3, -3, -3, -3, -3, -3, -3],
+                start: 500,
+                want_rows_above: 470,
+            },
+            Case {
+                name: "back and forth nets out",
+                burst: &[-3, -3, 3],
+                start: 500,
+                want_rows_above: 497,
+            },
+            Case {
+                name: "clamped at the top",
+                burst: &[-3, -3, -3],
+                start: 4,
+                want_rows_above: 0,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            // Stand in for what a frame would have measured.
+            app.log_total_rows = 1_000;
+            app.log_pane_height = 40;
+            app.log_rows_above = case.start;
+
+            for delta in case.burst {
+                scroll_log(&mut app, *delta);
+            }
+
+            assert_eq!(
+                app.log_rows_above, case.want_rows_above,
+                "{}: offset after the burst",
+                case.name
+            );
+        }
     }
 
     #[test]

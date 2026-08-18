@@ -1920,10 +1920,10 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
 
     // Per-service line accumulator, keyed by prefix bytes.
     let mut accumulators: HashMap<Bytes, BytesMut> = HashMap::new();
-    // Track which accumulators just flushed via \r. When a \n immediately
-    // follows a \r, the resulting empty line is suppressed — the \r already
-    // flushed the content.
-    let mut cr_flushed: HashSet<Bytes> = HashSet::new();
+    // Accumulators holding a \r whose meaning is not settled yet: a repaint if
+    // the next byte is anything else, the CR of a CRLF if it is a newline. See
+    // the branch that resolves it.
+    let mut cr_pending: HashSet<Bytes> = HashSet::new();
     // Processes that have taken the alternate screen and not yet given it
     // back. See the suppression below.
     let mut alt_screen: HashSet<Bytes> = HashSet::new();
@@ -1976,7 +1976,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
         // always passes; see `LogFilterControl::passes`.
         if !filter.passes(&msg.name) {
             accumulators.remove(&msg.prefix);
-            cr_flushed.remove(&msg.prefix);
+            cr_pending.remove(&msg.prefix);
             alt_screen.remove(&msg.prefix);
             continue;
         }
@@ -1987,7 +1987,17 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
         // next one starts clean.
         if msg.line.is_empty() && !msg.is_lifecycle {
             let held = accumulators.remove(&msg.prefix);
-            cr_flushed.remove(&msg.prefix);
+            // A \r still held at the end of the stream was a repaint that
+            // nothing followed — the last frame a progress bar drew before the
+            // process exited. It supersedes, rather than landing beside the
+            // frame it was painting over.
+            let was_repaint = cr_pending.remove(&msg.prefix);
+            let held = held.map(|mut acc| {
+                if was_repaint && acc.last() == Some(&b'\r') {
+                    acc.truncate(acc.len() - 1);
+                }
+                acc
+            });
             let owned_screen = alt_screen.remove(&msg.prefix);
             // A process that died holding the screen leaves escape fragments,
             // not a line anyone wants to read.
@@ -2011,7 +2021,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     msg.is_verbose,
                     &verbosity,
                     start,
-                    false,
+                    was_repaint,
                 )
                 .await;
             }
@@ -2042,6 +2052,36 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     bytes::Buf::advance(acc, stale);
                 }
                 continue;
+            }
+
+            // A held \r that no newline followed was a repaint after all, so
+            // flush what it painted over before this byte starts the next one.
+            if byte != b'\n' && cr_pending.remove(&msg.prefix) {
+                if acc.last() == Some(&b'\r') {
+                    acc.truncate(acc.len() - 1);
+                }
+                if !acc.is_empty() {
+                    let sanitized = if msg.prefix.is_empty() {
+                        acc.to_vec()
+                    } else {
+                        sanitize::sanitize_terminal_output(acc)
+                    };
+                    emit_line(
+                        &mut target,
+                        &tap,
+                        &mute,
+                        &msg.name,
+                        &msg.prefix,
+                        &sanitized,
+                        msg.is_lifecycle,
+                        msg.is_verbose,
+                        &verbosity,
+                        start,
+                        true,
+                    )
+                    .await;
+                }
+                acc.clear();
             }
 
             acc.extend_from_slice(&[byte]);
@@ -2088,7 +2128,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 )
                 .await;
                 alt_screen.insert(msg.prefix.clone());
-                cr_flushed.remove(&msg.prefix);
+                cr_pending.remove(&msg.prefix);
                 continue;
             }
 
@@ -2098,11 +2138,9 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 if acc.last() == Some(&b'\r') {
                     acc.truncate(acc.len() - 1); // remove \r
                 }
-                // Suppress empty lines that follow a \r flush — the content
-                // was already written when \r was processed.
-                let is_empty_after_cr = acc.is_empty() && cr_flushed.remove(&msg.prefix);
-                if !is_empty_after_cr {
-                    cr_flushed.remove(&msg.prefix);
+                // The \r of a \r\n was a line ending, not a repaint.
+                cr_pending.remove(&msg.prefix);
+                {
                     let sanitized = if msg.prefix.is_empty() {
                         acc.to_vec()
                     } else {
@@ -2125,36 +2163,16 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 }
                 acc.clear();
             } else if byte == b'\r' {
-                // Bare carriage return (no \n) — programs like Bazel use
-                // \r to overwrite progress lines in-place. Treat as a line
-                // boundary so each progress update gets prefixed correctly.
-                acc.truncate(acc.len() - 1); // remove \r
-                if !acc.is_empty() {
-                    let sanitized = if msg.prefix.is_empty() {
-                        acc.to_vec()
-                    } else {
-                        sanitize::sanitize_terminal_output(acc)
-                    };
-                    emit_line(
-                        &mut target,
-                        &tap,
-                        &mute,
-                        &msg.name,
-                        &msg.prefix,
-                        &sanitized,
-                        msg.is_lifecycle,
-                        msg.is_verbose,
-                        &verbosity,
-                        start,
-                        true,
-                    )
-                    .await;
-                }
-                acc.clear();
-                cr_flushed.insert(msg.prefix.clone());
+                // Might be a repaint, might be the CR of a CRLF. A process on a
+                // PTY has every newline it writes translated to \r\n by the
+                // terminal discipline, so calling it here would make every line
+                // of ordinary output a progress frame — and, now that frames
+                // supersede one another, collapse a service's entire output
+                // onto a single line. Hold it; the next byte says which it was.
+                cr_pending.insert(msg.prefix.clone());
             } else {
                 // Non-control byte — any pending \r suppression is stale.
-                cr_flushed.remove(&msg.prefix);
+                cr_pending.remove(&msg.prefix);
                 if acc.len() >= MAX_LINE {
                     // Overflow — flush without stripping.
                     let sanitized = if msg.prefix.is_empty() {
@@ -3250,6 +3268,20 @@ mod tests {
                 want: &["90%", "done"],
             },
             Case {
+                // Every line a process writes on a PTY arrives as \r\n, the
+                // terminal discipline having translated the newline. Reading
+                // that CR as a repaint collapses a service's whole output onto
+                // one line: 2,000 lines of output became 1.
+                name: "CRLF is a line ending, not a repaint",
+                emit: &[("builder", b"line one\r\nline two\r\nline three\r\n")],
+                want: &["line one", "line two", "line three"],
+            },
+            Case {
+                name: "a repaint mixed in among CRLF lines still repaints",
+                emit: &[("builder", b"start\r\n10%\r90%\rdone\r\n")],
+                want: &["start", "90%", "done"],
+            },
+            Case {
                 name: "a second process interleaves instead of being overwritten",
                 emit: &[
                     ("builder", b"10%\r"),
@@ -3299,6 +3331,19 @@ mod tests {
             assert_eq!(
                 frames, want_frames,
                 "{}: intermediate frames should not survive. got {got:?}",
+                case.name
+            );
+            // Nothing may be swallowed either. A short count is the collapse
+            // this guards against: with CRLF misread as a repaint, a service's
+            // whole output lands on one line.
+            let from_processes = got
+                .iter()
+                .filter(|line| case.want.iter().any(|w| line.contains(w)))
+                .count();
+            assert_eq!(
+                from_processes,
+                case.want.len(),
+                "{}: every line must survive. got {got:?}",
                 case.name
             );
         }

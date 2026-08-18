@@ -66,28 +66,89 @@ pub(crate) struct LogView<'a> {
     pub(crate) total_rows: usize,
 }
 
-/// Split one already-styled line into rows no wider than `width`.
+/// Where the `name | ` prefix ends, in columns.
+///
+/// don builds each line as a padded process name, a `| `, then the message, so
+/// the first `| ` is the column boundary. A process name cannot contain one, so
+/// taking the first is exact rather than a guess — and a message that contains
+/// `| ` later is unaffected.
+///
+/// Zero when there is no prefix at all, which is how a line with no owning
+/// process (or a stream-end marker) renders full width.
+pub(crate) fn prefix_columns(line: &Line<'_>) -> usize {
+    let mut before = 0usize;
+    let mut carry = false; // the previous span ended on a '|'
+    for span in &line.spans {
+        let text: &str = span.content.as_ref();
+        if carry && text.starts_with(' ') {
+            return before + 1;
+        }
+        if let Some(at) = text.find("| ") {
+            return before + text[..at].chars().count() + 2;
+        }
+        carry = text.ends_with('|');
+        before += text.chars().count();
+    }
+    0
+}
+
+/// The left column on a row that is a continuation of the row above.
+///
+/// Blank where the name would be, but the separator is carried down, so the
+/// boundary between the two columns is a line the eye can follow rather than
+/// something that only exists on whichever rows happen to start a message.
+fn continuation_indent(prefix_cols: usize) -> String {
+    match prefix_cols.checked_sub(2) {
+        Some(pad) => format!("{}| ", " ".repeat(pad)),
+        None => " ".repeat(prefix_cols),
+    }
+}
+
+/// Split one already-styled line into rows, holding the prefix in its own
+/// column.
+///
+/// The first row carries the real `name | ` prefix; every row after it is
+/// indented to the same width so the message forms a single column down the
+/// pane. Wrapping a line back to column zero is what makes a wall of output
+/// unreadable — you cannot tell a continuation from a new line, or see which
+/// process said what without tracing upwards.
 ///
 /// Wrapping is done here rather than by ratatui's `Wrap` because the pane needs
 /// the row *count* before it renders — to place the scroll anchor, to size the
 /// scrollbar, and to know whether it is at the bottom. Asking the widget after
 /// the fact would be a frame too late.
-pub(crate) fn wrap_line<'a>(line: &Line<'a>, width: u16) -> Vec<Line<'a>> {
+pub(crate) fn wrap_line<'a>(line: &Line<'a>, prefix_cols: usize, width: u16) -> Vec<Line<'a>> {
     let width = width.max(1) as usize;
+    // A pane too narrow to hold the prefix and anything else falls back to
+    // plain full-width wrapping; a zero-width message column cannot progress.
+    let prefix_cols = if prefix_cols + 1 >= width {
+        0
+    } else {
+        prefix_cols
+    };
+
     let mut rows: Vec<Line<'a>> = Vec::new();
     let mut current: Vec<ratatui::text::Span<'a>> = Vec::new();
     let mut used = 0usize;
+    // Columns consumed so far across the whole logical line, so we know when we
+    // are still inside the prefix.
+    let mut seen = 0usize;
 
     for span in &line.spans {
         let mut rest: &str = span.content.as_ref();
         while !rest.is_empty() {
-            let room = width.saturating_sub(used);
-            if room == 0 {
+            if used >= width {
                 rows.push(Line::from(std::mem::take(&mut current)));
-                used = 0;
-                continue;
+                current.push(ratatui::text::Span::raw(continuation_indent(prefix_cols)));
+                used = prefix_cols;
             }
-            // Split on a character boundary at most `room` columns wide.
+            let room = width - used;
+            // Never break inside the prefix: it is one cell of the column.
+            let room = if seen < prefix_cols {
+                room.min(prefix_cols - seen)
+            } else {
+                room
+            };
             let take = rest
                 .char_indices()
                 .take(room)
@@ -95,13 +156,11 @@ pub(crate) fn wrap_line<'a>(line: &Line<'a>, width: u16) -> Vec<Line<'a>> {
                 .map(|(idx, ch)| idx + ch.len_utf8())
                 .unwrap_or(rest.len());
             let (head, tail) = rest.split_at(take);
+            let taken = head.chars().count();
             current.push(ratatui::text::Span::styled(head.to_string(), span.style));
-            used += head.chars().count();
+            used += taken;
+            seen += taken;
             rest = tail;
-            if used >= width && !rest.is_empty() {
-                rows.push(Line::from(std::mem::take(&mut current)));
-                used = 0;
-            }
         }
     }
     if !current.is_empty() || rows.is_empty() {
@@ -114,21 +173,28 @@ pub(crate) fn wrap_line<'a>(line: &Line<'a>, width: u16) -> Vec<Line<'a>> {
 ///
 /// The store measures every line it ingests, and only ever paints a screenful
 /// — so measuring by wrapping meant allocating the full wrapped form of every
-/// line and dropping it, on every push and every reflow. This is the same
-/// arithmetic the wrap performs: it fills to `width` and breaks, so the row
-/// count is the character count over the width, and an empty line still takes
-/// a row.
+/// line and dropping it, on every push and every reflow.
+///
+/// Every row reserves `prefix_cols` — the real prefix on the first, an indent on
+/// the rest — so the message column is the same width throughout and the count
+/// is just the message over that width.
 ///
 /// Kept beside `wrap_line` and pinned against it by a test, because the two
 /// disagreeing would put the scroll anchor somewhere the content isn't.
-pub(crate) fn count_wrapped_rows(line: &Line<'_>, width: u16) -> usize {
+pub(crate) fn count_wrapped_rows(line: &Line<'_>, prefix_cols: usize, width: u16) -> usize {
     let width = width.max(1) as usize;
+    let prefix_cols = if prefix_cols + 1 >= width {
+        0
+    } else {
+        prefix_cols
+    };
     let chars: usize = line
         .spans
         .iter()
         .map(|span| span.content.chars().count())
         .sum();
-    chars.div_ceil(width).max(1)
+    let body = chars.saturating_sub(prefix_cols);
+    body.div_ceil(width - prefix_cols).max(1)
 }
 
 /// Build the visible rows for a pane of `width` × `height`.
@@ -175,7 +241,10 @@ pub(crate) fn build_view<'a>(
     if let Some((first_id, skip_within)) = index.line_at(rows_above) {
         let mut skip = usize::from(skip_within);
         for entry in index.ids_from(first_id).filter_map(|id| store.get(id)) {
-            for wrapped in wrap_line(&entry.parsed, width).into_iter().skip(skip) {
+            for wrapped in wrap_line(&entry.parsed, entry.prefix_cols(), width)
+                .into_iter()
+                .skip(skip)
+            {
                 rows.push(wrapped);
                 if rows.len() == height {
                     return LogView {
@@ -214,6 +283,11 @@ pub(crate) fn anchor_at(index: &super::view_index::ViewIndex, rows_above: usize)
 
 /// Move the anchor by `delta` rows, clamping at both ends.
 ///
+/// Returns the row offset it landed on as well as the anchor. Callers need it:
+/// wheel events arrive in bursts, many per frame, and each one has to start
+/// from where the previous one left off rather than from what the last frame
+/// happened to measure — otherwise a whole burst collapses into one step.
+///
 /// Scrolling to the bottom re-enters [`Scroll::Follow`] rather than anchoring
 /// at the last line — otherwise the view would sit one line behind forever
 /// once new output arrived, which reads as a freeze.
@@ -223,14 +297,14 @@ pub(crate) fn scrolled(
     total_rows: usize,
     height: u16,
     delta: isize,
-) -> Scroll {
+) -> (Scroll, usize) {
     let height = height.max(1) as usize;
     let max_above = total_rows.saturating_sub(height);
     let target = rows_above.saturating_add_signed(delta).min(max_above);
     if target >= max_above {
-        return Scroll::Follow;
+        return (Scroll::Follow, max_above);
     }
-    anchor_at(index, target)
+    (anchor_at(index, target), target)
 }
 
 #[cfg(test)]
@@ -292,6 +366,120 @@ mod tests {
         );
     }
 
+    /// The prefix is a column, not part of the text: what wraps lands under the
+    /// message, not back at the left edge.
+    #[test]
+    fn wrapping_indents_under_the_message_column() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            width: u16,
+            want: Vec<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a continuation lines up under the message",
+                // prefix "api | " is 6 columns, so the message column is 6 wide
+                // at width 12.
+                input: "api | abcdefghijkl",
+                width: 12,
+                want: vec!["api | abcdef", "    | ghijkl"],
+            },
+            Case {
+                name: "three rows keep the same indent",
+                input: "api | abcdefghijklmnopqr",
+                width: 12,
+                want: vec!["api | abcdef", "    | ghijkl", "    | mnopqr"],
+            },
+            Case {
+                name: "a short line is one row and is not padded out",
+                input: "api | hi",
+                width: 12,
+                want: vec!["api | hi"],
+            },
+            Case {
+                name: "no prefix means no column, and it wraps full width",
+                input: "abcdefghijklmn",
+                width: 12,
+                want: vec!["abcdefghijkl", "mn"],
+            },
+            Case {
+                name: "a pane too narrow for the column falls back to full width",
+                input: "api | abcdef",
+                width: 6,
+                want: vec!["api | ", "abcdef"],
+            },
+        ];
+
+        for case in cases {
+            let line = styled(case.input);
+            let prefix = prefix_columns(&line);
+            let rows = wrap_line(&line, prefix, case.width);
+            let got: Vec<String> = rows.iter().map(row_text).collect();
+            assert_eq!(got, case.want, "{}", case.name);
+            assert_eq!(
+                count_wrapped_rows(&line, prefix, case.width),
+                rows.len(),
+                "{}: the count must match what the wrap produced",
+                case.name
+            );
+        }
+    }
+
+    /// The boundary is the first `| `, wherever the styling happens to split.
+    #[test]
+    fn the_prefix_column_ends_at_the_first_separator() {
+        struct Case {
+            name: &'static str,
+            spans: Vec<&'static str>,
+            want: usize,
+        }
+
+        let cases = vec![
+            Case {
+                name: "one span",
+                spans: vec!["api | hello"],
+                want: 6,
+            },
+            Case {
+                name: "coloured name, then the separator",
+                spans: vec!["api", " | ", "hello"],
+                want: 6,
+            },
+            Case {
+                name: "the separator itself split across spans",
+                spans: vec!["api |", " hello"],
+                want: 6,
+            },
+            Case {
+                name: "a pipe in the message does not count",
+                spans: vec!["api | a | b"],
+                want: 6,
+            },
+            Case {
+                name: "no separator at all",
+                spans: vec!["just a bare line"],
+                want: 0,
+            },
+            Case {
+                name: "padded names give a wider column",
+                spans: vec!["nodejs-install  | building"],
+                want: 18,
+            },
+        ];
+
+        for case in cases {
+            let line = Line::from(
+                case.spans
+                    .iter()
+                    .map(|text| Span::raw(text.to_string()))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(prefix_columns(&line), case.want, "{}", case.name);
+        }
+    }
+
     /// Wrapping owns the row count, so it has to be exact: the pane places its
     /// scroll anchor and sizes its scrollbar from these numbers before anything
     /// is drawn.
@@ -338,7 +526,7 @@ mod tests {
         ];
 
         for case in cases {
-            let rows = wrap_line(&styled(case.input), case.width);
+            let rows = wrap_line(&styled(case.input), 0, case.width);
             let got: Vec<String> = rows.iter().map(row_text).collect();
             assert_eq!(got, case.want, "{}", case.name);
         }
@@ -348,7 +536,7 @@ mod tests {
     /// the columns they occupy rather than the bytes they take.
     #[test]
     fn wrapping_counts_characters_not_bytes() {
-        let rows = wrap_line(&styled("äöüßé"), 2);
+        let rows = wrap_line(&styled("äöüßé"), 0, 2);
         let got: Vec<String> = rows.iter().map(row_text).collect();
         assert_eq!(got, vec!["äö", "üß", "é"]);
     }
@@ -367,7 +555,7 @@ mod tests {
                 ratatui::style::Style::default().fg(ratatui::style::Color::Blue),
             ),
         ]);
-        let rows = wrap_line(&line, 4);
+        let rows = wrap_line(&line, 0, 4);
         assert_eq!(rows.len(), 2, "7 columns over a width of 4");
         assert_eq!(
             rows[0].spans[0].style.fg,
@@ -452,12 +640,17 @@ mod tests {
                     .map(|text| ratatui::text::Span::raw((*text).to_string()))
                     .collect::<Vec<_>>(),
             );
-            assert_eq!(
-                count_wrapped_rows(&line, case.width),
-                wrap_line(&line, case.width).len(),
-                "{}",
-                case.name
-            );
+            // Both with and without a prefix column: the count and the wrap
+            // must agree either way, since the anchor is placed from one and
+            // the content drawn from the other.
+            for prefix in [0, prefix_columns(&line)] {
+                assert_eq!(
+                    count_wrapped_rows(&line, prefix, case.width),
+                    wrap_line(&line, prefix, case.width).len(),
+                    "{} (prefix {prefix})",
+                    case.name
+                );
+            }
         }
     }
 }

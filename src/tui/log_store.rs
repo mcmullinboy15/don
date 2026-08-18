@@ -64,12 +64,21 @@ pub(crate) struct StoredLogLine {
     pub(crate) parsed: Line<'static>,
     /// Rows this line occupies at the store's current wrap width.
     wrapped_rows: usize,
+    /// Columns the `name | ` prefix occupies, so the pane can hold it in its
+    /// own column and indent what wraps underneath it. See
+    /// [`super::logs::prefix_columns`].
+    prefix_cols: usize,
 }
 
 impl StoredLogLine {
     /// Rows this line occupies at the width the store last reflowed to.
     pub(crate) fn wrapped_rows(&self) -> usize {
         self.wrapped_rows
+    }
+
+    /// Columns the process-name column takes on every row of this line.
+    pub(crate) fn prefix_cols(&self) -> usize {
+        self.prefix_cols
     }
 }
 
@@ -110,8 +119,9 @@ impl LogStore {
             return;
         }
         let parsed = super::parse_ansi_line(&line.bytes);
+        let prefix_cols = super::logs::prefix_columns(&parsed);
         let wrapped_rows = match self.wrapped_at {
-            Some(width) => super::logs::count_wrapped_rows(&parsed, width),
+            Some(width) => super::logs::count_wrapped_rows(&parsed, prefix_cols, width),
             None => 1,
         };
         // An id already held is a progress frame repainting itself, not a new
@@ -121,6 +131,7 @@ impl LogStore {
             back.line = line;
             back.parsed = parsed;
             back.wrapped_rows = wrapped_rows;
+            back.prefix_cols = prefix_cols;
             return;
         }
         let ceiling = self.capacity.saturating_mul(PINNED_OVERDRAFT);
@@ -140,6 +151,7 @@ impl LogStore {
             line,
             parsed,
             wrapped_rows,
+            prefix_cols,
         });
     }
 
@@ -153,7 +165,8 @@ impl LogStore {
         }
         self.wrapped_at = Some(width);
         for entry in &mut self.entries {
-            entry.wrapped_rows = super::logs::count_wrapped_rows(&entry.parsed, width);
+            entry.wrapped_rows =
+                super::logs::count_wrapped_rows(&entry.parsed, entry.prefix_cols, width);
         }
     }
 
