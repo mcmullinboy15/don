@@ -12,12 +12,16 @@
 //!
 //! ## Why the keys work the way they do
 //!
-//! Every keystroke belongs to the process, so don cannot claim a chord for its
-//! own use — Ctrl+arrow is word-movement in every shell, and stealing it would
-//! break the thing you attached to. don already holds `Ctrl+P` as a prefix
-//! (that is how Ctrl+P Ctrl+Q detaches), so the window's own commands live
-//! behind it, and a `Ctrl+P` followed by anything else sends both keys on
-//! untouched.
+//! Every keystroke belongs to the process except one. `Ctrl+D` detaches —
+//! the same key the TUI already uses to leave a remote session, so it means
+//! "back out of what I am in" at both levels.
+//!
+//! That is the whole vocabulary. There was a `Ctrl+P` prefix here, with chords
+//! behind it for detaching and for moving and resizing the window; all of it
+//! went, because a window you have to learn a modal grammar to leave is worse
+//! than one you cannot move. `Ctrl+D` no longer reaches the process, so a
+//! shell attached this way is left by detaching — and if it should actually
+//! stop, by stopping it from the services or tasks list.
 //!
 //! Keys arrive here already parsed, from the same crossterm stream that feeds
 //! the rest of the TUI, and [`super::keys::encode`] turns them back into bytes
@@ -28,123 +32,41 @@ use ratatui::layout::Rect;
 
 use super::keys::encode;
 
-/// What a byte from stdin turned out to mean.
+/// What a key press turned out to mean.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttachInput {
     /// Forward these bytes to the process.
     Forward(Vec<u8>),
-    /// Move the window one step.
-    Move(Direction),
-    /// Grow or shrink the window one step.
-    Resize(Direction),
-    /// Close the window, leaving the process running.
+    /// Detach: close the window, leaving the process running.
     Detach,
-    /// The prefix is held; nothing to do until the next byte decides.
-    Pending,
+    /// Nothing a terminal would have sent — a bare modifier press.
+    Nothing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-/// The docker-style prefix. A lone one is held, not forwarded, until the next
-/// key says what it meant.
-const PREFIX: char = 'p'; // with Ctrl
-/// Detach, when it follows the prefix.
-const DETACH: char = 'q'; // with Ctrl
-
-/// Steps a move or resize takes per press.
-const MOVE_STEP: u16 = 2;
-const RESIZE_STEP: u16 = 2;
+/// Detach: close the window, leaving the process running.
+const DETACH: char = 'd'; // with Ctrl
 
 /// Smallest window worth drawing: below this a process has nowhere to put a
 /// prompt, and the border eats what is left.
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 5;
 
-/// Translates key presses into either process input or window commands.
-///
-/// Stateful across calls because the prefix spans two keys.
-#[derive(Debug, Default)]
-pub(crate) struct KeyRouter {
-    holding_prefix: bool,
-}
-
-impl KeyRouter {
-    /// Route one key press.
-    ///
-    /// A key that resolves a held prefix produces its command; everything else
-    /// is the process's. Resolving a prefix that turned out not to be a
-    /// command sends both keys, in order, which is why this returns a list.
-    pub(crate) fn route(&mut self, key: KeyEvent) -> Vec<AttachInput> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let is_prefix = ctrl && key.code == KeyCode::Char(PREFIX);
-
-        if !self.holding_prefix {
-            if is_prefix {
-                self.holding_prefix = true;
-                return vec![AttachInput::Pending];
-            }
-            return vec![forward(key)];
-        }
-
-        self.holding_prefix = false;
-        if ctrl && key.code == KeyCode::Char(DETACH) {
-            return vec![AttachInput::Detach];
-        }
-        if let KeyCode::Char(c) = key.code
-            && !ctrl
-            && let Some(direction) = direction_of(c)
-        {
-            return vec![if c.is_ascii_uppercase() {
-                AttachInput::Resize(direction)
-            } else {
-                AttachInput::Move(direction)
-            }];
-        }
-
-        // Not a command, so the held prefix was the process's after all and
-        // goes through ahead of this key. A second prefix is the exception:
-        // one Ctrl+P reaches the process and the other starts holding again,
-        // which is how you type a literal Ctrl+P.
-        let prefix_key = KeyEvent::new(KeyCode::Char(PREFIX), KeyModifiers::CONTROL);
-        if is_prefix {
-            self.holding_prefix = true;
-            return vec![forward(prefix_key)];
-        }
-        vec![forward(prefix_key), forward(key)]
+/// What one key press means to an open window.
+pub(crate) fn route(key: KeyEvent) -> AttachInput {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(DETACH) {
+        return AttachInput::Detach;
     }
-}
-
-/// A key as process input. Keys a terminal wouldn't send anything for — a bare
-/// modifier press — are nothing to forward, but they don't cancel a held
-/// prefix either, so they read as `Pending`.
-fn forward(key: KeyEvent) -> AttachInput {
     match encode(key) {
         Some(bytes) => AttachInput::Forward(bytes),
-        None => AttachInput::Pending,
-    }
-}
-
-/// The vim direction keys, in either case.
-fn direction_of(c: char) -> Option<Direction> {
-    match c.to_ascii_lowercase() {
-        'h' => Some(Direction::Left),
-        'j' => Some(Direction::Down),
-        'k' => Some(Direction::Up),
-        'l' => Some(Direction::Right),
-        _ => None,
+        None => AttachInput::Nothing,
     }
 }
 
 /// Where the window sits and how big it is, in screen cells.
 ///
-/// Kept as a rectangle rather than a docked extent because this one floats —
-/// it is the only region of the TUI the reader positions freely.
+/// Kept as a rectangle rather than a docked extent because this one floats: it
+/// is placed over the log rather than beside it, so it needs an origin as well
+/// as a size, and both have to survive the terminal changing shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowRect {
     pub(crate) x: u16,
@@ -156,9 +78,9 @@ pub(crate) struct WindowRect {
 impl WindowRect {
     /// A window centred in `area`, taking most of it.
     ///
-    /// Big by default: the reason to attach is to use the process, and a
-    /// prompt in a postage stamp helps nobody. Moving and resizing are there
-    /// for when the log behind matters more.
+    /// Big, because the reason to attach is to use the process and a prompt in
+    /// a postage stamp helps nobody — and fixed, because there is nothing to
+    /// adjust it with any more.
     pub(crate) fn centred_in(area: Rect) -> Self {
         let width = (area.width.saturating_mul(4) / 5)
             .max(MIN_COLS)
@@ -172,34 +94,6 @@ impl WindowRect {
             width,
             height,
         }
-    }
-
-    /// Move one step, staying inside `area`.
-    pub(crate) fn moved(self, direction: Direction, area: Rect) -> Self {
-        let mut next = self;
-        match direction {
-            Direction::Left => next.x = next.x.saturating_sub(MOVE_STEP),
-            Direction::Right => next.x = next.x.saturating_add(MOVE_STEP),
-            Direction::Up => next.y = next.y.saturating_sub(MOVE_STEP),
-            Direction::Down => next.y = next.y.saturating_add(MOVE_STEP),
-        }
-        next.clamped_to(area)
-    }
-
-    /// Grow or shrink one step. Right/Down grow, Left/Up shrink — the edge
-    /// being dragged is the bottom-right, so the window's own corner follows
-    /// the direction pressed.
-    pub(crate) fn resized(self, direction: Direction, area: Rect) -> Self {
-        let mut next = self;
-        match direction {
-            Direction::Left => next.width = next.width.saturating_sub(RESIZE_STEP),
-            Direction::Right => next.width = next.width.saturating_add(RESIZE_STEP),
-            Direction::Up => next.height = next.height.saturating_sub(RESIZE_STEP),
-            Direction::Down => next.height = next.height.saturating_add(RESIZE_STEP),
-        }
-        next.width = next.width.max(MIN_COLS);
-        next.height = next.height.max(MIN_ROWS);
-        next.clamped_to(area)
     }
 
     /// Put the window back inside `area` — for when the area moved rather
@@ -257,103 +151,62 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    /// The prefix belongs to the process unless the next key claims it.
+    /// One key is don's; the rest are the process's, byte for byte.
     #[test]
-    fn the_prefix_is_held_until_the_next_key_decides() {
+    fn ctrl_d_detaches_and_everything_else_belongs_to_the_process() {
         struct Case {
             name: &'static str,
-            keys: Vec<KeyEvent>,
-            want: Vec<AttachInput>,
+            key: KeyEvent,
+            want: AttachInput,
         }
 
-        let cases = vec![
+        let cases = [
             Case {
-                name: "ordinary input goes straight through",
-                keys: vec![plain(KeyCode::Char('l')), plain(KeyCode::Enter)],
-                want: vec![
-                    AttachInput::Forward(b"l".to_vec()),
-                    AttachInput::Forward(b"\r".to_vec()),
-                ],
+                name: "ctrl+d detaches",
+                key: ctrl('d'),
+                want: AttachInput::Detach,
             },
             Case {
-                name: "ctrl+c belongs to the process, not to don",
-                keys: vec![ctrl('c')],
-                want: vec![AttachInput::Forward(vec![0x03])],
+                name: "a letter",
+                key: plain(KeyCode::Char('l')),
+                want: AttachInput::Forward(b"l".to_vec()),
             },
             Case {
-                name: "so do the arrows",
-                keys: vec![plain(KeyCode::Up)],
-                want: vec![AttachInput::Forward(b"\x1b[A".to_vec())],
+                name: "enter",
+                key: plain(KeyCode::Enter),
+                want: AttachInput::Forward(b"\r".to_vec()),
             },
             Case {
-                name: "a lone prefix is held, not forwarded",
-                keys: vec![ctrl('p')],
-                want: vec![AttachInput::Pending],
+                // The keys don claims everywhere else in the TUI still belong
+                // to the process here — that is what attaching means.
+                name: "ctrl+c interrupts the process, it does not stop don",
+                key: ctrl('c'),
+                want: AttachInput::Forward(vec![0x03]),
             },
             Case {
-                name: "prefix then detach",
-                keys: vec![ctrl('p'), ctrl('q')],
-                want: vec![AttachInput::Pending, AttachInput::Detach],
+                name: "escape",
+                key: plain(KeyCode::Esc),
+                want: AttachInput::Forward(vec![0x1b]),
             },
             Case {
-                name: "prefix then a non-command sends both keys",
-                keys: vec![ctrl('p'), plain(KeyCode::Char('x'))],
-                want: vec![
-                    AttachInput::Pending,
-                    AttachInput::Forward(vec![0x10]),
-                    AttachInput::Forward(b"x".to_vec()),
-                ],
+                name: "an arrow",
+                key: plain(KeyCode::Up),
+                want: AttachInput::Forward(b"\x1b[A".to_vec()),
             },
             Case {
-                name: "lowercase moves",
-                keys: vec![ctrl('p'), plain(KeyCode::Char('h'))],
-                want: vec![AttachInput::Pending, AttachInput::Move(Direction::Left)],
-            },
-            Case {
-                name: "uppercase resizes",
-                keys: vec![
-                    ctrl('p'),
-                    KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
-                ],
-                want: vec![AttachInput::Pending, AttachInput::Resize(Direction::Right)],
-            },
-            Case {
-                name: "ctrl+l after the prefix is the process's clear, not a move",
-                keys: vec![ctrl('p'), ctrl('l')],
-                want: vec![
-                    AttachInput::Pending,
-                    AttachInput::Forward(vec![0x10]),
-                    AttachInput::Forward(vec![0x0c]),
-                ],
-            },
-            Case {
-                name: "a doubled prefix sends one and holds the other",
-                keys: vec![ctrl('p'), ctrl('p')],
-                want: vec![AttachInput::Pending, AttachInput::Forward(vec![0x10])],
-            },
-            Case {
-                name: "and the held one still commands",
-                keys: vec![ctrl('p'), ctrl('p'), ctrl('q')],
-                want: vec![
-                    AttachInput::Pending,
-                    AttachInput::Forward(vec![0x10]),
-                    AttachInput::Detach,
-                ],
+                name: "a bare modifier press is not input",
+                key: plain(KeyCode::CapsLock),
+                want: AttachInput::Nothing,
             },
         ];
 
         for case in cases {
-            let mut router = KeyRouter::default();
-            let mut got: Vec<AttachInput> = Vec::new();
-            for key in case.keys {
-                got.extend(router.route(key));
-            }
-            assert_eq!(got, case.want, "{}", case.name);
+            assert_eq!(route(case.key), case.want, "{}", case.name);
         }
     }
 
-    /// The window stays on screen however it is pushed, and never shrinks
-    /// below something a process could use.
+    /// However the terminal changes shape, the window stays on screen and
+    /// stays big enough for the process to draw in.
     #[test]
     fn the_window_stays_on_screen_and_usable() {
         let area = Rect::new(0, 0, 100, 40);
@@ -361,29 +214,15 @@ mod tests {
         assert_eq!((start.width, start.height), (80, 32));
         assert_eq!((start.x, start.y), (10, 4));
 
-        // Pushed hard left, it stops at the edge rather than wrapping.
-        let mut w = start;
-        for _ in 0..50 {
-            w = w.moved(Direction::Left, area);
-        }
-        assert_eq!(w.x, 0, "flush to the left edge");
+        // The terminal shrank under it.
+        let smaller = Rect::new(0, 0, 40, 12);
+        let fitted = start.fitted(smaller);
+        assert!(fitted.width <= smaller.width && fitted.height <= smaller.height);
+        assert!(fitted.x + fitted.width <= smaller.width);
+        assert!(fitted.y + fitted.height <= smaller.height);
 
-        // Shrunk hard, it stops at the minimum.
-        let mut w = start;
-        for _ in 0..100 {
-            w = w.resized(Direction::Left, area);
-            w = w.resized(Direction::Up, area);
-        }
-        assert_eq!((w.width, w.height), (MIN_COLS, MIN_ROWS));
-
-        // Grown hard, it stops at the screen.
-        let mut w = start;
-        for _ in 0..100 {
-            w = w.resized(Direction::Right, area);
-            w = w.resized(Direction::Down, area);
-        }
-        assert!(w.width <= area.width && w.height <= area.height);
-        assert!(w.x + w.width <= area.width && w.y + w.height <= area.height);
+        // And grew again. Refitting never moves a window that already fits.
+        assert_eq!(fitted.fitted(area), fitted);
     }
 
     /// A tiny terminal still produces a window that fits inside it.

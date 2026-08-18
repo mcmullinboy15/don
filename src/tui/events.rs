@@ -54,7 +54,10 @@ pub(crate) enum AppEvent {
 pub(crate) enum AttachEvent {
     /// New output landed; the window's grid needs re-reading.
     Output,
-    /// The session is over. `Some` carries a message worth narrating —
-    /// the process exited, or the connection failed.
-    Ended(Option<String>),
+    /// The session is over — the process exited or the connection failed.
+    ///
+    /// Carries no reason. The window stays up showing the process's last
+    /// screen, and the state don already publishes for that process says what
+    /// became of it far better than a message composed at the socket could.
+    Ended,
 }

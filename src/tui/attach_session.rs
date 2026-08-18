@@ -92,11 +92,7 @@ pub(crate) async fn start(
             loop {
                 match reader.read(&mut buf).await {
                     Ok(0) | Err(_) => {
-                        let _ = events
-                            .send(AppEvent::Attach(AttachEvent::Ended(Some(format!(
-                                "'{name}' detached (process exited or restarted)"
-                            )))))
-                            .await;
+                        let _ = events.send(AppEvent::Attach(AttachEvent::Ended)).await;
                         return;
                     }
                     Ok(n) => {

@@ -280,9 +280,6 @@ pub async fn run_tui(
     // The live attach session, when there is one. Owned here rather than on
     // `App` because it is tasks and a socket, not view state.
     let mut attach: Option<attach_session::Session> = None;
-    // Whether a Ctrl+P is being held. Per-session, but harmless between
-    // sessions: attaching resets it.
-    let mut attach_router = attach_window::KeyRouter::default();
 
     // Drives the spinner and relative timestamps ("5s ago"), which move
     // without any event arriving.
@@ -383,7 +380,6 @@ pub async fn run_tui(
                             &mut app,
                             &mut stores,
                             &mut attach,
-                            &mut attach_router,
                             &client,
                             &controls,
                             area,
@@ -406,7 +402,6 @@ pub async fn run_tui(
                                         &mut app,
                                         &mut stores,
                                         &mut attach,
-                                        &mut attach_router,
                                         &client,
                                         &controls,
                                         area,
@@ -425,7 +420,6 @@ pub async fn run_tui(
                             // its input off the stream this loop is already
                             // reading, so nothing is handed over: no terminal
                             // teardown, no second reader of stdin.
-                            attach_router = attach_window::KeyRouter::default();
                             let window = attach_window::WindowRect::centred_in(area);
                             let (cols, rows) = window.grid_size();
                             match attach_session::start(
@@ -442,6 +436,7 @@ pub async fn run_tui(
                                         name: name.clone(),
                                         window,
                                         grid: None,
+                                        ended: false,
                                     });
                                     attach = Some(session);
                                 }
@@ -932,33 +927,36 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
 /// than what it does, so it is the only one resolved out here: while it is
 /// open, keys belong to the process and everything else — mouse, resize, the
 /// log still flowing behind — carries on as usual.
-#[allow(clippy::too_many_arguments)]
 async fn dispatch_event(
     event: AppEvent,
     app: &mut App,
     stores: &mut LogStores,
     attach: &mut Option<attach_session::Session>,
-    router: &mut attach_window::KeyRouter,
     client: &std::sync::Arc<Client>,
     controls: &TuiControls,
     area: Rect,
 ) -> Result<(), TuiError> {
     match event {
         AppEvent::Attach(attach_event) => {
-            handle_attach_event(attach_event, app, attach, controls).await;
+            handle_attach_event(attach_event, app, attach).await;
         }
-        AppEvent::Key(key) if attach.is_some() => {
-            for outcome in router.route(key) {
-                match outcome {
-                    attach_window::AttachInput::Forward(bytes) => {
-                        if let Some(session) = attach.as_ref() {
-                            session.send(bytes);
-                        }
+        AppEvent::Key(key) if attach.is_some() && !attach_ended(app) => {
+            match attach_window::route(key) {
+                attach_window::AttachInput::Forward(bytes) => {
+                    if let Some(session) = attach.as_ref() {
+                        session.send(bytes);
                     }
-                    attach_window::AttachInput::Pending => {}
-                    command => apply_window_command(command, app, attach, client, controls, area),
                 }
+                attach_window::AttachInput::Detach => end_attach(app, attach),
+                attach_window::AttachInput::Nothing => {}
             }
+        }
+        // The process is gone but its last screen is still up. There is
+        // nothing to type at, so every key dismisses it — anyone reaching for
+        // one wants the window out of the way, and making them guess which is
+        // just a smaller version of the ceremony this replaced.
+        AppEvent::Key(_) if app.attach.is_some() => {
+            end_attach(app, attach);
         }
         // A click inside the window would select text in the log underneath
         // it, where nobody can see it. Outside, the log is visible and the
@@ -970,11 +968,13 @@ async fn dispatch_event(
                 .is_some_and(|view| view.window.contains(mouse.column, mouse.row)) => {}
         // The window is placed in screen coordinates, so a smaller terminal
         // can leave it hanging off the edge. Refit before anything draws.
-        AppEvent::Resize if attach.is_some() => {
+        AppEvent::Resize if app.attach.is_some() => {
             if let Some(view) = app.attach.as_mut() {
                 let refitted = view.window.fitted(area);
                 if refitted != view.window {
                     view.window = refitted;
+                    // No-op once the session is gone: an ended window still
+                    // has to fit the screen, but there is nobody left to tell.
                     resize_process_grid(view.window, attach.as_ref(), client);
                 }
             }
@@ -996,7 +996,6 @@ async fn handle_attach_event(
     event: events::AttachEvent,
     app: &mut App,
     attach: &mut Option<attach_session::Session>,
-    controls: &TuiControls,
 ) {
     let Some(session) = attach.as_ref() else {
         return;
@@ -1011,37 +1010,17 @@ async fn handle_attach_event(
                 view.grid = grid;
             }
         }
-        events::AttachEvent::Ended(message) => {
-            end_attach(app, attach, message, controls);
+        // The connection is over, but the window is not. Keeping the last
+        // screen is the whole point of attaching to something that finishes:
+        // the output worth reading is the output it wrote last.
+        events::AttachEvent::Ended => {
+            if let Some(session) = attach.take() {
+                session.shutdown();
+            }
+            if let Some(view) = app.attach.as_mut() {
+                view.ended = true;
+            }
         }
-    }
-}
-
-/// Move, resize or close the window. Forwarded input never gets here — the
-/// caller has already sent it to the process.
-fn apply_window_command(
-    command: attach_window::AttachInput,
-    app: &mut App,
-    attach: &mut Option<attach_session::Session>,
-    client: &std::sync::Arc<Client>,
-    controls: &TuiControls,
-    area: Rect,
-) {
-    if matches!(command, attach_window::AttachInput::Detach) {
-        end_attach(app, attach, None, controls);
-        return;
-    }
-    let Some(view) = app.attach.as_mut() else {
-        return;
-    };
-    let before = view.window;
-    view.window = match command {
-        attach_window::AttachInput::Move(direction) => view.window.moved(direction, area),
-        attach_window::AttachInput::Resize(direction) => view.window.resized(direction, area),
-        _ => view.window,
-    };
-    if view.window.grid_size() != before.grid_size() {
-        resize_process_grid(view.window, attach.as_ref(), client);
     }
 }
 
@@ -1066,20 +1045,17 @@ fn resize_process_grid(
     );
 }
 
+/// Whether the window on screen is a record rather than a live terminal.
+fn attach_ended(app: &App) -> bool {
+    app.attach.as_ref().is_some_and(|view| view.ended)
+}
+
 /// Close the window. The process keeps running; don just stops watching it.
-fn end_attach(
-    app: &mut App,
-    attach: &mut Option<attach_session::Session>,
-    message: Option<String>,
-    controls: &TuiControls,
-) {
+fn end_attach(app: &mut App, attach: &mut Option<attach_session::Session>) {
     if let Some(session) = attach.take() {
         session.shutdown();
     }
     app.attach = None;
-    if let Some(message) = message {
-        controls.lifecycle_emitter.lifecycle_event(&message);
-    }
 }
 
 /// Leave whatever view is up: back to the plain log, keys back to the log.
@@ -1696,9 +1672,16 @@ fn overlay_toggle_command(app: &App) -> Option<OverlayCommand> {
         ServiceState::Stopped | ServiceState::Lazy => {
             Some(overlay_start_command(item.name.clone()))
         }
-        ServiceState::Failed | ServiceState::DependencyFailed => {
-            Some(overlay_stop_command(item.name.clone()))
-        }
+        // Failure is not a direction, so the process decides. A failed ready
+        // check under `on_failure = "notify"` leaves something alive worth
+        // stopping; a crash, or a dependency that failed before this ever got
+        // to try, leaves nothing — and stopping what is already stopped is not
+        // what anyone pressing enter on it meant.
+        ServiceState::Failed | ServiceState::DependencyFailed => Some(if item.pid.is_some() {
+            overlay_stop_command(item.name.clone())
+        } else {
+            overlay_start_command(item.name.clone())
+        }),
         ServiceState::Pending
         | ServiceState::Building
         | ServiceState::Starting
@@ -2531,6 +2514,65 @@ mod tests {
                 case.want_selection,
                 "{}",
                 case.name
+            );
+        }
+    }
+
+    /// Enter is start-or-stop, and for a failure the process decides which.
+    ///
+    /// A service stranded by a failed dependency was never started, so the one
+    /// thing enter could not usefully mean on it was "stop" — which is what it
+    /// meant, leaving the row in `stopped` having done nothing anyone asked
+    /// for.
+    #[test]
+    fn enter_on_a_failure_starts_it_unless_something_is_still_running() {
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+            pid: Option<i32>,
+            want_start: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "stranded by a dependency, never started",
+                state: ServiceState::DependencyFailed,
+                pid: None,
+                want_start: true,
+            },
+            Case {
+                name: "crashed, nothing left running",
+                state: ServiceState::Failed,
+                pid: None,
+                want_start: true,
+            },
+            Case {
+                name: "ready check failed under notify, process still alive",
+                state: ServiceState::Failed,
+                pid: Some(4242),
+                want_start: false,
+            },
+            Case {
+                name: "ready, so enter stops it",
+                state: ServiceState::Ready,
+                pid: Some(4242),
+                want_start: false,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Pending);
+            app.apply_service_runtime("api".to_string(), case.state, case.pid, Vec::new());
+            app.view_mode = ViewMode::Services;
+
+            let command = overlay_toggle_command(&app)
+                .unwrap_or_else(|| panic!("{}: enter should do something here", case.name));
+            assert_eq!(
+                matches!(command.action, ControlAction::Start),
+                case.want_start,
+                "{}: got {:?}",
+                case.name,
+                command.action
             );
         }
     }

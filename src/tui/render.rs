@@ -136,6 +136,21 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
     draw_attach_window(frame, app);
 }
 
+/// What became of the process a window was attached to.
+///
+/// Read from don's own record rather than from anything the connection said,
+/// because the connection only knows that it closed — the difference between a
+/// task that completed and one that failed lives here.
+fn attached_process_state(app: &App, name: &str) -> Cow<'static, str> {
+    if let Some(state) = app.tasks_state.get(name) {
+        return task_state_label(*state, &[]);
+    }
+    if let Some(state) = app.services_state.get(name) {
+        return service_state_label(*state, false, &[]);
+    }
+    Cow::Borrowed("ended")
+}
+
 /// Draw the attached process's screen into its floating window.
 ///
 /// Cell by cell rather than as text, because a terminal grid is not lines:
@@ -152,13 +167,25 @@ fn draw_attach_window(frame: &mut Frame<'_>, app: &App) {
         return;
     }
     frame.render_widget(Clear, area);
+    // An ended window is a record, not a terminal: dimmed, and titled with
+    // what became of the process rather than with keys that no longer do
+    // anything to it.
+    let (border, title) = if view.ended {
+        (
+            Color::DarkGray,
+            format!(
+                " {} — {} · any key dismisses ",
+                view.name,
+                attached_process_state(app, &view.name)
+            ),
+        )
+    } else {
+        (Color::Cyan, format!(" {} — [^D] detach ", view.name))
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(
-            " {} — [^P ^Q] detach  [^P hjkl] move  [^P HJKL] size ",
-            view.name
-        ));
+        .border_style(Style::default().fg(border))
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -828,8 +855,12 @@ fn service_table_row(
     show_pid: bool,
 ) -> Row<'static> {
     let name = item.name.clone();
-    let state_cell = Cell::from(service_state_label(item.state, &item.failed_dependencies))
-        .style(Style::default().fg(service_state_color(item.state)));
+    let state_cell = Cell::from(service_state_label(
+        item.state,
+        item.pid.is_some(),
+        &item.failed_dependencies,
+    ))
+    .style(Style::default().fg(service_state_color(item.state)));
     let name_style = name_colors
         .get(&name)
         .copied()
@@ -1326,7 +1357,20 @@ fn base_count_spans(counts: &StatusCounts, show_failure_info: bool) -> Vec<Span<
     spans
 }
 
-fn service_state_label(state: ServiceState, failed_dependencies: &[String]) -> Cow<'static, str> {
+/// What to call each state in the table.
+///
+/// `live` is whether the service still has a process, and it changes what
+/// `Failed` means. A service whose ready check failed under `on_failure =
+/// "notify"` is left running on purpose and may well be serving traffic —
+/// calling that "failed" beside its own pid reads as a contradiction. It is
+/// not "unhealthy" either: that state means the service *was* ready and its
+/// health monitor has since started failing, which is a different thing that
+/// has already earned its own word.
+fn service_state_label(
+    state: ServiceState,
+    live: bool,
+    failed_dependencies: &[String],
+) -> Cow<'static, str> {
     match state {
         ServiceState::Pending => Cow::Borrowed("pending"),
         ServiceState::Building => Cow::Borrowed("building"),
@@ -1337,6 +1381,7 @@ fn service_state_label(state: ServiceState, failed_dependencies: &[String]) -> C
         ServiceState::Unhealthy => Cow::Borrowed("unhealthy"),
         ServiceState::Stopping => Cow::Borrowed("stopping"),
         ServiceState::Stopped => Cow::Borrowed("stopped"),
+        ServiceState::Failed if live => Cow::Borrowed("ready check failed"),
         ServiceState::Failed => Cow::Borrowed("failed"),
         ServiceState::DependencyFailed => dependency_failed_label(failed_dependencies),
     }
@@ -1612,6 +1657,56 @@ mod tests {
             .map(|span| span.content.into_owned())
             .collect::<Vec<String>>()
             .join("")
+    }
+
+    /// "failed" printed next to a live pid reads as a contradiction, and the
+    /// service it happens to is one that may be serving traffic right now.
+    #[test]
+    fn a_failure_that_is_still_running_says_which_check_failed() {
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+            live: bool,
+            want: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "the process is gone, so it simply failed",
+                state: ServiceState::Failed,
+                live: false,
+                want: "failed",
+            },
+            Case {
+                name: "on_failure = notify leaves it running",
+                state: ServiceState::Failed,
+                live: true,
+                want: "ready check failed",
+            },
+            Case {
+                // A different situation with its own word: this one *was*
+                // ready. Liveness must not blur the two together.
+                name: "unhealthy is unaffected by liveness",
+                state: ServiceState::Unhealthy,
+                live: true,
+                want: "unhealthy",
+            },
+            Case {
+                name: "and so is everything else",
+                state: ServiceState::Ready,
+                live: true,
+                want: "ready",
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                service_state_label(case.state, case.live, &[]),
+                case.want,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]

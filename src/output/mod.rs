@@ -413,10 +413,25 @@ impl StdoutMuteControl {
     /// contorting for. A poisoned lock reads as "not muted": showing too much
     /// beats silently swallowing the terminal's output.
     fn is_muted(&self, name: &str) -> bool {
-        let contains = |set: &std::sync::RwLock<HashSet<String>>| {
-            set.read().map(|set| set.contains(name)).unwrap_or(false)
-        };
-        contains(&self.by_config) || contains(&self.attached)
+        self.contains(&self.by_config, name) || self.is_attached(name)
+    }
+
+    /// Whether a client currently holds this process's terminal.
+    ///
+    /// Narrower than [`Self::is_muted`], and the difference is the whole point:
+    /// a config mute keeps output off the terminal but still records it, while
+    /// an attach means the output is not lines at all. An interactive program
+    /// under an attach is redrawing a screen — key echo, prompt repaints,
+    /// cursor moves — and every fragment of that became a log entry, shredded
+    /// through the merged stream between the lines other processes were
+    /// writing. The attached client is watching that screen in its window; the
+    /// log has nothing to gain by also holding the wreckage of it.
+    fn is_attached(&self, name: &str) -> bool {
+        self.contains(&self.attached, name)
+    }
+
+    fn contains(&self, set: &std::sync::RwLock<HashSet<String>>, name: &str) -> bool {
+        set.read().map(|set| set.contains(name)).unwrap_or(false)
     }
 
     /// Mute a process added after construction with `log = "ignore"`.
@@ -2321,11 +2336,16 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
         bytes: line.to_vec(),
     });
     // Feed the tap first, so history and followers see the line even if
-    // the writer below blocks.
-    if is_frame {
-        tap.publish_frame(formatted).await;
-    } else {
-        tap.publish(formatted).await;
+    // the writer below blocks. Unless a client is attached: what this process
+    // is writing then is a screen, not a record — see `is_attached`. don's own
+    // narration about it still goes through, which is what keeps the log
+    // saying "migrate: complete (2.4s)" while its window is open.
+    if is_lifecycle || !mute.is_attached(name) {
+        if is_frame {
+            tap.publish_frame(formatted).await;
+        } else {
+            tap.publish(formatted).await;
+        }
     }
     if is_verbose && !verbosity.is_enabled() {
         return;
@@ -3020,6 +3040,91 @@ mod tests {
             mute.is_muted("added-later"),
             "services can join after construction"
         );
+
+        // The narrower question, which decides whether the *record* gets the
+        // output too. A config mute must never answer it: `log = "ignore"`
+        // keeps a service off the terminal and still in the log.
+        assert!(
+            !mute.is_attached("added-later"),
+            "a config mute is not an attach"
+        );
+        mute.attach("added-later");
+        assert!(mute.is_attached("added-later"));
+        mute.release("added-later");
+        assert!(!mute.is_attached("added-later"));
+    }
+
+    /// While a client is attached, the process is drawing a screen — key echo,
+    /// prompt repaints, cursor moves — and each fragment of it used to become
+    /// a log entry, shredded between the lines other processes were writing.
+    /// don's own narration about the process still goes through, which is what
+    /// keeps "complete (2.4s)" arriving while the window is open.
+    #[tokio::test]
+    async fn an_attached_process_writes_to_its_window_not_to_the_log() {
+        struct Case {
+            name: &'static str,
+            attached: bool,
+            is_lifecycle: bool,
+            want_in_log: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "ordinary output, nobody attached",
+                attached: false,
+                is_lifecycle: false,
+                want_in_log: true,
+            },
+            Case {
+                name: "ordinary output while attached",
+                attached: true,
+                is_lifecycle: false,
+                want_in_log: false,
+            },
+            Case {
+                name: "don's own narration while attached",
+                attached: true,
+                is_lifecycle: true,
+                want_in_log: true,
+            },
+        ];
+
+        for case in cases {
+            let tap = MergedLogTap::with_capacity(16);
+            let mute = StdoutMuteControl::new(HashSet::new());
+            if case.attached {
+                mute.attach("shell");
+            }
+            let (writer, _buf) = TestBuffer::new();
+            let mut target = StdoutTarget::new(writer);
+
+            emit_line(
+                &mut target,
+                &tap,
+                &mute,
+                "shell",
+                b"shell | ",
+                b"some output",
+                case.is_lifecycle,
+                false,
+                &VerbosityControl::new(false),
+                std::time::Instant::now(),
+                false,
+            )
+            .await;
+
+            let lines = tap.tail(16).await.lines;
+            assert_eq!(
+                !lines.is_empty(),
+                case.want_in_log,
+                "{}: log holds {:?}",
+                case.name,
+                lines
+                    .iter()
+                    .map(|l| String::from_utf8_lossy(&l.line.bytes).to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]

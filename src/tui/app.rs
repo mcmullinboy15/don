@@ -174,6 +174,13 @@ pub(crate) struct AttachView {
     pub(crate) name: String,
     pub(crate) window: super::attach_window::WindowRect,
     pub(crate) grid: Option<crate::output::emulator::Grid>,
+    /// The process is gone, and this window is its last screen.
+    ///
+    /// The window used to vanish the moment the process exited, which for a
+    /// task is the moment its answer finished being printed — so what you
+    /// attached to watch was taken away at the instant it became worth
+    /// reading. It stays until dismissed instead.
+    pub(crate) ended: bool,
 }
 
 impl std::fmt::Debug for AttachView {
@@ -182,6 +189,7 @@ impl std::fmt::Debug for AttachView {
             .field("name", &self.name)
             .field("window", &self.window)
             .field("grid", &self.grid.as_ref().map(|g| (g.cols, g.rows)))
+            .field("ended", &self.ended)
             .finish()
     }
 }
@@ -792,9 +800,39 @@ impl App {
             && self.filter.select_name(&name);
         self.services_state.insert(name.clone(), state);
         self.service_pids.insert(name.clone(), pid);
+        // A service that stopped, failed or is restarting has taken its
+        // terminal with it, whatever the socket has noticed.
+        if !matches!(
+            state,
+            ServiceState::Starting
+                | ServiceState::Running
+                | ServiceState::Ready
+                | ServiceState::Unhealthy
+        ) {
+            self.note_attached_process_gone(&name);
+        }
         self.apply_failed_dependencies(name, failed_dependencies);
         self.counts = StatusCounts::from_state(&self.services_state, &self.tasks_state);
         filter_changed
+    }
+
+    /// The process an attach window is showing has finished.
+    ///
+    /// don's own record is what settles this, not the connection. A task's
+    /// attach socket stays open past its exit — the sink it feeds outlives the
+    /// run — so waiting for the stream to close meant a finished task sat
+    /// there looking live, which is precisely the question someone attached to
+    /// a task is asking.
+    ///
+    /// The session is left running. Anything still in flight keeps landing in
+    /// the grid, so marking the window ended can never clip the last thing the
+    /// process wrote; the connection is closed when the reader dismisses it.
+    fn note_attached_process_gone(&mut self, name: &str) {
+        if let Some(view) = self.attach.as_mut()
+            && view.name == name
+        {
+            view.ended = true;
+        }
     }
 
     pub(crate) fn apply_task_state(
@@ -808,6 +846,9 @@ impl App {
             && self.auto_filter_on_failure_names.contains(&name)
             && self.filter.select_name(&name);
         self.tasks_state.insert(name.clone(), state);
+        if !matches!(state, TaskState::Running | TaskState::Building) {
+            self.note_attached_process_gone(&name);
+        }
         self.apply_failed_dependencies(name.clone(), failed_dependencies);
         if let Some(last_run) = last_run {
             self.tasks_last_run.insert(name, last_run);
