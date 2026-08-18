@@ -1,21 +1,15 @@
-//! The tasks behind an attach window: raw stdin in, process output out.
+//! The tasks behind an attach window: input in, process output out.
 //!
-//! Two directions, two tasks, and one rule that shapes both: while the window
-//! is open the crossterm event stream is *suspended* and stdin is read raw.
-//!
-//! Parsing stdin into key events and re-encoding them into bytes for the
-//! process would lose exactly the things an interactive program cares about —
-//! the precise escape sequence a terminal sent, modifier encodings, bracketed
-//! paste. Reading raw and forwarding bytes untouched is both more faithful and
-//! less code; the only bytes don keeps for itself are the ones behind the
-//! `Ctrl+P` prefix (see [`super::attach_window`]).
+//! Input does not come from here. The main loop routes it, because it is
+//! reading the same crossterm stream it always was — see [`super::keys`] for
+//! why the window does not take stdin for itself. What is left is a socket in
+//! each direction, and a task for each so neither blocks the loop.
 
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use super::attach_window::{AttachInput, KeyRouter};
 use super::events::{AppEvent, AttachEvent};
 use crate::output::emulator::EmulatorHandle;
 
@@ -26,16 +20,22 @@ pub(crate) struct Session {
     pub(crate) emulator: EmulatorHandle,
     /// Identifies the session to the resize endpoint.
     pub(crate) session_id: Option<u64>,
-    stdin_task: tokio::task::JoinHandle<()>,
+    to_process: mpsc::UnboundedSender<Vec<u8>>,
     output_task: tokio::task::JoinHandle<()>,
     writer_task: tokio::task::JoinHandle<()>,
 }
 
 impl Session {
+    /// Hand bytes to the process. Queued, never awaited: a keystroke must not
+    /// wait on the socket, and a full pipe is the process's problem to drain,
+    /// not a reason to stall the frame the keystroke belongs to.
+    pub(crate) fn send(&self, bytes: Vec<u8>) {
+        let _ = self.to_process.send(bytes);
+    }
+
     /// Stop every task. The process keeps running — this closes don's view of
     /// it, which is what detaching means.
     pub(crate) fn shutdown(self) {
-        self.stdin_task.abort();
         self.output_task.abort();
         self.writer_task.abort();
     }
@@ -114,46 +114,11 @@ pub(crate) async fn start(
         }
     });
 
-    // Raw stdin → the router → either the process or the main loop.
-    let stdin_task = tokio::spawn({
-        let events = events.clone();
-        async move {
-            let mut stdin = tokio::io::stdin();
-            let mut router = KeyRouter::default();
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = match stdin.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => n,
-                };
-                for outcome in router.route(&buf[..n]) {
-                    match outcome {
-                        AttachInput::Forward(bytes) => {
-                            if to_process.send(bytes).is_err() {
-                                return;
-                            }
-                        }
-                        AttachInput::Pending => {}
-                        command => {
-                            if events
-                                .send(AppEvent::Attach(AttachEvent::Command(command)))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
     Ok(Session {
         name: name.to_string(),
         emulator,
         session_id: session.session_id,
-        stdin_task,
+        to_process,
         output_task,
         writer_task,
     })

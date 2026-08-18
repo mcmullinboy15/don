@@ -12,14 +12,21 @@
 //!
 //! ## Why the keys work the way they do
 //!
-//! Every keystroke belongs to the process, byte for byte, so don cannot claim
-//! a chord for its own use — Ctrl+arrow is word-movement in every shell, and
-//! stealing it would break the thing you attached to. don already holds
-//! `Ctrl+P` as a prefix (that is how Ctrl+P Ctrl+Q detaches), so the window's
-//! own commands live behind it, and a `Ctrl+P` followed by anything else
-//! releases both bytes to the process untouched.
+//! Every keystroke belongs to the process, so don cannot claim a chord for its
+//! own use — Ctrl+arrow is word-movement in every shell, and stealing it would
+//! break the thing you attached to. don already holds `Ctrl+P` as a prefix
+//! (that is how Ctrl+P Ctrl+Q detaches), so the window's own commands live
+//! behind it, and a `Ctrl+P` followed by anything else sends both keys on
+//! untouched.
+//!
+//! Keys arrive here already parsed, from the same crossterm stream that feeds
+//! the rest of the TUI, and [`super::keys::encode`] turns them back into bytes
+//! — see that module for why that beats reading stdin raw.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
+
+use super::keys::encode;
 
 /// What a byte from stdin turned out to mean.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,10 +52,10 @@ pub(crate) enum Direction {
 }
 
 /// The docker-style prefix. A lone one is held, not forwarded, until the next
-/// byte says what it meant.
-const PREFIX: u8 = 0x10; // Ctrl+P
+/// key says what it meant.
+const PREFIX: char = 'p'; // with Ctrl
 /// Detach, when it follows the prefix.
-const DETACH: u8 = 0x11; // Ctrl+Q
+const DETACH: char = 'q'; // with Ctrl
 
 /// Steps a move or resize takes per press.
 const MOVE_STEP: u16 = 2;
@@ -59,79 +66,78 @@ const RESIZE_STEP: u16 = 2;
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 5;
 
-/// Translates stdin bytes into either process input or window commands.
+/// Translates key presses into either process input or window commands.
 ///
-/// Stateful across calls because the prefix spans two bytes, and those two
-/// bytes can arrive in different reads.
+/// Stateful across calls because the prefix spans two keys.
 #[derive(Debug, Default)]
 pub(crate) struct KeyRouter {
     holding_prefix: bool,
 }
 
 impl KeyRouter {
-    /// Route one read of stdin.
+    /// Route one key press.
     ///
-    /// Returns in order: a byte that resolves a held prefix produces its
-    /// command, and everything else accumulates into one `Forward`. A read
-    /// containing both is possible — pasting, or a fast typist — so this
-    /// returns a list rather than a single outcome.
-    pub(crate) fn route(&mut self, bytes: &[u8]) -> Vec<AttachInput> {
-        let mut out: Vec<AttachInput> = Vec::new();
-        let mut forward: Vec<u8> = Vec::new();
+    /// A key that resolves a held prefix produces its command; everything else
+    /// is the process's. Resolving a prefix that turned out not to be a
+    /// command sends both keys, in order, which is why this returns a list.
+    pub(crate) fn route(&mut self, key: KeyEvent) -> Vec<AttachInput> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_prefix = ctrl && key.code == KeyCode::Char(PREFIX);
 
-        for &byte in bytes {
-            if self.holding_prefix {
-                self.holding_prefix = false;
-                match byte {
-                    DETACH => {
-                        if !forward.is_empty() {
-                            out.push(AttachInput::Forward(std::mem::take(&mut forward)));
-                        }
-                        out.push(AttachInput::Detach);
-                        continue;
-                    }
-                    b'h' | b'j' | b'k' | b'l' | b'H' | b'J' | b'K' | b'L' => {
-                        if !forward.is_empty() {
-                            out.push(AttachInput::Forward(std::mem::take(&mut forward)));
-                        }
-                        let direction = match byte.to_ascii_lowercase() {
-                            b'h' => Direction::Left,
-                            b'j' => Direction::Down,
-                            b'k' => Direction::Up,
-                            _ => Direction::Right,
-                        };
-                        out.push(if byte.is_ascii_uppercase() {
-                            AttachInput::Resize(direction)
-                        } else {
-                            AttachInput::Move(direction)
-                        });
-                        continue;
-                    }
-                    // Not a command: the held prefix was the process's after
-                    // all, so it goes through ahead of this byte.
-                    _ => {
-                        forward.push(PREFIX);
-                        if byte == PREFIX {
-                            self.holding_prefix = true;
-                            continue;
-                        }
-                        forward.push(byte);
-                    }
-                }
-            } else if byte == PREFIX {
+        if !self.holding_prefix {
+            if is_prefix {
                 self.holding_prefix = true;
-            } else {
-                forward.push(byte);
+                return vec![AttachInput::Pending];
             }
+            return vec![forward(key)];
         }
 
-        if !forward.is_empty() {
-            out.push(AttachInput::Forward(forward));
+        self.holding_prefix = false;
+        if ctrl && key.code == KeyCode::Char(DETACH) {
+            return vec![AttachInput::Detach];
         }
-        if out.is_empty() {
-            out.push(AttachInput::Pending);
+        if let KeyCode::Char(c) = key.code
+            && !ctrl
+            && let Some(direction) = direction_of(c)
+        {
+            return vec![if c.is_ascii_uppercase() {
+                AttachInput::Resize(direction)
+            } else {
+                AttachInput::Move(direction)
+            }];
         }
-        out
+
+        // Not a command, so the held prefix was the process's after all and
+        // goes through ahead of this key. A second prefix is the exception:
+        // one Ctrl+P reaches the process and the other starts holding again,
+        // which is how you type a literal Ctrl+P.
+        let prefix_key = KeyEvent::new(KeyCode::Char(PREFIX), KeyModifiers::CONTROL);
+        if is_prefix {
+            self.holding_prefix = true;
+            return vec![forward(prefix_key)];
+        }
+        vec![forward(prefix_key), forward(key)]
+    }
+}
+
+/// A key as process input. Keys a terminal wouldn't send anything for — a bare
+/// modifier press — are nothing to forward, but they don't cancel a held
+/// prefix either, so they read as `Pending`.
+fn forward(key: KeyEvent) -> AttachInput {
+    match encode(key) {
+        Some(bytes) => AttachInput::Forward(bytes),
+        None => AttachInput::Pending,
+    }
+}
+
+/// The vim direction keys, in either case.
+fn direction_of(c: char) -> Option<Direction> {
+    match c.to_ascii_lowercase() {
+        'h' => Some(Direction::Left),
+        'j' => Some(Direction::Down),
+        'k' => Some(Direction::Up),
+        'l' => Some(Direction::Right),
+        _ => None,
     }
 }
 
@@ -196,6 +202,12 @@ impl WindowRect {
         next.clamped_to(area)
     }
 
+    /// Put the window back inside `area` — for when the area moved rather
+    /// than the window, which is what a terminal resize is.
+    pub(crate) fn fitted(self, area: Rect) -> Self {
+        self.clamped_to(area)
+    }
+
     /// Keep the window on screen: shrink to fit, then pull it inside.
     fn clamped_to(mut self, area: Rect) -> Self {
         self.width = self.width.min(area.width).max(1);
@@ -209,6 +221,14 @@ impl WindowRect {
             .min(area.y + area.height.saturating_sub(self.height))
             .max(area.y);
         self
+    }
+
+    /// Whether a screen cell is the window's.
+    pub(crate) fn contains(self, column: u16, row: u16) -> bool {
+        column >= self.x
+            && column < self.x.saturating_add(self.width)
+            && row >= self.y
+            && row < self.y.saturating_add(self.height)
     }
 
     pub(crate) fn to_rect(self) -> Rect {
@@ -229,69 +249,104 @@ impl WindowRect {
 mod tests {
     use super::*;
 
-    /// The prefix belongs to the process unless the next byte claims it, and
-    /// a read can carry both process input and a command.
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// The prefix belongs to the process unless the next key claims it.
     #[test]
-    fn the_prefix_is_held_until_the_next_byte_decides() {
+    fn the_prefix_is_held_until_the_next_key_decides() {
         struct Case {
             name: &'static str,
-            reads: &'static [&'static [u8]],
+            keys: Vec<KeyEvent>,
             want: Vec<AttachInput>,
         }
 
         let cases = vec![
             Case {
                 name: "ordinary input goes straight through",
-                reads: &[b"ls -la\r"],
-                want: vec![AttachInput::Forward(b"ls -la\r".to_vec())],
+                keys: vec![plain(KeyCode::Char('l')), plain(KeyCode::Enter)],
+                want: vec![
+                    AttachInput::Forward(b"l".to_vec()),
+                    AttachInput::Forward(b"\r".to_vec()),
+                ],
+            },
+            Case {
+                name: "ctrl+c belongs to the process, not to don",
+                keys: vec![ctrl('c')],
+                want: vec![AttachInput::Forward(vec![0x03])],
+            },
+            Case {
+                name: "so do the arrows",
+                keys: vec![plain(KeyCode::Up)],
+                want: vec![AttachInput::Forward(b"\x1b[A".to_vec())],
             },
             Case {
                 name: "a lone prefix is held, not forwarded",
-                reads: &[&[PREFIX]],
+                keys: vec![ctrl('p')],
                 want: vec![AttachInput::Pending],
             },
             Case {
                 name: "prefix then detach",
-                reads: &[&[PREFIX, DETACH]],
-                want: vec![AttachInput::Detach],
-            },
-            Case {
-                name: "prefix then a non-command releases both bytes",
-                reads: &[&[PREFIX, b'x']],
-                want: vec![AttachInput::Forward(vec![PREFIX, b'x'])],
-            },
-            Case {
-                name: "the prefix can span two reads",
-                reads: &[&[PREFIX], &[DETACH]],
+                keys: vec![ctrl('p'), ctrl('q')],
                 want: vec![AttachInput::Pending, AttachInput::Detach],
             },
             Case {
+                name: "prefix then a non-command sends both keys",
+                keys: vec![ctrl('p'), plain(KeyCode::Char('x'))],
+                want: vec![
+                    AttachInput::Pending,
+                    AttachInput::Forward(vec![0x10]),
+                    AttachInput::Forward(b"x".to_vec()),
+                ],
+            },
+            Case {
                 name: "lowercase moves",
-                reads: &[&[PREFIX, b'h']],
-                want: vec![AttachInput::Move(Direction::Left)],
+                keys: vec![ctrl('p'), plain(KeyCode::Char('h'))],
+                want: vec![AttachInput::Pending, AttachInput::Move(Direction::Left)],
             },
             Case {
                 name: "uppercase resizes",
-                reads: &[&[PREFIX, b'L']],
-                want: vec![AttachInput::Resize(Direction::Right)],
+                keys: vec![
+                    ctrl('p'),
+                    KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+                ],
+                want: vec![AttachInput::Pending, AttachInput::Resize(Direction::Right)],
             },
             Case {
-                name: "input before a command is forwarded first",
-                reads: &[&[b'a', b'b', PREFIX, DETACH]],
-                want: vec![AttachInput::Forward(b"ab".to_vec()), AttachInput::Detach],
+                name: "ctrl+l after the prefix is the process's clear, not a move",
+                keys: vec![ctrl('p'), ctrl('l')],
+                want: vec![
+                    AttachInput::Pending,
+                    AttachInput::Forward(vec![0x10]),
+                    AttachInput::Forward(vec![0x0c]),
+                ],
             },
             Case {
-                name: "a doubled prefix forwards one and holds the other",
-                reads: &[&[PREFIX, PREFIX]],
-                want: vec![AttachInput::Forward(vec![PREFIX])],
+                name: "a doubled prefix sends one and holds the other",
+                keys: vec![ctrl('p'), ctrl('p')],
+                want: vec![AttachInput::Pending, AttachInput::Forward(vec![0x10])],
+            },
+            Case {
+                name: "and the held one still commands",
+                keys: vec![ctrl('p'), ctrl('p'), ctrl('q')],
+                want: vec![
+                    AttachInput::Pending,
+                    AttachInput::Forward(vec![0x10]),
+                    AttachInput::Detach,
+                ],
             },
         ];
 
         for case in cases {
             let mut router = KeyRouter::default();
             let mut got: Vec<AttachInput> = Vec::new();
-            for read in case.reads {
-                got.extend(router.route(read));
+            for key in case.keys {
+                got.extend(router.route(key));
             }
             assert_eq!(got, case.want, "{}", case.name);
         }

@@ -54,8 +54,6 @@ pub(crate) enum AppEvent {
 pub(crate) enum AttachEvent {
     /// New output landed; the window's grid needs re-reading.
     Output,
-    /// The reader asked for the window to move or resize, or to detach.
-    Command(super::attach_window::AttachInput),
     /// The session is over. `Some` carries a message worth narrating —
     /// the process exited, or the connection failed.
     Ended(Option<String>),
