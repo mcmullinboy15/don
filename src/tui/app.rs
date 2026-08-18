@@ -310,6 +310,10 @@ pub(crate) struct App {
     /// Where the side panel docks and how big it is. Whether it is *open* is
     /// the view mode's fact — see [`Self::panel_open`].
     pub(crate) panel: super::panes::Panel,
+    /// Whether the reader has sized the panel themselves — a divider drag or a
+    /// Ctrl+arrow. Until they have, opening a panel picks a width from the
+    /// terminal's; once they have, their number is their number.
+    pub(crate) panel_extent_customized: bool,
     /// The layout the screen was last painted with, and whether a full repaint
     /// has been asked for. A pane opening, moving or resizing changes which
     /// cells mean what, and a diffing renderer only rewrites cells it believes
@@ -489,6 +493,7 @@ impl App {
             log_popup: None,
             panes: super::panes::Panes::empty(),
             panel: super::panes::Panel::default(),
+            panel_extent_customized: false,
             painted_layout: None,
             repaint_requested: false,
             focus: super::panes::Focus::Logs,

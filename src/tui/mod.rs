@@ -941,6 +941,7 @@ const RESIZE_STEP_ROWS: i16 = 2;
 /// is drawn, so every press in the burst computed the same target.
 fn nudge_panel(app: &mut App, delta: i16) {
     app.panel.extent = app.panel.extent.saturating_add_signed(delta).max(1);
+    app.panel_extent_customized = true;
 }
 
 fn open_services_panel(app: &mut App) {
@@ -948,6 +949,7 @@ fn open_services_panel(app: &mut App) {
     app.freeze_services_order();
     app.view_mode = ViewMode::Services;
     app.focus = panes::Focus::Panel;
+    fit_panel_to_terminal(app);
 }
 
 fn open_tasks_panel(app: &mut App) {
@@ -955,12 +957,32 @@ fn open_tasks_panel(app: &mut App) {
     app.freeze_tasks_order();
     app.view_mode = ViewMode::Tasks;
     app.focus = panes::Focus::Panel;
+    fit_panel_to_terminal(app);
 }
 
 fn open_filter_panel(app: &mut App) {
     app.filter.enter_edit();
     app.view_mode = ViewMode::Filter;
     app.focus = panes::Focus::Panel;
+    fit_panel_to_terminal(app);
+}
+
+/// Give the opening panel a width suited to the terminal, unless the reader
+/// has sized it themselves — their number is their number.
+///
+/// Two fifths of the width, floored at the old fixed 48 and capped at twice
+/// it: a wide terminal has room for the tables' wider columns (the pid, a
+/// task's last run), and pinning the panel at 48 there wasted the width on
+/// log lines that rarely need 200 columns. The bar spans the whole terminal,
+/// which is how the width is known here without a frame in hand.
+fn fit_panel_to_terminal(app: &mut App) {
+    if app.panel_extent_customized {
+        return;
+    }
+    let width = app.panes.bar.width;
+    if app.panel.side == panes::PaneSide::Right && width > 0 {
+        app.panel.extent = (width.saturating_mul(2) / 5).clamp(48, 96);
+    }
 }
 
 /// Whether a screen position is inside the open side panel.
@@ -1040,7 +1062,14 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 return;
             };
             app.focus = focus;
-            if focus != panes::Focus::Logs || app.view_mode != ViewMode::Normal {
+            // Selection needs the click to be on the log, and the log to be on
+            // screen. A side panel leaves it on screen — the guard used to say
+            // `view_mode != Normal` from the days when every other mode took
+            // the whole frame, which made selecting dead whenever a panel was
+            // open. Only the true full-screen overlays exclude it now.
+            if focus != panes::Focus::Logs
+                || matches!(app.view_mode, ViewMode::Failures | ViewMode::Form)
+            {
                 return;
             }
             match click_count(app, mouse.column, mouse.row) {
@@ -1069,6 +1098,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 );
                 app.panel.extent =
                     panes::extent_from_drag(area, app.panel.side, mouse.column, mouse.row);
+                app.panel_extent_customized = true;
                 return;
             }
             // The rows under a selection have to stop moving, or output
@@ -2253,6 +2283,125 @@ mod tests {
             }
 
             assert_eq!(app.panel.extent, case.want_extent, "{}", case.name);
+        }
+    }
+
+    /// Opening a panel sizes it to the terminal — until the reader has sized
+    /// it themselves, after which their number is their number.
+    #[test]
+    fn panel_width_follows_the_terminal_until_customized() {
+        use ratatui::layout::Rect;
+
+        struct Case {
+            name: &'static str,
+            terminal_width: u16,
+            customized: bool,
+            prior_extent: u16,
+            want_extent: u16,
+        }
+
+        let cases = [
+            Case {
+                name: "narrow terminal keeps the floor",
+                terminal_width: 120,
+                customized: false,
+                prior_extent: 48,
+                want_extent: 48,
+            },
+            Case {
+                name: "wide terminal grows the panel",
+                terminal_width: 200,
+                customized: false,
+                prior_extent: 48,
+                want_extent: 80,
+            },
+            Case {
+                name: "very wide caps at twice the old fixed width",
+                terminal_width: 300,
+                customized: false,
+                prior_extent: 48,
+                want_extent: 96,
+            },
+            Case {
+                name: "a hand-sized panel is left alone",
+                terminal_width: 300,
+                customized: true,
+                prior_extent: 30,
+                want_extent: 30,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            app.panel_extent_customized = case.customized;
+            app.panel.extent = case.prior_extent;
+            app.panes.bar = Rect::new(0, 21, case.terminal_width, 3);
+
+            open_services_panel(&mut app);
+
+            assert_eq!(app.panel.extent, case.want_extent, "{}", case.name);
+        }
+    }
+
+    /// Selecting log text works while a panel is open — the log is still on
+    /// screen, and the guard that said otherwise dated from when every
+    /// non-normal view took the whole frame.
+    #[test]
+    fn selection_works_beside_an_open_panel() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+
+        struct Case {
+            name: &'static str,
+            view_mode: ViewMode,
+            want_selection: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "plain log",
+                view_mode: ViewMode::Normal,
+                want_selection: true,
+            },
+            Case {
+                name: "services panel open",
+                view_mode: ViewMode::Services,
+                want_selection: true,
+            },
+            Case {
+                name: "filter panel open",
+                view_mode: ViewMode::Filter,
+                want_selection: true,
+            },
+            Case {
+                name: "full-screen failure summary: no log on screen",
+                view_mode: ViewMode::Failures,
+                want_selection: false,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            app.view_mode = case.view_mode;
+            app.panes.logs = Rect::new(0, 0, 60, 20);
+            app.panes.status = Some(Rect::new(60, 0, 40, 20));
+
+            let mouse = |kind: MouseEventKind, column: u16| MouseEvent {
+                kind,
+                column,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10), &mut app);
+            handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30), &mut app);
+            handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 30), &mut app);
+
+            assert_eq!(
+                app.log_selection.span().is_some(),
+                case.want_selection,
+                "{}",
+                case.name
+            );
         }
     }
 

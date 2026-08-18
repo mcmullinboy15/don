@@ -251,7 +251,11 @@ fn draw_log_pane(
     }
     frame.render_widget(Paragraph::new(rows), area);
 
-    if !following {
+    // Only when something is actually below the view. A selection pins the
+    // view at the tail without following, and announcing "scrolled — 0 rows
+    // below" for that state is a badge contradicting itself; the moment new
+    // output puts real rows below, it appears with a true number.
+    if !following && rows_below > 0 {
         draw_scroll_badge(frame, area, rows_below);
     }
 }
@@ -1717,6 +1721,88 @@ mod tests {
 
             assert!(text.contains(case.want), "case: {}", case.name);
             assert!(!text.contains(case.reject), "case: {}", case.name);
+        }
+    }
+
+    /// The scroll badge appears only when rows are genuinely below the view.
+    /// A selection pins the view at the tail without following, and a badge
+    /// reading "scrolled — 0 rows below" there contradicts itself.
+    #[test]
+    fn scroll_badge_only_shows_when_rows_are_below() {
+        use crate::output::{FormattedLogLine, LogId};
+
+        struct Case {
+            name: &'static str,
+            scroll: super::super::logs::Scroll,
+            want_badge: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "following: no badge",
+                scroll: super::super::logs::Scroll::Follow,
+                want_badge: false,
+            },
+            Case {
+                name: "pinned at the tail: nothing below, no badge",
+                scroll: super::super::logs::Scroll::At {
+                    id: LogId(29),
+                    row: 0,
+                },
+                want_badge: false,
+            },
+            Case {
+                name: "held above the tail: badge with a real count",
+                scroll: super::super::logs::Scroll::At {
+                    id: LogId(0),
+                    row: 0,
+                },
+                want_badge: true,
+            },
+        ];
+
+        for case in cases {
+            let mut app = App::new(AppInit {
+                service_names: vec!["api".to_string()],
+                task_names: Vec::new(),
+                build_tool_names: Vec::new(),
+                task_configs: HashMap::new(),
+                task_last_runs: HashMap::new(),
+                hidden_names: std::collections::HashSet::new(),
+                auto_filter_on_failure_names: std::collections::HashSet::new(),
+                cli_log_filter: None,
+            });
+            app.log_scroll = case.scroll;
+
+            let mut store = super::super::log_store::LogStore::with_capacity(100);
+            store.reflow(58);
+            for id in 0..30u64 {
+                store.push(
+                    LogId(id),
+                    FormattedLogLine {
+                        name: "api".to_string(),
+                        is_lifecycle: false,
+                        is_verbose: false,
+                        prefix: b"api \xe2\x94\x82 ".to_vec(),
+                        bytes: format!("line {id}").into_bytes(),
+                    },
+                );
+            }
+
+            let backend = ratatui::backend::TestBackend::new(60, 12);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &store))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+
+            assert_eq!(text.contains("scrolled"), case.want_badge, "{}", case.name);
         }
     }
 
