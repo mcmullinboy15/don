@@ -11,7 +11,7 @@
 
 mod actor;
 pub mod attach;
-pub(crate) mod emulator;
+pub mod emulator;
 pub(crate) mod osc;
 pub(crate) mod ring_buffer;
 pub(crate) mod sanitize;

@@ -45,6 +45,8 @@
 //! [`Line`]: ratatui::text::Line
 
 mod app;
+mod attach_session;
+mod attach_window;
 mod events;
 mod failure_summary;
 mod filter;
@@ -100,36 +102,12 @@ impl TerminalGuard {
         execute!(std::io::stdout(), EnterAlternateScreen, Print(MOUSE_ON))?;
         Ok(Self)
     }
-
-    /// Hand the terminal back for something else to use — `don attach`
-    /// bridging the user into a process's PTY.
-    ///
-    /// Returns a token that must be used to take it again, so the two halves
-    /// cannot drift apart: there is no way to release without a plan to
-    /// re-acquire, and no way to re-acquire twice.
-    fn release(&self) -> Result<ReleasedTerminal, TuiError> {
-        execute!(std::io::stdout(), Print(MOUSE_OFF), LeaveAlternateScreen)?;
-        crossterm::terminal::disable_raw_mode()?;
-        Ok(ReleasedTerminal)
-    }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = execute!(std::io::stdout(), Print(MOUSE_OFF), LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
-
-/// Proof that the terminal is currently somebody else's.
-#[must_use = "the terminal stays released until this is retaken"]
-struct ReleasedTerminal;
-
-impl ReleasedTerminal {
-    fn retake(self) -> Result<(), TuiError> {
-        crossterm::terminal::enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen, Print(MOUSE_ON))?;
-        Ok(())
     }
 }
 
@@ -297,6 +275,11 @@ pub async fn run_tui(
     let _guard = TerminalGuard::enter()?;
     let mut terminal = build_terminal()?;
     let mut input_handle = tokio::spawn(input::run(input_tx.clone()));
+    // The live attach session, when there is one. Owned here rather than on
+    // `App` because it is tasks and a socket, not view state — and because
+    // ending it has to hand stdin back to the input task, which is also the
+    // loop's to restart.
+    let mut attach: Option<attach_session::Session> = None;
 
     // Drives the spinner and relative timestamps ("5s ago"), which move
     // without any event arriving.
@@ -392,13 +375,27 @@ pub async fn run_tui(
                 match maybe_event {
                     Some(event) => {
                         let showing = app.debug_view;
-                        handle_app_event(
-                            event,
-                            &mut app,
-                            stores.active_mut(showing),
-                            &client,
-                            &controls,
-                        )?;
+                        if let AppEvent::Attach(attach_event) = event {
+                            handle_attach_event(
+                                attach_event,
+                                &mut app,
+                                &mut attach,
+                                &client,
+                                &controls,
+                                &input_tx,
+                                &mut input_handle,
+                                terminal.size()?.into(),
+                            )
+                            .await;
+                        } else {
+                            handle_app_event(
+                                event,
+                                &mut app,
+                                stores.active_mut(showing),
+                                &client,
+                                &controls,
+                            )?;
+                        }
                         // Input arrives in bursts — a drag reports once per cell
                         // the pointer crosses — and handling one per `select!`
                         // round means a round trip each, so a burst spreads
@@ -412,6 +409,19 @@ pub async fn run_tui(
                             match input_rx.try_recv() {
                                 // Re-read per event: a `v` earlier in this same
                                 // burst changes which record is in front.
+                                Ok(AppEvent::Attach(attach_event)) => {
+                                    handle_attach_event(
+                                        attach_event,
+                                        &mut app,
+                                        &mut attach,
+                                        &client,
+                                        &controls,
+                                        &input_tx,
+                                        &mut input_handle,
+                                        terminal.size()?.into(),
+                                    )
+                                    .await;
+                                }
                                 Ok(event) => {
                                     let showing = app.debug_view;
                                     handle_app_event(
@@ -430,22 +440,39 @@ pub async fn run_tui(
                             break;
                         }
                         if let Some(name) = app.bridge_request.take() {
-                            // The bridge needs the tty to itself: stop reading
-                            // stdin, give the screen back, run it, then take
-                            // both again. Nothing is replayed on return — the
-                            // store kept every line, so the next draw simply
-                            // paints the current truth.
+                            // The window draws on don's own screen, so the
+                            // terminal is never handed over. What *is* handed
+                            // over is stdin: the crossterm event stream stops
+                            // so the session can read raw bytes and forward
+                            // them to the process untouched.
                             input_handle.abort();
                             let _ = (&mut input_handle).await;
-                            let released = _guard.release()?;
-                            let end = run_bridge(&client, &name).await;
-                            released.retake()?;
-                            terminal = build_terminal()?;
                             let area: Rect = terminal.size()?.into();
-                            force_full_repaint(&mut terminal, area)?;
-                            input_handle = tokio::spawn(input::run(input_tx.clone()));
-                            if let Some(message) = end {
-                                controls.lifecycle_emitter.lifecycle_event(&message);
+                            let window = attach_window::WindowRect::centred_in(area);
+                            let (cols, rows) = window.grid_size();
+                            match attach_session::start(
+                                client.socket_path(),
+                                &name,
+                                cols,
+                                rows,
+                                input_tx.clone(),
+                            )
+                            .await
+                            {
+                                Ok(session) => {
+                                    app.attach = Some(app::AttachView {
+                                        name: name.clone(),
+                                        window,
+                                        grid: None,
+                                    });
+                                    attach = Some(session);
+                                }
+                                Err(e) => {
+                                    controls
+                                        .lifecycle_emitter
+                                        .lifecycle_event(&format!("attach '{name}' failed: {e}"));
+                                    input_handle = tokio::spawn(input::run(input_tx.clone()));
+                                }
                             }
                         }
                     }
@@ -651,6 +678,9 @@ fn handle_app_event(
         }
         AppEvent::Key(key) => handle_key(key, app, store, client, controls)?,
         AppEvent::Mouse(mouse) => handle_mouse(mouse, app),
+        // Handled by the loop, which owns the live session; by the time an
+        // event reaches here the loop has already dealt with it.
+        AppEvent::Attach(_) => {}
         AppEvent::CompletionsReady {
             param,
             request_id,
@@ -917,6 +947,94 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
         _ => {}
     }
     Ok(())
+}
+
+/// Apply one attach event: redraw the window, move it, or end the session.
+///
+/// Lives here rather than in `handle_app_event` because it needs the live
+/// session, which the loop owns — the connection outlives no frame and
+/// belongs to nothing in `App`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_attach_event(
+    event: events::AttachEvent,
+    app: &mut App,
+    attach: &mut Option<attach_session::Session>,
+    client: &std::sync::Arc<Client>,
+    controls: &TuiControls,
+    input_tx: &mpsc::Sender<AppEvent>,
+    input_handle: &mut tokio::task::JoinHandle<()>,
+    area: Rect,
+) {
+    let Some(session) = attach.as_ref() else {
+        return;
+    };
+    match event {
+        events::AttachEvent::Output => {
+            // Re-read the whole grid rather than tracking damage: it is one
+            // channel round trip for a screenful, and the alternative is
+            // teaching don's side which cells ghostty changed.
+            let grid = session.emulator.grid(&session.name).await;
+            if let Some(view) = app.attach.as_mut() {
+                view.grid = grid;
+            }
+        }
+        events::AttachEvent::Command(command) => {
+            let Some(view) = app.attach.as_mut() else {
+                return;
+            };
+            let before = view.window;
+            view.window = match command {
+                attach_window::AttachInput::Move(direction) => view.window.moved(direction, area),
+                attach_window::AttachInput::Resize(direction) => {
+                    view.window.resized(direction, area)
+                }
+                attach_window::AttachInput::Detach => {
+                    end_attach(app, attach, input_tx, input_handle, None, controls);
+                    return;
+                }
+                // Forwarded input never reaches the loop; the session sends it
+                // straight to the process.
+                _ => view.window,
+            };
+            if view.window.grid_size() != before.grid_size() {
+                let (cols, rows) = view.window.grid_size();
+                attach_session::notify_resize(
+                    std::sync::Arc::new(client.socket_path().to_path_buf()),
+                    session.name.clone(),
+                    session.session_id,
+                    cols,
+                    rows,
+                    session.emulator.clone(),
+                );
+            }
+        }
+        events::AttachEvent::Ended(message) => {
+            end_attach(app, attach, input_tx, input_handle, message, controls);
+        }
+    }
+}
+
+/// Close the window and give stdin back to the TUI.
+fn end_attach(
+    app: &mut App,
+    attach: &mut Option<attach_session::Session>,
+    input_tx: &mpsc::Sender<AppEvent>,
+    input_handle: &mut tokio::task::JoinHandle<()>,
+    message: Option<String>,
+    controls: &TuiControls,
+) {
+    if let Some(session) = attach.take() {
+        session.shutdown();
+    }
+    app.attach = None;
+    // The session's stdin reader is gone, so the event stream can have it
+    // back. Aborting first is belt and braces: two readers of one stdin would
+    // race for every byte.
+    input_handle.abort();
+    *input_handle = tokio::spawn(input::run(input_tx.clone()));
+    if let Some(message) = message {
+        controls.lifecycle_emitter.lifecycle_event(&message);
+    }
 }
 
 /// Close the side panel: back to the plain log, keys back to the log.
@@ -1480,27 +1598,6 @@ fn handle_services_key(
         _ => {}
     }
     Ok(())
-}
-
-/// Run one bridge session against `name`, with a banner on each side.
-/// Returns a lifecycle message to emit after the TUI is rebuilt, if the
-/// session ended in a way worth narrating.
-async fn run_bridge(client: &std::sync::Arc<Client>, name: &str) -> Option<String> {
-    {
-        use std::io::Write;
-        let banner =
-            format!("── bridged into '{name}' — Ctrl+P Ctrl+Q returns to the dashboard ──\r\n");
-        let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(banner.as_bytes());
-        let _ = stdout.flush();
-    }
-    match crate::client::attach::bridge_once(client.socket_path(), name).await {
-        crate::client::attach::BridgeEnd::Escape => None,
-        crate::client::attach::BridgeEnd::ServerDisconnect => Some(format!(
-            "'{name}' bridge ended (process exited or restarted)"
-        )),
-        crate::client::attach::BridgeEnd::Error(e) => Some(format!("attach '{name}' failed: {e}")),
-    }
 }
 
 fn handle_log_popup_key(key: KeyEvent, app: &mut App) {

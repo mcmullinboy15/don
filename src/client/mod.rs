@@ -6,6 +6,7 @@
 //! and closes. Follow-mode log streams use chunked transfer encoding.
 
 pub mod attach;
+pub mod attach_session;
 
 use serde::Deserialize;
 

@@ -131,6 +131,114 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
     }
     // The per-process log popup is a centred overlay and clears its own rect.
     draw_log_popup(frame, app);
+    // The attached process floats above everything: it owns the keyboard
+    // while it is open, so it should look like it does.
+    draw_attach_window(frame, app);
+}
+
+/// Draw the attached process's screen into its floating window.
+///
+/// Cell by cell rather than as text, because a terminal grid is not lines:
+/// each cell carries its own colours and attributes, and a program that draws
+/// a box or a status bar depends on every one of them landing where it put it.
+fn draw_attach_window(frame: &mut Frame<'_>, app: &App) {
+    use crate::output::emulator::CellColor;
+
+    let Some(view) = app.attach.as_ref() else {
+        return;
+    };
+    let area = view.window.to_rect();
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(
+            " {} — [^P ^Q] detach  [^P hjkl] move  [^P HJKL] size ",
+            view.name
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let Some(grid) = view.grid.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "connecting…",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner,
+        );
+        return;
+    };
+
+    let convert = |color: CellColor, fallback: Option<Color>| -> Option<Color> {
+        match color {
+            CellColor::Default => fallback,
+            CellColor::Palette(index) => Some(Color::Indexed(index)),
+            CellColor::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+        }
+    };
+
+    let buffer = frame.buffer_mut();
+    for row in 0..inner.height.min(grid.rows) {
+        for col in 0..inner.width.min(grid.cols) {
+            let Some(cell) = grid
+                .cells
+                .get(usize::from(row) * usize::from(grid.cols) + usize::from(col))
+            else {
+                continue;
+            };
+            let Some(target) = buffer.cell_mut((inner.x + col, inner.y + row)) else {
+                continue;
+            };
+            // An empty grapheme is the tail of a wide character, whose head
+            // already painted both columns — leave whatever it put there.
+            if cell.text.is_empty() {
+                continue;
+            }
+            target.set_symbol(&cell.text);
+            let mut style = Style::default();
+            if let Some(fg) = convert(cell.fg, None) {
+                style = style.fg(fg);
+            }
+            if let Some(bg) = convert(cell.bg, None) {
+                style = style.bg(bg);
+            }
+            if cell.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if cell.faint {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            if cell.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if cell.underline {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            if cell.inverse {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            if cell.strikethrough {
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            target.set_style(style);
+        }
+    }
+
+    // Put the real cursor where the process thinks it is, so anything that
+    // asks the reader to type shows them where.
+    if grid.cursor_visible {
+        let (x, y) = grid.cursor;
+        if x < inner.width && y < inner.height {
+            frame.set_cursor_position((inner.x + x, inner.y + y));
+        }
+    }
 }
 
 /// Render the visible slice of the log, plus a scroll indicator when the view

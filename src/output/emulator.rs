@@ -32,6 +32,56 @@ pub(crate) enum EmulatorRequest {
         name: String,
         reply: oneshot::Sender<Option<RepaintFrame>>,
     },
+    /// Render the current grid as cells, for a caller that draws rather than
+    /// writes — the TUI's attach window, which paints into a sub-rectangle of
+    /// a screen it does not own.
+    Grid {
+        name: String,
+        reply: oneshot::Sender<Option<Grid>>,
+    },
+}
+
+/// A cell's colour, independent of any renderer's palette type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellColor {
+    /// The terminal's default — the renderer decides what that means.
+    #[default]
+    Default,
+    Palette(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// One rendered cell: its grapheme cluster and its attributes.
+#[derive(Debug, Clone, Default)]
+pub struct GridCell {
+    /// The grapheme cluster, or a single space for an empty cell. A string
+    /// rather than a char because one cell can hold a base plus combining
+    /// marks.
+    pub text: String,
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub bold: bool,
+    pub faint: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+    pub strikethrough: bool,
+}
+
+/// A screen as cells, row-major.
+///
+/// The drawing counterpart to [`RepaintFrame`]. A client writing to a real
+/// terminal wants the ANSI; a client compositing into a rectangle of its own
+/// screen wants the cells, because it has to place every one of them itself.
+#[derive(Debug, Clone)]
+pub struct Grid {
+    pub cols: u16,
+    pub rows: u16,
+    /// `cols * rows` cells. Wide characters occupy their head cell; the tail
+    /// is an empty cell the renderer should skip past.
+    pub cells: Vec<GridCell>,
+    pub cursor: (u16, u16),
+    pub cursor_visible: bool,
 }
 
 /// A coherent ANSI rendering of a process's current screen: clear, every row
@@ -51,7 +101,7 @@ pub struct EmulatorHandle {
 
 impl EmulatorHandle {
     /// (Re)register a process's screen at the given size.
-    pub(crate) fn register(&self, name: &str, cols: u16, rows: u16) {
+    pub fn register(&self, name: &str, cols: u16, rows: u16) {
         let _ = self.tx.send(EmulatorRequest::Register {
             name: name.to_string(),
             cols,
@@ -60,7 +110,7 @@ impl EmulatorHandle {
     }
 
     /// Resize a process's screen.
-    pub(crate) fn resize(&self, name: &str, cols: u16, rows: u16) {
+    pub fn resize(&self, name: &str, cols: u16, rows: u16) {
         let _ = self.tx.send(EmulatorRequest::Resize {
             name: name.to_string(),
             cols,
@@ -82,6 +132,26 @@ impl EmulatorHandle {
         reply_rx.await.ok().flatten()
     }
 
+    /// Feed output bytes into a screen.
+    pub fn feed(&self, name: &str, bytes: Vec<u8>) {
+        let _ = self.tx.send(EmulatorRequest::Feed {
+            name: name.to_string(),
+            bytes,
+        });
+    }
+
+    /// The current screen as cells, or `None` if the name has no screen.
+    pub async fn grid(&self, name: &str) -> Option<Grid> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(EmulatorRequest::Grid {
+                name: name.to_string(),
+                reply,
+            })
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
     /// The raw feed sender, for wiring into a process's sink list.
     pub(crate) fn feed_sender(&self) -> mpsc::UnboundedSender<EmulatorRequest> {
         self.tx.clone()
@@ -90,7 +160,7 @@ impl EmulatorHandle {
 
 /// Start the emulator thread. Returns immediately; screens are created on
 /// demand via [`EmulatorHandle::register`].
-pub(crate) fn spawn_emulator_thread() -> EmulatorHandle {
+pub fn spawn_emulator_thread() -> EmulatorHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     // If the thread cannot be spawned the handle's sends fail silently and
     // repaints return `None` — attach degrades to no-repaint rather than
@@ -132,6 +202,10 @@ fn emulator_loop(mut rx: mpsc::UnboundedReceiver<EmulatorRequest>) {
                 let frame = screens.get(&name).and_then(|screen| screen.repaint());
                 let _ = reply.send(frame);
             }
+            EmulatorRequest::Grid { name, reply } => {
+                let grid = screens.get(&name).and_then(|screen| screen.grid());
+                let _ = reply.send(grid);
+            }
         }
     }
 }
@@ -141,6 +215,7 @@ trait Screen {
     fn feed(&mut self, bytes: &[u8]);
     fn resize(&mut self, cols: u16, rows: u16);
     fn repaint(&self) -> Option<RepaintFrame>;
+    fn grid(&self) -> Option<Grid>;
 }
 
 /// The ghostty-backed screen.
@@ -174,6 +249,75 @@ impl Screen for GhosttyScreen {
 
     fn repaint(&self) -> Option<RepaintFrame> {
         render_repaint(&self.term).ok()
+    }
+
+    fn grid(&self) -> Option<Grid> {
+        render_grid(&self.term).ok()
+    }
+}
+
+/// Walk the viewport grid and collect it as cells.
+///
+/// The same walk [`render_repaint`] performs, ending in a structure rather
+/// than a byte stream. Kept beside it so the two cannot drift about what a
+/// cell is — which one runs depends only on whether the caller writes to a
+/// terminal or draws into one.
+fn render_grid(
+    term: &libghostty_vt::terminal::Terminal<'_, '_>,
+) -> Result<Grid, libghostty_vt::error::Error> {
+    use libghostty_vt::screen::CellWide;
+    use libghostty_vt::terminal::{Point, PointCoordinate};
+
+    let cols = term.cols()?;
+    let rows = term.rows()?;
+    let mut cells: Vec<GridCell> = Vec::with_capacity(usize::from(cols) * usize::from(rows));
+    let mut grapheme_buf = [char::REPLACEMENT_CHARACTER; 16];
+
+    for y in 0..rows {
+        for x in 0..cols {
+            let grid_ref =
+                term.grid_ref(Point::Viewport(PointCoordinate { x, y: u32::from(y) }))?;
+            let cell = grid_ref.cell()?;
+            // The tail half of a wide character holds no grapheme of its own:
+            // the head already carries both columns' worth of glyph.
+            if matches!(cell.wide()?, CellWide::SpacerTail) {
+                cells.push(GridCell::default());
+                continue;
+            }
+            let style = grid_ref.style()?;
+            let text = match grid_ref.graphemes(&mut grapheme_buf) {
+                Ok(len) if len > 0 => grapheme_buf[..len.min(grapheme_buf.len())].iter().collect(),
+                _ => String::new(),
+            };
+            cells.push(GridCell {
+                text,
+                fg: cell_color(style.fg_color),
+                bg: cell_color(style.bg_color),
+                bold: style.bold,
+                faint: style.faint,
+                italic: style.italic,
+                underline: !matches!(style.underline, libghostty_vt::style::Underline::None),
+                inverse: style.inverse,
+                strikethrough: style.strikethrough,
+            });
+        }
+    }
+
+    Ok(Grid {
+        cols,
+        rows,
+        cells,
+        cursor: (term.cursor_x()?, term.cursor_y()?),
+        cursor_visible: term.is_cursor_visible()?,
+    })
+}
+
+fn cell_color(color: libghostty_vt::style::StyleColor) -> CellColor {
+    use libghostty_vt::style::StyleColor;
+    match color {
+        StyleColor::None => CellColor::Default,
+        StyleColor::Palette(index) => CellColor::Palette(index.0),
+        StyleColor::Rgb(rgb) => CellColor::Rgb(rgb.r, rgb.g, rgb.b),
     }
 }
 

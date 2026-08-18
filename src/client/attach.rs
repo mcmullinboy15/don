@@ -231,6 +231,18 @@ async fn bridge_terminal(
     reason
 }
 
+/// [`send_resize`] for callers outside this module — the TUI's attach window,
+/// which resizes the process's grid whenever the window is resized.
+pub(super) async fn send_resize_public(
+    socket_path: &Path,
+    name: &str,
+    session_id: Option<u64>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), ClientError> {
+    send_resize(socket_path, name, session_id, cols, rows).await
+}
+
 /// Send a resize request via a separate HTTP connection.
 async fn send_resize(
     socket_path: &Path,

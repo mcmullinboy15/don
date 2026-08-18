@@ -164,6 +164,28 @@ pub(crate) fn message_run(ids: &[crate::output::LogId], index: usize) -> Option<
     Some((first, last))
 }
 
+/// An attached process on screen: which one, where its window is, and the
+/// last grid its emulator produced.
+///
+/// The grid is cached rather than fetched during the draw because reading it
+/// is a round trip to the emulator thread, and `draw` is synchronous. The
+/// session task refreshes it whenever output lands.
+pub(crate) struct AttachView {
+    pub(crate) name: String,
+    pub(crate) window: super::attach_window::WindowRect,
+    pub(crate) grid: Option<crate::output::emulator::Grid>,
+}
+
+impl std::fmt::Debug for AttachView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachView")
+            .field("name", &self.name)
+            .field("window", &self.window)
+            .field("grid", &self.grid.as_ref().map(|g| (g.cols, g.rows)))
+            .finish()
+    }
+}
+
 /// A scroll the reader asked for, in units that do not need geometry to
 /// express: rows, pages, and the two ends.
 ///
@@ -266,6 +288,9 @@ pub(crate) struct App {
     /// PTY. Consumed by the main loop, which tears the TUI down, runs the
     /// bridge, and rebuilds.
     pub(crate) bridge_request: Option<String>,
+    /// The process whose screen is in the floating window, and where that
+    /// window sits. `None` when nothing is attached.
+    pub(crate) attach: Option<AttachView>,
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
     /// Graceful shutdown is in progress: the inline bar becomes
@@ -462,6 +487,7 @@ impl App {
         Self {
             exit_requested: false,
             bridge_request: None,
+            attach: None,
             counts,
             view_mode: ViewMode::Normal,
             shutdown_started: false,

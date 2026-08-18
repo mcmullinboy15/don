@@ -42,4 +42,21 @@ pub(crate) enum AppEvent {
         processes: Vec<ProcessStatus>,
         startup_complete: bool,
     },
+    /// The attached process's screen changed, or the session ended.
+    ///
+    /// Arrives through the same channel as input so a redraw of the window
+    /// orders with the keys that caused it, rather than racing them.
+    Attach(AttachEvent),
+}
+
+/// What the attach session has to say to the main loop.
+#[derive(Debug, Clone)]
+pub(crate) enum AttachEvent {
+    /// New output landed; the window's grid needs re-reading.
+    Output,
+    /// The reader asked for the window to move or resize, or to detach.
+    Command(super::attach_window::AttachInput),
+    /// The session is over. `Some` carries a message worth narrating —
+    /// the process exited, or the connection failed.
+    Ended(Option<String>),
 }
