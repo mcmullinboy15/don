@@ -37,6 +37,11 @@ use crate::output::{FormattedLogLine, LogId};
 /// what don still holds.
 pub(crate) const DEFAULT_CAPACITY: usize = crate::output::DEFAULT_MERGED_HISTORY_CAPACITY;
 
+/// How far past `capacity` the store will grow to keep a scrolled reader's
+/// place. Beyond this their anchor is dropped like anything else — a reader who
+/// has walked away is not worth an unbounded buffer.
+const PINNED_OVERDRAFT: usize = 2;
+
 /// A bounded, time-ordered buffer of the merged stream.
 pub(crate) struct LogStore {
     entries: VecDeque<StoredLogLine>,
@@ -45,6 +50,9 @@ pub(crate) struct LogStore {
     /// The width `wrapped_rows` was computed against. `None` before the first
     /// reflow.
     wrapped_at: Option<u16>,
+    /// The oldest id the view still needs, set while the reader is scrolled
+    /// back. See [`Self::set_pin`].
+    pin: Option<LogId>,
 }
 
 /// One stored line: what don sent, parsed once, measured once.
@@ -74,7 +82,24 @@ impl LogStore {
             capacity,
             next_id: LogId::ZERO,
             wrapped_at: None,
+            pin: None,
         }
+    }
+
+    /// Hold history from `id` onward while the reader is scrolled back there.
+    ///
+    /// Without this the buffer evicts under a reader who is looking at it: the
+    /// line they anchored to ages out, the view falls back to the oldest line
+    /// that survives, and since that keeps changing the pane walks away from
+    /// them. How fast depends only on the line rate — at fifty thousand lines
+    /// of capacity and fifty thousand lines a second, an anchor lasts about a
+    /// second, which is what a stack in a logging feedback loop felt like.
+    ///
+    /// `None` while following, which is the normal state and evicts as usual.
+    /// Bounded by [`PINNED_OVERDRAFT`], so a reader who scrolls up and leaves
+    /// cannot grow this without limit.
+    pub(crate) fn set_pin(&mut self, pin: Option<LogId>) {
+        self.pin = pin;
     }
 
     /// Store a line under the id don's merged stream gave it, evicting the
@@ -98,7 +123,16 @@ impl LogStore {
             back.wrapped_rows = wrapped_rows;
             return;
         }
+        let ceiling = self.capacity.saturating_mul(PINNED_OVERDRAFT);
         while self.entries.len() >= self.capacity {
+            let holding_the_readers_place = self.entries.len() < ceiling
+                && match (self.pin, self.entries.front()) {
+                    (Some(pin), Some(front)) => front.id >= pin,
+                    _ => false,
+                };
+            if holding_the_readers_place {
+                break;
+            }
             self.entries.pop_front();
         }
         self.entries.push_back(StoredLogLine {
@@ -185,6 +219,93 @@ mod tests {
             is_verbose: false,
             bytes: body.as_bytes().to_vec(),
         }
+    }
+
+    /// A reader scrolled back keeps their place: the lines they are looking at
+    /// are not evicted under them just because newer ones arrived.
+    #[test]
+    fn a_pin_holds_history_where_the_reader_is() {
+        struct Case {
+            name: &'static str,
+            capacity: usize,
+            pin: Option<u64>,
+            /// Lines pushed, ids 0..n.
+            pushes: u64,
+            want_oldest: u64,
+            want_len: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "following evicts as usual",
+                capacity: 10,
+                pin: None,
+                pushes: 30,
+                want_oldest: 20,
+                want_len: 10,
+            },
+            Case {
+                name: "a pin holds everything from it onward",
+                capacity: 10,
+                pin: Some(15),
+                pushes: 30,
+                want_oldest: 15,
+                want_len: 15,
+            },
+            Case {
+                // A pin inside the window the store would keep anyway changes
+                // nothing: it only ever prevents eviction, never forces it.
+                name: "a pin ahead of the normal window is a no-op",
+                capacity: 10,
+                pin: Some(25),
+                pushes: 30,
+                want_oldest: 20,
+                want_len: 10,
+            },
+            Case {
+                // Twice capacity is the ceiling: a reader who scrolled up and
+                // wandered off does not get an unbounded buffer.
+                name: "the overdraft is bounded",
+                capacity: 10,
+                pin: Some(0),
+                pushes: 100,
+                want_oldest: 80,
+                want_len: 20,
+            },
+        ];
+
+        for case in cases {
+            let mut store = LogStore::with_capacity(case.capacity);
+            store.reflow(80);
+            store.set_pin(case.pin.map(LogId));
+            for id in 0..case.pushes {
+                store.push(LogId(id), line("svc", "a line of output"));
+            }
+            assert_eq!(
+                store.oldest_id(),
+                Some(LogId(case.want_oldest)),
+                "{}: oldest retained",
+                case.name
+            );
+            assert_eq!(store.len(), case.want_len, "{}: retained count", case.name);
+        }
+    }
+
+    /// Releasing the pin lets the backlog drain back to capacity, so returning
+    /// to the tail does not leave the overdraft held forever.
+    #[test]
+    fn clearing_the_pin_drains_the_overdraft() {
+        let mut store = LogStore::with_capacity(10);
+        store.reflow(80);
+        store.set_pin(Some(LogId(0)));
+        for id in 0..20 {
+            store.push(LogId(id), line("svc", "x"));
+        }
+        assert_eq!(store.len(), 20, "held while pinned");
+
+        store.set_pin(None);
+        store.push(LogId(20), line("svc", "x"));
+        assert_eq!(store.len(), 10, "back to capacity once the reader follows");
     }
 
     #[test]

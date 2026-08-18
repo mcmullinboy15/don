@@ -488,6 +488,9 @@ fn build_terminal() -> Result<TuiTerminal, TuiError> {
 fn draw(terminal: &mut TuiTerminal, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
     let area: Rect = terminal.size()?.into();
     store.reflow(render::log_pane_width(area, app.status_pane));
+    // Hold history where the reader is looking, so a busy stack cannot evict
+    // their place out from under them between frames.
+    store.set_pin(app.log_scroll.anchor());
     terminal.draw(|frame| render::draw(frame, app, store))?;
     Ok(())
 }

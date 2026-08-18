@@ -39,6 +39,19 @@ pub(crate) enum Scroll {
     },
 }
 
+impl Scroll {
+    /// The line the view is held at, if it is held at one.
+    ///
+    /// The store keeps history from here onward rather than evicting it under
+    /// the reader — see [`LogStore::set_pin`].
+    pub(crate) fn anchor(self) -> Option<LogId> {
+        match self {
+            Scroll::Follow => None,
+            Scroll::At { id, .. } => Some(id),
+        }
+    }
+}
+
 /// What the renderer needs to paint the pane, and what the input layer needs
 /// to know about how far it can move.
 pub(crate) struct LogView<'a> {
