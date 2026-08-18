@@ -127,6 +127,23 @@ impl OverlayItem {
     }
 }
 
+/// The half of a log pane's state that is swapped out when the other pane is
+/// brought to the front.
+///
+/// The TUI shows one log pane at a time: don's record of the processes, or
+/// don's record of itself. Each keeps its own scroll position and its own row
+/// index, so switching between them does not move either one or throw away work
+/// — the index is the expensive thing, and rebuilding it on every toggle is
+/// what made pressing `v` flash.
+#[derive(Debug, Default)]
+pub(crate) struct StashedView {
+    pub(crate) index: super::view_index::ViewIndex,
+    pub(crate) scroll: super::logs::Scroll,
+    pub(crate) rows_above: usize,
+    pub(crate) total_rows: usize,
+    pub(crate) blank_after: HashMap<crate::output::LogId, u16>,
+}
+
 /// A scroll the reader asked for, in units that do not need geometry to
 /// express: rows, pages, and the two ends.
 ///
@@ -231,7 +248,6 @@ pub(crate) struct App {
     pub(crate) bridge_request: Option<String>,
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
-    pub(crate) verbose_enabled: bool,
     /// Graceful shutdown is in progress: the inline bar becomes
     /// non-interactive and `[don]`-prefixed lifecycle events bypass the
     /// committed filter (raw service stdout still respects it).
@@ -347,7 +363,13 @@ pub(crate) struct App {
     /// Counted, not a set: pressing Enter twice on a quiet stack means two
     /// blank rows, the same as it would in a shell.
     pub(crate) blank_after: HashMap<crate::output::LogId, u16>,
-    /// Rows above the top edge, as last drawn. For the scrollbar only —
+    /// Whether the pane is showing don's diagnostics rather than the processes'
+    /// output. Two separate records with separate stores; this says which one
+    /// is on screen.
+    pub(crate) debug_view: bool,
+    /// The other pane's state, waiting its turn. See [`StashedView`].
+    pub(crate) stashed_view: StashedView,
+    /// Rows above the top edge, as last drawn. For the scrollbar only —    /// Rows above the top edge, as last drawn. For the scrollbar only —
     /// scrolling must not read it, or it is back to deciding from stale
     /// geometry.
     pub(crate) log_rows_above: usize,
@@ -364,7 +386,6 @@ pub(crate) struct AppInit {
     pub(crate) hidden_names: HashSet<String>,
     pub(crate) auto_filter_on_failure_names: HashSet<String>,
     pub(crate) cli_log_filter: Option<HashSet<String>>,
-    pub(crate) verbose_enabled: bool,
 }
 
 impl App {
@@ -378,7 +399,6 @@ impl App {
             hidden_names,
             auto_filter_on_failure_names,
             cli_log_filter,
-            verbose_enabled,
         } = init;
         let services_state: HashMap<String, ServiceState> = service_names
             .iter()
@@ -411,7 +431,6 @@ impl App {
             bridge_request: None,
             counts,
             view_mode: ViewMode::Normal,
-            verbose_enabled,
             shutdown_started: false,
             filter: FilterState::new(all_filter_names, &hidden_names, cli_log_filter.as_ref()),
             spinner_frame: 0,
@@ -446,6 +465,8 @@ impl App {
             log_pane_origin: (0, 0),
             pending_scroll: PendingScroll::default(),
             blank_after: HashMap::new(),
+            debug_view: false,
+            stashed_view: StashedView::default(),
             log_rows_above: 0,
             log_total_rows: 0,
             log_pane_height: 0,
@@ -460,10 +481,6 @@ impl App {
         self.failure_summary_scroll = 0;
         self.form = None;
         self.log_popup = None;
-    }
-
-    pub(crate) fn set_verbose_enabled(&mut self, verbose_enabled: bool) {
-        self.verbose_enabled = verbose_enabled;
     }
 
     pub(crate) fn set_update_check(
@@ -483,10 +500,29 @@ impl App {
     /// more mutators than anyone will remember to keep in step, and a missed
     /// bump would leave the pane indexing against a filter the user has
     /// already changed. Cost is the number of *process names*, not lines.
+    /// Bring the other log pane to the front, putting this one away as it is.
+    ///
+    /// A swap, not a rebuild. Each pane keeps its own index and its own scroll
+    /// position, so coming back to one lands where it was left and costs
+    /// nothing — the index is the expensive thing, and throwing it away on
+    /// every toggle is what made this flash.
+    pub(crate) fn swap_log_view(&mut self) {
+        std::mem::swap(&mut self.view_index, &mut self.stashed_view.index);
+        std::mem::swap(&mut self.log_scroll, &mut self.stashed_view.scroll);
+        std::mem::swap(&mut self.log_rows_above, &mut self.stashed_view.rows_above);
+        std::mem::swap(&mut self.log_total_rows, &mut self.stashed_view.total_rows);
+        std::mem::swap(&mut self.blank_after, &mut self.stashed_view.blank_after);
+        // A selection is screen coordinates over content that is about to be
+        // entirely different text.
+        self.log_selection.clear();
+        self.follow_paused_for_selection = false;
+        self.pending_scroll = PendingScroll::default();
+        self.debug_view = !self.debug_view;
+    }
+
     pub(crate) fn log_filter_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.verbose_enabled.hash(&mut hasher);
         self.shutdown_started.hash(&mut hasher);
         self.filter.fingerprint(&mut hasher);
         // Blank marks change how tall a line is, so they belong to the same key
@@ -502,19 +538,12 @@ impl App {
         hasher.finish()
     }
 
-    pub(crate) fn should_render_log(
-        &self,
-        name: &str,
-        _is_lifecycle: bool,
-        is_verbose: bool,
-    ) -> bool {
-        // Verbose diagnostics are always in the stream (and the store —
-        // toggling `v` reveals history); whether they *render* is purely
-        // this client's choice. Checked before the shutdown override so
-        // teardown stays readable unless the user asked for the firehose.
-        if is_verbose && !self.verbose_enabled {
-            return false;
-        }
+    /// Whether the pane shows this line.
+    ///
+    /// Verbose is not an admission question: it decided which *store* the line
+    /// went into, and a store holds only its own kind. What is left is the
+    /// name filter, and the shutdown override.
+    pub(crate) fn should_render_log(&self, name: &str, _is_lifecycle: bool) -> bool {
         // During shutdown, every line bypasses the filter — the user wants
         // to see what's happening as each service tears down, including
         // service stdout from previously-hidden services (kafka, mongo, …).
@@ -904,7 +933,6 @@ mod tests {
             hidden_names: HashSet::new(),
             auto_filter_on_failure_names,
             cli_log_filter: None,
-            verbose_enabled: false,
         })
     }
 
@@ -1229,12 +1257,12 @@ mod tests {
         app.filter.toggle_highlighted(); // clear all
         app.filter.commit();
 
-        assert!(!app.should_render_log("db", false, false));
+        assert!(!app.should_render_log("db", false));
         let changed = apply_service(&mut app, "db", ServiceState::Failed, None);
 
         assert!(changed);
-        assert!(app.should_render_log("db", false, false));
-        assert!(!app.should_render_log("api", false, false));
+        assert!(app.should_render_log("db", false));
+        assert!(!app.should_render_log("api", false));
     }
 
     #[test]
@@ -1251,7 +1279,7 @@ mod tests {
         let changed = apply_service(&mut app, "api", ServiceState::DependencyFailed, None);
 
         assert!(!changed);
-        assert!(!app.should_render_log("api", false, false));
+        assert!(!app.should_render_log("api", false));
     }
 
     #[test]
@@ -1268,8 +1296,8 @@ mod tests {
         let changed = apply_task(&mut app, "lint", TaskState::Failed);
 
         assert!(changed);
-        assert!(app.should_render_log("lint", false, false));
-        assert!(!app.should_render_log("build", false, false));
+        assert!(app.should_render_log("lint", false));
+        assert!(!app.should_render_log("build", false));
     }
 
     #[test]
@@ -1465,19 +1493,19 @@ mod tests {
         // Without shutdown: filter passes "api", rejects "worker" — for both
         // service stdout (is_lifecycle=false) and lifecycle events
         // (is_lifecycle=true).
-        assert!(app.should_render_log("api", false, false));
-        assert!(app.should_render_log("api", true, false));
-        assert!(!app.should_render_log("worker", false, false));
-        assert!(!app.should_render_log("worker", true, false));
+        assert!(app.should_render_log("api", false));
+        assert!(app.should_render_log("api", true));
+        assert!(!app.should_render_log("worker", false));
+        assert!(!app.should_render_log("worker", true));
 
         app.begin_shutdown();
 
         // After shutdown: every line passes regardless of filter — the user
         // wants visibility into everything happening as services tear down.
-        assert!(app.should_render_log("api", false, false));
-        assert!(app.should_render_log("api", true, false));
-        assert!(app.should_render_log("worker", false, false));
-        assert!(app.should_render_log("worker", true, false));
+        assert!(app.should_render_log("api", false));
+        assert!(app.should_render_log("api", true));
+        assert!(app.should_render_log("worker", false));
+        assert!(app.should_render_log("worker", true));
     }
 
     #[test]
@@ -1542,7 +1570,6 @@ mod tests {
             hidden_names: HashSet::new(),
             auto_filter_on_failure_names: HashSet::new(),
             cli_log_filter: None,
-            verbose_enabled: false,
         });
         // beta is broken, so it opens at the top.
         apply_service(&mut app, "alpha", ServiceState::Ready, Some(1));

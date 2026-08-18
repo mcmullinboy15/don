@@ -117,11 +117,7 @@ fn draw_log_pane(
     };
     let mut index = std::mem::take(&mut app.view_index);
     index.sync(store, key, &app.blank_after, |entry| {
-        app.should_render_log(
-            &entry.line.name,
-            entry.line.is_lifecycle,
-            entry.line.is_verbose,
-        )
+        app.should_render_log(&entry.line.name, entry.line.is_lifecycle)
     });
     // The one place scroll position is decided, now that the index is current
     // and the pane's height is known.
@@ -387,7 +383,7 @@ fn draw_bar(frame: &mut Frame<'_>, app: &App, box_area: Rect) {
             app.spinner_frame,
             visible_services,
             total_services,
-            app.verbose_enabled,
+            app.debug_view,
             app.has_failure_summary(),
             !app.log_selection.is_empty(),
         )
@@ -948,7 +944,7 @@ fn normal_bar_line(
     spinner_frame: usize,
     visible_services: usize,
     total_services: usize,
-    verbose_enabled: bool,
+    debug_view: bool,
     has_failure_summary: bool,
     has_selection: bool,
 ) -> Line<'static> {
@@ -1020,10 +1016,12 @@ fn normal_bar_line(
         spans.push(dim("  [t] tasks"));
     }
     spans.push(dim("  [s] services"));
-    if verbose_enabled {
-        spans.push(separator());
-        spans.push(dim("verbose"));
-    }
+    spans.push(separator());
+    spans.push(dim(if debug_view {
+        "[v] back to output"
+    } else {
+        "[v] don's own log"
+    }));
     Line::from(spans)
 }
 
@@ -1752,7 +1750,6 @@ mod tests {
             hidden_names: std::collections::HashSet::new(),
             auto_filter_on_failure_names: std::collections::HashSet::new(),
             cli_log_filter: None,
-            verbose_enabled: false,
         });
         app.apply_task_state(
             "configure-everything".to_string(),
@@ -1788,7 +1785,6 @@ mod tests {
             hidden_names: std::collections::HashSet::new(),
             auto_filter_on_failure_names: std::collections::HashSet::new(),
             cli_log_filter: None,
-            verbose_enabled: false,
         });
         app.apply_service_runtime(
             "api".to_string(),

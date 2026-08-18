@@ -1672,7 +1672,6 @@ async fn attach_tui_inner(
     let local_output = don::output::OutputManager::new(&[], tokio::io::sink())
         .await
         .map_err(|e| format!("Error: {e}"))?;
-    let verbosity = local_output.verbosity_control();
     let lifecycle_emitter = local_output.clone_lifecycle_emitter();
     // Local narration this client generates itself (bridge notices, errors).
     // A cursor rather than a raw subscription so the two sides of the merge
@@ -1771,7 +1770,6 @@ async fn attach_tui_inner(
         log_rx,
         client,
         don::TuiMode::Remote,
-        verbosity,
         lifecycle_emitter,
         service_names,
         task_names,
@@ -2665,7 +2663,6 @@ async fn run_start(
                 }
             }
         });
-        let verbosity = output_manager.verbosity_control();
         let lifecycle_emitter = output_manager.clone_lifecycle_emitter();
 
         let service_names: Vec<String> = config
@@ -2794,7 +2791,6 @@ async fn run_start(
                 log_rx,
                 tui_client,
                 don::TuiMode::InProcess,
-                verbosity,
                 lifecycle_emitter,
                 service_names,
                 task_names,

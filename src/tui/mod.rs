@@ -73,7 +73,7 @@ use tokio::sync::mpsc;
 
 use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot};
 use crate::config::ParamKind;
-use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
+use crate::output::{FormattedLogLine, LifecycleEmitter};
 use app::{App, AppInit, ViewMode, line_matches_log_popup};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
@@ -182,7 +182,6 @@ pub enum TuiMode {
 
 #[derive(Clone)]
 struct TuiControls {
-    verbosity: VerbosityControl,
     lifecycle_emitter: LifecycleEmitter,
     mode: TuiMode,
 }
@@ -229,7 +228,6 @@ pub async fn run_tui(
     mut log_rx: mpsc::UnboundedReceiver<crate::output::MergedEvent>,
     client: Client,
     mode: TuiMode,
-    verbosity: VerbosityControl,
     lifecycle_emitter: LifecycleEmitter,
     service_names: Vec<String>,
     task_names: Vec<String>,
@@ -241,7 +239,6 @@ pub async fn run_tui(
     cli_log_filter: Option<std::collections::HashSet<String>>,
 ) -> Result<(), TuiError> {
     let controls = TuiControls {
-        verbosity,
         lifecycle_emitter,
         mode,
     };
@@ -275,9 +272,11 @@ pub async fn run_tui(
         hidden_names,
         auto_filter_on_failure_names,
         cli_log_filter,
-        verbose_enabled: controls.verbosity.is_enabled(),
     });
-    let mut store = LogStore::with_capacity(DEFAULT_CAPACITY);
+    let mut stores = LogStores {
+        output: LogStore::with_capacity(DEFAULT_CAPACITY),
+        debug: LogStore::with_capacity(DEFAULT_CAPACITY),
+    };
 
     let (input_tx, mut input_rx) = mpsc::channel::<AppEvent>(64);
     // Publish the sender so background tasks (completion replies) can
@@ -344,7 +343,7 @@ pub async fn run_tui(
                                 app.begin_shutdown();
                             }
                             app.append_log_popup_line(&line);
-                            store.push(id, line);
+                            stores.route(id, line);
                         }
                         dirty = true;
                     }
@@ -389,7 +388,14 @@ pub async fn run_tui(
             maybe_event = input_rx.recv(), if input_open => {
                 match maybe_event {
                     Some(event) => {
-                        handle_app_event(event, &mut app, &mut store, &client, &controls)?;
+                        let showing = app.debug_view;
+                        handle_app_event(
+                            event,
+                            &mut app,
+                            stores.active_mut(showing),
+                            &client,
+                            &controls,
+                        )?;
                         // Input arrives in bursts — a drag reports once per cell
                         // the pointer crosses — and handling one per `select!`
                         // round means a round trip each, so a burst spreads
@@ -401,9 +407,18 @@ pub async fn run_tui(
                                 break;
                             }
                             match input_rx.try_recv() {
-                                Ok(event) => handle_app_event(
-                                    event, &mut app, &mut store, &client, &controls,
-                                )?,
+                                // Re-read per event: a `v` earlier in this same
+                                // burst changes which record is in front.
+                                Ok(event) => {
+                                    let showing = app.debug_view;
+                                    handle_app_event(
+                                        event,
+                                        &mut app,
+                                        stores.active_mut(showing),
+                                        &client,
+                                        &controls,
+                                    )?
+                                }
                                 Err(_) => break,
                             }
                         }
@@ -450,7 +465,8 @@ pub async fn run_tui(
                 dirty = true;
             }
             () = &mut frame, if dirty => {
-                draw(&mut terminal, &mut app, &mut store)?;
+                let showing = app.debug_view;
+                draw(&mut terminal, &mut app, stores.active_mut(showing))?;
                 dirty = false;
                 frame
                     .as_mut()
@@ -461,7 +477,8 @@ pub async fn run_tui(
 
     // One last frame so the final state — "shutdown complete" — is on screen
     // before the guard puts the user's terminal back.
-    let _ = draw(&mut terminal, &mut app, &mut store);
+    let showing = app.debug_view;
+    let _ = draw(&mut terminal, &mut app, stores.active_mut(showing));
     input_handle.abort();
     let _ = input_handle.await;
     Ok(())
@@ -484,7 +501,40 @@ fn build_terminal() -> Result<TuiTerminal, TuiError> {
     Ok(terminal)
 }
 
-/// Throw away what the renderer believes is on screen, so the next draw paints
+/// The two records the log pane can show.
+///
+/// Kept apart rather than filtered out of one: they were sharing a single
+/// retention budget, so a chatty watch could push the output a reader actually
+/// wanted past the end of the buffer without that being visible anywhere. And
+/// "which lines count" was part of the row index's key, so changing your mind
+/// threw the index away and rebuilt it over the whole store.
+struct LogStores {
+    /// What the processes wrote.
+    output: LogStore,
+    /// What don said about them — see `LifecycleEmitter::debug_event`.
+    debug: LogStore,
+}
+
+impl LogStores {
+    /// File a line under the record it belongs to. The tag decides, once.
+    fn route(&mut self, id: crate::output::LogId, line: FormattedLogLine) {
+        if line.is_verbose {
+            self.debug.push(id, line);
+        } else {
+            self.output.push(id, line);
+        }
+    }
+
+    fn active_mut(&mut self, debug_view: bool) -> &mut LogStore {
+        if debug_view {
+            &mut self.debug
+        } else {
+            &mut self.output
+        }
+    }
+}
+
+/// Throw away what the renderer believes is on screen/// Throw away what the renderer believes is on screen, so the next draw paints
 /// every cell.
 ///
 /// Deliberately not `Terminal::clear`. As of ratatui-core 0.1.2 that reads the
@@ -654,19 +704,6 @@ fn handle_key(
             KeyCode::Char('d') if controls.mode == TuiMode::Remote => {
                 app.exit_requested = true;
             }
-            KeyCode::Char('v') | KeyCode::Char('V') => {
-                // Purely local display state: verbose lines are always in
-                // the stream, this client just chooses to show them. The
-                // toggle no longer touches the process-wide VerbosityControl,
-                // so it cannot change what other consumers see or record.
-                let enabled = !app.verbose_enabled;
-                app.set_verbose_enabled(enabled);
-                controls.lifecycle_emitter.lifecycle_event(if enabled {
-                    "verbose logging enabled"
-                } else {
-                    "verbose logging disabled"
-                });
-            }
             _ => {}
         }
         return Ok(());
@@ -749,6 +786,11 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         }
         // Ctrl+C is shutdown and cannot double as copy, so the keyboard route
         // to the clipboard is `y` — vi's yank, over the current selection.
+        // Swap which record the pane shows: what the processes wrote, or what
+        // don said about them. Purely local — both are always received and
+        // stored — and each keeps its own scroll position, so coming back
+        // lands where you left. Was Ctrl+V, which nothing advertised.
+        KeyCode::Char('v') | KeyCode::Char('V') => app.swap_log_view(),
         KeyCode::Char('y') => copy_selection(app),
         KeyCode::Esc => clear_selection(app),
         // The status pane sits *beside* the log rather than replacing it, so
@@ -1764,7 +1806,6 @@ mod tests {
             hidden_names: HashSet::new(),
             auto_filter_on_failure_names: HashSet::new(),
             cli_log_filter: None,
-            verbose_enabled: false,
         });
         app.apply_service_runtime("api".to_string(), state, None, Vec::new());
         app
