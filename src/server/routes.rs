@@ -104,25 +104,6 @@ fn process_name(process: &ProcessStatus) -> &str {
     }
 }
 
-/// How long a command will wait for the runner to finish deciding.
-///
-/// Bounded so a wedged startup reports something honest instead of hanging a
-/// client forever. Generous because the wait is real work — hashing a large
-/// watch set takes seconds — and timing out early would just resurrect the
-/// spurious failure this exists to prevent.
-const STARTUP_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Block until the runner has decided every process, or the deadline passes.
-///
-/// Safe to await here: this runs in the per-request axum task, not the
-/// runner's command loop, so waiting costs this one client and nothing else.
-async fn await_startup_settled(state: &ApiState) -> bool {
-    let mut reader = state.state.clone();
-    tokio::time::timeout(STARTUP_SETTLE_WAIT, reader.wait_for_startup_complete())
-        .await
-        .unwrap_or(false)
-}
-
 #[derive(Serialize)]
 struct ReadyResponse {
     /// Whether the initial startup sweep has decided every process.
@@ -507,22 +488,14 @@ async fn post_run_task(
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let wait = body.wait || body.wait_timeout.is_some();
 
-    // Wait for the runner to finish deciding before asking it to run anything.
-    // During the initial sweep every task has a worker attached that is
-    // working out skip/pending/run, and the runner cannot tell that apart from
-    // a real run — so a request landing here would be refused as "already
-    // running" for a task that is not running and may never run on its own.
-    if !await_startup_settled(&state).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(error_body(
-                "runner is still starting up — it hasn't finished working out \
-                 which tasks need to run yet",
-            )),
-        )
-            .into_response();
-    }
-
+    // Asked for now, not once startup settles. This used to wait for the whole
+    // sweep to finish, because during it every task has a worker attached
+    // working out skip/pending/run and that was indistinguishable from a real
+    // run — so a request landing here came back "already running" for a task
+    // that was not. The supervisor tells those apart now (see `resolve_command`
+    // and its `spawned` flag), and the wait was the worse half of the bargain:
+    // in a workspace whose startup takes minutes, pressing run meant waiting
+    // minutes for something unrelated.
     let reply = state
         .control
         .run_task(&name, body.params, wait, body.wait_timeout)

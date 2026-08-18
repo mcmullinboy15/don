@@ -70,12 +70,13 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
 /// Poll `GET /status` until `name` reports `state`. Returns false on timeout.
 ///
 /// The API socket is bound early in `Runner::run`, well before the startup
-/// sweep has decided what to do with each task. That sweep runs in a per-task
-/// worker, and a task with a worker in flight counts as "already running" — so
-/// a `POST /run/:name` issued right after `wait_for_socket` races the sweep and
-/// gets a 409 instead of actually starting the task. Waiting for the task's
-/// settled state (`skipped` for an `auto_run = false` task that has nothing to
-/// do) makes the run deterministic without guessing at a sleep duration.
+/// sweep has decided what to do with each task. A `POST /run/:name` issued
+/// right after `wait_for_socket` therefore lands mid-sweep — which is allowed,
+/// and covered on purpose by
+/// `integration_run_starts_the_task_without_waiting_for_the_rest_of_startup`.
+/// Tests that want to assert on what a run *did* wait for the task's settled
+/// state first (`skipped` for an `auto_run = false` task with nothing to do),
+/// so the outcome they read is the run's and not the sweep's.
 async fn wait_for_process_state(
     socket_path: &Path,
     name: &str,
@@ -1072,17 +1073,27 @@ fn integration_logs_endpoint_returns_ring_buffer() {
     });
 }
 
+/// "Run" means now, whatever else the workspace is doing.
+///
+/// Two things used to stand between pressing run and the task running, and
+/// this covers both. The task carries a worker deciding skip/pending/run,
+/// which read as "already running" and got the request refused. The route's
+/// answer to that was to wait for the *whole* startup sweep to settle first —
+/// which in a workspace whose slowest service takes minutes meant pressing run
+/// and watching nothing happen for minutes.
 #[test]
-fn integration_run_waits_for_startup_instead_of_reporting_already_running() {
-    run_with_timeout(Duration::from_secs(30), async {
+fn integration_run_starts_the_task_without_waiting_for_the_rest_of_startup() {
+    run_with_timeout(Duration::from_secs(45), async {
         let dir = TempDir::new("server-run-during-startup");
         let out_path = dir.path().join("ran.txt");
+        // The service is ready only once this appears, which is never: nothing
+        // creates it. So startup cannot settle for the duration of the test,
+        // and any wait on it would be the full timeout.
+        let never = dir.path().join("never.txt");
 
         // A watch set large enough that hashing it takes measurably longer
-        // than binding the API socket. That window is the bug: every task
-        // carries a worker deciding skip/pending/run, and the runner used to
-        // read that as "already running" — for a task that is not running and,
-        // with auto_run = false, never would on its own.
+        // than binding the API socket — that window is where a request lands
+        // while the task's own worker is still deciding.
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         for i in 0..3000 {
@@ -1090,12 +1101,12 @@ fn integration_run_waits_for_startup_instead_of_reporting_already_running() {
         }
 
         let toml = ConfigBuilder::new()
-            .add_custom_service("keeper", "sleep", &["60"])
+            .add_custom_service("slow-to-be-ready", "sleep", &["60"])
             .log("ignore")
-            .ready_exec("true", &[])
+            .ready_exec("test", &["-f", never.to_str().unwrap()])
             .done()
             .add_task(
-                "slow",
+                "chore",
                 "sh",
                 &["-c", &format!("echo done > {}", out_path.display())],
             )
@@ -1110,17 +1121,21 @@ fn integration_run_waits_for_startup_instead_of_reporting_already_running() {
 
         // Deliberately no settling sleep — issuing the request into the
         // window is the whole point of the test.
-        let (status, body) = request_with_body(&socket, "POST", "/run/slow", Some("{}")).await;
+        let asked_at = tokio::time::Instant::now();
+        let (status, body) = request_with_body(&socket, "POST", "/run/chore", Some("{}")).await;
         assert_eq!(
             status, 204,
-            "run should wait for the runner to settle, not be refused; body: {body}"
+            "run should be admitted, not refused; body: {body}"
         );
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = asked_at + Duration::from_secs(15);
         while !out_path.exists() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(out_path.exists(), "the deferred run should actually happen");
+        assert!(
+            out_path.exists(),
+            "the task should have run while the service was still not ready"
+        );
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

@@ -310,10 +310,17 @@ fn answer(
     }
 }
 
-/// `phase` and `holding` are what admission reads: the phase this supervisor
-/// has published, and whether it has a run in hand right now. Together they
-/// are exactly the pair the scheduler used to consult — a state map plus a
-/// busy flag — except that here both belong to the thing being asked.
+/// `phase` and `spawned` are what admission reads: the phase this supervisor
+/// has published, and whether a run of this task is actually *executing*.
+/// Together they are exactly the pair the scheduler used to consult — a state
+/// map plus a busy flag — except that here both belong to the thing being
+/// asked.
+///
+/// `spawned` is deliberately narrower than "busy". A supervisor working out
+/// whether its startup run is needed at all — hashing watch inputs, checking
+/// `auto_run` — is busy, but nothing is running, and refusing a manual run
+/// there would be a lie. Such a run is queued behind the evaluation instead,
+/// which takes milliseconds.
 fn resolve_command(
     command: TaskCommand,
     name: &str,
@@ -321,7 +328,7 @@ fn resolve_command(
     last_params: &std::collections::HashMap<String, String>,
     awaiting_artifact: bool,
     phase: super::TaskState,
-    holding: bool,
+    spawned: bool,
 ) -> Ask {
     match command {
         TaskCommand::Run(request) => {
@@ -342,7 +349,7 @@ fn resolve_command(
                 start_message,
             } = request;
 
-            if holding
+            if spawned
                 || matches!(
                     phase,
                     super::TaskState::Running | super::TaskState::Building
@@ -867,9 +874,12 @@ async fn supervise(
                 result = &mut worker => break result,
                 next = rx.recv(), if !mailbox_closed => match next {
                     Some(command) => {
+                        // Nothing has spawned yet — the worker is still
+                        // deciding — so a run arriving now is queued behind
+                        // that decision rather than refused.
                         match resolve_command(
                             command, &name, startup.as_ref(), &last_params, false, owner.phase,
-                            true,
+                            false,
                         ) {
                             Ask::Run(request) => superseded = Some(request),
                             Ask::Cancel { then, done } => {
@@ -1653,8 +1663,8 @@ mod tests {
             last_params: Vec<(&'static str, &'static str)>,
             /// The phase this supervisor has published for itself.
             phase: super::super::TaskState,
-            /// Whether it has a run in hand right now.
-            holding: bool,
+            /// Whether a run of it is actually executing.
+            spawned: bool,
             want: &'static str,
             /// Parameters the resolved run carries, when it makes one.
             want_params: Vec<(&'static str, &'static str)>,
@@ -1668,7 +1678,7 @@ mod tests {
                 task: test_task(),
                 last_params: vec![],
                 phase: super::super::TaskState::Pending,
-                holding: false,
+                spawned: false,
                 want: "run",
                 want_params: vec![],
                 // Admission is not the answer: `don run` is told it was
@@ -1677,15 +1687,29 @@ mod tests {
             },
             Case {
                 // The check that used to be `is_busy` on the scheduler.
-                name: "a task already holding a run refuses a second",
+                name: "a task with a run executing refuses a second",
                 command: Box::new(run(vec![])),
                 task: test_task(),
                 last_params: vec![],
                 phase: super::super::TaskState::Pending,
-                holding: true,
+                spawned: true,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
+            },
+            Case {
+                // Busy is not the same as running. During the startup sweep
+                // every task has a worker deciding skip/pending/run; refusing
+                // there is what made pressing "run" wait out the whole sweep.
+                name: "a task still deciding whether to run admits one",
+                command: Box::new(run(vec![])),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Skipped,
+                spawned: false,
+                want: "run",
+                want_params: vec![],
+                want_reply: None,
             },
             Case {
                 // …and the check that used to read the scheduler's state map.
@@ -1694,7 +1718,7 @@ mod tests {
                 task: test_task(),
                 last_params: vec![],
                 phase: super::super::TaskState::Running,
-                holding: false,
+                spawned: false,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
@@ -1705,7 +1729,7 @@ mod tests {
                 task: param_task(),
                 last_params: vec![],
                 phase: super::super::TaskState::Pending,
-                holding: false,
+                spawned: false,
                 want: "run",
                 want_params: vec![("env", "staging")],
                 want_reply: None,
@@ -1716,7 +1740,7 @@ mod tests {
                 task: param_task(),
                 last_params: vec![],
                 phase: super::super::TaskState::Pending,
-                holding: false,
+                spawned: false,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
@@ -1727,7 +1751,7 @@ mod tests {
                 task: test_task(),
                 last_params: vec![],
                 phase: super::super::TaskState::Running,
-                holding: true,
+                spawned: true,
                 want: "cancel-only",
                 want_params: vec![],
                 want_reply: None,
@@ -1738,7 +1762,7 @@ mod tests {
                 task: test_task(),
                 last_params: vec![],
                 phase: super::super::TaskState::Completed,
-                holding: false,
+                spawned: false,
                 want: "cancel-then-run",
                 want_params: vec![],
                 want_reply: Some(true),
@@ -1749,7 +1773,7 @@ mod tests {
                 task: param_task(),
                 last_params: vec![("env", "staging")],
                 phase: super::super::TaskState::Completed,
-                holding: false,
+                spawned: false,
                 want: "cancel-then-run",
                 want_params: vec![("env", "staging")],
                 want_reply: Some(true),
@@ -1762,7 +1786,7 @@ mod tests {
                 task: param_task(),
                 last_params: vec![],
                 phase: super::super::TaskState::Completed,
-                holding: false,
+                spawned: false,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
@@ -1791,7 +1815,7 @@ mod tests {
                 &last_params,
                 false,
                 case.phase,
-                case.holding,
+                case.spawned,
             );
             let (got, params) = match &ask {
                 Ask::Run(request) => ("run", Some(request.params.clone())),
