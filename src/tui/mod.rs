@@ -423,7 +423,8 @@ pub async fn run_tui(
                             let end = run_bridge(&client, &name).await;
                             released.retake()?;
                             terminal = build_terminal()?;
-                            terminal.clear()?;
+                            let area: Rect = terminal.size()?.into();
+                            force_full_repaint(&mut terminal, area)?;
                             input_handle = tokio::spawn(input::run(input_tx.clone()));
                             if let Some(message) = end {
                                 controls.lifecycle_emitter.lifecycle_event(&message);
@@ -483,7 +484,27 @@ fn build_terminal() -> Result<TuiTerminal, TuiError> {
     Ok(terminal)
 }
 
-/// Paint the whole screen from `app` and `store`.
+/// Throw away what the renderer believes is on screen, so the next draw paints
+/// every cell.
+///
+/// Deliberately not `Terminal::clear`. As of ratatui-core 0.1.2 that reads the
+/// cursor position first, in order to put it back afterwards — and reading it
+/// means writing `ESC[6n` and waiting for the terminal to answer on stdin,
+/// which this TUI's input task is already reading. The reply goes to the input
+/// task, the read times out after two seconds, and the whole TUI exits with
+/// "the cursor position could not be read within a normal duration". A
+/// dependency resolving one patch version forward was enough to turn opening a
+/// pane into a crash.
+///
+/// `resize` to the area it already has does what is actually wanted — clear the
+/// viewport, reset both buffers so the next diff has nothing to match against —
+/// and touches the cursor only on the inline viewport, which this is not.
+fn force_full_repaint(terminal: &mut TuiTerminal, area: Rect) -> Result<(), TuiError> {
+    terminal.resize(area)?;
+    Ok(())
+}
+
+/// Paint the whole screen from `app` and `store`./// Paint the whole screen from `app` and `store`.
 ///
 /// The store is reflowed to the log pane's width first: row counts have to be
 /// current before the view can place its scroll anchor, and a resize is the
@@ -497,7 +518,7 @@ fn draw(terminal: &mut TuiTerminal, app: &mut App, store: &mut LogStore) -> Resu
     // frame: opening, moving or resizing a pane is a thing people do
     // occasionally, not sixty times a second.
     if app.painted_layout != Some(app.status_pane) || app.repaint_requested {
-        terminal.clear()?;
+        force_full_repaint(terminal, area)?;
         app.painted_layout = Some(app.status_pane);
         app.repaint_requested = false;
     }
