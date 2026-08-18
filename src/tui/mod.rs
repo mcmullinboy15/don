@@ -1063,7 +1063,7 @@ fn end_attach(app: &mut App, attach: &mut Option<attach_session::Session>) {
 /// One function for panels and full-screen views alike, because dismissing
 /// either means the same thing — there is nothing else to go back to.
 fn return_to_logs(app: &mut App) {
-    app.view_mode = ViewMode::Normal;
+    app.set_view_mode(ViewMode::Normal);
     app.focus = panes::Focus::Logs;
 }
 
@@ -1088,7 +1088,7 @@ fn nudge_panel(app: &mut App, delta: i16) {
 fn open_services_panel(app: &mut App) {
     app.services_table.reset();
     app.freeze_services_order();
-    app.view_mode = ViewMode::Services;
+    app.set_view_mode(ViewMode::Services);
     app.focus = panes::Focus::Panel;
     fit_panel_to_terminal(app);
 }
@@ -1096,14 +1096,14 @@ fn open_services_panel(app: &mut App) {
 fn open_tasks_panel(app: &mut App) {
     app.tasks_table.reset();
     app.freeze_tasks_order();
-    app.view_mode = ViewMode::Tasks;
+    app.set_view_mode(ViewMode::Tasks);
     app.focus = panes::Focus::Panel;
     fit_panel_to_terminal(app);
 }
 
 fn open_filter_panel(app: &mut App) {
     app.filter.enter_edit();
-    app.view_mode = ViewMode::Filter;
+    app.set_view_mode(ViewMode::Filter);
     app.focus = panes::Focus::Panel;
     fit_panel_to_terminal(app);
 }
@@ -1888,7 +1888,7 @@ fn open_form_for_task(
         .collect();
 
     app.form = Some(form);
-    app.view_mode = ViewMode::Form;
+    app.set_view_mode(ViewMode::Form);
 
     // Kick off an initial fetch for every field that needs it. The replies
     // come back through `input_tx` so they land in the same event queue
@@ -2640,6 +2640,78 @@ mod tests {
                 app.focus,
                 panes::Focus::Panel,
                 "{}: and keeps the keys",
+                case.name
+            );
+        }
+    }
+
+    /// The log popup cannot outlive the table it is a row of.
+    ///
+    /// `s` and `t` close or switch their panel from anywhere, but the only key
+    /// that dismissed the popup lived inside the table handlers — so a popup
+    /// left behind was one nothing could close.
+    #[test]
+    fn changing_the_view_takes_the_log_popup_with_it() {
+        struct Case {
+            name: &'static str,
+            from: ViewMode,
+            key: KeyCode,
+        }
+
+        let cases = [
+            Case {
+                name: "closing the panel it was opened from",
+                from: ViewMode::Services,
+                key: KeyCode::Char('s'),
+            },
+            Case {
+                name: "switching to the other panel",
+                from: ViewMode::Services,
+                key: KeyCode::Char('t'),
+            },
+            Case {
+                name: "closing the tasks panel",
+                from: ViewMode::Tasks,
+                key: KeyCode::Char('t'),
+            },
+            Case {
+                name: "switching from tasks to services",
+                from: ViewMode::Tasks,
+                key: KeyCode::Char('s'),
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            app.apply_task_state(
+                "migrate".to_string(),
+                crate::client::TaskState::Pending,
+                None,
+                Vec::new(),
+            );
+            app.view_mode = case.from;
+            app.focus = panes::Focus::Panel;
+            app.open_log_popup("api".to_string(), vec![b"a line".to_vec()]);
+            assert!(app.log_popup.is_some(), "{}: opened", case.name);
+
+            let mut store = LogStore::with_capacity(10);
+            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
+            let controls = TuiControls {
+                lifecycle_emitter: LifecycleEmitter::discarding(),
+                mode: TuiMode::InProcess,
+            };
+            handle_key(
+                KeyEvent::new(case.key, KeyModifiers::NONE),
+                &mut app,
+                &mut store,
+                &client,
+                &controls,
+            )
+            .unwrap();
+
+            assert!(
+                app.log_popup.is_none(),
+                "{}: the popup went with the table",
                 case.name
             );
         }

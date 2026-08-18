@@ -545,12 +545,11 @@ impl App {
 
     pub(crate) fn begin_shutdown(&mut self) {
         self.shutdown_started = true;
-        self.view_mode = ViewMode::Normal;
+        self.set_view_mode(ViewMode::Normal);
         self.services_table.reset();
         self.tasks_table.reset();
         self.failure_summary_scroll = 0;
         self.form = None;
-        self.log_popup = None;
     }
 
     pub(crate) fn set_update_check(
@@ -759,7 +758,21 @@ impl App {
 
     pub(crate) fn open_failure_summary(&mut self) {
         self.failure_summary_scroll = 0;
-        self.view_mode = ViewMode::Failures;
+        self.set_view_mode(ViewMode::Failures);
+    }
+
+    /// Change which view is up.
+    ///
+    /// The one thing this does beyond the assignment is drop the log popup,
+    /// and it is why the assignment is a method at all. That popup is a detail
+    /// view of one *row* — opened with `l` from the services or tasks table —
+    /// so it has no meaning once that table is gone. Leaving it behind
+    /// stranded it: `s` and `t` close their panel from anywhere, and the only
+    /// key that dismissed the popup lived inside the table handlers, so a
+    /// popup that outlived its table could not be dismissed at all.
+    pub(crate) fn set_view_mode(&mut self, mode: ViewMode) {
+        self.view_mode = mode;
+        self.log_popup = None;
     }
 
     pub(crate) fn scroll_failure_summary_by(&mut self, delta: isize) {
