@@ -69,8 +69,8 @@ pub(crate) struct StoredLogLine {
     /// Rows this line occupies at the store's current wrap width.
     wrapped_rows: usize,
     /// Columns the `name | ` prefix occupies, so the pane can hold it in its
-    /// own column and indent what wraps underneath it. See
-    /// [`super::logs::prefix_columns`].
+    /// own column and indent what wraps underneath it. Measured from the
+    /// prefix the sink sent, not recovered from the text.
     prefix_cols: usize,
 }
 
@@ -225,14 +225,17 @@ impl LogStore {
         self.entries.get(at).filter(|entry| entry.id == id)
     }
 
-    /// Id the next stream line is expected to have — what a reconnecting
-    /// client asks to resume from.
+    /// Id the next stream line is expected to have.
+    ///
+    /// Test-only now. It used to be handed out to the blank that Enter
+    /// inserted, which is exactly the collision that stopped being a good idea
+    /// — an id belongs to the stream, and nothing local should spend one.
+    #[cfg(test)]
     pub(crate) fn next_id(&self) -> LogId {
         self.next_id
     }
 
     /// Id of the most recently stored line, if any.
-    #[cfg(test)]
     pub(crate) fn latest_id(&self) -> Option<LogId> {
         self.entries.back().map(|entry| entry.id)
     }
@@ -257,6 +260,38 @@ mod tests {
             prefix: Vec::new(),
             bytes: body.as_bytes().to_vec(),
         }
+    }
+
+    /// A blank the reader asked for must not be a stored line.
+    ///
+    /// It used to be pushed under `next_id` — the id the next real line would
+    /// arrive with. So either that line replaced the blank, or both sat under
+    /// one id and the store's binary searches began answering with whichever
+    /// came first, which is how logs appeared in the blank space and then
+    /// vanished.
+    #[test]
+    fn a_stream_line_never_lands_on_top_of_a_local_blank() {
+        let mut store = LogStore::with_capacity(10);
+        store.reflow(80);
+        store.push(LogId(0), line("api", "first"));
+
+        // What Enter does now: mark the newest line, touching nothing.
+        let marked = store.latest_id().unwrap();
+        assert_eq!(marked, LogId(0));
+        assert_eq!(store.next_id(), LogId(1), "the mark takes no id");
+
+        // The next real line arrives under the id the blank used to steal.
+        store.push(LogId(1), line("api", "second"));
+        let got: Vec<String> = store
+            .iter()
+            .map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned())
+            .collect();
+        assert_eq!(got, vec!["first", "second"], "both lines survive");
+        assert_eq!(
+            store.get(LogId(1)).map(|e| e.id),
+            Some(LogId(1)),
+            "and each id still resolves to its own line"
+        );
     }
 
     /// A reader scrolled back keeps their place: the lines they are looking at

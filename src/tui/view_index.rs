@@ -20,10 +20,18 @@
 //! dropping the front moves a single `base` rather than rewriting every entry
 //! behind it. The current row offset of an entry is `cum - base`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use super::log_store::{LogStore, StoredLogLine};
 use crate::output::LogId;
+
+/// Rows a line occupies, including the blank the reader marked after it.
+fn rows_for(entry: &StoredLogLine, blanks: &HashMap<LogId, u16>) -> u32 {
+    let blank = u32::from(blanks.get(&entry.id).copied().unwrap_or(0));
+    u32::try_from(entry.wrapped_rows().max(1))
+        .unwrap_or(u32::MAX)
+        .saturating_add(blank)
+}
 
 /// One admitted line's place in the view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,12 +73,17 @@ impl ViewIndex {
     ///
     /// Cheap in the common case — a few appends — and a full rebuild only when
     /// the filter or the pane width has moved.
-    pub(crate) fn sync<F>(&mut self, store: &LogStore, key: ViewKey, admits: F)
-    where
+    pub(crate) fn sync<F>(
+        &mut self,
+        store: &LogStore,
+        key: ViewKey,
+        blanks: &HashMap<LogId, u16>,
+        admits: F,
+    ) where
         F: Fn(&StoredLogLine) -> bool,
     {
         if !self.built || self.key != key {
-            self.rebuild(store, key, &admits);
+            self.rebuild(store, key, blanks, &admits);
             return;
         }
         // Drop what the store has evicted. Entries are ordered by id, so this
@@ -92,10 +105,10 @@ impl ViewIndex {
         // itself keeps its id, so no append or eviction would notice, and a
         // frame that grew or shrank would leave every row count behind it
         // wrong. Cheap enough to just re-measure it every sync.
-        self.remeasure_last(store);
+        self.remeasure_last(store, blanks);
         // Append what has arrived.
         for entry in store.iter_from(self.next_id) {
-            self.push(entry, &admits);
+            self.push(entry, blanks, &admits);
         }
     }
 
@@ -103,22 +116,27 @@ impl ViewIndex {
     ///
     /// Only correct for the *last* entry: nothing is indexed after it, so
     /// `next_cum` is the only cumulative total that has to move.
-    fn remeasure_last(&mut self, store: &LogStore) {
+    fn remeasure_last(&mut self, store: &LogStore, blanks: &HashMap<LogId, u16>) {
         let Some(last) = self.entries.back_mut() else {
             return;
         };
         let Some(entry) = store.get(last.id) else {
             return;
         };
-        let rows = u32::try_from(entry.wrapped_rows().max(1)).unwrap_or(u32::MAX);
+        let rows = rows_for(entry, blanks);
         if rows != last.rows {
             last.rows = rows;
             self.next_cum = last.cum + u64::from(rows);
         }
     }
 
-    fn rebuild<F>(&mut self, store: &LogStore, key: ViewKey, admits: &F)
-    where
+    fn rebuild<F>(
+        &mut self,
+        store: &LogStore,
+        key: ViewKey,
+        blanks: &HashMap<LogId, u16>,
+        admits: &F,
+    ) where
         F: Fn(&StoredLogLine) -> bool,
     {
         self.entries.clear();
@@ -128,11 +146,11 @@ impl ViewIndex {
         self.key = key;
         self.built = true;
         for entry in store.iter() {
-            self.push(entry, admits);
+            self.push(entry, blanks, admits);
         }
     }
 
-    fn push<F>(&mut self, entry: &StoredLogLine, admits: &F)
+    fn push<F>(&mut self, entry: &StoredLogLine, blanks: &HashMap<LogId, u16>, admits: &F)
     where
         F: Fn(&StoredLogLine) -> bool,
     {
@@ -140,7 +158,7 @@ impl ViewIndex {
         if !admits(entry) {
             return;
         }
-        let rows = u32::try_from(entry.wrapped_rows().max(1)).unwrap_or(u32::MAX);
+        let rows = rows_for(entry, blanks);
         self.entries.push_back(Indexed {
             id: entry.id,
             cum: self.next_cum,
@@ -193,6 +211,11 @@ impl ViewIndex {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// No blank marks — the default for a test that is not about them.
+    fn no_marks() -> HashMap<LogId, u16> {
+        HashMap::new()
+    }
     use crate::output::FormattedLogLine;
 
     fn store_of(lines: &[(u64, &str, &str)], width: u16) -> LogStore {
@@ -234,7 +257,7 @@ mod tests {
         let admits = |entry: &StoredLogLine| entry.line.name == "api";
 
         let mut index = ViewIndex::default();
-        index.sync(&store, key(10, 0), admits);
+        index.sync(&store, key(10, 0), &no_marks(), admits);
 
         // api lines only: 2 rows + 3 rows.
         assert_eq!(index.total_rows(), 5);
@@ -275,10 +298,10 @@ mod tests {
                     bytes: "x".repeat(1 + (step as usize % 4) * 9).into_bytes(),
                 },
             );
-            mended.sync(&store, key(12, 0), admits);
+            mended.sync(&store, key(12, 0), &no_marks(), admits);
 
             let mut fresh = ViewIndex::default();
-            fresh.sync(&store, key(12, 1), admits); // different key forces a rebuild
+            fresh.sync(&store, key(12, 1), &no_marks(), admits); // different key forces a rebuild
             fresh.key = mended.key;
 
             assert_eq!(
@@ -315,7 +338,7 @@ mod tests {
         );
 
         let mut index = ViewIndex::default();
-        index.sync(&store, key(10, 0), |_| true);
+        index.sync(&store, key(10, 0), &no_marks(), |_| true);
         assert_eq!(index.total_rows(), 1);
 
         // Same id, taller content: three rows at width 10.
@@ -329,7 +352,7 @@ mod tests {
                 bytes: b"a much longer frame that wraps".to_vec(),
             },
         );
-        index.sync(&store, key(10, 0), |_| true);
+        index.sync(&store, key(10, 0), &no_marks(), |_| true);
         assert_eq!(index.total_rows(), 3, "the taller frame is measured again");
 
         // And a line after it starts where the taller frame ends.
@@ -343,7 +366,7 @@ mod tests {
                 bytes: b"done".to_vec(),
             },
         );
-        index.sync(&store, key(10, 0), |_| true);
+        index.sync(&store, key(10, 0), &no_marks(), |_| true);
         assert_eq!(index.rows_above(LogId(1)), Some(3));
         assert_eq!(index.total_rows(), 4);
     }
@@ -355,17 +378,17 @@ mod tests {
         let store = store_of(&[(0, "api", "aaaaaaaaaaaaaaa"), (1, "web", "bbb")], 10);
         let mut index = ViewIndex::default();
 
-        index.sync(&store, key(10, 0), |e| e.line.name == "api");
+        index.sync(&store, key(10, 0), &no_marks(), |e| e.line.name == "api");
         assert_eq!(index.total_rows(), 2);
 
         // Same width, different filter.
-        index.sync(&store, key(10, 1), |_| true);
+        index.sync(&store, key(10, 1), &no_marks(), |_| true);
         assert_eq!(index.total_rows(), 3, "web's single row joins");
 
         // Same filter, wider pane: the long line stops wrapping.
         let mut wide = store_of(&[(0, "api", "aaaaaaaaaaaaaaa"), (1, "web", "bbb")], 40);
         wide.reflow(40);
-        index.sync(&wide, key(40, 1), |_| true);
+        index.sync(&wide, key(40, 1), &no_marks(), |_| true);
         assert_eq!(index.total_rows(), 2, "one row each at 40 columns");
     }
 }

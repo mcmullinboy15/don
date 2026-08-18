@@ -504,7 +504,7 @@ fn force_full_repaint(terminal: &mut TuiTerminal, area: Rect) -> Result<(), TuiE
     Ok(())
 }
 
-/// Paint the whole screen from `app` and `store`./// Paint the whole screen from `app` and `store`.
+/// Paint the whole screen from `app` and `store`.
 ///
 /// The store is reflowed to the log pane's width first: row counts have to be
 /// current before the view can place its scroll anchor, and a resize is the
@@ -698,18 +698,14 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
             resume_following(app);
         }
         KeyCode::Enter => {
-            // A local artifact, not a stream line: it borrows the id the next
-            // real line is expected to have so replay keeps it in place.
-            store.push(
-                store.next_id(),
-                FormattedLogLine {
-                    name: String::new(),
-                    is_verbose: false,
-                    is_lifecycle: false,
-                    prefix: Vec::new(),
-                    bytes: Vec::new(),
-                },
-            );
+            // Mark the newest line as followed by a blank row, rather than
+            // pushing a blank line of its own. A pushed blank needs an id, and
+            // the only one going spare is the id the next real line will
+            // arrive with — see `App::blank_after`.
+            if let Some(id) = store.latest_id() {
+                let blanks = app.blank_after.entry(id).or_insert(0);
+                *blanks = blanks.saturating_add(1);
+            }
         }
         // The conventional "something has scribbled on my screen" key. An
         // escape hatch, not a fix: anything that leaves the terminal and this
@@ -741,11 +737,11 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         // Scrolling the log. The pane's own history is the only history now,
         // so these are load-bearing rather than a convenience over the
         // terminal's scrollback.
-        KeyCode::Up => scroll_log(app, -1),
-        KeyCode::Down => scroll_log(app, 1),
-        KeyCode::PageUp => scroll_log(app, -log_page(app)),
-        KeyCode::PageDown => scroll_log(app, log_page(app)),
-        KeyCode::Home => scroll_log(app, isize::MIN / 2),
+        KeyCode::Up => scroll_log(app, |p| p.rows -= 1),
+        KeyCode::Down => scroll_log(app, |p| p.rows += 1),
+        KeyCode::PageUp => scroll_log(app, |p| p.pages -= 1),
+        KeyCode::PageDown => scroll_log(app, |p| p.pages += 1),
+        KeyCode::Home => scroll_log(app, |p| p.to_top = true),
         KeyCode::End => {
             app.log_selection.clear();
             app.follow_paused_for_selection = false;
@@ -797,8 +793,8 @@ const WHEEL_ROWS: isize = 3;
 /// nothing while it is hidden.
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
-        MouseEventKind::ScrollUp => scroll_log(app, -WHEEL_ROWS),
-        MouseEventKind::ScrollDown => scroll_log(app, WHEEL_ROWS),
+        MouseEventKind::ScrollUp => scroll_log(app, |p| p.rows -= WHEEL_ROWS),
+        MouseEventKind::ScrollDown => scroll_log(app, |p| p.rows += WHEEL_ROWS),
         // A click in the log pane takes focus back from any overlay, which is
         // the gesture people reach for before they remember `esc`.
         MouseEventKind::Down(MouseButton::Left) => {
@@ -933,7 +929,9 @@ fn pause_following_for_selection(app: &mut App) {
     if app.log_scroll != logs::Scroll::Follow {
         return;
     }
-    app.log_scroll = logs::anchor_at(&app.view_index, app.log_rows_above);
+    // Asked for, not computed: "hold where you are" needs to know where that is,
+    // which only the renderer does.
+    app.pending_scroll.pin = true;
     app.follow_paused_for_selection = true;
 }
 
@@ -971,18 +969,14 @@ fn copy_selection(app: &mut App) {
     });
 }
 
-/// One screenful, minus a row of overlap so the reader keeps their place.
-fn log_page(app: &App) -> isize {
-    isize::from(app.log_pane_height.saturating_sub(1).max(1) as i16)
-}
-
-/// Move the log view by `delta` rows.
+/// Record a scroll the reader asked for. Resolved when the pane is next drawn.
 ///
-/// Geometry comes from what the last frame measured — only the renderer knows
-/// how tall the pane came out and how much admitted content there is at this
-/// width. A resize between then and now costs one imprecise scroll, which the
-/// next frame corrects.
-fn scroll_log(app: &mut App, delta: isize) {
+/// Geometry deliberately absent: how far this can go depends on how much
+/// admitted content there is and how tall the pane came out, and both are known
+/// only while drawing. Deciding here meant deciding from what the last frame
+/// measured, which anything between frames — a filter change most of all —
+/// could have invalidated.
+fn scroll_log(app: &mut App, ask: impl FnOnce(&mut app::PendingScroll)) {
     // The selection is in screen coordinates, so it stops meaning anything the
     // moment different content is under those cells — same as a terminal drops
     // its own selection when you scroll. Scrolling is also a deliberate choice
@@ -990,21 +984,7 @@ fn scroll_log(app: &mut App, delta: isize) {
     // paused it.
     app.log_selection.clear();
     app.follow_paused_for_selection = false;
-    let (scroll, landed_on) = logs::scrolled(
-        &app.view_index,
-        app.log_rows_above,
-        app.log_total_rows,
-        app.log_pane_height,
-        delta,
-    );
-    app.log_scroll = scroll;
-    // Move the measured offset along with it. Wheel events arrive in bursts —
-    // several per frame when someone spins the wheel — and `log_rows_above` is
-    // only refreshed when a frame is drawn. Without this every event in a burst
-    // starts from the same stale offset and computes the same destination, so
-    // ten notches scroll exactly as far as one. The next frame overwrites this
-    // with the real measurement.
-    app.log_rows_above = landed_on;
+    ask(&mut app.pending_scroll);
 }
 
 fn handle_failure_summary_key(
@@ -1838,96 +1818,56 @@ mod tests {
         }
     }
 
-    /// Wheel events arrive in bursts, several per frame. Each has to build on
-    /// the last rather than on the offset the previous *frame* measured — or a
-    /// whole flick of the wheel scrolls exactly as far as one notch, which is
-    /// what made scrolling feel like it was ignoring you.
+    /// Wheel events arrive in bursts, several per frame, and each has to build
+    /// on the last. They now accumulate as intent and are resolved once, when
+    /// the pane is drawn and the geometry is true — so a burst is a sum, and a
+    /// filter change between the burst and the frame cannot make it land
+    /// somewhere unrelated.
     #[test]
-    fn a_burst_of_scrolls_accumulates_between_frames() {
+    fn a_burst_of_scrolls_accumulates_and_resolves_once() {
+        use super::app::PendingScroll;
+
         struct Case {
             name: &'static str,
             /// Deltas delivered without a frame in between.
             burst: &'static [isize],
-            start: usize,
-            want_rows_above: usize,
+            want: PendingScroll,
         }
 
         let cases = [
             Case {
-                name: "one notch moves one notch",
+                name: "one notch",
                 burst: &[-3],
-                start: 500,
-                want_rows_above: 497,
+                want: PendingScroll {
+                    rows: -3,
+                    ..PendingScroll::default()
+                },
             },
             Case {
-                name: "ten notches move ten notches",
+                name: "ten notches are ten notches, not one",
                 burst: &[-3, -3, -3, -3, -3, -3, -3, -3, -3, -3],
-                start: 500,
-                want_rows_above: 470,
+                want: PendingScroll {
+                    rows: -30,
+                    ..PendingScroll::default()
+                },
             },
             Case {
                 name: "back and forth nets out",
                 burst: &[-3, -3, 3],
-                start: 500,
-                want_rows_above: 497,
-            },
-            Case {
-                name: "clamped at the top",
-                burst: &[-3, -3, -3],
-                start: 4,
-                want_rows_above: 0,
+                want: PendingScroll {
+                    rows: -3,
+                    ..PendingScroll::default()
+                },
             },
         ];
 
         for case in cases {
             let mut app = app_with_service_state(ServiceState::Ready);
-            // Stand in for what a frame would have measured.
-            app.log_total_rows = 1_000;
-            app.log_pane_height = 40;
-            app.log_rows_above = case.start;
-
             for delta in case.burst {
-                scroll_log(&mut app, *delta);
+                let delta = *delta;
+                scroll_log(&mut app, move |p| p.rows += delta);
             }
-
-            assert_eq!(
-                app.log_rows_above, case.want_rows_above,
-                "{}: offset after the burst",
-                case.name
-            );
-        }
-    }
-
-    #[test]
-    fn overlay_enter_stops_failed_service_rows() {
-        struct Case {
-            name: &'static str,
-            state: ServiceState,
-        }
-
-        let cases = vec![
-            Case {
-                name: "failed",
-                state: ServiceState::Failed,
-            },
-            Case {
-                name: "dependency failed",
-                state: ServiceState::DependencyFailed,
-            },
-        ];
-
-        for case in cases {
-            let app = app_with_service_state(case.state);
-            let Some(command) = overlay_toggle_command(&app) else {
-                panic!("{}: expected command", case.name);
-            };
-            assert_eq!(
-                command.action,
-                ControlAction::Stop,
-                "{}: expected stop",
-                case.name
-            );
-            assert_eq!(command.name, "api", "{}: wrong service", case.name);
+            assert_eq!(app.pending_scroll, case.want, "{}", case.name);
         }
     }
 

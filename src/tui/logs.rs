@@ -189,6 +189,7 @@ pub(crate) fn count_wrapped_rows(line: &Line<'_>, prefix_cols: usize, width: u16
 pub(crate) fn build_view<'a>(
     store: &'a LogStore,
     index: &super::view_index::ViewIndex,
+    blanks: &std::collections::HashMap<LogId, u16>,
     scroll: Scroll,
     width: u16,
     height: u16,
@@ -215,10 +216,13 @@ pub(crate) fn build_view<'a>(
     if let Some((first_id, skip_within)) = index.line_at(rows_above) {
         let mut skip = usize::from(skip_within);
         for entry in index.ids_from(first_id).filter_map(|id| store.get(id)) {
-            for wrapped in wrap_line(&entry.parsed, entry.prefix_cols(), width)
-                .into_iter()
-                .skip(skip)
-            {
+            let mut line_rows = wrap_line(&entry.parsed, entry.prefix_cols(), width);
+            // The blank the reader asked for belongs to this line, so it scrolls
+            // with it and the index counted it as one of its rows.
+            for _ in 0..blanks.get(&entry.id).copied().unwrap_or(0) {
+                line_rows.push(Line::default());
+            }
+            for wrapped in line_rows.into_iter().skip(skip) {
                 rows.push(wrapped);
                 if rows.len() == height {
                     return LogView {
@@ -255,36 +259,66 @@ pub(crate) fn anchor_at(index: &super::view_index::ViewIndex, rows_above: usize)
     }
 }
 
-/// Move the anchor by `delta` rows, clamping at both ends.
+/// Turn the reader's pending intent into an anchor, against the geometry that
+/// exists right now.
 ///
-/// Returns the row offset it landed on as well as the anchor. Callers need it:
-/// wheel events arrive in bursts, many per frame, and each one has to start
-/// from where the previous one left off rather than from what the last frame
-/// happened to measure — otherwise a whole burst collapses into one step.
-///
-/// Scrolling to the bottom re-enters [`Scroll::Follow`] rather than anchoring
-/// at the last line — otherwise the view would sit one line behind forever
-/// once new output arrived, which reads as a freeze.
-pub(crate) fn scrolled(
+/// The one place scroll position is decided. It runs while drawing, because
+/// that is the only moment all three inputs are true at once: how much admitted
+/// content there is, where the view sits in it, and how tall the pane is.
+/// Deciding at input time meant reading what the previous frame measured — and
+/// a verbose toggle rebuilds the index, so one arrow key could move the view by
+/// the difference between two entirely different filters.
+pub(crate) fn resolve_scroll(
     index: &super::view_index::ViewIndex,
-    rows_above: usize,
-    total_rows: usize,
+    scroll: Scroll,
+    pending: super::app::PendingScroll,
     height: u16,
-    delta: isize,
-) -> (Scroll, usize) {
-    let height = height.max(1) as usize;
-    let max_above = total_rows.saturating_sub(height);
-    let target = rows_above.saturating_add_signed(delta).min(max_above);
-    if target >= max_above {
-        return (Scroll::Follow, max_above);
+) -> Scroll {
+    if pending.is_empty() {
+        return scroll;
     }
-    (anchor_at(index, target), target)
+    let height = height.max(1) as usize;
+    let total_rows = index.total_rows();
+    let max_above = total_rows.saturating_sub(height);
+
+    // Where the view sits now, measured the same way the pane will measure it.
+    let current = match scroll {
+        Scroll::Follow => max_above,
+        Scroll::At { id, row } => match index.rows_above(id) {
+            Some(above) => (above + row as usize).min(max_above),
+            None => 0,
+        },
+    };
+
+    if pending.to_top {
+        return anchor_at(index, 0);
+    }
+    // Pinning is "stop following, stay exactly here" — a selection starting
+    // holds the rows it was dragged across still.
+    if pending.pin && pending.rows == 0 && pending.pages == 0 {
+        return anchor_at(index, current);
+    }
+
+    let page = isize::try_from(height.saturating_sub(1).max(1)).unwrap_or(1);
+    let delta = pending
+        .rows
+        .saturating_add(pending.pages.saturating_mul(page));
+    let target = current.saturating_add_signed(delta).min(max_above);
+    if target >= max_above {
+        return Scroll::Follow;
+    }
+    anchor_at(index, target)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// No blank marks — the default for a test that is not about them.
+    fn no_marks() -> std::collections::HashMap<LogId, u16> {
+        std::collections::HashMap::new()
+    }
     use ratatui::text::Span;
 
     fn styled(text: &str) -> Line<'static> {
@@ -329,16 +363,77 @@ mod tests {
                 width: 40,
                 filter: 0,
             },
-            |entry| entry.line.name == "api",
+            &no_marks(),
+            |entry: &super::super::log_store::StoredLogLine| entry.line.name == "api",
         );
 
-        let view = build_view(&store, &index, Scroll::Follow, 40, 10);
+        let view = build_view(&store, &index, &no_marks(), Scroll::Follow, 40, 10);
         let text: Vec<String> = view.rows.iter().map(row_text).collect();
         assert_eq!(
             text,
             vec!["api one".to_string(), "api two".to_string()],
             "the pane drew lines the filter excludes"
         );
+    }
+
+    /// The bug this indirection exists for: one arrow key must move one row,
+    /// even when the view it is moving in was rebuilt since the last frame.
+    ///
+    /// Resolving at input time used the previous frame's row count, so toggling
+    /// verbose — which admits or hides thousands of lines — made the next
+    /// keypress land hundreds of rows from where it should.
+    #[test]
+    fn a_scroll_resolves_against_the_view_that_exists_now() {
+        use super::super::app::PendingScroll;
+        use crate::output::FormattedLogLine;
+
+        // A store where half the lines are verbose, so a filter change moves
+        // the row count a long way.
+        let mut store = LogStore::with_capacity(1000);
+        store.reflow(40);
+        for id in 0..600u64 {
+            store.push(
+                LogId(id),
+                FormattedLogLine {
+                    name: "api".to_string(),
+                    is_lifecycle: false,
+                    is_verbose: id % 2 == 0,
+                    prefix: b"api | ".to_vec(),
+                    bytes: b"a line".to_vec(),
+                },
+            );
+        }
+
+        let height = 20u16;
+        let quiet = |entry: &super::super::log_store::StoredLogLine| !entry.line.is_verbose;
+
+        // Verbose on: everything admitted, following the tail.
+        let mut index = super::super::view_index::ViewIndex::default();
+        index.sync(&store, key_for(0), &no_marks(), |_| true);
+        assert_eq!(index.total_rows(), 600);
+
+        // Now verbose goes off and the index rebuilds — 300 rows, not 600 —
+        // and only then does the arrow key get resolved.
+        index.sync(&store, key_for(1), &no_marks(), quiet);
+        assert_eq!(index.total_rows(), 300);
+
+        let up_once = PendingScroll {
+            rows: -1,
+            ..PendingScroll::default()
+        };
+        let scroll = resolve_scroll(&index, Scroll::Follow, up_once, height);
+
+        // One row above the tail of the *current* view: 300 rows, 20 visible,
+        // so the tail sits at 280 and one up is 279.
+        let view = build_view(&store, &index, &no_marks(), scroll, 40, height);
+        assert_eq!(
+            view.rows_above, 279,
+            "one arrow key moves one row in the view that exists now"
+        );
+    }
+
+    fn key_for(filter: u64) -> super::super::view_index::ViewKey {
+        super::super::view_index::ViewKey { width: 40, filter }
     }
 
     /// The prefix is a column, not part of the text: what wraps lands under the

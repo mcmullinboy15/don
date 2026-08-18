@@ -127,6 +127,29 @@ impl OverlayItem {
     }
 }
 
+/// A scroll the reader asked for, in units that do not need geometry to
+/// express: rows, pages, and the two ends.
+///
+/// Accumulates between frames — a wheel spin is many events per frame — and is
+/// resolved once, against the geometry that actually exists when the pane is
+/// drawn. Nothing here is clamped: clamping needs to know how much content
+/// there is, which is exactly the knowledge this defers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PendingScroll {
+    pub(crate) rows: isize,
+    pub(crate) pages: isize,
+    /// Jump to the oldest line held.
+    pub(crate) to_top: bool,
+    /// Stop following and hold the current position, without moving it.
+    pub(crate) pin: bool,
+}
+
+impl PendingScroll {
+    pub(crate) fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
 /// Aggregate counts derived from service/task state, displayed on the bar.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StatusCounts {
@@ -302,6 +325,31 @@ pub(crate) struct App {
     /// scroll anchor without re-deriving what only the renderer knows: how
     /// tall the pane came out and how much admitted content there is at this
     /// width. Written by the renderer, read by key and mouse handling.
+    /// What the reader has asked the view to do, not yet resolved.
+    ///
+    /// Input records intent; the renderer resolves it. Scroll arithmetic needs
+    /// three things — how much admitted content there is, where the view
+    /// currently sits in it, and how tall the pane is — and all three are known
+    /// only while rendering. Resolving at input time meant using the numbers
+    /// the *previous* frame measured, so anything that changed the view between
+    /// frames (a verbose toggle rebuilding the index, lines arriving, lines
+    /// evicting, a resize) made one keypress land somewhere unrelated.
+    pub(crate) pending_scroll: PendingScroll,
+    /// Lines the reader asked for a blank row after, by pressing Enter at the
+    /// tail — the terminal gesture for "start a fresh patch of screen".
+    ///
+    /// A mark, not a stored line. A blank pushed into the store had to be given
+    /// an id, and the only one available was the id the *next* real line would
+    /// arrive with, so the two collided: either the real line replaced the
+    /// blank, or both sat under one id and the store's binary searches started
+    /// answering with whichever came first.
+    ///
+    /// Counted, not a set: pressing Enter twice on a quiet stack means two
+    /// blank rows, the same as it would in a shell.
+    pub(crate) blank_after: HashMap<crate::output::LogId, u16>,
+    /// Rows above the top edge, as last drawn. For the scrollbar only —
+    /// scrolling must not read it, or it is back to deciding from stale
+    /// geometry.
     pub(crate) log_rows_above: usize,
     pub(crate) log_total_rows: usize,
     pub(crate) log_pane_height: u16,
@@ -396,6 +444,8 @@ impl App {
             follow_paused_for_selection: false,
             log_visible_rows: Vec::new(),
             log_pane_origin: (0, 0),
+            pending_scroll: PendingScroll::default(),
+            blank_after: HashMap::new(),
             log_rows_above: 0,
             log_total_rows: 0,
             log_pane_height: 0,
@@ -439,6 +489,16 @@ impl App {
         self.verbose_enabled.hash(&mut hasher);
         self.shutdown_started.hash(&mut hasher);
         self.filter.fingerprint(&mut hasher);
+        // Blank marks change how tall a line is, so they belong to the same key
+        // the row index is built against. Order-independent: a set has none.
+        let mut marks: u64 = 0;
+        for (id, count) in &self.blank_after {
+            let mut one = std::collections::hash_map::DefaultHasher::new();
+            (id, count).hash(&mut one);
+            marks = marks.wrapping_add(Hasher::finish(&one));
+        }
+        marks.hash(&mut hasher);
+        self.blank_after.len().hash(&mut hasher);
         hasher.finish()
     }
 

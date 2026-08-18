@@ -116,14 +116,26 @@ fn draw_log_pane(
         filter: app.log_filter_fingerprint(),
     };
     let mut index = std::mem::take(&mut app.view_index);
-    index.sync(store, key, |entry| {
+    index.sync(store, key, &app.blank_after, |entry| {
         app.should_render_log(
             &entry.line.name,
             entry.line.is_lifecycle,
             entry.line.is_verbose,
         )
     });
-    let view = super::logs::build_view(store, &index, app.log_scroll, area.width, area.height);
+    // The one place scroll position is decided, now that the index is current
+    // and the pane's height is known.
+    app.log_scroll =
+        super::logs::resolve_scroll(&index, app.log_scroll, app.pending_scroll, area.height);
+    app.pending_scroll = super::app::PendingScroll::default();
+    let view = super::logs::build_view(
+        store,
+        &index,
+        &app.blank_after,
+        app.log_scroll,
+        area.width,
+        area.height,
+    );
     app.view_index = index;
     // Remembered for the input layer: scrolling needs to know how far it can
     // go, and only the renderer knows how tall the pane came out.
