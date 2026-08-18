@@ -1323,6 +1323,10 @@ fn handle_failure_summary_key(
     Ok(())
 }
 
+/// Keys for the filter panel. There is no commit and no revert: every toggle
+/// applies to the pane the moment it happens — the reader watches it work
+/// beside the panel — so Esc dismisses without undoing, and Enter is just
+/// another way out rather than a "yes, really" step.
 fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Result<(), TuiError> {
     if app.filter.query_editing() {
         match key.code {
@@ -1331,7 +1335,6 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
                 app.filter.apply_query();
                 app.filter.end_query_edit();
                 if close_after_apply {
-                    app.filter.commit();
                     close_panel(app);
                 }
             }
@@ -1344,9 +1347,10 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
             KeyCode::Char(c) => {
                 app.filter.push_query_char(c);
             }
+            // One level up, not all the way out: the query goes, the list
+            // stays, and the selection the query produced is untouched.
             KeyCode::Esc => {
-                app.filter.cancel_edit();
-                close_panel(app);
+                app.filter.clear_query();
             }
             _ => {}
         }
@@ -1354,16 +1358,9 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
     }
 
     match key.code {
-        KeyCode::Enter => {
-            app.filter.commit();
-            close_panel(app);
-        }
-        KeyCode::Esc => {
-            app.filter.cancel_edit();
-            close_panel(app);
-        }
+        KeyCode::Enter | KeyCode::Esc => close_panel(app),
         KeyCode::Char('R') => {
-            app.filter.reset_edit_to_defaults();
+            app.filter.reset_to_defaults();
         }
         KeyCode::Char(' ') => {
             app.filter.toggle_highlighted();
@@ -1372,9 +1369,6 @@ fn handle_filter_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
             app.filter.select_only_highlighted();
         }
         KeyCode::Char('/') => {
-            app.filter.begin_query_edit();
-        }
-        KeyCode::Tab => {
             app.filter.begin_query_edit();
         }
         KeyCode::Up | KeyCode::Char('k') => {

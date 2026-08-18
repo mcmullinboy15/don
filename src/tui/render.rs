@@ -444,8 +444,8 @@ fn draw_filter_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // Border + title wraps the whole panel. Inside: list at top, bar at bottom.
     let title = match app.filter.focus() {
-        FilterFocus::List => " filter — [space] toggle  [o] only  [/] search  [enter] done ",
-        FilterFocus::Query => " filter — [type] search  [enter] apply  [esc] revert ",
+        FilterFocus::List => " filter — [space] toggle  [o] only  [/] search  [R] reset ",
+        FilterFocus::Query => " filter — [type] search  [enter] apply  [esc] clear ",
     };
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -1660,7 +1660,6 @@ mod tests {
         filter.enter_edit();
         filter.push_query_char('a');
         filter.select_only_highlighted();
-        filter.commit();
 
         let text = line_text(normal_bar_line(
             &StatusCounts::default(),

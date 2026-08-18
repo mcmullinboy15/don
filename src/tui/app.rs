@@ -28,8 +28,8 @@ pub(crate) enum ViewMode {
     /// Log flow + status bar. Keys trigger mode changes or scrollback actions.
     #[default]
     Normal,
-    /// Log-filter modal. Navigation edits the pending selection; `/` enters
-    /// query input, Enter commits, Esc cancels.
+    /// Log-filter panel. Every toggle applies to the pane immediately; `/`
+    /// enters query input, and Enter/Esc just close.
     Filter,
     /// Full-screen tasks table. Arrow keys move a highlight; Enter runs the
     /// selected task or opens its param form.
@@ -1317,7 +1317,6 @@ mod tests {
         app.filter.enter_edit();
         app.filter.select_only_highlighted(); // [all] row keeps everything selected.
         app.filter.toggle_highlighted(); // clear all
-        app.filter.commit();
 
         assert!(!app.should_render_log("db", false));
         let changed = apply_service(&mut app, "db", ServiceState::Failed, None);
@@ -1336,7 +1335,6 @@ mod tests {
         );
         app.filter.enter_edit();
         app.filter.toggle_highlighted(); // clear all
-        app.filter.commit();
 
         let changed = apply_service(&mut app, "api", ServiceState::DependencyFailed, None);
 
@@ -1353,7 +1351,6 @@ mod tests {
         );
         app.filter.enter_edit();
         app.filter.toggle_highlighted(); // clear all
-        app.filter.commit();
 
         let changed = apply_task(&mut app, "lint", TaskState::Failed);
 
@@ -1550,7 +1547,6 @@ mod tests {
         app.filter.enter_edit();
         app.filter.push_query_char('a');
         app.filter.select_only_highlighted();
-        app.filter.commit();
 
         // Without shutdown: filter passes "api", rejects "worker" — for both
         // service stdout (is_lifecycle=false) and lifecycle events

@@ -5,16 +5,17 @@
 //! task declares `hidden = true` to start outside the active set. The user
 //! can narrow or widen the selection interactively at any time.
 //!
-//! The filter has two lives:
-//! - **Browsing**: outside the modal, `active_selected` is the set of names
-//!   whose log lines render.
-//! - **Editing**: the modal opens with a snapshot of the current selection.
-//!   Space/`o`/`R` mutate `active_selected` immediately; `Esc` restores the
-//!   snapshot and closes, while Enter keeps the current selection and closes.
+//! Every change applies the moment it happens. Space, `o` and `R` mutate
+//! `active_selected` directly, and the log pane beside the panel shows the
+//! effect immediately — so there is no commit step and no revert. An Esc that
+//! silently undid changes the reader just watched work would be a trap, and
+//! an Enter whose only job was "yes, keep what I already have" a ceremony.
+//! Closing the panel changes nothing; what it shows *is* the filter.
 //!
 //! Typing does nothing until the user presses `/` to enter query-input
 //! sub-mode. Pressing Enter in query focus applies the current query result
-//! to the active selection and returns focus to the list.
+//! to the active selection and returns focus to the list; Esc drops the
+//! query (one level up) while keeping whatever selection it produced.
 //!
 //! Blank spacer lines (`name == ""`, inserted when the user presses Enter
 //! in Normal mode) always pass regardless of the filter — they're UI
@@ -83,11 +84,10 @@ pub(crate) struct FilterState {
     rows: Vec<FilterRow>,
     /// Which part of the modal currently owns keyboard focus.
     focus: FilterFocus,
-    /// Committed selection. Log lines pass iff their name is in this set.
+    /// The selection. Log lines pass iff their name is in this set, and every
+    /// toggle edits it directly — there is no pending copy waiting on an
+    /// Enter, because the pane beside the panel shows the effect immediately.
     active_selected: HashSet<String>,
-    /// Snapshot of `active_selected` captured when the modal opens so Esc can
-    /// restore the prior selection.
-    snapshot_selected: Option<HashSet<String>>,
     /// Highlighted index within `rows` — what Up/Down move.
     highlight: usize,
 }
@@ -131,7 +131,6 @@ impl FilterState {
             rows,
             focus: FilterFocus::List,
             active_selected,
-            snapshot_selected: None,
             highlight: 0,
         }
     }
@@ -180,51 +179,28 @@ impl FilterState {
         self.active_selected.contains(name)
     }
 
-    /// Add a name to the committed selection. Returns `true` when this made
-    /// the active filter more permissive. If a filter edit modal is open, the
-    /// edit snapshot is updated too so Esc does not undo externally-triggered
-    /// failure visibility.
+    /// Add a name to the selection. Returns `true` when this made the active
+    /// filter more permissive.
     pub(crate) fn select_name(&mut self, name: &str) -> bool {
         if !self.all_names.iter().any(|n| n == name) {
             return false;
         }
-        let changed = self.active_selected.insert(name.to_string());
-        if changed && let Some(snapshot) = self.snapshot_selected.as_mut() {
-            snapshot.insert(name.to_string());
-        }
-        changed
+        self.active_selected.insert(name.to_string())
     }
 
-    /// Start editing. Captures the current selection so Esc can restore it.
+    /// Open the panel's list fresh: query cleared, highlight at the top.
+    ///
+    /// No snapshot, no commit, no revert. Toggling applies to the pane the
+    /// moment it happens — the reader watches it work beside the panel — so an
+    /// Esc that silently undid what they just watched was a trap, and an Enter
+    /// whose only job was "yes, keep what I already have" was a ceremony.
+    /// What the panel shows *is* the filter; closing it changes nothing.
     pub(crate) fn enter_edit(&mut self) {
-        self.query.clear();
-        self.rows = build_rows(&self.all_names, "", &self.hidden_from_display);
-        self.focus = FilterFocus::List;
-        self.snapshot_selected = Some(self.active_selected.clone());
-        self.highlight = 0;
-    }
-
-    /// Finish editing, keeping the current active selection.
-    pub(crate) fn commit(&mut self) {
         self.reset_edit_state();
     }
 
-    /// Abandon the edit session and restore the selection from when the modal
-    /// opened.
-    pub(crate) fn cancel_edit(&mut self) {
-        if let Some(snapshot) = self.snapshot_selected.take() {
-            self.active_selected = snapshot;
-        }
-        self.reset_edit_state();
-    }
-
-    /// Reset the active selection to the config-derived defaults.
-    pub(crate) fn reset_edit_to_defaults(&mut self) {
-        self.active_selected = self.default_selected.clone();
-    }
-
-    /// Reset the committed selection to the config-derived defaults. Returns
-    /// `true` when the committed selection changed.
+    /// Reset the selection to the config-derived defaults. Returns
+    /// `true` when the selection changed.
     pub(crate) fn reset_to_defaults(&mut self) -> bool {
         if self.active_selected == self.default_selected {
             return false;
@@ -392,7 +368,15 @@ impl FilterState {
     fn reset_edit_state(&mut self) {
         self.query.clear();
         self.focus = FilterFocus::List;
-        self.snapshot_selected = None;
+        self.highlight = 0;
+        self.rows = build_rows(&self.all_names, "", &self.hidden_from_display);
+    }
+
+    /// Drop the query and return to the list — Esc's first level. The
+    /// selection the query produced stays; only the narrowing goes.
+    pub(crate) fn clear_query(&mut self) {
+        self.query.clear();
+        self.focus = FilterFocus::List;
         self.highlight = 0;
         self.rows = build_rows(&self.all_names, "", &self.hidden_from_display);
     }
@@ -477,13 +461,12 @@ mod tests {
     }
 
     #[test]
-    fn select_name_admits_hidden_name_and_survives_cancel() {
+    fn select_name_admits_hidden_name_immediately() {
         let mut s = state_with_hidden(&["api", "db"], &["db"]);
         assert!(!s.passes("db"));
 
         s.enter_edit();
         assert!(s.select_name("db"));
-        s.cancel_edit();
 
         assert!(s.passes("db"));
     }
@@ -497,11 +480,10 @@ mod tests {
     }
 
     #[test]
-    fn commit_keeps_selection_when_query_only_changes_visibility() {
+    fn a_query_alone_narrows_visibility_not_the_selection() {
         let mut s = state(&["api", "worker", "db"]);
         s.enter_edit();
         s.push_query_char('a');
-        s.commit();
         assert!(s.passes("api"));
         assert!(s.passes("worker"));
         assert!(s.passes("db"));
@@ -514,13 +496,12 @@ mod tests {
         s.enter_edit();
         s.push_query_char('a'); // matches "api" but not "don"
         s.select_only_highlighted();
-        s.commit();
         assert!(s.passes("api"));
         assert!(!s.passes("don"), "don gated when not in selection");
     }
 
     #[test]
-    fn space_multiselect_then_enter_commits_selection() {
+    fn space_multiselect_applies_immediately() {
         let mut s = state(&["api", "worker", "db", "cache"]);
         s.enter_edit();
         // Sorted rows: [All, api, cache, db, worker]. Highlight starts at 0 (All).
@@ -531,7 +512,6 @@ mod tests {
         s.toggle_highlighted(); // cache
         s.highlight_next(); // db
         s.toggle_highlighted(); // db
-        s.commit();
         let mut active: Vec<String> = s.active_names().iter().map(|n| n.to_string()).collect();
         active.sort();
         assert_eq!(active, vec!["cache".to_string(), "db".to_string()]);
@@ -546,7 +526,6 @@ mod tests {
         s.enter_edit();
         s.push_query_char('a'); // fuzzy matches "api"
         s.select_only_highlighted();
-        s.commit();
         let active: Vec<&str> = s.active_names();
         assert_eq!(active, vec!["api"]);
     }
@@ -620,26 +599,23 @@ mod tests {
         s.enter_edit();
         s.push_query_char('a');
         s.select_only_highlighted();
-        s.commit();
         assert!(s.passes("api"));
         assert!(!s.passes("worker"));
 
         s.enter_edit();
-        s.reset_edit_to_defaults();
-        s.commit();
+        s.reset_to_defaults();
         assert!(!s.passes("api"));
         assert!(s.passes("worker"));
     }
 
     #[test]
-    fn committed_reset_to_defaults_reports_changes() {
+    fn reset_to_defaults_reports_changes() {
         let mut s = state_with_hidden(&["api", "worker"], &["api"]);
         assert!(!s.reset_to_defaults());
 
         s.enter_edit();
         s.push_query_char('a');
         s.select_only_highlighted();
-        s.commit();
         assert!(s.passes("api"));
         assert!(!s.passes("worker"));
 
@@ -703,27 +679,30 @@ mod tests {
     }
 
     #[test]
-    fn explicit_toggle_commits_even_when_result_is_empty() {
+    fn explicit_toggle_applies_even_when_result_is_empty() {
         let mut s = state(&["api", "worker"]);
         s.enter_edit();
         s.toggle_highlighted(); // All → clear everything
-        s.commit();
         assert!(s.active_names().is_empty());
         assert!(!s.passes("api"));
         assert!(!s.passes("worker"));
     }
 
+    /// Esc's first level while typing: the query goes, the selection the
+    /// query produced stays. There is no revert — the reader watched every
+    /// change apply, so silently undoing them on the way out was a trap.
     #[test]
-    fn cancel_edit_discards_pending_selection_changes() {
+    fn clearing_the_query_keeps_the_selection_it_produced() {
         let mut s = state(&["api", "worker"]);
         s.enter_edit();
+        s.begin_query_edit();
         s.push_query_char('a');
         s.select_only_highlighted();
 
-        s.cancel_edit();
+        s.clear_query();
 
         assert!(s.passes("api"));
-        assert!(s.passes("worker"));
+        assert!(!s.passes("worker"), "the narrowing survives");
         assert_eq!(s.query(), "");
         assert!(!s.query_editing());
     }
@@ -827,7 +806,6 @@ mod tests {
                 }
                 s.toggle_highlighted();
             }
-            s.commit();
             assert_eq!(s.passes(case.probe), case.want, "case: {}", case.name);
         }
     }
