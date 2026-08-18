@@ -37,6 +37,14 @@ use crate::output::{FormattedLogLine, LogId};
 /// what don still holds.
 pub(crate) const DEFAULT_CAPACITY: usize = crate::output::DEFAULT_MERGED_HISTORY_CAPACITY;
 
+/// Cap on retained diagnostics.
+///
+/// don's own narration is for answering "why did that not rebuild" in the
+/// moment, not for scrolling back through. It is also the noisiest thing in the
+/// system when a watch is busy, so giving it the same scrollback as the
+/// processes' output spends a lot of memory on lines nobody reads.
+pub(crate) const DEBUG_CAPACITY: usize = 500;
+
 /// How far past `capacity` the store will grow to keep a scrolled reader's
 /// place. Beyond this their anchor is dropped like anything else — a reader who
 /// has walked away is not worth an unbounded buffer.

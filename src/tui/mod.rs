@@ -76,7 +76,7 @@ use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter};
 use app::{App, AppInit, ViewMode, line_matches_log_popup};
 use events::AppEvent;
-use log_store::{DEFAULT_CAPACITY, LogStore};
+use log_store::{DEBUG_CAPACITY, DEFAULT_CAPACITY, LogStore};
 use status_table::StatusTableKeyOutcome;
 
 /// Errors that can escape the TUI event loop.
@@ -273,9 +273,11 @@ pub async fn run_tui(
         auto_filter_on_failure_names,
         cli_log_filter,
     });
+    // Separate budgets, deliberately unequal: the output is scrollback, the
+    // diagnostics are for answering a question you have right now.
     let mut stores = LogStores {
         output: LogStore::with_capacity(DEFAULT_CAPACITY),
-        debug: LogStore::with_capacity(DEFAULT_CAPACITY),
+        debug: LogStore::with_capacity(DEBUG_CAPACITY),
     };
 
     let (input_tx, mut input_rx) = mpsc::channel::<AppEvent>(64);
@@ -704,6 +706,15 @@ fn handle_key(
             KeyCode::Char('d') if controls.mode == TuiMode::Remote => {
                 app.exit_requested = true;
             }
+            // Swap which record the pane shows: what the processes wrote, or
+            // what don said about them. Deliberately unadvertised — it answers
+            // "why did that not rebuild", which is a question you go looking
+            // for, not one the status bar should spend a slot on.
+            //
+            // Purely local: both records are always received and stored, and
+            // each keeps its own scroll position, so coming back lands where
+            // you left.
+            KeyCode::Char('v') | KeyCode::Char('V') => app.swap_log_view(),
             _ => {}
         }
         return Ok(());
@@ -786,11 +797,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         }
         // Ctrl+C is shutdown and cannot double as copy, so the keyboard route
         // to the clipboard is `y` — vi's yank, over the current selection.
-        // Swap which record the pane shows: what the processes wrote, or what
-        // don said about them. Purely local — both are always received and
-        // stored — and each keeps its own scroll position, so coming back
-        // lands where you left. Was Ctrl+V, which nothing advertised.
-        KeyCode::Char('v') | KeyCode::Char('V') => app.swap_log_view(),
         KeyCode::Char('y') => copy_selection(app),
         KeyCode::Esc => clear_selection(app),
         // The status pane sits *beside* the log rather than replacing it, so

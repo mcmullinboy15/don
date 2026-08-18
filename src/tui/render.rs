@@ -1017,12 +1017,14 @@ fn normal_bar_line(
         spans.push(dim("  [t] tasks"));
     }
     spans.push(dim("  [s] services"));
-    spans.push(separator());
-    spans.push(dim(if debug_view {
-        "[v] back to output"
-    } else {
-        "[v] don's own log"
-    }));
+    // Says which record is on screen, but never how to get to it. Reaching
+    // don's own log is for when you have gone looking for why something did
+    // not rebuild; the bar's slots belong to the things a reader needs
+    // without being told.
+    if debug_view {
+        spans.push(separator());
+        spans.push(dim("don's log"));
+    }
     Line::from(spans)
 }
 
