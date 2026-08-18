@@ -135,23 +135,22 @@ impl ReleasedTerminal {
 
 /// The mouse reporting modes don actually uses.
 ///
-/// Deliberately *not* crossterm's `EnableMouseCapture`, though it now includes
-/// the same `?1003h` — the difference is what happens to the flood. `?1003h`
-/// reports every motion event for as long as the pointer crosses the window;
-/// forwarded raw, that fills the input channel and leaves a keystroke queued
-/// behind hundreds of events nobody wanted, which reads as the UI ignoring
-/// you. The input task therefore gates motion: only the moves shift-hover
-/// actually consumes are forwarded, and the rest die before the channel —
-/// see [`input::run`].
+/// Deliberately *not* crossterm's `EnableMouseCapture`, which also turns on
+/// `?1003h` — "report every motion event". Nothing here consumes bare motion
+/// (shift-hover did once, and even gated it made the terminal emit and the
+/// input task parse a report for every cell the pointer crossed — paid on all
+/// mouse movement, whether or not the feature was ever used). Every one of
+/// those reports would be parsed and thrown away; what they cost is a flood
+/// of input for as long as the pointer merely crosses the window.
 ///
-/// `?1000h` reports press and release. `?1002h` adds motion while a button is
-/// held (drag-select, the divider drag). `?1003h` adds motion with no button,
-/// which is what shift-hover needs. `?1006h` asks for SGR coordinates so
-/// columns past 223 are reportable — crossterm also sets the older `?1015h`
-/// (RXVT) alongside it, which some terminals answer in *both* encodings.
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+/// `?1000h` reports press and release. `?1002h` adds motion *while a button is
+/// held*, which is what drag-select and the divider drag need and all they
+/// need. `?1006h` asks for SGR coordinates so columns past 223 are reportable
+/// — crossterm also sets the older `?1015h` (RXVT) alongside it, which some
+/// terminals answer in *both* encodings.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 /// The same modes, reset in reverse.
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 type TuiTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -1109,16 +1108,6 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
         MouseEventKind::Up(MouseButton::Left) => {
             app.dragging_divider = false;
             app.log_selection.finish();
-        }
-        // Only the moves shift-hover consumes get this far — the input task
-        // gates the rest. Where the pointer is, resolved to a message every
-        // frame by the renderer.
-        MouseEventKind::Moved => {
-            app.hover = if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-                Some((mouse.column, mouse.row))
-            } else {
-                None
-            };
         }
         _ => {}
     }

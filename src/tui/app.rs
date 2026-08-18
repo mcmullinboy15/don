@@ -146,10 +146,8 @@ pub(crate) struct StashedView {
 
 /// The run of visible rows that belong to the same message as row `index`.
 ///
-/// A message that wrapped is one thing to the reader, so both triple-click and
-/// shift-hover work on the run, not the row. One definition, because the two
-/// growing their own copies of "which rows are one message" is how a hover
-/// would highlight a different extent than a click selects.
+/// A message that wrapped is one thing to the reader, so triple-click selects
+/// the run, not the row it landed on.
 ///
 /// Only what is on screen: a message running off an edge is taken as far as it
 /// is visible. Returns `None` when `index` is outside the row list.
@@ -328,15 +326,6 @@ pub(crate) struct App {
     /// Set while the divider is being dragged, so motion resizes instead of
     /// selecting text.
     pub(crate) dragging_divider: bool,
-    /// Where the pointer is while shift is held, in screen coordinates.
-    ///
-    /// The renderer maps it to a message each frame and gives that message a
-    /// faint background, so a long wrapped line can be read without losing
-    /// one's place. Position rather than a resolved message id: the view moves
-    /// under a still pointer, and re-resolving per frame makes the highlight
-    /// track what is actually under the cursor instead of chasing a line that
-    /// scrolled away.
-    pub(crate) hover: Option<(u16, u16)>,
     /// A `g` was pressed and the next key decides: another `g` jumps to the
     /// top, anything else is just itself. Vim's chord, minus the timeout —
     /// a stale half-chord is cleared by whatever key comes next.
@@ -498,7 +487,6 @@ impl App {
             repaint_requested: false,
             focus: super::panes::Focus::Logs,
             dragging_divider: false,
-            hover: None,
             pending_g: false,
             services_order: Vec::new(),
             tasks_order: Vec::new(),

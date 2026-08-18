@@ -17,15 +17,9 @@ use super::events::AppEvent;
 /// closed or the receiver is dropped.
 pub(crate) async fn run(tx: mpsc::Sender<AppEvent>) {
     let mut reader = EventStream::new();
-    // Whether the last forwarded motion had shift held — i.e. whether the
-    // main loop currently shows a hover highlight that a later motion must
-    // clear. This is what keeps `?1003h` affordable: plain mouse movement
-    // is dropped here, before the channel, except for the single event that
-    // turns an active highlight off.
-    let mut hover_live = false;
     while let Some(result) = reader.next().await {
         let Ok(event) = result else { continue };
-        let Some(app_event) = translate(event, &mut hover_live) else {
+        let Some(app_event) = translate(event) else {
             continue;
         };
         if tx.send(app_event).await.is_err() {
@@ -35,31 +29,16 @@ pub(crate) async fn run(tx: mpsc::Sender<AppEvent>) {
 }
 
 /// Convert a crossterm event to an [`AppEvent`], returning `None` for events
-/// the TUI doesn't act on (key releases, unshifted mouse motion, focus,
-/// paste).
-fn translate(event: Event, hover_live: &mut bool) -> Option<AppEvent> {
+/// the TUI doesn't act on (key releases, bare mouse motion, focus, paste).
+fn translate(event: Event) -> Option<AppEvent> {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Release => None,
         Event::Key(key) => Some(AppEvent::Key(key)),
         Event::Resize(_, _) => Some(AppEvent::Resize),
-        // Motion with no button is a flood — most terminals report it for
-        // every cell the pointer crosses. Shift-hover is the one consumer:
-        // shifted moves go through, and one unshifted move goes through when
-        // a highlight is up so it can be taken down. Everything else dies
-        // here rather than waking the loop.
-        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
-            let shifted = mouse
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::SHIFT);
-            if shifted {
-                *hover_live = true;
-                Some(AppEvent::Mouse(mouse))
-            } else if std::mem::take(hover_live) {
-                Some(AppEvent::Mouse(mouse))
-            } else {
-                None
-            }
-        }
+        // Motion with no button held should not arrive at all — `?1003h` is
+        // deliberately off, see MOUSE_ON — but a terminal that sends it
+        // anyway must not wake the loop for events nothing acts on.
+        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => None,
         Event::Mouse(mouse) => Some(AppEvent::Mouse(mouse)),
         _ => None,
     }
@@ -82,7 +61,7 @@ mod tests {
 
     #[test]
     fn translate_key_press_forwards() {
-        let got = translate(press(KeyCode::Enter), &mut false);
+        let got = translate(press(KeyCode::Enter));
         assert!(matches!(got, Some(AppEvent::Key(_))));
     }
 
@@ -94,78 +73,37 @@ mod tests {
             kind: KeyEventKind::Release,
             state: KeyEventState::NONE,
         });
-        assert!(translate(release, &mut false).is_none());
+        assert!(translate(release).is_none());
     }
 
     #[test]
     fn translate_resize_becomes_resize_variant() {
         assert!(matches!(
-            translate(Event::Resize(80, 24), &mut false),
+            translate(Event::Resize(80, 24)),
             Some(AppEvent::Resize)
         ));
     }
 
-    /// `?1003h` reports every cell the pointer crosses. The gate is what makes
-    /// that affordable: only the moves hover consumes reach the channel — the
-    /// shifted ones, plus the single unshifted one that clears a live
-    /// highlight.
+    /// Bare motion never wakes the loop; a drag always does — dragging is how
+    /// selection works.
     #[test]
-    fn bare_motion_is_gated_to_what_hover_consumes() {
+    fn bare_motion_dropped_drags_forwarded() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
-        fn moved(shift: bool) -> Event {
-            Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Moved,
-                column: 10,
-                row: 5,
-                modifiers: if shift {
-                    KeyModifiers::SHIFT
-                } else {
-                    KeyModifiers::NONE
-                },
-            })
-        }
+        let moved = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(translate(moved).is_none());
 
-        struct Case {
-            name: &'static str,
-            events: &'static [bool],
-            /// Whether each event is forwarded.
-            want: &'static [bool],
-        }
-
-        let cases = [
-            Case {
-                name: "plain motion never wakes the loop",
-                events: &[false, false, false],
-                want: &[false, false, false],
-            },
-            Case {
-                name: "shifted motion is hover, and always goes through",
-                events: &[true, true, true],
-                want: &[true, true, true],
-            },
-            Case {
-                name: "one unshifted move clears a live highlight, the rest die",
-                events: &[true, false, false, false],
-                want: &[true, true, false, false],
-            },
-        ];
-
-        for case in cases {
-            let mut hover_live = false;
-            for (shift, want) in case.events.iter().zip(case.want) {
-                let got = translate(moved(*shift), &mut hover_live).is_some();
-                assert_eq!(got, *want, "{}: shift={}", case.name, shift);
-            }
-        }
-
-        // A drag is not gated: dragging is how selection works.
         let drag = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
             column: 1,
             row: 1,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(translate(drag, &mut false).is_some());
+        assert!(translate(drag).is_some());
     }
 }

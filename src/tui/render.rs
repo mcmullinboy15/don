@@ -222,7 +222,7 @@ fn draw_log_pane(
     app.log_pane_origin = (area.x, area.y);
 
     let selection = app.log_selection;
-    let mut rows: Vec<Line<'_>> = if selection.is_empty() {
+    let rows: Vec<Line<'_>> = if selection.is_empty() {
         view.rows
     } else {
         view.rows
@@ -234,21 +234,6 @@ fn draw_log_pane(
             })
             .collect()
     };
-    // Shift-hover: a faint band under the message the pointer is on, all of
-    // its wrapped rows, so a long line can be read without losing the place.
-    // Resolved against this frame's rows — the position is remembered, not
-    // the message, so scrolling under a still pointer highlights whatever is
-    // there now.
-    if let Some((column, row)) = app.hover
-        && column >= area.x
-        && column < area.x + area.width
-        && let Some(index) = row.checked_sub(area.y).map(usize::from)
-        && let Some((first, last)) = super::app::message_run(&view.row_ids, index)
-    {
-        for line in rows.get_mut(first..=last).unwrap_or_default() {
-            hover_wash(line, area.width);
-        }
-    }
     frame.render_widget(Paragraph::new(rows), area);
 
     // Only when something is actually below the view. A selection pins the
@@ -257,29 +242,6 @@ fn draw_log_pane(
     // output puts real rows below, it appears with a true number.
     if !following && rows_below > 0 {
         draw_scroll_badge(frame, area, rows_below);
-    }
-}
-
-/// Give one row the hover wash: a faint background across the pane's full
-/// width, under whatever styling the text already has.
-///
-/// The spans only cover the cells the text occupies, so the row is padded out
-/// with washed spaces — without that the band would end mid-row at the last
-/// character and read as a smear rather than a bar. Indexed 236 rather than
-/// the palette's `DarkGray`: this is a wash behind text of arbitrary colours,
-/// and the palette grey is bright enough on most themes to fight dim text for
-/// contrast.
-fn hover_wash(line: &mut Line<'_>, width: u16) {
-    const WASH: Color = Color::Indexed(236);
-    let mut used = 0usize;
-    for span in &mut line.spans {
-        used += span.content.chars().count();
-        span.style = span.style.bg(WASH);
-    }
-    let pad = usize::from(width).saturating_sub(used);
-    if pad > 0 {
-        line.spans
-            .push(Span::styled(" ".repeat(pad), Style::default().bg(WASH)));
     }
 }
 
