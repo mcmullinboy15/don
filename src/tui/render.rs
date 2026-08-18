@@ -160,6 +160,7 @@ fn draw_log_pane(
                 .collect::<String>()
         })
         .collect();
+    app.log_visible_ids = view.row_ids.clone();
     app.log_pane_origin = (area.x, area.y);
 
     let selection = app.log_selection;

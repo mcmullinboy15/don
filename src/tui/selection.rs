@@ -158,18 +158,6 @@ pub(crate) fn word_at(row: &str, column: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// The half-open column range of everything on the row, ignoring the padding a
-/// pane row carries. `None` for a blank row.
-pub(crate) fn line_extent(row: &str) -> Option<(usize, usize)> {
-    let chars: Vec<char> = row.chars().collect();
-    let start = chars.iter().position(|c| !c.is_whitespace())?;
-    let end = chars
-        .iter()
-        .rposition(|c| !c.is_whitespace())
-        .map_or(start, |idx| idx + 1);
-    Some((start, end))
-}
-
 /// Pull the selected text out of the rows the renderer laid out.
 ///
 /// `rows` are the pane's rows in order, `origin` is the pane's top-left corner,
@@ -181,12 +169,13 @@ pub(crate) fn line_extent(row: &str) -> Option<(usize, usize)> {
 pub(crate) fn selected_text(
     selection: &Selection,
     rows: &[String],
+    row_ids: &[crate::output::LogId],
     origin: (u16, u16),
 ) -> Option<String> {
     let (start, end) = selection.span()?;
     let left_edge = selection.left_edge();
 
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(Option<crate::output::LogId>, String)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let screen_row = origin
             .1
@@ -210,22 +199,42 @@ pub(crate) fn selected_text(
         };
         // Same bound the highlight draws, so the text matches what was shown.
         from = from.max(to_col(left_edge)).min(chars.len());
+        let id = row_ids.get(index).copied();
         if from >= until {
-            out.push(String::new());
+            out.push((id, String::new()));
             continue;
         }
-        out.push(chars[from..until].iter().collect::<String>());
+        out.push((id, chars[from..until].iter().collect::<String>()));
+    }
+
+    // Rows of one message are one line. The wrap is this pane's layout, not
+    // something the process wrote, so joining them back gives what it actually
+    // emitted — and joins before any trimming, because the character the wrap
+    // fell on is often the space between two words.
+    let mut lines: Vec<String> = Vec::new();
+    let mut previous: Option<crate::output::LogId> = None;
+    for (id, text) in out {
+        match (previous, id) {
+            (Some(before), Some(now)) if before == now => {
+                if let Some(line) = lines.last_mut() {
+                    line.push_str(&text);
+                }
+            }
+            _ => lines.push(text),
+        }
+        previous = id;
     }
 
     // Trailing blanks are the padding a pane row carries, not content.
-    while out.last().is_some_and(|line| line.trim().is_empty()) {
-        out.pop();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
     }
-    if out.is_empty() {
+    if lines.is_empty() {
         return None;
     }
     Some(
-        out.iter()
+        lines
+            .iter()
             .map(|line| line.trim_end())
             .collect::<Vec<_>>()
             .join("\n"),
@@ -327,6 +336,11 @@ mod tests {
         }
     }
 
+    /// One id per row, so no two rows are treated as one wrapped message.
+    fn distinct_ids(rows: &[String]) -> Vec<crate::output::LogId> {
+        (0..rows.len() as u64).map(crate::output::LogId).collect()
+    }
+
     fn drag(from: (u16, u16), to: (u16, u16)) -> Selection {
         drag_within(from, to, 0)
     }
@@ -397,6 +411,32 @@ mod tests {
         }
     }
 
+    /// A message that wrapped comes back as one line. The break is this pane's
+    /// layout, not something the process wrote, and the character the wrap fell
+    /// on is often the space between two words — so the rejoin happens before
+    /// any trimming, or the words run together.
+    #[test]
+    fn a_wrapped_message_is_copied_as_one_line() {
+        use crate::output::LogId;
+
+        let rows: Vec<String> = vec![
+            "api | first message".to_string(),
+            "api | a long one that ".to_string(),
+            "    | wrapped here".to_string(),
+            "api | last message".to_string(),
+        ];
+        // Rows 1 and 2 are one message; the others stand alone.
+        let ids = vec![LogId(1), LogId(2), LogId(2), LogId(3)];
+        let edge = 6u16;
+
+        let all = drag_within((0, 0), (40, 3), edge);
+        assert_eq!(
+            selected_text(&all, &rows, &ids, (0, 0)).unwrap(),
+            "first message\na long one that wrapped here\nlast message",
+            "the wrap is rejoined; the newlines between messages are kept"
+        );
+    }
+
     /// The name column is don's furniture, not log text, and nothing selects
     /// into it — however the drag was made.
     #[test]
@@ -410,7 +450,7 @@ mod tests {
 
         let across = drag_within((0, 0), (20, 2), edge);
         assert_eq!(
-            selected_text(&across, &rows, (0, 0)).unwrap(),
+            selected_text(&across, &rows, &distinct_ids(&rows), (0, 0)).unwrap(),
             "first line\nsecond line\nthird line",
             "a multi-row copy is the log, not a column of service names"
         );
@@ -418,7 +458,7 @@ mod tests {
         // Started inside the name column and dragged to column 13.
         let within = drag_within((0, 1), (13, 1), edge);
         assert_eq!(
-            selected_text(&within, &rows, (0, 0)).unwrap(),
+            selected_text(&within, &rows, &distinct_ids(&rows), (0, 0)).unwrap(),
             "seco",
             "a drag that began on the name still copies only the message"
         );
@@ -444,7 +484,7 @@ mod tests {
         ];
         let selection = drag_within((0, 0), (40, 2), 9);
         assert_eq!(
-            selected_text(&selection, &rows, (0, 0)).unwrap(),
+            selected_text(&selection, &rows, &distinct_ids(&rows), (0, 0)).unwrap(),
             "only line"
         );
     }
@@ -509,45 +549,6 @@ mod tests {
 
         for case in cases {
             let got = word_at(case.row, case.column).map(|(start, end)| {
-                case.row
-                    .chars()
-                    .skip(start)
-                    .take(end - start)
-                    .collect::<String>()
-            });
-            assert_eq!(got.as_deref(), case.want, "{}", case.name);
-        }
-    }
-
-    /// Triple-click takes the row, minus the padding a pane row carries.
-    #[test]
-    fn triple_click_selects_the_line_without_its_padding() {
-        struct Case {
-            name: &'static str,
-            row: &'static str,
-            want: Option<&'static str>,
-        }
-
-        let cases = vec![
-            Case {
-                name: "trailing pane padding is not content",
-                row: "api    | started            ",
-                want: Some("api    | started"),
-            },
-            Case {
-                name: "leading space is skipped too",
-                row: "   indented line",
-                want: Some("indented line"),
-            },
-            Case {
-                name: "a blank row has no extent",
-                row: "        ",
-                want: None,
-            },
-        ];
-
-        for case in cases {
-            let got = line_extent(case.row).map(|(start, end)| {
                 case.row
                     .chars()
                     .skip(start)

@@ -862,13 +862,12 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                     app.log_selection.begin(mouse.column, mouse.row);
                 }
                 2 => select_span(app, mouse.column, mouse.row, selection::word_at),
-                // Triple-click means "this log line". It does not need to
-                // skip don's own `name | ` chrome itself: the selection clamps
-                // to the message column's left edge, so every route into it —
-                // drag, double-click, this — starts in the same place.
-                _ => select_span(app, mouse.column, mouse.row, |row, _| {
-                    selection::line_extent(row)
-                }),
+                // Triple-click means "this message" — all of it, however many
+                // rows it wrapped across. It does not need to skip don's own
+                // `name | ` chrome itself: the selection clamps to the message
+                // column's left edge, so every route into it — drag,
+                // double-click, this — starts in the same place.
+                _ => select_message(app, mouse.row),
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -932,6 +931,51 @@ fn click_count(app: &mut App, column: u16, row: u16) -> u8 {
 /// Resolved against the rows the last frame drew, so a double click lands on
 /// the word actually under the pointer — after wrapping, filtering and scroll,
 /// none of which this has to know about.
+/// Select the whole log message the row belongs to, however many rows it
+/// wrapped across.
+///
+/// Which rows those are is the renderer's answer, not a guess from the text: a
+/// continuation row is indistinguishable from a short message once it is a
+/// string, and deciding by looking would be the same layout-scraping the
+/// prefix column was just taken off.
+fn select_message(app: &mut App, row: u16) {
+    let (origin_x, origin_y) = app.log_pane_origin;
+    let Some(index) = row.checked_sub(origin_y).map(usize::from) else {
+        return;
+    };
+    let Some(&id) = app.log_visible_ids.get(index) else {
+        return;
+    };
+    // The run of visible rows sharing this id. Only what is on screen: the
+    // selection is screen coordinates, so a message running off the top or
+    // bottom is taken as far as it is visible.
+    let first = app.log_visible_ids[..index]
+        .iter()
+        .rposition(|other| *other != id)
+        .map_or(0, |before| before + 1);
+    let last = app.log_visible_ids[index..]
+        .iter()
+        .position(|other| *other != id)
+        .map_or(app.log_visible_ids.len() - 1, |after| index + after - 1);
+
+    let end_col = app
+        .log_visible_rows
+        .get(last)
+        .map_or(0, |text| text.trim_end().chars().count());
+    if end_col == 0 {
+        clear_selection(app);
+        return;
+    }
+    // Same reason a drag freezes the view: the selection is screen
+    // coordinates, so the rows under it have to stop moving.
+    pause_following_for_selection(app);
+    let to_screen = |col: usize| origin_x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
+    let to_row = |index: usize| origin_y.saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+    app.log_selection.begin(origin_x, to_row(first));
+    app.log_selection.extend(to_screen(end_col), to_row(last));
+    app.log_selection.finish();
+}
+
 fn select_span(
     app: &mut App,
     column: u16,
@@ -996,6 +1040,7 @@ fn copy_selection(app: &mut App) {
     let Some(text) = selection::selected_text(
         &app.log_selection,
         &app.log_visible_rows,
+        &app.log_visible_ids,
         app.log_pane_origin,
     ) else {
         return;
@@ -1856,6 +1901,81 @@ mod tests {
                 "{}: filter opened",
                 case.name
             );
+        }
+    }
+
+    /// A triple-click takes the message, not the row it landed on. A message
+    /// that wrapped is still one thing to the reader, and which rows it
+    /// occupies is the renderer's answer — recovering it from the text would be
+    /// guessing at a layout the layout already knows.
+    #[test]
+    fn triple_click_takes_the_whole_wrapped_message() {
+        use crate::output::LogId;
+
+        struct Case {
+            name: &'static str,
+            /// Which log line each visible row came from.
+            row_ids: &'static [u64],
+            rows: &'static [&'static str],
+            /// Row the click landed on, as an index into `rows`.
+            click: usize,
+            /// Expected selected rows, first..=last.
+            want: (u16, u16),
+        }
+
+        let cases = [
+            Case {
+                name: "a message on one row selects that row",
+                row_ids: &[1, 2, 3],
+                rows: &["api | one", "api | two", "api | three"],
+                click: 1,
+                want: (1, 1),
+            },
+            Case {
+                name: "clicking the first row of a wrapped message takes all of it",
+                row_ids: &[1, 2, 2, 2, 3],
+                rows: &[
+                    "api | one",
+                    "api | long",
+                    "    | er",
+                    "    | still",
+                    "api | three",
+                ],
+                click: 1,
+                want: (1, 3),
+            },
+            Case {
+                name: "clicking a continuation row takes the message too",
+                row_ids: &[1, 2, 2, 2, 3],
+                rows: &[
+                    "api | one",
+                    "api | long",
+                    "    | er",
+                    "    | still",
+                    "api | three",
+                ],
+                click: 3,
+                want: (1, 3),
+            },
+            Case {
+                name: "a message running to the bottom edge stops there",
+                row_ids: &[1, 2, 2],
+                rows: &["api | one", "api | long", "    | er"],
+                click: 2,
+                want: (1, 2),
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            app.log_pane_origin = (0, 0);
+            app.log_visible_ids = case.row_ids.iter().map(|id| LogId(*id)).collect();
+            app.log_visible_rows = case.rows.iter().map(|r| (*r).to_string()).collect();
+
+            select_message(&mut app, u16::try_from(case.click).unwrap());
+
+            let (start, end) = app.log_selection.span().expect("a selection");
+            assert_eq!((start.1, end.1), case.want, "{}: rows covered", case.name);
         }
     }
 

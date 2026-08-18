@@ -58,6 +58,14 @@ pub(crate) struct LogView<'a> {
     /// Wrapped rows, top of pane first, exactly `height` of them or fewer if
     /// the whole log is shorter than the pane.
     pub(crate) rows: Vec<Line<'a>>,
+    /// The log line each row came from, one per entry in `rows`.
+    ///
+    /// A message can wrap across several rows, and the reader thinks of it as
+    /// one thing — triple-click selects the message, not the row it landed on.
+    /// Reported by the code that did the wrapping rather than recovered later
+    /// by looking at the text, which is a guess about layout the layout already
+    /// knows the answer to.
+    pub(crate) row_ids: Vec<LogId>,
     /// Whether the view is pinned to the newest line.
     pub(crate) following: bool,
     /// Rows of admitted content above the top edge — the scrollbar's position.
@@ -213,6 +221,7 @@ pub(crate) fn build_view<'a>(
     // Only the visible window is wrapped, and only from the line that owns the
     // top row — no walk of everything above it.
     let mut rows: Vec<Line<'a>> = Vec::with_capacity(height);
+    let mut row_ids: Vec<LogId> = Vec::with_capacity(height);
     if let Some((first_id, skip_within)) = index.line_at(rows_above) {
         let mut skip = usize::from(skip_within);
         for entry in index.ids_from(first_id).filter_map(|id| store.get(id)) {
@@ -224,9 +233,11 @@ pub(crate) fn build_view<'a>(
             }
             for wrapped in line_rows.into_iter().skip(skip) {
                 rows.push(wrapped);
+                row_ids.push(entry.id);
                 if rows.len() == height {
                     return LogView {
                         rows,
+                        row_ids,
                         following: matches!(scroll, Scroll::Follow),
                         rows_above,
                         total_rows,
@@ -239,6 +250,7 @@ pub(crate) fn build_view<'a>(
 
     LogView {
         rows,
+        row_ids,
         following: matches!(scroll, Scroll::Follow),
         rows_above,
         total_rows,

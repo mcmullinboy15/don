@@ -336,6 +336,10 @@ pub(crate) struct App {
     /// started. Written by the renderer so a copy resolves against exactly what
     /// was on screen rather than re-deriving wrapping, filtering and scroll.
     pub(crate) log_visible_rows: Vec<String>,
+    /// The log line each visible row belongs to, parallel to
+    /// `log_visible_rows`. Lets a triple-click take the whole message when it
+    /// wrapped across several rows.
+    pub(crate) log_visible_ids: Vec<crate::output::LogId>,
     pub(crate) log_pane_origin: (u16, u16),
     /// Geometry the last frame produced, so the input layer can move the
     /// scroll anchor without re-deriving what only the renderer knows: how
@@ -462,6 +466,7 @@ impl App {
             last_click: None,
             follow_paused_for_selection: false,
             log_visible_rows: Vec::new(),
+            log_visible_ids: Vec::new(),
             log_pane_origin: (0, 0),
             pending_scroll: PendingScroll::default(),
             blank_after: HashMap::new(),
