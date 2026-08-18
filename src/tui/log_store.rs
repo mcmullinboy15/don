@@ -53,6 +53,10 @@ pub(crate) struct LogStore {
     /// The oldest id the view still needs, set while the reader is scrolled
     /// back. See [`Self::set_pin`].
     pin: Option<LogId>,
+    /// Columns the name column takes. Every prefix the sink renders is padded
+    /// to the same width, so one number describes the whole pane; lines with no
+    /// prefix at all (the TUI's own notices) do not move it.
+    name_column: usize,
 }
 
 /// One stored line: what don sent, parsed once, measured once.
@@ -92,6 +96,7 @@ impl LogStore {
             next_id: LogId::ZERO,
             wrapped_at: None,
             pin: None,
+            name_column: 0,
         }
     }
 
@@ -126,6 +131,9 @@ impl LogStore {
             .iter()
             .map(|span| span.content.chars().count())
             .sum();
+        if prefix_cols > 0 {
+            self.name_column = prefix_cols;
+        }
         let mut joined = Vec::with_capacity(line.prefix.len() + line.bytes.len());
         joined.extend_from_slice(&line.prefix);
         joined.extend_from_slice(&line.bytes);
@@ -178,6 +186,12 @@ impl LogStore {
             entry.wrapped_rows =
                 super::logs::count_wrapped_rows(&entry.parsed, entry.prefix_cols, width);
         }
+    }
+
+    /// Columns the name column occupies, for a caller laying out over the same
+    /// grid — the selection, which must not reach into it.
+    pub(crate) fn name_column(&self) -> usize {
+        self.name_column
     }
 
     /// Iterate oldest-first over everything held.

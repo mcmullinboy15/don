@@ -38,6 +38,13 @@ use crate::task_state::TaskRunInfo;
 pub(crate) const BAR_HEIGHT: u16 = 3;
 
 /// Width available to log text, which is what the store wraps against.
+/// The log pane's top-left corner, for a caller working in screen coordinates
+/// — the selection, which needs to know where column zero of the log is.
+pub(crate) fn log_pane_origin(area: Rect, status: super::panes::StatusPane) -> (u16, u16) {
+    let logs = super::panes::layout(area, BAR_HEIGHT, status).logs;
+    (logs.x, logs.y)
+}
+
 pub(crate) fn log_pane_width(area: Rect, status: super::panes::StatusPane) -> u16 {
     super::panes::layout(area, BAR_HEIGHT, status)
         .logs

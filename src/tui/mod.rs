@@ -494,6 +494,13 @@ fn draw(terminal: &mut TuiTerminal, app: &mut App, store: &mut LogStore) -> Resu
     // Hold history where the reader is looking, so a busy stack cannot evict
     // their place out from under them between frames.
     store.set_pin(app.log_scroll.anchor());
+    // Selection may not reach into the name column. Refreshed here because both
+    // the column's width and the pane's origin can move under it.
+    app.log_selection.set_left_edge(
+        render::log_pane_origin(area, app.status_pane)
+            .0
+            .saturating_add(u16::try_from(store.name_column()).unwrap_or(0)),
+    );
     terminal.draw(|frame| render::draw(frame, app, store))?;
     Ok(())
 }
@@ -778,16 +785,13 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                     app.log_selection.begin(mouse.column, mouse.row);
                 }
                 2 => select_span(app, mouse.column, mouse.row, selection::word_at),
-                // Triple-click means "this log line", so it starts past don's
-                // own `name | ` chrome — the same thing a multi-row copy does,
-                // and the two disagreeing would be arbitrary.
-                _ => {
-                    let prefix = usize::from(log_prefix_width(app));
-                    select_span(app, mouse.column, mouse.row, move |row, _| {
-                        selection::line_extent(row)
-                            .map(|(start, end)| (start.max(prefix).min(end), end))
-                    })
-                }
+                // Triple-click means "this log line". It does not need to
+                // skip don's own `name | ` chrome itself: the selection clamps
+                // to the message column's left edge, so every route into it —
+                // drag, double-click, this — starts in the same place.
+                _ => select_span(app, mouse.column, mouse.row, |row, _| {
+                    selection::line_extent(row)
+                }),
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -908,27 +912,12 @@ fn resume_following(app: &mut App) {
     app.log_scroll = logs::Scroll::Follow;
 }
 
-/// The width of don's `name    | ` prefix, which a multi-row copy leaves out.
-///
-/// Read from the rendered rows rather than recomputed: the prefix is built
-/// upstream from the longest process name, and re-deriving it here would be a
-/// second opinion about a number that is already on screen.
-fn log_prefix_width(app: &App) -> u16 {
-    app.log_visible_rows
-        .iter()
-        .find_map(|row| row.find("| ").map(|idx| idx + 2))
-        .and_then(|width| u16::try_from(width).ok())
-        .unwrap_or(0)
-}
-
 /// Put the current selection on the clipboard, and say so.
 fn copy_selection(app: &mut App) {
-    let prefix = log_prefix_width(app);
     let Some(text) = selection::selected_text(
         &app.log_selection,
         &app.log_visible_rows,
         app.log_pane_origin,
-        prefix,
     ) else {
         return;
     };

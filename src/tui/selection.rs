@@ -37,11 +37,32 @@ pub(crate) struct Selection {
     /// True once the button is released: the selection stands until the next
     /// drag starts or the view moves under it.
     settled: bool,
+    /// First selectable screen column: the message column's left edge.
+    ///
+    /// The process name is don's own furniture, not log text — dragging across
+    /// it and pasting `api    | ` in front of every line is never what anyone
+    /// wanted. Carried on the selection rather than applied by each reader so
+    /// the highlight and the copied text cannot disagree about where the log
+    /// starts; they did, and a selection that copies something other than what
+    /// it shows is worse than one that includes the name.
+    left_edge: u16,
 }
 
 impl Selection {
+    /// Set the first column a selection may cover — the message column's left
+    /// edge, in screen coordinates. Applies to selections started afterwards.
+    pub(crate) fn set_left_edge(&mut self, left_edge: u16) {
+        self.left_edge = left_edge;
+    }
+
+    /// The first column a selection may cover.
+    pub(crate) fn left_edge(&self) -> u16 {
+        self.left_edge
+    }
+
     /// Start a drag at a screen position.
     pub(crate) fn begin(&mut self, column: u16, row: u16) {
+        let column = column.max(self.left_edge);
         self.anchor = Some((column, row));
         self.cursor = Some((column, row));
         self.settled = false;
@@ -50,7 +71,7 @@ impl Selection {
     /// Move the loose end.
     pub(crate) fn extend(&mut self, column: u16, row: u16) {
         if self.anchor.is_some() {
-            self.cursor = Some((column, row));
+            self.cursor = Some((column.max(self.left_edge), row));
         }
     }
 
@@ -64,7 +85,11 @@ impl Selection {
     /// Forget the selection — the view moved and the coordinates no longer
     /// mean what they meant.
     pub(crate) fn clear(&mut self) {
-        *self = Self::default();
+        // The edge belongs to the layout, not to this drag.
+        *self = Self {
+            left_edge: self.left_edge,
+            ..Self::default()
+        };
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -102,7 +127,9 @@ impl Selection {
         if row == end.1 && column >= end.0 {
             return false;
         }
-        true
+        // Rows in the middle of a multi-row drag start at column zero, so the
+        // edge has to be enforced per cell rather than only at the ends.
+        column >= self.left_edge
     }
 }
 
@@ -155,10 +182,9 @@ pub(crate) fn selected_text(
     selection: &Selection,
     rows: &[String],
     origin: (u16, u16),
-    prefix_width: u16,
 ) -> Option<String> {
     let (start, end) = selection.span()?;
-    let single_row = start.1 == end.1;
+    let left_edge = selection.left_edge();
 
     let mut out: Vec<String> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
@@ -182,9 +208,8 @@ pub(crate) fn selected_text(
         } else {
             chars.len()
         };
-        if !single_row {
-            from = from.max(usize::from(prefix_width)).min(chars.len());
-        }
+        // Same bound the highlight draws, so the text matches what was shown.
+        from = from.max(to_col(left_edge)).min(chars.len());
         if from >= until {
             out.push(String::new());
             continue;
@@ -303,7 +328,13 @@ mod tests {
     }
 
     fn drag(from: (u16, u16), to: (u16, u16)) -> Selection {
+        drag_within(from, to, 0)
+    }
+
+    /// A drag in a pane whose message column starts at `left_edge`.
+    fn drag_within(from: (u16, u16), to: (u16, u16), left_edge: u16) -> Selection {
         let mut selection = Selection::default();
+        selection.set_left_edge(left_edge);
         selection.begin(from.0, from.1);
         selection.extend(to.0, to.1);
         selection.finish();
@@ -366,32 +397,41 @@ mod tests {
         }
     }
 
-    /// The prefix is don's, not the process's. Copying several lines should
-    /// paste the log; copying part of one line should paste exactly what was
-    /// pointed at, prefix included if that is what they dragged over.
+    /// The name column is don's furniture, not log text, and nothing selects
+    /// into it — however the drag was made.
     #[test]
-    fn copying_across_rows_drops_the_prefix_don_added() {
+    fn selection_never_reaches_into_the_name_column() {
         let rows = vec![
             "api    | first line".to_string(),
             "api    | second line".to_string(),
             "worker | third line".to_string(),
         ];
-        let prefix = 9u16;
+        let edge = 9u16;
 
-        let across = drag((0, 0), (20, 2));
+        let across = drag_within((0, 0), (20, 2), edge);
         assert_eq!(
-            selected_text(&across, &rows, (0, 0), prefix).unwrap(),
+            selected_text(&across, &rows, (0, 0)).unwrap(),
             "first line\nsecond line\nthird line",
             "a multi-row copy is the log, not a column of service names"
         );
 
-        // Columns 0..13, half-open at the far end: thirteen cells.
-        let within = drag((0, 1), (13, 1));
+        // Started inside the name column and dragged to column 13.
+        let within = drag_within((0, 1), (13, 1), edge);
         assert_eq!(
-            selected_text(&within, &rows, (0, 0), prefix).unwrap(),
-            "api    | seco",
-            "a single-row copy is exactly the characters dragged over"
+            selected_text(&within, &rows, (0, 0)).unwrap(),
+            "seco",
+            "a drag that began on the name still copies only the message"
         );
+
+        // And the highlight agrees cell for cell — the text and what was shown
+        // are drawn from the same bound.
+        for column in 0..edge {
+            assert!(
+                !within.contains(column, 1),
+                "column {column} is inside the name column and must not highlight"
+            );
+        }
+        assert!(within.contains(edge, 1), "the message column highlights");
     }
 
     /// A pane is padded with blank rows; those are layout, not content.
@@ -402,9 +442,9 @@ mod tests {
             String::new(),
             String::new(),
         ];
-        let selection = drag((0, 0), (40, 2));
+        let selection = drag_within((0, 0), (40, 2), 9);
         assert_eq!(
-            selected_text(&selection, &rows, (0, 0), 9).unwrap(),
+            selected_text(&selection, &rows, (0, 0)).unwrap(),
             "only line"
         );
     }
