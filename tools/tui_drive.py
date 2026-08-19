@@ -91,6 +91,7 @@ def main():
     tlog(start, "alternate screen entered: %s" % entered_alt)
 
     session.pump(linger)
+    session.settle()
     bytes_at_steady = len(session.raw)
     tlog(start, "captured %d bytes by steady state" % bytes_at_steady)
 

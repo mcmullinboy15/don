@@ -690,4 +690,163 @@ mod tests {
             }
         }
     }
+
+    /// The pane must draw exactly the rows the index counted, through every
+    /// combination of the things that change underneath it: lines arriving,
+    /// eviction, blank marks the reader adds, the filter moving, and the width
+    /// moving. Drift between the two is not a cosmetic bug — the view
+    /// positions itself with one set of row counts and paints with another, so
+    /// it lands somewhere other than where it says, which is what "the logs
+    /// jumped" and "the logs vanished" both look like from outside.
+    #[test]
+    fn what_is_drawn_matches_what_the_index_counted() {
+        use std::collections::HashMap;
+        use std::hash::{Hash, Hasher};
+
+        // A deterministic sequence, so a failure is reproducible.
+        let mut seed = 0x5eed_1234_u64;
+        let mut roll = move |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+
+        let mut store = LogStore::with_capacity(32);
+        let mut index = super::super::view_index::ViewIndex::default();
+        let mut blanks: HashMap<LogId, u16> = HashMap::new();
+        let mut width = 40u16;
+        let height = 12u16;
+        let mut hide_web = false;
+        let mut next_id = 0u64;
+        let mut last_name = "api";
+        let mut scroll = Scroll::Follow;
+
+        for step in 0..300 {
+            match roll(10) {
+                0 => width = [20u16, 33, 40, 61, 80][roll(5)],
+                1 => hide_web = !hide_web,
+                _ => {}
+            }
+            // A burst of output, sometimes long enough to wrap several times.
+            for _ in 0..roll(4) {
+                let body = "x".repeat(1 + roll(90));
+                // A progress frame repaints the newest line in place, keeping
+                // its id — so nothing appends and nothing evicts, but the
+                // line's height moves and every row after it depends on that.
+                // It keeps the name too: the tap only supersedes a frame from
+                // the same process, so a repaint can never move a line across
+                // the filter.
+                let repaint = next_id > 0 && roll(4) == 0;
+                let name = if repaint {
+                    last_name
+                } else if roll(2) == 0 {
+                    "api"
+                } else {
+                    "web"
+                };
+                last_name = name;
+                let id = if repaint { next_id - 1 } else { next_id };
+                store.push(
+                    LogId(id),
+                    crate::output::FormattedLogLine {
+                        name: name.to_string(),
+                        is_lifecycle: false,
+                        is_verbose: false,
+                        prefix: format!("{name:<5}│ ").into_bytes(),
+                        bytes: body.into_bytes(),
+                    },
+                );
+                if !repaint {
+                    next_id += 1;
+                }
+            }
+            store.reflow(width);
+            store.set_pin(scroll.anchor());
+
+            let admits = |entry: &super::super::log_store::StoredLogLine| {
+                !(hide_web && entry.line.name == "web")
+            };
+            // The key the app builds, blank marks and all.
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hide_web.hash(&mut hasher);
+            let mut marks = 0u64;
+            for mark in &blanks {
+                let mut one = std::collections::hash_map::DefaultHasher::new();
+                mark.hash(&mut one);
+                marks = marks.wrapping_add(Hasher::finish(&one));
+            }
+            marks.hash(&mut hasher);
+            let key = super::super::view_index::ViewKey {
+                width,
+                filter: hasher.finish(),
+            };
+            index.sync(&store, key, &blanks, admits);
+
+            // What a walk of the store says, which is the definition the
+            // mended index is only ever an optimisation of.
+            let naive: usize = store
+                .iter()
+                .filter(|entry| admits(entry))
+                .map(|entry| {
+                    entry.wrapped_rows().max(1)
+                        + usize::from(blanks.get(&entry.id).copied().unwrap_or(0))
+                })
+                .sum();
+            assert_eq!(
+                index.total_rows(),
+                naive,
+                "step {step}: index total vs walking the store"
+            );
+
+            let view = build_view(&store, &index, &blanks, scroll, width, height);
+            assert_eq!(
+                view.total_rows, naive,
+                "step {step}: the view reports the index's total"
+            );
+            assert_eq!(
+                view.rows.len(),
+                view.row_ids.len(),
+                "step {step}: a row id per row"
+            );
+            // Every row the index says is on screen must actually be painted.
+            // Falling short here is the pane going blank or short; overshooting
+            // is impossible (the builder stops at `height`).
+            let expected = view
+                .total_rows
+                .saturating_sub(view.rows_above)
+                .min(height as usize);
+            assert_eq!(
+                view.rows.len(),
+                expected,
+                "step {step}: rows drawn vs rows the index placed \
+                 (width {width}, above {}, total {})",
+                view.rows_above,
+                view.total_rows
+            );
+
+            // The reader does things too: scrolls, and marks blank rows at the
+            // bottom of what is on screen — which is what Enter does.
+            match roll(6) {
+                0 => scroll = Scroll::Follow,
+                1 => scroll = anchor_at(&index, roll(view.total_rows.max(1))),
+                2 => {
+                    if let Some(&id) = view.row_ids.last() {
+                        let count = blanks.entry(id).or_insert(0);
+                        *count = count.saturating_add(1);
+                    }
+                }
+                3 => {
+                    // A wheel notch or an arrow, resolved the way the pane
+                    // resolves it — against the geometry that exists now.
+                    let pending = super::super::app::PendingScroll {
+                        rows: (roll(21) as isize) - 10,
+                        ..Default::default()
+                    };
+                    scroll = resolve_scroll(&index, scroll, pending, height);
+                }
+                _ => {}
+            }
+        }
+    }
 }

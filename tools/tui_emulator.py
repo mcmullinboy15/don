@@ -14,7 +14,16 @@ So the drivers render the stream and assert on the screen.
 
 `pyte` does this properly and is used when installed. The fallback covers the
 subset ratatui emits — CUP, ED, EL, SGR, alternate screen — which is enough
-for text assertions.
+for text assertions. Two things it has to get right that are easy to miss: a
+read is a chunk of a byte stream, so an escape sequence or a multi-byte
+character can straddle two of them, and a fragment printed instead of held
+shows up as corruption in the thing under test rather than in here.
+
+The other half of "what does the user see" is *when* you look. A frame is one
+burst of writes; sampling in the middle of one shows half the new screen over
+half the old, which reads as duplicated and truncated rows. `Session.settle`
+waits for the gap between frames, and any assertion on the screen should go
+after it.
 """
 
 import fcntl
@@ -43,18 +52,32 @@ class FallbackScreen:
         self.grid = [[" "] * cols for _ in range(rows)]
         self.cy = self.cx = 0
         self.alt = False
+        # An escape sequence the last read stopped in the middle of. A read is
+        # a chunk of a byte stream, not a message: a cursor move can and does
+        # straddle two of them. Printing the fragment instead of holding it is
+        # how "[7;1H" ends up as text in the middle of a log line, which reads
+        # as a rendering bug in the thing under test.
+        self.pending = b""
 
     def resize(self, cols, rows):
         self.cols, self.rows = cols, rows
         self.grid = [[" "] * cols for _ in range(rows)]
         self.cy = self.cx = 0
+        self.pending = b""
 
     def feed(self, data):
+        data = self.pending + data
+        self.pending = b""
         i = 0
         while i < len(data):
             b = data[i : i + 1]
             if b == b"\x1b":
-                i = self._escape(data, i)
+                nxt = self._escape(data, i)
+                if nxt is None:
+                    # Incomplete: keep it for the next read.
+                    self.pending = data[i:]
+                    return
+                i = nxt
                 continue
             if b == b"\n":
                 self.cy = min(self.cy + 1, self.rows - 1)
@@ -64,9 +87,16 @@ class FallbackScreen:
                 self.cx = 0
                 i += 1
                 continue
-            n = 1
-            while i + n < len(data) and (data[i + n] & 0xC0) == 0x80:
-                n += 1
+            # Width from the lead byte, not from how many continuation bytes
+            # happen to have arrived: the box-drawing characters in don's
+            # prefixes are three bytes each, and one split across a read
+            # boundary used to decode as garbage and then leave the cursor a
+            # column out for the rest of the line.
+            lead = data[i]
+            n = 4 if lead >= 0xF0 else 3 if lead >= 0xE0 else 2 if lead >= 0xC0 else 1
+            if i + n > len(data):
+                self.pending = data[i:]
+                return
             try:
                 ch = data[i : i + n].decode("utf-8")
             except UnicodeDecodeError:
@@ -80,8 +110,21 @@ class FallbackScreen:
             i += n
 
     def _escape(self, data, i):
-        m = re.match(rb"\x1b\[([0-9;?]*)([A-Za-z])", data[i : i + 32])
+        """Consume one escape sequence. `None` means "need more bytes"."""
+        rest = data[i:]
+        # OSC — don uses it for the clipboard. Ends at BEL or ST, and carries
+        # arbitrary base64 in between, so it must never be printed.
+        if rest[:2] == b"\x1b]":
+            end = rest.find(b"\x07")
+            st = rest.find(b"\x1b\\")
+            if end == -1 or (st != -1 and st < end):
+                return None if st == -1 else i + st + 2
+            return i + end + 1
+        m = re.match(rb"\x1b\[([0-9;?]*)([A-Za-z])", rest[:64])
         if not m:
+            # A CSI still being introduced, or a lone ESC at the very end.
+            if re.fullmatch(rb"\x1b(\[[0-9;?]*)?", rest[:64]):
+                return None
             return i + 1
         params, final = m.group(1), m.group(2)
         nums = [int(p) for p in params.split(b";") if p.isdigit()]
@@ -172,6 +215,35 @@ class Session:
                 self.raw.extend(chunk)
                 self.screen.feed(chunk)
         return alive
+
+    def settle(self, quiet=0.05, timeout=2.0):
+        """Pump until the TUI stops writing, so the screen is a whole frame.
+
+        A frame is one burst of cursor moves and cells. Reading the screen
+        while one is in flight shows half of it over half of the last, which
+        looks exactly like the rendering bugs these drivers exist to catch —
+        rows duplicated, rows cut short. Waiting for a gap in the output is
+        the difference between sampling a frame and sampling a seam.
+
+        The gap has to be shorter than the interval between frames: the TUI
+        redraws about ten times a second even when nothing arrives, to move
+        the spinner and the relative timestamps, so it is never quiet for
+        long. Returns False if it never paused at all.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r, _, _ = select.select([self.fd], [], [], quiet)
+            if self.fd not in r:
+                return True
+            try:
+                chunk = os.read(self.fd, 65536)
+            except OSError:
+                return True
+            if not chunk:
+                return True
+            self.raw.extend(chunk)
+            self.screen.feed(chunk)
+        return False
 
     def wait_for_screen(self, needle, timeout):
         """Pump until `needle` appears *on screen*, or time runs out.

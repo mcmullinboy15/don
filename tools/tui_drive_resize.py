@@ -97,6 +97,10 @@ def main():
     # the live tail, so any drift is visible rather than masked by new output.
     session.send(b"\x1b[5~\x1b[5~")
     session.pump(0.6)
+    # Read a whole frame, not a seam: a repaint in flight shows half of the new
+    # screen over half of the old, and the top line is exactly what this driver
+    # is asserting on.
+    session.settle()
     before = anchor_line(session)
     tlog(start, "scrolled up; top line: %r" % before[:70])
     if not before:
@@ -106,9 +110,14 @@ def main():
 
     failures = []
     for cols, rows in sequence[1:]:
+        # Quiet first, so the measurement starts from a whole frame and counts
+        # the repaint rather than whatever idle frames happened to be in
+        # flight.
+        session.settle()
         mark = len(session.raw)
         session.set_size(cols, rows)
-        session.pump(1.0)
+        session.pump(0.3)
+        session.settle()
         cost = len(session.raw) - mark
         after = anchor_line(session)
         screenful = cols * rows * 4  # a generous per-cell allowance with styling

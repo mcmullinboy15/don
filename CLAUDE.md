@@ -158,6 +158,13 @@ There are four tools in `tools/`:
   the view on every resize. Also budgets the bytes each resize costs, which
   catches a repaint turning into a history replay. Override the sequence with
   `DON_RESIZE_SIZES` (e.g. `"50x140,50x100"`).
+- **`tools/tui_drive_logs.py`** — drives the log pane through everything that
+  moves underneath it (output arriving, Enter's blank marks, the Ctrl+V record
+  swap, scrolling out of follow, resizing) and checks after each step that the
+  numbered lines on screen still ascend from top to bottom with no repeats.
+  That one invariant catches the whole family of index-vs-pane drift bugs:
+  duplicated rows, skipped rows, a pane that positions itself by one set of row
+  counts and paints another. Writes its own `don.toml` if the project has none.
 - **`tools/gen_stress_config.py`** — generates a synthetic `don.toml` plus
   per-service scripts mirroring a busy monorepo: hidden infra services, TERM-trap
   floods, dozens of lazy `app-NN` services with `listenfd` proxies. This is the
@@ -177,9 +184,19 @@ tail -15 /tmp/tui-stderr.log
 
 rm -rf /tmp/don-stress/.don
 python3 tools/tui_drive_resize.py target/release/don /tmp/don-stress
+
+rm -rf /tmp/don-logview
+python3 tools/tui_drive_logs.py target/release/don /tmp/don-logview
 ```
 
-Both print `RESULT: ok` or `RESULT: FAIL` and exit accordingly. Things worth
+The stress config's proxies start at port 18000, which collides with plenty of
+real projects. `DON_STRESS_PORT=29000` moves them.
+
+**Read the screen only after `Session.settle()`.** A frame is one burst of
+writes; sampling in the middle of one shows half the new screen over half the
+old, which looks exactly like the rendering bugs these drivers exist to catch.
+
+They each print `RESULT: ok` or `RESULT: FAIL` and exit accordingly. Things worth
 reading in the summary:
 
 - `reached 'all services running' on screen` — startup settled.

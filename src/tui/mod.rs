@@ -583,6 +583,8 @@ fn draw(terminal: &mut TuiTerminal, app: &mut App, store: &mut LogStore) -> Resu
         app.repaint_requested = false;
     }
     store.reflow(render::log_pane_width(area, app.panel, panel_open));
+    // Marks on lines that have aged out of history describe nothing.
+    app.prune_blank_marks(store.oldest_id());
     // Hold history where the reader is looking, so a busy stack cannot evict
     // their place out from under them between frames.
     store.set_pin(app.log_scroll.anchor());
@@ -847,8 +849,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
             // needs an id and the only one going spare is the id the next real
             // line will arrive with — see `App::blank_after`.
             if let Some(&id) = app.log_visible_ids.last() {
-                let blanks = app.blank_after.entry(id).or_insert(0);
-                *blanks = blanks.saturating_add(1);
+                app.mark_blank_after(id);
             }
             // A pin left over from a settled selection would hold the view
             // still while new output runs past it. Enter at the tail means
@@ -2643,6 +2644,86 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    use crate::output::LogId;
+
+    /// The marks are bookkeeping over lines the store still holds, and the
+    /// index is keyed on them — so both the key and the map have to behave
+    /// when history moves underneath them.
+    #[test]
+    fn blank_marks_are_keyed_cheaply_and_do_not_outlive_their_lines() {
+        let mut app = app_with_service_state(ServiceState::Ready);
+
+        // Adding a mark must invalidate the row index: the line it belongs to
+        // just got taller.
+        let before = app.log_filter_fingerprint();
+        app.mark_blank_after(LogId(7));
+        let after_one = app.log_filter_fingerprint();
+        assert_ne!(before, after_one, "a new mark re-keys the index");
+        app.mark_blank_after(LogId(7));
+        assert_ne!(
+            after_one,
+            app.log_filter_fingerprint(),
+            "and so does a second blank on the same line"
+        );
+        assert_eq!(
+            app.blank_after.get(&LogId(7)),
+            Some(&2),
+            "counted, not a set"
+        );
+
+        // Forgetting a mark for a line that is gone changes no row count, so
+        // it must not re-key — otherwise every eviction of a marked line costs
+        // a full rebuild of the index.
+        app.mark_blank_after(LogId(20));
+        let keyed = app.log_filter_fingerprint();
+        app.prune_blank_marks(Some(LogId(20)));
+        assert_eq!(
+            app.blank_after.keys().copied().collect::<Vec<_>>(),
+            vec![LogId(20)],
+            "marks older than the store's oldest line are dropped"
+        );
+        assert_eq!(
+            app.log_filter_fingerprint(),
+            keyed,
+            "dropping a mark on a line that is gone re-keys nothing"
+        );
+
+        // An empty store holds no lines, so it can hold no marks.
+        app.prune_blank_marks(None);
+        assert!(app.blank_after.is_empty());
+    }
+
+    /// Swapping the record in front swaps the marks with it, so the two views
+    /// cannot write on each other.
+    #[test]
+    fn swapping_the_record_takes_the_screen_state_with_it() {
+        let mut app = app_with_service_state(ServiceState::Ready);
+        app.log_visible_ids = vec![LogId(3)];
+        app.log_visible_rows = vec!["api | hello".to_string()];
+        app.mark_blank_after(LogId(3));
+
+        app.swap_log_view();
+        assert!(app.debug_view, "the other record is in front");
+        assert!(
+            app.blank_after.is_empty(),
+            "the other record has its own marks"
+        );
+        // The ids describe rows that are no longer on screen. Left behind,
+        // Enter would mark a line belonging to the record that is now hidden —
+        // an id this store does not hold, so it renders nothing and Enter
+        // reads as dead.
+        assert!(app.log_visible_ids.is_empty(), "and its own screen");
+        assert!(app.log_visible_rows.is_empty());
+
+        app.swap_log_view();
+        assert!(!app.debug_view);
+        assert_eq!(
+            app.blank_after.get(&LogId(3)),
+            Some(&1),
+            "coming back finds the marks where they were left"
+        );
     }
 
     /// The log popup cannot outlive the table it is a row of.

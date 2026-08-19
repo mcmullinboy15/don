@@ -142,6 +142,7 @@ pub(crate) struct StashedView {
     pub(crate) rows_above: usize,
     pub(crate) total_rows: usize,
     pub(crate) blank_after: HashMap<crate::output::LogId, u16>,
+    pub(crate) blank_epoch: u64,
 }
 
 /// The run of visible rows that belong to the same message as row `index`.
@@ -429,6 +430,13 @@ pub(crate) struct App {
     /// Counted, not a set: pressing Enter twice on a quiet stack means two
     /// blank rows, the same as it would in a shell.
     pub(crate) blank_after: HashMap<crate::output::LogId, u16>,
+    /// Bumped whenever a mark is *added*, and the only thing the row index is
+    /// keyed on. The key used to be a hash folded over the whole map, which
+    /// cost a hasher per mark on every frame and — worse — meant dropping a
+    /// mark for a line that had already been evicted looked like a change and
+    /// forced a full rebuild. Adding a mark changes how tall a line is;
+    /// forgetting one that no longer exists cannot change anything.
+    blank_epoch: u64,
     /// Whether the pane is showing don's diagnostics rather than the processes'
     /// output. Two separate records with separate stores; this says which one
     /// is on screen.
@@ -535,6 +543,7 @@ impl App {
             log_pane_origin: (0, 0),
             pending_scroll: PendingScroll::default(),
             blank_after: HashMap::new(),
+            blank_epoch: 0,
             debug_view: false,
             stashed_view: StashedView::default(),
             log_rows_above: 0,
@@ -595,6 +604,13 @@ impl App {
         std::mem::swap(&mut self.log_rows_above, &mut self.stashed_view.rows_above);
         std::mem::swap(&mut self.log_total_rows, &mut self.stashed_view.total_rows);
         std::mem::swap(&mut self.blank_after, &mut self.stashed_view.blank_after);
+        std::mem::swap(&mut self.blank_epoch, &mut self.stashed_view.blank_epoch);
+        // These describe the rows on screen, and the rows on screen are about
+        // to be a different record's. Stale, they would send Enter's blank
+        // mark to a line id belonging to the store that is no longer in front
+        // — where it renders nothing, so Enter reads as dead.
+        self.log_visible_rows.clear();
+        self.log_visible_ids.clear();
         // A selection is screen coordinates over content that is about to be
         // entirely different text.
         self.log_selection.clear();
@@ -609,16 +625,32 @@ impl App {
         self.shutdown_started.hash(&mut hasher);
         self.filter.fingerprint(&mut hasher);
         // Blank marks change how tall a line is, so they belong to the same key
-        // the row index is built against. Order-independent: a set has none.
-        let mut marks: u64 = 0;
-        for (id, count) in &self.blank_after {
-            let mut one = std::collections::hash_map::DefaultHasher::new();
-            (id, count).hash(&mut one);
-            marks = marks.wrapping_add(Hasher::finish(&one));
-        }
-        marks.hash(&mut hasher);
-        self.blank_after.len().hash(&mut hasher);
+        // the row index is built against.
+        self.blank_epoch.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Ask for a blank row after `id` — what Enter at the tail does.
+    pub(crate) fn mark_blank_after(&mut self, id: crate::output::LogId) {
+        let count = self.blank_after.entry(id).or_insert(0);
+        *count = count.saturating_add(1);
+        self.blank_epoch = self.blank_epoch.wrapping_add(1);
+    }
+
+    /// Forget marks on lines the store no longer holds.
+    ///
+    /// Without this the map is a slow leak: one entry per line the reader ever
+    /// pressed Enter on, kept for the life of the session, long after the line
+    /// it describes has scrolled out of history. Deliberately does not bump the
+    /// epoch — a mark on a line that is gone was already contributing nothing.
+    pub(crate) fn prune_blank_marks(&mut self, oldest: Option<crate::output::LogId>) {
+        if self.blank_after.is_empty() {
+            return;
+        }
+        match oldest {
+            Some(oldest) => self.blank_after.retain(|id, _| *id >= oldest),
+            None => self.blank_after.clear(),
+        }
     }
 
     /// Whether the pane shows this line.
