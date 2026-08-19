@@ -389,8 +389,16 @@ impl Client {
     /// plus `[don]` lifecycle events, in arrival order, with the metadata
     /// a renderer needs to filter and color. Returns when the server closes
     /// the stream or the callback returns `Err`.
-    /// `since` resumes exactly where a previous session stopped; `None` starts
-    /// from the tail of the server's history.
+    /// `since` resumes exactly where a previous session stopped; `None` asks
+    /// for everything the server still holds.
+    ///
+    /// That `last` is the tap's whole capacity rather than the route's default
+    /// is the point. The route answers ad-hoc clients too — a `curl` wants the
+    /// end of the log, not this morning — but a TUI attaching to a running
+    /// project is asking for the scrollback, and the one sharing a process
+    /// with the runner already preloads exactly this much. Anything less and
+    /// reattaching from a second terminal silently shows a fraction of what
+    /// the first one has, which reads as the log having been lost.
     pub async fn logs_follow_all<F>(
         &self,
         since: Option<crate::output::LogId>,
@@ -400,8 +408,13 @@ impl Client {
         F: FnMut(LogStreamEvent) -> Result<(), ClientError>,
     {
         let path = match since {
+            // `last` is ignored when resuming: the id says exactly what was
+            // missed, which is both cheaper and more accurate than a count.
             Some(since) => format!("/logs?follow=true&since={since}"),
-            None => "/logs?follow=true".to_string(),
+            None => format!(
+                "/logs?follow=true&last={}",
+                crate::output::DEFAULT_MERGED_HISTORY_CAPACITY
+            ),
         };
         self.follow_ndjson(&path, |line| {
             let event: LogStreamEvent = serde_json::from_str(line)?;

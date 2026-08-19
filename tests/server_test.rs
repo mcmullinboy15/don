@@ -854,6 +854,94 @@ async fn follow_lines(
     lines
 }
 
+/// A second terminal attaching to a running project sees the same scrollback
+/// as the first one, not the tail of it.
+///
+/// The route's own default is small on purpose — it answers ad-hoc clients too
+/// — so the TUI's client asks for the tap's whole capacity. Without that,
+/// reattaching showed the last hundred lines of a log with thousands in it,
+/// which reads as the history having been thrown away.
+#[test]
+fn integration_a_reattaching_client_gets_the_whole_history() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("server-merged-preload");
+        // Comfortably more than the route's ad-hoc default of 100.
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "chatty",
+                "bash",
+                &[
+                    "-c",
+                    "for i in $(seq 1 400); do echo tick$i; done; sleep 60",
+                ],
+            )
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(5)).await);
+        assert!(
+            wait_for_body_contains(
+                &socket,
+                "/logs/chatty?last=5",
+                "tick400",
+                Duration::from_secs(10)
+            )
+            .await,
+            "the service should have finished emitting before anyone follows"
+        );
+
+        let client = don::client::Client::with_socket_path(socket.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(async move {
+            let _ = client
+                .logs_follow_all(None, |event| {
+                    if let don::client::LogStreamEvent::Line { line, .. } = &event {
+                        let _ = tx.send(line.clone());
+                    }
+                    Ok(())
+                })
+                .await;
+        });
+
+        // The oldest line is the whole point: a client capped at the route's
+        // default would start somewhere in the three hundreds.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut ticks: Vec<String> = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Some(line)) => {
+                    let line = line.trim().to_string();
+                    // Only the service's own output. don's narration includes
+                    // a line quoting the command, which contains "tick" too.
+                    if line.starts_with("tick") {
+                        let last = line == "tick400";
+                        ticks.push(line);
+                        if last {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        follower.abort();
+
+        assert_eq!(
+            ticks.first().map(String::as_str),
+            Some("tick1"),
+            "the preload should start at the first line; got {} lines starting {:?}",
+            ticks.len(),
+            &ticks[..ticks.len().min(3)]
+        );
+        assert_eq!(ticks.len(), 400, "and carry all of them");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 #[test]
 fn integration_merged_logs_follow_carries_name_and_lifecycle() {
     run_with_timeout(Duration::from_secs(15), async {
