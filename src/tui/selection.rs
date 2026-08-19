@@ -6,26 +6,25 @@
 //! text* without the `api    | ` prefix don itself added, which native
 //! selection never could.
 //!
-//! ## Coordinates
+//! ## What a selection is
 //!
-//! A selection is two screen positions, not two positions in the log. That
-//! sounds fragile and is deliberate: what the user dragged across is what is on
-//! screen, and rows on screen are what the renderer just laid out. Resolving to
-//! text happens against the same rows the renderer produced, in the same frame
-//! — so a wrapped line, a filtered-out line and a scrolled view all resolve
-//! correctly without selection needing to know about any of them.
+//! Two places in the *log*: a line id and a character offset into that line's
+//! message. Not two places on the screen.
 //!
-//! Screen rows move, though, and the text under them moves with them: output
-//! arrives, the reader scrolls, old lines are evicted. So the rows are carried
-//! as signed numbers and shifted by however far the view moved — see
-//! [`Selection::shift_rows`] — which keeps the highlight on the text it was
-//! dragged across rather than on the coordinates that text happened to occupy.
-//! Signed, because a selection scrolled off the top has to keep counting up
-//! there to come back to the same place when the view returns.
+//! Screen coordinates were the first design and they read as the honest one —
+//! what the reader dragged across is what was on screen. But the screen is the
+//! one thing here that will not hold still. Output arrives, lines are evicted,
+//! the reader scrolls, the terminal is resized, the filter changes: every one
+//! of those moves the text under the coordinates, and a selection pinned to
+//! them ends up marking whatever landed there instead. The scroll anchor in
+//! [`super::logs`] gave up screen rows for a line id for exactly this reason.
 //!
-//! What that cannot survive is a *reflow*: a resize or a filter change moves
-//! different rows by different amounts, and there is no single shift to apply.
-//! Those clear it.
+//! An id and an offset survive all of it. A line that is evicted takes its end
+//! of the selection with it, which is right — that text is genuinely gone.
+//!
+//! The offset is into the message, so don's own `api    │ ` column simply is
+//! not addressable: the highlight and the copied text cannot disagree about
+//! where the log starts, because neither of them can point at the prefix.
 //!
 //! ## OSC 52
 //!
@@ -38,66 +37,50 @@
 
 use std::io::Write;
 
+use super::log_store::LogStore;
+use super::logs::RowSource;
+use super::view_index::ViewIndex;
+use crate::output::LogId;
+
+/// One end of a selection: a line, and how far into its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Point {
+    pub(crate) id: LogId,
+    pub(crate) offset: usize,
+}
+
+impl Point {
+    /// The place a screen column on `row` points at.
+    pub(crate) fn at(row: RowSource, column: usize) -> Self {
+        Self {
+            id: row.id,
+            offset: row.offset_at(column),
+        }
+    }
+}
+
 /// A drag in progress, or a finished selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Selection {
-    /// Column and screen row. The row is signed so it can track content that
-    /// has scrolled above the pane and come back.
-    anchor: Option<(u16, i32)>,
-    cursor: Option<(u16, i32)>,
+    anchor: Option<Point>,
+    cursor: Option<Point>,
     /// True once the button is released: the selection stands until the next
-    /// drag starts or the view moves under it.
+    /// drag starts, or the reader dismisses it.
     settled: bool,
-    /// First selectable screen column: the message column's left edge.
-    ///
-    /// The process name is don's own furniture, not log text — dragging across
-    /// it and pasting `api    | ` in front of every line is never what anyone
-    /// wanted. Carried on the selection rather than applied by each reader so
-    /// the highlight and the copied text cannot disagree about where the log
-    /// starts; they did, and a selection that copies something other than what
-    /// it shows is worse than one that includes the name.
-    left_edge: u16,
 }
 
 impl Selection {
-    /// Set the first column a selection may cover — the message column's left
-    /// edge, in screen coordinates. Applies to selections started afterwards.
-    pub(crate) fn set_left_edge(&mut self, left_edge: u16) {
-        self.left_edge = left_edge;
-    }
-
-    /// The first column a selection may cover.
-    pub(crate) fn left_edge(&self) -> u16 {
-        self.left_edge
-    }
-
-    /// Start a drag at a screen position.
-    pub(crate) fn begin(&mut self, column: u16, row: u16) {
-        let column = column.max(self.left_edge);
-        self.anchor = Some((column, i32::from(row)));
-        self.cursor = Some((column, i32::from(row)));
+    /// Start a drag.
+    pub(crate) fn begin(&mut self, at: Point) {
+        self.anchor = Some(at);
+        self.cursor = Some(at);
         self.settled = false;
     }
 
     /// Move the loose end.
-    pub(crate) fn extend(&mut self, column: u16, row: u16) {
+    pub(crate) fn extend(&mut self, to: Point) {
         if self.anchor.is_some() {
-            self.cursor = Some((column.max(self.left_edge), i32::from(row)));
-        }
-    }
-
-    /// The view moved by `delta` rows; move with it.
-    ///
-    /// Positive means the content came down the screen — the view scrolled up.
-    /// Applied to a settled selection and to a drag alike: a wheel notch
-    /// mid-drag should move the fixed end too, or the selection grows by the
-    /// scroll instead of by the pointer.
-    pub(crate) fn shift_rows(&mut self, delta: i32) {
-        if delta == 0 {
-            return;
-        }
-        for (_, row) in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
-            *row = row.saturating_add(delta);
+            self.cursor = Some(to);
         }
     }
 
@@ -108,147 +91,105 @@ impl Selection {
         }
     }
 
-    /// Forget the selection — the view moved and the coordinates no longer
-    /// mean what they meant.
     pub(crate) fn clear(&mut self) {
-        // The edge belongs to the layout, not to this drag.
-        *self = Self {
-            left_edge: self.left_edge,
-            ..Self::default()
-        };
+        *self = Self::default();
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.span().is_none()
     }
 
-    /// Normalised (start, end) in screen coordinates, reading order, or `None`
-    /// for a click that never became a drag.
-    pub(crate) fn span(&self) -> Option<((u16, i32), (u16, i32))> {
+    /// Normalised (start, end) in reading order, or `None` for a click that
+    /// never became a drag.
+    pub(crate) fn span(&self) -> Option<(Point, Point)> {
         let (anchor, cursor) = (self.anchor?, self.cursor?);
         if anchor == cursor {
             return None;
         }
-        // Compare by row first: a selection running up-left is still a
-        // selection running from the earlier position to the later one.
-        let (start, end) = if (anchor.1, anchor.0) <= (cursor.1, cursor.0) {
+        // A selection dragged up-left still runs from the earlier place to the
+        // later one. Ids ascend with time and offsets ascend within a line, so
+        // the derived ordering is reading order.
+        Some(if anchor <= cursor {
             (anchor, cursor)
         } else {
             (cursor, anchor)
-        };
-        Some((start, end))
+        })
     }
 
-    /// Whether a given screen cell falls inside the selection.
-    pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
+    /// Whether a character of the log falls inside the selection. Half-open at
+    /// the end, like a drag: the cell the pointer stopped on is not included.
+    pub(crate) fn contains(&self, at: Point) -> bool {
         let Some((start, end)) = self.span() else {
             return false;
         };
-        let row = i32::from(row);
-        if row < start.1 || row > end.1 {
-            return false;
-        }
-        if row == start.1 && column < start.0 {
-            return false;
-        }
-        if row == end.1 && column >= end.0 {
-            return false;
-        }
-        // Rows in the middle of a multi-row drag start at column zero, so the
-        // edge has to be enforced per cell rather than only at the ends.
-        column >= self.left_edge
+        at >= start && at < end
     }
 }
 
-/// The half-open column range of the word under `column`, if there is one.
+/// The half-open character range of the word under `offset`, if there is one.
 ///
 /// Whitespace-delimited, which is what a log wants: paths, ids, durations and
 /// bracketed levels all come out whole, and the alternative — a table of
 /// "word characters" — argues with itself over `/`, `-`, `:` and `.`, every
 /// one of which appears inside something a reader means to grab as a unit.
 ///
-/// `None` when the column is on whitespace or past the end of the row, so a
-/// double-click on empty space selects nothing rather than something arbitrary.
-pub(crate) fn word_at(row: &str, column: usize) -> Option<(usize, usize)> {
-    let chars: Vec<char> = row.chars().collect();
-    if column >= chars.len() || chars[column].is_whitespace() {
+/// `None` when the offset is on whitespace or past the end, so a double-click
+/// on empty space selects nothing rather than something arbitrary.
+///
+/// Runs over the whole message rather than one rendered row, so a word the
+/// pane wrapped in the middle still comes out whole.
+pub(crate) fn word_at(message: &str, offset: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = message.chars().collect();
+    if offset >= chars.len() || chars[offset].is_whitespace() {
         return None;
     }
-    let start = chars[..column]
+    let start = chars[..offset]
         .iter()
         .rposition(|c| c.is_whitespace())
         .map_or(0, |idx| idx + 1);
-    let end = chars[column..]
+    let end = chars[offset..]
         .iter()
         .position(|c| c.is_whitespace())
-        .map_or(chars.len(), |idx| column + idx);
+        .map_or(chars.len(), |idx| offset + idx);
     Some((start, end))
 }
 
-/// Pull the selected text out of the rows the renderer laid out.
+/// The selected text, read from the store.
 ///
-/// `rows` are the pane's rows in order, `origin` is the pane's top-left corner,
-/// and `prefix_width` is how many columns of each row belong to don's own
-/// `name | ` prefix rather than to the process's output. Selections that span
-/// more than one row drop the prefix, because what the user wants pasted is the
-/// log, not a column of service names. A selection *within* one row is taken
-/// verbatim — they pointed at exactly those characters.
+/// From the store and not from the rows on screen, because the selection is
+/// allowed to outlive the view of it: scroll away from a selection and it is
+/// still a selection, and copying it should still give the text. The index
+/// supplies which lines are admitted, so a filtered-out line inside the span
+/// is skipped exactly as it is on screen.
 pub(crate) fn selected_text(
     selection: &Selection,
-    rows: &[String],
-    row_ids: &[crate::output::LogId],
-    origin: (u16, u16),
+    index: &ViewIndex,
+    store: &LogStore,
 ) -> Option<String> {
     let (start, end) = selection.span()?;
-    let left_edge = selection.left_edge();
-
-    let mut out: Vec<(Option<crate::output::LogId>, String)> = Vec::new();
-    for (index, row) in rows.iter().enumerate() {
-        let screen_row =
-            i32::from(origin.1).saturating_add(i32::try_from(index).unwrap_or(i32::MAX));
-        if screen_row < start.1 || screen_row > end.1 {
-            continue;
-        }
-        let chars: Vec<char> = row.chars().collect();
-        let to_col = |screen_col: u16| -> usize {
-            usize::from(screen_col.saturating_sub(origin.0)).min(chars.len())
-        };
-        let mut from = if screen_row == start.1 {
-            to_col(start.0)
-        } else {
-            0
-        };
-        let until = if screen_row == end.1 {
-            to_col(end.0)
-        } else {
-            chars.len()
-        };
-        // Same bound the highlight draws, so the text matches what was shown.
-        from = from.max(to_col(left_edge)).min(chars.len());
-        let id = row_ids.get(index).copied();
-        if from >= until {
-            out.push((id, String::new()));
-            continue;
-        }
-        out.push((id, chars[from..until].iter().collect::<String>()));
-    }
-
-    // Rows of one message are one line. The wrap is this pane's layout, not
-    // something the process wrote, so joining them back gives what it actually
-    // emitted — and joins before any trimming, because the character the wrap
-    // fell on is often the space between two words.
     let mut lines: Vec<String> = Vec::new();
-    let mut previous: Option<crate::output::LogId> = None;
-    for (id, text) in out {
-        match (previous, id) {
-            (Some(before), Some(now)) if before == now => {
-                if let Some(line) = lines.last_mut() {
-                    line.push_str(&text);
-                }
-            }
-            _ => lines.push(text),
+    for id in index.ids_from(start.id) {
+        if id > end.id {
+            break;
         }
-        previous = id;
+        let Some(entry) = store.get(id) else {
+            continue;
+        };
+        let message: Vec<char> = entry.message_text().chars().collect();
+        let from = if id == start.id { start.offset } else { 0 };
+        let until = if id == end.id {
+            end.offset.min(message.len())
+        } else {
+            message.len()
+        };
+        let from = from.min(until);
+        lines.push(
+            message
+                .get(from..until)
+                .unwrap_or_default()
+                .iter()
+                .collect(),
+        );
     }
 
     // Trailing blanks are the padding a pane row carries, not content.
@@ -362,21 +303,46 @@ mod tests {
         }
     }
 
-    /// One id per row, so no two rows are treated as one wrapped message.
-    fn distinct_ids(rows: &[String]) -> Vec<crate::output::LogId> {
-        (0..rows.len() as u64).map(crate::output::LogId).collect()
+    fn store_of(lines: &[(u64, &str, &str)], width: u16) -> LogStore {
+        let mut store = LogStore::with_capacity(100);
+        store.reflow(width);
+        for (id, name, body) in lines {
+            store.push(
+                LogId(*id),
+                crate::output::FormattedLogLine {
+                    name: (*name).to_string(),
+                    is_lifecycle: false,
+                    is_verbose: false,
+                    prefix: format!("{name} | ").into_bytes(),
+                    bytes: body.as_bytes().to_vec(),
+                },
+            );
+        }
+        store
     }
 
-    fn drag(from: (u16, u16), to: (u16, u16)) -> Selection {
-        drag_within(from, to, 0)
+    fn index_of(store: &LogStore, width: u16, hide: &str) -> ViewIndex {
+        let mut index = ViewIndex::default();
+        index.sync(
+            store,
+            super::super::view_index::ViewKey { width, filter: 0 },
+            &std::collections::HashMap::new(),
+            |entry| entry.line.name != hide,
+        );
+        index
     }
 
-    /// A drag in a pane whose message column starts at `left_edge`.
-    fn drag_within(from: (u16, u16), to: (u16, u16), left_edge: u16) -> Selection {
+    fn at(id: u64, offset: usize) -> Point {
+        Point {
+            id: LogId(id),
+            offset,
+        }
+    }
+
+    fn drag(from: Point, to: Point) -> Selection {
         let mut selection = Selection::default();
-        selection.set_left_edge(left_edge);
-        selection.begin(from.0, from.1);
-        selection.extend(to.0, to.1);
+        selection.begin(from);
+        selection.extend(to);
         selection.finish();
         selection
     }
@@ -388,194 +354,222 @@ mod tests {
         struct Case {
             name: &'static str,
             selection: Selection,
-            inside: Vec<(u16, u16)>,
-            outside: Vec<(u16, u16)>,
+            inside: Vec<Point>,
+            outside: Vec<Point>,
         }
 
         let cases = vec![
             Case {
-                name: "left to right on one row",
-                selection: drag((2, 0), (5, 0)),
-                inside: vec![(2, 0), (4, 0)],
-                outside: vec![(1, 0), (5, 0), (2, 1)],
+                name: "within one line",
+                selection: drag(at(0, 2), at(0, 5)),
+                inside: vec![at(0, 2), at(0, 4)],
+                outside: vec![at(0, 1), at(0, 5), at(1, 0)],
             },
             Case {
-                name: "right to left is the same span",
-                selection: drag((5, 0), (2, 0)),
-                inside: vec![(2, 0), (4, 0)],
-                outside: vec![(1, 0), (5, 0)],
+                name: "dragged back is the same span",
+                selection: drag(at(0, 5), at(0, 2)),
+                inside: vec![at(0, 2), at(0, 4)],
+                outside: vec![at(0, 1), at(0, 5)],
             },
             Case {
-                name: "across rows takes the whole middle",
-                selection: drag((5, 1), (2, 3)),
-                inside: vec![(5, 1), (0, 2), (99, 2), (1, 3)],
-                outside: vec![(4, 1), (2, 3), (0, 4)],
+                name: "across lines takes everything between",
+                selection: drag(at(0, 3), at(2, 1)),
+                inside: vec![at(0, 3), at(0, 99), at(1, 0), at(1, 40), at(2, 0)],
+                outside: vec![at(0, 2), at(2, 1), at(3, 0)],
             },
             Case {
-                name: "a click that never moved selects nothing",
-                selection: drag((3, 2), (3, 2)),
+                name: "a click that never moved is not a selection",
+                selection: drag(at(1, 4), at(1, 4)),
                 inside: vec![],
-                outside: vec![(3, 2)],
+                outside: vec![at(1, 4)],
             },
         ];
 
         for case in cases {
             for point in case.inside {
-                assert!(
-                    case.selection.contains(point.0, point.1),
-                    "{}: {point:?} should be inside",
-                    case.name
-                );
+                assert!(case.selection.contains(point), "{}: {point:?}", case.name);
             }
             for point in case.outside {
-                assert!(
-                    !case.selection.contains(point.0, point.1),
-                    "{}: {point:?} should be outside",
-                    case.name
-                );
+                assert!(!case.selection.contains(point), "{}: {point:?}", case.name);
             }
         }
     }
 
-    /// A message that wrapped comes back as one line. The break is this pane's
-    /// layout, not something the process wrote, and the character the wrap fell
-    /// on is often the space between two words — so the rejoin happens before
-    /// any trimming, or the words run together.
+    /// The point of anchoring to the log: everything that moves the text on
+    /// screen — scrolling, a resize, a filter change — leaves the selection
+    /// covering the same characters.
     #[test]
-    fn a_wrapped_message_is_copied_as_one_line() {
-        use crate::output::LogId;
-
-        let rows: Vec<String> = vec![
-            "api | first message".to_string(),
-            "api | a long one that ".to_string(),
-            "    | wrapped here".to_string(),
-            "api | last message".to_string(),
-        ];
-        // Rows 1 and 2 are one message; the others stand alone.
-        let ids = vec![LogId(1), LogId(2), LogId(2), LogId(3)];
-        let edge = 6u16;
-
-        let all = drag_within((0, 0), (40, 3), edge);
-        assert_eq!(
-            selected_text(&all, &rows, &ids, (0, 0)).unwrap(),
-            "first message\na long one that wrapped here\nlast message",
-            "the wrap is rejoined; the newlines between messages are kept"
+    fn a_selection_survives_everything_that_moves_the_screen() {
+        let store = store_of(
+            &[
+                (0, "api", "the first line"),
+                (1, "web", "a line from the other service"),
+                (
+                    2,
+                    "api",
+                    "a much longer line that will wrap differently at each width",
+                ),
+            ],
+            40,
         );
-    }
+        // "line that will" out of the third message, chosen to straddle a wrap
+        // boundary at one width and not at another.
+        let selection = drag(at(2, 14), at(2, 28));
 
-    /// The name column is don's furniture, not log text, and nothing selects
-    /// into it — however the drag was made.
-    #[test]
-    fn selection_never_reaches_into_the_name_column() {
-        let rows = vec![
-            "api    | first line".to_string(),
-            "api    | second line".to_string(),
-            "worker | third line".to_string(),
-        ];
-        let edge = 9u16;
-
-        let across = drag_within((0, 0), (20, 2), edge);
-        assert_eq!(
-            selected_text(&across, &rows, &distinct_ids(&rows), (0, 0)).unwrap(),
-            "first line\nsecond line\nthird line",
-            "a multi-row copy is the log, not a column of service names"
-        );
-
-        // Started inside the name column and dragged to column 13.
-        let within = drag_within((0, 1), (13, 1), edge);
-        assert_eq!(
-            selected_text(&within, &rows, &distinct_ids(&rows), (0, 0)).unwrap(),
-            "seco",
-            "a drag that began on the name still copies only the message"
-        );
-
-        // And the highlight agrees cell for cell — the text and what was shown
-        // are drawn from the same bound.
-        for column in 0..edge {
-            assert!(
-                !within.contains(column, 1),
-                "column {column} is inside the name column and must not highlight"
-            );
-        }
-        assert!(within.contains(edge, 1), "the message column highlights");
-    }
-
-    /// A pane is padded with blank rows; those are layout, not content.
-    #[test]
-    fn trailing_blank_rows_are_not_copied() {
-        let rows = vec![
-            "api    | only line".to_string(),
-            String::new(),
-            String::new(),
-        ];
-        let selection = drag_within((0, 0), (40, 2), 9);
-        assert_eq!(
-            selected_text(&selection, &rows, &distinct_ids(&rows), (0, 0)).unwrap(),
-            "only line"
-        );
-    }
-
-    /// Double-click picks out a word. Whitespace-delimited is what a log wants:
-    /// a path, a duration or a bracketed level comes out whole, and clicking
-    /// empty space selects nothing rather than something arbitrary.
-    #[test]
-    fn double_click_selects_the_word_under_the_pointer() {
         struct Case {
             name: &'static str,
-            row: &'static str,
-            column: usize,
+            width: u16,
+            hide: &'static str,
+        }
+
+        for case in [
+            Case {
+                name: "as laid out",
+                width: 40,
+                hide: "",
+            },
+            Case {
+                name: "narrower, so the line wraps more",
+                width: 24,
+                hide: "",
+            },
+            Case {
+                name: "wide enough not to wrap at all",
+                width: 200,
+                hide: "",
+            },
+            Case {
+                name: "with the other service filtered out",
+                width: 40,
+                hide: "web",
+            },
+        ] {
+            let mut store = store_of(
+                &[
+                    (0, "api", "the first line"),
+                    (1, "web", "a line from the other service"),
+                    (
+                        2,
+                        "api",
+                        "a much longer line that will wrap differently at each width",
+                    ),
+                ],
+                case.width,
+            );
+            store.reflow(case.width);
+            let index = index_of(&store, case.width, case.hide);
+            assert_eq!(
+                selected_text(&selection, &index, &store).as_deref(),
+                Some("line that will"),
+                "{}",
+                case.name
+            );
+        }
+        let _ = store;
+    }
+
+    /// don's `name | ` column is not part of the message, so no offset can
+    /// point at it and the copied text can never contain it.
+    #[test]
+    fn the_name_column_is_not_selectable() {
+        let store = store_of(&[(0, "api", "hello world")], 40);
+        let index = index_of(&store, 40, "");
+        // A row whose message starts six columns in; columns inside the prefix
+        // clamp to the message's first character.
+        let row = RowSource {
+            id: LogId(0),
+            offset: 0,
+            indent: 6,
+        };
+        assert_eq!(Point::at(row, 0).offset, 0, "the far left is the message");
+        assert_eq!(
+            Point::at(row, 5).offset,
+            0,
+            "and so is the last prefix cell"
+        );
+        assert_eq!(Point::at(row, 6).offset, 0);
+        assert_eq!(Point::at(row, 9).offset, 3);
+
+        let whole = drag(Point::at(row, 0), Point::at(row, 100));
+        assert_eq!(
+            selected_text(&whole, &index, &store).as_deref(),
+            Some("hello world"),
+            "no prefix in the copy"
+        );
+    }
+
+    /// A message the pane wrapped is one thing to the reader; the wrap is this
+    /// pane's layout, not something the process wrote.
+    #[test]
+    fn a_wrapped_message_is_copied_as_one_line() {
+        let store = store_of(&[(0, "api", "one two three four five six seven")], 20);
+        let index = index_of(&store, 20, "");
+        let all = drag(at(0, 0), at(0, usize::MAX));
+        let text = selected_text(&all, &index, &store).unwrap();
+        assert_eq!(text, "one two three four five six seven");
+        assert!(!text.contains('\n'), "the wrap is not a newline");
+    }
+
+    /// Lines the filter excludes are not on screen, so they are not in the
+    /// copy either — even when the selection spans across them.
+    #[test]
+    fn a_filtered_out_line_inside_the_span_is_skipped() {
+        let store = store_of(
+            &[
+                (0, "api", "first"),
+                (1, "web", "hidden"),
+                (2, "api", "second"),
+            ],
+            40,
+        );
+        let index = index_of(&store, 40, "web");
+        let across = drag(at(0, 0), at(2, usize::MAX));
+        assert_eq!(
+            selected_text(&across, &index, &store).as_deref(),
+            Some("first\nsecond")
+        );
+    }
+
+    /// A double-click finds the word in the message, so one the pane wrapped
+    /// still comes out whole.
+    #[test]
+    fn word_at_takes_whole_words_out_of_the_message() {
+        struct Case {
+            name: &'static str,
+            offset: usize,
             want: Option<&'static str>,
         }
 
-        let row = "api    | GET /v1/users 200 in 12.4ms";
-        let cases = vec![
+        let message = "GET /api/v1/users 200 14ms";
+        for case in [
             Case {
-                name: "the process name",
-                row,
-                column: 1,
-                want: Some("api"),
+                name: "a path is one word",
+                offset: 6,
+                want: Some("/api/v1/users"),
             },
             Case {
-                name: "a path, kept whole through its slashes",
-                row,
-                column: 16,
-                want: Some("/v1/users"),
-            },
-            Case {
-                name: "a duration, kept whole through its dot",
-                row,
-                column: 32,
-                want: Some("12.4ms"),
-            },
-            Case {
-                name: "the first character of a word",
-                row,
-                column: 9,
+                name: "from the first character of one",
+                offset: 0,
                 want: Some("GET"),
             },
             Case {
+                name: "a duration keeps its unit",
+                offset: 23,
+                want: Some("14ms"),
+            },
+            Case {
                 name: "whitespace selects nothing",
-                row,
-                column: 4,
+                offset: 3,
                 want: None,
             },
             Case {
-                name: "past the end selects nothing",
-                row,
-                column: 500,
+                name: "and so does past the end",
+                offset: 500,
                 want: None,
             },
-            Case {
-                name: "a blank row selects nothing",
-                row: "          ",
-                column: 3,
-                want: None,
-            },
-        ];
-
-        for case in cases {
-            let got = word_at(case.row, case.column).map(|(start, end)| {
-                case.row
+        ] {
+            let got = word_at(message, case.offset).map(|(start, end)| {
+                message
                     .chars()
                     .skip(start)
                     .take(end - start)
@@ -583,50 +577,5 @@ mod tests {
             });
             assert_eq!(got.as_deref(), case.want, "{}", case.name);
         }
-    }
-
-    /// A selection is dragged across *text*, and the text moves: output
-    /// arrives, the reader scrolls, old lines are evicted. The highlight has
-    /// to move with it or it ends up marking whatever happens to be at those
-    /// coordinates afterwards.
-    #[test]
-    fn a_selection_moves_with_the_rows_it_was_dragged_across() {
-        let mut selection = Selection::default();
-        selection.begin(4, 10);
-        selection.extend(9, 10);
-        selection.finish();
-        assert!(selection.contains(5, 10));
-
-        // Three rows of output arrive while following: the text moves up.
-        selection.shift_rows(-3);
-        assert!(selection.contains(5, 7), "the highlight followed the text");
-        assert!(!selection.contains(5, 10), "and left where it used to be");
-
-        // Scrolled back down, it is where it started.
-        selection.shift_rows(3);
-        assert!(selection.contains(5, 10));
-
-        // Pushed off the top and brought back. A row count that saturated at
-        // zero would lose the position; a signed one does not.
-        selection.shift_rows(-40);
-        assert!(!selection.contains(5, 0), "well above the pane");
-        selection.shift_rows(40);
-        assert!(
-            selection.contains(5, 10),
-            "and comes back to the same characters"
-        );
-    }
-
-    /// The fixed end moves too. A wheel notch during a drag scrolls the whole
-    /// view, so anchoring only the loose end would grow the selection by the
-    /// scroll rather than by the pointer.
-    #[test]
-    fn a_shift_moves_both_ends_of_a_drag() {
-        let mut selection = Selection::default();
-        selection.begin(2, 5);
-        selection.extend(6, 8);
-        selection.shift_rows(-2);
-        let (start, end) = selection.span().unwrap();
-        assert_eq!((start.1, end.1), (3, 6), "the span kept its height");
     }
 }

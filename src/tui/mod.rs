@@ -559,13 +559,6 @@ fn draw(terminal: &mut TuiTerminal, app: &mut App, store: &mut LogStore) -> Resu
     // Hold history where the reader is looking, so a busy stack cannot evict
     // their place out from under them between frames.
     store.set_pin(app.log_scroll.anchor());
-    // Selection may not reach into the name column. Refreshed here because both
-    // the column's width and the pane's origin can move under it.
-    app.log_selection.set_left_edge(
-        render::log_pane_origin(area, app.panel, panel_open)
-            .0
-            .saturating_add(u16::try_from(store.name_column()).unwrap_or(0)),
-    );
     terminal.draw(|frame| render::draw(frame, app, store))?;
     Ok(())
 }
@@ -622,7 +615,7 @@ fn handle_app_event(
             // anchor is a line id, so it means the same thing at any size.
         }
         AppEvent::Key(key) => handle_key(key, app, store, client, controls)?,
-        AppEvent::Mouse(mouse) => handle_mouse(mouse, app),
+        AppEvent::Mouse(mouse) => handle_mouse(mouse, app, store),
         // Handled by the loop, which owns the live session; by the time an
         // event reaches here the loop has already dealt with it.
         AppEvent::Attach(_) => {}
@@ -802,7 +795,7 @@ fn handle_key(
     Ok(())
 }
 
-fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Result<(), TuiError> {
+fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
     // The half-finished `gg` chord: taken here so any key other than the
     // second `g` clears it just by arriving.
     let awaiting_second_g = std::mem::take(&mut app.pending_g);
@@ -827,8 +820,8 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
             // A mark rather than a pushed blank line, because a pushed blank
             // needs an id and the only one going spare is the id the next real
             // line will arrive with — see `App::blank_after`.
-            if let Some(&id) = app.log_visible_ids.last() {
-                app.mark_blank_after(id);
+            if let Some(source) = app.log_row_sources.last() {
+                app.mark_blank_after(source.id);
             }
             // A pin left over from a settled selection would hold the view
             // still while new output runs past it. Enter at the tail means
@@ -877,7 +870,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, _store: &mut LogStore) -> Res
         }
         // Ctrl+C is shutdown and cannot double as copy, so the keyboard route
         // to the clipboard is `y` — vi's yank, over the current selection.
-        KeyCode::Char('y') => copy_selection(app),
+        KeyCode::Char('y') => copy_selection(app, store),
         // With a panel open but the log focused, Esc means "done with the
         // panel" — it is the dismiss key every panel view already answers to,
         // and it should not need a focus switch first.
@@ -1201,7 +1194,7 @@ const WHEEL_ROWS: isize = 3;
 /// Wheel scrolling works in every mode: a full-screen table on top does not
 /// mean the user has stopped caring where the log is, and moving it costs
 /// nothing while it is hidden.
-fn handle_mouse(mouse: MouseEvent, app: &mut App) {
+fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
     match mouse.kind {
         // The wheel works on whatever is under the pointer — scrolling the log
         // that is hidden *behind* the panel you are pointing at is the kind of
@@ -1243,14 +1236,13 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 // selected before.
                 1 => {
                     clear_selection(app);
-                    app.log_selection.begin(mouse.column, mouse.row);
+                    if let Some(at) = point_at(app, mouse.column, mouse.row) {
+                        app.log_selection.begin(at);
+                    }
                 }
-                2 => select_span(app, mouse.column, mouse.row, selection::word_at),
+                2 => select_word(app, store, mouse.column, mouse.row),
                 // Triple-click means "this message" — all of it, however many
-                // rows it wrapped across. It does not need to skip don's own
-                // `name | ` chrome itself: the selection clamps to the message
-                // column's left edge, so every route into it — drag,
-                // double-click, this — starts in the same place.
+                // rows it wrapped across.
                 _ => select_message(app, mouse.row),
             }
         }
@@ -1270,7 +1262,9 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             // The rows under a selection have to stop moving, or output
             // arriving mid-drag pulls the text out from under the pointer.
             pause_following_for_selection(app);
-            app.log_selection.extend(mouse.column, mouse.row);
+            if let Some(at) = point_at(app, mouse.column, mouse.row) {
+                app.log_selection.extend(at);
+            }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             app.dragging_divider = false;
@@ -1315,65 +1309,66 @@ fn click_count(app: &mut App, column: u16, row: u16) -> u8 {
 ///
 /// Resolved against the rows the last frame drew, so a double click lands on
 /// the word actually under the pointer — after wrapping, filtering and scroll,
-/// none of which this has to know about.
-/// Select the whole log message the row belongs to, however many rows it
-/// wrapped across.
+/// Where in the log a screen cell points.
 ///
-/// Which rows those are is the renderer's answer, not a guess from the text: a
-/// continuation row is indistinguishable from a short message once it is a
-/// string, and deciding by looking would be the same layout-scraping the
-/// prefix column was just taken off.
-fn select_message(app: &mut App, row: u16) {
+/// `None` outside the pane, or on a row the last frame did not draw — the row
+/// sources are that frame's answer, and nothing else knows how the text was
+/// laid out.
+fn point_at(app: &App, column: u16, row: u16) -> Option<selection::Point> {
     let (origin_x, origin_y) = app.log_pane_origin;
-    let Some(index) = row.checked_sub(origin_y).map(usize::from) else {
-        return;
-    };
-    let Some((first, last)) = app::message_run(&app.log_visible_ids, index) else {
-        return;
-    };
+    let index = usize::from(row.checked_sub(origin_y)?);
+    let source = *app.log_row_sources.get(index)?;
+    Some(selection::Point::at(
+        source,
+        usize::from(column.saturating_sub(origin_x)),
+    ))
+}
 
-    let end_col = app
-        .log_visible_rows
-        .get(last)
-        .map_or(0, |text| text.trim_end().chars().count());
-    if end_col == 0 {
+/// Double-click: the word under the pointer.
+///
+/// Found in the message rather than in the rendered row, so a word the pane
+/// wrapped across two rows still comes out whole.
+fn select_word(app: &mut App, store: &LogStore, column: u16, row: u16) {
+    let Some(at) = point_at(app, column, row) else {
+        return;
+    };
+    let Some(message) = store.get(at.id).map(|entry| entry.message_text()) else {
+        return;
+    };
+    let Some((start, end)) = selection::word_at(&message, at.offset) else {
         clear_selection(app);
         return;
-    }
-    // Same reason a drag freezes the view: the selection is screen
-    // coordinates, so the rows under it have to stop moving.
+    };
     pause_following_for_selection(app);
-    let to_screen = |col: usize| origin_x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
-    let to_row = |index: usize| origin_y.saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-    app.log_selection.begin(origin_x, to_row(first));
-    app.log_selection.extend(to_screen(end_col), to_row(last));
+    app.log_selection.begin(selection::Point {
+        id: at.id,
+        offset: start,
+    });
+    app.log_selection.extend(selection::Point {
+        id: at.id,
+        offset: end,
+    });
     app.log_selection.finish();
 }
 
-fn select_span(
-    app: &mut App,
-    column: u16,
-    row: u16,
-    span: impl Fn(&str, usize) -> Option<(usize, usize)>,
-) {
-    let (origin_x, origin_y) = app.log_pane_origin;
-    let Some(index) = row.checked_sub(origin_y).map(usize::from) else {
+/// Triple-click: the whole message, however many rows it wrapped across.
+///
+/// The end is left open rather than measured — `selected_text` clamps to the
+/// message it finds, so this stays right if the line is a progress frame that
+/// repaints itself into something shorter.
+fn select_message(app: &mut App, row: u16) {
+    let Some(at) = point_at(app, 0, row) else {
         return;
     };
-    let Some(text) = app.log_visible_rows.get(index) else {
-        return;
-    };
-    let within = usize::from(column.saturating_sub(origin_x));
-    let Some((start, end)) = span(text, within) else {
-        clear_selection(app);
-        return;
-    };
-    // Same reason a drag freezes the view: the selection is screen
-    // coordinates, so the rows under it have to stop moving.
     pause_following_for_selection(app);
-    let to_screen = |col: usize| origin_x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
-    app.log_selection.begin(to_screen(start), row);
-    app.log_selection.extend(to_screen(end), row);
+    app.log_selection.begin(selection::Point {
+        id: at.id,
+        offset: 0,
+    });
+    app.log_selection.extend(selection::Point {
+        id: at.id,
+        offset: usize::MAX,
+    });
     app.log_selection.finish();
 }
 
@@ -1419,13 +1414,8 @@ fn at_tail(app: &App) -> bool {
 }
 
 /// Put the current selection on the clipboard, and say so.
-fn copy_selection(app: &mut App) {
-    let Some(text) = selection::selected_text(
-        &app.log_selection,
-        &app.log_visible_rows,
-        &app.log_visible_ids,
-        app.log_pane_origin,
-    ) else {
+fn copy_selection(app: &mut App, store: &LogStore) {
+    let Some(text) = selection::selected_text(&app.log_selection, &app.view_index, store) else {
         return;
     };
     let lines = text.lines().count();
@@ -2287,78 +2277,56 @@ mod tests {
         }
     }
 
-    /// A triple-click takes the message, not the row it landed on. A message
-    /// that wrapped is still one thing to the reader, and which rows it
-    /// occupies is the renderer's answer — recovering it from the text would be
-    /// guessing at a layout the layout already knows.
+    /// A triple-click takes the message, not the row it landed on — from any
+    /// row of it, including a continuation row. It no longer has to work out
+    /// which rows the message occupies: the selection is the line's id, and
+    /// every row of it carries the same one.
     #[test]
     fn triple_click_takes_the_whole_wrapped_message() {
         use crate::output::LogId;
+        use logs::RowSource;
 
-        struct Case {
-            name: &'static str,
-            /// Which log line each visible row came from.
-            row_ids: &'static [u64],
-            rows: &'static [&'static str],
-            /// Row the click landed on, as an index into `rows`.
-            click: usize,
-            /// Expected selected rows, first..=last.
-            want: (i32, i32),
-        }
-
-        let cases = [
-            Case {
-                name: "a message on one row selects that row",
-                row_ids: &[1, 2, 3],
-                rows: &["api | one", "api | two", "api | three"],
-                click: 1,
-                want: (1, 1),
+        // A three-row message between two one-row ones.
+        let sources = [
+            RowSource {
+                id: LogId(1),
+                offset: 0,
+                indent: 6,
             },
-            Case {
-                name: "clicking the first row of a wrapped message takes all of it",
-                row_ids: &[1, 2, 2, 2, 3],
-                rows: &[
-                    "api | one",
-                    "api | long",
-                    "    | er",
-                    "    | still",
-                    "api | three",
-                ],
-                click: 1,
-                want: (1, 3),
+            RowSource {
+                id: LogId(2),
+                offset: 0,
+                indent: 6,
             },
-            Case {
-                name: "clicking a continuation row takes the message too",
-                row_ids: &[1, 2, 2, 2, 3],
-                rows: &[
-                    "api | one",
-                    "api | long",
-                    "    | er",
-                    "    | still",
-                    "api | three",
-                ],
-                click: 3,
-                want: (1, 3),
+            RowSource {
+                id: LogId(2),
+                offset: 14,
+                indent: 6,
             },
-            Case {
-                name: "a message running to the bottom edge stops there",
-                row_ids: &[1, 2, 2],
-                rows: &["api | one", "api | long", "    | er"],
-                click: 2,
-                want: (1, 2),
+            RowSource {
+                id: LogId(2),
+                offset: 28,
+                indent: 6,
+            },
+            RowSource {
+                id: LogId(3),
+                offset: 0,
+                indent: 6,
             },
         ];
 
-        for case in cases {
+        for (click, want) in [(0usize, 1u64), (1, 2), (2, 2), (3, 2), (4, 3)] {
             let mut app = app_with_service_state(ServiceState::Ready);
             app.log_pane_origin = (0, 0);
-            app.log_visible_ids = case.row_ids.iter().map(|id| LogId(*id)).collect();
-            app.log_visible_rows = case.rows.iter().map(|r| (*r).to_string()).collect();
+            app.log_row_sources = sources.to_vec();
 
-            select_message(&mut app, u16::try_from(case.click).unwrap());
+            select_message(&mut app, u16::try_from(click).unwrap());
 
             let (start, end) = app.log_selection.span().expect("a selection");
-            assert_eq!((start.1, end.1), case.want, "{}: rows covered", case.name);
+            assert_eq!(start.id, LogId(want), "clicking row {click}");
+            assert_eq!(end.id, LogId(want), "clicking row {click}");
+            assert_eq!(start.offset, 0, "from the start of the message");
+            assert_eq!(end.offset, usize::MAX, "to the end of it");
         }
     }
 
@@ -2541,6 +2509,16 @@ mod tests {
             app.view_mode = case.view_mode;
             app.panes.logs = Rect::new(0, 0, 60, 20);
             app.panes.status = Some(Rect::new(60, 0, 40, 20));
+            // A frame's worth of rows to point at: a selection is a place in
+            // the log, so there has to be a log under the pointer.
+            app.log_pane_origin = (0, 0);
+            app.log_row_sources = (0..20u64)
+                .map(|row| logs::RowSource {
+                    id: LogId(row),
+                    offset: 0,
+                    indent: 0,
+                })
+                .collect();
 
             let mouse = |kind: MouseEventKind, column: u16| MouseEvent {
                 kind,
@@ -2548,9 +2526,22 @@ mod tests {
                 row: 5,
                 modifiers: KeyModifiers::NONE,
             };
-            handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10), &mut app);
-            handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30), &mut app);
-            handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 30), &mut app);
+            let store = LogStore::with_capacity(4);
+            handle_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), 10),
+                &mut app,
+                &store,
+            );
+            handle_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), 30),
+                &mut app,
+                &store,
+            );
+            handle_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), 30),
+                &mut app,
+                &store,
+            );
 
             assert_eq!(
                 app.log_selection.span().is_some(),
@@ -2862,7 +2853,11 @@ mod tests {
     #[test]
     fn swapping_the_record_takes_the_screen_state_with_it() {
         let mut app = app_with_service_state(ServiceState::Ready);
-        app.log_visible_ids = vec![LogId(3)];
+        app.log_row_sources = vec![logs::RowSource {
+            id: LogId(3),
+            offset: 0,
+            indent: 0,
+        }];
         app.log_visible_rows = vec!["api | hello".to_string()];
         app.mark_blank_after(LogId(3));
 
@@ -2876,7 +2871,7 @@ mod tests {
         // Enter would mark a line belonging to the record that is now hidden —
         // an id this store does not hold, so it renders nothing and Enter
         // reads as dead.
-        assert!(app.log_visible_ids.is_empty(), "and its own screen");
+        assert!(app.log_row_sources.is_empty(), "and its own screen");
         assert!(app.log_visible_rows.is_empty());
 
         app.swap_log_view();
@@ -3197,7 +3192,15 @@ mod tests {
             app.log_rows_above = case.rows_above;
             app.log_total_rows = case.total_rows;
             app.log_pane_height = 20;
-            app.log_visible_ids = case.visible.iter().map(|id| LogId(*id)).collect();
+            app.log_row_sources = case
+                .visible
+                .iter()
+                .map(|id| logs::RowSource {
+                    id: LogId(*id),
+                    offset: 0,
+                    indent: 0,
+                })
+                .collect();
             let mut store = LogStore::with_capacity(10);
 
             handle_normal_key(

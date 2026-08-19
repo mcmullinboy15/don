@@ -58,20 +58,63 @@ pub(crate) struct LogView<'a> {
     /// Wrapped rows, top of pane first, exactly `height` of them or fewer if
     /// the whole log is shorter than the pane.
     pub(crate) rows: Vec<Line<'a>>,
-    /// The log line each row came from, one per entry in `rows`.
+    /// Where each row came from, one per entry in `rows`.
     ///
-    /// A message can wrap across several rows, and the reader thinks of it as
-    /// one thing — triple-click selects the message, not the row it landed on.
     /// Reported by the code that did the wrapping rather than recovered later
     /// by looking at the text, which is a guess about layout the layout already
     /// knows the answer to.
-    pub(crate) row_ids: Vec<LogId>,
+    pub(crate) row_sources: Vec<RowSource>,
     /// Whether the view is pinned to the newest line.
     pub(crate) following: bool,
     /// Rows of admitted content above the top edge — the scrollbar's position.
     pub(crate) rows_above: usize,
     /// Total rows the admitted content occupies at this width.
     pub(crate) total_rows: usize,
+}
+
+/// What a rendered row is a view of: a place in the log, not a place on the
+/// screen.
+///
+/// A message can wrap across several rows, and the reader thinks of it as one
+/// thing — triple-click takes the message, not the row it landed on, and a
+/// selection is a range of *text*, which is why `offset` is here. Screen rows
+/// move under the reader constantly; `(id, offset)` does not move at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowSource {
+    /// The log line this row is part of.
+    pub(crate) id: LogId,
+    /// How many characters of that line's message come before this row.
+    pub(crate) offset: usize,
+    /// Columns of don's own prefix — the real one on a message's first row, an
+    /// indent on the rest — before the message starts.
+    pub(crate) indent: usize,
+}
+
+impl RowSource {
+    /// The message offset a screen column on this row points at.
+    ///
+    /// Columns inside the prefix clamp to the row's start: the name column is
+    /// don's furniture and pasting `api    │ ` in front of every line is never
+    /// what anyone wanted.
+    pub(crate) fn offset_at(self, column: usize) -> usize {
+        self.offset + column.saturating_sub(self.indent)
+    }
+}
+
+/// Message characters one row can hold at this width, and the prefix width the
+/// pane actually used.
+///
+/// Mirrors the degenerate-width fallback in [`wrap_line`]: a pane too narrow to
+/// hold the prefix and anything else drops the prefix, and the offsets have to
+/// agree with the rows that produced them.
+pub(crate) fn row_metrics(prefix_cols: usize, width: u16) -> (usize, usize) {
+    let width = usize::from(width.max(1));
+    let indent = if prefix_cols + 1 >= width {
+        0
+    } else {
+        prefix_cols
+    };
+    (width - indent, indent)
 }
 
 /// The left column on a row that is a continuation of the row above.
@@ -221,23 +264,31 @@ pub(crate) fn build_view<'a>(
     // Only the visible window is wrapped, and only from the line that owns the
     // top row — no walk of everything above it.
     let mut rows: Vec<Line<'a>> = Vec::with_capacity(height);
-    let mut row_ids: Vec<LogId> = Vec::with_capacity(height);
+    let mut row_sources: Vec<RowSource> = Vec::with_capacity(height);
     if let Some((first_id, skip_within)) = index.line_at(rows_above) {
         let mut skip = usize::from(skip_within);
         for entry in index.ids_from(first_id).filter_map(|id| store.get(id)) {
             let mut line_rows = wrap_line(&entry.parsed, entry.prefix_cols(), width);
+            let (per_row, indent) = row_metrics(entry.prefix_cols(), width);
+            let wrapped_rows = line_rows.len();
             // The blank the reader asked for belongs to this line, so it scrolls
             // with it and the index counted it as one of its rows.
             for _ in 0..blanks.get(&entry.id).copied().unwrap_or(0) {
                 line_rows.push(Line::default());
             }
-            for wrapped in line_rows.into_iter().skip(skip) {
+            for (row, wrapped) in line_rows.into_iter().enumerate().skip(skip) {
                 rows.push(wrapped);
-                row_ids.push(entry.id);
+                row_sources.push(RowSource {
+                    id: entry.id,
+                    // A blank the reader asked for is not part of the message,
+                    // so it points at the end of it rather than past it.
+                    offset: row.min(wrapped_rows.saturating_sub(1)) * per_row,
+                    indent,
+                });
                 if rows.len() == height {
                     return LogView {
                         rows,
-                        row_ids,
+                        row_sources,
                         following: matches!(scroll, Scroll::Follow),
                         rows_above,
                         total_rows,
@@ -250,7 +301,7 @@ pub(crate) fn build_view<'a>(
 
     LogView {
         rows,
-        row_ids,
+        row_sources,
         following: matches!(scroll, Scroll::Follow),
         rows_above,
         total_rows,
@@ -806,7 +857,7 @@ mod tests {
             );
             assert_eq!(
                 view.rows.len(),
-                view.row_ids.len(),
+                view.row_sources.len(),
                 "step {step}: a row id per row"
             );
             // Every row the index says is on screen must actually be painted.
@@ -831,7 +882,7 @@ mod tests {
                 0 => scroll = Scroll::Follow,
                 1 => scroll = anchor_at(&index, roll(view.total_rows.max(1))),
                 2 => {
-                    if let Some(&id) = view.row_ids.last() {
+                    if let Some(id) = view.row_sources.last().map(|s| s.id) {
                         let count = blanks.entry(id).or_insert(0);
                         *count = count.saturating_add(1);
                     }

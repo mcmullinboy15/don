@@ -57,17 +57,6 @@ fn inner(area: Rect) -> Rect {
     )
 }
 
-/// The log pane's top-left text corner, for a caller working in screen
-/// coordinates — the selection, which needs to know where column zero is.
-pub(crate) fn log_pane_origin(
-    area: Rect,
-    panel: super::panes::Panel,
-    panel_open: bool,
-) -> (u16, u16) {
-    let text = log_text_area(area, panel, panel_open);
-    (text.x, text.y)
-}
-
 /// Width available to log text, which is what the store wraps against.
 pub(crate) fn log_pane_width(area: Rect, panel: super::panes::Panel, panel_open: bool) -> u16 {
     log_text_area(area, panel, panel_open).width.max(1)
@@ -326,27 +315,6 @@ fn draw_log_pane(
         area.height,
     );
     app.view_index = index;
-
-    // Move the selection with the text it was dragged across.
-    //
-    // Scrolling, output arriving and eviction all shift every admitted row by
-    // the same amount, and that amount is the change in `rows_above` — so one
-    // subtraction keeps the highlight on the same characters. A reflow is the
-    // exception: a new width or a new filter moves different rows by different
-    // amounts, and there is no single shift that is right, so the selection
-    // goes rather than landing somewhere arbitrary.
-    let reflowed = app.selection_laid_out_against != Some((key, area.x, area.y));
-    if reflowed {
-        app.log_selection.clear();
-        app.follow_paused_for_selection = false;
-        app.selection_laid_out_against = Some((key, area.x, area.y));
-    } else {
-        let moved = i64::try_from(app.log_rows_above).unwrap_or(0)
-            - i64::try_from(view.rows_above).unwrap_or(0);
-        app.log_selection
-            .shift_rows(i32::try_from(moved).unwrap_or(0));
-    }
-
     // Remembered for the input layer: scrolling needs to know how far it can
     // go, and only the renderer knows how tall the pane came out.
     app.log_rows_above = view.rows_above;
@@ -374,7 +342,7 @@ fn draw_log_pane(
                 .collect::<String>()
         })
         .collect();
-    app.log_visible_ids = view.row_ids.clone();
+    app.log_row_sources = view.row_sources.clone();
     app.log_pane_origin = (area.x, area.y);
 
     let selection = app.log_selection;
@@ -383,11 +351,8 @@ fn draw_log_pane(
     } else {
         view.rows
             .into_iter()
-            .enumerate()
-            .map(|(index, line)| {
-                let row = area.y + u16::try_from(index).unwrap_or(u16::MAX);
-                highlight_selected(line, &selection, area.x, row)
-            })
+            .zip(view.row_sources)
+            .map(|(line, source)| highlight_selected(line, &selection, source))
             .collect()
     };
     frame.render_widget(Paragraph::new(rows), area);
@@ -410,23 +375,25 @@ fn draw_log_pane(
 fn highlight_selected<'a>(
     line: Line<'a>,
     selection: &super::selection::Selection,
-    origin_x: u16,
-    row: u16,
+    source: super::logs::RowSource,
 ) -> Line<'a> {
     let mut out: Vec<Span<'a>> = Vec::with_capacity(line.spans.len());
-    let mut column = origin_x;
+    // Columns within the row, so the prefix is simply below the message's
+    // first offset and never selectable.
+    let mut column = 0usize;
     for span in line.spans {
         let mut run = String::new();
         let mut run_selected: Option<bool> = None;
         for ch in span.content.chars() {
-            let selected = selection.contains(column, row);
+            let selected = column >= source.indent
+                && selection.contains(super::selection::Point::at(source, column));
             if run_selected != Some(selected) && !run.is_empty() {
                 out.push(styled_run(&run, span.style, run_selected == Some(true)));
                 run.clear();
             }
             run_selected = Some(selected);
             run.push(ch);
-            column = column.saturating_add(1);
+            column += 1;
         }
         if !run.is_empty() {
             out.push(styled_run(&run, span.style, run_selected == Some(true)));

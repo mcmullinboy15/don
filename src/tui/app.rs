@@ -145,26 +145,6 @@ pub(crate) struct StashedView {
     pub(crate) blank_epoch: u64,
 }
 
-/// The run of visible rows that belong to the same message as row `index`.
-///
-/// A message that wrapped is one thing to the reader, so triple-click selects
-/// the run, not the row it landed on.
-///
-/// Only what is on screen: a message running off an edge is taken as far as it
-/// is visible. Returns `None` when `index` is outside the row list.
-pub(crate) fn message_run(ids: &[crate::output::LogId], index: usize) -> Option<(usize, usize)> {
-    let id = *ids.get(index)?;
-    let first = ids[..index]
-        .iter()
-        .rposition(|other| *other != id)
-        .map_or(0, |before| before + 1);
-    let last = ids[index..]
-        .iter()
-        .position(|other| *other != id)
-        .map_or(ids.len() - 1, |after| index + after - 1);
-    Some((first, last))
-}
-
 /// An attached process on screen: which one, where its window is, and the
 /// last grid its emulator produced.
 ///
@@ -405,15 +385,11 @@ pub(crate) struct App {
     /// The plain text of the rows the last frame drew, and where the pane
     /// started. Written by the renderer so a copy resolves against exactly what
     /// was on screen rather than re-deriving wrapping, filtering and scroll.
-    /// The geometry the live selection's screen rows were measured against:
-    /// the view key (width and filter) and the pane's origin. When any of it
-    /// moves, the rows mean something else — see the note in `draw_log_pane`.
-    pub(crate) selection_laid_out_against: Option<(super::view_index::ViewKey, u16, u16)>,
     pub(crate) log_visible_rows: Vec<String>,
     /// The log line each visible row belongs to, parallel to
     /// `log_visible_rows`. Lets a triple-click take the whole message when it
     /// wrapped across several rows.
-    pub(crate) log_visible_ids: Vec<crate::output::LogId>,
+    pub(crate) log_row_sources: Vec<super::logs::RowSource>,
     pub(crate) log_pane_origin: (u16, u16),
     /// Geometry the last frame produced, so the input layer can move the
     /// scroll anchor without re-deriving what only the renderer knows: how
@@ -551,9 +527,8 @@ impl App {
             copy_notice: None,
             last_click: None,
             follow_paused_for_selection: false,
-            selection_laid_out_against: None,
             log_visible_rows: Vec::new(),
-            log_visible_ids: Vec::new(),
+            log_row_sources: Vec::new(),
             log_pane_origin: (0, 0),
             pending_scroll: PendingScroll::default(),
             blank_after: HashMap::new(),
@@ -624,7 +599,7 @@ impl App {
         // mark to a line id belonging to the store that is no longer in front
         // — where it renders nothing, so Enter reads as dead.
         self.log_visible_rows.clear();
-        self.log_visible_ids.clear();
+        self.log_row_sources.clear();
         // A selection is screen coordinates over content that is about to be
         // entirely different text.
         self.log_selection.clear();

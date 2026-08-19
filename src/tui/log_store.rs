@@ -92,6 +92,21 @@ impl StoredLogLine {
     pub(crate) fn prefix_cols(&self) -> usize {
         self.prefix_cols
     }
+
+    /// The message as plain text, without don's `name │ ` column.
+    ///
+    /// Taken from the parsed form rather than the raw bytes so the offsets it
+    /// yields are the ones the pane laid out — the raw bytes still carry the
+    /// escape sequences that became styles, and counting through those would
+    /// put every offset past the first colour in the wrong place.
+    pub(crate) fn message_text(&self) -> String {
+        self.parsed
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .skip(self.prefix_cols)
+            .collect()
+    }
 }
 
 impl LogStore {
@@ -194,12 +209,6 @@ impl LogStore {
             entry.wrapped_rows =
                 super::logs::count_wrapped_rows(&entry.parsed, entry.prefix_cols, width);
         }
-    }
-
-    /// Columns the name column occupies, for a caller laying out over the same
-    /// grid — the selection, which must not reach into it.
-    pub(crate) fn name_column(&self) -> usize {
-        self.name_column
     }
 
     /// Iterate oldest-first over everything held.
