@@ -85,9 +85,23 @@ pub(crate) async fn attach_handler(
             .into_response();
     }
 
+    // The size this attach will settle on, worked out before attaching
+    // because the repaint is rendered against it — see `AttachControl::attach`.
+    // The session cannot be registered yet: registering it needs the gate,
+    // which is what attaching hands back.
+    let pending_size = {
+        let map = state.attach_sessions.lock().await;
+        let mut sizes = map
+            .get(&name)
+            .map(|sessions| sessions.sizes.clone())
+            .unwrap_or_default();
+        sizes.insert(u64::MAX, (params.cols, params.rows));
+        effective_size(&sizes).unwrap_or((params.cols, params.rows))
+    };
+
     // Attach straight through the process's output state — the supervisor
     // registered the live spawn's gate there; no runner round trip.
-    let session = match state.attach.attach(&name, params.pid).await {
+    let session = match state.attach.attach(&name, params.pid, pending_size).await {
         Ok(session) => session,
         Err(e) => {
             let status = match e {
@@ -104,6 +118,7 @@ pub(crate) async fn attach_handler(
     };
 
     let pty_input = session.pty_input;
+    let repaint = session.repaint;
     let output_rx = session.output_rx;
     // Detach-on-drop: however the bridge task ends, releasing this guard is
     // what decrements the client count and resumes prefixed stdout.
@@ -141,7 +156,7 @@ pub(crate) async fn attach_handler(
         };
 
         let io = hyper_util::rt::TokioIo::new(upgraded);
-        bridge_raw(io, pty_input, output_rx).await;
+        bridge_raw(io, pty_input, repaint, output_rx).await;
 
         end_session(&state_clone, &name_clone, session_id).await;
     });
@@ -226,6 +241,7 @@ pub(crate) async fn resize_handler(
 async fn bridge_raw<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     io: S,
     pty_input: mpsc::Sender<crate::output::PtyInput>,
+    repaint: Option<bytes::Bytes>,
     mut output_rx: mpsc::Receiver<crate::output::SinkLine>,
 ) {
     use crate::output::PtyInput;
@@ -237,6 +253,14 @@ async fn bridge_raw<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
     // Task: output_rx → client (raw bytes) + OSC detection.
     let output_to_client = async move {
+        // The screen as it stood when this session's stream was cut, ahead of
+        // the first live byte — otherwise the client starts from a blank
+        // screen and only learns what the process wrote next.
+        if let Some(frame) = repaint
+            && io_write.write_all(&frame).await.is_err()
+        {
+            return;
+        }
         while let Some(sink_line) = output_rx.recv().await {
             for response in crate::output::osc::find_responses(&sink_line.line) {
                 let _ = osc_tx.try_send(bytes::Bytes::from_static(response));

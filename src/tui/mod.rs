@@ -369,6 +369,11 @@ pub async fn run_tui(
                     .map(|(n, _)| n.clone())
                     .collect();
                 app.filter.set_hidden_from_display(lazy);
+                // A task that declared itself interactive may have just
+                // started, or the one whose window is open may have just
+                // finished. Both are decided in `app`, and settled here.
+                let area: Rect = terminal.size()?.into();
+                settle_attach(&mut app, &mut attach, &client, &controls, &input_tx, area).await;
                 dirty = true;
             }
             maybe_event = input_rx.recv(), if input_open => {
@@ -415,38 +420,10 @@ pub async fn run_tui(
                         if app.exit_requested {
                             break;
                         }
-                        if let Some(name) = app.bridge_request.take() {
-                            // The window draws on don's own screen and takes
-                            // its input off the stream this loop is already
-                            // reading, so nothing is handed over: no terminal
-                            // teardown, no second reader of stdin.
-                            let window = attach_window::WindowRect::centred_in(area);
-                            let (cols, rows) = window.grid_size();
-                            match attach_session::start(
-                                client.socket_path(),
-                                &name,
-                                cols,
-                                rows,
-                                input_tx.clone(),
-                            )
-                            .await
-                            {
-                                Ok(session) => {
-                                    app.attach = Some(app::AttachView {
-                                        name: name.clone(),
-                                        window,
-                                        grid: None,
-                                        ended: false,
-                                    });
-                                    attach = Some(session);
-                                }
-                                Err(e) => {
-                                    controls
-                                        .lifecycle_emitter
-                                        .lifecycle_event(&format!("attach '{name}' failed: {e}"));
-                                }
-                            }
-                        }
+                        settle_attach(
+                            &mut app, &mut attach, &client, &controls, &input_tx, area,
+                        )
+                        .await;
                     }
                     None => input_open = false,
                 }
@@ -1046,6 +1023,50 @@ fn resize_process_grid(
     );
 }
 
+/// Open or close the attach window, if anything has asked for it.
+///
+/// The decision is `app`'s — a key the reader pressed, or an interactive task
+/// starting or finishing — and the session is the loop's, so the two meet here.
+/// Called from both arms that can move that state, because an interactive task
+/// starting is a runner event and pressing `a` is an input one.
+async fn settle_attach(
+    app: &mut App,
+    attach: &mut Option<attach_session::Session>,
+    client: &std::sync::Arc<Client>,
+    controls: &TuiControls,
+    input_tx: &mpsc::Sender<AppEvent>,
+    area: Rect,
+) {
+    if std::mem::take(&mut app.attach_dismiss_requested) {
+        end_attach(app, attach);
+    }
+    let Some(name) = app.bridge_request.take() else {
+        return;
+    };
+    // The window draws on don's own screen and takes its input off the stream
+    // this loop is already reading, so nothing is handed over: no terminal
+    // teardown, no second reader of stdin.
+    let window = attach_window::WindowRect::centred_in(area);
+    let (cols, rows) = window.grid_size();
+    match attach_session::start(client.socket_path(), &name, cols, rows, input_tx.clone()).await {
+        Ok(session) => {
+            app.attach = Some(app::AttachView {
+                name: name.clone(),
+                window,
+                grid: None,
+                ended: false,
+            });
+            *attach = Some(session);
+        }
+        Err(e) => {
+            app.attach_opened_automatically = false;
+            controls
+                .lifecycle_emitter
+                .lifecycle_event(&format!("attach '{name}' failed: {e}"));
+        }
+    }
+}
+
 /// Whether the window on screen is a record rather than a live terminal.
 fn attach_ended(app: &App) -> bool {
     app.attach.as_ref().is_some_and(|view| view.ended)
@@ -1057,6 +1078,7 @@ fn end_attach(app: &mut App, attach: &mut Option<attach_session::Session>) {
         session.shutdown();
     }
     app.attach = None;
+    app.attach_opened_automatically = false;
 }
 
 /// Leave whatever view is up: back to the plain log, keys back to the log.
@@ -2182,6 +2204,22 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
+    /// An app that knows about one task, interactive or not.
+    fn app_with_interactive_task(name: &str, interactive: bool) -> App {
+        let toml = format!("[tasks.{name}]\ncmd = \"true\"\ninteractive = {interactive}\n");
+        let config: crate::config::Config = toml.parse().unwrap();
+        App::new(AppInit {
+            service_names: Vec::new(),
+            task_names: vec![name.to_string()],
+            build_tool_names: Vec::new(),
+            task_configs: config.tasks.clone().into_iter().collect(),
+            task_last_runs: HashMap::new(),
+            hidden_names: HashSet::new(),
+            auto_filter_on_failure_names: HashSet::new(),
+            cli_log_filter: None,
+        })
+    }
+
     fn app_with_service_state(state: ServiceState) -> App {
         let mut app = App::new(AppInit {
             service_names: vec!["api".to_string()],
@@ -2647,6 +2685,126 @@ mod tests {
     }
 
     use crate::output::LogId;
+
+    /// A task that says it wants a human gets the window opened for it, and
+    /// gets it closed again when it succeeds. `interactive = true` used to
+    /// print "run `don attach x`" and leave the reader to do it — a strange
+    /// thing to ask of someone already watching the screen it would open on.
+    #[test]
+    fn an_interactive_task_opens_and_closes_its_own_window() {
+        struct Case {
+            name: &'static str,
+            /// What the run settles into.
+            finished: crate::client::TaskState,
+            want_dismiss: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "success takes the window with it",
+                finished: crate::client::TaskState::Completed,
+                want_dismiss: true,
+            },
+            Case {
+                // The last screen a failed task drew is the reason it failed.
+                name: "failure keeps it up to be read",
+                finished: crate::client::TaskState::Failed,
+                want_dismiss: false,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_interactive_task("conf-init", true);
+            app.apply_task_state(
+                "conf-init".to_string(),
+                crate::client::TaskState::Running,
+                None,
+                Vec::new(),
+            );
+            assert_eq!(
+                app.bridge_request.as_deref(),
+                Some("conf-init"),
+                "{}: the window is asked for",
+                case.name
+            );
+            assert!(app.attach_opened_automatically, "{}", case.name);
+
+            // The loop would have opened it; stand in for that.
+            let name = app.bridge_request.take().unwrap();
+            app.attach = Some(app::AttachView {
+                name,
+                window: attach_window::WindowRect::centred_in(Rect::new(0, 0, 80, 24)),
+                grid: None,
+                ended: false,
+            });
+
+            app.apply_task_state("conf-init".to_string(), case.finished, None, Vec::new());
+            assert_eq!(
+                app.attach_dismiss_requested, case.want_dismiss,
+                "{}: dismissed?",
+                case.name
+            );
+        }
+    }
+
+    /// The window opens for a task that asked for it, and for nothing else —
+    /// and never over an attach the reader chose.
+    #[test]
+    fn nothing_else_opens_a_window_by_itself() {
+        // An ordinary task runs without one.
+        let mut plain = app_with_interactive_task("build", false);
+        plain.apply_task_state(
+            "build".to_string(),
+            crate::client::TaskState::Running,
+            None,
+            Vec::new(),
+        );
+        assert!(
+            plain.bridge_request.is_none(),
+            "an ordinary task opens nothing"
+        );
+
+        // An attach already on screen is not replaced: one the reader asked
+        // for outranks one nobody did.
+        let mut busy = app_with_interactive_task("conf-init", true);
+        busy.attach = Some(app::AttachView {
+            name: "something-else".to_string(),
+            window: attach_window::WindowRect::centred_in(Rect::new(0, 0, 80, 24)),
+            grid: None,
+            ended: false,
+        });
+        busy.apply_task_state(
+            "conf-init".to_string(),
+            crate::client::TaskState::Running,
+            None,
+            Vec::new(),
+        );
+        assert!(
+            busy.bridge_request.is_none(),
+            "an open window is not stolen"
+        );
+
+        // Re-publishing the same state is not a fresh start, so a window the
+        // reader detached from does not spring back.
+        let mut again = app_with_interactive_task("conf-init", true);
+        again.apply_task_state(
+            "conf-init".to_string(),
+            crate::client::TaskState::Running,
+            None,
+            Vec::new(),
+        );
+        again.bridge_request = None;
+        again.apply_task_state(
+            "conf-init".to_string(),
+            crate::client::TaskState::Running,
+            None,
+            Vec::new(),
+        );
+        assert!(
+            again.bridge_request.is_none(),
+            "only the transition into running opens one"
+        );
+    }
 
     /// The marks are bookkeeping over lines the store still holds, and the
     /// index is keyed on them — so both the key and the map have to behave

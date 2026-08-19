@@ -118,9 +118,13 @@ impl EmulatorHandle {
         });
     }
 
-    /// Render a process's current screen. `None` when the process has no screen
-    /// (never registered, or the emulator backend failed) or the thread is
-    /// gone.
+    /// Render a process's current screen. `None` when the process has no
+    /// screen, or the thread is gone.
+    ///
+    /// Test-only. Production asks through the output actor instead, which is
+    /// what orders the request against the bytes the attach sink will and will
+    /// not receive — see `OutputMsg::AttachSink`.
+    #[cfg(test)]
     pub(crate) async fn repaint(&self, name: &str) -> Option<RepaintFrame> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx

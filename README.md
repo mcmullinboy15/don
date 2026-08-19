@@ -211,10 +211,20 @@ interactive = true
 ```
 
 Every task already runs on a PTY and any task can be reached with `don attach
-<task>`, so this doesn't change how the task runs. It changes what Don *says*:
-a task blocked on input is indistinguishable from a task that has hung, so
-Don announces `waiting for input — run 'don attach console'` rather than
-letting it sit there looking stuck.
+<task>`, so this doesn't change how the task runs. It changes who has to do
+something about it. In the TUI, an interactive task **opens its own attach
+window** when it starts and closes it again when it succeeds — you answer the
+prompt where you were already looking. If it fails, the window stays up, dimmed
+and titled with the outcome, so its last screen is still there to read; any key
+dismisses it. Outside the TUI there is no client to attach, so Don says
+`waiting for input — run 'don attach console'` instead, because a task blocked
+on input is otherwise indistinguishable from one that has hung.
+
+`terminal = "foreground"` is the older spelling of `interactive = true` and
+still works. It named a mechanism Don no longer has — a task taking the
+terminal away from everything else — but what it was *for* outlived the
+mechanism, so a config that still says it keeps working. `terminal = "muxed"`
+is the ordinary case and means `interactive = false`.
 
 A process that takes the terminal's **alternate screen** — vim, htop, lazygit,
 anything full-screen — is detected regardless of how it's configured. Its
@@ -813,7 +823,8 @@ See [`examples/`](examples/) for complete working configs.
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
 | `reload` | bool | Service-level master switch for Don-managed watches, rebuilds, and restarts (default: true) |
 | `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
-| `interactive` | bool | (tasks) `true` when the task waits for a human at its terminal (default: false) |
+| `interactive` | bool | (tasks) `true` when the task waits for a human at its terminal; the TUI opens its attach window (default: false) |
+| `terminal` | string | (tasks) Older spelling of `interactive`: `"foreground"` = `true`, `"muxed"` = `false` |
 | `params` | [[table]] | (tasks) Declare run-time parameters for interactive tasks |
 | `params.name` | string | Parameter name, referenced as `{{name}}` and passed as `--name=value` |
 | `params.prompt` | string | Optional prompt shown in the TUI form |

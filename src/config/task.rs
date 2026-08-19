@@ -212,6 +212,54 @@ impl Task {
 mod tests {
     use super::*;
 
+    /// `terminal = "foreground"` is the older spelling of `interactive = true`.
+    /// It named a mechanism don no longer has, but the intent outlived the
+    /// mechanism, so a config that still says it is honoured rather than
+    /// rejected.
+    #[test]
+    fn terminal_is_read_as_the_interactive_it_became() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            want: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "foreground wanted a human at the terminal",
+                toml: "[tasks.console]\ncmd = \"vim\"\nterminal = \"foreground\"\n",
+                want: true,
+            },
+            Case {
+                name: "muxed was the ordinary case, and still is",
+                toml: "[tasks.console]\ncmd = \"true\"\nterminal = \"muxed\"\n",
+                want: false,
+            },
+            Case {
+                name: "the table spelling, whose screen key has no successor",
+                toml: "[tasks.console]\ncmd = \"vim\"\nterminal = { mode = \"foreground\", screen = \"alternate\" }\n",
+                want: true,
+            },
+            Case {
+                name: "a table with no mode is the default",
+                toml: "[tasks.console]\ncmd = \"true\"\nterminal = { screen = \"main\" }\n",
+                want: false,
+            },
+            Case {
+                // Mid-migration: the current key is the one to believe.
+                name: "an explicit interactive wins over the old spelling",
+                toml: "[tasks.console]\ncmd = \"vim\"\nterminal = \"muxed\"\ninteractive = true\n",
+                want: true,
+            },
+        ];
+
+        for case in cases {
+            let config: crate::config::Config = case.toml.parse().unwrap();
+            let task = config.tasks.get("console").unwrap();
+            assert_eq!(task.interactive, case.want, "{}", case.name);
+        }
+    }
+
     #[test]
     fn a_task_is_not_interactive_unless_it_says_so() {
         struct Case {

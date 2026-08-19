@@ -186,15 +186,24 @@ log = "ignore"
 | `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
 | `interactive` | bool | `false` (default). `true` says the task waits for a human at its terminal |
+| `terminal` | string | Older spelling of `interactive`: `"foreground"` = `true`, `"muxed"` = `false` |
 | `headless` | table | Optional `cmd` and/or `args` overrides for non-TUI runs |
 
 Every task runs on a PTY and every task can be reached with `don attach`, so
 `interactive` changes nothing about how a task is spawned or where its output
 goes. It exists because it is the one thing Don cannot work out for itself: a
-task blocked reading stdin looks exactly like a task that has hung. Declaring
-it is what lets Don say `waiting for input — run 'don attach <task>'` instead
-of leaving the user to guess. Use it for REPLs, editors, interactive
-migrations, and prompting deploy scripts:
+task blocked reading stdin looks exactly like a task that has hung.
+
+Declaring it is what lets the TUI open the task's attach window when it starts
+and close it again when it succeeds — a failed one keeps its window, since its
+last screen is the reason it failed. Without a TUI there is nothing to attach,
+so Don says `waiting for input — run 'don attach <task>'` instead. Use it for
+REPLs, editors, interactive migrations, and prompting deploy scripts:
+
+`terminal = "foreground"` is accepted as the older spelling of `interactive =
+true`, and `"muxed"` as `false`. The mechanism it named — one task owning the
+terminal — is gone; the declaration it carried is not, so configs predating the
+rename keep working rather than being rejected.
 
 ```toml
 [tasks.console]

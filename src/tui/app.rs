@@ -297,6 +297,13 @@ pub(crate) struct App {
     /// PTY. Consumed by the main loop, which tears the TUI down, runs the
     /// bridge, and rebuilds.
     pub(crate) bridge_request: Option<String>,
+    /// Whether the window on screen opened itself rather than being asked for.
+    /// Only an automatic one closes itself again.
+    pub(crate) attach_opened_automatically: bool,
+    /// The loop should close the attach window. Set from here, acted on there,
+    /// like [`Self::bridge_request`] — this side has the state that decides,
+    /// that side owns the session.
+    pub(crate) attach_dismiss_requested: bool,
     /// The process whose screen is in the floating window, and where that
     /// window sits. `None` when nothing is attached.
     pub(crate) attach: Option<AttachView>,
@@ -503,6 +510,8 @@ impl App {
         Self {
             exit_requested: false,
             bridge_request: None,
+            attach_opened_automatically: false,
+            attach_dismiss_requested: false,
             attach: None,
             counts,
             view_mode: ViewMode::Normal,
@@ -872,6 +881,47 @@ impl App {
     /// The session is left running. Anything still in flight keeps landing in
     /// the grid, so marking the window ended can never clip the last thing the
     /// process wrote; the connection is closed when the reader dismisses it.
+    /// A task that declared it wants a human has started running.
+    ///
+    /// `interactive = true` — and the `terminal = "foreground"` it grew out of
+    /// — says the task will sit there waiting for input. don used to answer
+    /// that by printing "run `don attach x`" and leaving the reader to do it,
+    /// which is a strange thing to ask of someone watching the screen the task
+    /// is already on. The window opens itself instead.
+    ///
+    /// Only on the transition into `Running`, and only when nothing else is
+    /// attached: an attach the reader asked for outranks one nobody did, and
+    /// a window they detached from must not spring back.
+    fn note_interactive_task_started(&mut self, name: &str) {
+        if self.attach.is_some() || self.bridge_request.is_some() {
+            return;
+        }
+        if !self
+            .task_configs
+            .get(name)
+            .is_some_and(|task| task.interactive)
+        {
+            return;
+        }
+        self.bridge_request = Some(name.to_string());
+        self.attach_opened_automatically = true;
+    }
+
+    /// A task whose window opened itself has stopped running.
+    ///
+    /// Success takes the window with it: it opened to let the reader answer a
+    /// prompt, the prompt is answered, and making them dismiss it would be one
+    /// more keypress for something they already watched happen. Failure keeps
+    /// it, because the last screen a failed task drew is the reason it failed.
+    fn note_auto_attached_task_finished(&mut self, name: &str, state: TaskState) {
+        if !self.attach_opened_automatically || state == TaskState::Failed {
+            return;
+        }
+        if self.attach.as_ref().is_some_and(|view| view.name == name) {
+            self.attach_dismiss_requested = true;
+        }
+    }
+
     fn note_attached_process_gone(&mut self, name: &str) {
         if let Some(view) = self.attach.as_mut()
             && view.name == name
@@ -890,9 +940,13 @@ impl App {
         let filter_changed = state == TaskState::Failed
             && self.auto_filter_on_failure_names.contains(&name)
             && self.filter.select_name(&name);
-        self.tasks_state.insert(name.clone(), state);
+        let was = self.tasks_state.insert(name.clone(), state);
+        if state == TaskState::Running && was != Some(TaskState::Running) {
+            self.note_interactive_task_started(&name);
+        }
         if !matches!(state, TaskState::Running | TaskState::Building) {
             self.note_attached_process_gone(&name);
+            self.note_auto_attached_task_finished(&name, state);
         }
         self.apply_failed_dependencies(name.clone(), failed_dependencies);
         if let Some(last_run) = last_run {

@@ -91,8 +91,9 @@ impl std::str::FromStr for Config {
     type Err = toml::de::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value: toml::Value = toml::from_str(s)?;
+        let mut value: toml::Value = toml::from_str(s)?;
         reject_removed_keys(&value).map_err(serde::de::Error::custom)?;
+        apply_compat_keys(&mut value).map_err(serde::de::Error::custom)?;
         value.try_into()
     }
 }
@@ -103,20 +104,62 @@ impl std::str::FromStr for Config {
 /// whose `don.toml` still says `turbo.task = "dev"` is told the service
 /// "must have one of: bazel, docker, rust, go, or run" — true, and useless
 /// about why a config that worked yesterday doesn't today.
-const REMOVED_KEYS: &[(&str, &str)] = &[
-    (
-        "turbo",
-        "Turborepo support has been removed. Replace it with a `run` command \
+const REMOVED_KEYS: &[(&str, &str)] = &[(
+    "turbo",
+    "Turborepo support has been removed. Replace it with a `run` command \
          (plus `build` if you need one), or use the bazel preset.",
-    ),
-    (
-        "terminal",
-        "Every task runs on a PTY and any task can be reached with \
-         `don attach`, so there is no terminal to hand over. Use \
-         `interactive = true` to say a task waits for a human, which is what \
-         `terminal = \"foreground\"` had come to mean.",
-    ),
-];
+)];
+
+/// Fold spellings don has replaced into the ones it reads, in place.
+///
+/// `terminal = "foreground"` is the older way of saying `interactive = true`.
+/// It named a mechanism don no longer has — a task taking the terminal away
+/// from everything else — but the *intent* survived the mechanism, and a
+/// config that says it is still saying something true: this task wants a human
+/// at a keyboard. So it is honoured rather than rejected, and honoured by
+/// rewriting it into today's key rather than by carrying two fields that mean
+/// one thing.
+///
+/// `screen` had no successor and is ignored: there is no takeover to choose a
+/// screen for.
+fn apply_compat_keys(value: &mut toml::Value) -> Result<(), String> {
+    let Some(tasks) = value.get_mut("tasks").and_then(toml::Value::as_table_mut) else {
+        return Ok(());
+    };
+    for (name, task) in tasks.iter_mut() {
+        let Some(table) = task.as_table_mut() else {
+            continue;
+        };
+        let Some(terminal) = table.remove("terminal") else {
+            continue;
+        };
+        let mode = match &terminal {
+            toml::Value::String(mode) => Some(mode.as_str()),
+            toml::Value::Table(table) => match table.get("mode") {
+                Some(toml::Value::String(mode)) => Some(mode.as_str()),
+                // A table with no mode is the default, which is muxed.
+                None => Some("muxed"),
+                Some(_) => None,
+            },
+            _ => None,
+        };
+        let interactive = match mode {
+            Some("foreground") => true,
+            Some("muxed") => false,
+            _ => {
+                return Err(format!(
+                    "task '{name}': unknown terminal value {terminal}, expected \"muxed\" or \
+                     \"foreground\". `terminal` is the older spelling of `interactive`; \
+                     `foreground` means `interactive = true`"
+                ));
+            }
+        };
+        // An explicit `interactive` is the current key and the one the reader
+        // most likely meant; a config carrying both is mid-migration.
+        table.entry("interactive").or_insert(interactive.into());
+    }
+    Ok(())
+}
 
 /// Reject a config that still uses a removed key, by name and location.
 fn reject_removed_keys(value: &toml::Value) -> Result<(), String> {
@@ -205,6 +248,9 @@ impl Config {
         }
 
         reject_removed_keys(&value).map_err(|error| ConfigError::Validation {
+            errors: vec![error],
+        })?;
+        apply_compat_keys(&mut value).map_err(|error| ConfigError::Validation {
             errors: vec![error],
         })?;
         Ok(value.try_into()?)
@@ -3156,19 +3202,19 @@ mod tests {
                 want_fragment: Some("task 'build': 'turbo' is no longer supported"),
             },
             Case {
-                name: "the terminal key, in either spelling",
-                input: "[tasks.console]\ncmd = \"true\"\nterminal = \"foreground\"\n",
-                want_fragment: Some("task 'console': 'terminal' is no longer supported"),
-            },
-            Case {
-                name: "the terminal key as a table",
-                input: "[tasks.console]\ncmd = \"true\"\nterminal = { mode = \"muxed\" }\n",
-                want_fragment: Some("`interactive = true`"),
-            },
-            Case {
-                name: "the key that replaced it parses",
+                name: "the key that replaced terminal parses",
                 input: "[tasks.console]\ncmd = \"true\"\ninteractive = true\n",
                 want_fragment: None,
+            },
+            Case {
+                name: "and so does terminal itself",
+                input: "[tasks.console]\ncmd = \"true\"\nterminal = \"foreground\"\n",
+                want_fragment: None,
+            },
+            Case {
+                name: "a terminal value that never existed is still an error",
+                input: "[tasks.console]\ncmd = \"true\"\nterminal = \"tmux\"\n",
+                want_fragment: Some("expected \"muxed\" or \"foreground\""),
             },
             Case {
                 name: "bazel is untouched",

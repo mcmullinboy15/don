@@ -164,11 +164,24 @@ enum OutputMsg {
         live_capacity: usize,
         reply: oneshot::Sender<mpsc::Receiver<SinkLine>>,
     },
-    /// A fresh attach sink, preloaded with one frame of repaint bytes.
-    RepaintSink {
-        frame: Bytes,
+    /// A fresh attach sink, plus a repaint of the screen as it stood the
+    /// instant that sink was added.
+    ///
+    /// Both halves are cut at the same point *by this actor*, which is the
+    /// whole reason it does the asking. The repaint used to be fetched by the
+    /// caller and handed in, leaving a window between the snapshot and the
+    /// sink landing: anything the process wrote in it reached the screen and
+    /// the log but never the client, so attaching to something that printed
+    /// once and waited — a prompt — showed an empty window about one time in
+    /// five. Here the request to the emulator is queued behind exactly the
+    /// bytes this sink will not receive, because the same thread that fans
+    /// bytes out is the one issuing it.
+    AttachSink {
         capacity: usize,
-        reply: oneshot::Sender<mpsc::Receiver<SinkLine>>,
+        reply: oneshot::Sender<(
+            mpsc::Receiver<SinkLine>,
+            oneshot::Receiver<Option<super::emulator::RepaintFrame>>,
+        )>,
     },
     /// Drop every sink. Shutdown, so the writer tasks can drain and exit.
     ClearSinks,
@@ -285,17 +298,20 @@ impl OutputHandle {
         rx.await.ok()
     }
 
-    pub(super) async fn repaint_sink(
+    /// A sink for one attach session, and the repaint that precedes it.
+    ///
+    /// The repaint arrives on its own channel rather than inside the sink: it
+    /// has to reach the client *first*, and the sink starts taking live bytes
+    /// the moment it exists.
+    pub(super) async fn attach_sink(
         &self,
-        frame: Bytes,
         capacity: usize,
-    ) -> Option<mpsc::Receiver<SinkLine>> {
+    ) -> Option<(
+        mpsc::Receiver<SinkLine>,
+        oneshot::Receiver<Option<super::emulator::RepaintFrame>>,
+    )> {
         let (reply, rx) = oneshot::channel();
-        self.send(OutputMsg::RepaintSink {
-            frame,
-            capacity,
-            reply,
-        });
+        self.send(OutputMsg::AttachSink { capacity, reply });
         rx.await.ok()
     }
 }
@@ -507,22 +523,46 @@ impl ServiceOutputState {
                 self.sinks.push(SinkHandle::BoundedDrop(tx));
                 let _ = reply.send(rx);
             }
-            OutputMsg::RepaintSink {
-                frame,
-                capacity,
-                reply,
-            } => {
+            OutputMsg::AttachSink { capacity, reply } => {
                 let (tx, rx) = mpsc::channel::<SinkLine>(capacity);
-                // Channel is empty and capacity >= 2, so this cannot fail.
-                let _ = tx.try_send(SinkLine {
-                    prefix: Bytes::new(),
-                    line: frame,
-                    name: self.name.clone(),
-                    is_lifecycle: false,
-                    is_verbose: false,
+                let (frame_tx, frame_rx) = oneshot::channel();
+                // Ask for the repaint before adding the sink, on the same
+                // channel the screen is fed through: the request queues behind
+                // every byte already fanned out and ahead of every byte this
+                // sink is about to get. Ordering the two cuts is the point —
+                // see `OutputMsg::AttachSink`.
+                let emulator = self.sinks.iter().find_map(|sink| match sink {
+                    SinkHandle::Emulator(emulator) => Some(emulator.clone()),
+                    _ => None,
                 });
+                match emulator {
+                    Some(emulator) => {
+                        let _ = emulator.send(super::emulator::EmulatorRequest::Repaint {
+                            name: self.name.clone(),
+                            reply: frame_tx,
+                        });
+                    }
+                    // No screen to repaint from — a pipe spawn, or an
+                    // emulator backend that would not start. Preload the last
+                    // lines instead, so attaching still opens on something,
+                    // and drop the sender so the caller gets `None` rather
+                    // than waiting for a reply nobody will send.
+                    None => {
+                        drop(frame_tx);
+                        for line in self.ring_buffer.last_n(50) {
+                            let line = line.strip_suffix(b"\n").unwrap_or(line);
+                            let _ = tx.try_send(SinkLine {
+                                prefix: self.prefix.clone(),
+                                line: Bytes::copy_from_slice(line),
+                                name: self.name.clone(),
+                                is_lifecycle: false,
+                                is_verbose: false,
+                            });
+                        }
+                    }
+                }
                 self.sinks.push(SinkHandle::BoundedDrop(tx));
-                let _ = reply.send(rx);
+                let _ = reply.send((rx, frame_rx));
             }
             OutputMsg::ClearSinks => {
                 self.sinks.clear();

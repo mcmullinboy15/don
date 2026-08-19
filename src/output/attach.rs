@@ -29,8 +29,15 @@ pub struct AttachSession {
     /// Sender into the spawn's PTY input gate — input frames and resizes
     /// interleave atomically with every other writer.
     pub pty_input: mpsc::Sender<PtyInput>,
-    /// Live output receiver (preloaded with a screen repaint, or the last
-    /// ring-buffer lines when no emulator screen is registered).
+    /// The process's screen as it stood the instant `output_rx` was cut, to
+    /// be written to the client before anything from that receiver.
+    ///
+    /// Separate from the stream because it has to go first, and the stream
+    /// starts taking live bytes the moment it exists. `None` when the process
+    /// has no screen to repaint from.
+    pub repaint: Option<Bytes>,
+    /// Live output receiver, carrying every byte written from the moment the
+    /// repaint above was taken.
     pub output_rx: mpsc::Receiver<SinkLine>,
     /// Dropping this is the detach. Hold it for the bridge's lifetime.
     pub guard: AttachGuard,
@@ -122,7 +129,24 @@ impl AttachControl {
     /// only counts clients — for the stdout-sink pause and the lifecycle
     /// events. Waiting for a process that isn't running yet is the client's
     /// job (it retries); this answers immediately.
-    pub async fn attach(&self, name: &str, pid: u32) -> Result<AttachSession, CommandError> {
+    /// Attach a client, at the grid size the process should now believe it
+    /// has.
+    ///
+    /// `size` is the *effective* size — the smallest attached client wins each
+    /// dimension — and it is applied to the screen before the repaint is
+    /// rendered off it, which is the whole reason it is a parameter here. The
+    /// repaint is a screenful of absolutely-positioned rows padded to the
+    /// screen's width; rendered at one width and replayed into a client whose
+    /// screen is another, every row wraps, the screen scrolls, and everything
+    /// but the last few lines is pushed off the top before the client draws a
+    /// single frame. Which looks, from the outside, exactly like attaching
+    /// showing you nothing.
+    pub async fn attach(
+        &self,
+        name: &str,
+        pid: u32,
+        size: (u16, u16),
+    ) -> Result<AttachSession, CommandError> {
         let Some(output) = self.output_for(name) else {
             return Err(CommandError::UnknownService {
                 name: name.to_string(),
@@ -150,17 +174,21 @@ impl AttachControl {
         // screen, then stream live bytes — never a raw-byte replay. Processes
         // whose screen never registered (emulator backend unavailable) fall
         // back to the last ring-buffer lines.
-        let output_rx = match self.emulator.repaint(name).await {
-            // Headroom for live bytes on top of the repaint frame.
-            Some(frame) => output.repaint_sink(Bytes::from(frame.bytes), 256).await,
-            None => output.follow_sink(50, 256).await,
-        };
-        let Some(output_rx) = output_rx else {
+        self.emulator.resize(name, size.0, size.1);
+        let Some((output_rx, frame_rx)) = output.attach_sink(256).await else {
             return Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: "process output is shutting down".to_string(),
             });
         };
+        // `None` when the process has no screen — the emulator backend failed,
+        // or this is a pipe spawn. The client then simply starts from live
+        // bytes, which is what it did before there was a repaint at all.
+        let repaint = frame_rx
+            .await
+            .ok()
+            .flatten()
+            .map(|frame| Bytes::from(frame.bytes));
 
         sinks.emitter.service_event(
             name,
@@ -172,6 +200,7 @@ impl AttachControl {
 
         Ok(AttachSession {
             pty_input,
+            repaint,
             output_rx,
             guard: AttachGuard {
                 name: name.to_string(),
