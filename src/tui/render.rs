@@ -326,6 +326,27 @@ fn draw_log_pane(
         area.height,
     );
     app.view_index = index;
+
+    // Move the selection with the text it was dragged across.
+    //
+    // Scrolling, output arriving and eviction all shift every admitted row by
+    // the same amount, and that amount is the change in `rows_above` — so one
+    // subtraction keeps the highlight on the same characters. A reflow is the
+    // exception: a new width or a new filter moves different rows by different
+    // amounts, and there is no single shift that is right, so the selection
+    // goes rather than landing somewhere arbitrary.
+    let reflowed = app.selection_laid_out_against != Some((key, area.x, area.y));
+    if reflowed {
+        app.log_selection.clear();
+        app.follow_paused_for_selection = false;
+        app.selection_laid_out_against = Some((key, area.x, area.y));
+    } else {
+        let moved = i64::try_from(app.log_rows_above).unwrap_or(0)
+            - i64::try_from(view.rows_above).unwrap_or(0);
+        app.log_selection
+            .shift_rows(i32::try_from(moved).unwrap_or(0));
+    }
+
     // Remembered for the input layer: scrolling needs to know how far it can
     // go, and only the renderer knows how tall the pane came out.
     app.log_rows_above = view.rows_above;
@@ -587,7 +608,7 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: " tasks — [enter] run  [a] attach  [l] logs  [/] filter ".to_string(),
+            title: " tasks — [enter] run  [a] attach  [o] output  [/] filter ".to_string(),
             border_style: panel_border_style(app),
             header,
             rows,
@@ -748,7 +769,8 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: " services — [enter] start/stop  [r] restart  [a] attach  [l] logs ".to_string(),
+            title: " services — [enter] start/stop  [r] restart  [a] attach  [o] output "
+                .to_string(),
             border_style: panel_border_style(app),
             header,
             rows,

@@ -15,8 +15,17 @@
 //! — so a wrapped line, a filtered-out line and a scrolled view all resolve
 //! correctly without selection needing to know about any of them.
 //!
-//! The consequence is that a selection does not survive scrolling or a resize,
-//! which matches what a terminal does with its own selection.
+//! Screen rows move, though, and the text under them moves with them: output
+//! arrives, the reader scrolls, old lines are evicted. So the rows are carried
+//! as signed numbers and shifted by however far the view moved — see
+//! [`Selection::shift_rows`] — which keeps the highlight on the text it was
+//! dragged across rather than on the coordinates that text happened to occupy.
+//! Signed, because a selection scrolled off the top has to keep counting up
+//! there to come back to the same place when the view returns.
+//!
+//! What that cannot survive is a *reflow*: a resize or a filter change moves
+//! different rows by different amounts, and there is no single shift to apply.
+//! Those clear it.
 //!
 //! ## OSC 52
 //!
@@ -32,8 +41,10 @@ use std::io::Write;
 /// A drag in progress, or a finished selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Selection {
-    anchor: Option<(u16, u16)>,
-    cursor: Option<(u16, u16)>,
+    /// Column and screen row. The row is signed so it can track content that
+    /// has scrolled above the pane and come back.
+    anchor: Option<(u16, i32)>,
+    cursor: Option<(u16, i32)>,
     /// True once the button is released: the selection stands until the next
     /// drag starts or the view moves under it.
     settled: bool,
@@ -63,15 +74,30 @@ impl Selection {
     /// Start a drag at a screen position.
     pub(crate) fn begin(&mut self, column: u16, row: u16) {
         let column = column.max(self.left_edge);
-        self.anchor = Some((column, row));
-        self.cursor = Some((column, row));
+        self.anchor = Some((column, i32::from(row)));
+        self.cursor = Some((column, i32::from(row)));
         self.settled = false;
     }
 
     /// Move the loose end.
     pub(crate) fn extend(&mut self, column: u16, row: u16) {
         if self.anchor.is_some() {
-            self.cursor = Some((column.max(self.left_edge), row));
+            self.cursor = Some((column.max(self.left_edge), i32::from(row)));
+        }
+    }
+
+    /// The view moved by `delta` rows; move with it.
+    ///
+    /// Positive means the content came down the screen — the view scrolled up.
+    /// Applied to a settled selection and to a drag alike: a wheel notch
+    /// mid-drag should move the fixed end too, or the selection grows by the
+    /// scroll instead of by the pointer.
+    pub(crate) fn shift_rows(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        for (_, row) in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
+            *row = row.saturating_add(delta);
         }
     }
 
@@ -98,7 +124,7 @@ impl Selection {
 
     /// Normalised (start, end) in screen coordinates, reading order, or `None`
     /// for a click that never became a drag.
-    pub(crate) fn span(&self) -> Option<((u16, u16), (u16, u16))> {
+    pub(crate) fn span(&self) -> Option<((u16, i32), (u16, i32))> {
         let (anchor, cursor) = (self.anchor?, self.cursor?);
         if anchor == cursor {
             return None;
@@ -118,6 +144,7 @@ impl Selection {
         let Some((start, end)) = self.span() else {
             return false;
         };
+        let row = i32::from(row);
         if row < start.1 || row > end.1 {
             return false;
         }
@@ -177,9 +204,8 @@ pub(crate) fn selected_text(
 
     let mut out: Vec<(Option<crate::output::LogId>, String)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        let screen_row = origin
-            .1
-            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        let screen_row =
+            i32::from(origin.1).saturating_add(i32::try_from(index).unwrap_or(i32::MAX));
         if screen_row < start.1 || screen_row > end.1 {
             continue;
         }
@@ -557,5 +583,50 @@ mod tests {
             });
             assert_eq!(got.as_deref(), case.want, "{}", case.name);
         }
+    }
+
+    /// A selection is dragged across *text*, and the text moves: output
+    /// arrives, the reader scrolls, old lines are evicted. The highlight has
+    /// to move with it or it ends up marking whatever happens to be at those
+    /// coordinates afterwards.
+    #[test]
+    fn a_selection_moves_with_the_rows_it_was_dragged_across() {
+        let mut selection = Selection::default();
+        selection.begin(4, 10);
+        selection.extend(9, 10);
+        selection.finish();
+        assert!(selection.contains(5, 10));
+
+        // Three rows of output arrive while following: the text moves up.
+        selection.shift_rows(-3);
+        assert!(selection.contains(5, 7), "the highlight followed the text");
+        assert!(!selection.contains(5, 10), "and left where it used to be");
+
+        // Scrolled back down, it is where it started.
+        selection.shift_rows(3);
+        assert!(selection.contains(5, 10));
+
+        // Pushed off the top and brought back. A row count that saturated at
+        // zero would lose the position; a signed one does not.
+        selection.shift_rows(-40);
+        assert!(!selection.contains(5, 0), "well above the pane");
+        selection.shift_rows(40);
+        assert!(
+            selection.contains(5, 10),
+            "and comes back to the same characters"
+        );
+    }
+
+    /// The fixed end moves too. A wheel notch during a drag scrolls the whole
+    /// view, so anchoring only the loose end would grow the selection by the
+    /// scroll rather than by the pointer.
+    #[test]
+    fn a_shift_moves_both_ends_of_a_drag() {
+        let mut selection = Selection::default();
+        selection.begin(2, 5);
+        selection.extend(6, 8);
+        selection.shift_rows(-2);
+        let (start, end) = selection.span().unwrap();
+        assert_eq!((start.1, end.1), (3, 6), "the span kept its height");
     }
 }

@@ -405,6 +405,10 @@ pub(crate) struct App {
     /// The plain text of the rows the last frame drew, and where the pane
     /// started. Written by the renderer so a copy resolves against exactly what
     /// was on screen rather than re-deriving wrapping, filtering and scroll.
+    /// The geometry the live selection's screen rows were measured against:
+    /// the view key (width and filter) and the pane's origin. When any of it
+    /// moves, the rows mean something else — see the note in `draw_log_pane`.
+    pub(crate) selection_laid_out_against: Option<(super::view_index::ViewKey, u16, u16)>,
     pub(crate) log_visible_rows: Vec<String>,
     /// The log line each visible row belongs to, parallel to
     /// `log_visible_rows`. Lets a triple-click take the whole message when it
@@ -547,6 +551,7 @@ impl App {
             copy_notice: None,
             last_click: None,
             follow_paused_for_selection: false,
+            selection_laid_out_against: None,
             log_visible_rows: Vec::new(),
             log_visible_ids: Vec::new(),
             log_pane_origin: (0, 0),

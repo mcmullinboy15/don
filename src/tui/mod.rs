@@ -318,12 +318,6 @@ pub async fn run_tui(
                                 Err(_) => break,
                             }
                         }
-                        if !batch.is_empty() && app.log_scroll == logs::Scroll::Follow {
-                            // Following means every row shifts up; the
-                            // selection's screen coordinates now point at
-                            // different text, so it is no longer a selection.
-                            app.log_selection.clear();
-                        }
                         for (id, line) in batch {
                             if is_shutdown_start_line(&line) && !app.shutdown_started {
                                 app.begin_shutdown();
@@ -774,6 +768,14 @@ fn handle_key(
             }
             KeyCode::Char('l') if app.view_mode == ViewMode::Filter => {
                 return_to_logs(app);
+                return Ok(());
+            }
+            // The third panel's key, and a toggle like the other two. It used
+            // to fall through to the tables, where it opened one row's log —
+            // so reaching for the filter while reading the services list got
+            // you a popup instead, every time.
+            KeyCode::Char('l') => {
+                open_filter_panel(app);
                 return Ok(());
             }
             _ => {}
@@ -1445,12 +1447,11 @@ fn copy_selection(app: &mut App) {
 /// measured, which anything between frames — a filter change most of all —
 /// could have invalidated.
 fn scroll_log(app: &mut App, ask: impl FnOnce(&mut app::PendingScroll)) {
-    // The selection is in screen coordinates, so it stops meaning anything the
-    // moment different content is under those cells — same as a terminal drops
-    // its own selection when you scroll. Scrolling is also a deliberate choice
-    // of where to be, so it takes ownership of the view from the selection that
-    // paused it.
-    app.log_selection.clear();
+    // The selection stays: the renderer moves it by however far the view
+    // moved, so it keeps covering the text it was dragged across rather than
+    // the coordinates that text used to occupy. Scrolling is still a
+    // deliberate choice of where to be, though, so it takes ownership of the
+    // view from the selection that paused following.
     app.follow_paused_for_selection = false;
     ask(&mut app.pending_scroll);
 }
@@ -1572,7 +1573,9 @@ fn handle_tasks_key(
             dispatch_run_task(client, task_name.clone());
             after_task_run(&task_name, app, store)?;
         }
-    } else if key.code == KeyCode::Char('l') {
+    } else if key.code == KeyCode::Char('o') {
+        // `o` for output, not `l` — `l` is the filter panel's key everywhere
+        // else and reaching for it here should mean the same thing.
         let Some(item) = highlighted_task_item(app) else {
             return Ok(());
         };
@@ -1630,7 +1633,8 @@ fn handle_services_key(
                 dispatch_overlay_command(client, &controls.lifecycle_emitter, cmd);
             }
         }
-        KeyCode::Char('l') => {
+        // `o` for output. See the note in `handle_tasks_key`.
+        KeyCode::Char('o') => {
             let Some(item) = highlighted_service_item(app) else {
                 return Ok(());
             };
@@ -2299,7 +2303,7 @@ mod tests {
             /// Row the click landed on, as an index into `rows`.
             click: usize,
             /// Expected selected rows, first..=last.
-            want: (u16, u16),
+            want: (i32, i32),
         }
 
         let cases = [
@@ -2882,6 +2886,94 @@ mod tests {
             Some(&1),
             "coming back finds the marks where they were left"
         );
+    }
+
+    /// `l` is the filter panel's key, from the tables too. It used to fall
+    /// through to them and open one row's log, so reaching for the filter
+    /// while reading the services list got you a popup every time.
+    #[test]
+    fn l_always_means_the_filter_panel() {
+        struct Case {
+            name: &'static str,
+            from: ViewMode,
+            key: KeyCode,
+            want_mode: ViewMode,
+            want_popup: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "from the services table",
+                from: ViewMode::Services,
+                key: KeyCode::Char('l'),
+                want_mode: ViewMode::Filter,
+                want_popup: false,
+            },
+            Case {
+                name: "from the tasks table",
+                from: ViewMode::Tasks,
+                key: KeyCode::Char('l'),
+                want_mode: ViewMode::Filter,
+                want_popup: false,
+            },
+            Case {
+                name: "and is still its own toggle",
+                from: ViewMode::Filter,
+                key: KeyCode::Char('l'),
+                want_mode: ViewMode::Normal,
+                want_popup: false,
+            },
+            Case {
+                // The row's own log moved to `o`, for output.
+                name: "o opens the highlighted service's output",
+                from: ViewMode::Services,
+                key: KeyCode::Char('o'),
+                want_mode: ViewMode::Services,
+                want_popup: true,
+            },
+            Case {
+                name: "and the highlighted task's",
+                from: ViewMode::Tasks,
+                key: KeyCode::Char('o'),
+                want_mode: ViewMode::Tasks,
+                want_popup: true,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            app.apply_task_state(
+                "migrate".to_string(),
+                crate::client::TaskState::Pending,
+                None,
+                Vec::new(),
+            );
+            app.view_mode = case.from;
+            app.focus = panes::Focus::Panel;
+            let mut store = LogStore::with_capacity(10);
+            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
+            let controls = TuiControls {
+                lifecycle_emitter: LifecycleEmitter::discarding(),
+                mode: TuiMode::InProcess,
+            };
+
+            handle_key(
+                KeyEvent::new(case.key, KeyModifiers::NONE),
+                &mut app,
+                &mut store,
+                &client,
+                &controls,
+            )
+            .unwrap();
+
+            assert_eq!(app.view_mode, case.want_mode, "{}", case.name);
+            assert_eq!(
+                app.log_popup.is_some(),
+                case.want_popup,
+                "{}: popup?",
+                case.name
+            );
+        }
     }
 
     /// The log popup cannot outlive the table it is a row of.
