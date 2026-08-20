@@ -103,6 +103,10 @@ pub struct Task {
     /// File glob patterns to ignore when watching (e.g. "**/*.log", "target/**").
     #[serde(default)]
     pub ignore: Vec<String>,
+    /// How long to wait after the last matching change before re-running
+    /// (e.g. "500ms", "2s"). Defaults to 200ms. A generator whose own output
+    /// lands in bursts wants a longer window than an editor save does.
+    pub debounce: Option<String>,
     /// Maximum time the task is allowed to run (e.g. "5m", "30s"). No timeout by default.
     pub timeout: Option<String>,
     /// Where to send stdout/stderr. Defaults to stdout.

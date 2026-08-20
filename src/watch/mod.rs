@@ -175,8 +175,53 @@ struct WatchedItem {
     patterns: Vec<Pattern>,
     /// Glob patterns for ignoring file events (checked before watch patterns).
     ignore_patterns: Vec<Pattern>,
+    /// What this item has seen since its debounce window opened, narrated when
+    /// the window closes.
+    window: WindowTally,
     /// Last diagnostic associated with this item's watch registration or state.
     last_error: Option<String>,
+}
+
+/// What one item saw across a debounce window.
+///
+/// The watcher used to narrate a line per path per item, which is fine for an
+/// editor save and ruinous for a generator: a task that rewrites a thousand
+/// files puts tens of thousands of lines through the diagnostics buffer, and
+/// they scroll away faster than anyone can read them. A window is the unit the
+/// reader actually cares about — "what made this rebuild" — so the counting
+/// happens here and one line comes out at the end of it.
+#[derive(Default)]
+struct WindowTally {
+    /// Paths that matched a watch pattern since the window opened.
+    matched: usize,
+    /// Paths an ignore pattern claimed since the window opened.
+    ignored: usize,
+    /// Notify batches that touched this item since the window opened — how
+    /// many times the deadline was pushed back.
+    batches: usize,
+    /// One matched path and the pattern that took it, for the line at the end.
+    example: Option<(String, String)>,
+}
+
+impl WindowTally {
+    /// Render the window as the tail of the "debounce fired" line, then clear
+    /// it for the next one.
+    fn take_summary(&mut self) -> String {
+        let summary = match &self.example {
+            Some((path, pattern)) => format!(
+                "{} path(s) over {} batch(es), pattern={pattern:?} e.g. {path:?}{}",
+                self.matched,
+                self.batches,
+                match self.ignored {
+                    0 => String::new(),
+                    ignored => format!(", {ignored} ignored"),
+                }
+            ),
+            None => format!("{} path(s) over {} batch(es)", self.matched, self.batches),
+        };
+        *self = Self::default();
+        summary
+    }
 }
 
 /// An update to the watch patterns for a specific item.
@@ -525,6 +570,7 @@ impl WatchManager {
                     kind: WatchItemKind::Service,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
+                    window: WindowTally::default(),
                     last_error: None,
                 },
             );
@@ -561,6 +607,11 @@ impl WatchManager {
                     std::fs::canonicalize(&joined).unwrap_or(joined)
                 }
                 None => base_dir.to_path_buf(),
+            };
+
+            let task_debounce = match &task.debounce {
+                Some(d) => parse_duration(d)?,
+                None => DEFAULT_DEBOUNCE,
             };
 
             let mut compiled_patterns = Vec::new();
@@ -611,11 +662,12 @@ impl WatchManager {
             items.insert(
                 name.clone(),
                 WatchedItem {
-                    debounce_duration: DEFAULT_DEBOUNCE, // Tasks use default debounce.
+                    debounce_duration: task_debounce,
                     debounce_deadline: None,
                     kind: WatchItemKind::Task,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
+                    window: WindowTally::default(),
                     last_error: None,
                 },
             );
@@ -724,6 +776,7 @@ impl WatchManager {
                             kind: WatchItemKind::BuildGraph,
                             patterns: compiled_patterns,
                             ignore_patterns: compiled_ignore,
+                            window: WindowTally::default(),
                             last_error: None,
                         },
                     );
@@ -929,6 +982,7 @@ impl WatchManager {
                     kind: update.kind,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
+                    window: WindowTally::default(),
                     last_error: None,
                 },
             );
@@ -981,9 +1035,14 @@ impl WatchManager {
             return;
         }
 
+        // Count, not contents: a `rm -rf` plus copy of a generated tree
+        // arrives as batches of hundreds of paths, and printing them all made
+        // a single line longer than the buffer it went into.
         self.emitter.debug_event(&format!(
-            "watch: event kind={:?} paths={:?}",
-            event.kind, paths
+            "watch: event kind={:?} paths={} e.g. {:?}",
+            event.kind,
+            paths.len(),
+            paths.first().map(|path| path.display().to_string())
         ));
 
         // Backstop for the recursion we deliberately gave up by using only
@@ -1006,100 +1065,97 @@ impl WatchManager {
     /// state machines. Shared by live notify events and the new-directory
     /// backstop (which replays pre-existing files under a freshly-watched dir).
     fn process_changed_paths(&mut self, paths: &[PathBuf]) {
-        // Find which items are affected by this event's paths.
         // Ignore patterns are checked first — if any ignore pattern matches,
-        // the event is skipped for that item.
+        // the path is skipped for that item. Nothing is narrated per path
+        // here: what each item saw accumulates into its window and comes out
+        // as one line when the window closes.
         let mut affected: Vec<String> = Vec::new();
+        // Paths in this batch that opened no window anywhere, and the items
+        // that declined them. One line for the batch, because a path nothing
+        // wants has the same explanation for every item that skipped it.
+        let mut unwanted = 0usize;
+        let mut unwanted_example: Option<String> = None;
+        let mut decliners: Vec<String> = Vec::new();
+
         for path in paths {
             let path_str = path.to_string_lossy();
             let mut matched_any = false;
-            let mut ignored_by: Vec<String> = Vec::new();
-            let mut unmatched = 0usize;
-            for (name, item) in &self.items {
-                let state = debounce_label(item);
-                if let Some(ig) = item
+            let mut ignored_here: Vec<String> = Vec::new();
+            for (name, item) in self.items.iter_mut() {
+                if item
                     .ignore_patterns
                     .iter()
-                    .find(|pattern| matches_ignore(pattern, &path_str))
+                    .any(|pattern| matches_ignore(pattern, &path_str))
                 {
-                    self.emitter.service_debug_event(
-                        name,
-                        &format!(
-                            "watch: ignored path={:?} state={} ignore={:?}",
-                            path,
-                            state,
-                            ig.as_str()
-                        ),
-                    );
-                    ignored_by.push(name.clone());
+                    item.window.ignored = item.window.ignored.saturating_add(1);
+                    ignored_here.push(name.clone());
                     continue;
                 }
-                if let Some(pat) = item
+                if let Some(pattern) = item
                     .patterns
                     .iter()
                     .find(|pattern| matches_glob(pattern, &path_str))
                 {
-                    self.emitter.service_debug_event(
-                        name,
-                        &format!(
-                            "watch: matched path={:?} state={} pattern={:?}",
-                            path,
-                            state,
-                            pat.as_str()
-                        ),
-                    );
+                    if item.window.example.is_none() {
+                        item.window.example =
+                            Some((path_str.to_string(), pattern.as_str().to_string()));
+                    }
+                    item.window.matched = item.window.matched.saturating_add(1);
                     matched_any = true;
                     if !affected.contains(name) {
                         affected.push(name.clone());
                     }
-                } else {
-                    unmatched += 1;
                 }
             }
             if !matched_any {
-                // One line, not one per item. This used to narrate every item
-                // that didn't match, but in the branch where it fired the
-                // reason was the same for all of them — the one the summary
-                // already gives — and the only per-item detail was a debounce
-                // label that says nothing about the path. On a stack with
-                // dozens of watch items that turned every stray write under
-                // the project into dozens of lines.
-                if ignored_by.is_empty() {
-                    self.emitter.debug_event(&format!(
-                        "watch: no item matched {:?} ({} checked)",
-                        path, unmatched
-                    ));
-                } else {
-                    self.emitter.debug_event(&format!(
-                        "watch: no rebuild match for {:?} (ignored by {})",
-                        path,
-                        ignored_by.join(", ")
-                    ));
+                unwanted = unwanted.saturating_add(1);
+                if unwanted_example.is_none() {
+                    unwanted_example = Some(path_str.to_string());
                 }
+                for name in ignored_here {
+                    if !decliners.contains(&name) {
+                        decliners.push(name);
+                    }
+                }
+            }
+        }
+
+        if unwanted > 0 {
+            let example = unwanted_example.unwrap_or_default();
+            if decliners.is_empty() {
+                self.emitter.debug_event(&format!(
+                    "watch: {unwanted} path(s) matched no item, e.g. {example:?}"
+                ));
+            } else {
+                self.emitter.debug_event(&format!(
+                    "watch: {unwanted} path(s) matched no item, e.g. {example:?} (ignored by {})",
+                    decliners.join(", ")
+                ));
             }
         }
 
         // A sliding window: a change while one is already pending bumps the
         // deadline, so rapid consecutive saves become one notification. There
         // is no third case any more — whether the receiver is *busy* with the
-        // last one is not something the watcher tracks.
+        // last one is not something the watcher tracks. Only the window
+        // *opening* is narrated; the bumps are counted and reported when it
+        // closes, because a burst is one event to the reader and was hundreds
+        // of lines to the buffer.
         let now = Instant::now();
         for name in affected {
             if let Some(item) = self.items.get_mut(&name) {
-                let bumped = item.debounce_deadline.is_some();
+                let opening = item.debounce_deadline.is_none();
                 item.debounce_deadline = Some(now + item.debounce_duration);
-                self.emitter.service_debug_event(
-                    &name,
-                    &format!(
-                        "watch: {} (deadline in {:?})",
-                        if bumped {
-                            "debounce deadline bumped"
-                        } else {
-                            "change seen — debouncing"
-                        },
-                        item.debounce_duration
-                    ),
-                );
+                item.window.batches = item.window.batches.saturating_add(1);
+                if opening {
+                    self.emitter.service_debug_event(
+                        &name,
+                        &format!(
+                            "watch: change seen — debouncing (deadline in {:?})",
+                            item.debounce_duration
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1173,6 +1229,11 @@ impl WatchManager {
                 continue;
             };
             item.debounce_deadline = None;
+            // The whole window in one line: what matched, how many batches it
+            // took, and one path to point at. This is the line that answers
+            // "why did that rebuild", and it replaces everything the watcher
+            // used to say on the way here.
+            let window = item.window.take_summary();
             // The synthetic `__graph` item speaks for the process it was
             // derived from; everything else speaks for itself.
             let target = match kind {
@@ -1182,7 +1243,7 @@ impl WatchManager {
             self.emitter.service_debug_event(
                 &name,
                 &format!(
-                    "watch: debounce fired → {target} changed ({})",
+                    "watch: debounce fired → {target} changed ({}) — {window}",
                     kind.as_str()
                 ),
             );
@@ -1205,11 +1266,7 @@ impl WatchManager {
                     name.clone(),
                     WatchItemSnapshot {
                         kind: watch_item_kind_label(item.kind),
-                        state: if item.debounce_deadline.is_some() {
-                            "debouncing"
-                        } else {
-                            "idle"
-                        },
+                        state: debounce_label(item),
                         debounce_ms: item.debounce_duration.as_millis() as u64,
                         last_error: item.last_error.clone(),
                         patterns: item
@@ -2307,6 +2364,70 @@ bazel.target = "//services/api:api"
         }
     }
 
+    /// A task's `debounce` used to parse into a field nothing read: the watch
+    /// item was built with `DEFAULT_DEBOUNCE` regardless, so a config asking
+    /// for a longer window silently got 200ms. A generator whose output lands
+    /// in a burst is exactly the case that wants a longer one.
+    #[tokio::test]
+    async fn test_task_debounce_reaches_its_watch_item() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            want_debounce_ms: u64,
+        }
+
+        let cases = vec![
+            Case {
+                name: "an unset debounce is the default",
+                toml: r#"
+[tasks.codegen]
+cmd = "gen"
+watch = ["src/**/*.rs"]
+"#,
+                want_debounce_ms: 200,
+            },
+            Case {
+                name: "a configured debounce is used",
+                toml: r#"
+[tasks.codegen]
+cmd = "gen"
+watch = ["src/**/*.rs"]
+debounce = "1500ms"
+"#,
+                want_debounce_ms: 1500,
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(temp.path().join("src")).unwrap();
+            let config: crate::config::Config = case.toml.parse().unwrap();
+            let (_update_tx, update_rx) = mpsc::unbounded_channel();
+            let (_query_tx, query_rx) = mpsc::channel(8);
+            let output = crate::output::OutputManager::new(
+                &[("codegen", &crate::config::LogConfig::Stdout)],
+                tokio::io::sink(),
+            )
+            .await
+            .unwrap();
+
+            let (watch_mgr, _warnings) = WatchManager::new(
+                &config,
+                crate::config::Platform::LinuxX86_64,
+                temp.path(),
+                Box::new(signal::RecordingDispatch::default()),
+                update_rx,
+                query_rx,
+                output.clone_lifecycle_emitter(),
+            )
+            .unwrap();
+
+            let snapshot = watch_mgr.snapshot();
+            let item = snapshot.items.get("codegen").expect(case.name);
+            assert_eq!(item.debounce_ms, case.want_debounce_ms, "{}", case.name);
+        }
+    }
+
     #[test]
     fn test_glob_pattern_matches_files_in_watched_dirs() {
         struct Case {
@@ -2413,6 +2534,7 @@ bazel.target = "//services/api:api"
             kind,
             patterns: patterns.iter().map(|p| Pattern::new(p).unwrap()).collect(),
             ignore_patterns: vec![],
+            window: WindowTally::default(),
             last_error: None,
         }
     }
@@ -2461,6 +2583,106 @@ bazel.target = "//services/api:api"
             last_notify_error: None,
             global_ignore: Vec::new(),
             overrides: OverrideBuilder::new(".").build().unwrap(),
+        }
+    }
+
+    /// A burst is one line to the reader, whatever it cost the watcher.
+    ///
+    /// The watcher used to narrate a line per path per item, so a generator
+    /// rewriting a thousand files pushed tens of thousands of lines through a
+    /// diagnostics buffer that holds a fraction of that — the window that
+    /// explained the rebuild was gone before the rebuild finished. The tally
+    /// accumulates across every batch in a window and is spent once, when the
+    /// window closes.
+    #[tokio::test]
+    async fn a_burst_is_one_window_tally_however_many_batches_it_arrives_in() {
+        let mut items = HashMap::new();
+        items.insert(
+            "codegen".to_string(),
+            watched(
+                WatchItemKind::Task,
+                Duration::from_millis(50),
+                &["/repo/models/**/*.prisma"],
+            ),
+        );
+        let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+        let mut mgr = test_manager(items, dispatch.clone()).await;
+
+        // Three batches, as notify delivers a `rm -rf` plus copy: some paths
+        // the item wants, one it has never heard of.
+        for batch in 0..3 {
+            let paths: Vec<PathBuf> = (0..4)
+                .map(|i| PathBuf::from(format!("/repo/models/m{batch}{i}.prisma")))
+                .chain(std::iter::once(PathBuf::from("/repo/unrelated.txt")))
+                .collect();
+            mgr.process_changed_paths(&paths);
+        }
+
+        let item = mgr.items.get("codegen").unwrap();
+        assert_eq!(item.window.matched, 12, "every matched path counted");
+        assert_eq!(item.window.batches, 3, "one per batch, not per path");
+        assert!(item.window.example.is_some(), "a path to point at");
+
+        // Closing the window spends the tally; the next one starts empty.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        mgr.fire_debounce_timers().await;
+        let item = mgr.items.get("codegen").unwrap();
+        assert_eq!(item.window.matched, 0, "tally reset");
+        assert_eq!(item.window.batches, 0, "tally reset");
+        assert!(item.window.example.is_none(), "tally reset");
+        assert_eq!(
+            dispatch.calls.lock().unwrap().as_slice(),
+            &[("codegen".to_string(), WatchItemKind::Task)]
+        );
+    }
+
+    /// The summary is the whole of what a window says, so its shape is worth
+    /// pinning: the counts always, the example only when something matched.
+    #[test]
+    fn test_window_tally_summary() {
+        struct Case {
+            name: &'static str,
+            tally: WindowTally,
+            want: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a matched window names the pattern and one path",
+                tally: WindowTally {
+                    matched: 12,
+                    ignored: 0,
+                    batches: 3,
+                    example: Some(("/repo/a.prisma".to_string(), "**/*.prisma".to_string())),
+                },
+                want: "12 path(s) over 3 batch(es), pattern=\"**/*.prisma\" e.g. \"/repo/a.prisma\"",
+            },
+            Case {
+                name: "ignored paths are reported alongside",
+                tally: WindowTally {
+                    matched: 2,
+                    ignored: 40,
+                    batches: 1,
+                    example: Some(("/repo/a.prisma".to_string(), "**/*.prisma".to_string())),
+                },
+                want: "2 path(s) over 1 batch(es), pattern=\"**/*.prisma\" e.g. \"/repo/a.prisma\", 40 ignored",
+            },
+            Case {
+                name: "a window with nothing to point at still reports its counts",
+                tally: WindowTally {
+                    matched: 0,
+                    ignored: 0,
+                    batches: 1,
+                    example: None,
+                },
+                want: "0 path(s) over 1 batch(es)",
+            },
+        ];
+
+        for mut case in cases {
+            assert_eq!(case.tally.take_summary(), case.want, "{}", case.name);
+            assert_eq!(case.tally.matched, 0, "{}: spent", case.name);
+            assert_eq!(case.tally.batches, 0, "{}: spent", case.name);
         }
     }
 
@@ -2594,6 +2816,7 @@ bazel.target = "//services/api:api"
             kind: WatchItemKind::Service,
             patterns: original_patterns,
             ignore_patterns: vec![],
+            window: WindowTally::default(),
             last_error: None,
         };
 

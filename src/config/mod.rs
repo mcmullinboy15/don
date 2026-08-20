@@ -693,6 +693,11 @@ impl Config {
                     ));
                 }
             }
+            if let Some(ref debounce) = task.debounce
+                && let Err(e) = crate::duration::parse_duration(debounce)
+            {
+                errors.push(format!("task '{name}': invalid debounce: {e}"));
+            }
             if let Some(ref timeout) = task.timeout
                 && let Err(e) = crate::duration::parse_duration(timeout)
             {
@@ -2606,6 +2611,40 @@ mod tests {
                         panic!("expected validation error");
                     };
                     assert!(errors.iter().any(|e| e.contains("invalid debounce")));
+                },
+            },
+            ConfigTestCase {
+                name: "a task's invalid debounce duration is a validation error",
+                input: r#"
+                    [tasks.gen]
+                    cmd = "gen"
+                    watch = ["src/**"]
+                    debounce = "banana"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let err = config.validate(TEST_PLATFORM).unwrap_err();
+                    let ConfigError::Validation { errors } = &err else {
+                        panic!("expected validation error");
+                    };
+                    assert!(errors.iter().any(|e| e.contains("invalid debounce")));
+                },
+            },
+            ConfigTestCase {
+                name: "a task's debounce is parsed and kept",
+                input: r#"
+                    [tasks.gen]
+                    cmd = "gen"
+                    watch = ["src/**"]
+                    debounce = "1s"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    config.validate(TEST_PLATFORM).unwrap();
+                    assert_eq!(
+                        config.tasks.get("gen").unwrap().debounce.as_deref(),
+                        Some("1s")
+                    );
                 },
             },
             ConfigTestCase {

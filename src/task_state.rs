@@ -287,11 +287,95 @@ impl TaskStateStore {
             return Ok(true);
         }
 
-        let current_hash =
-            self.compute_hash_with_progress(watch_patterns, ignore_patterns, base_dir, progress)?;
-        let stored_hash = self.read_stored_hash(task_name)?;
+        match self.check_watched_inputs_sync(
+            task_name,
+            watch_patterns,
+            ignore_patterns,
+            base_dir,
+            usize::MAX,
+            progress,
+        )? {
+            WatchedInputs::Changed => Ok(true),
+            WatchedInputs::Unchanged => Ok(false),
+            // Unreachable with an uncapped check; a task whose inputs cannot
+            // be verified is one that needs to run.
+            WatchedInputs::Unverifiable { .. } => Ok(true),
+        }
+    }
 
-        Ok(stored_hash.as_ref() != Some(&current_hash))
+    /// Compare the watched inputs against the hash recorded by the last
+    /// successful run, giving up rather than hashing past `max_files`.
+    ///
+    /// This is [`needs_run`](Self::needs_run) with the cap made visible:
+    /// callers that use the answer to *suppress* a run need to know the
+    /// difference between "identical" and "not checked", where a caller
+    /// deciding whether to run at startup can treat both as "run".
+    ///
+    /// Runs filesystem I/O on a blocking thread.
+    pub(crate) async fn check_watched_inputs<F>(
+        &self,
+        task_name: &str,
+        watch_patterns: &[String],
+        ignore_patterns: &[String],
+        base_dir: Option<&Path>,
+        max_files: usize,
+        mut progress: F,
+    ) -> Result<WatchedInputs, TaskStateError>
+    where
+        F: FnMut(TaskHashProgress) + Send + 'static,
+    {
+        let this = self.clone();
+        let task_name = task_name.to_string();
+        let watch_patterns = watch_patterns.to_vec();
+        let ignore_patterns = ignore_patterns.to_vec();
+        let base_dir = base_dir.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            this.check_watched_inputs_sync(
+                &task_name,
+                &watch_patterns,
+                &ignore_patterns,
+                base_dir.as_deref(),
+                max_files,
+                &mut progress,
+            )
+        })
+        .await
+        .map_err(|e| TaskStateError::Io(std::io::Error::other(e)))?
+    }
+
+    fn check_watched_inputs_sync<F>(
+        &self,
+        task_name: &str,
+        watch_patterns: &[String],
+        ignore_patterns: &[String],
+        base_dir: Option<&Path>,
+        max_files: usize,
+        progress: &mut F,
+    ) -> Result<WatchedInputs, TaskStateError>
+    where
+        F: FnMut(TaskHashProgress),
+    {
+        // A task with nothing declared has no inputs to compare, so there is
+        // nothing that could rule a run out.
+        if watch_patterns.is_empty() {
+            return Ok(WatchedInputs::Changed);
+        }
+
+        let current_hash = match self.compute_hash_with_progress(
+            watch_patterns,
+            ignore_patterns,
+            base_dir,
+            max_files,
+            progress,
+        )? {
+            HashOutcome::Hash(hash) => hash,
+            HashOutcome::TooLarge { files } => return Ok(WatchedInputs::Unverifiable { files }),
+        };
+        // No recorded hash means no successful run to compare against.
+        match self.read_stored_hash(task_name)? {
+            Some(stored) if stored == current_hash => Ok(WatchedInputs::Unchanged),
+            _ => Ok(WatchedInputs::Changed),
+        }
     }
 
     fn record_success_sync(
@@ -326,7 +410,16 @@ impl TaskStateStore {
         ignore_patterns: &[String],
         base_dir: Option<&Path>,
     ) -> Result<String, TaskStateError> {
-        self.compute_hash_with_progress(watch_patterns, ignore_patterns, base_dir, &mut |_| {})
+        match self.compute_hash_with_progress(
+            watch_patterns,
+            ignore_patterns,
+            base_dir,
+            usize::MAX,
+            &mut |_| {},
+        )? {
+            HashOutcome::Hash(hash) => Ok(hash),
+            HashOutcome::TooLarge { files } => Err(TaskStateError::TooManyFiles { files }),
+        }
     }
 
     fn compute_hash_with_progress<F>(
@@ -334,8 +427,9 @@ impl TaskStateStore {
         watch_patterns: &[String],
         ignore_patterns: &[String],
         base_dir: Option<&Path>,
+        max_files: usize,
         progress: &mut F,
-    ) -> Result<String, TaskStateError>
+    ) -> Result<HashOutcome, TaskStateError>
     where
         F: FnMut(TaskHashProgress),
     {
@@ -434,9 +528,18 @@ impl TaskStateStore {
                 files_ignored: stats.files_ignored,
                 elapsed: glob_started.elapsed(),
             });
+            // Checked between roots rather than inside the walk: the point is
+            // to not *read* a six-figure file set, and one root's walk is a
+            // bounded price for keeping the collector's signature simple.
+            if paths.len() > max_files {
+                return Ok(HashOutcome::TooLarge { files: paths.len() });
+            }
         }
         paths.sort();
         paths.dedup();
+        if paths.len() > max_files {
+            return Ok(HashOutcome::TooLarge { files: paths.len() });
+        }
 
         let mut hasher = Sha256::new();
 
@@ -478,7 +581,7 @@ impl TaskStateStore {
             elapsed: hash_started.elapsed(),
         });
 
-        Ok(encode(hasher.finalize()))
+        Ok(HashOutcome::Hash(encode(hasher.finalize())))
     }
 
     fn hash_file_path(&self, task_name: &str) -> PathBuf {
@@ -743,6 +846,45 @@ pub enum TaskStateError {
     /// Latest-run metadata could not be serialized or parsed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A hash that must be exact was asked for over a file set past the cap.
+    #[error("watched inputs expanded to {files} files, past the hashing cap")]
+    TooManyFiles {
+        /// How many files the glob had matched when the walk gave up.
+        files: usize,
+    },
+}
+
+/// The most files a self-write check will hash before giving up.
+///
+/// The check exists to catch a generator task rewriting its own watched
+/// inputs with identical content. Hashing answers that exactly, but it is
+/// linear in the tree, and a watch glob over a monorepo can expand to six
+/// figures — at that size the check costs more than the run it would save, so
+/// the caller falls back to the suppression window alone. Applied per walk
+/// root, so one oversized root is walked before the bail-out.
+pub(crate) const MAX_VERIFY_FILES: usize = 20_000;
+
+/// What a watched-input check concluded.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WatchedInputs {
+    /// The content hash moved since the last recorded run.
+    Changed,
+    /// The content hash is identical: nothing this task watches actually
+    /// changed, whatever the file watcher saw move.
+    Unchanged,
+    /// The glob expanded past the cap, so no hash was computed and the caller
+    /// has to decide without one.
+    Unverifiable {
+        /// How many files had matched when the walk gave up.
+        files: usize,
+    },
+}
+
+/// A hash over a capped file set: either the digest, or the count that
+/// exceeded the cap before any file was read.
+enum HashOutcome {
+    Hash(String),
+    TooLarge { files: usize },
 }
 
 #[cfg(test)]
@@ -953,6 +1095,108 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    /// The self-write check is what stops a generator that rewrites its own
+    /// watched inputs from re-triggering itself forever. It has to tell three
+    /// situations apart: content that really moved, content rewritten
+    /// byte-for-byte (mtime only, which is what an unconditional `rm -rf` plus
+    /// copy produces), and a file set too large to be worth hashing.
+    #[tokio::test]
+    async fn test_check_watched_inputs_separates_rewritten_from_changed() {
+        struct Case {
+            name: &'static str,
+            /// What the file holds when the hash is recorded.
+            before: &'static str,
+            /// What it holds when the check runs. Rewriting the same bytes is
+            /// the self-write case.
+            after: &'static str,
+            /// Extra files to create, to push the set past the cap.
+            extra_files: usize,
+            max_files: usize,
+            want: WatchedInputs,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a byte-for-byte rewrite is not a change",
+                before: "CREATE TABLE t;",
+                after: "CREATE TABLE t;",
+                extra_files: 0,
+                max_files: MAX_VERIFY_FILES,
+                want: WatchedInputs::Unchanged,
+            },
+            Case {
+                name: "different contents are a change",
+                before: "CREATE TABLE t;",
+                after: "CREATE TABLE t2;",
+                extra_files: 0,
+                max_files: MAX_VERIFY_FILES,
+                want: WatchedInputs::Changed,
+            },
+            Case {
+                name: "a file set past the cap is not hashed at all",
+                before: "CREATE TABLE t;",
+                after: "CREATE TABLE t;",
+                extra_files: 4,
+                max_files: 3,
+                want: WatchedInputs::Unverifiable { files: 5 },
+            },
+        ];
+
+        for case in cases {
+            let dir = TempDir::new("self-write-check");
+            let watched = dir.path().join("watched.sql");
+            fs::write(&watched, case.before).unwrap();
+            for i in 0..case.extra_files {
+                fs::write(dir.path().join(format!("extra{i}.sql")), "-- filler").unwrap();
+            }
+
+            let state = TaskStateStore::new(dir.path().join(".don-state"));
+            let patterns = vec!["**/*.sql".to_string()];
+            state
+                .record_success("gen", &patterns, &[], Some(dir.path()))
+                .await
+                .unwrap();
+
+            fs::write(&watched, case.after).unwrap();
+
+            let got = state
+                .check_watched_inputs(
+                    "gen",
+                    &patterns,
+                    &[],
+                    Some(dir.path()),
+                    case.max_files,
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(got, case.want, "{}", case.name);
+        }
+    }
+
+    /// A task that has never succeeded has no hash to compare against, so the
+    /// check must not read "unchanged" from a missing record and suppress the
+    /// very first run.
+    #[tokio::test]
+    async fn test_check_watched_inputs_without_a_recorded_run_is_a_change() {
+        let dir = TempDir::new("self-write-no-record");
+        fs::write(dir.path().join("watched.sql"), "CREATE TABLE t;").unwrap();
+        let state = TaskStateStore::new(dir.path().join(".don-state"));
+
+        let got = state
+            .check_watched_inputs(
+                "gen",
+                &["**/*.sql".to_string()],
+                &[],
+                Some(dir.path()),
+                MAX_VERIFY_FILES,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, WatchedInputs::Changed);
     }
 
     #[tokio::test]

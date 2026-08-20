@@ -133,6 +133,7 @@ mod tests {
             depends_on: vec![],
             watch: vec![],
             ignore: vec![],
+            debounce: None,
             timeout: None,
             log: crate::config::LogConfig::Stdout,
             interactive: false,

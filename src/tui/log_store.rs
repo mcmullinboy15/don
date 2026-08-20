@@ -40,10 +40,18 @@ pub(crate) const DEFAULT_CAPACITY: usize = crate::output::DEFAULT_MERGED_HISTORY
 /// Cap on retained diagnostics.
 ///
 /// don's own narration is for answering "why did that not rebuild" in the
-/// moment, not for scrolling back through. It is also the noisiest thing in the
-/// system when a watch is busy, so giving it the same scrollback as the
-/// processes' output spends a lot of memory on lines nobody reads.
-pub(crate) const DEBUG_CAPACITY: usize = 500;
+/// moment, not for scrolling back through, so it gets a smaller budget than
+/// the processes' output.
+///
+/// Five hundred was too small to read at. A reader who scrolls back holds
+/// their place with a pin bounded by [`PINNED_OVERDRAFT`], so once the buffer
+/// has taken `capacity * PINNED_OVERDRAFT` lines it evicts out from under them
+/// — their anchor goes, the view falls back to the oldest surviving line, and
+/// since that keeps moving the pane empties while the new lines pile up below
+/// the window they are looking at. At five hundred a single busy moment
+/// crossed that in under a second. This is sized so that reading the
+/// diagnostics while a stack is busy is possible at all.
+pub(crate) const DEBUG_CAPACITY: usize = 5_000;
 
 /// How far past `capacity` the store will grow to keep a scrolled reader's
 /// place. Beyond this their anchor is dropped like anything else — a reader who

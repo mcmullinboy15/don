@@ -2,15 +2,29 @@ use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use super::service_worker::ensure_download_for_config_worker;
 use super::task;
 use crate::config::{Platform, TaskAutoRun};
-use crate::task_state::{TaskHashProgress, TaskStateStore};
+use crate::task_state::{TaskHashProgress, TaskStateStore, WatchedInputs};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Clone, Copy)]
 pub(crate) enum TaskRunMode {
-    Startup { has_dependents: bool },
+    Startup {
+        has_dependents: bool,
+    },
     Triggered,
+    /// A watch trigger that landed while this task was running, or just after
+    /// it finished — so the change may be the task's own output arriving back
+    /// under its own watch patterns.
+    ///
+    /// A generator that rewrites its inputs unconditionally (a `rm -rf` plus
+    /// `cp` back into the worktree is the usual shape) would otherwise trigger
+    /// itself forever: every run bumps every mtime, the watcher reports a
+    /// change, and the change starts another run. The content hash settles it,
+    /// so this mode consults it before spawning where [`Triggered`] does not.
+    ///
+    /// [`Triggered`]: TaskRunMode::Triggered
+    Verify,
 }
 
 pub(crate) enum TaskRunPrepared {
@@ -194,6 +208,58 @@ pub(crate) async fn run_task_worker(
     crate::endpoints::render_env(&endpoints.snapshot(), name, &mut task_cfg.env)
         .map_err(|error| error.to_string())?;
     let task_cfg = &task_cfg;
+    if matches!(mode, TaskRunMode::Verify) && !task_cfg.watch.is_empty() {
+        let watch_base = working_dir_for(&base_dir, task_cfg.dir.as_deref());
+        let ignore_patterns = resolve_watch_ignore_patterns(
+            &watch_base,
+            &task_cfg.ignore,
+            &base_dir,
+            &global_watch_ignore,
+        );
+        let task_state = TaskStateStore::new(base_dir.join(".don").join("task-state"));
+        let progress_emitter = emitter.clone();
+        let progress_name = name.to_string();
+        let checked = task_state
+            .check_watched_inputs(
+                name,
+                &task_cfg.watch,
+                &ignore_patterns,
+                Some(&watch_base),
+                crate::task_state::MAX_VERIFY_FILES,
+                move |progress| {
+                    progress_emitter
+                        .service_debug_event(&progress_name, &format_hash_progress(progress));
+                },
+            )
+            .await;
+        match checked {
+            Ok(WatchedInputs::Unchanged) => {
+                return Ok(TaskRunPrepared::Skipped {
+                    message: "no changes — its own run rewrote these files".to_string(),
+                });
+            }
+            // Past the cap the hash is not worth its cost, so the window this
+            // mode already stands for is the whole answer. Said out loud,
+            // because it is the one case where a real edit made during a long
+            // run is dropped.
+            Ok(WatchedInputs::Unverifiable { files }) => {
+                return Ok(TaskRunPrepared::Skipped {
+                    message: format!(
+                        "no changes — changed during its own run ({files} watched files, too many to verify)"
+                    ),
+                });
+            }
+            Ok(WatchedInputs::Changed) => {}
+            // A check that could not run is not evidence of anything; fall
+            // through to the run the watcher asked for.
+            Err(e) => {
+                emitter.service_debug_event(
+                    name,
+                    &format!("task state: self-write check failed: {e}; running anyway"),
+                );
+            }
+        }
+    }
     if let TaskRunMode::Startup { has_dependents } = mode {
         let has_watch = !task_cfg.watch.is_empty();
         let watch_base = working_dir_for(&base_dir, task_cfg.dir.as_deref());

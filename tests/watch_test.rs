@@ -1188,7 +1188,7 @@ ready.exec.cmd = "true"
         let new_output = after.get(before..).unwrap_or_default();
         let mentions = new_output.matches("stray.txt").count();
         assert!(
-            new_output.contains("no item matched"),
+            new_output.contains("matched no item"),
             "the one summary line should still be emitted. output: {new_output}"
         );
         assert!(

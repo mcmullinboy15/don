@@ -321,15 +321,51 @@ fn answer(
 /// `auto_run` — is busy, but nothing is running, and refusing a manual run
 /// there would be a lie. Such a run is queued behind the evaluation instead,
 /// which takes milliseconds.
+/// How long after a run finishes a watch trigger is still attributed to that
+/// run's own writes.
+///
+/// Long enough for a `rm -rf` plus a copy of a few thousand files to drain
+/// through notify and past the item's debounce window; short enough that a
+/// save made while reading the last run's output is still the user's. Being
+/// wrong either way costs one hash, not a run.
+const SELF_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a watch trigger arriving now could be the last run's own output.
+fn is_self_write_suspect(last_run_ended: Option<std::time::Instant>) -> bool {
+    last_run_ended.is_some_and(|at| at.elapsed() < SELF_WRITE_GRACE)
+}
+
+/// What this supervisor currently is, at the moment a command arrives.
+///
+/// Grouped rather than passed loose because every field answers the same
+/// question — "what is this task in the middle of?" — and the call sites read
+/// as a description of the supervisor's own state instead of a bool run.
+#[derive(Clone, Copy)]
+struct RunContext {
+    /// A build this run's artifact depends on is still in flight.
+    awaiting_artifact: bool,
+    /// The phase this supervisor has published for itself.
+    phase: super::TaskState,
+    /// Whether a run of it is actually executing.
+    spawned: bool,
+    /// Whether a watch trigger arriving now could be the last run's own
+    /// output landing back under its watch patterns.
+    self_write_suspect: bool,
+}
+
 fn resolve_command(
     command: TaskCommand,
     name: &str,
     startup: Option<&StartupConfig>,
     last_params: &std::collections::HashMap<String, String>,
-    awaiting_artifact: bool,
-    phase: super::TaskState,
-    spawned: bool,
+    ctx: RunContext,
 ) -> Ask {
+    let RunContext {
+        awaiting_artifact,
+        phase,
+        spawned,
+        self_write_suspect,
+    } = ctx;
     match command {
         TaskCommand::Run(request) => {
             let Some(startup) = startup else {
@@ -425,12 +461,20 @@ fn resolve_command(
                     "files changed (pending — task has params, run manually)".to_string(),
                 );
             }
-            // No hash check: the watcher already confirmed a matching file
-            // changed. That check exists for startup, to skip a task whose
-            // inputs have not moved since its last run.
+            // Normally no hash check: the watcher already confirmed a matching
+            // file changed, and that check exists for startup, to skip a task
+            // whose inputs have not moved since its last run. The exception is
+            // a change that landed while this task was running or moments
+            // after — that one may be the task's own output, and taking the
+            // watcher's word for it is what makes a generator rewriting its
+            // inputs re-trigger itself forever.
             Ask::Run(RunRequest {
                 params: std::collections::HashMap::new(),
-                mode: super::task_worker::TaskRunMode::Triggered,
+                mode: if self_write_suspect {
+                    super::task_worker::TaskRunMode::Verify
+                } else {
+                    super::task_worker::TaskRunMode::Triggered
+                },
                 intent: super::TaskRunIntent::Background,
                 reply: None,
                 start_message: Some("re-running (file changed)".to_string()),
@@ -548,6 +592,9 @@ async fn supervise(
     let service_writer = output.as_ref().map(|output| output.writer());
     let mut pending: Option<RunRequest> = None;
     let mut mailbox_closed = false;
+    // When the last run finished, for `is_self_write_suspect`. Only a run that
+    // actually spawned sets it — nothing else of this task's wrote anything.
+    let mut last_run_ended: Option<std::time::Instant> = None;
     // The parameters the last run used, for a restart to reuse. Held here
     // because a restart is executed here; the scheduler kept a copy only to
     // hand it back on the way in.
@@ -633,9 +680,14 @@ async fn supervise(
                                         &name,
                                         startup.as_ref(),
                                         &last_params,
-                                        awaiting_artifact,
-                                        owner.phase,
-                                        false,
+                                        RunContext {
+                                            awaiting_artifact,
+                                            phase: owner.phase,
+                                            spawned: false,
+                                            self_write_suspect: is_self_write_suspect(
+                                                last_run_ended,
+                                            ),
+                                        },
                                     ) {
                                         Ask::Run(request)
                                         | Ask::Cancel { then: Some(request), .. } => {
@@ -746,9 +798,16 @@ async fn supervise(
                                     &name,
                                     startup.as_ref(),
                                     &last_params,
-                                    awaiting_artifact,
-                                    owner.phase,
-                                    false,
+                                    RunContext {
+                                        awaiting_artifact,
+                                        phase: owner.phase,
+                                        spawned: false,
+                                        // The build graph moved, not the
+                                        // watched inputs — a hash over the
+                                        // latter would rule out a run for
+                                        // the wrong reason.
+                                        self_write_suspect: false,
+                                    },
                                 ) {
                                     Ask::Run(request) => {
                                         busy.store(true, Ordering::Relaxed);
@@ -878,8 +937,16 @@ async fn supervise(
                         // deciding — so a run arriving now is queued behind
                         // that decision rather than refused.
                         match resolve_command(
-                            command, &name, startup.as_ref(), &last_params, false, owner.phase,
-                            false,
+                            command,
+                            &name,
+                            startup.as_ref(),
+                            &last_params,
+                            RunContext {
+                                awaiting_artifact: false,
+                                phase: owner.phase,
+                                spawned: false,
+                                self_write_suspect: is_self_write_suspect(last_run_ended),
+                            },
                         ) {
                             Ask::Run(request) => superseded = Some(request),
                             Ask::Cancel { then, done } => {
@@ -1118,8 +1185,19 @@ async fn supervise(
                 next = rx.recv(), if !mailbox_closed => match next {
                     Some(command) => {
                         match resolve_command(
-                            command, &name, startup.as_ref(), &last_params, false, owner.phase,
-                            true,
+                            command,
+                            &name,
+                            startup.as_ref(),
+                            &last_params,
+                            RunContext {
+                                awaiting_artifact: false,
+                                phase: owner.phase,
+                                spawned: true,
+                                // This task is running right now, so anything
+                                // landing under its watch patterns is its own
+                                // output until the hash says otherwise.
+                                self_write_suspect: true,
+                            },
                         ) {
                             // A run queued behind this one starts strictly
                             // after it — owning the exit is what makes that
@@ -1154,6 +1232,7 @@ async fn supervise(
             await_reader(reader).await;
         }
         drop(osc);
+        last_run_ended = Some(std::time::Instant::now());
         // The run is over: unregister attach so new clients are refused and
         // muted stdout resumes before the completion message lands.
         if let Some(output) = output.as_ref() {
@@ -1665,7 +1744,12 @@ mod tests {
             phase: super::super::TaskState,
             /// Whether a run of it is actually executing.
             spawned: bool,
+            /// Whether a watch trigger arriving now could be the last run's
+            /// own output landing back under its watch patterns.
+            self_write_suspect: bool,
             want: &'static str,
+            /// The mode the resolved run carries, when it makes one.
+            want_mode: Option<&'static str>,
             /// Parameters the resolved run carries, when it makes one.
             want_params: Vec<(&'static str, &'static str)>,
             want_reply: Option<bool>,
@@ -1679,6 +1763,8 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Pending,
                 spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "run",
                 want_params: vec![],
                 // Admission is not the answer: `don run` is told it was
@@ -1693,6 +1779,8 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Pending,
                 spawned: true,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
@@ -1707,6 +1795,8 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Skipped,
                 spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "run",
                 want_params: vec![],
                 want_reply: None,
@@ -1719,6 +1809,8 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Running,
                 spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
@@ -1730,6 +1822,8 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Pending,
                 spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "run",
                 want_params: vec![("env", "staging")],
                 want_reply: None,
@@ -1741,9 +1835,37 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Pending,
                 spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
+            },
+            Case {
+                name: "a watch trigger outside the self-write window is taken at its word",
+                command: Box::new(|_| TaskCommand::Rerun),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Completed,
+                spawned: false,
+                self_write_suspect: false,
+                want_mode: Some("triggered"),
+                want: "run",
+                want_params: vec![],
+                want_reply: None,
+            },
+            Case {
+                name: "a watch trigger inside the self-write window is verified first",
+                command: Box::new(|_| TaskCommand::Rerun),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Completed,
+                spawned: false,
+                self_write_suspect: true,
+                want_mode: Some("verify"),
+                want: "run",
+                want_params: vec![],
+                want_reply: None,
             },
             Case {
                 name: "a kill cancels and does not run again",
@@ -1752,6 +1874,8 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Running,
                 spawned: true,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "cancel-only",
                 want_params: vec![],
                 want_reply: None,
@@ -1763,6 +1887,8 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Completed,
                 spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "cancel-then-run",
                 want_params: vec![],
                 want_reply: Some(true),
@@ -1774,6 +1900,8 @@ mod tests {
                 last_params: vec![("env", "staging")],
                 phase: super::super::TaskState::Completed,
                 spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "cancel-then-run",
                 want_params: vec![("env", "staging")],
                 want_reply: Some(true),
@@ -1787,6 +1915,8 @@ mod tests {
                 last_params: vec![],
                 phase: super::super::TaskState::Completed,
                 spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
                 want: "nothing",
                 want_params: vec![],
                 want_reply: Some(false),
@@ -1813,26 +1943,45 @@ mod tests {
                 "seed",
                 Some(&startup),
                 &last_params,
-                false,
-                case.phase,
-                case.spawned,
+                RunContext {
+                    awaiting_artifact: false,
+                    phase: case.phase,
+                    spawned: case.spawned,
+                    self_write_suspect: case.self_write_suspect,
+                },
             );
-            let (got, params) = match &ask {
-                Ask::Run(request) => ("run", Some(request.params.clone())),
-                Ask::Cancel { then: None, .. } => ("cancel-only", None),
+            let mode_label = |mode: &super::super::task_worker::TaskRunMode| match mode {
+                super::super::task_worker::TaskRunMode::Startup { .. } => "startup",
+                super::super::task_worker::TaskRunMode::Triggered => "triggered",
+                super::super::task_worker::TaskRunMode::Verify => "verify",
+            };
+            let (got, params, mode) = match &ask {
+                Ask::Run(request) => (
+                    "run",
+                    Some(request.params.clone()),
+                    Some(mode_label(&request.mode)),
+                ),
+                Ask::Cancel { then: None, .. } => ("cancel-only", None, None),
                 Ask::Cancel {
                     then: Some(request),
                     ..
-                } => ("cancel-then-run", Some(request.params.clone())),
-                Ask::Park(_) => ("park", None),
-                Ask::Requery => ("requery", None),
-                Ask::Nothing => ("nothing", None),
+                } => (
+                    "cancel-then-run",
+                    Some(request.params.clone()),
+                    Some(mode_label(&request.mode)),
+                ),
+                Ask::Park(_) => ("park", None, None),
+                Ask::Requery => ("requery", None, None),
+                Ask::Nothing => ("nothing", None, None),
             };
             // An admitted run still holds the reply — it is answered when the
             // run is picked up, not here. Drop it so "nobody answered" is a
             // closed channel rather than a wait that never ends.
             drop(ask);
             assert_eq!(got, case.want, "{}", case.name);
+            if let Some(want_mode) = case.want_mode {
+                assert_eq!(mode, Some(want_mode), "{}: run mode", case.name);
+            }
             if let Some(params) = params {
                 let want: std::collections::HashMap<String, String> = case
                     .want_params

@@ -406,6 +406,7 @@ mod tests {
             depends_on: vec![],
             watch: vec![],
             ignore: vec![],
+            debounce: None,
             timeout: None,
             log: LogConfig::Stdout,
             interactive: false,

@@ -380,6 +380,7 @@ fn integration_task_download_resolves_cmd() {
             depends_on: vec![],
             watch: vec![],
             ignore: vec![],
+            debounce: None,
             timeout: None,
             log: don::config::LogConfig::Stdout,
             interactive: false,
