@@ -38,10 +38,19 @@ jobs:
 
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup component add clippy
+          rustup component add clippy rustfmt
 
           rustc --version
           cargo --version
+
+      # libghostty-vt-sys compiles ghostty's VT core with `zig build` at
+      # build time — no prebuilt libraries exist. Ghostty pins the Zig
+      # version exactly; keep this in step with what the pinned
+      # libghostty-vt release requires.
+      - name: Install Zig (required by libghostty-vt-sys)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
 
       # The Go preset integration tests spawn a real `go` toolchain. The Ubuntu
       # runner image ships one, but the macOS image does not — install it
@@ -50,6 +59,19 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: stable
+
+      # The web UI bundle is embedded into the binary but isn't committed —
+      # it's a build artifact. Build it before cargo so the embedded assets
+      # are real; a couple of the web tests assert the app shell is served.
+      # `npm ci` also typechecks the frontend via the build script.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the web UI bundle
+        run: npm --prefix web ci && npm --prefix web run build
 
       - name: Build
         run: cargo build --locked
@@ -62,3 +84,8 @@ jobs:
 
       - name: Lint
         run: cargo clippy --locked -- -D warnings
+
+      # Runs after the build so a formatting nit never masks a compile error —
+      # the useful failure should be the one you see first.
+      - name: Check formatting
+        run: cargo fmt --check

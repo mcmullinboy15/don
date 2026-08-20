@@ -1,13 +1,9 @@
-//! Runtime port publication, references, and ready-check resolution.
+//! The `.don/ports.json` manifest writer, and the two custody funnels that
+//! keep the runner's shadow, the endpoint projection and the manifest in step.
 
-use super::service::ServiceHandle;
-use super::{CommandError, Runner};
-use crate::config::ReadyCheck;
+use super::Runner;
 use crate::output::LifecycleEmitter;
-use crate::ports::{DockerPort, PortManifest, ProxyPort, ServicePorts};
-use crate::proxy::ProxyBindingMode;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::SocketAddr;
+use crate::ports::PortManifest;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -48,8 +44,7 @@ pub(in crate::runner) fn spawn_manifest_writer(
                     emitter.lifecycle_event(&format!("failed to update runtime ports: {error}"));
                 }
                 Err(join_error) => {
-                    emitter
-                        .lifecycle_event(&format!("runtime ports writer failed: {join_error}"));
+                    emitter.lifecycle_event(&format!("runtime ports writer failed: {join_error}"));
                 }
             }
         }
@@ -58,53 +53,121 @@ pub(in crate::runner) fn spawn_manifest_writer(
 }
 
 impl Runner {
-    /// Render `$(service.key)` references in inline environment values.
-    pub(in crate::runner) fn render_runtime_env(
-        &self,
-        item_name: &str,
-        env: &mut HashMap<String, String>,
-    ) -> Result<(), CommandError> {
-        let references = self.runtime_port_references();
-        // Only tokens naming a known service are treated as runtime references;
-        // this keeps shell-style `$(...)` values in inline env untouched.
-        let known_services: HashSet<String> = self.services.keys().cloned().collect();
-        for (key, value) in env.iter_mut() {
-            *value =
-                super::env_refs::render(value, &references, &known_services).map_err(|error| {
-                    CommandError::Failed {
-                        name: item_name.to_string(),
-                        message: format!("invalid runtime port reference in env.{key}: {error}"),
-                    }
-                })?;
-        }
-        Ok(())
-    }
-
-    /// Resolve a service ready check against its actual public runtime ports.
-    pub(in crate::runner) fn effective_ready_check(
+    /// This service's ready check, resolved against published endpoints —
+    /// for `don status -v` and the ready lifecycle line.
+    ///
+    /// The authoritative resolution for the check that actually *runs* happens
+    /// in the service supervisor over its own live proxy and docker state.
+    /// Both go through [`crate::process::ready::resolve_ready_check`], so they
+    /// cannot drift.
+    pub(in crate::runner) fn endpoint_ready_check(
         &self,
         name: &str,
         resolved: &crate::config::ResolvedService,
-    ) -> Option<ReadyCheck> {
-        let mut ready = resolved.ready.clone()?;
-        let mut env = resolved.env.clone();
-        env.extend(self.runtime_public_env(name));
+    ) -> Option<crate::config::ReadyCheck> {
+        crate::endpoints::effective_ready_check(&self.endpoints.snapshot(), name, resolved)
+    }
 
-        if let Some(tcp) = ready.tcp.take() {
-            let expanded = super::service::expand_env_vars(&tcp, &env);
-            ready.tcp = Some(rewrite_tcp_port(
-                &expanded,
-                &self.ready_port_replacements(name),
-            ));
-        }
-        if let Some(http) = ready.http.take() {
-            let expanded = super::service::expand_env_vars(&http, &env);
-            ready.http = Some(rewrite_http_port(
-                &expanded,
-                &self.ready_port_replacements(name),
-            ));
-        }
-        Some(ready)
+    /// Fold a wired spawn's custody: the shadow, the endpoint projection and
+    /// the port manifest, in one place so the three cannot drift.
+    ///
+    /// There is exactly one other custody funnel,
+    /// [`clear_service_custody`](Self::clear_service_custody). Setting
+    /// Recording custody anywhere else means the endpoint projection and the
+    /// state projection disagree about whether a container is live — which
+    /// shows up as a peer's `$(db.PORT)` resolving when it shouldn't, or not
+    /// resolving when it should.
+    pub(in crate::runner) fn fold_service_custody(
+        &mut self,
+        name: &str,
+        identity: super::ServiceHandleIdentity,
+        pgid: Option<i32>,
+        docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
+        proxy_backend_env: Option<std::collections::HashMap<String, String>>,
+    ) {
+        let docker_live = identity == super::ServiceHandleIdentity::Docker;
+        self.endpoints.publish_wired(
+            name,
+            docker_port_bindings.clone(),
+            proxy_backend_env.clone(),
+            docker_live,
+        );
+        // The projection is where custody is recorded, not a copy of where it
+        // is recorded. Published here rather than on the state transition,
+        // because a wire can land while the service is already `Running` and
+        // `set_service_state` would no-op.
+        self.state.set_service_runtime(
+            name,
+            Some(crate::state_store::ServiceRuntime {
+                pid: pgid,
+                docker: docker_live,
+                docker_ports: crate::docker::describe_port_bindings(&docker_port_bindings),
+            }),
+        );
+        // Say so, because the wire lands *after* the transition that announced
+        // the start. A service with a ready check gets a second transition
+        // afterwards and its pid rides along on that; one without never does,
+        // so without this it would be pid-less on the event stream forever.
+        // That is why pids showed for some services and not others.
+        self.rebroadcast_service_runtime(name);
+        self.refresh_runtime_port_manifest();
+    }
+
+    /// Re-announce a service's current state now that its runtime detail has
+    /// changed, so event consumers see the same thing the projection holds.
+    fn rebroadcast_service_runtime(&self, name: &str) {
+        let state = self.service_state(name);
+        self.broadcast_service_state(name, state);
+    }
+
+    /// Custody ended. Docker *bindings* are retained so a restart can request
+    /// the same host ports, but the service stops being reachable — so its
+    /// references stop resolving and it leaves the port manifest.
+    pub(in crate::runner) fn clear_service_custody(&mut self, name: &str) {
+        self.endpoints.clear_custody(name);
+        self.state.set_service_runtime(name, None);
+        // No re-announcement here, unlike the wire above: custody only ends
+        // alongside a phase change, and that transition carries the cleared
+        // runtime with it. Saying it twice would put a second `Stopping` in
+        // front of `Stopped` and make teardown read as if it stalled.
+        self.refresh_runtime_port_manifest();
+    }
+
+    /// What this service's supervisor currently holds, read from the
+    /// projection the fold publishes. The scheduler keeps no second copy —
+    /// this *is* the record.
+    pub(in crate::runner) fn service_runtime(
+        &self,
+        name: &str,
+    ) -> Option<crate::state_store::ServiceRuntime> {
+        self.state
+            .current()
+            .processes
+            .iter()
+            .find_map(|status| match status {
+                crate::state_store::ProcessStatus::Service {
+                    name: process_name,
+                    runtime,
+                    ..
+                } if process_name == name => runtime.clone(),
+                _ => None,
+            })
+    }
+
+    /// The running task's process group id, if it has one.
+    pub(in crate::runner) fn task_pid(&self, name: &str) -> Option<i32> {
+        self.state
+            .current()
+            .processes
+            .iter()
+            .find_map(|status| match status {
+                crate::state_store::ProcessStatus::Task {
+                    name: process_name,
+                    pid,
+                    ..
+                } if process_name == name => *pid,
+                _ => None,
+            })
     }
 
     /// Queue a rewrite of `.don/ports.json` from the runner's current live
@@ -112,7 +175,8 @@ impl Runner {
     /// performed by the manifest-writer task.
     pub(in crate::runner) fn refresh_runtime_port_manifest(&self) {
         if let Some(tx) = &self.manifest_writer_tx {
-            let _ = tx.send(ManifestWrite::Update(Box::new(self.port_manifest())));
+            let manifest = crate::endpoints::port_manifest(&self.endpoints.snapshot());
+            let _ = tx.send(ManifestWrite::Update(Box::new(manifest)));
         }
     }
 
@@ -130,271 +194,5 @@ impl Runner {
         if let Some(handle) = self.manifest_writer_handle.take() {
             let _ = handle.await;
         }
-    }
-
-    fn runtime_port_references(&self) -> HashMap<String, String> {
-        let mut references = HashMap::new();
-        for (service_name, runtime) in &self.services {
-            // A proxy is the outer public endpoint when a service declares
-            // both proxy and Docker mappings, so insert it last.
-            if let Some(ServiceHandle::Docker(handle)) = runtime.handle.as_ref() {
-                extend_service_references(
-                    &mut references,
-                    service_name,
-                    handle.env_reference_values(),
-                );
-            }
-            if let Some(proxy) = runtime.proxy.as_ref() {
-                extend_service_references(
-                    &mut references,
-                    service_name,
-                    proxy.env_reference_values(),
-                );
-            }
-        }
-        references
-    }
-
-    fn runtime_public_env(&self, name: &str) -> HashMap<String, String> {
-        let mut env = HashMap::new();
-        let Some(runtime) = self.services.get(name) else {
-            return env;
-        };
-        if let Some(ServiceHandle::Docker(handle)) = runtime.handle.as_ref() {
-            env.extend(handle.public_env_vars());
-        }
-        if let Some(proxy) = runtime.proxy.as_ref() {
-            env.extend(proxy.public_env_vars());
-        }
-        env
-    }
-
-    fn ready_port_replacements(&self, name: &str) -> HashMap<u16, u16> {
-        let mut candidates: HashMap<u16, Option<u16>> = HashMap::new();
-        let Some(runtime) = self.services.get(name) else {
-            return HashMap::new();
-        };
-
-        if let Some(proxy) = runtime.proxy.as_ref() {
-            for binding in proxy.bindings() {
-                let Ok(configured) = binding.configured_addr.parse::<SocketAddr>() else {
-                    continue;
-                };
-                record_port_replacement(
-                    &mut candidates,
-                    configured.port(),
-                    binding.bound_addr.port(),
-                );
-            }
-        }
-        if let Some(ServiceHandle::Docker(handle)) = runtime.handle.as_ref() {
-            for binding in handle
-                .port_bindings()
-                .iter()
-                .filter(|binding| binding.protocol == "tcp")
-            {
-                record_port_replacement(
-                    &mut candidates,
-                    binding.configured_host_port,
-                    binding.host_port,
-                );
-            }
-        }
-
-        candidates
-            .into_iter()
-            .filter_map(|(configured, actual)| {
-                actual
-                    .filter(|actual| configured != 0 && configured != *actual)
-                    .map(|actual| (configured, actual))
-            })
-            .collect()
-    }
-
-    fn port_manifest(&self) -> PortManifest {
-        let mut services = BTreeMap::new();
-        for (name, runtime) in &self.services {
-            let proxy: Vec<ProxyPort> = runtime
-                .proxy
-                .as_ref()
-                .map(|proxy| {
-                    proxy
-                        .bindings()
-                        .iter()
-                        .map(|binding| {
-                            let (mode, env, target) = match &binding.mode {
-                                ProxyBindingMode::Env { env_name } => {
-                                    ("env".to_string(), Some(env_name.clone()), None)
-                                }
-                                ProxyBindingMode::Forward { target } => {
-                                    ("forward".to_string(), None, Some(target.to_string()))
-                                }
-                                ProxyBindingMode::Listenfd => ("listenfd".to_string(), None, None),
-                            };
-                            ProxyPort {
-                                configured_addr: binding.configured_addr.clone(),
-                                bound_addr: binding.bound_addr.to_string(),
-                                mode,
-                                env,
-                                target,
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let docker = match runtime.handle.as_ref() {
-                Some(ServiceHandle::Docker(handle)) => handle
-                    .port_bindings()
-                    .iter()
-                    .map(|binding| DockerPort {
-                        configured: binding.configured.clone(),
-                        host_addr: binding.host_addr().to_string(),
-                        container_port: binding.container_port.to_string(),
-                        protocol: binding.protocol.clone(),
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-
-            if !proxy.is_empty() || !docker.is_empty() {
-                services.insert(name.clone(), ServicePorts { proxy, docker });
-            }
-        }
-        PortManifest {
-            version: 1,
-            generated_at_unix_secs: 0,
-            services,
-        }
-    }
-}
-
-fn extend_service_references(
-    references: &mut HashMap<String, String>,
-    service_name: &str,
-    values: HashMap<String, String>,
-) {
-    for (key, value) in values {
-        references.insert(format!("{service_name}.{key}"), value);
-    }
-}
-
-fn record_port_replacement(
-    candidates: &mut HashMap<u16, Option<u16>>,
-    configured: u16,
-    actual: u16,
-) {
-    match candidates.entry(configured) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(Some(actual));
-        }
-        std::collections::hash_map::Entry::Occupied(mut entry)
-            if entry.get().is_some_and(|existing| existing != actual) =>
-        {
-            entry.insert(None);
-        }
-        std::collections::hash_map::Entry::Occupied(_) => {}
-    }
-}
-
-fn rewrite_tcp_port(value: &str, replacements: &HashMap<u16, u16>) -> String {
-    if let Ok(mut address) = value.parse::<SocketAddr>()
-        && let Some(actual) = replacements.get(&address.port())
-    {
-        address.set_port(*actual);
-        return address.to_string();
-    }
-
-    let Some((prefix, port)) = value.rsplit_once(':') else {
-        return value.to_string();
-    };
-    let Ok(configured) = port.parse::<u16>() else {
-        return value.to_string();
-    };
-    match replacements.get(&configured) {
-        Some(actual) => format!("{prefix}:{actual}"),
-        None => value.to_string(),
-    }
-}
-
-fn rewrite_http_port(value: &str, replacements: &HashMap<u16, u16>) -> String {
-    let Ok(mut url) = reqwest::Url::parse(value) else {
-        return value.to_string();
-    };
-    let Some(configured) = url.port_or_known_default() else {
-        return value.to_string();
-    };
-    let Some(actual) = replacements.get(&configured) else {
-        return value.to_string();
-    };
-    if url.set_port(Some(*actual)).is_err() {
-        return value.to_string();
-    }
-    url.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ready_port_rewrite_table() {
-        struct Case {
-            name: &'static str,
-            input: &'static str,
-            http: bool,
-            expected: &'static str,
-        }
-
-        let replacements = HashMap::from([(3000, 49152), (80, 49153)]);
-        let cases = vec![
-            Case {
-                name: "socket address",
-                input: "127.0.0.1:3000",
-                http: false,
-                expected: "127.0.0.1:49152",
-            },
-            Case {
-                name: "hostname address",
-                input: "localhost:3000",
-                http: false,
-                expected: "localhost:49152",
-            },
-            Case {
-                name: "explicit HTTP port",
-                input: "http://localhost:3000/health",
-                http: true,
-                expected: "http://localhost:49152/health",
-            },
-            Case {
-                name: "implicit HTTP port",
-                input: "http://localhost/health",
-                http: true,
-                expected: "http://localhost:49153/health",
-            },
-            Case {
-                name: "unmapped",
-                input: "127.0.0.1:9000",
-                http: false,
-                expected: "127.0.0.1:9000",
-            },
-        ];
-
-        for case in cases {
-            let actual = if case.http {
-                rewrite_http_port(case.input, &replacements)
-            } else {
-                rewrite_tcp_port(case.input, &replacements)
-            };
-            assert_eq!(actual, case.expected, "{}", case.name);
-        }
-    }
-
-    #[test]
-    fn ambiguous_replacement_is_suppressed() {
-        let mut candidates = HashMap::new();
-        record_port_replacement(&mut candidates, 3000, 49152);
-        record_port_replacement(&mut candidates, 3000, 49153);
-        assert_eq!(candidates.get(&3000), Some(&None));
     }
 }

@@ -1,9 +1,9 @@
-use super::profile::resolve_profile_items_for_platform;
-use super::{RunnerError, RuntimeService, RuntimeTask, ServiceState, TaskItemState};
+use super::{RunnerError, RuntimeService, RuntimeTask};
+use crate::config::profile::resolve_profile_processes_for_platform;
 use crate::config::{Config, Platform, ServiceKind};
 use crate::output::OutputManager;
-use crate::process::pid_file::{PidFile, PidFileError};
-use crate::task_state::TaskState;
+use crate::sys::pid_file::{PidFile, PidFileError};
+use crate::task_state::TaskStateStore;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -54,7 +54,7 @@ pub(in crate::runner) async fn cleanup_stale_state(
             }
         })
         .collect();
-    let cleanup_report = crate::process::cleanup::run_cleanup(base_dir, &docker_names).await;
+    let cleanup_report = crate::sys::cleanup::run_cleanup(base_dir, &docker_names).await;
     if cleanup_report.pid_files_removed > 0
         || cleanup_report.sock_removed
         || cleanup_report.containers_removed > 0
@@ -83,7 +83,7 @@ pub(in crate::runner) fn connect_docker_if_needed(
         .map_err(|e| RunnerError::Config(format!("docker connection failed: {e}")))
 }
 
-pub(in crate::runner) fn resolve_active_items(
+pub(in crate::runner) fn resolve_active_processes(
     config: &Config,
     platform: Platform,
     profile: Option<&str>,
@@ -95,31 +95,31 @@ pub(in crate::runner) fn resolve_active_items(
         .profiles
         .get(profile_name)
         .ok_or_else(|| RunnerError::Config(format!("unknown profile '{profile_name}'")))?;
-    Ok(Some(resolve_profile_items_for_platform(
+    Ok(Some(resolve_profile_processes_for_platform(
         config, prof, platform,
     )))
 }
 
 pub(in crate::runner) fn filter_active_services(
     config: &Config,
-    active_items: Option<&HashSet<String>>,
+    active_processes: Option<&HashSet<String>>,
 ) -> HashSet<String> {
     config
         .services
         .keys()
-        .filter(|name| active_items.is_none_or(|s| s.contains(*name)))
+        .filter(|name| active_processes.is_none_or(|s| s.contains(*name)))
         .cloned()
         .collect()
 }
 
 pub(in crate::runner) fn filter_active_tasks(
     config: &Config,
-    active_items: Option<&HashSet<String>>,
+    active_processes: Option<&HashSet<String>>,
 ) -> HashSet<String> {
     config
         .tasks
         .keys()
-        .filter(|name| active_items.is_none_or(|s| s.contains(*name)))
+        .filter(|name| active_processes.is_none_or(|s| s.contains(*name)))
         .cloned()
         .collect()
 }
@@ -174,14 +174,11 @@ pub(in crate::runner) async fn build_runtime_maps(
         if active_services.contains(name) {
             let mut resolved = svc.resolve(platform);
             resolved.depends_on = config.effective_depends_on(name, &resolved.depends_on);
-            services.insert(
-                name.clone(),
-                RuntimeService::new(resolved, ServiceState::Pending),
-            );
+            services.insert(name.clone(), RuntimeService::new(resolved));
         }
     }
 
-    let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
+    let task_state = TaskStateStore::new(base_dir.join(".don").join("task-state"));
     let mut tasks = HashMap::new();
     for (name, task) in &config.tasks {
         if active_tasks.contains(name) {
@@ -192,10 +189,7 @@ pub(in crate::runner) async fn build_runtime_maps(
             }
             let has_success = task_state.has_success(name).await.unwrap_or(false);
             let last_run = task_state.last_run(name).await.unwrap_or(None);
-            tasks.insert(
-                name.clone(),
-                RuntimeTask::new(task, TaskItemState::Pending, has_success, last_run),
-            );
+            tasks.insert(name.clone(), RuntimeTask::new(task, has_success, last_run));
         }
     }
     (services, tasks)

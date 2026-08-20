@@ -6,9 +6,35 @@
 //! and closes. Follow-mode log streams use chunked transfer encoding.
 
 pub mod attach;
+pub mod attach_session;
 
-use crate::runner::{CompletionError, ItemStatus};
 use serde::Deserialize;
+
+// Re-exported (and used here) so client-side consumers (the TUI) can name
+// every type the API surface speaks without importing from `runner` — the
+// types live there, but the *dependency* reads `crate::client`, which is
+// the module edge the TUI separation enforces.
+pub use crate::runner::{
+    CompletionError, ProcessStatus, RunnerEvent, ServiceRuntime, ServiceState, StateSnapshot,
+    TaskState,
+};
+
+/// One parsed record from `GET /events`.
+#[derive(Debug, Clone)]
+pub enum EventStreamItem {
+    /// The stream's first record: full current state, so a connecting (or
+    /// reconnecting) client starts consistent instead of
+    /// stale-until-the-next-event.
+    Snapshot {
+        processes: Vec<ProcessStatus>,
+        startup_complete: bool,
+    },
+    /// A runner event, exactly as broadcast.
+    Event(RunnerEvent),
+    /// This follower fell `n` events behind and they are unrecoverable —
+    /// resync from `GET /status`.
+    Lagged(u64),
+}
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -58,7 +84,7 @@ pub enum ClientError {
 /// Deserialised body of `GET /status`.
 #[derive(Debug, Deserialize)]
 pub struct StatusResponse {
-    pub items: Vec<ItemStatus>,
+    pub processes: Vec<ProcessStatus>,
 }
 
 /// Deserialised body of `GET /watch`.
@@ -75,12 +101,62 @@ pub struct LogsResponse {
 }
 
 /// Options for running a task through the daemon API.
+/// One record from the merged log stream (`GET /logs?follow=true`).
+///
+/// Untagged: a record is either a log line or a lag notice, distinguished
+/// by shape. See the endpoint docs in `server/routes.rs` for field
+/// semantics.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum LogStreamEvent {
+    /// A formatted log line, ANSI colors included, no trailing newline.
+    Line {
+        /// This line's place in the merged stream — the same number every
+        /// client sees for it. Resume from `id + 1` after a disconnect.
+        id: crate::output::LogId,
+        /// Owning process name; `[don]` lifecycle events carry their own
+        /// sentinel name (see [`crate::output::LIFECYCLE_EVENT_NAME`]).
+        name: String,
+        /// True for `[don]`-prefixed lifecycle events.
+        lifecycle: bool,
+        /// True for verbose diagnostic messages — always present in the
+        /// stream; the reader decides whether to display them.
+        #[serde(default)]
+        verbose: bool,
+        /// The rendered name column — padded, coloured, with its separator,
+        /// and the elapsed stamp when verbose. Empty from a runner that
+        /// predates the split, in which case `line` carries it inline.
+        #[serde(default)]
+        prefix: String,
+        /// The message, with whatever styling the process emitted. No prefix.
+        line: String,
+    },
+    /// `dropped` lines are gone for good and the stream continues from
+    /// `resumed_at`. Only sent when the server's own history could not cover
+    /// the gap — an ordinary slow reader is caught up silently.
+    Dropped {
+        dropped: u64,
+        resumed_at: crate::output::LogId,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunTaskOptions {
     /// Wait until the task process exits before returning.
     pub wait: bool,
     /// Maximum time the daemon should wait for task completion.
     pub wait_timeout: Option<String>,
+}
+
+/// Deserialised body of `GET /ready`.
+#[derive(Debug, Deserialize)]
+pub struct ReadyInfo {
+    /// Whether the initial startup sweep has decided every process.
+    pub startup_complete: bool,
+    /// The runner's crate version. `None` from a runner that predates the
+    /// field.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +177,11 @@ impl Client {
         }
     }
 
+    /// The unix socket path this client talks to.
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
     /// Directly wrap an existing socket path (tests, non-standard layouts).
     pub fn with_socket_path(socket_path: PathBuf) -> Self {
         Self { socket_path }
@@ -110,13 +191,13 @@ impl Client {
     ///
     /// When `name` is `Some`, the response is restricted to that single
     /// service/task and includes its full resolved watch path list (the
-    /// all-items view omits the path list — see the server's `collect_status`).
+    /// all-processes view omits the path list — see the server's `collect_status`).
     /// A name that matches nothing yields an empty list, not an error.
     pub async fn status(
         &self,
         verbose: bool,
         name: Option<&str>,
-    ) -> Result<Vec<ItemStatus>, ClientError> {
+    ) -> Result<Vec<ProcessStatus>, ClientError> {
         let mut path = String::from("/status");
         let mut sep = '?';
         if verbose {
@@ -131,16 +212,33 @@ impl Client {
         let (status, body) = self.request("GET", &path, false).await?;
         ensure_ok(status, &body)?;
         let parsed: StatusResponse = serde_json::from_slice(&body)?;
-        Ok(parsed.items)
+        Ok(parsed.processes)
     }
 
-    /// `GET /watch` — global file-watch state (inotify dirs + per-item
+    /// `GET /watch` — global file-watch state (inotify dirs + per-process
     /// patterns). `Ok(None)` means no watches are active.
     pub async fn watch(&self) -> Result<Option<crate::runner::WatchReport>, ClientError> {
         let (status, body) = self.request("GET", "/watch", false).await?;
         ensure_ok(status, &body)?;
         let parsed: WatchResponse = serde_json::from_slice(&body)?;
         Ok(parsed.watch)
+    }
+
+    /// `GET /ready` — whether the runner has finished its initial sweep.
+    ///
+    /// The API socket is bound before the runner starts, so its presence says
+    /// nothing about readiness. This is that signal: wait for it before
+    /// issuing a control action whose meaning depends on startup being over.
+    pub async fn ready(&self) -> Result<bool, ClientError> {
+        Ok(self.ready_info().await?.startup_complete)
+    }
+
+    /// `GET /ready`, full body — readiness plus the runner's version, for
+    /// clients that want to warn about skew against a long-lived runner.
+    pub async fn ready_info(&self) -> Result<ReadyInfo, ClientError> {
+        let (status, body) = self.request("GET", "/ready", false).await?;
+        ensure_ok(status, &body)?;
+        Ok(serde_json::from_slice(&body)?)
     }
 
     /// `POST /start/:name`
@@ -158,18 +256,25 @@ impl Client {
         self.control("/restart/", name).await
     }
 
-    /// `POST /shutdown` — gracefully stop the daemon and all running services.
-    pub async fn shutdown(&self) -> Result<(), ClientError> {
-        let (status, body) = self.request("POST", "/shutdown", false).await?;
+    /// `POST /hard-restart/:name` — kill and restart, skipping graceful stop.
+    pub async fn hard_restart(&self, name: &str) -> Result<(), ClientError> {
+        self.control("/hard-restart/", name).await
+    }
+
+    /// `POST /shutdown?force=true` — escalate like a second Ctrl+C:
+    /// in-flight graceful stops SIGKILL their process groups.
+    pub async fn shutdown_force(&self) -> Result<(), ClientError> {
+        let (status, body) = self.request("POST", "/shutdown?force=true", false).await?;
         if status == 204 {
             return Ok(());
         }
-        Err(classify_error(status, &body))
+        ensure_ok(status, &body)?;
+        Ok(())
     }
 
-    /// `POST /run-pending` — trigger all tasks in PendingRun state.
-    pub async fn run_pending(&self) -> Result<(), ClientError> {
-        let (status, body) = self.request("POST", "/run-pending", false).await?;
+    /// `POST /shutdown` — gracefully stop the daemon and all running services.
+    pub async fn shutdown(&self) -> Result<(), ClientError> {
+        let (status, body) = self.request("POST", "/shutdown", false).await?;
         if status == 204 {
             return Ok(());
         }
@@ -271,14 +376,118 @@ impl Client {
         &self,
         name: &str,
         last: usize,
-        mut on_line: F,
+        on_line: F,
     ) -> Result<(), ClientError>
     where
         F: FnMut(&str) -> Result<(), ClientError>,
     {
         let path = format!("/logs/{}?last={last}&follow=true", urlencode(name));
+        self.follow_ndjson(&path, on_line).await
+    }
+
+    /// `GET /logs?follow=true` — stream the merged log stream: every process
+    /// plus `[don]` lifecycle events, in arrival order, with the metadata
+    /// a renderer needs to filter and color. Returns when the server closes
+    /// the stream or the callback returns `Err`.
+    /// `since` resumes exactly where a previous session stopped; `None` asks
+    /// for everything the server still holds.
+    ///
+    /// That `last` is the tap's whole capacity rather than the route's default
+    /// is the point. The route answers ad-hoc clients too — a `curl` wants the
+    /// end of the log, not this morning — but a TUI attaching to a running
+    /// project is asking for the scrollback, and the one sharing a process
+    /// with the runner already preloads exactly this much. Anything less and
+    /// reattaching from a second terminal silently shows a fraction of what
+    /// the first one has, which reads as the log having been lost.
+    pub async fn logs_follow_all<F>(
+        &self,
+        since: Option<crate::output::LogId>,
+        mut on_event: F,
+    ) -> Result<(), ClientError>
+    where
+        F: FnMut(LogStreamEvent) -> Result<(), ClientError>,
+    {
+        let path = match since {
+            // `last` is ignored when resuming: the id says exactly what was
+            // missed, which is both cheaper and more accurate than a count.
+            Some(since) => format!("/logs?follow=true&since={since}"),
+            None => format!(
+                "/logs?follow=true&last={}",
+                crate::output::DEFAULT_MERGED_HISTORY_CAPACITY
+            ),
+        };
+        self.follow_ndjson(&path, |line| {
+            let event: LogStreamEvent = serde_json::from_str(line)?;
+            on_event(event)
+        })
+        .await
+    }
+
+    /// `GET /events`, parsed. Each record is either a [`RunnerEvent`] or a
+    /// lag notice; records that parse as neither (a serialization-error
+    /// notice, an event variant this binary predates) are skipped, which is
+    /// what makes version skew between a long-lived runner and a newer
+    /// client degrade to "some events invisible" instead of a hard error.
+    pub async fn events_follow_typed<F>(&self, mut on_event: F) -> Result<(), ClientError>
+    where
+        F: FnMut(EventStreamItem) -> Result<(), ClientError>,
+    {
+        self.follow_ndjson("/events", |line| {
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_) => return Ok(()),
+            };
+            let process = match value.get("type").and_then(|t| t.as_str()) {
+                Some("lagged") => EventStreamItem::Lagged(
+                    value.get("skipped").and_then(|n| n.as_u64()).unwrap_or(0),
+                ),
+                Some("snapshot") => {
+                    #[derive(Deserialize)]
+                    struct Snapshot {
+                        processes: Vec<ProcessStatus>,
+                        #[serde(default)]
+                        startup_complete: bool,
+                    }
+                    match serde_json::from_value::<Snapshot>(value) {
+                        Ok(snapshot) => EventStreamItem::Snapshot {
+                            processes: snapshot.processes,
+                            startup_complete: snapshot.startup_complete,
+                        },
+                        Err(_) => return Ok(()),
+                    }
+                }
+                _ => match serde_json::from_value::<RunnerEvent>(value) {
+                    Ok(event) => EventStreamItem::Event(event),
+                    Err(_) => return Ok(()),
+                },
+            };
+            on_event(process)
+        })
+        .await
+    }
+
+    /// `GET /events` — stream runner state changes, one JSON object per line.
+    ///
+    /// Same shape as [`Self::logs_follow`], and the same lifetime: the call
+    /// returns when the daemon closes the stream (normally at shutdown) or
+    /// when `on_line` asks to stop by returning `Err`.
+    pub async fn events_follow<F>(&self, on_line: F) -> Result<(), ClientError>
+    where
+        F: FnMut(&str) -> Result<(), ClientError>,
+    {
+        self.follow_ndjson("/events", on_line).await
+    }
+
+    /// Read a newline-delimited JSON stream, invoking `on_line` per line.
+    ///
+    /// Handles both chunked and read-until-close bodies, since the API uses
+    /// whichever hyper picks for a given response.
+    async fn follow_ndjson<F>(&self, path: &str, mut on_line: F) -> Result<(), ClientError>
+    where
+        F: FnMut(&str) -> Result<(), ClientError>,
+    {
         let mut stream = self.connect().await?;
-        write_request(&mut stream, "GET", &path, false).await?;
+        write_request(&mut stream, "GET", path, false).await?;
         // Parse status line + headers.
         let (status, headers, mut leftover) = read_head(&mut stream).await?;
         if status != 200 {
@@ -290,7 +499,6 @@ impl Client {
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"));
 
-        // NDJSON: one `{"line":"..."}` per line.
         // Buffer raw body bytes, decode chunks if needed, split on \n.
         let mut pending = Vec::<u8>::new();
         loop {
@@ -334,20 +542,7 @@ impl Client {
     }
 
     async fn connect(&self) -> Result<UnixStream, ClientError> {
-        match UnixStream::connect(&self.socket_path).await {
-            Ok(s) => Ok(s),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                Err(ClientError::NotRunning {
-                    path: self.socket_path.clone(),
-                })
-            }
-            Err(e) => Err(ClientError::Io(e)),
-        }
+        connect_unix(&self.socket_path).await
     }
 
     async fn request(
@@ -370,12 +565,46 @@ impl Client {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>), ClientError> {
-        let mut stream = self.connect().await?;
-        write_request_with_body(&mut stream, method, path, body).await?;
-        let (status, headers, leftover) = read_head(&mut stream).await?;
-        let body = drain_body(&mut stream, &headers, leftover).await?;
-        Ok((status, body))
+        unix_request(&self.socket_path, method, path, body).await
     }
+}
+
+/// Connect to a unix socket, mapping "nothing is listening" to the friendlier
+/// [`ClientError::NotRunning`] rather than a bare io error.
+pub(crate) async fn connect_unix(socket_path: &Path) -> Result<UnixStream, ClientError> {
+    match UnixStream::connect(socket_path).await {
+        Ok(s) => Ok(s),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Err(ClientError::NotRunning {
+                path: socket_path.to_path_buf(),
+            })
+        }
+        Err(e) => Err(ClientError::Io(e)),
+    }
+}
+
+/// One-shot HTTP request over a unix socket, returning `(status, body)`.
+///
+/// Shared by the project API client above and the daemon control client
+/// (`crate::daemon::client`) — both speak plain HTTP/1.1 with
+/// `Connection: close` over a `UnixStream`, so neither needs its own
+/// request/response plumbing.
+pub(crate) async fn unix_request(
+    socket_path: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>), ClientError> {
+    let mut stream = connect_unix(socket_path).await?;
+    write_request_with_body(&mut stream, method, path, body).await?;
+    let (status, headers, leftover) = read_head(&mut stream).await?;
+    let response = drain_body(&mut stream, &headers, leftover).await?;
+    Ok((status, response))
 }
 
 fn ensure_ok(status: u16, body: &[u8]) -> Result<(), ClientError> {

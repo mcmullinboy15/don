@@ -123,6 +123,9 @@ where
 
 pub(crate) struct StatusTableView<'a> {
     pub(crate) title: String,
+    /// The border carries focus: the table lives in a side panel now, and its
+    /// frame is what says whether keys land here or in the log.
+    pub(crate) border_style: Style,
     pub(crate) header: Row<'static>,
     pub(crate) rows: Vec<Row<'static>>,
     pub(crate) widths: Vec<Constraint>,
@@ -136,7 +139,10 @@ pub(crate) fn draw_status_table(frame: &mut Frame<'_>, area: Rect, view: StatusT
         return;
     }
 
-    let outer = Block::default().borders(Borders::ALL).title(view.title);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(view.border_style)
+        .title(view.title);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     if inner.height < 2 {

@@ -3,7 +3,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{ItemStatus, Runner, RunnerCommand, ServiceState, TerminalCoordinator};
+use don::runner::{ProcessStatus, Runner, RunnerCommand, ServiceState};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -90,17 +90,22 @@ async fn make_runner_verbose(
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     (runner, shutdown_tx, buf)
 }
 
@@ -260,7 +265,7 @@ fn integration_task_depends_on_service() {
 }
 
 #[test]
-fn integration_headless_task_uses_command_override_without_foreground_terminal() {
+fn integration_headless_task_uses_command_override_and_is_not_interactive() {
     run_with_timeout(Duration::from_secs(15), async {
         let dir = TempDir::new("headless-task-override");
         let output_path = dir.path().join("task-output.txt");
@@ -269,7 +274,7 @@ fn integration_headless_task_uses_command_override_without_foreground_terminal()
 [tasks.push]
 cmd = "sh"
 args = ["-c", "printf interactive > {}"]
-terminal = "foreground"
+interactive = true
 headless = {{ args = ["-c", "printf headless > {}"] }}
 log = "ignore"
 "#,
@@ -324,7 +329,7 @@ fn integration_manual_task_dependency_unblocks_service_after_run() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -342,17 +347,11 @@ fn integration_manual_task_dependency_unblocks_service_after_run() {
             "api should remain blocked before migrate runs: {output}"
         );
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "migrate".to_string(),
-                params: std::collections::HashMap::new(),
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        control
+            .run_task("migrate", std::collections::HashMap::new(), false, None)
+            .await
+            .unwrap()
             .unwrap();
-        reply_rx.await.unwrap().unwrap();
 
         wait_for_substr(&buf, "api: starting", Duration::from_secs(5)).await;
         assert!(
@@ -515,6 +514,77 @@ fn integration_tcp_ready_check() {
             "should show tcpsvc ready: {output}"
         );
     });
+}
+
+/// A client watching only the event stream must learn every service's pid.
+///
+/// The wire that records custody lands *after* the transition that announced
+/// the start, so the "started" event cannot carry a pid. A service with a ready
+/// check gets a second transition afterwards and its pid rides along on that;
+/// one without never does. Both must end up announced, or the TUI's PID column
+/// is blank for exactly the services that are quickest to come up.
+#[test]
+fn integration_every_service_announces_its_pid_on_the_event_stream() {
+    struct Case {
+        name: &'static str,
+        service: &'static str,
+        ready_check: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "a second transition would have carried it anyway",
+            service: "checked",
+            ready_check: true,
+        },
+        Case {
+            name: "ready at start, so the wire is the only chance",
+            service: "plain",
+            ready_check: false,
+        },
+    ];
+
+    for case in cases {
+        run_with_timeout(Duration::from_secs(15), async {
+            let dir = TempDir::new("pid-events");
+            let mut builder = ConfigBuilder::new()
+                .add_custom_service(case.service, "sleep", &["60"])
+                .log("ignore");
+            if case.ready_check {
+                builder = builder.ready_exec("true", &[]);
+            }
+            let toml = builder.done().build();
+
+            let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+            let mut events = runner.subscribe();
+            let handle = tokio::spawn(async move {
+                let _ = runner.run().await;
+            });
+            wait_for_substr(&buf, "all services running", Duration::from_secs(5)).await;
+
+            let mut announced = None;
+            while announced.is_none() {
+                let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let don::runner::RunnerEvent::ServiceStateChanged { name, pid, .. } = event
+                    && name == case.service
+                {
+                    announced = pid;
+                }
+            }
+
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+            assert!(
+                announced.is_some_and(|pid| pid > 0),
+                "{}: {} never announced a pid",
+                case.name,
+                case.service
+            );
+        });
+    }
 }
 
 // --- Exec ready check ---
@@ -748,6 +818,21 @@ async fn wait_for_any_substr(
     }
 }
 
+/// A python one-liner that opens `port`, blocks until something connects, and
+/// then returns — for services that must reach `ready` and *then* exit.
+///
+/// `accept()` rather than a sleep on purpose. The service's whole job here is
+/// to stay alive across exactly one event: don's TCP ready check connecting.
+/// A fixed sleep guesses how long that takes, and a guess that's too short on a
+/// loaded machine makes the service exit before don ever observes it ready —
+/// which surfaces as "timeout waiting for ready (tcp)" and looks like a runner
+/// bug rather than a test that ran out of patience.
+fn listen_until_ready_check(port: u16) -> String {
+    format!(
+        "\nimport socket\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ns.accept()\n"
+    )
+}
+
 // --- Crash detection + on_failure policy ---
 
 #[test]
@@ -758,16 +843,17 @@ fn integration_clean_exit_status_zero_marks_stopped_not_failed() {
         let dir = TempDir::new("clean-exit");
         let port = free_port();
 
-        // Service that opens its ready port, sleeps long enough for the
-        // ready check to pass, then exits 0 — i.e. simulates a long-
-        // running service that decides to terminate cleanly.
+        // Service that opens its ready port, waits for the ready check to
+        // actually connect, then exits 0 — i.e. simulates a long-running
+        // service that decides to terminate cleanly.
         let script = dir.path().join("script.sh");
         std::fs::write(
             &script,
             format!(
                 "#!/bin/sh\n\
-                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(1.5)\n\" \n\
-                 exit 0\n"
+                 python3 -c \"{listen_until_ready_check}\" \n\
+                 exit 0\n",
+                listen_until_ready_check = listen_until_ready_check(port)
             ),
         )
         .unwrap();
@@ -838,9 +924,10 @@ fn integration_crash_triggers_auto_restart_when_on_failure_restart() {
                  N=$(cat {ctr})\n\
                  N=$((N + 1))\n\
                  echo $N > {ctr}\n\
-                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(0.8)\n\" \n\
+                 python3 -c \"{listen_until_ready_check}\" \n\
                  exit 7\n",
-                ctr = counter.display()
+                ctr = counter.display(),
+                listen_until_ready_check = listen_until_ready_check(port)
             ),
         )
         .unwrap();
@@ -898,6 +985,15 @@ retries = 30
             launches >= 2,
             "expected the auto-restart to launch the script at least twice, got {launches}"
         );
+        // And *bounded*. A lower bound alone would pass under an infinite
+        // respawn loop, which is exactly what a permission level that is
+        // sticky across a crash would produce if demand were not one-shot
+        // (see `crate::gate` and `Demand`). The crash-loop guard gives up
+        // after MAX_RAPID_CRASHES, so the script cannot run many times.
+        assert!(
+            launches <= 4,
+            "expected the crash-loop guard to bound respawns, got {launches}"
+        );
     });
 }
 
@@ -912,7 +1008,7 @@ fn integration_crash_after_ready_marks_failed_with_exit_code() {
 
         // A service that:
         //   1. opens the ready-check port,
-        //   2. sleeps briefly so the ready check passes and we observe Ready,
+        //   2. stays up until the ready check connects, so we observe Ready,
         //   3. exits with status 42.
         // Using `sh -c` keeps the script self-contained and exit-code-honest
         // (no signal complications).
@@ -922,8 +1018,9 @@ fn integration_crash_after_ready_marks_failed_with_exit_code() {
             &crash_script,
             format!(
                 "#!/bin/sh\n\
-                 python3 -c \"\nimport socket, time\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', {port}))\ns.listen(1)\ntime.sleep(1.5)\n\" \n\
-                 exit 42\n"
+                 python3 -c \"{listen_until_ready_check}\" \n\
+                 exit 42\n",
+                listen_until_ready_check = listen_until_ready_check(port)
             ),
         )
         .unwrap();
@@ -1072,6 +1169,7 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1080,15 +1178,9 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
         wait_for_substr(&buf, "retries", Duration::from_secs(8)).await;
 
         std::fs::write(&ready_file, "ok").unwrap();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "badsvc".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        let restarted = control.restart("badsvc").await.unwrap();
         assert!(
-            reply_rx.await.unwrap().is_ok(),
+            restarted.is_ok(),
             "manual restart should accept a failed service"
         );
 
@@ -1113,7 +1205,7 @@ fn integration_restart_failed_ready_check_stops_live_process_first() {
             reached_ready = statuses.iter().any(|item| {
                 matches!(
                     item,
-                    ItemStatus::Service {
+                    ProcessStatus::Service {
                         name,
                         state: ServiceState::Ready,
                         ..
@@ -1297,7 +1389,8 @@ on_failure = "restart"
             .parse()
             .unwrap();
         assert_eq!(
-            launches, 2,
+            launches,
+            2,
             "initial start plus one retry should produce exactly two fast crashes \
              before giving up. output: {}",
             read_buf(&buf)
@@ -1344,6 +1437,7 @@ fn integration_restart_crashed_service_without_ready_check() {
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1356,15 +1450,9 @@ fn integration_restart_crashed_service_without_ready_check() {
         .await;
 
         std::fs::write(&gate_file, "ok").unwrap();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "crashy".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        let restarted = control.restart("crashy").await.unwrap();
         assert!(
-            reply_rx.await.unwrap().is_ok(),
+            restarted.is_ok(),
             "manual restart should accept a crashed service"
         );
 
@@ -1385,7 +1473,7 @@ fn integration_restart_crashed_service_without_ready_check() {
             reached_ready = statuses.iter().any(|item| {
                 matches!(
                     item,
-                    ItemStatus::Service {
+                    ProcessStatus::Service {
                         name,
                         state: ServiceState::Ready,
                         ..
@@ -1463,7 +1551,7 @@ fn integration_non_blocking_dependency_failure_does_not_block_dependent() {
         assert!(
             statuses.iter().any(|item| matches!(
                 item,
-                ItemStatus::Service {
+                ProcessStatus::Service {
                     state: ServiceState::Ready | ServiceState::Running,
                     ..
                 }
@@ -1534,7 +1622,7 @@ fn integration_non_blocking_dependency_unblocks_when_dependency_is_stopped() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1548,15 +1636,8 @@ fn integration_non_blocking_dependency_unblocks_when_dependency_is_stopped() {
             read_buf(&buf)
         );
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "dep".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
         assert!(
-            reply_rx.await.unwrap().is_ok(),
+            control.stop("dep").await.unwrap().is_ok(),
             "stopping dep should succeed"
         );
 
@@ -1662,6 +1743,7 @@ while True: time.sleep(60)\n\
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1685,7 +1767,7 @@ while True: time.sleep(60)\n\
         assert!(
             statuses.iter().any(|item| matches!(
                 item,
-                ItemStatus::Service {
+                ProcessStatus::Service {
                     state: ServiceState::DependencyFailed,
                     failed_dependencies,
                     ..
@@ -1702,14 +1784,7 @@ while True: time.sleep(60)\n\
         .await;
 
         std::fs::write(&gate_file, "ok").unwrap();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "db".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
-        let restart_result = reply_rx.await.unwrap();
+        let restart_result = control.restart("db").await.unwrap();
         assert!(
             restart_result.is_ok(),
             "manual db restart should succeed, got {restart_result:?}. output: {}",
@@ -1732,7 +1807,7 @@ while True: time.sleep(60)\n\
         assert!(
             statuses.iter().any(|item| matches!(
                 item,
-                ItemStatus::Service {
+                ProcessStatus::Service {
                     state: ServiceState::Ready,
                     failed_dependencies,
                     ..
@@ -1784,6 +1859,7 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1796,11 +1872,10 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
         .await;
 
         std::fs::write(&db_gate, "ok").unwrap();
-        cmd_tx
-            .send(RunnerCommand::TaskRerun {
-                name: "db".to_string(),
-            })
-            .unwrap();
+        tokio::spawn({
+            let control = control.clone();
+            async move { control.restart("db").await }
+        });
         wait_for_substr(&buf, "DB_RECOVERING", Duration::from_secs(5)).await;
 
         let mut cleared_recovered_root = false;
@@ -1817,7 +1892,7 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
             cleared_recovered_root = statuses.iter().any(|item| {
                 matches!(
                     item,
-                    ItemStatus::Service {
+                    ProcessStatus::Service {
                         state: ServiceState::Pending,
                         failed_dependencies,
                         ..
@@ -1835,11 +1910,10 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
             read_buf(&buf)
         );
 
-        cmd_tx
-            .send(RunnerCommand::TaskRerun {
-                name: "cache".to_string(),
-            })
-            .unwrap();
+        tokio::spawn({
+            let control = control.clone();
+            async move { control.restart("cache").await }
+        });
         wait_for_substr(&buf, "CACHE_FAIL", Duration::from_secs(5)).await;
 
         let mut refreshed = false;
@@ -1856,7 +1930,7 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
             refreshed = statuses.iter().any(|item| {
                 matches!(
                     item,
-                    ItemStatus::Service {
+                    ProcessStatus::Service {
                         state: ServiceState::DependencyFailed,
                         failed_dependencies,
                         ..
@@ -1875,11 +1949,10 @@ fn integration_dependency_failure_refreshes_while_item_remains_blocked() {
         );
 
         std::fs::write(&cache_gate, "ok").unwrap();
-        cmd_tx
-            .send(RunnerCommand::TaskRerun {
-                name: "cache".to_string(),
-            })
-            .unwrap();
+        tokio::spawn({
+            let control = control.clone();
+            async move { control.restart("cache").await }
+        });
         wait_for_substr(&buf, "api: started", Duration::from_secs(10)).await;
 
         let _ = shutdown_tx.send(()).await;
@@ -1916,7 +1989,7 @@ fn integration_task_watch_skip() {
 
             std::fs::write(dir.path().join("data.sql"), "CREATE TABLE test;").unwrap();
 
-            let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
+            let task_state = don::TaskStateStore::new(dir.path().join(".don").join("task-state"));
             let patterns = vec![format!("{}/*.sql", dir.path().display())];
             task_state
                 .record_success("migrate", &patterns, &[], None)
@@ -1953,7 +2026,7 @@ fn integration_task_global_watch_ignore_skip() {
         std::fs::create_dir_all(&generated_dir).unwrap();
         std::fs::write(generated_dir.join("data.sql"), "CREATE TABLE test;").unwrap();
 
-        let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
+        let task_state = don::TaskStateStore::new(dir.path().join(".don").join("task-state"));
         let patterns = vec![format!("{}/**/*.sql", dir.path().display())];
         let ignore_patterns = vec![format!("{}/generated/**", dir.path().display())];
         task_state
@@ -1990,7 +2063,7 @@ fn integration_task_watch_run_on_change() {
 
         std::fs::write(dir.path().join("data.sql"), "CREATE TABLE test;").unwrap();
 
-        let task_state = don::TaskState::new(dir.path().join(".don").join("task-state"));
+        let task_state = don::TaskStateStore::new(dir.path().join(".don").join("task-state"));
         let patterns = vec![format!("{}/*.sql", dir.path().display())];
         task_state
             .record_success("migrate", &patterns, &[], None)
@@ -2122,17 +2195,21 @@ fn integration_don_pid_file_prevents_double_start() {
         let (_shutdown_tx1, shutdown_rx1) = mpsc::channel(2);
 
         // First runner acquires the PID file.
-        let _runner1 = Runner::new(
+        let mut _runner1 = Runner::new(
             config,
             PLATFORM,
             output_manager,
             dir.path().to_path_buf(),
             None,
             shutdown_rx1,
-            TerminalCoordinator::detached(),
+            true,
         )
         .await
         .unwrap();
+        // The runner no longer binds its own API socket; the binary does,
+        // and so must anything else that wants CLI/daemon access.
+        let api_shutdown = don::server::serve_for_runner(&_runner1).unwrap();
+        _runner1.set_api_shutdown(api_shutdown);
 
         // Second runner should fail — PID file is held.
         let config2: Config = toml.parse().unwrap();
@@ -2149,7 +2226,7 @@ fn integration_don_pid_file_prevents_double_start() {
             dir.path().to_path_buf(),
             None,
             shutdown_rx2,
-            TerminalCoordinator::detached(),
+            true,
         )
         .await;
 

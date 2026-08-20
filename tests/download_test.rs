@@ -2,7 +2,6 @@
 mod helpers;
 
 use don::config::{Command, PlatformDownload};
-use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::time::Duration;
@@ -15,9 +14,6 @@ async fn start_file_server(
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::routing::get;
-
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let app = axum::Router::new()
         .route(
@@ -34,7 +30,12 @@ async fn start_file_server(
         )
         .with_state(serve_dir);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    // Bind port 0 and read back what the kernel assigned, rather than asking
+    // for a port that was probed and released a moment ago: the listener never
+    // stops holding the port, so nothing else on the machine can take it in
+    // between and this can't fail with "address already in use".
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
@@ -381,12 +382,11 @@ fn integration_task_download_resolves_cmd() {
             ignore: vec![],
             timeout: None,
             log: don::config::LogConfig::Stdout,
-            terminal: don::config::TaskTerminal::default(),
+            interactive: false,
             headless: None,
             auto_run: don::config::TaskAutoRun::Always,
             download: Some(download),
             bazel: None,
-            turbo: None,
             params: vec![],
             hidden: false,
             auto_filter_on_failure: None,

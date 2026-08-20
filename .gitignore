@@ -1,3 +1,14 @@
 /target
 .don
 *.local.toml
+web/node_modules
+# The built bundle is a build artifact, not source. It's embedded into the
+# binary and shipped in the published crate (Cargo.toml `include` puts it in
+# the tarball regardless of this file), but it never belongs in git history.
+# build.rs creates the directory when it's missing, so a fresh clone compiles.
+web/dist/
+
+# Byte-compiled TUI drivers. Running the drivers is part of the documented
+# workflow for any TUI change, so a tracked cache means every such change
+# arrives with a binary diff attached.
+tools/__pycache__/

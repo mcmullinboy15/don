@@ -43,16 +43,29 @@ enum DisconnectReason {
 /// Auto-reconnects when the server disconnects (e.g. task rerun or
 /// service restart). Returns when the user detaches with Ctrl+C/Ctrl+D.
 pub async fn run_attach(socket_path: &Path, name: &str) -> Result<(), ClientError> {
+    let mut waiting_notice_shown = false;
     loop {
         match attach_once(socket_path, name).await {
             DisconnectReason::UserDetach => return Ok(()),
+            // "Not running yet" — the runner answers immediately and waiting
+            // is the client's job. Retry until the process appears (Ctrl+C
+            // exits; the terminal is not in raw mode between attempts).
+            DisconnectReason::Error(ClientError::Conflict { .. }) => {
+                if !waiting_notice_shown {
+                    waiting_notice_shown = true;
+                    let mut stdout = tokio::io::stdout();
+                    let _ = stdout.write_all(b"[waiting for process...]\r\n").await;
+                    let _ = stdout.flush().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
             DisconnectReason::Error(e) => return Err(e),
             DisconnectReason::ServerDisconnect => {
-                // Write a notice — the next attach_once will block on the
-                // server side until the process starts again.
+                waiting_notice_shown = true;
                 let mut stdout = tokio::io::stdout();
                 let _ = stdout.write_all(b"\r\n[waiting for process...]\r\n").await;
                 let _ = stdout.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             }
         }
     }
@@ -108,6 +121,12 @@ async fn attach_once(socket_path: &Path, name: &str) -> DisconnectReason {
         return DisconnectReason::Error(super::classify_error(status, &body));
     }
 
+    // The session id for resize requests, issued in the 101 response.
+    let session_id = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-don-attach-session"))
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok());
+
     // 101 — the stream is now raw. Enter raw mode.
     let _guard = match RawModeGuard::enable() {
         Ok(g) => g,
@@ -124,7 +143,7 @@ async fn attach_once(socket_path: &Path, name: &str) -> DisconnectReason {
 
     // Bridge stdin/stdout with the raw stream.
     // Stream closes when we drop it.
-    bridge_terminal(&mut stream, socket_path, name, pid).await
+    bridge_terminal(&mut stream, socket_path, name, session_id).await
 }
 
 /// Check data for detach triggers: Ctrl+C (\x03) or Ctrl+D (\x04).
@@ -137,7 +156,7 @@ async fn bridge_terminal(
     stream: &mut UnixStream,
     socket_path: &Path,
     name: &str,
-    pid: u32,
+    session_id: Option<u64>,
 ) -> DisconnectReason {
     let (mut stream_read, mut stream_write) = stream.split();
     let mut stdin = tokio::io::stdin();
@@ -202,7 +221,7 @@ async fn bridge_terminal(
                 let sp = socket_path.clone();
                 let n = name.clone();
                 tokio::spawn(async move {
-                    let _ = send_resize(&sp, &n, pid, cols, rows).await;
+                    let _ = send_resize(&sp, &n, session_id, cols, rows).await;
                 });
             }
         }
@@ -212,16 +231,31 @@ async fn bridge_terminal(
     reason
 }
 
+/// [`send_resize`] for callers outside this module — the TUI's attach window,
+/// which resizes the process's grid whenever the window is resized.
+pub(super) async fn send_resize_public(
+    socket_path: &Path,
+    name: &str,
+    session_id: Option<u64>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), ClientError> {
+    send_resize(socket_path, name, session_id, cols, rows).await
+}
+
 /// Send a resize request via a separate HTTP connection.
 async fn send_resize(
     socket_path: &Path,
     name: &str,
-    _pid: u32,
+    session_id: Option<u64>,
     cols: u16,
     rows: u16,
 ) -> Result<(), ClientError> {
     let mut stream = UnixStream::connect(socket_path).await?;
-    let body = serde_json::json!({"cols": cols, "rows": rows});
+    let body = match session_id {
+        Some(id) => serde_json::json!({"cols": cols, "rows": rows, "session": id}),
+        None => serde_json::json!({"cols": cols, "rows": rows}),
+    };
     let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
     let path = format!("/attach/{}/resize", super::urlencode(name));
     let req = format!(
@@ -239,4 +273,158 @@ async fn send_resize(
     let mut buf = [0u8; 256];
     let _ = stream.read(&mut buf).await;
     Ok(())
+}
+
+/// Why a TUI bridge session ended.
+pub enum BridgeEnd {
+    /// The user typed the escape sequence (Ctrl+P Ctrl+Q).
+    Escape,
+    /// The server closed the stream (task exited, runner stopped).
+    ServerDisconnect,
+    /// The session could not start or broke.
+    Error(ClientError),
+}
+
+/// Bridge the current (already-raw or about-to-be-raw) terminal into
+/// `name`'s PTY for the TUI's bridge mode.
+///
+/// Unlike [`run_attach`], everything forwards — including Ctrl+C and
+/// Ctrl+D, which the bridged program may want — and the only way out from
+/// the keyboard is the docker-style escape sequence Ctrl+P Ctrl+Q. No
+/// reconnect loop: the caller owns what happens next.
+pub async fn bridge_once(socket_path: &Path, name: &str) -> BridgeEnd {
+    let mut stream = match UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => return BridgeEnd::Error(ClientError::Io(e)),
+    };
+
+    let pid = std::process::id();
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let path = format!(
+        "/attach/{}?pid={pid}&cols={cols}&rows={rows}",
+        super::urlencode(name),
+    );
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: don-attach\r\n\
+         \r\n"
+    );
+    if let Err(e) = stream.write_all(req.as_bytes()).await {
+        return BridgeEnd::Error(ClientError::Io(e));
+    }
+    let (status, headers, leftover) = match super::read_head(&mut stream).await {
+        Ok(r) => r,
+        Err(e) => return BridgeEnd::Error(e),
+    };
+    if status != 101 {
+        let body = match super::drain_body(&mut stream, &headers, leftover).await {
+            Ok(b) => b,
+            Err(e) => return BridgeEnd::Error(e),
+        };
+        return BridgeEnd::Error(super::classify_error(status, &body));
+    }
+    let session_id = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-don-attach-session"))
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok());
+
+    let _guard = match RawModeGuard::enable() {
+        Ok(g) => g,
+        Err(e) => return BridgeEnd::Error(e),
+    };
+    if !leftover.is_empty() {
+        let mut stdout = tokio::io::stdout();
+        let _ = stdout.write_all(&leftover).await;
+        let _ = stdout.flush().await;
+    }
+
+    let (mut stream_read, mut stream_write) = stream.split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
+    let resize_handle = tokio::spawn({
+        use futures_util::StreamExt;
+        async move {
+            let mut reader = crossterm::event::EventStream::new();
+            while let Some(Ok(event)) = reader.next().await {
+                if let crossterm::event::Event::Resize(cols, rows) = event
+                    && resize_tx.send((cols, rows)).await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+
+    let socket_path = socket_path.to_path_buf();
+    let name_owned = name.to_string();
+    // Escape detection: a lone Ctrl+P is HELD (not forwarded) until the
+    // next byte decides — Ctrl+Q escapes, anything else releases the held
+    // byte to the task. Docker's semantics.
+    let mut held_ctrl_p = false;
+    let mut stdin_buf = [0u8; 4096];
+    let mut stream_buf = [0u8; 8192];
+    let end = loop {
+        tokio::select! {
+            read_result = stdin.read(&mut stdin_buf) => {
+                match read_result {
+                    Ok(0) => break BridgeEnd::ServerDisconnect,
+                    Ok(n) => {
+                        let mut out: Vec<u8> = Vec::with_capacity(n + 1);
+                        let mut escaped = false;
+                        for &byte in &stdin_buf[..n] {
+                            if held_ctrl_p {
+                                held_ctrl_p = false;
+                                if byte == 0x11 {
+                                    escaped = true;
+                                    break;
+                                }
+                                out.push(0x10);
+                                if byte == 0x10 {
+                                    held_ctrl_p = true;
+                                    continue;
+                                }
+                                out.push(byte);
+                            } else if byte == 0x10 {
+                                held_ctrl_p = true;
+                            } else {
+                                out.push(byte);
+                            }
+                        }
+                        if !out.is_empty() && stream_write.write_all(&out).await.is_err() {
+                            break BridgeEnd::ServerDisconnect;
+                        }
+                        if escaped {
+                            break BridgeEnd::Escape;
+                        }
+                    }
+                    Err(e) => break BridgeEnd::Error(ClientError::Io(e)),
+                }
+            }
+            read_result = stream_read.read(&mut stream_buf) => {
+                match read_result {
+                    Ok(0) | Err(_) => break BridgeEnd::ServerDisconnect,
+                    Ok(n) => {
+                        if stdout.write_all(&stream_buf[..n]).await.is_err() {
+                            break BridgeEnd::ServerDisconnect;
+                        }
+                        let _ = stdout.flush().await;
+                    }
+                }
+            }
+            Some((cols, rows)) = resize_rx.recv() => {
+                let sp = socket_path.clone();
+                let n2 = name_owned.clone();
+                tokio::spawn(async move {
+                    let _ = send_resize(&sp, &n2, session_id, cols, rows).await;
+                });
+            }
+        }
+    };
+    resize_handle.abort();
+    let _ = resize_handle.await;
+    end
 }

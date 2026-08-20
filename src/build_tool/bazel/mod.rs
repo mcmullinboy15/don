@@ -6,7 +6,7 @@
 
 mod graph;
 
-use super::{AbortOnDrop, BuildGraphResolver, BuildToolError, ResolvedBuildInfo};
+use super::{AbortOnDrop, BuildToolError, ResolvedBuildInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -511,25 +511,6 @@ impl BazelResolver {
 
         Ok(out)
     }
-
-    /// Parse the package output from `bazel query --output=package`.
-    ///
-    /// Each line is a package path like `services/api/src`. External packages
-    /// (prefixed with `@`) and empty lines are filtered out. Returns raw
-    /// package paths — callers append `/**` for tier-2 source globs and
-    /// `/BUILD` / `/BUILD.bazel` for tier-1 build-graph globs.
-    fn parse_packages(output: &str) -> Vec<String> {
-        output
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            // Filter out external dependencies (e.g. @rules_go//...)
-            .filter(|line| !line.starts_with('@'))
-            // Filter out bazel-out generated files
-            .filter(|line| !line.starts_with("bazel-out"))
-            .map(String::from)
-            .collect()
-    }
 }
 
 /// Stream a bazel client's stderr to the given emitter line-by-line, while
@@ -588,98 +569,10 @@ fn is_lock_wait_notice(line: &str) -> bool {
             || line.contains("Waiting for it to complete"))
 }
 
-impl BuildGraphResolver for BazelResolver {
-    async fn resolve(
-        &self,
-        target: &str,
-        working_dir: &Path,
-    ) -> Result<ResolvedBuildInfo, BuildToolError> {
-        self.check_installed().await?;
-
-        // Query for source packages that contribute to the target.
-        // `kind("source file", deps(...))` gives us all source files in the
-        // transitive closure. External packages (prefixed with `@`) are filtered
-        // out during parsing rather than using `intersect //...` which can be
-        // too aggressive with some Bazel versions.
-        let query = format!("kind(\"source file\", deps({target}))");
-        let output = self.run_query(&query, "package", working_dir).await?;
-        let packages = Self::parse_packages(&output);
-        let watch_paths: Vec<String> = packages.iter().map(|p| format!("{p}/**")).collect();
-        // Tier-1 build-graph globs are per-package so the watcher can register
-        // a non-recursive watch on each package dir (matching just the
-        // `BUILD` / `BUILD.bazel` filename). Workspace-level files
-        // (WORKSPACE, MODULE.bazel) are handled separately by the watch
-        // manager with a single non-recursive watch on the repo root — no
-        // point broadcasting them here.
-        let graph_definition_globs: Vec<String> = packages
-            .iter()
-            .flat_map(|p| [format!("{p}/BUILD"), format!("{p}/BUILD.bazel")])
-            .collect();
-
-        Ok(ResolvedBuildInfo {
-            watch_paths,
-            graph_definition_globs,
-        })
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_packages() {
-        struct Case {
-            name: &'static str,
-            input: &'static str,
-            expected: Vec<&'static str>,
-        }
-
-        let cases = vec![
-            Case {
-                name: "basic packages",
-                input: "services/api/src\nlibs/auth\nlibs/common\n",
-                expected: vec!["services/api/src", "libs/auth", "libs/common"],
-            },
-            Case {
-                name: "filters external deps",
-                input: "@rules_go//go/tools\nservices/api\n@com_google_protobuf//:protobuf\nlibs/db\n",
-                expected: vec!["services/api", "libs/db"],
-            },
-            Case {
-                name: "filters bazel-out",
-                input: "services/api\nbazel-out/k8-fastbuild/genfiles/proto\nlibs/common\n",
-                expected: vec!["services/api", "libs/common"],
-            },
-            Case {
-                name: "handles empty lines",
-                input: "\nservices/api\n\n\nlibs/db\n\n",
-                expected: vec!["services/api", "libs/db"],
-            },
-            Case {
-                name: "handles whitespace",
-                input: "  services/api  \n  libs/db  \n",
-                expected: vec!["services/api", "libs/db"],
-            },
-            Case {
-                name: "empty input",
-                input: "",
-                expected: vec![],
-            },
-            Case {
-                name: "only external deps",
-                input: "@rules_go//go\n@io_bazel_rules_docker//docker\n",
-                expected: vec![],
-            },
-        ];
-
-        for case in cases {
-            let result = BazelResolver::parse_packages(case.input);
-            let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
-            assert_eq!(result, expected, "case: {}", case.name);
-        }
-    }
 
     #[test]
     fn test_should_emit_stderr_line() {

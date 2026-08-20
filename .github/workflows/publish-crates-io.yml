@@ -28,7 +28,34 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+      # Publishing needs `--allow-dirty` below, because generating the bundle
+      # leaves a file cargo counts as uncommitted. That flag also switches off
+      # the check for *genuinely* uncommitted work, so do that check here,
+      # before anything has been generated, rather than losing it.
+      - name: Verify the tree is clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::refusing to publish from a dirty tree"
+            git status --porcelain
+            exit 1
+          fi
+      # The bundle is embedded in the binary and ships in the crate (see the
+      # `include` list in Cargo.toml) but isn't committed, so it has to be
+      # built here. Without this, crates.io would get a don with no web UI.
+      # cargo publish verifies the crate by building it, which needs Zig
+      # for libghostty-vt-sys.
+      - name: Install Zig (required by libghostty-vt-sys)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build the web UI bundle
+        run: npm --prefix web ci && npm --prefix web run build
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
+        # Dirty only because the freshly built bundle is gitignored; the
+        # `include` list in Cargo.toml is what decides the contents.
+        run: cargo publish --allow-dirty

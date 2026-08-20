@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use don::TaskRunInfo;
 use don::client::{Client, ClientError, RunTaskOptions};
-use don::runner::{ItemStatus, ServiceState, TaskItemState};
+use don::runner::{ProcessStatus, ServiceState, TaskState};
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -64,6 +64,11 @@ enum Commands {
         /// where the terminal doesn't reliably answer DSR cursor queries.
         #[arg(long)]
         no_tui: bool,
+        /// Internal: set by the fork-model parent so the runner child knows
+        /// an interactive client is attaching (disables headless task
+        /// overrides).
+        #[arg(long, hide = true)]
+        attached: bool,
         /// Restrict displayed log lines to the given comma-separated set of
         /// service/task names. Affects pipe-mode output and seeds the TUI
         /// filter on startup (overriding any `hidden = true` defaults).
@@ -71,10 +76,54 @@ enum Commands {
         /// still returns full output. Example: `--log-filter=web,api,db`.
         #[arg(long, value_delimiter = ',')]
         log_filter: Vec<String>,
+        /// Don't announce this project to the system-wide don daemon, so it
+        /// won't appear in the web UI. Registration is best-effort and never
+        /// affects the stack itself; this flag is for when you'd rather the
+        /// daemon not know about a project at all.
+        #[arg(long)]
+        no_daemon: bool,
+        /// Serve a web UI for this project from this process, instead of
+        /// relying on a system-wide daemon. Implies `--no-daemon`: the UI
+        /// shows only this project and lives exactly as long as it does.
+        /// Defaults to port 3667 (the daemon owns 3666); pass
+        /// `--with-ui=PORT` to choose another.
+        #[arg(
+            long,
+            value_name = "PORT",
+            num_args = 0..=1,
+            default_missing_value = "3667",
+            conflicts_with = "name"
+        )]
+        with_ui: Option<u16>,
     },
-    /// Stop the daemon, or stop one running service when a name is given
+    /// Run or manage the system-wide daemon that serves the web UI
+    ///
+    /// The daemon is a broker: it tracks which don projects are running and
+    /// serves a UI over them. It never owns your services, so stopping it
+    /// leaves every running stack untouched.
+    Daemon {
+        /// Port to serve the web UI on. Use 0 to let the OS pick one.
+        #[arg(long, env = "DON_UI_PORT", default_value_t = don::web::DEFAULT_PORT)]
+        port: u16,
+        /// Run the control plane without a web UI. Useful for debugging
+        /// registration on its own.
+        #[arg(long, conflicts_with = "port")]
+        no_web: bool,
+        #[command(subcommand)]
+        command: Option<DaemonCommands>,
+    },
+    /// Open the don web UI in your browser
+    Ui {
+        /// Print the URL instead of opening a browser
+        #[arg(long)]
+        print: bool,
+    },
+    /// Stop this project's stack, or one running service when a name is given
+    ///
+    /// This is the project you're in, not the system-wide daemon — use
+    /// `don daemon stop` for that.
     Stop {
-        /// Name of the service to stop (omit to stop the daemon)
+        /// Name of the service to stop (omit to stop the whole stack)
         name: Option<String>,
     },
     /// Restart a running service
@@ -94,7 +143,7 @@ enum Commands {
         /// Emit machine-readable JSON instead of the table: an object with a
         /// top-level `ready` bool (true when every service is Ready or Lazy),
         /// a `tasks_pending_run` count (tasks parked awaiting a manual run —
-        /// the headless equivalent of the TUI's `*` flag), and an `items`
+        /// the headless equivalent of the TUI's `*` flag), and an `processes`
         /// array. Useful for scripts and agents polling for stack readiness.
         #[arg(long)]
         json: bool,
@@ -106,7 +155,7 @@ enum Commands {
         json: bool,
     },
     /// Show everything don is currently watching: the inotify directories it has
-    /// registered plus the per-item glob patterns that trigger reloads. Useful
+    /// registered plus the per-process glob patterns that trigger reloads. Useful
     /// for confirming a file actually falls under a watch — especially for
     /// build-tool services whose paths are resolved dynamically.
     Watch {
@@ -130,6 +179,9 @@ enum Commands {
         /// Name of the service to attach to
         name: String,
     },
+    /// Attach the full TUI to an already-running project. Ctrl+D detaches
+    /// (the stack keeps running); Ctrl+C requests a graceful shutdown.
+    Tui,
     /// Clean up stale state from a previous run
     Cleanup {
         /// Kill a running daemon first, then clean up
@@ -138,14 +190,11 @@ enum Commands {
     },
     /// Run a task (bypasses auto_run)
     Run {
-        /// Name of a specific task to run (mutually exclusive with --all-pending)
-        name: Option<String>,
-        /// Run all tasks currently in pending_run state
-        #[arg(long, conflicts_with = "name")]
-        all_pending: bool,
+        /// Name of the task to run
+        name: String,
         /// Never prompt for missing required params — error instead. Implicit
         /// when stdin isn't a TTY. Useful in scripts / CI.
-        #[arg(long, conflicts_with = "all_pending")]
+        #[arg(long)]
         no_prompt: bool,
         /// Wait until the task exits before returning
         #[arg(long)]
@@ -187,9 +236,42 @@ enum Commands {
     /// Internal: list names for shell completion scripts. Hidden from help.
     #[command(name = "__complete", hide = true)]
     Complete {
-        /// One of: services, tasks, items, profiles
+        /// One of: services, tasks, processes, profiles
         kind: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCommands {
+    /// Show whether a daemon is running and which projects it knows about
+    Status {
+        /// Emit machine-readable JSON instead of the human-readable report
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the running daemon. Registered projects keep running.
+    ///
+    /// When the daemon is installed as a service this goes through the
+    /// supervisor, so it stays stopped instead of being restarted underneath
+    /// you.
+    Stop,
+    /// Restart the daemon, e.g. to pick up an upgraded `don` binary
+    ///
+    /// Requires the daemon to be installed as a service — there's nothing to
+    /// restart a bare foreground `don daemon` with.
+    Restart,
+    /// Install the daemon as a per-user service so it starts on login
+    Install {
+        /// Port the installed service should serve the web UI on
+        #[arg(long, default_value_t = don::web::DEFAULT_PORT)]
+        port: u16,
+        /// Print the service file that would be written, without touching
+        /// anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Stop the installed service and remove it
+    Uninstall,
 }
 
 #[tokio::main]
@@ -226,17 +308,40 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             name: None,
             detached,
             no_tui,
+            attached,
             log_filter,
+            no_daemon,
+            with_ui,
         } => {
             let result = if detached {
-                run_start_detached(&config_path, profile.as_deref(), verbose, log_filter).await
+                run_start_detached(
+                    &config_path,
+                    profile.as_deref(),
+                    verbose,
+                    no_daemon,
+                    with_ui,
+                )
+                .await
+            } else if should_auto_attach(&config_path, no_tui) {
+                run_start_attached(
+                    &config_path,
+                    profile.as_deref(),
+                    verbose,
+                    log_filter,
+                    no_daemon,
+                    with_ui,
+                )
+                .await
             } else {
                 run_start(
                     &config_path,
                     profile.as_deref(),
                     verbose,
                     no_tui,
+                    attached,
                     log_filter,
+                    no_daemon,
+                    with_ui,
                 )
                 .await
             };
@@ -263,32 +368,25 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             verbose,
             json,
         } => run_status(&config_path, name.as_deref(), verbose, json).await,
+        Commands::Daemon {
+            port,
+            no_web,
+            command,
+        } => run_daemon_command(port, no_web, command).await,
+        Commands::Ui { print } => run_ui(print).await,
         Commands::Ports { json } => run_ports(&config_path, json),
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
+        Commands::Tui => run_attach_tui(&config_path).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
         Commands::Run {
             name,
-            all_pending,
             raw,
             no_prompt,
             wait,
             timeout,
-        } => match (name, all_pending) {
-            (Some(n), _) => run_run_task(&config_path, n, raw, no_prompt, wait, timeout).await,
-            (None, true) => {
-                if wait || timeout.is_some() {
-                    errln("don run --all-pending does not support --wait or --timeout");
-                    return 2;
-                }
-                run_client(&config_path, |c| async move { c.run_pending().await }).await
-            }
-            (None, false) => {
-                errln("don run: provide a task name or --all-pending");
-                1
-            }
-        },
+        } => run_run_task(&config_path, name, raw, no_prompt, wait, timeout).await,
         Commands::Completions { shell } => {
             let mut out = std::io::stdout();
             match don::completions::emit_script::<_, Cli>(shell, "don", &mut out) {
@@ -652,6 +750,345 @@ where
     }
 }
 
+/// Dispatch `don daemon [status|stop]`. No subcommand runs the daemon in the
+/// foreground — that's what the systemd unit / launchd agent execs.
+async fn run_daemon_command(port: u16, no_web: bool, command: Option<DaemonCommands>) -> i32 {
+    let paths = match don::daemon::DaemonPaths::from_process_env() {
+        Ok(paths) => paths,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    match command {
+        None => run_daemon_foreground(paths, port, no_web).await,
+        Some(DaemonCommands::Status { json }) => run_daemon_status(paths, json).await,
+        Some(DaemonCommands::Stop) => run_daemon_stop(paths).await,
+        Some(DaemonCommands::Restart) => run_daemon_restart(&paths),
+        Some(DaemonCommands::Install {
+            port: install_port,
+            dry_run,
+        }) => run_daemon_install(&paths, install_port, dry_run),
+        Some(DaemonCommands::Uninstall) => run_daemon_uninstall(&paths),
+    }
+}
+
+fn run_daemon_install(paths: &don::daemon::DaemonPaths, port: u16, dry_run: bool) -> i32 {
+    let plan = match don::daemon::install::plan(paths, port) {
+        Ok(plan) => plan,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    if dry_run {
+        println!("would write {}:\n", plan.unit_path.display());
+        println!("{}", plan.contents);
+        return 0;
+    }
+
+    match don::daemon::install::install(&plan) {
+        Ok(messages) => {
+            for message in messages {
+                println!("{message}");
+            }
+            println!("open the ui with `don ui`");
+            0
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            // The unit is on disk even when the supervisor call failed, so
+            // point at the manual path rather than leaving a dead end.
+            if plan.unit_path.exists() {
+                errln(format!(
+                    "the service file was written to {} — you can start it by hand",
+                    plan.unit_path.display()
+                ));
+            }
+            1
+        }
+    }
+}
+
+fn run_daemon_uninstall(paths: &don::daemon::DaemonPaths) -> i32 {
+    // Port doesn't matter for removal; only the unit path is used.
+    let plan = match don::daemon::install::plan(paths, don::web::DEFAULT_PORT) {
+        Ok(plan) => plan,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+    match don::daemon::install::uninstall(&plan) {
+        Ok(messages) => {
+            for message in messages {
+                println!("{message}");
+            }
+            0
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            1
+        }
+    }
+}
+
+async fn run_daemon_foreground(paths: don::daemon::DaemonPaths, port: u16, no_web: bool) -> i32 {
+    // The daemon has no OutputManager, so its progress goes straight to
+    // stderr — which is where systemd and launchd capture it from anyway.
+    let report: don::daemon::Reporter = std::sync::Arc::new(|line: &str| {
+        errln(format!("[don daemon] {line}"));
+    });
+
+    let options = don::daemon::DaemonOptions {
+        paths,
+        web_addr: (!no_web).then(|| std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+    };
+    match don::daemon::run(options, report).await {
+        Ok(()) => 0,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            1
+        }
+    }
+}
+
+async fn run_daemon_status(paths: don::daemon::DaemonPaths, json: bool) -> i32 {
+    let client = don::daemon::DaemonClient::new(paths.socket());
+    let info = match client.info().await {
+        Ok(info) => info,
+        Err(ClientError::NotRunning { .. }) => {
+            if json {
+                println!("{}", serde_json::json!({ "running": false }));
+            } else {
+                println!("don daemon is not running");
+                println!("  start it with `don daemon`, or install it as a service");
+                println!("  with `don daemon install` so it comes back on login.");
+            }
+            // Not an error — "is it running?" was answered.
+            return 0;
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    let projects = client.projects().await.unwrap_or_default();
+
+    if json {
+        let body = serde_json::json!({
+            "running": true,
+            "version": info.version,
+            "pid": info.pid,
+            "web_addr": info.web_addr,
+            "projects": projects,
+        });
+        match serde_json::to_string_pretty(&body) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                errln(format!("Error: {e}"));
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    println!("don daemon {} (pid {})", info.version, info.pid);
+    match &info.web_addr {
+        Some(addr) => println!("  web ui: http://{addr}"),
+        None => println!("  web ui: disabled"),
+    }
+    println!("  socket: {}", paths.socket().display());
+    if projects.is_empty() {
+        println!("  projects: none registered");
+    } else {
+        println!("  projects:");
+        for project in &projects {
+            let profile = project
+                .profile
+                .as_ref()
+                .map(|p| format!(" [{p}]"))
+                .unwrap_or_default();
+            println!(
+                "    {}{profile}  pid {}  {}",
+                project.name,
+                project.pid,
+                project.root.display()
+            );
+        }
+    }
+    0
+}
+
+/// `don ui` — open the daemon's web UI in a browser.
+///
+/// Asks the daemon where it bound rather than assuming the default port, so
+/// this works against a daemon started with `--port` or with port 0.
+async fn run_ui(print_only: bool) -> i32 {
+    let paths = match don::daemon::DaemonPaths::from_process_env() {
+        Ok(paths) => paths,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    let client = don::daemon::DaemonClient::new(paths.socket());
+    let info = match client.info().await {
+        Ok(info) => info,
+        Err(ClientError::NotRunning { .. }) => {
+            errln(
+                "don daemon is not running, so there's no web ui to open.\n  \
+                 Start one with `don daemon`, install it with `don daemon install`,\n  \
+                 or serve a single project with `don start --with-ui`.",
+            );
+            return 1;
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    let Some(addr) = info.web_addr else {
+        errln(
+            "the don daemon is running with its web ui disabled.\n  \
+             Restart it without `--no-web` to enable it.",
+        );
+        return 1;
+    };
+
+    let url = format!("http://{addr}/");
+
+    if print_only {
+        println!("{url}");
+        return 0;
+    }
+
+    match open_in_browser(&url) {
+        Ok(()) => {
+            println!("opened {url}");
+            0
+        }
+        Err(e) => {
+            errln(format!(
+                "could not open a browser ({e}) — open this instead:"
+            ));
+            println!("{url}");
+            0
+        }
+    }
+}
+
+/// Hand a URL to the platform's URL opener.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("{opener}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{opener} exited with {status}"))
+    }
+}
+
+/// `don daemon stop`.
+///
+/// An installed daemon is stopped through its supervisor. Asking it to exit on
+/// its own would leave systemd or launchd thinking it stopped for reasons of
+/// its own — and since a clean exit isn't covered by `Restart=on-failure`, the
+/// service would sit inactive until something started it again, which is a
+/// confusing state to leave someone in.
+async fn run_daemon_stop(paths: don::daemon::DaemonPaths) -> i32 {
+    if let Ok(plan) = don::daemon::install::plan(&paths, don::web::DEFAULT_PORT)
+        && plan.installed()
+    {
+        return match don::daemon::install::supervisor_stop(&plan) {
+            Ok(()) => {
+                println!("don daemon stopped (running projects were left alone)");
+                println!("  it will start again on login — `don daemon uninstall` to prevent that");
+                0
+            }
+            Err(e) => {
+                errln(format!("Error: {e}"));
+                1
+            }
+        };
+    }
+
+    let socket = paths.socket();
+    let client = don::daemon::DaemonClient::new(socket.clone());
+    match client.shutdown().await {
+        Ok(()) => {}
+        Err(ClientError::NotRunning { .. }) => {
+            println!("don daemon is not running");
+            return 0;
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    }
+
+    match wait_for_daemon_socket_gone(&socket, std::time::Duration::from_secs(10)).await {
+        Ok(()) => {
+            println!("don daemon stopped (running projects were left alone)");
+            0
+        }
+        Err(e) => {
+            errln(e);
+            1
+        }
+    }
+}
+
+/// `don daemon restart` — mainly for picking up an upgraded `don` binary.
+///
+/// Supervisor-only by design. Restarting a bare foreground `don daemon` would
+/// mean spawning a detached replacement, which is process management this
+/// command has no business inventing — better to say so.
+fn run_daemon_restart(paths: &don::daemon::DaemonPaths) -> i32 {
+    let plan = match don::daemon::install::plan(paths, don::web::DEFAULT_PORT) {
+        Ok(plan) => plan,
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            return 1;
+        }
+    };
+
+    if !plan.installed() {
+        errln(format!(
+            "the don daemon isn't installed as a service, so there's nothing to restart it with.\n  \
+             Expected a unit at {}.\n  \
+             Install it with `don daemon install`, or stop and start your `don daemon` by hand.",
+            plan.unit_path.display()
+        ));
+        return 1;
+    }
+
+    match don::daemon::install::supervisor_restart(&plan) {
+        Ok(()) => {
+            println!("don daemon restarted (running projects were left alone)");
+            0
+        }
+        Err(e) => {
+            errln(format!("Error: {e}"));
+            1
+        }
+    }
+}
+
 async fn run_stop_daemon(config_path: &Path) -> i32 {
     let base = base_dir(config_path);
     let client = Client::new(&base);
@@ -696,17 +1133,17 @@ async fn wait_for_daemon_socket_gone(
 async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json: bool) -> i32 {
     let client = client_for(config_path);
     match client.status(verbose, name).await {
-        Ok(mut items) => {
+        Ok(mut processes) => {
             // A named query is filtered server-side; an empty result means the
             // name didn't match anything. Fetch the full list to offer a
             // did-you-mean before failing.
             if let Some(name) = name
-                && items.is_empty()
+                && processes.is_empty()
             {
                 let suggestion = match client.status(false, None).await {
                     Ok(all) => {
                         let available: std::collections::HashSet<&str> =
-                            all.iter().map(item_name).collect();
+                            all.iter().map(process_name).collect();
                         suggest_name_typo(name, &available)
                     }
                     Err(_) => String::new(),
@@ -714,22 +1151,22 @@ async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json:
                 errln(format!("no service or task named '{name}'{suggestion}"));
                 return 1;
             }
-            items.sort_by(|a, b| {
+            processes.sort_by(|a, b| {
                 status_sort_bucket(a)
                     .cmp(&status_sort_bucket(b))
-                    .then_with(|| item_name(a).cmp(item_name(b)))
+                    .then_with(|| process_name(a).cmp(process_name(b)))
             });
             if json {
                 #[derive(serde::Serialize)]
                 struct StatusJson<'a> {
                     ready: bool,
                     tasks_pending_run: usize,
-                    items: &'a [ItemStatus],
+                    processes: &'a [ProcessStatus],
                 }
                 let payload = StatusJson {
-                    ready: don::runner::all_services_ready(&items),
-                    tasks_pending_run: count_tasks_pending_run(&items),
-                    items: &items,
+                    ready: don::runner::all_services_ready(&processes),
+                    tasks_pending_run: count_tasks_pending_run(&processes),
+                    processes: &processes,
                 };
                 return match serde_json::to_string_pretty(&payload) {
                     Ok(s) => {
@@ -742,7 +1179,7 @@ async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json:
                     }
                 };
             }
-            print_status_table(&items, verbose, name.is_some());
+            print_status_table(&processes, verbose, name.is_some());
             0
         }
         Err(e) => {
@@ -836,10 +1273,9 @@ fn print_watch_report(report: &don::WatchReport) {
         }
     );
     for item in &report.items {
-        let stale = if item.stale { " stale" } else { "" };
         println!(
-            "  {}  {dim}{} · {} · debounce {}ms{}{reset}",
-            item.name, item.kind, item.state, item.debounce_ms, stale
+            "  {}  {dim}{} · {} · debounce {}ms{reset}",
+            item.name, item.kind, item.state, item.debounce_ms
         );
         for pattern in &item.patterns {
             println!("      {pattern}");
@@ -853,22 +1289,14 @@ fn print_watch_report(report: &don::WatchReport) {
     }
 
     // Diagnostics worth surfacing: a non-zero count here usually explains a
-    // "didn't reload" report (dropped events or an item stuck mid-rebuild).
-    if report.notify_error_count > 0 || report.runner_event_lag_count > 0 {
+    // "didn't reload" report.
+    if report.notify_error_count > 0 {
         println!();
-        if report.notify_error_count > 0 {
-            let last = report.last_notify_error.as_deref().unwrap_or("");
-            println!(
-                "{dim}notify errors:{reset} {} (last: {last})",
-                report.notify_error_count
-            );
-        }
-        if report.runner_event_lag_count > 0 {
-            println!(
-                "{dim}runner-event lag:{reset} {} — an item may be stuck mid-rebuild",
-                report.runner_event_lag_count
-            );
-        }
+        let last = report.last_notify_error.as_deref().unwrap_or("");
+        println!(
+            "{dim}notify errors:{reset} {} (last: {last})",
+            report.notify_error_count
+        );
     }
 }
 
@@ -876,9 +1304,9 @@ fn print_watch_report(report: &don::WatchReport) {
 /// last. Putting `DependencyFailed` *below* `Failed` surfaces the actual
 /// culprit — the thing the user needs to look at — above everything that
 /// merely got stranded.
-fn status_sort_bucket(item: &ItemStatus) -> u8 {
+fn status_sort_bucket(item: &ProcessStatus) -> u8 {
     match item {
-        ItemStatus::Service { state, .. } => match state {
+        ProcessStatus::Service { state, .. } => match state {
             ServiceState::Failed | ServiceState::Unhealthy => 0,
             ServiceState::DependencyFailed => 1,
             ServiceState::Pending | ServiceState::Building | ServiceState::Starting => 2,
@@ -888,33 +1316,33 @@ fn status_sort_bucket(item: &ItemStatus) -> u8 {
             ServiceState::Stopped => 6,
             ServiceState::Lazy => 7,
         },
-        ItemStatus::Task { state, .. } => match state {
-            TaskItemState::Failed => 0,
-            TaskItemState::DependencyFailed => 1,
-            TaskItemState::Pending | TaskItemState::Building | TaskItemState::Running => 2,
-            TaskItemState::PendingRun => 7,
-            TaskItemState::Completed => 8,
-            TaskItemState::Skipped => 9,
+        ProcessStatus::Task { state, .. } => match state {
+            TaskState::Failed => 0,
+            TaskState::DependencyFailed => 1,
+            TaskState::Pending | TaskState::Building | TaskState::Running => 2,
+            TaskState::PendingRun => 7,
+            TaskState::Completed => 8,
+            TaskState::Skipped => 9,
         },
     }
 }
 
-fn item_name(item: &ItemStatus) -> &str {
+fn process_name(item: &ProcessStatus) -> &str {
     match item {
-        ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name.as_str(),
+        ProcessStatus::Service { name, .. } | ProcessStatus::Task { name, .. } => name.as_str(),
     }
 }
 
 /// Count tasks parked in `PendingRun` — maintenance work awaiting a manual run.
 /// Mirrors the TUI's `*` flag so headless `--json` callers can detect it.
-fn count_tasks_pending_run(items: &[ItemStatus]) -> usize {
-    items
+fn count_tasks_pending_run(processes: &[ProcessStatus]) -> usize {
+    processes
         .iter()
-        .filter(|item| {
+        .filter(|process| {
             matches!(
-                item,
-                ItemStatus::Task {
-                    state: TaskItemState::PendingRun,
+                process,
+                ProcessStatus::Task {
+                    state: TaskState::PendingRun,
                     ..
                 }
             )
@@ -965,6 +1393,412 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
     }
 }
 
+/// TTY-mode `don start`: spawn the runner as a background child and attach
+/// the TUI as a client — the fork model.
+///
+/// The runner never has a terminal; the thing in your terminal is an
+/// ordinary client of the socket API, identical to `don tui`. Ctrl+C keeps
+/// its contract (graceful stack shutdown — the TUI requests it over the
+/// API; a terminal-delivered SIGINT is forwarded to the child, so a second
+/// one still reaches the runner's force-kill escalation). Ctrl+D detaches,
+/// leaving the stack running.
+///
+/// The parent gates on the *socket*, not on startup completing — watching
+/// startup happen is what the TUI is for. A child that dies before the
+/// socket answers gets its log tail relayed, so startup failures surface
+/// exactly where the user is looking.
+async fn run_start_attached(
+    config_path: &Path,
+    profile: Option<&str>,
+    verbose: bool,
+    log_filter: Vec<String>,
+    no_daemon: bool,
+    with_ui: Option<u16>,
+) -> Result<(), String> {
+    let base = base_dir(config_path);
+
+    // Already running: `don start` is idempotent in TTY mode — attach the
+    // TUI to the stack that's up (tmux-attach muscle memory) instead of
+    // erroring about it. Decided with PJ 2026-08-06.
+    let probe = Client::new(&base);
+    match probe.status(false, None).await {
+        Ok(_) => {
+            println!("don is already running here — attaching (Ctrl+D detaches, `don stop` stops)");
+            let log_filter_set: Option<std::collections::HashSet<String>> = if log_filter.is_empty()
+            {
+                None
+            } else {
+                Some(log_filter.into_iter().collect())
+            };
+            return attach_tui_inner(config_path, log_filter_set).await;
+        }
+        Err(ClientError::NotRunning { .. }) => {}
+        Err(e) => return Err(format!("failed to check for a running don: {e}")),
+    }
+
+    let (mut child, log_path) =
+        spawn_runner_child(config_path, profile, verbose, no_daemon, with_ui)?;
+    let child_pid = child.id();
+
+    // Wait for the API socket to answer. Generous only about the socket —
+    // binding happens before the runner's main loop, so a healthy child
+    // answers almost immediately.
+    let client = Client::new(&base);
+    let start = tokio::time::Instant::now();
+    let socket_timeout = std::time::Duration::from_secs(10);
+    loop {
+        if client.ready().await.is_ok() {
+            break;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed to check the runner process: {e}"))?
+        {
+            let status_text = match status.code() {
+                Some(code) => format!("exit code {code}"),
+                None => "terminated by signal".to_string(),
+            };
+            let tail = read_log_tail(&log_path, 20);
+            let mut msg = format!(
+                "the runner exited before its API came up ({status_text}); log: {}",
+                log_path.display()
+            );
+            if !tail.is_empty() {
+                msg.push_str("\n\n");
+                msg.push_str(&tail);
+            }
+            return Err(msg);
+        }
+        if start.elapsed() >= socket_timeout {
+            return Err(format!(
+                "the runner did not answer within {socket_timeout:?} (pid {child_pid}); log: {}",
+                log_path.display()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+
+    // Forward terminal signals to the runner child. The TUI's raw mode
+    // means Ctrl+C arrives as a key (handled over the API), so this exists
+    // for signals sent from *outside* — `kill -INT`, a closing terminal
+    // emulator — and it preserves the two-press force-kill escalation,
+    // because the child's own signal counter sees each forwarded SIGINT.
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+            return;
+        };
+        let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                received = sigint.recv() => { if received.is_none() { return; } }
+                received = sigterm.recv() => { if received.is_none() { return; } }
+            }
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child_pid as i32),
+                nix::sys::signal::Signal::SIGINT,
+            );
+        }
+    });
+
+    let log_filter_set: Option<std::collections::HashSet<String>> = if log_filter.is_empty() {
+        None
+    } else {
+        Some(log_filter.into_iter().collect())
+    };
+    attach_tui_inner(config_path, log_filter_set).await?;
+
+    // After a shutdown the child has exited (or is about to); reap it so a
+    // fast exit doesn't leave a zombie for the brief rest of our lifetime.
+    // After a detach it is alive and this is a no-op — init inherits it.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = child.try_wait();
+    Ok(())
+}
+
+/// Whether TTY-mode `don start` should use the fork model.
+///
+/// Conservative: any config that fails to load or validate falls back to
+/// the in-process path, which reports the error exactly as it always has.
+/// Interactive (foreground) tasks are no obstacle — they run on
+/// runner-owned PTYs and clients bridge to them over the socket.
+fn should_auto_attach(config_path: &Path, no_tui: bool) -> bool {
+    use std::io::IsTerminal;
+    if no_tui || !std::io::stdout().is_terminal() {
+        return false;
+    }
+    let Ok(config) = don::config::Config::from_file(config_path) else {
+        return false;
+    };
+    let Some(platform) = don::config::Platform::current() else {
+        return false;
+    };
+    config.validate(platform).is_ok()
+}
+
+/// `don tui` — attach the full TUI to an already-running project.
+///
+/// A pure client of the socket API: the process set comes from `GET /status`
+/// (which doubles as the "is anything running?" check, answered before the
+/// terminal is touched), logs from the merged follow with history preload,
+/// events from `GET /events` (whose snapshot preamble makes the view
+/// consistent at connect). Ctrl+D detaches, leaving the stack running;
+/// Ctrl+C requests a graceful shutdown and the TUI exits when the runner's
+/// streams close.
+async fn run_attach_tui(config_path: &Path) -> i32 {
+    match attach_tui_inner(config_path, None).await {
+        Ok(()) => 0,
+        Err(message) => {
+            eprintln!("{message}");
+            1
+        }
+    }
+}
+
+async fn attach_tui_inner(
+    config_path: &Path,
+    cli_log_filter: Option<std::collections::HashSet<String>>,
+) -> Result<(), String> {
+    use don::client::{Client, LogStreamEvent};
+
+    {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            return Err(
+                "don tui needs a terminal — use `don status` or `don logs` in scripts".into(),
+            );
+        }
+    }
+
+    let base = base_dir(config_path);
+    let client = Client::new(&base);
+
+    // Authoritative process set from the runner. Everything below intersects
+    // against it, so profile filtering and config drift can't invent processes
+    // the runner doesn't have.
+    let processes = client
+        .status(false, None)
+        .await
+        .map_err(|e| format!("cannot attach: {e}"))?;
+    let mut service_names: Vec<String> = Vec::new();
+    let mut task_names: Vec<String> = Vec::new();
+    for process in &processes {
+        match process {
+            don::client::ProcessStatus::Service { name, .. } => service_names.push(name.clone()),
+            don::client::ProcessStatus::Task { name, .. } => task_names.push(name.clone()),
+        }
+    }
+    let active: std::collections::HashSet<&String> =
+        service_names.iter().chain(task_names.iter()).collect();
+
+    // Config supplies what /status doesn't: task param schemas, hidden and
+    // auto-filter flags, whether a bazel stream exists. Best-effort — the
+    // file may have drifted since the runner started.
+    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+    let platform =
+        don::config::Platform::current().ok_or_else(|| "unsupported platform".to_string())?;
+
+    let task_configs: std::collections::HashMap<String, don::config::Task> = config
+        .tasks
+        .iter()
+        .filter(|(name, _)| active.contains(name))
+        .map(|(name, task)| (name.clone(), task.clone()))
+        .collect();
+    let hidden_names: std::collections::HashSet<String> = config
+        .services
+        .iter()
+        .filter(|(name, svc)| active.contains(name) && svc.hidden)
+        .map(|(name, _)| name.clone())
+        .chain(
+            config
+                .tasks
+                .iter()
+                .filter(|(name, task)| active.contains(name) && task.hidden)
+                .map(|(name, _)| name.clone()),
+        )
+        .collect();
+    let auto_filter_on_failure_names: std::collections::HashSet<String> = config
+        .services
+        .iter()
+        .filter(|(name, svc)| {
+            active.contains(name)
+                && svc
+                    .resolve(platform)
+                    .auto_filter_on_failure
+                    .unwrap_or(config.auto_filter_on_failure)
+        })
+        .map(|(name, _)| name.clone())
+        .chain(
+            config
+                .tasks
+                .iter()
+                .filter(|(name, task)| {
+                    active.contains(name)
+                        && task
+                            .auto_filter_on_failure
+                            .unwrap_or(config.auto_filter_on_failure)
+                })
+                .map(|(name, _)| name.clone()),
+        )
+        .collect();
+    let has_build_tool =
+        config.services.iter().any(|(name, svc)| {
+            active.contains(name) && svc.resolve(platform).bazel_config().is_some()
+        }) || config
+            .tasks
+            .iter()
+            .any(|(name, task)| active.contains(name) && task.bazel.is_some());
+    let build_tool_names: Vec<String> = if has_build_tool {
+        vec!["bazel".to_string()]
+    } else {
+        Vec::new()
+    };
+
+    let task_state = don::TaskStateStore::new(base.join(".don").join("task-state"));
+    let mut task_last_runs = std::collections::HashMap::new();
+    for name in &task_names {
+        if let Ok(Some(last_run)) = task_state.last_run(name).await {
+            task_last_runs.insert(name.clone(), last_run);
+        }
+    }
+
+    // A local, null-writer output manager gives the TUI a lifecycle emitter
+    // whose feedback lines ("restart requested") render locally with the
+    // same formatting as runner output, plus the verbosity control the `v`
+    // key flips. The emitter's lines flow local sink task -> tap -> merger
+    // below, exactly like runner lines flow into the socket stream.
+    let local_output = don::output::OutputManager::new(&[], tokio::io::sink())
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
+    let lifecycle_emitter = local_output.clone_lifecycle_emitter();
+    // Local narration this client generates itself (bridge notices, errors).
+    // A cursor rather than a raw subscription so the two sides of the merge
+    // behave the same way when either falls behind.
+    let mut local_tap = local_output.log_stream_sender().cursor(None, 0).await;
+
+    // A long-lived runner can outlive a `don` upgrade. Warn about skew as a
+    // rendered line rather than misbehaving quietly.
+    if let Ok(info) = client.ready_info().await {
+        let mine = env!("CARGO_PKG_VERSION");
+        match info.version.as_deref() {
+            Some(theirs) if theirs != mine => lifecycle_emitter.lifecycle_event(&format!(
+                "version skew: this client is {mine}, the runner is {theirs} — restart the stack to align"
+            )),
+            None => lifecycle_emitter.lifecycle_event(&format!(
+                "version skew: this client is {mine}, the runner predates version reporting — restart the stack to align"
+            )),
+            _ => {}
+        }
+    }
+
+    // Remote merged stream -> intermediate channel. The spawned follow ends
+    // when the server closes the stream (shutdown) or the merger drops the
+    // receiver (TUI exited).
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::unbounded_channel::<LogStreamEvent>();
+    {
+        let follow = Client::new(&base);
+        tokio::spawn(async move {
+            let _ = follow
+                .logs_follow_all(None, |event| {
+                    remote_tx
+                        .send(event)
+                        .map_err(|_| don::client::ClientError::Invalid("tui closed".into()))
+                })
+                .await;
+        });
+    }
+
+    // One merger owns the TUI's log sender. That ownership is the exit
+    // path: when the remote stream ends (runner gone), the merger returns,
+    // the sender drops, and the TUI loop sees its log channel close.
+    let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                remote = remote_rx.recv() => match remote {
+                    Some(LogStreamEvent::Line { id, name, lifecycle, verbose, prefix, line }) => {
+                        let event = don::output::MergedEvent::Line(don::output::MergedLine {
+                            id,
+                            line: std::sync::Arc::new(don::output::FormattedLogLine {
+                                name,
+                                is_lifecycle: lifecycle,
+                                is_verbose: verbose,
+                                prefix: prefix.into_bytes(),
+                                bytes: line.into_bytes(),
+                            }),
+                            // The wire doesn't carry it and this side doesn't
+                            // need it: the flag exists for cursors, and the
+                            // store this feeds replaces on id equality alone.
+                            supersedes: false,
+                        });
+                        if log_tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    Some(LogStreamEvent::Dropped { dropped, resumed_at }) => {
+                        // The server already tried its own history; if it is
+                        // telling us, the lines are genuinely gone.
+                        if log_tx
+                            .send(don::output::MergedEvent::Dropped {
+                                count: dropped,
+                                resumed_at,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    None => return,
+                },
+                local = local_tap.recv() => match local {
+                    Some(event) => {
+                        if log_tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    // Local feedback is best-effort; the remote stream is
+                    // the one whose end must end the session.
+                    None => continue,
+                },
+            }
+        }
+    });
+
+    don::run_tui(
+        log_rx,
+        client,
+        don::TuiMode::Remote,
+        lifecycle_emitter,
+        service_names,
+        task_names,
+        build_tool_names,
+        task_configs,
+        task_last_runs,
+        hidden_names,
+        auto_filter_on_failure_names,
+        cli_log_filter,
+    )
+    .await
+    .map_err(|e| format!("tui error: {e}"))?;
+
+    // Keep the local sink alive for the whole session (its task carries the
+    // emitter's feedback lines into the merger above).
+    drop(local_output);
+
+    // Distinguish detach from shutdown for the user: after Ctrl+C the
+    // runner's socket is already closing by the time the TUI exits, so this
+    // probe fails and stays quiet; after Ctrl+D it answers.
+    let probe = Client::new(&base);
+    if probe.ready().await.is_ok() {
+        println!(
+            "detached — the stack is still running (`don tui` to reattach, `don stop` to stop)"
+        );
+    }
+    Ok(())
+}
+
 async fn run_attach(config_path: &Path, name: &str) -> i32 {
     let base = base_dir(config_path);
     let socket_path = base.join(".don").join("don.sock");
@@ -980,36 +1814,38 @@ async fn run_attach(config_path: &Path, name: &str) -> i32 {
     }
 }
 
-fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: bool) {
-    if items.is_empty() {
+fn print_status_table(processes: &[ProcessStatus], verbose: bool, show_watch_paths: bool) {
+    if processes.is_empty() {
         println!("(no services or tasks)");
         return;
     }
     // Compute column widths.
     let kind_w = "KIND".len().max(
-        items
+        processes
             .iter()
             .map(|i| match i {
-                ItemStatus::Service { .. } => "service".len(),
-                ItemStatus::Task { .. } => "task".len(),
+                ProcessStatus::Service { .. } => "service".len(),
+                ProcessStatus::Task { .. } => "task".len(),
             })
             .max()
             .unwrap_or(0),
     );
     let name_w = "NAME".len().max(
-        items
+        processes
             .iter()
             .map(|i| match i {
-                ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name.len(),
+                ProcessStatus::Service { name, .. } | ProcessStatus::Task { name, .. } => {
+                    name.len()
+                }
             })
             .max()
             .unwrap_or(0),
     );
 
     let state_w = "STATE".len().max(
-        items
+        processes
             .iter()
-            .map(item_state_label)
+            .map(process_state_label)
             .map(|label| label.len())
             .max()
             .unwrap_or(0),
@@ -1019,13 +1855,15 @@ fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: boo
         "{:<kind_w$}  {:<name_w$}  {:<state_w$}  LAST RUN  RESULT  DURATION",
         "KIND", "NAME", "STATE"
     );
-    for item in items {
-        let (kind, name, state_str, color, last_run, result, duration, verbose_info) = match item {
-            ItemStatus::Service {
+    for process in processes {
+        let (kind, name, state_str, color, last_run, result, duration, verbose_info) = match process
+        {
+            ProcessStatus::Service {
                 name,
                 state,
                 failed_dependencies,
                 verbose,
+                ..
             } => (
                 "service",
                 name.as_str(),
@@ -1036,12 +1874,13 @@ fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: boo
                 "-".to_string(),
                 verbose.as_ref(),
             ),
-            ItemStatus::Task {
+            ProcessStatus::Task {
                 name,
                 state,
                 failed_dependencies,
                 last_run,
                 verbose,
+                ..
             } => (
                 "task",
                 name.as_str(),
@@ -1124,7 +1963,7 @@ fn format_duration_ms(duration_ms: u64) -> String {
     }
 }
 
-/// Print verbose details for a single item, indented under the status line.
+/// Print verbose details for a single process, indented under the status line.
 #[allow(clippy::print_stdout)]
 fn print_verbose_info(info: &don::runner::VerboseInfo, show_watch_paths: bool) {
     let dim = SetAttribute(Attribute::Dim);
@@ -1152,12 +1991,9 @@ fn print_verbose_info(info: &don::runner::VerboseInfo, show_watch_paths: bool) {
     if let Some(ref target) = info.bazel_target {
         println!("  {dim}bazel:{reset}  {target}");
     }
-    if let Some(ref task) = info.turbo_task {
-        println!("  {dim}turbo:{reset}  {task}");
-    }
-    // When inspecting a single item, expand the full resolved watch path list
+    // When inspecting a single process, expand the full resolved watch path list
     // (these are dynamically resolved for build-tool services, so the count
-    // alone hides what's actually being watched). In the all-items view keep it
+    // alone hides what's actually being watched). In the all-processes view keep it
     // to a count so a large stack stays scannable.
     if show_watch_paths && !info.watch.is_empty() {
         println!(
@@ -1214,37 +2050,37 @@ fn service_state_color(s: ServiceState) -> Color {
     }
 }
 
-fn task_state_label(s: TaskItemState) -> &'static str {
+fn task_state_label(s: TaskState) -> &'static str {
     match s {
-        TaskItemState::Pending => "pending",
-        TaskItemState::Building => "building",
-        TaskItemState::Running => "running",
-        TaskItemState::Completed => "completed",
-        TaskItemState::Skipped => "skipped",
-        TaskItemState::Failed => "failed",
-        TaskItemState::DependencyFailed => "dep failed",
-        TaskItemState::PendingRun => "pending_run",
+        TaskState::Pending => "pending",
+        TaskState::Building => "building",
+        TaskState::Running => "running",
+        TaskState::Completed => "completed",
+        TaskState::Skipped => "skipped",
+        TaskState::Failed => "failed",
+        TaskState::DependencyFailed => "dep failed",
+        TaskState::PendingRun => "pending_run",
     }
 }
 
-fn task_state_color(s: TaskItemState) -> Color {
+fn task_state_color(s: TaskState) -> Color {
     match s {
-        TaskItemState::Completed | TaskItemState::Skipped => Color::Green,
-        TaskItemState::Running | TaskItemState::Pending | TaskItemState::Building => Color::Yellow,
-        TaskItemState::PendingRun => Color::Cyan,
-        TaskItemState::Failed => Color::Red,
-        TaskItemState::DependencyFailed => Color::DarkRed,
+        TaskState::Completed | TaskState::Skipped => Color::Green,
+        TaskState::Running | TaskState::Pending | TaskState::Building => Color::Yellow,
+        TaskState::PendingRun => Color::Cyan,
+        TaskState::Failed => Color::Red,
+        TaskState::DependencyFailed => Color::DarkRed,
     }
 }
 
-fn item_state_label(item: &ItemStatus) -> Cow<'static, str> {
-    match item {
-        ItemStatus::Service {
+fn process_state_label(process: &ProcessStatus) -> Cow<'static, str> {
+    match process {
+        ProcessStatus::Service {
             state,
             failed_dependencies,
             ..
         } => state_label(service_state_label(*state), failed_dependencies),
-        ItemStatus::Task {
+        ProcessStatus::Task {
             state,
             failed_dependencies,
             ..
@@ -1267,40 +2103,40 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
 
     // Acquire the PID file lock so we don't race with a running daemon.
     let don_pid_path = don_dir.join("don.pid");
-    let pid_lock = match don::process::pid_file::PidFile::acquire(
-        don_pid_path.clone(),
-        std::process::id() as i32,
-    )
-    .await
-    {
-        Ok(lock) => lock,
-        Err(don::process::pid_file::PidFileError::AlreadyLocked) => {
-            if !force {
-                println!("don daemon is running — nothing to clean up (use --force to kill it)");
-                return 0;
-            }
-            // --force: read the running daemon's PID and kill it.
-            errln("killing running don daemon...");
-            if let Err(e) = kill_running_daemon(&don_pid_path).await {
-                errln(format!("failed to kill daemon: {e}"));
-                return 1;
-            }
-            // Now re-acquire the lock.
-            match don::process::pid_file::PidFile::acquire(don_pid_path, std::process::id() as i32)
-                .await
-            {
-                Ok(lock) => lock,
-                Err(e) => {
-                    errln(format!("failed to acquire pid lock after kill: {e}"));
+    let pid_lock =
+        match don::sys::pid_file::PidFile::acquire(don_pid_path.clone(), std::process::id() as i32)
+            .await
+        {
+            Ok(lock) => lock,
+            Err(don::sys::pid_file::PidFileError::AlreadyLocked) => {
+                if !force {
+                    println!(
+                        "don daemon is running — nothing to clean up (use --force to kill it)"
+                    );
+                    return 0;
+                }
+                // --force: read the running daemon's PID and kill it.
+                errln("killing running don daemon...");
+                if let Err(e) = kill_running_daemon(&don_pid_path).await {
+                    errln(format!("failed to kill daemon: {e}"));
                     return 1;
                 }
+                // Now re-acquire the lock.
+                match don::sys::pid_file::PidFile::acquire(don_pid_path, std::process::id() as i32)
+                    .await
+                {
+                    Ok(lock) => lock,
+                    Err(e) => {
+                        errln(format!("failed to acquire pid lock after kill: {e}"));
+                        return 1;
+                    }
+                }
             }
-        }
-        Err(e) => {
-            errln(format!("failed to acquire pid lock: {e}"));
-            return 1;
-        }
-    };
+            Err(e) => {
+                errln(format!("failed to acquire pid lock: {e}"));
+                return 1;
+            }
+        };
 
     // Load config to discover docker container names. If config doesn't
     // exist or is invalid, still clean up what we can (pid files and socket).
@@ -1336,7 +2172,7 @@ async fn run_cleanup_command(config_path: &std::path::Path, force: bool) -> i32 
         }
     };
 
-    let report = don::process::cleanup::run_cleanup(&base, &docker_names).await;
+    let report = don::sys::cleanup::run_cleanup(&base, &docker_names).await;
     println!("{report}");
     for warning in &report.warnings {
         errln(format!("Warning: {warning}"));
@@ -1455,7 +2291,8 @@ async fn run_start_detached(
     config_path: &Path,
     profile: Option<&str>,
     verbose: bool,
-    log_filter: Vec<String>,
+    no_daemon: bool,
+    with_ui: Option<u16>,
 ) -> Result<(), String> {
     let base = base_dir(config_path);
     let client = Client::new(&base);
@@ -1465,12 +2302,33 @@ async fn run_start_detached(
         Err(e) => return Err(format!("failed to check daemon status: {e}")),
     }
 
-    let log_path = base.join(".don").join("logs").join("detached.log");
+    let (mut child, log_path) =
+        spawn_runner_child(config_path, profile, verbose, no_daemon, with_ui)?;
+    let pid = child.id();
+    wait_for_detached_start(&mut child, &base, &log_path, pid).await
+}
+
+/// Spawn the runner as a background child: new session (no controlling
+/// terminal, so terminal-generated signals never reach it), stdin null,
+/// stdout+stderr appended to `.don/logs/runner.log` — the post-mortem for a
+/// runner nobody is attached to.
+///
+/// Used by both `don start -d` (spawn and exit) and TTY-mode `don start`
+/// (spawn and attach).
+fn spawn_runner_child(
+    config_path: &Path,
+    profile: Option<&str>,
+    verbose: bool,
+    no_daemon: bool,
+    with_ui: Option<u16>,
+) -> Result<(std::process::Child, PathBuf), String> {
+    let base = base_dir(config_path);
+    let log_path = base.join(".don").join("logs").join("runner.log");
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
-    append_detached_log_header(&log_path)?;
+    append_runner_log_header(&log_path)?;
 
     let exe = std::env::current_exe().map_err(|e| format!("failed to locate don binary: {e}"))?;
     let stdout = std::fs::OpenOptions::new()
@@ -1491,19 +2349,28 @@ async fn run_start_detached(
     if verbose {
         cmd.arg("--verbose");
     }
-    cmd.arg("start").arg("--no-tui");
+    cmd.arg("start").arg("--no-tui").arg("--attached");
+    if no_daemon {
+        cmd.arg("--no-daemon");
+    }
+    if let Some(port) = with_ui {
+        cmd.arg(format!("--with-ui={port}"));
+    }
     if let Some(profile_name) = profile {
         cmd.arg("--profile").arg(profile_name);
     }
-    if !log_filter.is_empty() {
-        cmd.arg("--log-filter").arg(log_filter.join(","));
-    }
+    // `--log-filter` is deliberately NOT forwarded: in pipe mode it
+    // filters stdout, and the child's stdout is runner.log — the
+    // post-mortem log should be complete. The filter is presentation;
+    // the attached TUI applies it client-side. (`-d` callers who want a
+    // filtered background log can be catered to later if anyone asks.)
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Run the daemon in a new session so terminal-generated signals for
-        // the parent shell do not also hit the detached don process.
+        // Run the runner in a new session so terminal-generated signals for
+        // the parent shell do not also hit it. Signal *forwarding* (for the
+        // attached case) is explicit and pid-targeted.
         unsafe {
             cmd.pre_exec(|| {
                 if nix::libc::setsid() == -1 {
@@ -1514,20 +2381,19 @@ async fn run_start_detached(
         }
     }
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn detached don: {e}"))?;
-    let pid = child.id();
-    wait_for_detached_start(&mut child, &base, &log_path, pid).await
+        .map_err(|e| format!("failed to spawn don runner: {e}"))?;
+    Ok((child, log_path))
 }
 
-fn append_detached_log_header(log_path: &Path) -> Result<(), String> {
+fn append_runner_log_header(log_path: &Path) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
         .map_err(|e| format!("failed to open {}: {e}", log_path.display()))?;
-    writeln!(file, "\n--- don start --detached ---")
+    writeln!(file, "\n--- don runner (background) ---")
         .map_err(|e| format!("failed to write {}: {e}", log_path.display()))?;
     Ok(())
 }
@@ -1598,14 +2464,21 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
     lines.join("\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_start(
     config_path: &std::path::Path,
     profile: Option<&str>,
     verbose: bool,
     no_tui: bool,
+    attached: bool,
     log_filter: Vec<String>,
+    no_daemon: bool,
+    with_ui: Option<u16>,
 ) -> Result<(), String> {
     use std::io::IsTerminal;
+
+    // Serving a UI from this process means not depending on a daemon at all.
+    let no_daemon = no_daemon || with_ui.is_some();
 
     let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
@@ -1636,28 +2509,23 @@ async fn run_start(
         .or_else(|| config.default_profile.clone());
     let profile_ref: Option<&str> = profile.as_deref();
 
-    // Resolve the active item set up front so the output manager and TUI
-    // only see items that will actually run. Without this, prefix padding
+    // Resolve the active process set up front so the output manager and TUI
+    // only see processes that will actually run. Without this, prefix padding
     // is sized for the longest name in the whole config, and the TUI
-    // service menu lists items the profile excludes. The runner re-runs
+    // service menu lists processes the profile excludes. The runner re-runs
     // this inside `Runner::new` to build its own filtered state.
-    let active_items: Option<std::collections::HashSet<String>> =
+    let active_processes: Option<std::collections::HashSet<String>> =
         if let Some(profile_name) = profile_ref {
             let prof = config
                 .profiles
                 .get(profile_name)
                 .ok_or_else(|| format!("Error: unknown profile '{profile_name}'"))?;
-            Some(don::runner::resolve_profile_items(&config, prof))
+            Some(don::config::resolve_profile_processes(&config, prof))
         } else {
             None
         };
 
-    let is_active = |name: &str| active_items.as_ref().is_none_or(|s| s.contains(name));
-    let has_foreground_tasks = config
-        .tasks
-        .iter()
-        .any(|(name, task)| is_active(name) && task.terminal.is_foreground());
-
+    let is_active = |name: &str| active_processes.as_ref().is_none_or(|s| s.contains(name));
     // Collect service names and their log configs for OutputManager.
     let service_configs: Vec<(&str, &don::config::LogConfig)> = config
         .services
@@ -1676,7 +2544,7 @@ async fn run_start(
 
     // Synthetic build-tool stream names should participate in the initial
     // output palette so color choice and prefix width depend only on the
-    // config-derived item set, not on later registration order.
+    // config-derived process set, not on later registration order.
     let service_kinds = || {
         config.services.values().flat_map(|svc| {
             std::iter::once(svc.kind.as_ref())
@@ -1686,16 +2554,11 @@ async fn run_start(
     };
     let uses_bazel = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Bazel(_)))
         || config.tasks.values().any(|t| t.bazel.is_some());
-    let uses_turbo = service_kinds().any(|k| matches!(k, don::config::ServiceKind::Turbo(_)))
-        || config.tasks.values().any(|t| t.turbo.is_some());
     let build_tool_log = don::config::LogConfig::Stdout;
-    let build_tool_configs: Vec<(&str, &don::config::LogConfig)> = [
-        uses_bazel.then_some(("bazel", &build_tool_log)),
-        uses_turbo.then_some(("turbo", &build_tool_log)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let build_tool_configs: Vec<(&str, &don::config::LogConfig)> = uses_bazel
+        .then_some(("bazel", &build_tool_log))
+        .into_iter()
+        .collect();
 
     let all_configs: Vec<(&str, &don::config::LogConfig)> = service_configs
         .into_iter()
@@ -1724,7 +2587,7 @@ async fn run_start(
         }
     }
 
-    // Validate `--log-filter` against the active item set so typos surface
+    // Validate `--log-filter` against the active process set so typos surface
     // before the runner spawns anything. The synthetic `[don]` lifecycle
     // entry is implicitly allowed everywhere — `don::output` keeps it
     // visible regardless of the allowlist — so accepting "don" here is a
@@ -1758,28 +2621,49 @@ async fn run_start(
 
     // Install signal handlers before building the runner so Ctrl+C still
     // reaches the graceful-shutdown path even during a slow startup.
-    let shutdown_rx = don::runner::install_signal_handlers()
+    let shutdown_rx = don::signals::install_signal_handlers()
         .await
         .map_err(|e| format!("Error installing signal handlers: {e}"))?;
 
-    let _ = has_foreground_tasks; // logged earlier; TUI now handles fg tasks via pause/resume
+    // Bring the UI up before the runner so a port conflict fails before
+    // anything has been spawned — the same "validate everything before
+    // starting anything" rule the config checks above follow. Held until
+    // `run_start` returns, which is what stops the server.
+    let _ui = match with_ui {
+        Some(port) => Some(start_with_ui(port, &base, profile_ref).await?),
+        None => None,
+    };
 
     if is_tty {
-        let (output_manager, log_rx) = don::output::OutputManager::new_with_tui_and_log_filters(
+        // TUI mode: nothing may write to the real stdout while the TUI owns
+        // the screen, so the writer is a null sink and the TUI follows the
+        // merged log stream — the same tap `GET /logs?follow=true` serves,
+        // subscribed before the runner starts so no startup line is missed.
+        let output_manager = don::output::OutputManager::new_verbose_with_log_filters(
             &all_configs,
             &log_keep_filters,
+            tokio::io::sink(),
             verbose,
         )
         .await
         .map_err(|e| format!("Error creating output manager: {e}"))?;
-        let verbosity = output_manager.verbosity_control();
+        let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
+        // A cursor, not a raw subscription: falling behind is repaired from the
+        // tap's own history rather than punched into the TUI's log as a hole.
+        // The remote TUI is fed the same `MergedEvent`s off the wire, so the
+        // two clients differ in transport and nothing else.
+        let mut tap = output_manager
+            .log_stream_sender()
+            .cursor(None, don::output::DEFAULT_MERGED_HISTORY_CAPACITY)
+            .await;
+        tokio::spawn(async move {
+            while let Some(event) = tap.recv().await {
+                if log_tx.send(event).is_err() {
+                    return; // TUI is gone; stop following.
+                }
+            }
+        });
         let lifecycle_emitter = output_manager.clone_lifecycle_emitter();
-
-        // Channel that lets the runner ask the TUI to release/re-take the
-        // terminal when a foreground task is about to run.
-        let (terminal_request_tx, terminal_request_rx) = tokio::sync::mpsc::channel(8);
-        let terminal_coordinator =
-            don::runner::TerminalCoordinator::with_channel(terminal_request_tx);
 
         let service_names: Vec<String> = config
             .services
@@ -1799,7 +2683,7 @@ async fn run_start(
         // per-param completion requests.
         let task_configs: std::collections::HashMap<String, don::config::Task> =
             config.tasks.clone();
-        let task_state = don::TaskState::new(base.join(".don").join("task-state"));
+        let task_state = don::TaskStateStore::new(base.join(".don").join("task-state"));
         let mut task_last_runs = std::collections::HashMap::new();
         for name in &task_names {
             if let Ok(Some(last_run)) = task_state.last_run(name).await {
@@ -1808,8 +2692,8 @@ async fn run_start(
         }
 
         // Synthetic build-tool stream names that should appear in the TUI
-        // filter. Without these entries, lines emitted by the bazel/turbo
-        // clients (which carry `name = "bazel"` / `"turbo"`) are silently
+        // filter. Without these entries, lines emitted by the bazel
+        // client (which carries `name = "bazel"`) are silently
         // dropped by the filter's allowlist — the user sees nothing during
         // the build phase.
         let build_tool_names: Vec<String> = build_tool_configs
@@ -1859,7 +2743,10 @@ async fn run_start(
             )
             .collect();
 
-        let runner = await_with_shutdown_supervision(
+        // Clone before `output_manager` moves into the runner — the daemon
+        // registration watcher reports failures at debug verbosity.
+        let daemon_emitter = output_manager.clone_lifecycle_emitter();
+        let mut runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
                 async move {
@@ -1870,7 +2757,9 @@ async fn run_start(
                         base,
                         profile.as_deref(),
                         shutdown_rx,
-                        terminal_coordinator,
+                        // A TUI is present and interactive tasks are
+                        // bridgeable, so headless overrides don't apply.
+                        false,
                     )
                     .await
                     .map_err(|e| format!("Error: {e}"))
@@ -1879,9 +2768,15 @@ async fn run_start(
             "starting runner",
         )
         .await?;
+        serve_project_api(&mut runner, &daemon_emitter);
+        spawn_daemon_registration(&runner, daemon_emitter, profile_ref, no_daemon);
 
-        let events = runner.subscribe();
-        let commands = runner.command_sender();
+        // The TUI is a client of the socket API — same surface a detached
+        // client will use. The socket is already bound (serve_project_api
+        // above), so the connection cannot race the bind.
+        // `base` moved into the runner spawn; the canonical root is on the
+        // runner anyway, and canonical is the safer of the two.
+        let tui_client = don::client::Client::new(runner.base_dir());
 
         // Wrap the TUI so that if it exits unexpectedly (e.g. a terminal IO
         // error or panic), we signal the runner to shut down instead of
@@ -1894,9 +2789,8 @@ async fn run_start(
         let tui = tokio::spawn(async move {
             let result = don::run_tui(
                 log_rx,
-                events,
-                commands,
-                verbosity,
+                tui_client,
+                don::TuiMode::InProcess,
                 lifecycle_emitter,
                 service_names,
                 task_names,
@@ -1906,7 +2800,6 @@ async fn run_start(
                 hidden_names,
                 auto_filter_on_failure_names,
                 tui_log_filter,
-                terminal_request_rx,
             )
             .await;
             if result.is_err() {
@@ -1952,7 +2845,8 @@ async fn run_start(
             output_manager.set_log_filter(allow);
         }
 
-        let runner = await_with_shutdown_supervision(
+        let daemon_emitter = output_manager.clone_lifecycle_emitter();
+        let mut runner = await_with_shutdown_supervision(
             tokio::spawn({
                 let profile = profile.clone();
                 async move {
@@ -1963,7 +2857,11 @@ async fn run_start(
                         base,
                         profile.as_deref(),
                         shutdown_rx,
-                        don::runner::TerminalCoordinator::detached(),
+                        // Headless unless the fork-model parent told us an
+                        // interactive client is attaching: with no TUI and
+                        // no attaching parent, nobody is there to drive an
+                        // interactive task, so `headless` overrides apply.
+                        !attached,
                     )
                     .await
                     .map_err(|e| format!("Error: {e}"))
@@ -1972,11 +2870,107 @@ async fn run_start(
             "starting runner",
         )
         .await?;
+        serve_project_api(&mut runner, &daemon_emitter);
+        spawn_daemon_registration(&runner, daemon_emitter, profile_ref, no_daemon);
 
         let runner_task =
             tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
         await_with_shutdown_supervision(runner_task, "waiting for runner shutdown").await
     }
+}
+
+/// Bind and serve this project's unix-socket API.
+///
+/// Done here rather than inside `Runner::run` so the runner never names the
+/// server — that edge was half of a dependency cycle. A bind failure is
+/// reported and the stack still starts: the API is how you *inspect* a
+/// running project, and losing it should not stop the project running.
+fn serve_project_api(runner: &mut don::runner::Runner, emitter: &don::LifecycleEmitter) {
+    match don::server::serve_for_runner(runner) {
+        Ok(shutdown_tx) => runner.set_api_shutdown(shutdown_tx),
+        Err(e) => emitter.lifecycle_event(&format!("api server disabled: {e}")),
+    }
+}
+
+/// Announce this project to the system-wide daemon so it shows up in the web
+/// UI, and withdraw it again on shutdown.
+///
+/// This lives in the binary, not the runner: which projects a daemon should
+/// list is a deployment policy, and the runner has no business knowing one
+/// exists. It learns the two moments that matter from the event stream —
+/// `ApiListening` (the socket a daemon would proxy to now exists) and
+/// `ShutdownStarted`.
+///
+/// Best-effort throughout. A state directory that can't be resolved (no
+/// `$HOME`, an unusual sandbox) or a daemon that isn't running costs you the
+/// UI listing and nothing else — never the ability to start a stack. Nothing
+/// here is ever awaited by the runner, so a slow or absent daemon cannot add
+/// a millisecond to startup or to Ctrl+C.
+fn spawn_daemon_registration(
+    runner: &don::runner::Runner,
+    emitter: don::output::LifecycleEmitter,
+    profile: Option<&str>,
+    no_daemon: bool,
+) {
+    if no_daemon {
+        return;
+    }
+    let Ok(paths) = don::daemon::DaemonPaths::from_process_env() else {
+        return;
+    };
+    don::daemon::registration::spawn(
+        runner.subscribe(),
+        paths.socket(),
+        // The runner's canonical root, not the path we passed in — the daemon
+        // keys projects by a hash of it. See `Runner::base_dir`.
+        runner.base_dir().to_path_buf(),
+        profile.map(str::to_string),
+        emitter,
+    );
+}
+
+/// A web UI served by `don start --with-ui`, alive for as long as this value.
+///
+/// Dropping the sender ends the server's graceful-shutdown wait, so the UI
+/// goes away with the stack it belongs to — no explicit teardown call to
+/// forget on one of `run_start`'s exit paths.
+struct WithUiGuard {
+    _shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// Start a project-local web UI on `port`.
+///
+/// Errors here are fatal rather than best-effort: unlike daemon
+/// registration, the user explicitly asked for this UI, so silently not
+/// getting one would be worse than a clear failure.
+async fn start_with_ui(
+    port: u16,
+    base: &Path,
+    profile: Option<&str>,
+) -> Result<WithUiGuard, String> {
+    let root = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    // Built as a registry row (one id-derivation to rule them all), then
+    // converted to the web layer's own type. In fork mode this runs in the
+    // runner child, so the pid really is the runner's.
+    let entry: don::web::Project =
+        don::daemon::ProjectEntry::new(root, std::process::id(), profile.map(str::to_string))
+            .into();
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let (listener, addr) = don::web::bind(addr).await.map_err(|e| {
+        format!(
+            "Error: {e}\n\
+             Another process is likely using port {port} — pass `--with-ui=PORT` to pick another."
+        )
+    })?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(don::web::serve_single(listener, entry, shutdown_rx));
+
+    println!("don web ui: http://{addr}/");
+    Ok(WithUiGuard {
+        _shutdown_tx: shutdown_tx,
+    })
 }
 
 async fn await_with_shutdown_supervision<T>(
@@ -1993,11 +2987,24 @@ where
     let poll_interval = std::time::Duration::from_millis(100);
 
     loop {
-        if don::runner::signal_count() >= 2 {
-            errln(format!("forcing exit while {phase}"));
-            handle.abort();
-            let _ = handle.await;
-            return Err(format!("forced exit while {phase}"));
+        if don::signals::signal_count() >= 2 {
+            // Escalation requested. Do NOT abort yet: the runner polls the
+            // same flag (100ms) and its force branch is what SIGKILLs child
+            // process groups — aborting the task here races that sweep and
+            // strands children as orphans, which is the one thing shutdown
+            // must never do. A healthy runner finishes the sweep well inside
+            // this window; the abort below is only for a wedged one.
+            match tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle).await {
+                Ok(result) => return map_join_result(result, phase),
+                Err(_) => {
+                    errln(format!(
+                        "runner unresponsive after force — exiting while {phase}"
+                    ));
+                    handle.abort();
+                    let _ = handle.await;
+                    return Err(format!("forced exit while {phase}"));
+                }
+            }
         }
 
         tokio::select! {
@@ -2021,10 +3028,12 @@ fn map_join_result<T>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{Cli, Commands, item_name, parse_task_args, split_run_flags, status_sort_bucket};
+    use super::{
+        Cli, Commands, parse_task_args, process_name, split_run_flags, status_sort_bucket,
+    };
     use clap::Parser;
     use don::config::{ParamKind, TaskParam};
-    use don::runner::{ItemStatus, ServiceState, TaskItemState};
+    use don::runner::{ProcessStatus, ServiceState, TaskState};
 
     fn p(name: &str) -> TaskParam {
         TaskParam {
@@ -2039,8 +3048,9 @@ mod tests {
         }
     }
 
-    fn service(name: &str, state: ServiceState) -> ItemStatus {
-        ItemStatus::Service {
+    fn service(name: &str, state: ServiceState) -> ProcessStatus {
+        ProcessStatus::Service {
+            runtime: None,
             name: name.to_string(),
             state,
             failed_dependencies: Vec::new(),
@@ -2048,8 +3058,9 @@ mod tests {
         }
     }
 
-    fn task(name: &str, state: TaskItemState) -> ItemStatus {
-        ItemStatus::Task {
+    fn task(name: &str, state: TaskState) -> ProcessStatus {
+        ProcessStatus::Task {
+            pid: None,
             name: name.to_string(),
             state,
             failed_dependencies: Vec::new(),
@@ -2090,18 +3101,18 @@ mod tests {
 
     #[test]
     fn count_tasks_pending_run_counts_only_pending_tasks() {
-        let items = vec![
+        let processes = vec![
             service("svc-ready", ServiceState::Ready),
-            task("task-pending-a", TaskItemState::PendingRun),
-            task("task-pending-b", TaskItemState::PendingRun),
-            task("task-completed", TaskItemState::Completed),
-            task("task-failed", TaskItemState::Failed),
+            task("task-pending-a", TaskState::PendingRun),
+            task("task-pending-b", TaskState::PendingRun),
+            task("task-completed", TaskState::Completed),
+            task("task-failed", TaskState::Failed),
         ];
-        assert_eq!(super::count_tasks_pending_run(&items), 2);
+        assert_eq!(super::count_tasks_pending_run(&processes), 2);
 
         let none = vec![
             service("svc-ready", ServiceState::Ready),
-            task("task-completed", TaskItemState::Completed),
+            task("task-completed", TaskState::Completed),
         ];
         assert_eq!(super::count_tasks_pending_run(&none), 0);
 
@@ -2112,13 +3123,13 @@ mod tests {
     fn status_sort_prioritizes_actionable_states() {
         struct Case {
             name: &'static str,
-            items: Vec<ItemStatus>,
+            processes: Vec<ProcessStatus>,
             want: Vec<&'static str>,
         }
 
         let cases = vec![Case {
             name: "mixed services and tasks",
-            items: vec![
+            processes: vec![
                 service("svc-ready", ServiceState::Ready),
                 service("svc-building", ServiceState::Building),
                 service("svc-running", ServiceState::Running),
@@ -2127,12 +3138,12 @@ mod tests {
                 service("svc-failed", ServiceState::Failed),
                 service("svc-dep", ServiceState::DependencyFailed),
                 service("svc-stopping", ServiceState::Stopping),
-                task("task-skipped", TaskItemState::Skipped),
-                task("task-completed", TaskItemState::Completed),
-                task("task-building", TaskItemState::Building),
-                task("task-pending-run", TaskItemState::PendingRun),
-                task("task-failed", TaskItemState::Failed),
-                task("task-dep", TaskItemState::DependencyFailed),
+                task("task-skipped", TaskState::Skipped),
+                task("task-completed", TaskState::Completed),
+                task("task-building", TaskState::Building),
+                task("task-pending-run", TaskState::PendingRun),
+                task("task-failed", TaskState::Failed),
+                task("task-dep", TaskState::DependencyFailed),
             ],
             want: vec![
                 "svc-failed",
@@ -2153,12 +3164,12 @@ mod tests {
         }];
 
         for mut case in cases {
-            case.items.sort_by(|a, b| {
+            case.processes.sort_by(|a, b| {
                 status_sort_bucket(a)
                     .cmp(&status_sort_bucket(b))
-                    .then_with(|| item_name(a).cmp(item_name(b)))
+                    .then_with(|| process_name(a).cmp(process_name(b)))
             });
-            let got: Vec<&str> = case.items.iter().map(item_name).collect();
+            let got: Vec<&str> = case.processes.iter().map(process_name).collect();
             assert_eq!(got, case.want, "case: {}", case.name);
         }
     }

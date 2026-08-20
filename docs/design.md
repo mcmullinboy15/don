@@ -4,6 +4,10 @@ Don is a dev environment orchestrator. You write a `don.toml` config that define
 
 ## Architecture
 
+> Component responsibilities — who owns what, the signals between them, and
+> the one boundary that is not yet where it belongs — are in
+> [`ownership.md`](ownership.md).
+
 Don is built as both a library (`don`) and a CLI binary. The library exposes all core functionality so other Rust tools can embed don's capabilities.
 
 At runtime, don:
@@ -181,45 +185,58 @@ log = "ignore"
 | `watch` | list of globs | File patterns — task only re-runs if these changed since last success. Empty = always runs |
 | `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
-| `terminal` | string or table | `"muxed"` (default) routes through Don output; `"foreground"` gives the task exclusive terminal ownership |
+| `interactive` | bool | `false` (default). `true` says the task waits for a human at its terminal |
+| `terminal` | string | Older spelling of `interactive`: `"foreground"` = `true`, `"muxed"` = `false` |
 | `headless` | table | Optional `cmd` and/or `args` overrides for non-TUI runs |
 
-Foreground terminal tasks are for interactive commands that need stdin and an
-unprefixed terminal, such as REPLs, editors, interactive migrations, or test
-watchers:
+Every task runs on a PTY and every task can be reached with `don attach`, so
+`interactive` changes nothing about how a task is spawned or where its output
+goes. It exists because it is the one thing Don cannot work out for itself: a
+task blocked reading stdin looks exactly like a task that has hung.
+
+Declaring it is what lets the TUI open the task's attach window when it starts
+and close it again when it succeeds — a failed one keeps its window, since its
+last screen is the reason it failed. Without a TUI there is nothing to attach,
+so Don says `waiting for input — run 'don attach <task>'` instead. Use it for
+REPLs, editors, interactive migrations, and prompting deploy scripts:
+
+`terminal = "foreground"` is accepted as the older spelling of `interactive =
+true`, and `"muxed"` as `false`. The mechanism it named — one task owning the
+terminal — is gone; the declaration it carried is not, so configs predating the
+rename keep working rather than being rejected.
 
 ```toml
 [tasks.console]
 cmd = "rails"
 args = ["console"]
-terminal = "foreground"
+interactive = true
 ```
 
-`terminal = "foreground"` enters the terminal alternate screen by default.
-Use a table to choose the main screen explicitly:
-
-```toml
-terminal = { mode = "foreground", screen = "main" }
-```
-
-During startup, a foreground task is exclusive. When it becomes ready, Don
-does not start other newly-ready services/tasks until that task exits. Already
-running dependencies continue to run, and their output is still captured in
-ring buffers and log files while visible Don output is paused. Watch-triggered
-foreground tasks may also steal the terminal during development.
-
-Foreground tasks can provide a non-interactive command variant for
+An interactive task can provide a non-interactive command variant for
 `--no-tui`, redirected-output, and detached runs. Fields omitted from
-`headless` inherit their normal values, and headless execution uses muxed
-output instead of foreground terminal ownership:
+`headless` inherit their normal values. Applying the override also clears
+`interactive`, because nothing is going to attach in that mode:
 
 ```toml
 [tasks.push]
 cmd = "scurry"
 args = ["push"]
-terminal = "foreground"
+interactive = true
 headless = { args = ["push", "--force"] }
 ```
+
+> `terminal = "muxed" | "foreground"` was the earlier spelling, back when a
+> foreground task took exclusive ownership of Don's terminal. Per-task PTYs and
+> `don attach` replaced that; the key is rejected with a message pointing here.
+
+Independently of `interactive`, the stdout writer tracks the alternate-screen
+private modes (`?1049`, `?1047`, `?47`) per process. A process holding the
+screen is emitting frames — cursor moves and clears with no line boundaries —
+so the multiplexed view would otherwise show one endless line of concatenated
+frames, and show it only once the process exited. Instead Don emits `entered
+full-screen mode — run 'don attach <name>' to see it` once and suppresses
+output until the screen is handed back. Ring buffers, file sinks and the
+server-side emulator behind `don attach` are fed upstream and lose nothing.
 
 #### Task State Tracking
 
@@ -536,14 +553,119 @@ Don stores all mutable state under `.don/` in the project directory:
 
 This directory should be added to `.gitignore`.
 
+### System-wide daemon state
+
+The `don daemon` that serves the web UI is not scoped to any project, so it is
+the one component that writes outside a `.don/` directory. Its state lives in a
+single directory resolved by `src/daemon/paths.rs` — `$DON_STATE_DIR`, else
+`$XDG_STATE_HOME/don`, else `~/.local/state/don` (`~/Library/Application
+Support/don` on macOS):
+
+| Path | Purpose |
+|------|---------|
+| `daemon.sock` | Unix socket for the daemon's control API (register/deregister/list) |
+| `daemon.pid` | Flock'd single-instance guard |
+| `registry.json` | Cached list of running projects, so a daemon restart doesn't lose sight of them |
+| `logs/daemon.log` | Daemon output when run under systemd/launchd |
+
+Nothing here belongs to a project, and the daemon never writes into one.
+
+## Web UI and the Broker Daemon
+
+The daemon is a **broker**: it holds a registry of running projects and serves a
+UI over them, reverse-proxying each project's existing `.don/don.sock`. It never
+spawns or supervises a service.
+
+```
+terminal A: don start ──runner──> services      terminal B: don start ──runner──> services
+              │ .don/don.sock                                 │ .don/don.sock
+              └──── register(name, root, sock) ───┬───────────┘
+                                                  ▼
+                                         don daemon (registry)
+                                           unix sock: control
+                                           tcp 127.0.0.1:3666: web UI ──> browser
+```
+
+That choice is what keeps the rest of don unchanged. `don start` still owns its
+process group, its `.don/`, and its terminal. Consequences worth stating:
+
+- **Registration is best-effort and never awaited on the runner task.** Most
+  users won't install a daemon, so a project that can't reach one must start and
+  stop exactly as fast. Deregistration is fired at the top of the shutdown path
+  and never awaited — per the shutdown-responsiveness rules, nothing may sit
+  between the user's Ctrl+C and the stack going down.
+- **Liveness is derived, not tracked.** There are no heartbeats. Reading the
+  registry probes each project's socket and drops the ones that don't answer, so
+  a `kill -9`'d runner cleans itself up without a background timer, and a
+  deregistration that never landed costs nothing.
+- **Stopping the daemon is harmless.** Every registered project keeps running.
+
+### Two hosts, one router
+
+The web router is built against a `ProjectDirectory` that either reads the
+daemon's registry or holds a single project (`don start --with-ui`). No handler
+knows which mode it is in, and every handler forwards through
+`crate::client::Client` to the project API — the UI holds no orchestration logic
+of its own and so cannot drift from the CLI.
+
+### Web UI access
+
+The web UI binds loopback and does not authenticate. Every other don API is a
+unix socket chmod'd to 0600, where the filesystem does the work; a TCP port has
+no equivalent, so in principle any local process can drive the UI's API. That is
+an accepted trade: anything able to run a process on this machine can already do
+everything don can, so a shared secret would add ceremony without adding a
+guarantee.
+
+One case is *not* covered by that reasoning, because the attacker has no access
+to the machine at all — a web page the user merely visits. Same-origin policy
+stops such a page reading a response from 127.0.0.1, but DNS rebinding defeats
+it: point `evil.example.com` at 127.0.0.1 and the page becomes same-origin with
+don, free to read project paths, logs, and config. A rebound request carries the
+attacker's hostname, so `src/web/origin.rs` rejects any `Host` whose name isn't
+a loopback one.
+
+Only the name is checked, not the port. A browser always sends the authority it
+connected to, so the port can't disagree in a way that signals an attack —
+while comparing it breaks every reverse proxy, which legitimately forwards a
+different one. Don's own proxy does this whenever the daemon runs behind
+`proxy = { ... }`, as it does in this repo's `don.toml`.
+
+That guard protects confidentiality, not integrity. A blind cross-origin `POST`
+that ignores the response carries the correct `Host` and still goes through, so
+a visited page can trigger an action here without seeing its result. Closing
+that would take a custom-header requirement (which forces a CORS preflight the
+server fails) — deliberately not done, on the same "it's your machine" grounds.
+
 ## Environment Variables
 
 Environment variables are resolved in this order (later wins):
 
+0. The inherited environment, plus `PWD` set to the directory the child will
+   actually run in — Don changes the child's cwd, so leaving `PWD` pointing at
+   Don's own would be a lie that shell children silently correct and everything
+   else silently believes.
 1. `.env.<service-name>` — auto-loaded if the file exists (convention)
 2. `env_file` — explicitly listed env files, loaded in order
 3. `env` — inline variables from the config
 4. Don-injected variables (`LISTEN_FDS`, `LISTEN_FDNAMES`, `DON_PUBLIC_*`, `DON_DOWNLOAD_DIR`, etc.)
+
+### `${VAR}` expansion
+
+`cmd`, `args`, `ready.tcp`/`ready.http`, and inline `env` values expand
+`${VAR}` references. Unknown names are left verbatim, so a value that merely
+resembles a reference survives rather than being silently emptied.
+
+Inline `env` values expand against everything *except* the `env` block itself —
+the inherited environment (including `PWD`), env files, and Don's injected
+variables. They deliberately cannot reference each other: config env is a map,
+map order is arbitrary, and `A = "${B}"` beside `B = "x"` would otherwise
+resolve differently from run to run.
+
+```toml
+[services.api]
+env = { DATABASE_URL = "postgres://localhost:${PORT}/app", STATE = "${PWD}/.state" }
+```
 
 An env-mode proxy keeps its configured env variable (for example `PORT`) for
 the private backend port the service binds. Its actual public listener is
@@ -891,7 +1013,6 @@ Commands:
   ports                     Show configured and actual runtime ports
   logs <name>               Tail the logs for a specific service
   run <name>                Run a specific task (bypasses auto_run)
-  run --all-pending         Run every task currently in pending_run
   exec <cmd> [args...]      Run a command with .don/bin on PATH
   attach <name>             Interactively attach stdin/stdout to a running service
   cleanup                   Kill orphaned processes, remove stale sockets/containers

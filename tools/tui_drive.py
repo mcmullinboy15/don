@@ -1,237 +1,129 @@
 #!/usr/bin/env python3
-"""Drive `don start` in TUI mode under a real PTY.
+"""Drive `don start` in TUI mode under a real PTY and check what it renders.
 
 Why this exists
 ---------------
-Don's TUI uses ratatui + crossterm and relies on a working terminal —
-in particular, an initial DSR (`\\x1b[6n`) query whose response anchors
-the inline viewport. Plain pipes / `script(1)` / `expect(1)` don't
-answer DSR, so the TUI bails on startup with "The cursor position could
-not be read within a normal duration". This driver:
+Pipe-mode integration tests cover the runner and `OutputManager`, but not
+ratatui rendering, the input task, or the interplay between them and the
+merged log stream. Several of the worst regressions in this codebase have been
+TUI-only: pipe mode fine, TUI hangs or freezes or loses lifecycle events under
+load.
 
-  - allocates a real PTY via `pty.fork()`
-  - intercepts DSR queries on the master side and answers `\\x1b[1;1R`
-  - waits for "all services running" on stdout
-  - sends SIGINT after a configurable linger
-  - watches for "shutdown complete" then a clean exit
-  - declares HANG and force-kills if the process hasn't exited within
-    8 seconds of "shutdown complete" (or 30 s after SIGINT)
-  - prints a structured summary on stderr (lifecycle event counts,
-    captured byte total, exit code) and the full ANSI stream on stdout
+This drives the real thing under a PTY, renders its output into a screen (see
+`tui_emulator.py`), and asserts on what the user would actually see:
+
+  - the stack reaches N/N services ready
+  - Ctrl+C reaches the TUI and shutdown narrates itself
+  - don exits promptly rather than wedging
+  - the alternate screen is handed back on the way out
+
+That last check matters and is easy to lose: leaving the alternate screen up
+after exit dumps the user back into a terminal whose scrollback appears to
+have vanished.
+
+Note for anyone updating this: assertions are on the *screen*, never on the
+raw byte stream. A full-screen TUI writes text split across escape sequences
+and repaints regions repeatedly, so a byte-stream grep both misses lines that
+are on screen and finds lines that scrolled off long ago.
 
 Usage
 -----
     python3 tools/tui_drive.py <path-to-don-binary> <config-dir> [linger]
 
-Example (against the synthetic stress config in this repo):
+Example, against the synthetic stress config in this repo:
 
     python3 tools/gen_stress_config.py /tmp/don-stress
     cargo build --release
+    rm -rf /tmp/don-stress/.don
     python3 tools/tui_drive.py target/release/don /tmp/don-stress 4 \\
         > /tmp/tui-stdout.bin 2> /tmp/tui-stderr.log
-    tail -15 /tmp/tui-stderr.log
+    tail -20 /tmp/tui-stderr.log
 
-The "lifecycle 'stopping' events" / "'send SIGTERM'" / "'stopped'"
-counts on stderr should equal the number of running (non-lazy) services
-when shutdown is healthy. A "HANG" line in the summary or a non-zero
-exit is the signal that something regressed.
+`captured bytes` is a useful regression signal: a jump from tens of KB to
+several MB without a config change means the TUI started repainting far more
+than it should.
 """
 
-import os
-import pty
 import re
-import select
-import signal
 import sys
 import time
 
-if len(sys.argv) < 3:
-    print(f"usage: {sys.argv[0]} <don binary> <cwd> [linger-seconds]", file=sys.stderr)
-    sys.exit(2)
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from tui_emulator import HAVE_PYTE, Session  # noqa: E402
 
-# Resolve the binary path before fork — `os.chdir(CWD)` happens in the
-# child, so a relative `target/release/don` would otherwise resolve
-# inside the test config dir and fail.
-DON = os.path.realpath(sys.argv[1])
-CWD = sys.argv[2]
-LINGER = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
-if not os.access(DON, os.X_OK):
-    print(f"binary not found or not executable: {DON}", file=sys.stderr)
-    sys.exit(2)
+# The status bar counts ready services — "11/11 services ready". The
+# backreference is what makes this an assertion rather than a formality: it
+# only matches once every service the bar counts has come up, and requiring a
+# non-zero count keeps an empty "0/0" from matching before the config loads.
+#
+# Deliberately not the runner's "all services running" lifecycle line, which
+# this used to look for. That line is still emitted, but it lands in the log
+# pane and scrolls away under any real load — the check passed or failed
+# depending on how chatty the config was. The bar stays put.
+READY = re.compile(r"\b([1-9]\d*)/\1 services ready\b")
+SHUTTING_DOWN = "shutting down"
+STARTUP_TIMEOUT = 90.0
+SHUTDOWN_TIMEOUT = 30.0
 
-ANSI = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07")
-DSR = re.compile(rb"\x1b\[6n")
-READY_NEEDLE = b"all services running"
-SHUTDOWN_NEEDLE = b"shutdown complete"
 
-start = time.monotonic()
-def tlog(msg):
-    sys.stderr.write(f"[{int((time.monotonic() - start) * 1000)}ms] {msg}\n")
-    sys.stderr.flush()
+def tlog(start, message):
+    print("[%6.0fms] %s" % ((time.time() - start) * 1000, message), file=sys.stderr)
 
-# Set up the PTY ourselves so we can read AND write to the master.
-pid, fd = pty.fork()
-if pid == 0:
-    # Child: exec don.
-    os.chdir(CWD)
-    os.environ["TERM"] = "xterm-256color"
-    os.environ.setdefault("COLUMNS", "200")
-    os.environ.setdefault("LINES", "60")
-    os.execvp(DON, [DON, "start"])
-    os._exit(127)
 
-tlog(f"spawned don pid={pid}")
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    binary, project = sys.argv[1], sys.argv[2]
+    linger = float(sys.argv[3]) if len(sys.argv) > 3 else 4.0
 
-# Set master pty non-blocking.
-import fcntl
-flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    start = time.time()
+    session = Session(binary, project)
+    tlog(start, "spawned don pid=%d (pyte: %s)" % (session.pid, HAVE_PYTE))
 
-# Try to set window size.
-try:
-    import termios, struct
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 200, 0, 0))
-except Exception as e:
-    tlog(f"ioctl TIOCSWINSZ failed: {e}")
+    reached_ready = session.wait_for_screen(READY, STARTUP_TIMEOUT)
+    tlog(start, "reached %r on screen: %s" % (READY.pattern, reached_ready))
+    if not reached_ready:
+        tlog(start, "FAIL: startup never settled; last screen follows")
+        print(session.text(), file=sys.stderr)
 
-captured = bytearray()
-saw_ready = False
-saw_shutdown = False
-shutdown_seen_at = None
-sigint_sent = False
-sigint_at = None
-exit_code = None
-deadline = time.monotonic() + 90  # absolute cap
+    entered_alt = session.screen.alt
+    tlog(start, "alternate screen entered: %s" % entered_alt)
 
-while True:
-    try:
-        rlist, _, _ = select.select([fd], [], [], 0.05)
-    except (OSError, select.error):
-        break
+    session.pump(linger)
+    session.settle()
+    bytes_at_steady = len(session.raw)
+    tlog(start, "captured %d bytes by steady state" % bytes_at_steady)
 
-    if rlist:
-        try:
-            data = os.read(fd, 8192)
-        except OSError as e:
-            # Errno 5 (EIO) on Linux means the slave side has closed —
-            # this is the normal way a pty signals child exit on this
-            # platform. Don't treat it as a failure; let the next
-            # waitpid() pick up the actual exit status.
-            if getattr(e, 'errno', None) == 5:
-                tlog("EOF on master (slave closed)")
-            else:
-                tlog(f"read error: {e}")
-            break
-        if not data:
-            tlog("EOF on master")
-            break
-        captured.extend(data)
-        sys.stdout.buffer.write(data)
-        sys.stdout.buffer.flush()
+    # A quiet period should cost almost nothing: the loop marks state dirty and
+    # draws at most once a frame, and an unchanged screen diffs to nothing.
+    session.pump(2.0)
+    idle_bytes = len(session.raw) - bytes_at_steady
+    tlog(start, "bytes written during 2s idle: %d" % idle_bytes)
 
-        # Answer DSR queries.
-        for _ in DSR.finditer(data):
-            try:
-                os.write(fd, b"\x1b[1;1R")
-            except OSError:
-                pass
+    session.interrupt()
+    tlog(start, "sent Ctrl+C")
+    saw_shutdown = session.wait_for_screen(SHUTTING_DOWN, 10.0)
+    tlog(start, "saw %r on screen: %s" % (SHUTTING_DOWN, saw_shutdown))
 
-        plain = ANSI.sub(b"", bytes(captured))
-        if not saw_ready and READY_NEEDLE in plain:
-            saw_ready = True
-            tlog(f"saw '{READY_NEEDLE.decode()}'")
-        if not saw_shutdown and SHUTDOWN_NEEDLE in plain:
-            saw_shutdown = True
-            shutdown_seen_at = time.monotonic()
-            tlog(f"saw '{SHUTDOWN_NEEDLE.decode()}'")
+    code = session.wait_exit(SHUTDOWN_TIMEOUT)
+    if code is None:
+        tlog(start, "HANG: don still alive %.0fs after Ctrl+C" % SHUTDOWN_TIMEOUT)
+        print(session.text(), file=sys.stderr)
+        session.kill()
+    else:
+        tlog(start, "don exit code: %d" % code)
 
-    # After ready + linger, send SIGINT.
-    if saw_ready and not sigint_sent:
-        if time.monotonic() - start >= LINGER:
-            tlog(f"sending SIGINT to {pid}")
-            os.kill(pid, signal.SIGINT)
-            sigint_sent = True
-            sigint_at = time.monotonic()
+    left_alt = not session.screen.alt
+    tlog(start, "alternate screen handed back: %s" % left_alt)
+    tlog(start, "captured bytes total: %d" % len(session.raw))
 
-    # Hang detection: if we saw 'shutdown complete' but the process is still
-    # alive 8s later, force-kill and report.
-    if shutdown_seen_at is not None and time.monotonic() - shutdown_seen_at > 8:
-        tlog("HANG: 'shutdown complete' fired but don is still alive 8s later")
-        os.kill(pid, signal.SIGKILL)
+    sys.stdout.buffer.write(bytes(session.raw))
 
-    # Reap.
-    try:
-        wpid, status = os.waitpid(pid, os.WNOHANG)
-    except ChildProcessError:
-        wpid, status = pid, 0
-    if wpid:
-        if os.WIFEXITED(status):
-            exit_code = os.WEXITSTATUS(status)
-            tlog(f"don exited normally code={exit_code}")
-        elif os.WIFSIGNALED(status):
-            exit_code = -os.WTERMSIG(status)
-            tlog(f"don killed by signal {os.WTERMSIG(status)}")
-        break
+    ok = reached_ready and entered_alt and saw_shutdown and left_alt and code == 0
+    tlog(start, "RESULT: %s" % ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
 
-    if time.monotonic() > deadline:
-        tlog("driver deadline; killing don")
-        os.kill(pid, signal.SIGKILL)
 
-    # If we sent SIGINT and the process is still running 30s later, kill.
-    if sigint_at is not None and time.monotonic() - sigint_at > 30:
-        tlog("30s after SIGINT — process still alive, sending SIGKILL")
-        os.kill(pid, signal.SIGKILL)
-
-# Drain any remaining output (process is dead but pty may have buffered bytes).
-end_drain = time.monotonic() + 0.5
-while time.monotonic() < end_drain:
-    try:
-        rlist, _, _ = select.select([fd], [], [], 0.05)
-    except (OSError, select.error):
-        break
-    if not rlist:
-        break
-    try:
-        data = os.read(fd, 8192)
-    except OSError:
-        break
-    if not data:
-        break
-    captured.extend(data)
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
-
-# If we broke out of the read loop on EIO without yet reaping the child,
-# do a final waitpid (with a short bounded grace) so the summary reports
-# a real exit code instead of None.
-if exit_code is None:
-    grace_deadline = time.monotonic() + 2.0
-    while time.monotonic() < grace_deadline:
-        try:
-            wpid, status = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            break
-        if wpid:
-            if os.WIFEXITED(status):
-                exit_code = os.WEXITSTATUS(status)
-            elif os.WIFSIGNALED(status):
-                exit_code = -os.WTERMSIG(status)
-            break
-        time.sleep(0.05)
-
-plain = ANSI.sub(b"", bytes(captured))
-text = plain.decode("utf-8", errors="replace")
-
-tlog("=== driver summary ===")
-tlog(f"don exit code: {exit_code}")
-tlog(f"saw ready:     {saw_ready}")
-tlog(f"saw shutdown:  {saw_shutdown}")
-tlog(f"lifecycle 'stopping' events: {text.count(': stopping')}")
-tlog(f"lifecycle 'send SIGTERM'   : {text.count('send SIGTERM to pgid')}")
-tlog(f"lifecycle 'stopped'        : {text.count(': stopped')}")
-tlog(f"captured bytes: {len(captured)}")
-
-# Persist plain output.
-with open(os.path.join(CWD, ".don-tui-driver.plain.log"), "wb") as f:
-    f.write(plain)
-sys.exit(0 if exit_code == 0 else (1 if exit_code is not None else 2))
+if __name__ == "__main__":
+    sys.exit(main())

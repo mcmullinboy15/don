@@ -3,7 +3,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, TerminalCoordinator};
+use don::runner::Runner;
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -56,17 +56,22 @@ async fn spawn_runner(
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     let socket_path = base_dir.join(".don").join("don.sock");
     let handle = tokio::spawn(async move {
         if let Err(err) = runner.run().await {
@@ -243,12 +248,15 @@ fn integration_attach_send_input_and_receive_output() {
     });
 }
 
+/// Attach is multi-client (tmux-style shared input): a second client gets
+/// its own session, both see the process's output, and input from either
+/// interleaves at the PTY without shearing.
 #[test]
-fn integration_second_attach_rejected_with_pid() {
+fn integration_second_attach_shares_input_and_output() {
     run_with_timeout(Duration::from_secs(15), async {
-        let dir = TempDir::new("attach-lock");
+        let dir = TempDir::new("attach-multi");
         let toml = ConfigBuilder::new()
-            .add_custom_service("keeper", "sleep", &["60"])
+            .add_custom_service("echoer", "cat", &[])
             .log("ignore")
             .ready_exec("true", &[])
             .done()
@@ -258,23 +266,38 @@ fn integration_second_attach_rejected_with_pid() {
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // First attach should succeed (101).
-        let (_stream1, _) = raw_attach(&socket, "keeper", 11111).await;
+        let (mut stream1, _) = raw_attach(&socket, "echoer", 11111).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (mut stream2, _) = raw_attach(&socket, "echoer", 22222).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Second attach should be rejected (409 Conflict).
-        let (status, body) = raw_attach_error(&socket, "keeper", 22222).await;
-        assert_eq!(status, 409, "expected 409 Conflict, got {status}");
+        // Input from the second client reaches the process, and BOTH
+        // clients see the echoed output.
+        stream2.write_all(b"from-two\n").await.unwrap();
+        let out1 = collect_bytes(&mut stream1, Duration::from_secs(2)).await;
+        let out2 = collect_bytes(&mut stream2, Duration::from_secs(2)).await;
+        let text1 = String::from_utf8_lossy(&out1);
+        let text2 = String::from_utf8_lossy(&out2);
         assert!(
-            body.contains("11111"),
-            "error should mention first PID; got: {body}"
+            text1.contains("from-two"),
+            "first client should see the echo; got: {text1:?}"
         );
         assert!(
-            body.contains("attached"),
-            "error should mention 'attached'; got: {body}"
+            text2.contains("from-two"),
+            "second client should see the echo; got: {text2:?}"
         );
 
-        drop(_stream1);
+        // Input from the first client still works with two attached.
+        stream1.write_all(b"from-one\n").await.unwrap();
+        let out2 = collect_bytes(&mut stream2, Duration::from_secs(2)).await;
+        let text2 = String::from_utf8_lossy(&out2);
+        assert!(
+            text2.contains("from-one"),
+            "second client should see the first's input echoed; got: {text2:?}"
+        );
+
+        drop(stream1);
+        drop(stream2);
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
     });

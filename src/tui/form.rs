@@ -27,8 +27,8 @@
 
 use std::collections::HashMap;
 
+use crate::client::CompletionError;
 use crate::config::{ParamKind, Task, TaskParam};
-use crate::runner::CompletionError;
 
 use super::fuzzy::fuzzy_match;
 
@@ -408,12 +408,11 @@ mod tests {
             ignore: vec![],
             timeout: None,
             log: LogConfig::Stdout,
-            terminal: crate::config::TaskTerminal::default(),
+            interactive: false,
             headless: None,
             auto_run: crate::config::TaskAutoRun::Always,
             download: None,
             bazel: None,
-            turbo: None,
             params,
             hidden: false,
             auto_filter_on_failure: None,

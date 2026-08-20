@@ -5,14 +5,14 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, RunnerCommand, RunnerEvent, ServiceState, TerminalCoordinator};
+use don::runner::{Runner, RunnerEvent, ServiceState};
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
@@ -111,17 +111,21 @@ async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     configure(&output_manager);
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
 
     let handle = tokio::spawn(async move {
         let _ = runner.run().await;
@@ -156,70 +160,26 @@ async fn make_runner(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     (runner, shutdown_tx, buf)
 }
 
 // --- Tests ---
-
-/// Foreground tasks pause the global stdout/TUI sink while they own the
-/// terminal. If shutdown begins before the pause is released — e.g. the
-/// task's run_worker is aborted before `TaskRunPrepared` arrives, or the
-/// foreground task gets SIGKILL'd at the end of shutdown and its
-/// `TaskExited` lands after the main loop has broken out — every lifecycle
-/// event we emit during shutdown is silently dropped. `initiate_shutdown`
-/// must force-clear the pause so the user actually sees what's happening.
-#[test]
-fn shutdown_clears_leaked_visible_output_pause() {
-    run_with_timeout(Duration::from_secs(15), async {
-        let dir = TempDir::new("shutdown-clear-pause");
-        let toml = ConfigBuilder::new()
-            .add_custom_service("api", "sleep", &["60"])
-            .log("ignore")
-            .ready_exec("true", &[])
-            .done()
-            .build();
-
-        // Engage the pause before the runner takes ownership of the
-        // OutputManager — same end state as a foreground task that grabbed
-        // the terminal and never got to release it.
-        let (shutdown_tx, handle, buf) = spawn_runner_with(&toml, dir.path(), |om| {
-            om.pause_visible_output();
-        })
-        .await;
-
-        // Can't wait for "all services running" through the buffer — it's
-        // currently muted. Sleep long enough for the service to boot.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let _ = shutdown_tx.send(()).await;
-        handle.await.unwrap();
-
-        let output = read_buf(&buf);
-        assert!(
-            output.contains("shutting down gracefully"),
-            "shutdown banner should be visible after pause is cleared. output: {output:?}"
-        );
-        assert!(
-            output.contains("api: send SIGTERM to pgid"),
-            "per-service signal lifecycle event should be visible. output: {output:?}"
-        );
-        assert!(
-            output.contains("shutdown complete"),
-            "shutdown complete should be visible. output: {output:?}"
-        );
-    });
-}
 
 /// Lifecycle events ("send SIGTERM…", "stopping…") share the stdout sink
 /// with regular service output. If a noisy service spams during shutdown
@@ -455,9 +415,13 @@ fn shutdown_kills_running_task() {
         handle.await.unwrap();
 
         let output = read_buf(&buf);
+        // The task's own supervisor signals it and says so. There is no
+        // aggregate "killing N tasks" line any more — that was the runner
+        // speaking on everyone's behalf, which is exactly what teardown
+        // stopped doing.
         assert!(
-            output.contains("killing") && output.contains("task"),
-            "expected task kill message. output: {output}"
+            output.contains("slow: send SIGKILL to task pgid"),
+            "expected the task's supervisor to signal its own run. output: {output}"
         );
         assert!(output.contains("shutdown complete"), "output: {output}");
     });
@@ -554,20 +518,19 @@ fn shutdown_interrupts_manual_stop_worker() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
 
         assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "stubborn".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        // Detached: this stop is deliberately slow, and the point of the test
+        // is what a shutdown does while it is still in flight.
+        let stop = tokio::spawn({
+            let control = control.clone();
+            async move { control.stop("stubborn").await }
+        });
 
         assert!(wait_for_output(&buf, "stopping... (requested)", Duration::from_secs(2)).await);
 
@@ -575,7 +538,7 @@ fn shutdown_interrupts_manual_stop_worker() {
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
         let elapsed = start.elapsed();
-        let _ = reply_rx.await;
+        let _ = stop.await;
 
         let output = read_buf(&buf);
         assert!(output.contains("shutdown complete"), "output: {output}");
@@ -603,20 +566,19 @@ fn shutdown_interrupts_manual_restart_worker() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
 
         assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "stubborn".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        // Detached: this restart's stop half is deliberately slow, and the
+        // test is about what shutdown does while it is still in flight.
+        let restart = tokio::spawn({
+            let control = control.clone();
+            async move { control.restart("stubborn").await }
+        });
 
         assert!(
             wait_for_output(
@@ -631,7 +593,7 @@ fn shutdown_interrupts_manual_restart_worker() {
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
         let elapsed = start.elapsed();
-        let _ = reply_rx.await;
+        let _ = restart.await;
 
         let output = read_buf(&buf);
         assert!(output.contains("shutdown complete"), "output: {output}");
@@ -658,20 +620,21 @@ fn shutdown_interrupts_manual_start_worker() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
 
         assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
 
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Start {
-                name: "lazy-builder".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
+        // Detached: the reply only lands once the start has settled, and this
+        // test is waiting for the build it kicks off.
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.start("lazy-builder").await;
+            }
+        });
 
         assert!(
             wait_for_output(
@@ -718,7 +681,7 @@ fn shutdown_interrupts_rebuild_worker() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             let _ = runner.run().await;
         });
@@ -727,11 +690,15 @@ fn shutdown_interrupts_rebuild_worker() {
 
         std::fs::write(dir.path().join("slow-build"), "1").unwrap();
 
-        cmd_tx
-            .send(RunnerCommand::Rebuild {
-                name: "builder".to_string(),
-            })
-            .unwrap();
+        // A rebuild by name — the same cycle a watched file starts, minus
+        // waiting for the debounce. Detached: the reply lands when the build
+        // is accepted, and this test is watching what the build then does.
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.hard_restart("builder").await;
+            }
+        });
 
         assert!(
             wait_for_output(

@@ -8,7 +8,7 @@ mod helpers;
 use don::client::Client;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, TerminalCoordinator};
+use don::runner::Runner;
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -44,17 +44,22 @@ async fn spawn_runner(toml: &str, base_dir: &Path) -> (PathBuf, mpsc::Sender<()>
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     let socket_path = base_dir.join(".don").join("don.sock");
     let handle = tokio::spawn(async move {
         let _ = runner.run().await;
@@ -99,6 +104,28 @@ fn run_cli(config_path: &Path, extra: &[&str]) -> (i32, String, String) {
 }
 
 // --- tests ---
+
+#[test]
+fn cli_tui_without_runner_errors_actionably() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("cli-tui-no-runner");
+        let toml = keeper_config();
+        let config_path = dir.path().join("don.toml");
+        std::fs::write(&config_path, &toml).unwrap();
+
+        // No runner: the error must point at `don start` (or, headless, at
+        // the terminal requirement) *before* the terminal is touched.
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&config_path, &["tui"]))
+                .await
+                .unwrap();
+        assert_ne!(code, 0, "attaching with no runner must fail");
+        assert!(
+            stderr.contains("don start") || stderr.contains("needs a terminal"),
+            "error should be actionable; got: {stderr}"
+        );
+    });
+}
 
 #[test]
 fn cli_status_against_running_daemon() {
@@ -153,11 +180,11 @@ fn cli_status_json_against_running_daemon() {
         // The keeper service has a passing ready check, so the stack is ready.
         assert_eq!(parsed["ready"], serde_json::json!(true), "stdout: {stdout}");
 
-        let items = parsed["items"].as_array().expect("items array");
-        let keeper = items
+        let processes = parsed["processes"].as_array().expect("processes array");
+        let keeper = processes
             .iter()
             .find(|i| i["name"] == serde_json::json!("keeper"))
-            .expect("keeper item present");
+            .expect("keeper process present");
         assert_eq!(keeper["kind"], serde_json::json!("service"));
         assert_eq!(keeper["state"], serde_json::json!("ready"));
 
@@ -292,9 +319,12 @@ fn cli_stop_and_restart_flow() {
         // status should show stopped
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = Client::new(dir.path());
-        let items = client.status(false, None).await.unwrap();
-        let joined = format!("{items:?}");
-        assert!(joined.to_lowercase().contains("stopped"), "items: {joined}");
+        let statuses = client.status(false, None).await.unwrap();
+        let joined = format!("{statuses:?}");
+        assert!(
+            joined.to_lowercase().contains("stopped"),
+            "statuses: {joined}"
+        );
 
         // restart keeper
         let cp = config_path.clone();

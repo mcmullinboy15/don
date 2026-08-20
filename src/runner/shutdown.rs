@@ -1,508 +1,246 @@
-use super::graph::topological_sort;
-use super::service::ServiceHandle;
-use super::signals::force_shutdown_requested;
-use super::task_worker::TaskRunPrepared;
-use super::{Runner, RunnerInternalCommand, ServiceState, ServiceStopAction};
-use crate::runner::service::stop_service;
-use std::collections::{BTreeMap, HashMap};
-use tokio::task::JoinSet;
+//! Teardown, from the root's side.
+//!
+//! There is no stop order here. Every supervisor sees the same shutdown signal
+//! and each waits for *its own* dependents to be holding nothing before ending
+//! what it holds, so reverse-dependency order emerges from the graph rather
+//! than being walked by anyone. See [`crate::process::await_dependents_gone`].
+//!
+//! What the root still owns is the part no single process can answer — is the
+//! whole stack down? — plus the lifetimes it created: the build manager, the
+//! update checker, the supervisor tasks themselves.
+
+use super::Runner;
+use crate::signals::force_shutdown_requested;
 
 impl Runner {
     /// Initiate graceful shutdown of all services.
     pub(in crate::runner) async fn initiate_shutdown(&mut self) {
+        // No gate revocation is needed: every supervisor watches the same
+        // shutdown flag this sets, and refuses to self-start once it is set.
+
         if self.shutting_down {
             return;
         }
         self.shutting_down = true;
-        // A foreground task pauses the stdout/TUI sink while it owns the
-        // terminal, and normally releases it from `handle_task_exit` /
-        // `handle_task_done`. During shutdown those completion paths can be
-        // skipped — the run_worker may be aborted before it sends
-        // `TaskRunPrepared`, or the foreground task gets SIGKILL'd at the
-        // end of this function and its `TaskExited` arrives after the main
-        // loop has already broken out. If we leave the pause engaged, every
-        // lifecycle event we emit below ("send SIGTERM…", "stopping…",
-        // "shutdown complete") and every service's own shutdown output is
-        // silently dropped by `stdout_sink_task`. Force-clear it up front so
-        // the user actually sees what shutdown is doing.
-        self.output_manager.resume_visible_output();
+
+        // Read *before* raising the flag. Tearing down is itself work, so a
+        // supervisor marks itself busy the moment it starts — asking afterwards
+        // would report every process as "cancelled by shutdown".
+        let interrupted: Vec<String> = self
+            .service_starts
+            .registry()
+            .busy_names()
+            .chain(self.task_supervisors.registry().busy_names())
+            .map(str::to_string)
+            .collect();
+
         let _ = self.event_tx.send(super::RunnerEvent::ShutdownStarted);
         let _ = self.shutdown_flag_tx.send(true);
         self.output_manager
             .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");
 
-        // Abort the detached batch-build task and await its termination so
-        // it can't keep any `LifecycleEmitter`/`SinkHandle` clones alive
-        // past shutdown. The `Child` inside has `kill_on_drop(true)`, so
-        // dropping the aborted future SIGKILLs the bazel/turbo client;
-        // awaiting the JoinHandle guarantees the drop has actually run
-        // before we continue. A 5s timeout guards against the pathological
-        // case where the inner reader tasks don't drop promptly — we'd
-        // rather continue shutdown than wedge on a stuck bazel pipe.
-        if let Some(guard) = self.batch_build_handle.take()
-            && let Some(handle) = guard.into_inner()
+        // `ShutdownStarted` above is what withdraws this project from the
+        // daemon — the binary subscribes and does it, detached. Deliberately
+        // broadcast before any of the slow teardown below: the user is
+        // waiting on Ctrl+C, and stopping services takes long enough that the
+        // withdrawal normally lands well before we exit.
+
+        // End the build manager. It aborts every in-flight batch — the first
+        // build as much as a rebuild or a re-query — and awaits them, so no
+        // `LifecycleEmitter`/`SinkHandle` clone outlives shutdown and no new
+        // batch can spawn mid-teardown. The `Child` inside has
+        // `kill_on_drop(true)`, so dropping the aborted future SIGKILLs the
+        // bazel client; the bounded joins inside guarantee the drop has run
+        // before this returns.
+        let (batcher_done_tx, batcher_done_rx) = tokio::sync::oneshot::channel();
+        if self
+            .batcher_tx
+            .send(super::build_batcher::BatchRequest::Shutdown {
+                done: batcher_done_tx,
+            })
+            .is_ok()
         {
-            handle.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(11), batcher_done_rx).await;
         }
-        if let Some(guard) = self.rebuild_batch_handle.take()
-            && let Some(handle) = guard.into_inner()
-        {
-            handle.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        }
-        if let Some(guard) = self.graph_requery_handle.take()
-            && let Some(handle) = guard.into_inner()
-        {
-            handle.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        if let Some(handle) = self.batcher_handle.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
         if let Some(handle) = self.update_check_handle.take() {
             handle.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
 
-        let mut service_worker_handles = Vec::new();
-        for (name, rs) in &mut self.services {
-            if let Some(worker) = rs.start_worker.take() {
-                self.output_manager
-                    .service_event(name, "start cancelled by shutdown");
-                worker.abort();
-                service_worker_handles.push(worker);
-            }
-            if let Some(worker) = rs.rebuild_worker.take() {
-                self.output_manager
-                    .service_event(name, "rebuild cancelled by shutdown");
-                worker.abort();
-                service_worker_handles.push(worker);
-            }
+        // Whatever was mid-flight when the signal landed. Its supervisor will
+        // abandon it; this only says so.
+        for name in interrupted {
+            self.output_manager
+                .service_event(&name, "cancelled by shutdown");
         }
-        for worker in service_worker_handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-        }
-
-        let mut task_worker_handles = Vec::new();
-        for (name, rt) in &mut self.tasks {
-            if let Some(waiter) = rt.run_waiter.take() {
-                waiter.complete(Err(super::CommandError::Failed {
-                    name: name.clone(),
-                    message: "run cancelled by shutdown".to_string(),
-                }));
-            }
-            if let Some(worker) = rt.run_worker.take() {
-                self.output_manager
-                    .service_event(name, "run cancelled by shutdown");
-                worker.abort();
-                task_worker_handles.push(worker);
-            }
-        }
-        for worker in task_worker_handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-        }
-
-        // Same treatment for any in-flight JIT lazy builds. These are
-        // spawned when a lazy service's proxy gets its first connection
-        // and, until this was tracked, would keep streaming bazel/turbo
-        // output long past "shutdown complete".
-        let lazy_handles: Vec<tokio::task::JoinHandle<()>> = self
-            .lazy_build_handles
-            .drain()
-            .filter_map(|(_, (_, guard))| guard.into_inner())
-            .collect();
-        for h in &lazy_handles {
-            h.abort();
-        }
-        for h in lazy_handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
-        }
+        // Neither supervisor set may be ended here: both own processes, and
+        // both are in the middle of ending them. They are aborted at the
+        // teardown tail, once every one of them reports holding nothing —
+        // aborting earlier would drop held handles (`kill_on_drop`) before the
+        // graceful path decided anything.
 
         self.drain_late_worker_results().await;
 
-        // Shut down all proxy listeners first (stop accepting new connections).
-        for rs in self.services.values_mut() {
-            if let Some(proxy) = rs.proxy.take() {
-                proxy.shutdown();
-            }
+        // The API server is NOT told to stop here, deliberately. Streaming
+        // responses (log/event followers) end on that signal, and firing it
+        // before the wave below would cut every attached client off from the
+        // entire teardown narration — the stopping/stopped lines they are
+        // watching for. The flip happens at the end of teardown, after the
+        // output flush, in `run`'s tail; serving reads during teardown is
+        // harmless (commands land in a queue nobody reads and their reply
+        // channels drop, which clients already handle).
+
+        // Nothing is sequenced from here. Every supervisor saw the same
+        // shutdown signal, and each waits for its own dependents to be holding
+        // nothing before ending what it holds — so the reverse-dependency
+        // order emerges rather than being walked. See
+        // `crate::process::await_dependents_gone`.
+        //
+        // What is left for the root is the one question no single process can
+        // answer: is the whole stack down? It watches the merge for that, and
+        // narrates the countdown from it.
+        let total_live = self
+            .facts_snapshot()
+            .iter()
+            .filter(|(_, facts)| !facts.holds_nothing())
+            .count();
+        if total_live > 0 {
+            self.output_manager
+                .lifecycle_event(&format!("stopping {total_live} process(es)"));
         }
 
-        // Tell the API server to stop accepting connections.
-        if let Some(tx) = self.server_shutdown_tx.take() {
-            let _ = tx.send(true);
-        }
-
-        // Build reverse dependency order for shutdown.
-        // Services at the same depth (no dependency relationship) stop concurrently.
-        let dep_map = self.build_dep_name_map();
-        let order = match topological_sort(&dep_map) {
-            Ok(o) => o,
-            Err(cycle) => {
-                self.output_manager.error_event(&format!(
-                    "shutdown: dependency graph has a cycle ({cycle:?}) — \
-                     stopping live services in arbitrary order"
-                ));
-                self.services.keys().cloned().collect()
-            }
-        };
-
-        // Compute depth of each service node for grouping.
-        let mut depths: HashMap<String, usize> = HashMap::new();
-        for name in &order {
-            let node_deps = dep_map.get(name).cloned().unwrap_or_default();
-            let max_dep_depth = node_deps
-                .iter()
-                .filter_map(|d| depths.get(d))
-                .max()
-                .copied()
-                .unwrap_or(0);
-            let depth = if node_deps.is_empty() {
-                0
-            } else {
-                max_dep_depth + 1
-            };
-            depths.insert(name.clone(), depth);
-        }
-
-        // Group live services by depth, then iterate from highest depth
-        // (most dependent) to lowest (least dependent). A service handle is
-        // the source of truth here: states like Unhealthy still have a live
-        // process and must be signalled during shutdown.
-        let mut by_depth: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        for name in &order {
-            let Some(service) = self.services.get(name) else {
-                continue;
-            };
-            if service.handle.is_none() {
-                continue;
-            }
-            let depth = depths.get(name).copied().unwrap_or(0);
-            by_depth.entry(depth).or_default().push(name.clone());
-        }
-
-        let mut remaining: usize = by_depth.values().map(|v| v.len()).sum();
-
-        // Stop from highest depth to lowest (dependents first).
-        for (_depth, names) in by_depth.into_iter().rev() {
-            for name in &names {
-                self.set_service_state(name, ServiceState::Stopping);
-                self.output_manager
-                    .service_event(name, &format!("stopping... ({remaining} remaining)"));
-            }
-
-            // Track PGIDs of services being stopped so we can SIGKILL
-            // them if a second Ctrl+C arrives during graceful shutdown.
-            let mut stopping_pgids: HashMap<String, i32> = HashMap::new();
-            let mut join_set: JoinSet<String> = JoinSet::new();
-            for name in &names {
-                if let Some(handle) = self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
-                    if let ServiceHandle::Process(ref proc) = handle {
-                        stopping_pgids.insert(name.clone(), proc.pgid());
+        let mut force_rx = crate::signals::force_watch();
+        let mut announced_force = false;
+        let mut remaining = total_live;
+        // A backstop, not the mechanism: every grace period is bounded and a
+        // second Ctrl+C collapses them all, so this only catches a supervisor
+        // that has genuinely wedged.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while remaining > 0 {
+            tokio::select! {
+                Some((name, facts)) = self.facts.recv() => {
+                    let previous = self.facts_snapshot().get(&name).map(|f| f.phase);
+                    if self.facts.apply(name.clone(), facts) {
+                        self.absorb_facts(&name, previous);
                     }
-                    let shutdown_config = self.effective_shutdown_config(name);
-                    let force = force_shutdown_requested();
-                    let name_owned = name.clone();
-                    let debug = super::service::StopDebug::new(
-                        name.clone(),
-                        self.output_manager.clone_lifecycle_emitter(),
-                    );
-                    join_set.spawn(async move {
-                        let _ =
-                            stop_service(handle, Some(&shutdown_config), force, true, Some(debug))
-                                .await;
-                        name_owned
-                    });
-                }
-            }
-
-            // Wait for graceful stops, but if a second Ctrl+C arrives,
-            // SIGKILL all processes being stopped and abort the futures.
-            loop {
-                if force_shutdown_requested() && !join_set.is_empty() {
-                    self.output_manager
-                        .lifecycle_event("forcing immediate shutdown");
-                    // SIGKILL all processes that are still being stopped.
-                    let names: Vec<String> = stopping_pgids
+                    let now = self
+                        .facts_snapshot()
                         .iter()
-                        .map(|(name, pgid)| {
-                            self.output_manager.service_event(
-                                name,
-                                &format!("send SIGKILL to pgid {pgid} (force shutdown)"),
-                            );
-                            let _ = nix::sys::signal::killpg(
-                                nix::unistd::Pid::from_raw(*pgid),
-                                nix::sys::signal::Signal::SIGKILL,
-                            );
-                            name.clone()
-                        })
-                        .collect();
-                    for name in names {
-                        if let Some(rs) = self.services.get_mut(&name) {
-                            rs.pgid = None;
-                        }
-                        self.set_service_state(&name, ServiceState::Stopped);
+                        .filter(|(_, facts)| !facts.holds_nothing())
+                        .count();
+                    if now < remaining {
+                        remaining = now;
+                        self.output_manager
+                            .lifecycle_event(&format!("stopped ({remaining} remaining)"));
                     }
-                    join_set.abort_all();
-                    while join_set.join_next().await.is_some() {}
-                    remaining = 0;
+                }
+                _ = force_rx.changed(), if !announced_force => {
+                    if *force_rx.borrow() {
+                        announced_force = true;
+                        self.output_manager
+                            .lifecycle_event("forcing immediate shutdown");
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    self.output_manager.error_event(
+                        "shutdown: gave up waiting for processes to stop",
+                    );
                     break;
                 }
-
-                // Poll for the next completed stop, with a short sleep so
-                // we can re-check the force flag promptly.
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    join_set.join_next(),
-                )
-                .await
-                {
-                    Ok(Some(Ok(name))) => {
-                        stopping_pgids.remove(&name);
-                        if let Some(rs) = self.services.get_mut(&name) {
-                            rs.pgid = None;
-                        }
-                        self.set_service_state(&name, ServiceState::Stopped);
-                        self.drain_service_output(&name).await;
-                        remaining -= 1;
-                        self.output_manager
-                            .service_event(&name, &format!("stopped ({remaining} remaining)"));
-                    }
-                    Ok(Some(Err(_))) => {
-                        remaining = remaining.saturating_sub(1);
-                    }
-                    Ok(None) => break,  // All tasks done.
-                    Err(_) => continue, // Timeout — re-check force flag.
-                }
-            }
-
-            if remaining == 0 {
-                break;
             }
         }
-
-        // Kill any still-running task process groups.
-        let running_task_pgids: Vec<(String, i32)> = self
-            .tasks
-            .iter()
-            .filter_map(|(name, rt)| rt.pgid.map(|pgid| (name.clone(), pgid)))
-            .collect();
-        if !running_task_pgids.is_empty() {
-            self.output_manager.lifecycle_event(&format!(
-                "killing {} running task{}",
-                running_task_pgids.len(),
-                if running_task_pgids.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ));
-            for (name, pgid) in &running_task_pgids {
-                self.output_manager
-                    .service_event(name, &format!("send SIGKILL to task pgid {pgid}"));
-                if let Err(e) = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(*pgid),
-                    nix::sys::signal::Signal::SIGKILL,
-                ) {
-                    // ESRCH = already dead, which is fine.
-                    if e != nix::Error::ESRCH {
-                        self.output_manager.service_error_event(
-                            name,
-                            &format!("failed to kill task pgid {pgid}: {e}"),
-                        );
-                    }
-                }
-                if let Some(rt) = self.tasks.get_mut(name) {
-                    rt.pgid = None;
-                }
-            }
+        // Every stop has been executed and joined, and the task pgid sweep
+        // has run; both supervisor sets are idle (or their waits have
+        // completed against killed processes) and can end now.
+        // Abort-all-then-await keeps the 1s bound paid once, not once per
+        // process.
+        let supervisors = self.service_starts.abort_all();
+        for (_, handle) in supervisors {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        }
+        let supervisors = self.task_supervisors.abort_all();
+        for (_, handle) in supervisors {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
     }
 
     /// Wait for remaining async tasks to finish after shutdown.
     pub(in crate::runner) async fn wait_for_shutdown(&mut self) {
-        // All handles should already be stopped by initiate_shutdown.
-        // Drop remaining handles, release sockets, clear attach state.
-        for rs in self.services.values_mut() {
-            if let Some(worker) = rs.control_worker.take() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
-            if let Some(worker) = rs.start_worker.take() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
-            if let Some(worker) = rs.rebuild_worker.take() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
-            if let Some(worker) = rs.output_worker.take() {
-                Self::await_output_worker(worker).await;
-            }
-            rs.handle = None;
-            rs.attach_lock = None;
-            rs.attach_waiter = None;
-            rs.control_reply = None;
-            rs.stop_action = ServiceStopAction::None;
-        }
-        for rt in self.tasks.values_mut() {
-            if let Some(worker) = rt.run_worker.take() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
-            }
-            if let Some(worker) = rt.output_worker.take() {
-                Self::await_output_worker(worker).await;
-            }
-            rt.attach_lock = None;
-            rt.attach_waiter = None;
+        // Custody goes through the funnel even here, so the projection ends
+        // teardown agreeing with reality.
+        let names: Vec<String> = self.services.keys().cloned().collect();
+        for name in names {
+            self.clear_service_custody(&name);
         }
     }
 
     async fn drain_late_worker_results(&mut self) {
-        while let Ok(cmd) = self.internal_rx.try_recv() {
-            match cmd {
-                RunnerInternalCommand::ServiceStartPrepared {
-                    name,
-                    context,
-                    result,
-                    ..
-                } => {
-                    self.stop_late_service_start(name, context, result).await;
+        // Late prepared reports carry spawned processes' identities; kill
+        // those. Everything else is bookkeeping nobody needs mid-teardown.
+        while let Ok(report) = self.report_rx.try_recv() {
+            match report {
+                super::ProcessReport::ServiceStartPrepared { name, result, .. } => {
+                    self.stop_late_service_start(name, result).await;
                 }
-                RunnerInternalCommand::TaskRunPrepared { name, result, .. } => {
+                super::ProcessReport::TaskRunPrepared { name, result, .. } => {
                     self.stop_late_task_start(name, result).await;
                 }
-                RunnerInternalCommand::ServiceStopComplete { .. }
-                | RunnerInternalCommand::ServiceRebuildPrepared { .. }
-                | RunnerInternalCommand::GraphRequeryComplete(_)
-                | RunnerInternalCommand::TaskExited(_)
-                | RunnerInternalCommand::TaskRunWaitTimedOut { .. }
-                | RunnerInternalCommand::BatchBuildComplete(_)
-                | RunnerInternalCommand::RebuildBatchComplete(_)
-                | RunnerInternalCommand::LazyBuildComplete { .. }
-                | RunnerInternalCommand::ServiceHealthChanged { .. }
-                | RunnerInternalCommand::AutoRestart { .. }
-                | RunnerInternalCommand::ServiceExited { .. }
-                | RunnerInternalCommand::ReadyCheckComplete { .. }
-                | RunnerInternalCommand::UpdateCheckComplete(_) => {}
+                _ => {}
             }
         }
+        while self.update_rx.try_recv().is_ok() {}
     }
 
     pub(in crate::runner) async fn stop_late_service_start(
         &mut self,
         name: String,
-        context: Box<super::service_worker::ServiceStartContext>,
-        result: Result<Box<crate::runner::service::StartResult>, String>,
+        result: Result<Box<super::service_supervisor::ServiceWired>, String>,
     ) {
-        let Ok(start_result) = result else {
+        let Ok(_wired) = result else {
             return;
         };
         self.output_manager
             .service_event(&name, "start cancelled by shutdown");
-        let crate::runner::service::StartResult {
-            handle,
-            child_output,
-        } = *start_result;
-
-        let output_worker = self.output_manager.service_writer(&name).map(|writer| {
-            tokio::spawn(async move {
-                let _ = writer.process_stream(child_output).await;
-            })
+        // The supervisor wired this spawn and holds the process — ask it to
+        // stop. Its reader drains before the done-signal, so joining this
+        // covers the output too (what the old inline reader+stop did).
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let sent = self.service_starts.registry().get(&name).is_some_and(|h| {
+            h.request(super::service_supervisor::ServiceCommand::Stop(
+                super::service_supervisor::StopRequest {
+                    force: force_shutdown_requested(),
+                    wait_full_exit: false,
+                    interrupt: None,
+                    notify: super::service_supervisor::StopNotify::Done(done_tx),
+                    // Teardown: the failure history dies with the runner.
+                    reset_policy: false,
+                },
+            ))
         });
-        let shutdown_config = context
-            .resolved
-            .shutdown
-            .clone()
-            .map(|shutdown| shutdown.merged_over(&self.config.shutdown))
-            .unwrap_or_else(|| self.config.shutdown.clone());
-        let _ = stop_service(
-            handle,
-            Some(&shutdown_config),
-            force_shutdown_requested(),
-            true,
-            Some(super::service::StopDebug::new(
-                name.clone(),
-                self.output_manager.clone_lifecycle_emitter(),
-            )),
-        )
-        .await;
-        if let Some(worker) = output_worker {
-            Self::await_output_worker(worker).await;
+        if sent {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(15), done_rx).await;
         }
     }
 
     pub(in crate::runner) async fn stop_late_task_start(
         &mut self,
         name: String,
-        result: Result<TaskRunPrepared, String>,
+        result: Result<super::task_supervisor::TaskRunReport, String>,
     ) {
-        let Ok(prepared) = result else {
+        let Ok(super::task_supervisor::TaskRunReport::Running(wired)) = result else {
             return;
         };
-        match prepared {
-            TaskRunPrepared::Spawned(spawn) => {
-                self.output_manager
-                    .service_event(&name, "run cancelled by shutdown");
-                let crate::runner::task::TaskSpawn {
-                    mut handle,
-                    child_output,
-                    rendered_cmdline: _rendered_cmdline,
-                } = *spawn;
-                let output_worker = self.output_manager.service_writer(&name).map(|writer| {
-                    tokio::spawn(async move {
-                        let _ = writer.process_stream(child_output).await;
-                    })
-                });
-                self.output_manager.service_event(
-                    &name,
-                    &format!("send SIGKILL to task pgid {}", handle.pgid()),
-                );
-                let _ = handle
-                    .terminate(
-                        nix::sys::signal::Signal::SIGKILL,
-                        std::time::Duration::from_millis(500),
-                    )
-                    .await;
-                if let Some(worker) = output_worker {
-                    Self::await_output_worker(worker).await;
-                }
-            }
-            TaskRunPrepared::ForegroundSpawned(spawn) => {
-                self.output_manager
-                    .service_event(&name, "run cancelled by shutdown");
-                let crate::runner::task::ForegroundTaskSpawn {
-                    mut handle,
-                    rendered_cmdline: _rendered_cmdline,
-                } = *spawn;
-                self.output_manager.service_event(
-                    &name,
-                    &format!("send SIGKILL to foreground task pgid {}", handle.pgid()),
-                );
-                let _ = handle
-                    .terminate(
-                        nix::sys::signal::Signal::SIGKILL,
-                        std::time::Duration::from_millis(500),
-                    )
-                    .await;
-            }
-            TaskRunPrepared::PendingRun { .. } | TaskRunPrepared::Skipped { .. } => {}
-        }
-    }
-
-    async fn drain_service_output(&mut self, name: &str) {
-        let Some(worker) = self
-            .services
-            .get_mut(name)
-            .and_then(|rs| rs.output_worker.take())
-        else {
-            return;
-        };
-
-        Self::await_output_worker(worker).await;
-    }
-
-    async fn await_output_worker(worker: tokio::task::JoinHandle<()>) {
-        let mut worker = worker;
-        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker).await {
-            Ok(_) => {}
-            Err(_) => {
-                worker.abort();
-                let _ = worker.await;
-            }
+        // The supervisor holds the process and is parked on its exit; ask it
+        // to end the run. It signals the group and drains the reader before
+        // answering, which is what this waits for.
+        let _ = wired;
+        self.output_manager
+            .service_event(&name, "run cancelled by shutdown");
+        if let Some(done) = self.send_task_kill(&name) {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), done).await;
         }
     }
 }

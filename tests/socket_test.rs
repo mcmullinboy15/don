@@ -4,14 +4,14 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::ports::{manifest_path, read_manifest};
-use don::runner::{Runner, RunnerCommand, TerminalCoordinator};
+use don::runner::Runner;
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
@@ -94,17 +94,22 @@ async fn make_runner_inner(
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     (runner, shutdown_tx, buf)
 }
 
@@ -990,6 +995,134 @@ fn integration_lazy_starts_immediately_when_dependency_satisfied() {
 
 /// A lazy service with a pending first connection whose dependency then fails
 /// must surface DependencyFailed and never launch its process.
+/// An explicit `don start` honours the dependency graph — the one start path
+/// that used to ignore it entirely.
+///
+/// The rule is asymmetric on purpose: a dependency that is still coming up is
+/// worth waiting for, so the request is refused and says which one. A
+/// dependency that has *settled* never will come up on its own, and the user
+/// named this service anyway, so the start proceeds.
+/// A stopped service stays stopped, even though its gate is wide open.
+///
+/// Since permission became dependency-only it is *sticky*: a service whose
+/// dependencies are satisfied carries an `Open` level for the rest of the
+/// session, including while it is stopped. Nothing restarts it because
+/// demand is one-shot and a stop withdraws it — this pins that, because the
+/// failure mode is a service that springs back to life after `don stop`.
+#[test]
+fn integration_a_stopped_service_does_not_restart_itself_off_a_standing_gate() {
+    run_with_timeout(Duration::from_secs(25), async {
+        let dir = TempDir::new("stopped-stays-stopped");
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "bash", &["-c", "echo KEEPER_UP; exec sleep 60"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let control = runner.process_control();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "KEEPER_UP", Duration::from_secs(8)).await,
+            "expected keeper to start. output: {}",
+            read_buf(&buf)
+        );
+
+        control
+            .stop("keeper")
+            .await
+            .unwrap()
+            .expect("stopping keeper should succeed");
+
+        let launches_after_stop = read_buf(&buf).matches("KEEPER_UP").count();
+
+        // Long enough for several scheduler passes to publish the still-open
+        // level. A demand that was not withdrawn would spend one of them.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            read_buf(&buf).matches("KEEPER_UP").count(),
+            launches_after_stop,
+            "a stopped service restarted itself. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = handle.await;
+    });
+}
+
+#[test]
+fn integration_explicit_start_waits_for_a_working_dep_but_not_a_settled_one() {
+    run_with_timeout(Duration::from_secs(25), async {
+        let dir = TempDir::new("explicit-start-deps");
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service("slow", "bash", &["-c", "sleep 30"])
+            .ready_exec("false", &[])
+            .done()
+            .add_custom_service("api", "bash", &["-c", "echo API_STARTED; exec sleep 60"])
+            .depends_on(&["slow"])
+            .ready_exec("true", &[])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let control = runner.process_control();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        // `slow` never passes its ready check, so `api` waits.
+        assert!(
+            wait_for_output(&buf, "slow: starting", Duration::from_secs(8)).await,
+            "expected slow to start. output: {}",
+            read_buf(&buf)
+        );
+
+        // Still coming up: refuse, and name the dependency.
+        let err = control
+            .start("api")
+            .await
+            .unwrap()
+            .expect_err("a dependency that is still coming up must be waited for");
+        assert!(
+            err.to_string().contains("waiting for dependency 'slow'"),
+            "expected the blocking dependency to be named, got: {err}"
+        );
+        assert!(
+            !read_buf(&buf).contains("API_STARTED"),
+            "api must not have started. output: {}",
+            read_buf(&buf)
+        );
+
+        // Settle the dependency by stopping it. Waiting can no longer help,
+        // so the same request now succeeds.
+        control
+            .stop("slow")
+            .await
+            .unwrap()
+            .expect("stopping slow should succeed");
+
+        control
+            .start("api")
+            .await
+            .unwrap()
+            .expect("a settled dependency must not block an explicit start");
+        assert!(
+            wait_for_output(&buf, "API_STARTED", Duration::from_secs(8)).await,
+            "expected api to start past its settled dependency. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = handle.await;
+    });
+}
+
 #[test]
 fn integration_lazy_dependency_failure_blocks_start() {
     run_with_timeout(Duration::from_secs(20), async {
@@ -1075,10 +1208,16 @@ fn integration_lazy_dep_rerun_failure_after_startup_blocks_start() {
 
         // First run (startup) succeeds instantly; the second run (our triggered
         // rerun) prints SETUP_RERUN, lingers, then fails.
+        //
+        // The marker is split so it appears only in the task's *output*, never
+        // in the `spawn bash -c '...'` line that echoes the command back. An
+        // unsplit marker matches that line during startup, so the wait below
+        // returns immediately and the connection races the rerun instead of
+        // following it.
         let setup_cmd = format!(
             "N=$(cat {ctr} 2>/dev/null || echo 0); N=$((N + 1)); echo $N > {ctr}; \
              if [ $N -eq 1 ]; then echo SETUP_OK; exit 0; fi; \
-             echo SETUP_RERUN; sleep 2; exit 1",
+             echo SETUP_'RERUN'; sleep 2; exit 1",
             ctr = counter.display()
         );
         let toml = ConfigBuilder::new()
@@ -1094,7 +1233,7 @@ fn integration_lazy_dep_rerun_failure_after_startup_blocks_start() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1107,12 +1246,15 @@ fn integration_lazy_dep_rerun_failure_after_startup_blocks_start() {
         );
 
         // Re-run `setup` post-startup. auto_run = always makes an in-flight
-        // rerun count as unsatisfied, so a connection now defers.
-        cmd_tx
-            .send(RunnerCommand::TaskRerun {
-                name: "setup".to_string(),
-            })
-            .unwrap();
+        // rerun count as unsatisfied, so a connection now defers. Detached:
+        // the reply lands when the re-run finishes, and the test wants to
+        // connect while it is still going.
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.restart("setup").await;
+            }
+        });
         assert!(
             wait_for_output(&buf, "SETUP_RERUN", Duration::from_secs(5)).await,
             "expected setup to re-run. output: {}",
@@ -1178,7 +1320,7 @@ fn integration_lazy_starts_when_service_dep_recovers_off_startup() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1191,15 +1333,8 @@ fn integration_lazy_starts_when_service_dep_recovers_off_startup() {
 
         // Stop `dep`; the reply confirms it reached Stopped (no longer a
         // satisfied dependency).
-        let (stop_tx, stop_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "dep".to_string(),
-                reply: stop_tx,
-            })
-            .unwrap();
         assert!(
-            stop_rx.await.unwrap().is_ok(),
+            control.stop("dep").await.unwrap().is_ok(),
             "expected dep to stop. output: {}",
             read_buf(&buf)
         );
@@ -1223,14 +1358,15 @@ fn integration_lazy_starts_when_service_dep_recovers_off_startup() {
         );
 
         // Restart dep off the startup loop; its recovery must re-fire the
-        // deferred lazy start via the pending sweep.
-        let (start_tx, _start_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Start {
-                name: "dep".to_string(),
-                reply: start_tx,
-            })
-            .unwrap();
+        // deferred lazy start via the pending sweep. Detached: the reply only
+        // lands once the start has settled, and the assertion below is what
+        // this test is actually waiting for.
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.start("dep").await;
+            }
+        });
         assert!(
             wait_for_output(&buf, "api: ready", Duration::from_secs(10)).await,
             "expected api to start once dep recovered. output: {}",
@@ -1280,7 +1416,7 @@ fn integration_lazy_service_dep_failure_after_startup_blocks_start() {
             .build();
 
         let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let handle = tokio::spawn(async move {
             runner.run().await.unwrap();
         });
@@ -1291,22 +1427,14 @@ fn integration_lazy_service_dep_failure_after_startup_blocks_start() {
             read_buf(&buf)
         );
 
-        let (stop_tx, stop_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Stop {
-                name: "dep".to_string(),
-                reply: stop_tx,
-            })
-            .unwrap();
-        assert!(stop_rx.await.unwrap().is_ok());
+        assert!(control.stop("dep").await.unwrap().is_ok());
 
-        let (start_tx, _start_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Start {
-                name: "dep".to_string(),
-                reply: start_tx,
-            })
-            .unwrap();
+        tokio::spawn({
+            let control = control.clone();
+            async move {
+                let _ = control.start("dep").await;
+            }
+        });
         assert!(
             wait_for_output(&buf, "DEP_RUN_2", Duration::from_secs(5)).await,
             "expected the failing second dep run. output: {}",
@@ -1584,4 +1712,67 @@ fn integration_failed_but_live_service_keeps_serving_its_proxy() {
             handle.await.unwrap();
         });
     }
+}
+
+#[test]
+fn integration_ready_event_reports_the_probed_address_not_the_template() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("socket-ready-template");
+        let public = free_port();
+
+        // `${PORT}` is the ephemeral backend port Don hands the service, so
+        // the ready check probes the service itself rather than Don's proxy
+        // (which would answer the instant it bound, before the service ran).
+        // The lifecycle line has to name the port actually probed — reporting
+        // the literal `${PORT}` tells the reader nothing, and reporting the
+        // public port would be an outright lie about what was checked.
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "api",
+                "bash",
+                &["-c", "python3 -m http.server $PORT --bind 127.0.0.1"],
+            )
+            .proxy_env(&format!("127.0.0.1:{public}"), "PORT")
+            .ready_tcp_with("127.0.0.1:${PORT}", "200ms", 40)
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "ready (tcp ", Duration::from_secs(12)).await,
+            "service never reported ready. output: {}",
+            String::from_utf8_lossy(&buf.lock().unwrap())
+        );
+
+        let output = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let line = output
+            .lines()
+            .find(|line| line.contains("ready (tcp "))
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(
+            !line.contains("${"),
+            "ready event should name the probed address, not the template: {line}"
+        );
+        // The backend is ephemeral and chosen by the kernel, so assert the
+        // relationship that matters rather than a literal: it is a real port,
+        // and it is not the public listener.
+        assert!(
+            !line.contains(&format!("127.0.0.1:{public}")),
+            "ready event should report the backend port, not the public one ({public}): {line}"
+        );
+        let probed: u16 = line
+            .rsplit_once("127.0.0.1:")
+            .and_then(|(_, rest)| rest.trim_end_matches(')').parse().ok())
+            .unwrap_or_else(|| panic!("no numeric port in ready event: {line}"));
+        assert!(probed > 0, "probed port should be real: {line}");
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
 }

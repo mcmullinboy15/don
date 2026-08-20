@@ -7,13 +7,13 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, RunnerCommand, RunnerEvent, TaskItemState, TerminalCoordinator};
+use don::runner::{Runner, RunnerEvent, TaskState};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
@@ -78,17 +78,22 @@ async fn make_runner(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     (runner, shutdown_tx, buf)
 }
 
@@ -97,7 +102,7 @@ async fn make_runner(
 async fn wait_for_task_state(
     events: &mut broadcast::Receiver<RunnerEvent>,
     task_name: &str,
-    target: TaskItemState,
+    target: TaskState,
 ) -> bool {
     loop {
         match events.recv().await {
@@ -110,6 +115,24 @@ async fn wait_for_task_state(
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return false,
         }
+    }
+}
+
+/// Poll the output buffer until `needle` appears, then return the whole thing.
+///
+/// A state event and the lifecycle line that describes it travel by different
+/// routes — the broadcast, and the output actor's writer — so observing the
+/// event says nothing about the line having been written yet. Reading the
+/// buffer the instant the event lands is a race that only shows up when the
+/// machine is loaded enough to delay the sink task.
+async fn wait_for_buf(buf: &Arc<Mutex<Vec<u8>>>, needle: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let contents = read_buf(buf);
+        if contents.contains(needle) || tokio::time::Instant::now() >= deadline {
+            return contents;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -171,7 +194,7 @@ default = "100"
             out_path.display()
         ));
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let mut events = runner.subscribe();
 
         let runner_handle = tokio::spawn(async move { runner.run().await });
@@ -180,21 +203,15 @@ default = "100"
         // Trigger the task with --index=users.
         let mut params = HashMap::new();
         params.insert("index".to_string(), "users".to_string());
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "sync".to_string(),
-                params,
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        control
+            .run_task("sync", params, false, None)
+            .await
+            .unwrap()
             .unwrap();
-        reply_rx.await.unwrap().unwrap();
 
         // Wait for completion.
         assert!(
-            wait_for_task_state(&mut events, "sync", TaskItemState::Completed).await,
+            wait_for_task_state(&mut events, "sync", TaskState::Completed).await,
             "task didn't reach Completed"
         );
 
@@ -243,7 +260,7 @@ default = "100"
             out_path.display()
         ));
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let mut events = runner.subscribe();
 
         let runner_handle = tokio::spawn(async move { runner.run().await });
@@ -251,24 +268,20 @@ default = "100"
 
         let mut params = HashMap::new();
         params.insert("index".to_string(), "users".to_string());
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "sync".to_string(),
-                params,
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        control
+            .run_task("sync", params, false, None)
+            .await
+            .unwrap()
             .unwrap();
-        reply_rx.await.unwrap().unwrap();
 
         assert!(
-            wait_for_task_state(&mut events, "sync", TaskItemState::Completed).await,
+            wait_for_task_state(&mut events, "sync", TaskState::Completed).await,
             "task didn't reach Completed"
         );
 
-        let output = read_buf(&buf);
+        // The spawn line is emitted after the trigger line and carries the
+        // rendered params, so waiting for it covers all three assertions.
+        let output = wait_for_buf(&buf, "sync: spawn sh -c").await;
         assert!(
             output.contains("sync: running (manual trigger)"),
             "missing manual trigger line in {output:?}"
@@ -306,7 +319,7 @@ auto_run = false
             out_path.display()
         ));
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let mut events = runner.subscribe();
         let runner_handle = tokio::spawn(async move { runner.run().await });
 
@@ -314,21 +327,15 @@ auto_run = false
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Empty params map mirrors what `dispatch_action` sends for plain
-        // RunTask actions.
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "plain".to_string(),
-                params: HashMap::new(),
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        // run actions.
+        control
+            .run_task("plain", HashMap::new(), false, None)
+            .await
+            .unwrap()
             .unwrap();
-        reply_rx.await.unwrap().unwrap();
 
         assert!(
-            wait_for_task_state(&mut events, "plain", TaskItemState::Completed).await,
+            wait_for_task_state(&mut events, "plain", TaskState::Completed).await,
             "task didn't complete"
         );
         let captured = std::fs::read_to_string(&out_path).unwrap();
@@ -356,30 +363,24 @@ auto_run = false
             out_path.display()
         ));
         let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let mut events = runner.subscribe();
 
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         for _ in 0..2 {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            cmd_tx
-                .send(RunnerCommand::RunTask {
-                    name: "plain".to_string(),
-                    params: HashMap::new(),
-                    wait: false,
-                    wait_timeout: None,
-                    reply: reply_tx,
-                })
+            control
+                .run_task("plain", HashMap::new(), false, None)
+                .await
+                .unwrap()
                 .unwrap();
-            reply_rx.await.unwrap().unwrap();
             assert!(
-                wait_for_task_state(&mut events, "plain", TaskItemState::Running).await,
+                wait_for_task_state(&mut events, "plain", TaskState::Running).await,
                 "task didn't reach Running"
             );
             assert!(
-                wait_for_task_state(&mut events, "plain", TaskItemState::Completed).await,
+                wait_for_task_state(&mut events, "plain", TaskState::Completed).await,
                 "task didn't reach Completed"
             );
         }
@@ -414,43 +415,29 @@ auto_run = false
             out_path.display()
         ));
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
 
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "slow".to_string(),
-                params: HashMap::new(),
-                wait: true,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
-            .unwrap();
-
+        // Pinned rather than spawned: the first poll is what delivers the
+        // request, so the timeout below also establishes that the supervisor
+        // has it before the conflicting one is sent.
+        let mut waited = std::pin::pin!(control.run_task("slow", HashMap::new(), true, None));
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut reply_rx)
+            tokio::time::timeout(Duration::from_millis(50), &mut waited)
                 .await
                 .is_err(),
             "wait reply arrived before the task could exit"
         );
 
-        let (reply_tx, conflict_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "slow".to_string(),
-                params: HashMap::new(),
-                wait: true,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        let result = control
+            .run_task("slow", HashMap::new(), true, None)
+            .await
             .unwrap();
-        let result = conflict_rx.await.unwrap();
         assert!(result.is_err(), "second run should reject while running");
 
-        reply_rx.await.unwrap().unwrap();
+        waited.await.unwrap().unwrap();
         assert!(
             wait_for_line_count(&out_path, 1).await,
             "task did not write output"
@@ -476,23 +463,15 @@ auto_run = false
 "#,
         );
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
 
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "fail".to_string(),
-                params: HashMap::new(),
-                wait: true,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        let result = control
+            .run_task("fail", HashMap::new(), true, None)
+            .await
             .unwrap();
-
-        let result = reply_rx.await.unwrap();
         match result {
             Err(don::runner::CommandError::Failed { name, message }) => {
                 assert_eq!(name, "fail");
@@ -524,29 +503,27 @@ auto_run = false
 "#,
         );
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let mut events = runner.subscribe();
 
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "long".to_string(),
-                params: HashMap::new(),
-                wait: true,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
-            .unwrap();
+        let mut waited = std::pin::pin!(control.run_task("long", HashMap::new(), true, None));
+        // Poll once so the request is delivered, then let the task start.
         assert!(
-            wait_for_task_state(&mut events, "long", TaskItemState::Running).await,
+            tokio::time::timeout(Duration::from_millis(10), &mut waited)
+                .await
+                .is_err(),
+            "a `sleep 60` cannot have finished already"
+        );
+        assert!(
+            wait_for_task_state(&mut events, "long", TaskState::Running).await,
             "task did not start"
         );
 
         let _ = shutdown_tx.send(()).await;
-        let result = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+        let result = tokio::time::timeout(Duration::from_secs(2), waited)
             .await
             .expect("wait reply hung during shutdown")
             .unwrap();
@@ -588,7 +565,7 @@ required = true
             pid_path.display()
         ));
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let mut events = runner.subscribe();
 
         let runner_handle = tokio::spawn(async move { runner.run().await });
@@ -596,19 +573,13 @@ required = true
 
         let mut params = HashMap::new();
         params.insert("index".to_string(), "users".to_string());
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "sync".to_string(),
-                params,
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        control
+            .run_task("sync", params, false, None)
+            .await
+            .unwrap()
             .unwrap();
-        reply_rx.await.unwrap().unwrap();
         assert!(
-            wait_for_task_state(&mut events, "sync", TaskItemState::Running).await,
+            wait_for_task_state(&mut events, "sync", TaskState::Running).await,
             "task didn't reach Running"
         );
         assert!(
@@ -616,14 +587,7 @@ required = true
             "pid file was not written"
         );
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::Restart {
-                name: "sync".to_string(),
-                reply: reply_tx,
-            })
-            .unwrap();
-        reply_rx.await.unwrap().unwrap();
+        control.restart("sync").await.unwrap().unwrap();
 
         assert!(
             wait_for_line_count(&pid_path, 2).await,
@@ -661,21 +625,14 @@ required = true
 "#,
         );
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "sync".to_string(),
-                params: HashMap::new(),
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
+        let result = control
+            .run_task("sync", HashMap::new(), false, None)
+            .await
             .unwrap();
-        let result = reply_rx.await.unwrap();
         match result {
             Err(don::runner::CommandError::InvalidParams { name, message }) => {
                 assert_eq!(name, "sync");
@@ -709,23 +666,13 @@ name = "index"
 "#,
         );
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let control = runner.process_control();
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let mut params = HashMap::new();
         params.insert("nope".to_string(), "x".to_string());
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::RunTask {
-                name: "sync".to_string(),
-                params,
-                wait: false,
-                wait_timeout: None,
-                reply: reply_tx,
-            })
-            .unwrap();
-        let result = reply_rx.await.unwrap();
+        let result = control.run_task("sync", params, false, None).await.unwrap();
         match result {
             Err(don::runner::CommandError::InvalidParams { message, .. }) => {
                 assert!(
@@ -776,8 +723,8 @@ name = "x"
                     if name == "interactive" =>
                 {
                     match state {
-                        TaskItemState::Skipped => saw_skipped = true,
-                        TaskItemState::Running | TaskItemState::Completed => saw_run = true,
+                        TaskState::Skipped => saw_skipped = true,
+                        TaskState::Running | TaskState::Completed => saw_run = true,
                         _ => {}
                     }
                 }
@@ -815,21 +762,13 @@ cmd = "false"
 "#,
         );
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let completions = runner.completion_resolver();
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::ResolveCompletions {
-                task: "sync".to_string(),
-                param: "index".to_string(),
-                partial: HashMap::new(),
-                force_refresh: false,
-                reply: reply_tx,
-            })
-            .unwrap();
-        let result = reply_rx.await.unwrap();
+        let result = completions
+            .resolve_param("sync", "index", &HashMap::new(), false)
+            .await;
         let err = result.expect_err("completion command exits 1, should be an error");
         let log_path = err.log_path.expect("error should carry a log path");
         assert!(log_path.exists(), "log file should have been written");
@@ -865,21 +804,14 @@ choices = ["dev", "staging", "prod"]
 "#,
         );
         let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
-        let cmd_tx = runner.command_sender();
+        let completions = runner.completion_resolver();
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(RunnerCommand::ResolveCompletions {
-                task: "sync".to_string(),
-                param: "env".to_string(),
-                partial: HashMap::new(),
-                force_refresh: false,
-                reply: reply_tx,
-            })
+        let values = completions
+            .resolve_param("sync", "env", &HashMap::new(), false)
+            .await
             .unwrap();
-        let values = reply_rx.await.unwrap().unwrap();
         assert_eq!(values, vec!["dev", "staging", "prod"]);
 
         let _ = shutdown_tx.send(()).await;

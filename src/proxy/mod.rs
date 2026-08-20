@@ -168,6 +168,31 @@ pub(crate) struct ServiceProxy {
     policy: ConnectionPolicy,
 }
 
+/// What the runner takes from a service's proxy at bind time.
+///
+/// The live [`ServiceProxy`] belongs to the service's supervisor. This is only
+/// what the runner needs *once*, before handing it over: the bindings (which
+/// never change after bind, and go into the endpoint projection) and a handle
+/// to the shared connection counter. Nothing here is a shadow of mutable
+/// state — policy lives with the proxy, and backend env with the endpoints.
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyView {
+    /// Configured-to-actual binding metadata, in declaration order.
+    pub(crate) bindings: Vec<ProxyBinding>,
+    /// Live count of Don-owned forward connections, shared with the accept
+    /// loops. `None` when the service has no env/forward entries.
+    active_forward_connections: Option<Arc<AtomicUsize>>,
+}
+
+impl ProxyView {
+    /// The shared live counter itself, for a holder that wants to keep
+    /// reading it. This is a handle to one number, not a copy of it — it
+    /// cannot go stale the way a snapshotted value would.
+    pub(crate) fn connection_counter(&self) -> Option<Arc<AtomicUsize>> {
+        self.active_forward_connections.clone()
+    }
+}
+
 enum PendingListener {
     Forward {
         listener: TcpListener,
@@ -386,11 +411,6 @@ impl ServiceProxy {
         }
     }
 
-    /// Whether this proxy is currently refusing connections.
-    pub(crate) fn is_refusing(&self) -> bool {
-        self.policy == ConnectionPolicy::Refuse
-    }
-
     /// Set what happens to incoming connections. Returns whether the policy
     /// actually changed.
     ///
@@ -453,73 +473,17 @@ impl ServiceProxy {
     /// externally reachable listeners, which can differ from the configured
     /// addresses when fallback ports or explicit port 0 are used.
     pub(crate) fn public_env_vars(&self) -> HashMap<String, String> {
-        let mut vars = HashMap::new();
-
-        for (idx, binding) in self.bindings.iter().enumerate() {
-            let addr = binding.connect_addr();
-            vars.insert(format!("DON_PUBLIC_ADDR_{idx}"), addr.to_string());
-            vars.insert(format!("DON_PUBLIC_PORT_{idx}"), addr.port().to_string());
-
-            if idx == 0 {
-                vars.insert("DON_PUBLIC_ADDR".to_string(), addr.to_string());
-                vars.insert("DON_PUBLIC_PORT".to_string(), addr.port().to_string());
-            }
-
-            if let ProxyBindingMode::Env { env_name } = &binding.mode {
-                let suffix = sanitize_env_suffix(env_name);
-                if !suffix.is_empty() {
-                    vars.insert(format!("DON_PUBLIC_{suffix}"), addr.port().to_string());
-                    vars.insert(format!("DON_PUBLIC_{suffix}_ADDR"), addr.to_string());
-                    vars.insert(format!("DON_PUBLIC_{suffix}_PORT"), addr.port().to_string());
-                }
-            }
-        }
-
-        vars
+        public_env_vars_for(&self.bindings)
     }
 
-    /// Runtime reference values for other services' inline env expansion.
-    /// Values always describe public listener addresses, never env-mode
-    /// backend ports. For example, `$(database.PORT)` resolves to the public
-    /// port for `proxy = { ..., env = "PORT" }`.
-    pub(crate) fn env_reference_values(&self) -> HashMap<String, String> {
-        let mut vars = HashMap::new();
-
-        for (idx, binding) in self.bindings.iter().enumerate() {
-            let addr = binding.connect_addr();
-            vars.insert(format!("addr_{idx}"), addr.to_string());
-            vars.insert(format!("port_{idx}"), addr.port().to_string());
-            vars.insert(format!("ADDR_{idx}"), addr.to_string());
-            vars.insert(format!("PORT_{idx}"), addr.port().to_string());
-
-            if idx == 0 {
-                vars.insert("addr".to_string(), addr.to_string());
-                vars.insert("port".to_string(), addr.port().to_string());
-                vars.insert("ADDR".to_string(), addr.to_string());
-                vars.insert("PORT".to_string(), addr.port().to_string());
-            }
-
-            if let ProxyBindingMode::Env { env_name } = &binding.mode {
-                let suffix = sanitize_env_suffix(env_name);
-                if !suffix.is_empty() {
-                    vars.insert(suffix.clone(), addr.port().to_string());
-                    vars.insert(format!("{suffix}_ADDR"), addr.to_string());
-                    vars.insert(format!("{suffix}_PORT"), addr.port().to_string());
-                }
-            }
+    /// A [`ProxyView`] of this proxy's current metadata, for the runner's
+    /// bookkeeping while the proxy itself lives with the supervisor.
+    pub(crate) fn view(&self) -> ProxyView {
+        ProxyView {
+            bindings: self.bindings.clone(),
+            active_forward_connections: (!self.forward.is_empty())
+                .then(|| self.active_forward_connections.clone()),
         }
-
-        vars
-    }
-
-    /// True if any proxy entry requires serial (no-overlap) restart. Fixed
-    /// `Forward` backends can't have two processes binding the same port at
-    /// once, so the caller must fully tear down the old instance before
-    /// starting the new one.
-    pub(crate) fn requires_full_exit_on_restart(&self) -> bool {
-        self.forward
-            .iter()
-            .any(|f| matches!(f.backend, ForwardBackend::Fixed(_)))
     }
 
     /// Socket-activation env vars for listenfd entries. Empty if the service
@@ -554,7 +518,7 @@ impl ServiceProxy {
             .collect()
     }
 
-    /// Cloneable configured-to-actual binding metadata in declaration order.
+    /// Configured-to-actual binding metadata in declaration order.
     pub(crate) fn bindings(&self) -> &[ProxyBinding] {
         &self.bindings
     }
@@ -564,25 +528,6 @@ impl ServiceProxy {
         self.bindings
             .iter()
             .map(|binding| binding.bound_addr)
-            .collect()
-    }
-
-    /// Human-readable entries using the actual bound public addresses, in
-    /// original declaration order.
-    pub(crate) fn descriptions(&self) -> Vec<String> {
-        self.bindings
-            .iter()
-            .map(|binding| match &binding.mode {
-                ProxyBindingMode::Env { env_name } => {
-                    format!("{} (env={env_name})", binding.bound_addr)
-                }
-                ProxyBindingMode::Forward { target } => {
-                    format!("{} → {target}", binding.bound_addr)
-                }
-                ProxyBindingMode::Listenfd => {
-                    format!("{} (listenfd)", binding.bound_addr)
-                }
-            })
             .collect()
     }
 
@@ -599,23 +544,6 @@ impl ServiceProxy {
                 )
             })
             .collect()
-    }
-
-    /// Active env/forward proxy connections owned by Don. Listenfd-mode
-    /// sockets are accepted by the child process, so Don cannot count them.
-    pub(crate) fn active_forward_connections(&self) -> Option<usize> {
-        if self.forward.is_empty() {
-            return None;
-        }
-        Some(self.active_forward_connections.load(Ordering::Relaxed))
-    }
-
-    /// Re-arm the lazy trigger for listenfd entries. Called after the service
-    /// stops and re-enters the `Lazy` state so the next queued connection
-    /// triggers another start cycle. Idempotent: the runner also derives this
-    /// policy from the service state.
-    pub(crate) fn rearm_lazy_watchers(&mut self) {
-        self.set_policy(ConnectionPolicy::LazyTrigger);
     }
 
     /// Shut down all proxy work — abort forwarding accept loops and the
@@ -693,6 +621,84 @@ fn should_fallback(
 fn fallback_addr(mut configured_addr: SocketAddr) -> SocketAddr {
     configured_addr.set_port(0);
     configured_addr
+}
+
+/// Public address env vars derived from binding metadata — the body of
+/// [`ServiceProxy::public_env_vars`] and [`ProxyView::public_env_vars`].
+pub(crate) fn public_env_vars_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+
+    for (idx, binding) in bindings.iter().enumerate() {
+        let addr = binding.connect_addr();
+        vars.insert(format!("DON_PUBLIC_ADDR_{idx}"), addr.to_string());
+        vars.insert(format!("DON_PUBLIC_PORT_{idx}"), addr.port().to_string());
+
+        if idx == 0 {
+            vars.insert("DON_PUBLIC_ADDR".to_string(), addr.to_string());
+            vars.insert("DON_PUBLIC_PORT".to_string(), addr.port().to_string());
+        }
+
+        if let ProxyBindingMode::Env { env_name } = &binding.mode {
+            let suffix = sanitize_env_suffix(env_name);
+            if !suffix.is_empty() {
+                vars.insert(format!("DON_PUBLIC_{suffix}"), addr.port().to_string());
+                vars.insert(format!("DON_PUBLIC_{suffix}_ADDR"), addr.to_string());
+                vars.insert(format!("DON_PUBLIC_{suffix}_PORT"), addr.port().to_string());
+            }
+        }
+    }
+
+    vars
+}
+
+/// Reference values (`$(service.PORT)` and friends) derived from binding
+/// metadata. Always public listener addresses, never env-mode backend ports.
+pub(crate) fn env_reference_values_for(bindings: &[ProxyBinding]) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+
+    for (idx, binding) in bindings.iter().enumerate() {
+        let addr = binding.connect_addr();
+        vars.insert(format!("addr_{idx}"), addr.to_string());
+        vars.insert(format!("port_{idx}"), addr.port().to_string());
+        vars.insert(format!("ADDR_{idx}"), addr.to_string());
+        vars.insert(format!("PORT_{idx}"), addr.port().to_string());
+
+        if idx == 0 {
+            vars.insert("addr".to_string(), addr.to_string());
+            vars.insert("port".to_string(), addr.port().to_string());
+            vars.insert("ADDR".to_string(), addr.to_string());
+            vars.insert("PORT".to_string(), addr.port().to_string());
+        }
+
+        if let ProxyBindingMode::Env { env_name } = &binding.mode {
+            let suffix = sanitize_env_suffix(env_name);
+            if !suffix.is_empty() {
+                vars.insert(suffix.clone(), addr.port().to_string());
+                vars.insert(format!("{suffix}_ADDR"), addr.to_string());
+                vars.insert(format!("{suffix}_PORT"), addr.port().to_string());
+            }
+        }
+    }
+
+    vars
+}
+
+/// Human-readable listener entries derived from binding metadata.
+pub(crate) fn descriptions_for(bindings: &[ProxyBinding]) -> Vec<String> {
+    bindings
+        .iter()
+        .map(|binding| match &binding.mode {
+            ProxyBindingMode::Env { env_name } => {
+                format!("{} (env={env_name})", binding.bound_addr)
+            }
+            ProxyBindingMode::Forward { target } => {
+                format!("{} → {target}", binding.bound_addr)
+            }
+            ProxyBindingMode::Listenfd => {
+                format!("{} (listenfd)", binding.bound_addr)
+            }
+        })
+        .collect()
 }
 
 fn sanitize_env_suffix(name: &str) -> String {
@@ -1179,7 +1185,8 @@ mod tests {
         BackendStatus, ConnectionPolicy, DEFAULT_PROXY_CONNECTION_LIMIT,
         MIN_PROXY_CONNECTION_LIMIT, PROXY_FD_RESERVE, ProxyBinding, ProxyBindingMode,
         ProxyConnectionAccounting, ProxyError, ServiceProxy, backend_connect_candidates,
-        proxy_accept_loop_with_permits, proxy_connection_limit_for_soft_nofile,
+        env_reference_values_for, proxy_accept_loop_with_permits,
+        proxy_connection_limit_for_soft_nofile,
     };
 
     #[tokio::test]
@@ -1244,39 +1251,73 @@ mod tests {
 
         let emitter = test_lifecycle_emitter().await;
         for case in cases {
-            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let reserved_addr = reservation.local_addr().unwrap();
-            let configured_addr = if case.configured_port_zero {
-                SocketAddr::new(reserved_addr.ip(), 0)
-            } else {
-                reserved_addr
-            };
-            let blocker = if case.occupied {
-                Some(reservation)
-            } else {
-                drop(reservation);
-                None
-            };
-            let entry = ProxyEntry {
-                listen: configured_addr.to_string(),
-                mode: case.mode,
-            };
+            // A "free" port is obtained by binding 127.0.0.1:0, reading the
+            // address and dropping the listener — don has to perform the real
+            // bind itself, so the window between that drop and don's bind
+            // cannot be closed from the test and any other process on the
+            // machine can claim the port in it. A steal has an unambiguous
+            // signature (don reports a fallback for a port we expected to be
+            // free), so the *setup* is retried when it shows up. A genuine
+            // regression produces that same signature on every attempt and
+            // still fails the assertions below on the final one.
+            const SETUP_ATTEMPTS: usize = 10;
+            let mut attempt = 0;
+            let (configured_addr, blocker, result) = loop {
+                attempt += 1;
+                let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let reserved_addr = reservation.local_addr().unwrap();
+                let configured_addr = if case.configured_port_zero {
+                    SocketAddr::new(reserved_addr.ip(), 0)
+                } else {
+                    reserved_addr
+                };
+                let blocker = if case.occupied {
+                    Some(reservation)
+                } else {
+                    drop(reservation);
+                    None
+                };
+                let entry = ProxyEntry {
+                    listen: configured_addr.to_string(),
+                    mode: case.mode.clone(),
+                };
 
-            let result = ServiceProxy::bind(
-                &[entry],
-                case.fallback_ports,
-                None,
-                case.name,
-                emitter.clone(),
-            )
-            .await;
+                let result = ServiceProxy::bind(
+                    &[entry],
+                    case.fallback_ports,
+                    None,
+                    case.name,
+                    emitter.clone(),
+                )
+                .await;
+
+                // Only a case that hands don a port it expects to still own
+                // can be disturbed by a thief; occupied ports are held by a
+                // live listener and port 0 never falls back.
+                let port_stolen = !case.occupied
+                    && !case.configured_port_zero
+                    && matches!(
+                        &result,
+                        Ok(proxy) if proxy
+                            .view()
+                            .bindings
+                            .first()
+                            .is_some_and(|binding| binding.used_fallback)
+                            != case.expect_fallback
+                    );
+                if port_stolen && attempt < SETUP_ATTEMPTS {
+                    continue;
+                }
+                break (configured_addr, blocker, result);
+            };
 
             if case.expect_success {
                 let proxy = result.unwrap_or_else(|error| {
                     panic!("{}: expected bind success, got {error}", case.name)
                 });
-                let binding = proxy
-                    .bindings()
+                let view = proxy.view();
+                let binding = view
+                    .bindings
                     .first()
                     .unwrap_or_else(|| panic!("{}: missing binding metadata", case.name));
                 assert_eq!(
@@ -1344,7 +1385,8 @@ mod tests {
         let proxy = ServiceProxy::bind(&entries, true, None, "mixed", emitter)
             .await
             .unwrap();
-        let bindings = proxy.bindings();
+        let view = proxy.view();
+        let bindings = &view.bindings;
 
         assert_eq!(bindings.len(), 4);
         assert!(matches!(&bindings[0].mode, ProxyBindingMode::Listenfd));
@@ -1362,7 +1404,7 @@ mod tests {
             bindings.iter().map(|binding| binding.bound_addr).collect();
         assert_eq!(proxy.listen_addrs(), actual_addrs);
         assert_eq!(
-            proxy.descriptions(),
+            super::descriptions_for(&proxy.view().bindings),
             vec![
                 format!("{} (listenfd)", actual_addrs[0]),
                 format!("{} (env=api_port)", actual_addrs[1]),
@@ -1395,7 +1437,7 @@ mod tests {
             Some(&actual_addrs[1].to_string())
         );
 
-        let references = proxy.env_reference_values();
+        let references = env_reference_values_for(proxy.view().bindings.as_slice());
         assert_eq!(references.get("addr"), Some(&actual_addrs[0].to_string()));
         assert_eq!(
             references.get("port_2"),
@@ -1417,7 +1459,7 @@ mod tests {
         );
         assert!(proxy.fallback_descriptions().is_empty());
 
-        let cloned = proxy.bindings().to_vec();
+        let cloned = proxy.view().bindings;
         drop(proxy);
         assert_eq!(cloned.len(), 4);
         assert_eq!(cloned[1].bound_addr, actual_addrs[1]);
@@ -1449,32 +1491,63 @@ mod tests {
 
     #[tokio::test]
     async fn failed_bind_releases_all_earlier_pending_listeners() {
-        let first_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let first_addr = first_reservation.local_addr().unwrap();
-        drop(first_reservation);
-
-        let _blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let blocked_addr = _blocker.local_addr().unwrap();
-        let entries = vec![
-            ProxyEntry {
-                listen: first_addr.to_string(),
-                mode: ProxyMode::Env("PORT".to_string()),
-            },
-            ProxyEntry {
-                listen: blocked_addr.to_string(),
-                mode: ProxyMode::Listenfd,
-            },
-        ];
         let emitter = test_lifecycle_emitter().await;
 
-        let result = ServiceProxy::bind(&entries, false, None, "transactional", emitter).await;
-        assert!(matches!(result, Err(ProxyError::Bind { .. })));
+        // The first entry needs an address that is free when don binds it, and
+        // still free when the test re-binds it afterwards. Both ends of that
+        // sequence are races against every other process on the machine: the
+        // reserve-then-drop window before don's bind, and the gap between don
+        // releasing the address and the test's re-bind. Neither can be closed
+        // from the test, so the whole scenario is retried on a collision — a
+        // don that really holds the listener fails every attempt, and the
+        // assertions below fire on the last one.
+        const SETUP_ATTEMPTS: usize = 10;
+        for attempt in 1..=SETUP_ATTEMPTS {
+            let last_attempt = attempt == SETUP_ATTEMPTS;
 
-        let rebound = tokio::net::TcpListener::bind(first_addr).await;
-        assert!(
-            rebound.is_ok(),
-            "the first listener remained owned after a later bind failed"
-        );
+            let first_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let first_addr = first_reservation.local_addr().unwrap();
+            drop(first_reservation);
+
+            let _blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let blocked_addr = _blocker.local_addr().unwrap();
+            let entries = vec![
+                ProxyEntry {
+                    listen: first_addr.to_string(),
+                    mode: ProxyMode::Env("PORT".to_string()),
+                },
+                ProxyEntry {
+                    listen: blocked_addr.to_string(),
+                    mode: ProxyMode::Listenfd,
+                },
+            ];
+
+            let result =
+                ServiceProxy::bind(&entries, false, None, "transactional", emitter.clone()).await;
+
+            match &result {
+                // The intended failure: the *second* entry could not bind.
+                Err(ProxyError::Bind { addr, .. }) if *addr == blocked_addr.to_string() => {}
+                // Someone else took the first address inside the reservation
+                // window, so this attempt never exercised the rollback.
+                Err(ProxyError::Bind { addr, .. })
+                    if *addr == first_addr.to_string() && !last_attempt =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("expected the second entry to fail its bind, got {error}"),
+                Ok(_) => panic!("expected the second entry to fail its bind, it succeeded"),
+            }
+
+            let rebound = tokio::net::TcpListener::bind(first_addr).await;
+            if rebound.is_ok() {
+                return;
+            }
+            assert!(
+                !last_attempt,
+                "the first listener remained owned after a later bind failed"
+            );
+        }
     }
 
     #[test]
@@ -1593,7 +1666,8 @@ mod tests {
             .await
             .unwrap();
             let addrs: Vec<SocketAddr> = proxy
-                .bindings()
+                .view()
+                .bindings
                 .iter()
                 .map(|binding| binding.bound_addr)
                 .collect();
@@ -1617,7 +1691,6 @@ mod tests {
                 "{}: entering refusal should report a change",
                 case.name
             );
-            assert!(proxy.is_refusing(), "{}", case.name);
 
             // Every listener refuses — parked connections and new ones alike.
             for (addr, mut early) in addrs.iter().zip(parked) {
@@ -1643,7 +1716,6 @@ mod tests {
                 ConnectionPolicy::Serve
             };
             assert!(proxy.set_policy(recovered), "{}", case.name);
-            assert!(!proxy.is_refusing(), "{}", case.name);
             for addr in &addrs {
                 let mut after = tokio::net::TcpStream::connect(addr).await.unwrap();
                 assert!(
@@ -1676,7 +1748,8 @@ mod tests {
             .await
             .unwrap();
         let addrs: Vec<SocketAddr> = proxy
-            .bindings()
+            .view()
+            .bindings
             .iter()
             .map(|binding| binding.bound_addr)
             .collect();
@@ -1686,7 +1759,7 @@ mod tests {
         let mut buf = [0u8; 1];
         let mut refused = tokio::net::TcpStream::connect(addrs[0]).await.unwrap();
         assert_closed(&mut refused, &mut buf, "refused while failed").await;
-        proxy.rearm_lazy_watchers();
+        proxy.set_policy(ConnectionPolicy::LazyTrigger);
 
         // The second listener — the one that never fired — must trigger too.
         let _client = tokio::net::TcpStream::connect(addrs[1]).await.unwrap();

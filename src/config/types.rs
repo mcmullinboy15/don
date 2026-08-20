@@ -19,24 +19,6 @@ pub struct BazelConfig {
     pub watch: bool,
 }
 
-/// Turborepo build tool integration for a service or task.
-///
-/// When configured, Don queries Turborepo at startup to determine the task
-/// graph and source inputs, and watches the relevant package directories.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct TurboConfig {
-    /// Turbo task name to query for watch resolution (e.g. `"dev"`, `"build"`).
-    pub task: String,
-    /// Whether Don should auto-watch package inputs resolved from the Turbo graph.
-    #[serde(default = "default_true")]
-    pub watch: bool,
-    /// Turbo task to run during the batch build phase (e.g. `"build"`).
-    /// Defaults to `"build"`. Set to `""` to skip the batch build for this item.
-    pub build_task: Option<String>,
-    /// Filter to a specific package (e.g. `"@myorg/api"`).
-    pub filter: Option<String>,
-}
-
 /// A single proxy entry. Don binds `listen` once at startup and holds the
 /// port across service restarts.
 ///

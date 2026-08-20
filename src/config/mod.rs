@@ -8,7 +8,8 @@ mod download;
 mod group;
 pub(crate) mod param;
 mod platform;
-mod profile;
+pub(crate) mod ports;
+pub(crate) mod profile;
 pub(crate) mod service;
 pub(crate) mod task;
 pub(crate) mod template;
@@ -23,13 +24,12 @@ pub use self::profile::Profile;
 pub use self::service::{
     DockerBuildConfig, DockerConfig, ResolvedService, RustConfig, Service, ServiceKind,
 };
-pub use self::task::{
-    Task, TaskAutoRun, TaskHeadless, TaskTerminal, TaskTerminalMode, TaskTerminalScreen,
-};
+pub use self::task::{Task, TaskAutoRun, TaskHeadless};
 pub use self::types::{
     BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
-    ShutdownConfig, TurboConfig,
+    ShutdownConfig,
 };
+pub use profile::resolve_profile_processes;
 
 pub use self::service::{GoConfig, ServiceOverride};
 
@@ -91,8 +91,94 @@ impl std::str::FromStr for Config {
     type Err = toml::de::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        toml::from_str(s)
+        let mut value: toml::Value = toml::from_str(s)?;
+        reject_removed_keys(&value).map_err(serde::de::Error::custom)?;
+        apply_compat_keys(&mut value).map_err(serde::de::Error::custom)?;
+        value.try_into()
     }
+}
+
+/// Config keys that used to configure a feature don no longer has.
+///
+/// Deserialization ignores unknown keys, so without this an upgraded user
+/// whose `don.toml` still says `turbo.task = "dev"` is told the service
+/// "must have one of: bazel, docker, rust, go, or run" — true, and useless
+/// about why a config that worked yesterday doesn't today.
+const REMOVED_KEYS: &[(&str, &str)] = &[(
+    "turbo",
+    "Turborepo support has been removed. Replace it with a `run` command \
+         (plus `build` if you need one), or use the bazel preset.",
+)];
+
+/// Fold spellings don has replaced into the ones it reads, in place.
+///
+/// `terminal = "foreground"` is the older way of saying `interactive = true`.
+/// It named a mechanism don no longer has — a task taking the terminal away
+/// from everything else — but the *intent* survived the mechanism, and a
+/// config that says it is still saying something true: this task wants a human
+/// at a keyboard. So it is honoured rather than rejected, and honoured by
+/// rewriting it into today's key rather than by carrying two fields that mean
+/// one thing.
+///
+/// `screen` had no successor and is ignored: there is no takeover to choose a
+/// screen for.
+fn apply_compat_keys(value: &mut toml::Value) -> Result<(), String> {
+    let Some(tasks) = value.get_mut("tasks").and_then(toml::Value::as_table_mut) else {
+        return Ok(());
+    };
+    for (name, task) in tasks.iter_mut() {
+        let Some(table) = task.as_table_mut() else {
+            continue;
+        };
+        let Some(terminal) = table.remove("terminal") else {
+            continue;
+        };
+        let mode = match &terminal {
+            toml::Value::String(mode) => Some(mode.as_str()),
+            toml::Value::Table(table) => match table.get("mode") {
+                Some(toml::Value::String(mode)) => Some(mode.as_str()),
+                // A table with no mode is the default, which is muxed.
+                None => Some("muxed"),
+                Some(_) => None,
+            },
+            _ => None,
+        };
+        let interactive = match mode {
+            Some("foreground") => true,
+            Some("muxed") => false,
+            _ => {
+                return Err(format!(
+                    "task '{name}': unknown terminal value {terminal}, expected \"muxed\" or \
+                     \"foreground\". `terminal` is the older spelling of `interactive`; \
+                     `foreground` means `interactive = true`"
+                ));
+            }
+        };
+        // An explicit `interactive` is the current key and the one the reader
+        // most likely meant; a config carrying both is mid-migration.
+        table.entry("interactive").or_insert(interactive.into());
+    }
+    Ok(())
+}
+
+/// Reject a config that still uses a removed key, by name and location.
+fn reject_removed_keys(value: &toml::Value) -> Result<(), String> {
+    for section in ["services", "tasks"] {
+        let Some(items) = value.get(section).and_then(toml::Value::as_table) else {
+            continue;
+        };
+        let kind = section.trim_end_matches('s');
+        for (name, item) in items {
+            for (key, guidance) in REMOVED_KEYS {
+                if item.get(key).is_some() {
+                    return Err(format!(
+                        "{kind} '{name}': '{key}' is no longer supported. {guidance}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 const VALID_SIGNALS: &[&str] = &[
@@ -161,6 +247,12 @@ impl Config {
             }
         }
 
+        reject_removed_keys(&value).map_err(|error| ConfigError::Validation {
+            errors: vec![error],
+        })?;
+        apply_compat_keys(&mut value).map_err(|error| ConfigError::Validation {
+            errors: vec![error],
+        })?;
         Ok(value.try_into()?)
     }
 
@@ -361,7 +453,7 @@ impl Config {
             // ServiceKind must be set (either on the base or via a platform override).
             if resolved.kind.is_none() {
                 errors.push(format!(
-                    "service '{name}': must have one of: bazel, turbo, docker, rust, go, or run"
+                    "service '{name}': must have one of: bazel, docker, rust, go, or run"
                 ));
             }
             if let Some(ref ready) = resolved.ready {
@@ -471,7 +563,7 @@ impl Config {
                         "service '{name}': docker service must set `docker.image` or `docker.build`"
                     ));
                 }
-                if let Err(error) = crate::docker::parse::parse_port_mappings(&docker.ports) {
+                if let Err(error) = ports::parse_port_specs(&docker.ports) {
                     errors.push(format!("service '{name}': {error}"));
                 }
                 if self.fallback_ports && docker.container.is_some() {
@@ -578,12 +670,6 @@ impl Config {
 
         // Validate tasks
         for (name, task) in &self.tasks {
-            // Bazel and turbo are mutually exclusive.
-            if task.bazel.is_some() && task.turbo.is_some() {
-                errors.push(format!(
-                    "task '{name}': 'bazel' and 'turbo' are mutually exclusive"
-                ));
-            }
             for dep in &task.depends_on {
                 if !dependency_reference_names.contains(dep.name.as_str()) {
                     let suggestion = suggest_typo(&dep.name, &dependency_reference_names);
@@ -909,7 +995,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// config-parse time so the collision is caught before the user tries to
 /// invoke the task.
 const RESERVED_PARAM_NAMES: &[&str] = &[
-    "all-pending",
     "no-prompt",
     "wait",
     "timeout",
@@ -1580,7 +1665,10 @@ mod tests {
                     let Some(ServiceKind::Docker(docker)) = &macos.kind else {
                         panic!("expected docker preset on macos");
                     };
-                    assert_eq!(docker.image.as_deref(), Some("cockroachdb/cockroach:v24.1.0"));
+                    assert_eq!(
+                        docker.image.as_deref(),
+                        Some("cockroachdb/cockroach:v24.1.0")
+                    );
                     assert_eq!(macos.env["COCKROACH_PORT"], "26257");
                     assert!(macos.download.is_some());
                 },
@@ -1647,7 +1735,10 @@ mod tests {
                     let Some(ServiceKind::Docker(docker)) = &macos.kind else {
                         panic!("expected docker on macos");
                     };
-                    assert_eq!(docker.image.as_deref(), Some("cockroachdb/cockroach:v24.1.0"));
+                    assert_eq!(
+                        docker.image.as_deref(),
+                        Some("cockroachdb/cockroach:v24.1.0")
+                    );
 
                     // Platform without an override and no base preset should fail
                     let other = config.services["crdb"].resolve(Platform::LinuxAarch64);
@@ -2745,8 +2836,7 @@ mod tests {
                 name: "reload = false disables file watching",
                 input: r#"
                     [services.frontend]
-                    turbo.task = "dev"
-                    turbo.filter = "@myorg/frontend"
+                    bazel.target = "//frontend:frontend"
                     reload = false
                 "#,
                 expect_err: false,
@@ -3088,6 +3178,69 @@ mod tests {
         }
     }
 
+    /// An upgraded `don.toml` that still configures a removed feature must
+    /// say so by name. Unknown keys are otherwise ignored, which would leave
+    /// the user with a generic "must have one of: ..." and no idea why a
+    /// config that worked yesterday stopped.
+    #[test]
+    fn removed_keys_are_rejected_by_name() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            want_fragment: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "turbo service",
+                input: "[services.web]\nturbo.task = \"dev\"\n",
+                want_fragment: Some("service 'web': 'turbo' is no longer supported"),
+            },
+            Case {
+                name: "turbo task",
+                input: "[tasks.build]\ncmd = \"true\"\nturbo.task = \"build\"\n",
+                want_fragment: Some("task 'build': 'turbo' is no longer supported"),
+            },
+            Case {
+                name: "the key that replaced terminal parses",
+                input: "[tasks.console]\ncmd = \"true\"\ninteractive = true\n",
+                want_fragment: None,
+            },
+            Case {
+                name: "and so does terminal itself",
+                input: "[tasks.console]\ncmd = \"true\"\nterminal = \"foreground\"\n",
+                want_fragment: None,
+            },
+            Case {
+                name: "a terminal value that never existed is still an error",
+                input: "[tasks.console]\ncmd = \"true\"\nterminal = \"tmux\"\n",
+                want_fragment: Some("expected \"muxed\" or \"foreground\""),
+            },
+            Case {
+                name: "bazel is untouched",
+                input: "[services.api]\nbazel.target = \"//api:api\"\n",
+                want_fragment: None,
+            },
+        ];
+
+        for case in cases {
+            let parsed = case.input.parse::<Config>();
+            match case.want_fragment {
+                Some(fragment) => {
+                    let err = parsed.expect_err(case.name).to_string();
+                    assert!(
+                        err.contains(fragment),
+                        "{}: expected {fragment:?} in {err:?}",
+                        case.name
+                    );
+                }
+                None => {
+                    assert!(parsed.is_ok(), "{}: should still parse", case.name);
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_parse_bazel_config() {
         let toml = r#"
@@ -3120,41 +3273,6 @@ bazel.watch = false
     }
 
     #[test]
-    fn test_parse_turbo_config() {
-        let toml = r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-"#;
-        let config: Config = toml.parse().unwrap();
-        let svc = config.services.get("web").unwrap();
-        let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
-            panic!("expected turbo kind");
-        };
-        assert_eq!(turbo.task, "dev");
-        assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
-        assert!(turbo.watch);
-    }
-
-    #[test]
-    fn test_parse_turbo_watch_false() {
-        let toml = r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-turbo.watch = false
-"#;
-        let config: Config = toml.parse().unwrap();
-        let svc = config.services.get("web").unwrap();
-        let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
-            panic!("expected turbo kind");
-        };
-        assert_eq!(turbo.task, "dev");
-        assert_eq!(turbo.filter.as_deref(), Some("@myorg/web"));
-        assert!(!turbo.watch);
-    }
-
-    #[test]
     fn test_parse_task_with_bazel() {
         let toml = r#"
 [tasks.codegen]
@@ -3165,7 +3283,6 @@ bazel.target = "//tools/codegen:all"
         let config: Config = toml.parse().unwrap();
         let task = config.tasks.get("codegen").unwrap();
         assert_eq!(task.bazel.as_ref().unwrap().target, "//tools/codegen:all");
-        assert!(task.turbo.is_none());
     }
 
     #[test]
@@ -3184,24 +3301,6 @@ bazel.target = "//services/api:api"
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("only one of"),
-            "expected mutual exclusivity error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_validate_bazel_turbo_mutually_exclusive_task() {
-        let toml = r#"
-[tasks.codegen]
-cmd = "build"
-bazel.target = "//tools:codegen"
-turbo.task = "build"
-"#;
-        let config: Config = toml.parse().unwrap();
-        let result = config.validate(TEST_PLATFORM);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("mutually exclusive"),
             "expected mutual exclusivity error, got: {err}"
         );
     }
@@ -3231,61 +3330,6 @@ bazel.target = "//services/api:macos_arm64"
             panic!("expected bazel kind on macos");
         };
         assert_eq!(bazel_mac.target, "//services/api:macos_arm64");
-    }
-
-    #[test]
-    fn test_turbo_build_task_config() {
-        struct Case {
-            name: &'static str,
-            toml: &'static str,
-            expected_build_task: Option<&'static str>,
-        }
-
-        let cases = vec![
-            Case {
-                name: "default build_task (not specified)",
-                toml: r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-"#,
-                expected_build_task: None,
-            },
-            Case {
-                name: "explicit build_task",
-                toml: r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-turbo.build_task = "compile"
-"#,
-                expected_build_task: Some("compile"),
-            },
-            Case {
-                name: "empty build_task opts out of batch build",
-                toml: r#"
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-turbo.build_task = ""
-"#,
-                expected_build_task: Some(""),
-            },
-        ];
-
-        for case in cases {
-            let config: Config = case.toml.parse().unwrap();
-            let svc = config.services.get("web").unwrap();
-            let Some(ServiceKind::Turbo(turbo)) = &svc.kind else {
-                panic!("case '{}': expected turbo kind", case.name);
-            };
-            assert_eq!(
-                turbo.build_task.as_deref(),
-                case.expected_build_task,
-                "case: {}",
-                case.name
-            );
-        }
     }
 
     #[test]

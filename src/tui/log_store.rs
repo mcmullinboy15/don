@@ -1,34 +1,112 @@
-//! Bounded store of formatted log lines for replay on filter change.
+//! The TUI's copy of don's merged log stream.
 //!
-//! The TUI uses `Terminal::insert_before` for live log flow, which pushes
-//! lines into the terminal's native scrollback. We keep an in-memory copy
-//! of recent lines so that when the filter changes — the one case where we
-//! clear the screen — we can replay matching lines into the now-empty
-//! viewport without losing them.
+//! Every line don sends this client lands here, unfiltered and unabridged.
+//! What the user sees is a view over it (see [`super::logs`]); the store itself
+//! never decides what is worth keeping, because the alternative — filtering at
+//! ingest — makes widening a filter reveal nothing, since the lines it would
+//! have shown were discarded on the way in.
 //!
-//! Lines older than the capacity are evicted silently; the user's terminal
-//! scrollback is a separate, larger store that we don't manage.
+//! Entries are keyed by don's own [`LogId`], not by a number this store mints.
+//! That is what lets two clients refer to the same line, lets a reconnecting
+//! client ask for exactly what it missed, and lets a gap be reported as a
+//! measured hole rather than a silent thinning.
+//!
+//! ## What is cached, and why
+//!
+//! Two things are expensive per frame and cheap per line:
+//!
+//! - **Parsing.** Upstream hands us pre-rendered ANSI bytes. Turning those into
+//!   a styled [`Line`] is done once, at push. A full-screen repaint touches
+//!   every visible line every frame, so parsing at render would tie frame cost
+//!   to screen height *and* re-do identical work forever.
+//! - **Wrapped row counts.** How many rows a line occupies depends on the pane
+//!   width, and the pane needs the total before it draws — to place the scroll
+//!   anchor and size the scrollbar. Recomputed only when the width changes.
 
 use std::collections::VecDeque;
 
-use crate::output::FormattedLogLine;
+use ratatui::text::Line;
 
-/// Default cap. Large enough to cover a few screens of history at typical
-/// terminal heights (80–120 rows) while bounding memory growth.
-pub(crate) const DEFAULT_CAPACITY: usize = 5_000;
+use crate::output::{FormattedLogLine, LogId};
 
-/// A bounded, time-ordered buffer of formatted log lines.
+/// Default cap on retained lines.
+///
+/// This is the TUI's scrollback now, not a replay cache for the terminal's own
+/// history — there is no terminal history to fall back on in the alternate
+/// screen. Sized to match don's merged store, so what the user can scroll to is
+/// what don still holds.
+pub(crate) const DEFAULT_CAPACITY: usize = crate::output::DEFAULT_MERGED_HISTORY_CAPACITY;
+
+/// Cap on retained diagnostics.
+///
+/// don's own narration is for answering "why did that not rebuild" in the
+/// moment, not for scrolling back through. It is also the noisiest thing in the
+/// system when a watch is busy, so giving it the same scrollback as the
+/// processes' output spends a lot of memory on lines nobody reads.
+pub(crate) const DEBUG_CAPACITY: usize = 500;
+
+/// How far past `capacity` the store will grow to keep a scrolled reader's
+/// place. Beyond this their anchor is dropped like anything else — a reader who
+/// has walked away is not worth an unbounded buffer.
+const PINNED_OVERDRAFT: usize = 2;
+
+/// A bounded, time-ordered buffer of the merged stream.
 pub(crate) struct LogStore {
     entries: VecDeque<StoredLogLine>,
     capacity: usize,
-    next_id: u64,
+    next_id: LogId,
+    /// The width `wrapped_rows` was computed against. `None` before the first
+    /// reflow.
+    wrapped_at: Option<u16>,
+    /// The oldest id the view still needs, set while the reader is scrolled
+    /// back. See [`Self::set_pin`].
+    pin: Option<LogId>,
+    /// Columns the name column takes. Every prefix the sink renders is padded
+    /// to the same width, so one number describes the whole pane; lines with no
+    /// prefix at all (the TUI's own notices) do not move it.
+    name_column: usize,
 }
 
-/// One stored log line plus its monotonically increasing sequence id.
+/// One stored line: what don sent, parsed once, measured once.
 pub(crate) struct StoredLogLine {
-    #[allow(dead_code)] // retained for future filtering/replay needs.
-    pub(crate) id: u64,
+    pub(crate) id: LogId,
     pub(crate) line: FormattedLogLine,
+    /// The styled form, parsed at push. Owned (`'static`) so the store can hand
+    /// it out without tying the borrow to the raw bytes.
+    pub(crate) parsed: Line<'static>,
+    /// Rows this line occupies at the store's current wrap width.
+    wrapped_rows: usize,
+    /// Columns the `name | ` prefix occupies, so the pane can hold it in its
+    /// own column and indent what wraps underneath it. Measured from the
+    /// prefix the sink sent, not recovered from the text.
+    prefix_cols: usize,
+}
+
+impl StoredLogLine {
+    /// Rows this line occupies at the width the store last reflowed to.
+    pub(crate) fn wrapped_rows(&self) -> usize {
+        self.wrapped_rows
+    }
+
+    /// Columns the process-name column takes on every row of this line.
+    pub(crate) fn prefix_cols(&self) -> usize {
+        self.prefix_cols
+    }
+
+    /// The message as plain text, without don's `name │ ` column.
+    ///
+    /// Taken from the parsed form rather than the raw bytes so the offsets it
+    /// yields are the ones the pane laid out — the raw bytes still carry the
+    /// escape sequences that became styles, and counting through those would
+    /// put every offset past the first colour in the wrong place.
+    pub(crate) fn message_text(&self) -> String {
+        self.parsed
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .skip(self.prefix_cols)
+            .collect()
+    }
 }
 
 impl LogStore {
@@ -36,51 +114,154 @@ impl LogStore {
     /// drops every push.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: VecDeque::with_capacity(capacity.min(DEFAULT_CAPACITY)),
+            entries: VecDeque::new(),
             capacity,
-            next_id: 0,
+            next_id: LogId::ZERO,
+            wrapped_at: None,
+            pin: None,
+            name_column: 0,
         }
     }
 
-    /// Push a line, evicting the oldest if at capacity. Returns the line's
-    /// sequence id.
-    pub(crate) fn push(&mut self, line: FormattedLogLine) -> u64 {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+    /// Hold history from `id` onward while the reader is scrolled back there.
+    ///
+    /// Without this the buffer evicts under a reader who is looking at it: the
+    /// line they anchored to ages out, the view falls back to the oldest line
+    /// that survives, and since that keeps changing the pane walks away from
+    /// them. How fast depends only on the line rate — at fifty thousand lines
+    /// of capacity and fifty thousand lines a second, an anchor lasts about a
+    /// second, which is what a stack in a logging feedback loop felt like.
+    ///
+    /// `None` while following, which is the normal state and evicts as usual.
+    /// Bounded by [`PINNED_OVERDRAFT`], so a reader who scrolls up and leaves
+    /// cannot grow this without limit.
+    pub(crate) fn set_pin(&mut self, pin: Option<LogId>) {
+        self.pin = pin;
+    }
+
+    /// Store a line under the id don's merged stream gave it, evicting the
+    /// oldest if at capacity.
+    pub(crate) fn push(&mut self, id: LogId, line: FormattedLogLine) {
+        self.next_id = LogId(id.0.saturating_add(1));
         if self.capacity == 0 {
-            return id;
+            return;
         }
-        if self.entries.len() >= self.capacity {
+        // The two halves arrive already separated, so the column boundary is
+        // known rather than recovered: parse the prefix on its own to measure
+        // it, then the whole row for rendering.
+        let prefix_cols = super::parse_ansi_line(&line.prefix)
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+        if prefix_cols > 0 {
+            self.name_column = prefix_cols;
+        }
+        let mut joined = Vec::with_capacity(line.prefix.len() + line.bytes.len());
+        joined.extend_from_slice(&line.prefix);
+        joined.extend_from_slice(&line.bytes);
+        let parsed = super::parse_ansi_line(&joined);
+        let wrapped_rows = match self.wrapped_at {
+            Some(width) => super::logs::count_wrapped_rows(&parsed, prefix_cols, width),
+            None => 1,
+        };
+        // An id already held is a progress frame repainting itself, not a new
+        // line — see `MergedLogTap::publish_frame`. Only ever the newest line
+        // is repainted, so this looks no further back than the last entry.
+        if let Some(back) = self.entries.back_mut().filter(|back| back.id == id) {
+            back.line = line;
+            back.parsed = parsed;
+            back.wrapped_rows = wrapped_rows;
+            back.prefix_cols = prefix_cols;
+            return;
+        }
+        let ceiling = self.capacity.saturating_mul(PINNED_OVERDRAFT);
+        while self.entries.len() >= self.capacity {
+            let holding_the_readers_place = self.entries.len() < ceiling
+                && match (self.pin, self.entries.front()) {
+                    (Some(pin), Some(front)) => front.id >= pin,
+                    _ => false,
+                };
+            if holding_the_readers_place {
+                break;
+            }
             self.entries.pop_front();
         }
-        self.entries.push_back(StoredLogLine { id, line });
-        id
+        self.entries.push_back(StoredLogLine {
+            id,
+            line,
+            parsed,
+            wrapped_rows,
+            prefix_cols,
+        });
     }
 
-    /// Iterate oldest-first. Used by filter-change replay to rerender
-    /// matching lines into the freshly-cleared terminal.
+    /// Recompute cached row counts for a new pane width.
+    ///
+    /// A no-op when the width has not moved, which is every frame but the ones
+    /// straddling a resize.
+    pub(crate) fn reflow(&mut self, width: u16) {
+        if self.wrapped_at == Some(width) {
+            return;
+        }
+        self.wrapped_at = Some(width);
+        for entry in &mut self.entries {
+            entry.wrapped_rows =
+                super::logs::count_wrapped_rows(&entry.parsed, entry.prefix_cols, width);
+        }
+    }
+
+    /// Iterate oldest-first over everything held.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &StoredLogLine> {
         self.entries.iter()
     }
 
-    /// Iterate oldest-first over entries with `id >= since`. Used by the
-    /// TUI to replay only lines that arrived during a pause window without
-    /// re-emitting earlier lines that are already in the user's scrollback.
-    pub(crate) fn iter_since(&self, since: u64) -> impl Iterator<Item = &StoredLogLine> {
-        self.entries.iter().filter(move |e| e.id >= since)
+    /// The oldest id still held, for a reader deciding what it has missed.
+    pub(crate) fn oldest_id(&self) -> Option<LogId> {
+        self.entries.front().map(|entry| entry.id)
     }
 
-    /// Id the next pushed line will receive. Save this before a pause to
-    /// distinguish lines that arrive during the pause from those already
-    /// stored.
-    pub(crate) fn next_id(&self) -> u64 {
+    /// Iterate from the first entry with `id >= from`.
+    ///
+    /// A binary search rather than a scan: ids ascend, and the callers that
+    /// want this — the view index mending itself, the renderer taking the
+    /// visible window — would otherwise walk the whole store to reach a
+    /// screenful near the end of it.
+    pub(crate) fn iter_from(&self, from: LogId) -> impl Iterator<Item = &StoredLogLine> {
+        let at = self.entries.partition_point(|entry| entry.id < from);
+        self.entries.iter().skip(at)
+    }
+
+    /// The line stored under `id`, if it is still held.
+    ///
+    /// Ids ascend, so this is a binary search. Used by the pane to fetch the
+    /// lines the view index selected, rather than re-deciding which lines those
+    /// are — see [`super::logs::build_view`].
+    pub(crate) fn get(&self, id: LogId) -> Option<&StoredLogLine> {
+        let at = self.entries.partition_point(|entry| entry.id < id);
+        self.entries.get(at).filter(|entry| entry.id == id)
+    }
+
+    /// Id the next stream line is expected to have.
+    ///
+    /// Test-only now. It used to be handed out to the blank that Enter
+    /// inserted, which is exactly the collision that stopped being a good idea
+    /// — an id belongs to the stream, and nothing local should spend one.
+    #[cfg(test)]
+    pub(crate) fn next_id(&self) -> LogId {
         self.next_id
     }
 
     /// Id of the most recently stored line, if any.
+    ///
+    /// Test-only. Enter's blank mark used it once, and marking the newest
+    /// *stored* line was the bug: with hidden services chattering, the newest
+    /// stored line is usually one the filter does not admit, so the mark
+    /// rendered nothing. What the display marks is the newest *visible* line,
+    /// which only the renderer knows.
     #[cfg(test)]
-    pub(crate) fn latest_id(&self) -> Option<u64> {
-        self.next_id.checked_sub(1)
+    pub(crate) fn latest_id(&self) -> Option<LogId> {
+        self.entries.back().map(|entry| entry.id)
     }
 
     /// Number of lines currently stored.
@@ -99,45 +280,306 @@ mod tests {
         FormattedLogLine {
             name: name.to_string(),
             is_lifecycle: false,
+            is_verbose: false,
+            prefix: Vec::new(),
             bytes: body.as_bytes().to_vec(),
         }
+    }
+
+    /// A blank the reader asked for must not be a stored line.
+    ///
+    /// It used to be pushed under `next_id` — the id the next real line would
+    /// arrive with. So either that line replaced the blank, or both sat under
+    /// one id and the store's binary searches began answering with whichever
+    /// came first, which is how logs appeared in the blank space and then
+    /// vanished.
+    #[test]
+    fn a_stream_line_never_lands_on_top_of_a_local_blank() {
+        let mut store = LogStore::with_capacity(10);
+        store.reflow(80);
+        store.push(LogId(0), line("api", "first"));
+
+        // What Enter does now: mark a line it can see, touching nothing.
+        let marked = store.latest_id().unwrap();
+        assert_eq!(marked, LogId(0));
+        assert_eq!(store.next_id(), LogId(1), "the mark takes no id");
+
+        // The next real line arrives under the id the blank used to steal.
+        store.push(LogId(1), line("api", "second"));
+        let got: Vec<String> = store
+            .iter()
+            .map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned())
+            .collect();
+        assert_eq!(got, vec!["first", "second"], "both lines survive");
+        assert_eq!(
+            store.get(LogId(1)).map(|e| e.id),
+            Some(LogId(1)),
+            "and each id still resolves to its own line"
+        );
+    }
+
+    /// A reader scrolled back keeps their place: the lines they are looking at
+    /// are not evicted under them just because newer ones arrived.
+    #[test]
+    fn a_pin_holds_history_where_the_reader_is() {
+        struct Case {
+            name: &'static str,
+            capacity: usize,
+            pin: Option<u64>,
+            /// Lines pushed, ids 0..n.
+            pushes: u64,
+            want_oldest: u64,
+            want_len: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "following evicts as usual",
+                capacity: 10,
+                pin: None,
+                pushes: 30,
+                want_oldest: 20,
+                want_len: 10,
+            },
+            Case {
+                name: "a pin holds everything from it onward",
+                capacity: 10,
+                pin: Some(15),
+                pushes: 30,
+                want_oldest: 15,
+                want_len: 15,
+            },
+            Case {
+                // A pin inside the window the store would keep anyway changes
+                // nothing: it only ever prevents eviction, never forces it.
+                name: "a pin ahead of the normal window is a no-op",
+                capacity: 10,
+                pin: Some(25),
+                pushes: 30,
+                want_oldest: 20,
+                want_len: 10,
+            },
+            Case {
+                // Twice capacity is the ceiling: a reader who scrolled up and
+                // wandered off does not get an unbounded buffer.
+                name: "the overdraft is bounded",
+                capacity: 10,
+                pin: Some(0),
+                pushes: 100,
+                want_oldest: 80,
+                want_len: 20,
+            },
+        ];
+
+        for case in cases {
+            let mut store = LogStore::with_capacity(case.capacity);
+            store.reflow(80);
+            store.set_pin(case.pin.map(LogId));
+            for id in 0..case.pushes {
+                store.push(LogId(id), line("svc", "a line of output"));
+            }
+            assert_eq!(
+                store.oldest_id(),
+                Some(LogId(case.want_oldest)),
+                "{}: oldest retained",
+                case.name
+            );
+            assert_eq!(store.len(), case.want_len, "{}: retained count", case.name);
+        }
+    }
+
+    /// Releasing the pin lets the backlog drain back to capacity, so returning
+    /// to the tail does not leave the overdraft held forever.
+    #[test]
+    fn clearing_the_pin_drains_the_overdraft() {
+        let mut store = LogStore::with_capacity(10);
+        store.reflow(80);
+        store.set_pin(Some(LogId(0)));
+        for id in 0..20 {
+            store.push(LogId(id), line("svc", "x"));
+        }
+        assert_eq!(store.len(), 20, "held while pinned");
+
+        store.set_pin(None);
+        store.push(LogId(20), line("svc", "x"));
+        assert_eq!(store.len(), 10, "back to capacity once the reader follows");
     }
 
     #[test]
     fn push_grows_length_up_to_capacity() {
         let mut store = LogStore::with_capacity(10);
-        store.push(line("a", "first"));
-        store.push(line("b", "second"));
-        store.push(line("a", "third"));
+        store.push(LogId(0), line("a", "first"));
+        store.push(LogId(1), line("b", "second"));
+        store.push(LogId(2), line("a", "third"));
         assert_eq!(store.len(), 3);
     }
 
     #[test]
     fn push_at_capacity_evicts_oldest() {
         let mut store = LogStore::with_capacity(3);
-        store.push(line("a", "1"));
-        store.push(line("a", "2"));
-        store.push(line("a", "3"));
-        store.push(line("a", "4"));
-
+        for id in 0..4 {
+            store.push(LogId(id), line("a", "x"));
+        }
         assert_eq!(store.len(), 3);
+        assert_eq!(
+            store.iter().next().map(|entry| entry.id),
+            Some(LogId(1)),
+            "the oldest goes first"
+        );
     }
 
     #[test]
     fn zero_capacity_drops_every_push() {
         let mut store = LogStore::with_capacity(0);
-        store.push(line("a", "1"));
-        store.push(line("a", "2"));
+        store.push(LogId(0), line("a", "1"));
+        store.push(LogId(1), line("a", "2"));
         assert_eq!(store.len(), 0);
     }
 
+    /// Ids come from don's merged stream, so the store carries whatever it is
+    /// given rather than counting for itself — a client resuming mid-stream
+    /// starts at a non-zero id, and one that lost lines skips.
     #[test]
-    fn latest_id_tracks_most_recent_push() {
-        let mut store = LogStore::with_capacity(2);
+    fn stored_ids_are_the_streams_own() {
+        let mut store = LogStore::with_capacity(10);
         assert_eq!(store.latest_id(), None);
-        assert_eq!(store.push(line("a", "1")), 0);
-        assert_eq!(store.latest_id(), Some(0));
-        assert_eq!(store.push(line("a", "2")), 1);
-        assert_eq!(store.latest_id(), Some(1));
+        assert_eq!(store.next_id(), LogId::ZERO);
+
+        store.push(LogId(500), line("a", "resumed"));
+        assert_eq!(store.latest_id(), Some(LogId(500)));
+        assert_eq!(store.next_id(), LogId(501));
+
+        store.push(LogId(900), line("a", "after a drop"));
+        assert_eq!(store.latest_id(), Some(LogId(900)));
+        assert_eq!(store.iter().count(), 2, "both survive; ids simply skip");
+    }
+
+    /// The pane needs a row count before it draws, so the store measures at
+    /// push and re-measures only when the width moves.
+    #[test]
+    fn row_counts_track_the_wrap_width() {
+        struct Case {
+            name: &'static str,
+            width: u16,
+            want_rows: usize,
+        }
+
+        let cases = vec![
+            Case {
+                name: "wide enough for one row",
+                width: 40,
+                want_rows: 1,
+            },
+            Case {
+                name: "half the width doubles it",
+                width: 10,
+                want_rows: 2,
+            },
+            Case {
+                name: "a quarter quadruples it",
+                width: 5,
+                want_rows: 4,
+            },
+        ];
+
+        for case in cases {
+            let mut store = LogStore::with_capacity(10);
+            store.reflow(case.width);
+            store.push(LogId(0), line("a", "12345678901234567890"));
+            assert_eq!(
+                store.iter().next().unwrap().wrapped_rows(),
+                case.want_rows,
+                "{}: at push",
+                case.name
+            );
+
+            // And a line pushed before the width was known catches up on
+            // reflow rather than staying wrong.
+            let mut later = LogStore::with_capacity(10);
+            later.push(LogId(0), line("a", "12345678901234567890"));
+            later.reflow(case.width);
+            assert_eq!(
+                later.iter().next().unwrap().wrapped_rows(),
+                case.want_rows,
+                "{}: after reflow",
+                case.name
+            );
+        }
+    }
+
+    /// Parsing happens once, at push — a repaint touches every visible line
+    /// every frame, so doing it at render would tie frame cost to screen height
+    /// and redo identical work forever.
+    #[test]
+    fn ansi_is_parsed_into_styles_at_push() {
+        let mut store = LogStore::with_capacity(10);
+        store.push(LogId(0), line("a", "\x1b[31mred\x1b[0m plain"));
+        let entry = store.iter().next().unwrap();
+        assert!(
+            entry.parsed.spans.len() >= 2,
+            "the escape should have split the line into styled spans"
+        );
+        assert_eq!(
+            entry.parsed.spans[0].style.fg,
+            Some(ratatui::style::Color::Red),
+            "and the colour should have survived"
+        );
+    }
+
+    /// A repeated id is a progress frame repainting itself, not a new line —
+    /// the store has to update in place or the pane grows a line per redraw.
+    #[test]
+    fn a_repeated_id_replaces_rather_than_appends() {
+        struct Case {
+            name: &'static str,
+            /// `(id, body)` in push order.
+            pushes: &'static [(u64, &'static str)],
+            want: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                name: "the same id lands once, holding the newest content",
+                pushes: &[(0, "10%"), (0, "50%"), (0, "90%")],
+                want: &["90%"],
+            },
+            Case {
+                name: "a new id still appends",
+                pushes: &[(0, "10%"), (0, "90%"), (1, "done")],
+                want: &["90%", "done"],
+            },
+            Case {
+                name: "only the newest line is replaceable",
+                pushes: &[(0, "one"), (1, "two"), (0, "not me")],
+                want: &["one", "two", "not me"],
+            },
+        ];
+
+        for case in cases {
+            let mut store = LogStore::with_capacity(10);
+            store.reflow(80);
+            for (id, body) in case.pushes {
+                store.push(LogId(*id), line("bazel", body));
+            }
+            let got: Vec<String> = store
+                .iter()
+                .map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned())
+                .collect();
+            assert_eq!(got, case.want, "{}", case.name);
+        }
+    }
+
+    /// A frame that changes height has to change the row count with it, or the
+    /// scroll arithmetic keeps using the old one.
+    #[test]
+    fn replacing_a_line_remeasures_it() {
+        let mut store = LogStore::with_capacity(10);
+        store.reflow(10);
+        store.push(LogId(0), line("bazel", "short"));
+        assert_eq!(store.get(LogId(0)).unwrap().wrapped_rows(), 1);
+
+        store.push(LogId(0), line("bazel", "a much longer frame that wraps"));
+        assert_eq!(store.len(), 1, "still one line");
+        assert_eq!(store.get(LogId(0)).unwrap().wrapped_rows(), 3);
     }
 }

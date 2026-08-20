@@ -1,11 +1,13 @@
-//! Input task — forwards crossterm key events to the TUI loop.
+//! Input task — forwards crossterm events to the TUI loop.
 //!
-//! Thin by design: we don't interpret keys here because interpretation
-//! depends on the current view mode, which lives in the main loop. The
-//! only filtering done here is dropping release events (which ratatui
-//! also doesn't care about) and resize→no-op-payload conversion.
+//! Thin by design: we don't interpret input here because interpretation
+//! depends on the current view mode and on where the panes ended up, both of
+//! which live in the main loop. The only filtering done here is dropping
+//! events nothing acts on — key releases, and the mouse *moves* that arrive
+//! between drags, which would otherwise wake the loop thousands of times for
+//! nothing.
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind, MouseEventKind};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
@@ -27,12 +29,17 @@ pub(crate) async fn run(tx: mpsc::Sender<AppEvent>) {
 }
 
 /// Convert a crossterm event to an [`AppEvent`], returning `None` for events
-/// the TUI doesn't care about (key releases, mouse, focus, paste).
+/// the TUI doesn't act on (key releases, bare mouse motion, focus, paste).
 fn translate(event: Event) -> Option<AppEvent> {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Release => None,
         Event::Key(key) => Some(AppEvent::Key(key)),
         Event::Resize(_, _) => Some(AppEvent::Resize),
+        // Motion with no button held should not arrive at all — `?1003h` is
+        // deliberately off, see MOUSE_ON — but a terminal that sends it
+        // anyway must not wake the loop for events nothing acts on.
+        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => None,
+        Event::Mouse(mouse) => Some(AppEvent::Mouse(mouse)),
         _ => None,
     }
 }
@@ -75,5 +82,28 @@ mod tests {
             translate(Event::Resize(80, 24)),
             Some(AppEvent::Resize)
         ));
+    }
+
+    /// Bare motion never wakes the loop; a drag always does — dragging is how
+    /// selection works.
+    #[test]
+    fn bare_motion_dropped_drags_forwarded() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let moved = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(translate(moved).is_none());
+
+        let drag = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(translate(drag).is_some());
     }
 }

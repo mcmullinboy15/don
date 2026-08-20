@@ -1,20 +1,17 @@
-//! Rendering primitives for the TUI.
+//! Rendering for the TUI.
 //!
-//! Two entry points:
-//! - [`draw_bar`] fills the single-row inline viewport with the status bar.
-//!   It's called on every state change while the inline terminal is active.
-//! - [`draw_modal`] renders full-screen content (filter, task/service tables,
-//!   form) into an alt-screen [`Terminal`]. It's called whenever the
-//!   modal's app state changes.
+//! One entry point, [`draw`], which paints the whole screen every frame: the
+//! log pane, the status bar, and whichever full-screen view or overlay the
+//! current mode calls for. All of it is a pure function of [`App`], the
+//! [`LogStore`] and the frame size — no cursor math, no incremental writes, no
+//! knowledge of what changed since last time.
 //!
-//! All UI output is a pure function of the [`App`] state plus the frame size —
-//! no cursor math, no incremental writes.
+//! That last part is the point. The old renderer had two entry points against
+//! two different terminals, and every caller had to decide which one to invoke
+//! and whether the log flow underneath needed replaying. Painting everything,
+//! every frame, from one source of truth removes the question.
 //!
-//! Log lines are *not* rendered here; they go into scrollback above the inline
-//! viewport via [`Terminal::insert_before`].
-//!
-//! [`Terminal`]: ratatui::Terminal
-//! [`Terminal::insert_before`]: ratatui::Terminal::insert_before
+//! [`LogStore`]: super::log_store::LogStore
 
 use std::collections::HashMap;
 
@@ -33,30 +30,423 @@ use super::app::{App, OverlayItem, StatusCounts, TaskStatusItem, ViewMode};
 use super::failure_summary;
 use super::filter::{FilterFocus, FilterRow, FilterState};
 use super::status_table::{StatusTableView, draw_status_table};
-use crate::runner::{ServiceState, TaskItemState};
+use crate::client::{ServiceState, TaskState};
 use crate::task_state::TaskRunInfo;
 
-/// Total rows the inline viewport reserves: 1 blank buffer row + 3 rows
-/// for the bordered status box (top border + content + bottom border).
-pub(crate) const BAR_VIEWPORT_HEIGHT: u16 = 4;
+/// Rows the status bar occupies at the bottom of the screen: top border,
+/// content, bottom border.
+pub(crate) const BAR_HEIGHT: u16 = 3;
+
+/// The rectangle log text actually occupies: the log pane minus its border.
+///
+/// The one definition of that inset. The store wraps against this width, the
+/// selection clamps against this origin, and the renderer paints inside it —
+/// three readers, and any two of them computing the inset independently is a
+/// one-cell disagreement that shows up as a selection off by a column.
+pub(crate) fn log_text_area(area: Rect, panel: super::panes::Panel, panel_open: bool) -> Rect {
+    inner(super::panes::layout(area, BAR_HEIGHT, panel, panel_open).logs)
+}
+
+/// `Block::inner` for a plain full border, without needing the block.
+fn inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+/// Width available to log text, which is what the store wraps against.
+pub(crate) fn log_pane_width(area: Rect, panel: super::panes::Panel, panel_open: bool) -> u16 {
+    log_text_area(area, panel, panel_open).width.max(1)
+}
+
+/// Paint the whole screen.
+pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_store::LogStore) {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let panes = super::panes::layout(area, BAR_HEIGHT, app.panel, app.panel_open());
+    app.panes = panes;
+    // Write the extent the layout actually granted back to the stored one, so
+    // the two can never drift. A stored extent past what the terminal honours
+    // would make keyboard resizing dead for as many presses as the overshoot —
+    // adjusting a number the screen is not showing.
+    if let Some(rect) = panes.status {
+        app.panel.extent = match app.panel.side {
+            super::panes::PaneSide::Right => rect.width,
+            super::panes::PaneSide::Bottom => rect.height,
+        };
+    }
+
+    // Clamp the scroll positions the overlays own before drawing them: they are
+    // bounded by geometry only this function knows.
+    app.sync_log_popup_scroll(log_popup_visible_rows(area));
+    if app.view_mode == ViewMode::Failures {
+        let max_scroll = failure_summary_max_scroll(area, app);
+        app.sync_failure_summary_scroll(max_scroll);
+    }
+
+    draw_log_pane(frame, app, store, panes.logs);
+
+    // The services, tasks and filter views live in the side panel, beside a
+    // log that keeps flowing — acting on a process and watching what it prints
+    // are one activity, and the old full-screen tables forced a choice.
+    // Cleared first because the widgets only paint the cells they use, and a
+    // shrinking table would otherwise leave its old rows behind.
+    if let Some(panel_area) = panes.status {
+        frame.render_widget(Clear, panel_area);
+        match app.view_mode {
+            ViewMode::Services => draw_services_table(frame, app, panel_area),
+            ViewMode::Tasks => draw_tasks_table(frame, app, panel_area),
+            ViewMode::Filter => draw_filter_modal(frame, app, panel_area),
+            _ => {}
+        }
+    }
+    draw_bar(frame, app, panes.bar);
+
+    // The failure summary and the param form stay full-screen: both demand a
+    // decision, where a panel is for acting while still watching output. They
+    // wipe what is under them first — the widgets only paint their own cells.
+    if matches!(app.view_mode, ViewMode::Failures | ViewMode::Form) {
+        frame.render_widget(Clear, area);
+    }
+    match app.view_mode {
+        ViewMode::Failures => draw_failure_summary(frame, app),
+        ViewMode::Form => draw_form_modal(frame, app),
+        _ => {}
+    }
+    // The per-process log popup is a centred overlay and clears its own rect.
+    draw_log_popup(frame, app);
+    // The attached process floats above everything: it owns the keyboard
+    // while it is open, so it should look like it does.
+    draw_attach_window(frame, app);
+}
+
+/// What became of the process a window was attached to.
+///
+/// Read from don's own record rather than from anything the connection said,
+/// because the connection only knows that it closed — the difference between a
+/// task that completed and one that failed lives here.
+fn attached_process_state(app: &App, name: &str) -> Cow<'static, str> {
+    if let Some(state) = app.tasks_state.get(name) {
+        return task_state_label(*state, &[]);
+    }
+    if let Some(state) = app.services_state.get(name) {
+        return service_state_label(*state, false, &[]);
+    }
+    Cow::Borrowed("ended")
+}
+
+/// Draw the attached process's screen into its floating window.
+///
+/// Cell by cell rather than as text, because a terminal grid is not lines:
+/// each cell carries its own colours and attributes, and a program that draws
+/// a box or a status bar depends on every one of them landing where it put it.
+fn draw_attach_window(frame: &mut Frame<'_>, app: &App) {
+    use crate::output::emulator::CellColor;
+
+    let Some(view) = app.attach.as_ref() else {
+        return;
+    };
+    let area = view.window.to_rect();
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    // An ended window is a record, not a terminal: dimmed, and titled with
+    // what became of the process rather than with keys that no longer do
+    // anything to it.
+    let (border, title) = if view.ended {
+        (
+            Color::DarkGray,
+            format!(
+                " {} — {} · any key dismisses ",
+                view.name,
+                attached_process_state(app, &view.name)
+            ),
+        )
+    } else {
+        (Color::Cyan, format!(" {} — [^D] detach ", view.name))
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let Some(grid) = view.grid.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "connecting…",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner,
+        );
+        return;
+    };
+
+    let convert = |color: CellColor, fallback: Option<Color>| -> Option<Color> {
+        match color {
+            CellColor::Default => fallback,
+            CellColor::Palette(index) => Some(Color::Indexed(index)),
+            CellColor::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+        }
+    };
+
+    let buffer = frame.buffer_mut();
+    for row in 0..inner.height.min(grid.rows) {
+        for col in 0..inner.width.min(grid.cols) {
+            let Some(cell) = grid
+                .cells
+                .get(usize::from(row) * usize::from(grid.cols) + usize::from(col))
+            else {
+                continue;
+            };
+            let Some(target) = buffer.cell_mut((inner.x + col, inner.y + row)) else {
+                continue;
+            };
+            // An empty grapheme is the tail of a wide character, whose head
+            // already painted both columns — leave whatever it put there.
+            if cell.text.is_empty() {
+                continue;
+            }
+            target.set_symbol(&cell.text);
+            let mut style = Style::default();
+            if let Some(fg) = convert(cell.fg, None) {
+                style = style.fg(fg);
+            }
+            if let Some(bg) = convert(cell.bg, None) {
+                style = style.bg(bg);
+            }
+            if cell.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if cell.faint {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            if cell.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if cell.underline {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            if cell.inverse {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            if cell.strikethrough {
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            target.set_style(style);
+        }
+    }
+
+    // Put the real cursor where the process thinks it is, so anything that
+    // asks the reader to type shows them where.
+    if grid.cursor_visible {
+        let (x, y) = grid.cursor;
+        if x < inner.width && y < inner.height {
+            frame.set_cursor_position((inner.x + x, inner.y + y));
+        }
+    }
+}
+
+/// Render the visible slice of the log, plus a scroll indicator when the view
+/// is not pinned to the newest line.
+fn draw_log_pane(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    store: &super::log_store::LogStore,
+    area: Rect,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    // The pane is a bordered box like everything else on screen, so the lines
+    // between regions are all the same kind of line. Text lives in the inner
+    // rect; every geometry below uses it, and the standalone helpers
+    // (`log_text_area`) apply the same inset so the input layer agrees.
+    let focused = app.focus == super::panes::Focus::Logs;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
+        .title(if app.debug_view {
+            " don's log "
+        } else {
+            " logs "
+        });
+    let text_area = block.inner(area);
+    frame.render_widget(block, area);
+    if text_area.height == 0 || text_area.width == 0 {
+        return;
+    }
+    let area = text_area;
+    // Mend the index before reading it: this is the one place that knows the
+    // pane's width, and the filter may have moved since the last frame.
+    let key = super::view_index::ViewKey {
+        width: area.width,
+        filter: app.log_filter_fingerprint(),
+    };
+    let mut index = std::mem::take(&mut app.view_index);
+    index.sync(store, key, &app.blank_after, |entry| {
+        app.should_render_log(&entry.line.name, entry.line.is_lifecycle)
+    });
+    // The one place scroll position is decided, now that the index is current
+    // and the pane's height is known.
+    app.log_scroll =
+        super::logs::resolve_scroll(&index, app.log_scroll, app.pending_scroll, area.height);
+    app.pending_scroll = super::app::PendingScroll::default();
+    let view = super::logs::build_view(
+        store,
+        &index,
+        &app.blank_after,
+        app.log_scroll,
+        area.width,
+        area.height,
+    );
+    app.view_index = index;
+    // Remembered for the input layer: scrolling needs to know how far it can
+    // go, and only the renderer knows how tall the pane came out.
+    app.log_rows_above = view.rows_above;
+    app.log_total_rows = view.total_rows;
+    app.log_pane_height = area.height;
+
+    // Top-aligned: a log shorter than the pane starts at the top and grows
+    // down, the way a terminal does. Bottom-anchoring it would leave the first
+    // line of a fresh run stranded under a screenful of blanks.
+    let following = view.following;
+    let rows_below = view
+        .total_rows
+        .saturating_sub(view.rows_above + area.height as usize);
+
+    // The plain text of what is about to be on screen, kept so a copy resolves
+    // against exactly the rows the user dragged across — after wrapping, after
+    // filtering, after scrolling, with no need to re-derive any of it.
+    app.log_visible_rows = view
+        .rows
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    app.log_row_sources = view.row_sources.clone();
+    app.log_pane_origin = (area.x, area.y);
+
+    let selection = app.log_selection;
+    let rows: Vec<Line<'_>> = if selection.is_empty() {
+        view.rows
+    } else {
+        view.rows
+            .into_iter()
+            .zip(view.row_sources)
+            .map(|(line, source)| highlight_selected(line, &selection, source))
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(rows), area);
+
+    // Only when something is actually below the view. A selection pins the
+    // view at the tail without following, and announcing "scrolled — 0 rows
+    // below" for that state is a badge contradicting itself; the moment new
+    // output puts real rows below, it appears with a true number.
+    if !following && rows_below > 0 {
+        draw_scroll_badge(frame, area, rows_below);
+    }
+}
+
+/// Re-style the cells of one row that fall inside the selection.
+///
+/// Splits spans at the selection boundary rather than styling whole spans: a
+/// selection almost never lines up with where the upstream formatter changed
+/// colour, and highlighting the whole span would make the selection look like
+/// it covers more than it does.
+fn highlight_selected<'a>(
+    line: Line<'a>,
+    selection: &super::selection::Selection,
+    source: super::logs::RowSource,
+) -> Line<'a> {
+    let mut out: Vec<Span<'a>> = Vec::with_capacity(line.spans.len());
+    // Columns within the row, so the prefix is simply below the message's
+    // first offset and never selectable.
+    let mut column = 0usize;
+    for span in line.spans {
+        let mut run = String::new();
+        let mut run_selected: Option<bool> = None;
+        for ch in span.content.chars() {
+            let selected = column >= source.indent
+                && selection.contains(super::selection::Point::at(source, column));
+            if run_selected != Some(selected) && !run.is_empty() {
+                out.push(styled_run(&run, span.style, run_selected == Some(true)));
+                run.clear();
+            }
+            run_selected = Some(selected);
+            run.push(ch);
+            column += 1;
+        }
+        if !run.is_empty() {
+            out.push(styled_run(&run, span.style, run_selected == Some(true)));
+        }
+    }
+    Line::from(out)
+}
+
+fn styled_run(text: &str, style: Style, selected: bool) -> Span<'static> {
+    if selected {
+        Span::styled(text.to_string(), style.add_modifier(Modifier::REVERSED))
+    } else {
+        Span::styled(text.to_string(), style)
+    }
+}
+
+/// A small right-aligned marker saying the view is held above the live tail.
+///
+/// Without it, a scrolled-up pane during a quiet period is indistinguishable
+/// from a stalled one.
+fn draw_scroll_badge(frame: &mut Frame<'_>, area: Rect, rows_below: usize) {
+    let label = format!(" ↑ scrolled — {rows_below} row(s) below · [end] follow ");
+    let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+    if width >= area.width {
+        return;
+    }
+    let badge = Rect::new(
+        area.x + area.width - width,
+        area.y + area.height.saturating_sub(1),
+        width,
+        1,
+    );
+    frame.render_widget(Clear, badge);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        badge,
+    );
+}
 
 /// Spinner frames — the standard "dots" set. Rotate with `app.spinner_frame`.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Draw the status bar (blank buffer row + bordered box) into the inline
-/// viewport.
-pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
-    if area.height < BAR_VIEWPORT_HEIGHT || area.width < 2 {
+/// Draw the status bar into the rows reserved for it.
+fn draw_bar(frame: &mut Frame<'_>, app: &App, box_area: Rect) {
+    if box_area.height < BAR_HEIGHT || box_area.width < 2 {
         return;
     }
-    // Row 0 (blank) gives breathing room between scrollback logs and the box.
-    // Rows 1..=3 render the bordered box.
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(3)])
-        .split(area);
-    let box_area = layout[1];
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -65,14 +455,14 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(block, box_area);
 
     // Count only services for the filter badge — tasks and synthetic
-    // streams (don/bazel/turbo) are filterable too, but the bar should
+    // streams (don/bazel) are filterable too, but the bar should
     // echo what the user thinks of as "my services." Lazy services are
     // excluded so the denominator matches `counts.services_total` (which
     // excludes Lazy for the same "not-yet-started" reason).
     let countable = || {
         app.services_state
             .iter()
-            .filter(|(_, s)| !matches!(s, crate::runner::ServiceState::Lazy))
+            .filter(|(_, s)| !matches!(s, ServiceState::Lazy))
     };
     let visible_services = countable()
         .filter(|(name, _)| app.filter.passes(name))
@@ -87,13 +477,28 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
             app.spinner_frame,
             visible_services,
             total_services,
-            app.verbose_enabled,
+            app.debug_view,
             app.has_failure_summary(),
+            !app.log_selection.is_empty(),
         )
     };
-    let update_badge = (!app.shutdown_started)
-        .then(|| app.update_badge.as_ref().map(update_badge_line))
-        .flatten();
+    // OSC 52 has no acknowledgement, so this line is the only sign a copy
+    // happened. It takes the right-hand slot over the update badge: the user
+    // just acted, and an answer to that beats a background notice.
+    let copy_badge = app.copy_notice.as_ref().map(|(notice, _)| {
+        Line::from(Span::styled(
+            format!(" {notice} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ))
+    });
+    let update_badge = copy_badge.or_else(|| {
+        (!app.shutdown_started)
+            .then(|| app.update_badge.as_ref().map(update_badge_line))
+            .flatten()
+    });
 
     if let Some(right_line) = update_badge {
         let right_width = u16::try_from(line_width(&right_line)).unwrap_or(u16::MAX);
@@ -117,36 +522,20 @@ pub(crate) fn draw_bar(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Paragraph::new(left_line), inner);
 }
 
-/// Dispatch to the full-screen render function for the current view mode.
-/// Callers should only invoke this when `app.view_mode != Normal`.
-pub(crate) fn draw_modal(frame: &mut Frame<'_>, app: &App) {
-    match app.view_mode {
-        ViewMode::Filter => draw_filter_modal(frame, app),
-        ViewMode::Tasks => draw_tasks_table(frame, app),
-        ViewMode::Services => draw_services_table(frame, app),
-        ViewMode::Failures => draw_failure_summary(frame, app),
-        ViewMode::Form => draw_form_modal(frame, app),
-        ViewMode::Normal => {}
-    }
-    draw_log_popup(frame, app);
-}
-
-fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
+fn draw_filter_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if area.height < 3 || area.width == 0 {
         return;
     }
 
-    // Border + title wraps the whole modal. Inside: list at top, bar at bottom.
+    // Border + title wraps the whole panel. Inside: list at top, bar at bottom.
     let title = match app.filter.focus() {
-        FilterFocus::List => {
-            " Filter logs — [j/k ↑↓] move  [space] toggle  [o] only this  [/] search  [enter] done  [esc] revert "
-        }
-        FilterFocus::Query => {
-            " Filter logs — [type] search  [enter] apply/close if single  [tab] back to list  [esc] revert "
-        }
+        FilterFocus::List => " filter — [space] toggle  [o] only  [/] search  [R] reset ",
+        FilterFocus::Query => " filter — [type] search  [enter] apply  [esc] clear ",
     };
-    let outer = Block::default().borders(Borders::ALL).title(title);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(panel_border_style(app))
+        .title(title);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -169,8 +558,7 @@ fn draw_filter_modal(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(bar, layout[2]);
 }
 
-fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
+fn draw_tasks_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let name_colors = log_name_colors(app);
     let items = app.task_items();
     let layout = task_table_layout(area.width);
@@ -187,8 +575,8 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
         frame,
         area,
         StatusTableView {
-            title: " don tasks — [j/k ↑↓] move  [enter] run/form  [l] logs  [/] filter  [esc] clear/dismiss "
-                .to_string(),
+            title: " tasks — [enter] run  [a] attach  [l] logs  [/] filter ".to_string(),
+            border_style: panel_border_style(app),
             header,
             rows,
             widths: layout.widths,
@@ -310,9 +698,30 @@ pub(crate) fn failure_summary_max_scroll(area: Rect, app: &App) -> usize {
 /// Render the full-screen services table — a table of every known service
 /// with its current state, sorted errors → running → exited → lazy then
 /// alphabetical within each bucket.
-fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
-    let header = Row::new(vec!["NAME", "PID", "STATE"]).style(
+/// Panel width below which the PID column is dropped.
+///
+/// A narrow panel is for names and states; a pid squeezed in leaves neither
+/// the name nor the failure detail room to say anything. Wide enough to want
+/// it back, it returns — the same shape the task table's columns follow.
+const SERVICES_PID_MIN_WIDTH: u16 = 60;
+
+fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let show_pid = area.width >= SERVICES_PID_MIN_WIDTH;
+    let labels = if show_pid {
+        vec!["NAME", "PID", "STATE"]
+    } else {
+        vec!["NAME", "STATE"]
+    };
+    let widths = if show_pid {
+        vec![
+            Constraint::Percentage(45),
+            Constraint::Length(10),
+            Constraint::Percentage(55),
+        ]
+    } else {
+        vec![Constraint::Percentage(45), Constraint::Percentage(55)]
+    };
+    let header = Row::new(labels).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(Color::Cyan),
@@ -321,27 +730,32 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App) {
     let rows = app
         .service_items()
         .iter()
-        .map(|item| service_table_row(item, &name_colors))
+        .map(|item| service_table_row(item, &name_colors, show_pid))
         .collect();
     draw_status_table(
         frame,
         area,
         StatusTableView {
-            title:
-                " don services — [j/k ↑↓] move  [enter] start/stop  [r] restart  [R] hard restart  [l] logs  [/] filter  [esc] clear/dismiss "
-                    .to_string(),
+            title: " services — [enter] start/stop  [r] restart  [a] attach  [l] logs ".to_string(),
+            border_style: panel_border_style(app),
             header,
             rows,
-            widths: vec![
-                Constraint::Percentage(45),
-                Constraint::Length(10),
-                Constraint::Percentage(55),
-            ],
+            widths,
             state: &app.services_table,
             empty_label: "(no services)",
             selected_hint: service_selected_hint(app),
         },
     );
+}
+
+/// The side panel's border: cyan when it has the keys, grey when the log does.
+/// The same rule the log pane uses, so focus is legible at a glance.
+fn panel_border_style(app: &App) -> Style {
+    Style::default().fg(if app.focus == super::panes::Focus::Panel {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    })
 }
 
 fn draw_log_popup(frame: &mut Frame<'_>, app: &App) {
@@ -423,24 +837,33 @@ fn parse_ansi_text(bytes: &[u8]) -> Text<'static> {
         .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(bytes).into_owned()))
 }
 
-fn service_table_row(item: &OverlayItem, name_colors: &HashMap<String, Color>) -> Row<'static> {
+fn service_table_row(
+    item: &OverlayItem,
+    name_colors: &HashMap<String, Color>,
+    show_pid: bool,
+) -> Row<'static> {
     let name = item.name.clone();
-    let pid = item
-        .pid
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let state_cell = Cell::from(service_state_label(item.state, &item.failed_dependencies))
-        .style(Style::default().fg(service_state_color(item.state)));
+    let state_cell = Cell::from(service_state_label(
+        item.state,
+        item.pid.is_some(),
+        &item.failed_dependencies,
+    ))
+    .style(Style::default().fg(service_state_color(item.state)));
     let name_style = name_colors
         .get(&name)
         .copied()
         .map(|color| Style::default().fg(color))
         .unwrap_or_default();
-    Row::new(vec![
-        Cell::from(name).style(name_style),
-        Cell::from(pid).style(Style::default().fg(Color::DarkGray)),
-        state_cell,
-    ])
+    let mut cells = vec![Cell::from(name).style(name_style)];
+    if show_pid {
+        let pid = item
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        cells.push(Cell::from(pid).style(Style::default().fg(Color::DarkGray)));
+    }
+    cells.push(state_cell);
+    Row::new(cells)
 }
 
 fn task_table_row(
@@ -640,14 +1063,16 @@ fn format_task_duration(duration_ms: Option<u64>) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normal_bar_line(
     counts: &StatusCounts,
     filter: &FilterState,
     spinner_frame: usize,
     visible_services: usize,
     total_services: usize,
-    verbose_enabled: bool,
+    debug_view: bool,
     has_failure_summary: bool,
+    has_selection: bool,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -683,14 +1108,29 @@ fn normal_bar_line(
     }
 
     spans.push(separator());
-    spans.push(dim("[l] logs"));
+    if has_selection {
+        // Copying is explicit now, so the key that does it has to be visible
+        // at the moment there is something to copy.
+        spans.push(Span::styled(
+            "[y] copy",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(dim("  [esc] clear"));
+        spans.push(separator());
+    }
+    spans.push(dim("[f] filter"));
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
         spans.push(dim("  [R] reset"));
     }
     // Parked tasks are easy to miss as a lone `*`, so tint the whole hotkey.
     if counts.tasks_pending_run > 0 {
-        spans.push(Span::styled("  [t] tasks", Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            "  [t] tasks",
+            Style::default().fg(Color::Yellow),
+        ));
         spans.push(Span::styled(
             "*",
             Style::default()
@@ -701,9 +1141,13 @@ fn normal_bar_line(
         spans.push(dim("  [t] tasks"));
     }
     spans.push(dim("  [s] services"));
-    if verbose_enabled {
+    // Says which record is on screen, but never how to get to it. Reaching
+    // don's own log is for when you have gone looking for why something did
+    // not rebuild; the bar's slots belong to the things a reader needs
+    // without being told.
+    if debug_view {
         spans.push(separator());
-        spans.push(dim("verbose"));
+        spans.push(dim("don's log"));
     }
     Line::from(spans)
 }
@@ -901,7 +1345,20 @@ fn base_count_spans(counts: &StatusCounts, show_failure_info: bool) -> Vec<Span<
     spans
 }
 
-fn service_state_label(state: ServiceState, failed_dependencies: &[String]) -> Cow<'static, str> {
+/// What to call each state in the table.
+///
+/// `live` is whether the service still has a process, and it changes what
+/// `Failed` means. A service whose ready check failed under `on_failure =
+/// "notify"` is left running on purpose and may well be serving traffic —
+/// calling that "failed" beside its own pid reads as a contradiction. It is
+/// not "unhealthy" either: that state means the service *was* ready and its
+/// health monitor has since started failing, which is a different thing that
+/// has already earned its own word.
+fn service_state_label(
+    state: ServiceState,
+    live: bool,
+    failed_dependencies: &[String],
+) -> Cow<'static, str> {
     match state {
         ServiceState::Pending => Cow::Borrowed("pending"),
         ServiceState::Building => Cow::Borrowed("building"),
@@ -912,21 +1369,22 @@ fn service_state_label(state: ServiceState, failed_dependencies: &[String]) -> C
         ServiceState::Unhealthy => Cow::Borrowed("unhealthy"),
         ServiceState::Stopping => Cow::Borrowed("stopping"),
         ServiceState::Stopped => Cow::Borrowed("stopped"),
+        ServiceState::Failed if live => Cow::Borrowed("ready check failed"),
         ServiceState::Failed => Cow::Borrowed("failed"),
         ServiceState::DependencyFailed => dependency_failed_label(failed_dependencies),
     }
 }
 
-fn task_state_label(state: TaskItemState, failed_dependencies: &[String]) -> Cow<'static, str> {
+fn task_state_label(state: TaskState, failed_dependencies: &[String]) -> Cow<'static, str> {
     match state {
-        TaskItemState::Pending => Cow::Borrowed("pending"),
-        TaskItemState::Building => Cow::Borrowed("building"),
-        TaskItemState::Running => Cow::Borrowed("running"),
-        TaskItemState::Completed => Cow::Borrowed("completed"),
-        TaskItemState::Skipped => Cow::Borrowed("skipped"),
-        TaskItemState::Failed => Cow::Borrowed("failed"),
-        TaskItemState::DependencyFailed => dependency_failed_label(failed_dependencies),
-        TaskItemState::PendingRun => Cow::Borrowed("pending run"),
+        TaskState::Pending => Cow::Borrowed("pending"),
+        TaskState::Building => Cow::Borrowed("building"),
+        TaskState::Running => Cow::Borrowed("running"),
+        TaskState::Completed => Cow::Borrowed("completed"),
+        TaskState::Skipped => Cow::Borrowed("skipped"),
+        TaskState::Failed => Cow::Borrowed("failed"),
+        TaskState::DependencyFailed => dependency_failed_label(failed_dependencies),
+        TaskState::PendingRun => Cow::Borrowed("pending run"),
     }
 }
 
@@ -955,13 +1413,13 @@ fn service_state_color(state: ServiceState) -> Color {
     }
 }
 
-fn task_state_color(state: TaskItemState) -> Color {
+fn task_state_color(state: TaskState) -> Color {
     match state {
-        TaskItemState::Completed | TaskItemState::Skipped => Color::Green,
-        TaskItemState::Running | TaskItemState::Pending | TaskItemState::Building => Color::Yellow,
-        TaskItemState::PendingRun => Color::Cyan,
-        TaskItemState::Failed => Color::Red,
-        TaskItemState::DependencyFailed => Color::Rgb(150, 60, 60),
+        TaskState::Completed | TaskState::Skipped => Color::Green,
+        TaskState::Running | TaskState::Pending | TaskState::Building => Color::Yellow,
+        TaskState::PendingRun => Color::Cyan,
+        TaskState::Failed => Color::Red,
+        TaskState::DependencyFailed => Color::Rgb(150, 60, 60),
     }
 }
 
@@ -1189,6 +1647,56 @@ mod tests {
             .join("")
     }
 
+    /// "failed" printed next to a live pid reads as a contradiction, and the
+    /// service it happens to is one that may be serving traffic right now.
+    #[test]
+    fn a_failure_that_is_still_running_says_which_check_failed() {
+        struct Case {
+            name: &'static str,
+            state: ServiceState,
+            live: bool,
+            want: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "the process is gone, so it simply failed",
+                state: ServiceState::Failed,
+                live: false,
+                want: "failed",
+            },
+            Case {
+                name: "on_failure = notify leaves it running",
+                state: ServiceState::Failed,
+                live: true,
+                want: "ready check failed",
+            },
+            Case {
+                // A different situation with its own word: this one *was*
+                // ready. Liveness must not blur the two together.
+                name: "unhealthy is unaffected by liveness",
+                state: ServiceState::Unhealthy,
+                live: true,
+                want: "unhealthy",
+            },
+            Case {
+                name: "and so is everything else",
+                state: ServiceState::Ready,
+                live: true,
+                want: "ready",
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                service_state_label(case.state, case.live, &[]),
+                case.want,
+                "{}",
+                case.name
+            );
+        }
+    }
+
     #[test]
     fn dependency_failed_label_names_blocking_dependencies() {
         struct Case {
@@ -1247,6 +1755,7 @@ mod tests {
             0,
             false,
             false,
+            false,
         );
         let star = line
             .spans
@@ -1279,6 +1788,7 @@ mod tests {
             0,
             false,
             false,
+            false,
         );
 
         let hotkey = line
@@ -1303,7 +1813,6 @@ mod tests {
         filter.enter_edit();
         filter.push_query_char('a');
         filter.select_only_highlighted();
-        filter.commit();
 
         let text = line_text(normal_bar_line(
             &StatusCounts::default(),
@@ -1313,9 +1822,10 @@ mod tests {
             2,
             false,
             false,
+            false,
         ));
 
-        assert!(text.contains("[l] logs (1/2)  [R] reset"));
+        assert!(text.contains("[f] filter (1/2)  [R] reset"));
     }
 
     #[test]
@@ -1358,10 +1868,170 @@ mod tests {
                 2,
                 false,
                 true,
+                false,
             ));
 
             assert!(text.contains(case.want), "case: {}", case.name);
             assert!(!text.contains(case.reject), "case: {}", case.name);
+        }
+    }
+
+    /// The scroll badge appears only when rows are genuinely below the view.
+    /// A selection pins the view at the tail without following, and a badge
+    /// reading "scrolled — 0 rows below" there contradicts itself.
+    #[test]
+    fn scroll_badge_only_shows_when_rows_are_below() {
+        use crate::output::{FormattedLogLine, LogId};
+
+        struct Case {
+            name: &'static str,
+            scroll: super::super::logs::Scroll,
+            want_badge: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "following: no badge",
+                scroll: super::super::logs::Scroll::Follow,
+                want_badge: false,
+            },
+            Case {
+                name: "pinned at the tail: nothing below, no badge",
+                scroll: super::super::logs::Scroll::At {
+                    id: LogId(29),
+                    row: 0,
+                },
+                want_badge: false,
+            },
+            Case {
+                name: "held above the tail: badge with a real count",
+                scroll: super::super::logs::Scroll::At {
+                    id: LogId(0),
+                    row: 0,
+                },
+                want_badge: true,
+            },
+        ];
+
+        for case in cases {
+            let mut app = App::new(AppInit {
+                service_names: vec!["api".to_string()],
+                task_names: Vec::new(),
+                build_tool_names: Vec::new(),
+                task_configs: HashMap::new(),
+                task_last_runs: HashMap::new(),
+                hidden_names: std::collections::HashSet::new(),
+                auto_filter_on_failure_names: std::collections::HashSet::new(),
+                cli_log_filter: None,
+            });
+            app.log_scroll = case.scroll;
+
+            let mut store = super::super::log_store::LogStore::with_capacity(100);
+            store.reflow(58);
+            for id in 0..30u64 {
+                store.push(
+                    LogId(id),
+                    FormattedLogLine {
+                        name: "api".to_string(),
+                        is_lifecycle: false,
+                        is_verbose: false,
+                        prefix: b"api \xe2\x94\x82 ".to_vec(),
+                        bytes: format!("line {id}").into_bytes(),
+                    },
+                );
+            }
+
+            let backend = ratatui::backend::TestBackend::new(60, 12);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &store))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+
+            assert_eq!(text.contains("scrolled"), case.want_badge, "{}", case.name);
+        }
+    }
+
+    /// A narrow panel drops the PID column: names and states are what a
+    /// glance needs, and a pid squeezed in leaves neither room to say
+    /// anything. Wide enough to want it back, it returns.
+    #[test]
+    fn services_pid_column_hides_below_the_width_threshold() {
+        struct Case {
+            width: u16,
+            want_pid: bool,
+        }
+
+        let cases = [
+            Case {
+                width: 48,
+                want_pid: false,
+            },
+            Case {
+                width: SERVICES_PID_MIN_WIDTH,
+                want_pid: true,
+            },
+            Case {
+                width: 90,
+                want_pid: true,
+            },
+        ];
+
+        for case in cases {
+            let mut app = App::new(AppInit {
+                service_names: vec!["api".to_string()],
+                task_names: Vec::new(),
+                build_tool_names: Vec::new(),
+                task_configs: HashMap::new(),
+                task_last_runs: HashMap::new(),
+                hidden_names: std::collections::HashSet::new(),
+                auto_filter_on_failure_names: std::collections::HashSet::new(),
+                cli_log_filter: None,
+            });
+            app.apply_service_runtime(
+                "api".to_string(),
+                ServiceState::Ready,
+                Some(4242),
+                Vec::new(),
+            );
+            app.view_mode = ViewMode::Services;
+
+            let backend = ratatui::backend::TestBackend::new(case.width, 8);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw_services_table(frame, &app, frame.area()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+
+            assert_eq!(
+                text.contains("PID"),
+                case.want_pid,
+                "width {}: PID header",
+                case.width
+            );
+            assert_eq!(
+                text.contains("4242"),
+                case.want_pid,
+                "width {}: the pid itself",
+                case.width
+            );
+            assert!(
+                text.contains("api") && text.contains("ready"),
+                "width {}: name and state always present",
+                case.width
+            );
         }
     }
 
@@ -1429,19 +2099,23 @@ mod tests {
             hidden_names: std::collections::HashSet::new(),
             auto_filter_on_failure_names: std::collections::HashSet::new(),
             cli_log_filter: None,
-            verbose_enabled: false,
         });
         app.apply_task_state(
             "configure-everything".to_string(),
-            TaskItemState::DependencyFailed,
+            TaskState::DependencyFailed,
             None,
             vec!["configure-kafka-topics".to_string()],
         );
         app.view_mode = ViewMode::Tasks;
 
+        // The width under test is the *panel's* width now, not the terminal's:
+        // the table lives in the side panel and adapts its columns to however
+        // wide the user has dragged it.
         let backend = ratatui::backend::TestBackend::new(width, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| draw_tasks_table(frame, &app, frame.area()))
+            .unwrap();
         terminal
             .backend()
             .buffer()
@@ -1462,7 +2136,6 @@ mod tests {
             hidden_names: std::collections::HashSet::new(),
             auto_filter_on_failure_names: std::collections::HashSet::new(),
             cli_log_filter: None,
-            verbose_enabled: false,
         });
         app.apply_service_runtime(
             "api".to_string(),
@@ -1477,7 +2150,10 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(45, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        let store = super::super::log_store::LogStore::with_capacity(0);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &store))
+            .unwrap();
         let rendered = terminal
             .backend()
             .buffer()
@@ -1545,7 +2221,7 @@ mod tests {
     fn task_table_row_shows_last_run_result_and_duration() {
         let item = TaskStatusItem {
             name: "lint".to_string(),
-            state: TaskItemState::Completed,
+            state: TaskState::Completed,
             failed_dependencies: Vec::new(),
             last_run: Some(TaskRunInfo {
                 finished_at_unix_secs: 0,

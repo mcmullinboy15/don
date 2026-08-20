@@ -1,21 +1,30 @@
-//! Just-in-time activation helpers for lazy services.
+//! Narration for a lazy service's first connection.
 //!
-//! `Lazy` means no connection has requested the service yet. The first
-//! connection transitions it to `Pending`, after which the normal dependency
-//! scheduler owns it just like any other service.
+//! `Lazy` means no connection has requested the service yet. Its supervisor
+//! moves itself to `Pending` in the same step it takes the demand — this only
+//! explains the wait that follows, if there is one.
 
-use super::build_tools::BatchBuildOutcome;
-use super::{NodeKind, Runner, ServiceState};
+use super::Runner;
 
 impl Runner {
-    /// Record the first proxy connection for a lazy service.
+    /// A supervisor reports that something now wants it running.
     ///
-    /// Moving to `Pending` is the request: no parallel name set is needed, and
-    /// the normal pending-item scheduler can wait, cascade dependency failure,
-    /// and start the service when its dependencies become ready.
-    pub(in crate::runner) fn handle_lazy_connection(&mut self, name: &str) {
+    /// Demand is only ever raised by a lazy service's proxy, so there is no
+    /// task case. A process already holding a live one says nothing: its phase
+    /// is authoritative and a duplicate trigger changes nothing.
+    pub(in crate::runner) fn handle_demand(&mut self, name: &str, _demand: super::Demand) {
+        if self.service_runtime(name).is_some() {
+            return;
+        }
+        if self.services.contains_key(name) {
+            self.narrate_lazy_demand(name);
+        }
+    }
+
+    /// Say why a first connection is or isn't about to start the service.
+    fn narrate_lazy_demand(&mut self, name: &str) {
         let deps = match self.services.get(name) {
-            Some(rs) if rs.state() == ServiceState::Lazy => rs.resolved.depends_on.clone(),
+            Some(rs) => rs.resolved.depends_on.clone(),
             _ => return,
         };
 
@@ -48,60 +57,6 @@ impl Runner {
                     ),
                 );
             }
-        }
-
-        self.set_service_state(name, ServiceState::Pending);
-    }
-
-    /// Start the detached build-tool chain for a triggered lazy service when
-    /// it has not been batch-built yet. Returns whether a build was started.
-    pub(in crate::runner) fn start_lazy_build_if_needed(&mut self, name: &str) -> bool {
-        let needs_jit = self.services.get(name).is_some_and(|rs| {
-            rs.state() == ServiceState::Pending
-                && rs.resolved.lazy
-                && rs.resolved.is_build_tool_managed()
-                && !rs.batch_built
-        });
-        if !needs_jit {
-            return false;
-        }
-
-        let item = match self.services.get(name) {
-            Some(rs) => self.build_batch_item(name, NodeKind::Service, rs),
-            None => return false,
-        };
-        self.output_manager
-            .service_event(name, "dependencies ready — building before start");
-        self.set_service_state(name, ServiceState::Building);
-        self.spawn_lazy_build(name, item);
-        true
-    }
-
-    /// Apply a lazy JIT build result and return successful builds to Pending.
-    /// The normal scheduler then re-checks every dependency before starting.
-    pub(in crate::runner) fn handle_lazy_build_complete(
-        &mut self,
-        name: &str,
-        generation: u64,
-        outcome: BatchBuildOutcome,
-    ) {
-        let matching_handle = self
-            .lazy_build_handles
-            .get(name)
-            .is_some_and(|(active_generation, _)| *active_generation == generation);
-        if matching_handle {
-            self.lazy_build_handles.remove(name);
-        }
-        let is_current_build = self.services.get(name).is_some_and(|rs| {
-            rs.start_generation == generation && rs.state() == ServiceState::Building
-        });
-        if !is_current_build {
-            return;
-        }
-        let replay_items = outcome.replay_items.clone();
-        self.apply_batch_build_outcome(outcome);
-        if let Some(item) = replay_items.iter().find(|item| item.name == name) {
-            self.schedule_lazy_build_replay(item);
         }
     }
 }

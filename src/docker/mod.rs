@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::config::service::DockerConfig;
-use crate::process::ChildOutput;
+use crate::sys::ChildOutput;
 use stream::DockerLogReader;
 
 /// Errors from Docker operations.
@@ -95,7 +95,25 @@ impl DockerPortBinding {
 /// names refer to the first mapping; every mapping also gets an indexed name.
 ///
 /// Free function so it can be unit-tested without a live Docker client.
-fn public_env_vars(bindings: &[DockerPortBinding]) -> HashMap<String, String> {
+/// Render each binding the way `don status -v` shows it. Formatted once, at
+/// the moment custody is recorded, so the projection carries display-ready
+/// lines instead of the bindings themselves.
+pub(crate) fn describe_port_bindings(bindings: &[DockerPortBinding]) -> Vec<String> {
+    bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "{} → {} ({}/{})",
+                binding.configured,
+                binding.connect_addr(),
+                binding.container_port,
+                binding.protocol
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn public_env_vars(bindings: &[DockerPortBinding]) -> HashMap<String, String> {
     let mut vars = HashMap::new();
     for (index, binding) in bindings.iter().enumerate() {
         let addr = binding.connect_addr().to_string();
@@ -115,7 +133,7 @@ fn public_env_vars(bindings: &[DockerPortBinding]) -> HashMap<String, String> {
 /// that container port is unambiguous.
 ///
 /// Free function so it can be unit-tested without a live Docker client.
-fn env_reference_values(bindings: &[DockerPortBinding]) -> HashMap<String, String> {
+pub(crate) fn env_reference_values(bindings: &[DockerPortBinding]) -> HashMap<String, String> {
     let mut refs = HashMap::new();
     let mut container_port_counts: HashMap<u16, usize> = HashMap::new();
     for binding in bindings {
@@ -155,7 +173,7 @@ fn env_reference_values(bindings: &[DockerPortBinding]) -> HashMap<String, Strin
 
 /// Handle to a running Docker container.
 ///
-/// Provides stop/remove operations analogous to [`crate::process::ProcessHandle`].
+/// Provides stop/remove operations analogous to [`crate::sys::ProcessHandle`].
 /// The container is identified by ID and name.
 pub struct DockerHandle {
     client: Docker,
@@ -177,22 +195,6 @@ impl std::fmt::Debug for DockerHandle {
 impl DockerHandle {
     pub(crate) fn port_bindings(&self) -> &[DockerPortBinding] {
         &self.port_bindings
-    }
-
-    /// Standard public-address variables for this service's Docker mappings.
-    ///
-    /// Generic names refer to the first configured mapping; every mapping also
-    /// receives a stable zero-based indexed name.
-    pub(crate) fn public_env_vars(&self) -> HashMap<String, String> {
-        public_env_vars(&self.port_bindings)
-    }
-
-    /// Runtime-reference values used by dependent service environment fields.
-    ///
-    /// Alongside generic and indexed aliases, a container-port-qualified alias
-    /// is included only when that container port is unambiguous.
-    pub(crate) fn env_reference_values(&self) -> HashMap<String, String> {
-        env_reference_values(&self.port_bindings)
     }
 
     /// Stop the container with the given signal and timeout, then remove it.

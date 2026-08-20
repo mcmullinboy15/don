@@ -80,6 +80,17 @@ pub(crate) fn sanitize_terminal_output(input: &[u8]) -> Vec<u8> {
             b' ' => {
                 i += if i + 2 < input.len() { 3 } else { 2 };
             }
+            // Character-set designation: ESC ( ) * + - . / % then one byte.
+            // `ESC ( 0` is DEC Special Graphics, which is how a great many CLIs
+            // draw boxes and rules — `q` becomes a horizontal line. Stripping
+            // only the ESC left the designator behind, so a tool drawing a rule
+            // put a literal `(0qqqqqqqq` in the log. The whole sequence goes:
+            // don cannot honour a charset switch anyway, because the switch
+            // would outlive the line and reinterpret everything after it,
+            // including other services' output.
+            b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'%' => {
+                i += if i + 2 < input.len() { 3 } else { 2 };
+            }
             // Anything else after ESC — strip the ESC, keep the next byte
             // (probably a malformed sequence).
             _ => {
@@ -167,6 +178,22 @@ mod tests {
     #[test]
     fn sanitize_table() {
         let cases = vec![
+            Case {
+                // `ESC ( 0` selects DEC Special Graphics, where `q` draws a
+                // horizontal rule — how a great many CLIs draw boxes. Stripping
+                // only the ESC used to leave `(0` and the rule's letters in the
+                // log; honouring it is not an option either, since the switch
+                // would outlive the line and reinterpret every service's output
+                // after it.
+                name: "charset designation goes whole, payload and all",
+                input: b"box \x1b(0qqqq\x1b(B done",
+                expected: b"box qqqq done",
+            },
+            Case {
+                name: "the other designators go too",
+                input: b"a\x1b)0b\x1b*Ac\x1b+Bd\x1b%Ge",
+                expected: b"abcde",
+            },
             Case {
                 name: "plain text unchanged",
                 input: b"hello world",

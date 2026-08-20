@@ -1,7 +1,7 @@
 //! Build tool integration for resolving watch paths and dependencies.
 //!
-//! Don can query external build tools (Bazel, Turborepo) to automatically
-//! determine which source directories to watch for a given build target.
+//! Don can query Bazel to automatically determine which source directories
+//! to watch for a given build target.
 //! This eliminates the need to manually maintain `watch` patterns as the
 //! build graph evolves.
 //!
@@ -11,10 +11,10 @@
 //! - **Tier 2**: Watch resolved source directories. These are the directories
 //!   the build tool reports as inputs for a given target.
 
+pub(crate) mod batch;
+pub(crate) mod batcher;
 pub(crate) mod bazel;
-pub(crate) mod turbo;
-
-use std::path::Path;
+pub(crate) mod manager;
 
 /// Errors from build tool integration.
 #[derive(Debug, thiserror::Error)]
@@ -51,25 +51,6 @@ pub(crate) struct ResolvedBuildInfo {
     pub graph_definition_globs: Vec<String>,
 }
 
-/// Trait for querying build tools to resolve watch paths and dependencies.
-///
-/// Implementations shell out to the build tool CLI and parse the structured
-/// output to determine which source directories feed into a given target.
-pub(crate) trait BuildGraphResolver: Send + Sync {
-    /// Resolve watch paths and dependencies for a build target.
-    ///
-    /// `target` is the build-tool-specific target string (e.g. `"//services/api:api"`
-    /// for Bazel or `"dev"` for Turborepo).
-    ///
-    /// `working_dir` is the absolute path to the directory where the build tool
-    /// should be invoked (typically the service's `dir` or the project root).
-    fn resolve(
-        &self,
-        target: &str,
-        working_dir: &Path,
-    ) -> impl std::future::Future<Output = Result<ResolvedBuildInfo, BuildToolError>> + Send;
-}
-
 /// Result of a batch build operation.
 ///
 /// Reports which targets succeeded and which failed, allowing the runner
@@ -85,16 +66,16 @@ pub(crate) struct BatchBuildResult {
 /// the handle was explicitly extracted via [`Self::into_inner`].
 ///
 /// We use this to make the stderr/stdout streaming tasks spawned inside
-/// `build_targets` / `build_packages` cancellable: when the parent future
+/// `build_targets` cancellable: when the parent future
 /// is dropped (e.g. shutdown mid-build), the streaming tasks must stop
 /// reading and release any senders they hold (typically a
 /// [`crate::output::LifecycleEmitter`] cloned for the on-line callback).
 /// Without that, the stdout sink channel never closes, and
 /// `OutputManager::shutdown` blocks forever waiting on its writer task.
 ///
-/// The orphaned bazel/turbo build *action* processes inherit the child's
+/// The orphaned bazel build *action* processes inherit the child's
 /// stdout/stderr fds and can hold them open long after we SIGKILL the
-/// build-tool client, so "EOF on the pipe" is not a reliable wakeup.
+/// bazel client, so "EOF on the pipe" is not a reliable wakeup.
 pub(crate) struct AbortOnDrop<T> {
     handle: Option<tokio::task::JoinHandle<T>>,
 }

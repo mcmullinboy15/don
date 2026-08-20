@@ -1,8 +1,8 @@
 //! File watching with per-service debounce and change-during-build handling.
 //!
 //! The [`WatchManager`] sets up `notify` watchers for services and tasks with
-//! `watch` patterns, debounces events per-service, and sends [`RunnerCommand::Rebuild`]
-//! or [`RunnerCommand::TaskRerun`] to the runner when a rebuild cycle should start.
+//! `watch` patterns, debounces events per-service, and emits a
+//! [`WatchSignal`] when a rebuild cycle should start.
 //!
 //! Each watched service has its own state machine:
 //!
@@ -12,28 +12,60 @@
 //!                      Rebuilding (another cycle)
 //! ```
 //!
-//! The watch module subscribes to [`RunnerEvent::RebuildComplete`] to know when
-//! a cycle finishes, and checks the `stale` flag to decide whether to immediately
-//! start another cycle.
+//! A cycle ends when the matching [`WatchOutcome`] arrives; the `stale` flag
+//! then decides whether to immediately start another one.
+//!
+//! This module deliberately knows nothing about the runner — see
+//! [`signal`] for why the two vocabularies are separate.
+
+pub(crate) mod report;
+pub(crate) mod signal;
+
+pub(crate) use signal::WatchDispatch;
 
 use crate::config::{Config, Platform};
 use crate::duration::parse_duration;
 use crate::globwalk::{matches_glob, matches_ignore};
 use crate::output::LifecycleEmitter;
-use crate::runner::{RunnerCommand, RunnerEvent};
 use glob::Pattern;
 use ignore::overrides::{Override, OverrideBuilder};
 use notify::{EventKind, PathsMut, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 /// Default debounce window when none is configured.
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Synthetic watch item used for workspace-level build graph files.
 pub(crate) const WORKSPACE_GRAPH_ITEM_NAME: &str = "__workspace_graph__";
+
+/// Ignore globs don applies whatever the config says.
+///
+/// `.don/` is don's own state directory, and the runner writes every lifecycle
+/// line it emits into `.don/logs/runner.log`. A config whose watch globs reach
+/// the whole project — `**/*.ts`, and every monorepo has one — registers that
+/// directory like any other, and then don logging a line modifies runner.log,
+/// which fires a watch event, which don logs. That feedback loop feeds itself
+/// and settles at tens of thousands of lines a second.
+///
+/// `.git/` is not a loop, just noise, and a great deal of it: a fetch, a commit,
+/// or git's own background gc rewrites refs, logs and index locks, and none of
+/// it is a file anyone asked to watch.
+///
+/// Neither holds anyone's source, so there is no case for watching them and no
+/// reason to make every project remember to say so.
+const BUILTIN_WATCH_IGNORE: &[&str] = &[".don/**", ".git/**"];
+
+/// The config's `watch_ignore` with don's own built-ins in front.
+fn effective_watch_ignore(configured: &[String]) -> Vec<String> {
+    BUILTIN_WATCH_IGNORE
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .chain(configured.iter().cloned())
+        .collect()
+}
 
 /// Errors from the watch module.
 #[derive(Debug, thiserror::Error)]
@@ -46,39 +78,98 @@ pub enum WatchError {
     Io(PathBuf, std::io::Error),
 }
 
-/// Per-item state machine for file-watch-triggered rebuilds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WatchState {
-    /// No pending changes. Watching for events.
-    Idle,
-    /// Events received, waiting for debounce window to expire.
-    Debouncing,
-    /// A rebuild/rerun cycle is in progress.
-    Rebuilding,
+/// How long to wait for a watcher to answer a status query.
+///
+/// Verbose status is interactive, so a wedged watcher must degrade to "no
+/// watch info" rather than hang the caller.
+const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The half of a *running* watcher that its owner keeps.
+///
+/// Held as an `Option`, and `Some` only once one is actually running — which
+/// is the point. These two senders used to be separate `Option` fields set
+/// together before `WatchManager` was even constructed, so `is_none()` meant
+/// "startup hasn't got there yet", never "there is no watcher".
+///
+/// Note what is *not* here: a way to tell the watcher that something it asked
+/// for has finished. It no longer asks for anything — it says what changed
+/// and the receiver takes it from there.
+pub(crate) struct WatchHandle {
+    /// Revised watch patterns, pushed after a build-tool re-query.
+    updates: mpsc::UnboundedSender<WatchUpdate>,
+    /// Status queries for verbose output.
+    queries: mpsc::Sender<WatchQuery>,
 }
 
-/// What command to send when this item's debounce timer fires.
+impl WatchHandle {
+    pub(crate) fn new(
+        updates: mpsc::UnboundedSender<WatchUpdate>,
+        queries: mpsc::Sender<WatchQuery>,
+    ) -> Self {
+        Self { updates, queries }
+    }
+
+    /// A sender for pushing revised watch patterns.
+    pub(crate) fn updates(&self) -> mpsc::UnboundedSender<WatchUpdate> {
+        self.updates.clone()
+    }
+
+    /// Ask the watcher what it is currently watching.
+    ///
+    /// `None` if it has gone away or does not answer within [`QUERY_TIMEOUT`]
+    /// — verbose status drops the watch section rather than blocking on it.
+    pub(crate) async fn snapshot(&self) -> Option<WatchSnapshot> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.queries.send(WatchQuery { reply }).await.ok()?;
+        tokio::time::timeout(QUERY_TIMEOUT, reply_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+}
+
+/// What kind of thing this item is, which decides who is told when it
+/// changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchItemKind {
-    /// Send `RunnerCommand::Rebuild { name }`.
+    /// A service's own sources. Its supervisor is told.
     Service,
-    /// Send `RunnerCommand::TaskRerun { name }`.
+    /// A task's own inputs. Its supervisor is told.
     Task,
-    /// Send `RunnerCommand::BuildGraphChanged { name }` — tier-1 watch for
-    /// build tool definition files (BUILD, package.json, etc.). No rebuild cycle;
-    /// the runner re-queries the build tool and updates tier-2 watch patterns.
+    /// Tier-1 watch for build tool definition files (BUILD, package.json,
+    /// …). The build manager is told, and re-queries the tool for the tier-2
+    /// patterns this item should really be watching.
     BuildGraph,
+}
+
+impl WatchItemKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Service => "service",
+            Self::Task => "task",
+            Self::BuildGraph => "build-graph",
+        }
+    }
+}
+
+impl std::fmt::Display for WatchItemKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Per-item watch tracking.
 struct WatchedItem {
-    state: WatchState,
     debounce_duration: Duration,
-    /// When in Debouncing state, the deadline at which to fire.
+    /// Set while a change is waiting out this item's debounce window; the
+    /// deadline at which it fires. `None` means nothing is pending.
+    ///
+    /// This is the whole of the watcher's per-item state now. It used to also
+    /// track whether a rebuild cycle was running and whether an edit had
+    /// landed during one — both facts belonging to whoever runs the cycle,
+    /// which is why keeping them here needed a completion channel back.
     debounce_deadline: Option<Instant>,
-    /// True when events arrived during a rebuild — triggers another cycle on completion.
-    stale: bool,
-    /// What kind of item this is — determines the command to send.
+    /// What kind of item this is — determines who is told.
     kind: WatchItemKind,
     /// Glob patterns for matching file events.
     patterns: Vec<Pattern>,
@@ -113,7 +204,6 @@ pub(crate) struct WatchUpdate {
 pub(crate) struct WatchItemSnapshot {
     pub kind: &'static str,
     pub state: &'static str,
-    pub stale: bool,
     pub debounce_ms: u64,
     pub last_error: Option<String>,
     /// Compiled (absolute) glob patterns this item matches file events against.
@@ -134,7 +224,6 @@ pub(crate) struct WatchSnapshot {
     /// Workspace-wide `watch_ignore` globs (apply to every item).
     pub global_ignore: Vec<String>,
     pub notify_error_count: u64,
-    pub runner_event_lag_count: u64,
     pub last_notify_error: Option<String>,
 }
 
@@ -156,10 +245,8 @@ pub(crate) struct WatchManager {
     event_rx: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     /// Per-item (service or task) state.
     items: HashMap<String, WatchedItem>,
-    /// Sender to the runner's command channel.
-    cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
-    /// Receiver for runner events (rebuild/rerun completion).
-    runner_events: broadcast::Receiver<RunnerEvent>,
+    /// Who is told when a debounce window closes.
+    dispatch: Box<dyn WatchDispatch>,
     /// Receiver for watch pattern updates from the runner (build tool re-queries).
     update_rx: mpsc::UnboundedReceiver<WatchUpdate>,
     /// Receiver for debug/status queries from the runner.
@@ -178,7 +265,6 @@ pub(crate) struct WatchManager {
     /// Count of notify backend errors seen since startup.
     notify_error_count: u64,
     /// Count of broadcast lag incidents while consuming runner events.
-    runner_event_lag_count: u64,
     /// Most recent notify backend error.
     last_notify_error: Option<String>,
     /// Workspace-wide `watch_ignore` patterns (resolved to absolute globs).
@@ -244,8 +330,7 @@ impl WatchManager {
         config: &Config,
         platform: Platform,
         base_dir: &Path,
-        cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
-        runner_events: broadcast::Receiver<RunnerEvent>,
+        dispatch: Box<dyn WatchDispatch>,
         update_rx: mpsc::UnboundedReceiver<WatchUpdate>,
         query_rx: mpsc::Receiver<WatchQuery>,
         emitter: LifecycleEmitter,
@@ -283,8 +368,9 @@ impl WatchManager {
             base_dir.display(),
             canonicalize_started.elapsed()
         ));
+        let watch_ignore = effective_watch_ignore(&config.watch_ignore);
         let mut global_ignore_patterns: Vec<String> = Vec::new();
-        for pattern in &config.watch_ignore {
+        for pattern in &watch_ignore {
             global_ignore_patterns.push(
                 resolve_pattern(base_dir, pattern)
                     .to_string_lossy()
@@ -308,7 +394,7 @@ impl WatchManager {
         // canonical base dir. This is what prunes ignored subtrees when we walk
         // to decide which directories to register with the notify backend.
         let ignore_setup_started = Instant::now();
-        let overrides = build_watch_ignore_overrides(base_dir, &config.watch_ignore, &mut warnings);
+        let overrides = build_watch_ignore_overrides(base_dir, &watch_ignore, &mut warnings);
         emitter.debug_event(&format!(
             "watch: ignore setup complete resolved_patterns={} warnings={} elapsed={:?}",
             global_ignore_patterns.len(),
@@ -434,10 +520,8 @@ impl WatchManager {
             items.insert(
                 name.clone(),
                 WatchedItem {
-                    state: WatchState::Idle,
                     debounce_duration: debounce,
                     debounce_deadline: None,
-                    stale: false,
                     kind: WatchItemKind::Service,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
@@ -527,10 +611,8 @@ impl WatchManager {
             items.insert(
                 name.clone(),
                 WatchedItem {
-                    state: WatchState::Idle,
                     debounce_duration: DEFAULT_DEBOUNCE, // Tasks use default debounce.
                     debounce_deadline: None,
-                    stale: false,
                     kind: WatchItemKind::Task,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
@@ -561,15 +643,15 @@ impl WatchManager {
         // Per-package BUILD / package.json watches are NOT seeded here —
         // they're registered lazily via `WatchUpdate { kind: BuildGraph, .. }`
         // once `run_batch_build_chain` resolves the actual package list from
-        // `bazel query` / `turbo run --dry-run`. Seeding them from `**/BUILD`
+        // `bazel query`. Seeding them from `**/BUILD`
         // would force a recursive `watcher.watch` on the workspace root,
         // which follows `bazel-*` symlinks into the bazel cache and takes
         // minutes on large monorepos (3,000+ external repos under
         // `execroot/_main/external/`).
         //
         // What IS seeded: a single non-recursive watch on the workspace root
-        // for workspace-level files (WORKSPACE, MODULE.bazel, turbo.json,
-        // pnpm-workspace.yaml). These change rarely but must trigger a full
+        // for workspace-level files (WORKSPACE, MODULE.bazel). These change
+        // rarely but must trigger a full
         // build-graph re-query.
         {
             let has_bazel = config.services.values().any(|s| {
@@ -581,29 +663,13 @@ impl WatchManager {
                 .tasks
                 .values()
                 .any(|t| t.bazel.as_ref().is_some_and(|bazel| bazel.watch));
-            let has_turbo = config.services.values().any(|s| {
-                let resolved = s.resolve(platform);
-                resolved
-                    .turbo_config()
-                    .is_some_and(|turbo| resolved.reload && turbo.watch)
-            }) || config
-                .tasks
-                .values()
-                .any(|t| t.turbo.as_ref().is_some_and(|turbo| turbo.watch));
-
-            if has_bazel || has_turbo {
+            if has_bazel {
                 let graph_setup_started = Instant::now();
                 emitter.debug_event(&format!(
-                    "watch: workspace graph setup started bazel={has_bazel} turbo={has_turbo} root={}",
+                    "watch: workspace graph setup started bazel={has_bazel} root={}",
                     base_dir.display()
                 ));
-                let mut root_file_names: Vec<&str> = Vec::new();
-                if has_bazel {
-                    root_file_names.extend(["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"]);
-                }
-                if has_turbo {
-                    root_file_names.extend(["turbo.json", "turbo.jsonc", "pnpm-workspace.yaml"]);
-                }
+                let root_file_names = ["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"];
 
                 let mut compiled_patterns = Vec::new();
                 for file_name in &root_file_names {
@@ -653,10 +719,8 @@ impl WatchManager {
                     items.insert(
                         WORKSPACE_GRAPH_ITEM_NAME.to_string(),
                         WatchedItem {
-                            state: WatchState::Idle,
                             debounce_duration: DEFAULT_DEBOUNCE,
                             debounce_deadline: None,
-                            stale: false,
                             kind: WatchItemKind::BuildGraph,
                             patterns: compiled_patterns,
                             ignore_patterns: compiled_ignore,
@@ -716,14 +780,12 @@ impl WatchManager {
                 notify_tx,
                 event_rx,
                 items,
-                cmd_tx,
-                runner_events,
+                dispatch,
                 update_rx,
                 query_rx,
                 registered_dirs,
                 emitter,
                 notify_error_count: 0,
-                runner_event_lag_count: 0,
                 last_notify_error: None,
                 global_ignore,
                 overrides,
@@ -753,23 +815,6 @@ impl WatchManager {
                 }
                 _ = sleep_until_or_pending(next_deadline) => {
                     self.fire_debounce_timers().await;
-                }
-                result = self.runner_events.recv() => {
-                    match result {
-                        Ok(event) => self.handle_runner_event(&event).await,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            // Missed n events. If one was a RebuildComplete,
-                            // the corresponding WatchedItem is stuck in
-                            // `Rebuilding` and will swallow future edits until
-                            // the item is re-registered. Surface it loudly.
-                            self.runner_event_lag_count =
-                                self.runner_event_lag_count.saturating_add(n);
-                            self.emitter.lifecycle_event(&format!(
-                                "watch: broadcast lag — missed {n} runner events; a service may be stuck in Rebuilding"
-                            ));
-                        }
-                    }
                 }
                 Some(update) = self.update_rx.recv() => {
                     self.apply_watch_update(update);
@@ -879,10 +924,8 @@ impl WatchManager {
             self.items.insert(
                 update.name.clone(),
                 WatchedItem {
-                    state: WatchState::Idle,
                     debounce_duration: DEFAULT_DEBOUNCE,
                     debounce_deadline: None,
-                    stale: false,
                     kind: update.kind,
                     patterns: compiled_patterns,
                     ignore_patterns: compiled_ignore,
@@ -900,7 +943,6 @@ impl WatchManager {
     fn nearest_debounce_deadline(&self) -> Option<Instant> {
         self.items
             .values()
-            .filter(|item| item.state == WatchState::Debouncing)
             .filter_map(|item| item.debounce_deadline)
             .min()
     }
@@ -972,9 +1014,9 @@ impl WatchManager {
             let path_str = path.to_string_lossy();
             let mut matched_any = false;
             let mut ignored_by: Vec<String> = Vec::new();
-            let mut unmatched: Vec<String> = Vec::new();
+            let mut unmatched = 0usize;
             for (name, item) in &self.items {
-                let state = watch_state_label(item.state);
+                let state = debounce_label(item);
                 if let Some(ig) = item
                     .ignore_patterns
                     .iter()
@@ -1011,13 +1053,22 @@ impl WatchManager {
                         affected.push(name.clone());
                     }
                 } else {
-                    unmatched.push(name.clone());
+                    unmatched += 1;
                 }
             }
             if !matched_any {
+                // One line, not one per item. This used to narrate every item
+                // that didn't match, but in the branch where it fired the
+                // reason was the same for all of them — the one the summary
+                // already gives — and the only per-item detail was a debounce
+                // label that says nothing about the path. On a stack with
+                // dozens of watch items that turned every stray write under
+                // the project into dozens of lines.
                 if ignored_by.is_empty() {
-                    self.emitter
-                        .debug_event(&format!("watch: no item matched {:?}", path));
+                    self.emitter.debug_event(&format!(
+                        "watch: no item matched {:?} ({} checked)",
+                        path, unmatched
+                    ));
                 } else {
                     self.emitter.debug_event(&format!(
                         "watch: no rebuild match for {:?} (ignored by {})",
@@ -1025,68 +1076,31 @@ impl WatchManager {
                         ignored_by.join(", ")
                     ));
                 }
-                for name in unmatched {
-                    if let Some(item) = self.items.get(&name) {
-                        self.emitter.service_debug_event(
-                            &name,
-                            &format!(
-                                "watch: did not match path={:?} state={} reason=no pattern matched",
-                                path,
-                                watch_state_label(item.state)
-                            ),
-                        );
-                    }
-                }
             }
         }
 
+        // A sliding window: a change while one is already pending bumps the
+        // deadline, so rapid consecutive saves become one notification. There
+        // is no third case any more — whether the receiver is *busy* with the
+        // last one is not something the watcher tracks.
         let now = Instant::now();
-        let mut stale_services: Vec<String> = Vec::new();
         for name in affected {
             if let Some(item) = self.items.get_mut(&name) {
-                match item.state {
-                    // Idle → Debouncing: first change starts the debounce window.
-                    WatchState::Idle => {
-                        item.state = WatchState::Debouncing;
-                        item.debounce_deadline = Some(now + item.debounce_duration);
-                        self.emitter.service_debug_event(
-                            &name,
-                            &format!(
-                                "watch: Idle → Debouncing (deadline in {:?})",
-                                item.debounce_duration
-                            ),
-                        );
-                    }
-                    // Debouncing → Debouncing: sliding window resets the deadline
-                    // so rapid consecutive saves coalesce into one rebuild.
-                    WatchState::Debouncing => {
-                        item.debounce_deadline = Some(now + item.debounce_duration);
-                        self.emitter.service_debug_event(
-                            &name,
-                            &format!(
-                                "watch: Debouncing — deadline bumped ({:?})",
-                                item.debounce_duration
-                            ),
-                        );
-                    }
-                    // Rebuilding: can't start another cycle now. Set stale so we
-                    // trigger a new rebuild when the current one completes.
-                    WatchState::Rebuilding => {
-                        item.stale = true;
-                        if item.kind == WatchItemKind::Service && !stale_services.contains(&name) {
-                            stale_services.push(name.clone());
-                        }
-                        self.emitter.service_debug_event(
-                            &name,
-                            "watch: Rebuilding — marked stale (will re-run after completion)",
-                        );
-                    }
-                }
+                let bumped = item.debounce_deadline.is_some();
+                item.debounce_deadline = Some(now + item.debounce_duration);
+                self.emitter.service_debug_event(
+                    &name,
+                    &format!(
+                        "watch: {} (deadline in {:?})",
+                        if bumped {
+                            "debounce deadline bumped"
+                        } else {
+                            "change seen — debouncing"
+                        },
+                        item.debounce_duration
+                    ),
+                );
             }
-        }
-
-        for name in stale_services {
-            let _ = self.cmd_tx.send(RunnerCommand::RebuildStale { name });
         }
     }
 
@@ -1147,8 +1161,7 @@ impl WatchManager {
         let mut to_fire: Vec<(String, WatchItemKind)> = Vec::new();
 
         for (name, item) in &self.items {
-            if item.state == WatchState::Debouncing
-                && let Some(deadline) = item.debounce_deadline
+            if let Some(deadline) = item.debounce_deadline
                 && now >= deadline
             {
                 to_fire.push((name.clone(), item.kind));
@@ -1156,109 +1169,24 @@ impl WatchManager {
         }
 
         for (name, kind) in to_fire {
-            if let Some(item) = self.items.get_mut(&name) {
-                item.debounce_deadline = None;
-
-                let (cmd, label) = match kind {
-                    WatchItemKind::Task => {
-                        item.state = WatchState::Rebuilding;
-                        (RunnerCommand::TaskRerun { name: name.clone() }, "TaskRerun")
-                    }
-                    WatchItemKind::Service => {
-                        item.state = WatchState::Rebuilding;
-                        (RunnerCommand::Rebuild { name: name.clone() }, "Rebuild")
-                    }
-                    WatchItemKind::BuildGraph => {
-                        // Build graph change has no rebuild/complete cycle —
-                        // the runner re-queries the build tool asynchronously.
-                        // Extract the service/task name by stripping "__graph" suffix.
-                        item.state = WatchState::Idle;
-                        let item_name = build_graph_command_name(&name);
-                        (
-                            RunnerCommand::BuildGraphChanged { name: item_name },
-                            "BuildGraphChanged",
-                        )
-                    }
-                };
-                self.emitter.service_debug_event(
-                    &name,
-                    &format!(
-                        "watch: debounce fired → sending {} (state={:?})",
-                        label, item.state
-                    ),
-                );
-                // If the channel is closed, the runner is shutting down.
-                if self.cmd_tx.send(cmd).is_err() {
-                    self.emitter.service_debug_event(
-                        &name,
-                        "watch: command channel closed — runner is shutting down",
-                    );
-                }
-            }
-        }
-    }
-
-    /// Handle a runner event — mainly looking for rebuild/rerun completion.
-    async fn handle_runner_event(&mut self, event: &RunnerEvent) {
-        match event {
-            RunnerEvent::RebuildComplete { name, success } => {
-                if let Some(item) = self.items.get_mut(name) {
-                    if item.stale {
-                        // More changes came in during the rebuild — trigger another cycle.
-                        item.stale = false;
-                        item.state = WatchState::Rebuilding;
-                        self.emitter.service_debug_event(
-                            name,
-                            &format!(
-                                "watch: RebuildComplete(success={success}) stale=true — re-running"
-                            ),
-                        );
-                        let _ = self
-                            .cmd_tx
-                            .send(RunnerCommand::Rebuild { name: name.clone() });
-                    } else {
-                        item.state = WatchState::Idle;
-                        self.emitter.service_debug_event(
-                            name,
-                            &format!("watch: RebuildComplete(success={success}) → Idle"),
-                        );
-                    }
-                } else {
-                    self.emitter
-                        .debug_event(&format!("watch: RebuildComplete for unknown item {name:?}"));
-                }
-            }
-            RunnerEvent::TaskRerunComplete { name, success } => {
-                if let Some(item) = self.items.get_mut(name) {
-                    if item.stale {
-                        item.stale = false;
-                        item.state = WatchState::Rebuilding;
-                        self.emitter.service_debug_event(
-                            name,
-                            &format!(
-                                "watch: TaskRerunComplete(success={success}) stale=true — re-running"
-                            ),
-                        );
-                        let _ = self
-                            .cmd_tx
-                            .send(RunnerCommand::TaskRerun { name: name.clone() });
-                    } else {
-                        item.state = WatchState::Idle;
-                        self.emitter.service_debug_event(
-                            name,
-                            &format!("watch: TaskRerunComplete(success={success}) → Idle"),
-                        );
-                    }
-                } else {
-                    self.emitter.debug_event(&format!(
-                        "watch: TaskRerunComplete for unknown item {name:?}"
-                    ));
-                }
-            }
-            RunnerEvent::ShutdownComplete => {
-                // Stop watching.
-            }
-            _ => {}
+            let Some(item) = self.items.get_mut(&name) else {
+                continue;
+            };
+            item.debounce_deadline = None;
+            // The synthetic `__graph` item speaks for the process it was
+            // derived from; everything else speaks for itself.
+            let target = match kind {
+                WatchItemKind::BuildGraph => build_graph_command_name(&name),
+                WatchItemKind::Service | WatchItemKind::Task => name.clone(),
+            };
+            self.emitter.service_debug_event(
+                &name,
+                &format!(
+                    "watch: debounce fired → {target} changed ({})",
+                    kind.as_str()
+                ),
+            );
+            self.dispatch.changed(&target, kind);
         }
     }
 
@@ -1277,8 +1205,11 @@ impl WatchManager {
                     name.clone(),
                     WatchItemSnapshot {
                         kind: watch_item_kind_label(item.kind),
-                        state: watch_state_label(item.state),
-                        stale: item.stale,
+                        state: if item.debounce_deadline.is_some() {
+                            "debouncing"
+                        } else {
+                            "idle"
+                        },
                         debounce_ms: item.debounce_duration.as_millis() as u64,
                         last_error: item.last_error.clone(),
                         patterns: item
@@ -1313,7 +1244,6 @@ impl WatchManager {
                 .map(|p| p.as_str().to_string())
                 .collect(),
             notify_error_count: self.notify_error_count,
-            runner_event_lag_count: self.runner_event_lag_count,
             last_notify_error: self.last_notify_error.clone(),
         }
     }
@@ -1750,12 +1680,9 @@ fn refresh_item_definition(
     ignore_patterns: Vec<Pattern>,
 ) {
     // A build-tool re-query is a full re-registration of this item's watch
-    // definition. If we previously missed a RebuildComplete /
-    // TaskRerunComplete broadcast, the item may be stuck in `Rebuilding` and
-    // would otherwise swallow future edits forever.
-    item.state = WatchState::Idle;
+    // definition, so any window that was open counted changes against
+    // patterns that no longer apply.
     item.debounce_deadline = None;
-    item.stale = false;
     item.kind = kind;
     item.patterns = patterns;
     item.ignore_patterns = ignore_patterns;
@@ -1770,11 +1697,12 @@ fn build_graph_command_name(name: &str) -> String {
     name.strip_suffix("__graph").unwrap_or(name).to_string()
 }
 
-fn watch_state_label(state: WatchState) -> &'static str {
-    match state {
-        WatchState::Idle => "idle",
-        WatchState::Debouncing => "debouncing",
-        WatchState::Rebuilding => "rebuilding",
+/// Whether this item currently has a change waiting out its window.
+fn debounce_label(item: &WatchedItem) -> &'static str {
+    if item.debounce_deadline.is_some() {
+        "debouncing"
+    } else {
+        "idle"
     }
 }
 
@@ -2333,8 +2261,6 @@ bazel.target = "//services/api:api"
         for case in cases {
             let temp = tempfile::tempdir().unwrap();
             let config: crate::config::Config = case.toml.parse().unwrap();
-            let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-            let (_event_tx, event_rx) = broadcast::channel(8);
             let (_update_tx, update_rx) = mpsc::unbounded_channel();
             let (_query_tx, query_rx) = mpsc::channel(8);
             let output = crate::output::OutputManager::new(
@@ -2348,8 +2274,7 @@ bazel.target = "//services/api:api"
                 &config,
                 crate::config::Platform::LinuxX86_64,
                 temp.path(),
-                cmd_tx,
-                event_rx,
+                Box::new(signal::RecordingDispatch::default()),
                 update_rx,
                 query_rx,
                 output.clone_lifecycle_emitter(),
@@ -2480,603 +2405,192 @@ bazel.target = "//services/api:api"
         }
     }
 
-    #[tokio::test]
-    async fn test_state_machine_debounce_coalesces_events() {
-        // Simulate: 10 events arrive in quick succession. Only one rebuild fires.
-        tokio::time::pause();
+    /// A watched item, as the manager holds one.
+    fn watched(kind: WatchItemKind, debounce: Duration, patterns: &[&str]) -> WatchedItem {
+        WatchedItem {
+            debounce_duration: debounce,
+            debounce_deadline: None,
+            kind,
+            patterns: patterns.iter().map(|p| Pattern::new(p).unwrap()).collect(),
+            ignore_patterns: vec![],
+            last_error: None,
+        }
+    }
 
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-
-        let mut items = HashMap::new();
-        items.insert(
-            "api".to_string(),
-            WatchedItem {
-                state: WatchState::Idle,
-                debounce_duration: Duration::from_millis(200),
-                debounce_deadline: None,
-                stale: false,
-                kind: WatchItemKind::Service,
-                patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
-            },
-        );
-
-        // Create a minimal event to feed the state machine.
-        let make_event = || notify::Event {
+    fn modify_event(path: &str) -> notify::Event {
+        notify::Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from("src/main.rs")],
+            paths: vec![PathBuf::from(path)],
             attrs: Default::default(),
-        };
-
-        // Feed 10 events rapidly (every 10ms).
-        let mut mgr_items = items;
-        for _ in 0..10 {
-            let event = make_event();
-            handle_notify_event_standalone(&mut mgr_items, &event, &cmd_tx).await;
-            tokio::time::advance(Duration::from_millis(10)).await;
         }
-
-        // All items should be in Debouncing state.
-        assert_eq!(mgr_items["api"].state, WatchState::Debouncing);
-
-        // Advance past the debounce window (200ms from the last event).
-        tokio::time::advance(Duration::from_millis(200)).await;
-
-        // Fire timers.
-        fire_debounce_timers_standalone(&mut mgr_items, &cmd_tx).await;
-        assert_eq!(mgr_items["api"].state, WatchState::Rebuilding);
-
-        // Should have received exactly one Rebuild command.
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::Rebuild { ref name } if name == "api"));
-        assert!(cmd_rx.try_recv().is_err());
-
-        // Clean up: send rebuild complete event to reset state.
-        let event = RunnerEvent::RebuildComplete {
-            name: "api".to_string(),
-            success: true,
-        };
-        handle_runner_event_standalone(&mut mgr_items, &event, &cmd_tx).await;
-        assert_eq!(mgr_items["api"].state, WatchState::Idle);
     }
 
+    /// A manager with no notify backend, driven directly. Registration is
+    /// what needs a real watcher; matching and debouncing are not.
+    async fn test_manager(
+        items: HashMap<String, WatchedItem>,
+        dispatch: std::sync::Arc<signal::RecordingDispatch>,
+    ) -> WatchManager {
+        struct Shared(std::sync::Arc<signal::RecordingDispatch>);
+        impl WatchDispatch for Shared {
+            fn changed(&self, name: &str, kind: WatchItemKind) {
+                self.0.changed(name, kind);
+            }
+        }
+        let output = crate::output::OutputManager::new(&[], tokio::io::sink())
+            .await
+            .unwrap();
+        let (notify_tx, event_rx) = mpsc::unbounded_channel();
+        let (_update_tx, update_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::channel(8);
+        std::mem::forget(_update_tx);
+        std::mem::forget(_query_tx);
+        WatchManager {
+            watcher: None,
+            notify_tx,
+            event_rx,
+            items,
+            dispatch: Box::new(Shared(dispatch)),
+            update_rx,
+            query_rx,
+            registered_dirs: HashMap::new(),
+            emitter: output.clone_lifecycle_emitter(),
+            notify_error_count: 0,
+            last_notify_error: None,
+            global_ignore: Vec::new(),
+            overrides: OverrideBuilder::new(".").build().unwrap(),
+        }
+    }
+
+    /// Debouncing is the whole of what the watcher decides now: how many
+    /// events become how many notifications, and to whom.
+    ///
+    /// What is deliberately absent: any notion of the receiver being busy.
+    /// A change arriving while the last one is still being acted on is
+    /// dispatched again — folding the two is the receiver's call, made
+    /// against a cycle only it can see.
     #[tokio::test]
-    async fn test_events_after_debounce_trigger_new_cycle() {
-        tokio::time::pause();
+    async fn debounce_decides_how_many_notifications_one_burst_becomes() {
+        struct Case {
+            name: &'static str,
+            kind: WatchItemKind,
+            item_name: &'static str,
+            debounce: Duration,
+            /// (path, how long to wait after it) per event.
+            events: Vec<(&'static str, Duration)>,
+            /// Dispatches expected, in order.
+            want: Vec<(&'static str, WatchItemKind)>,
+        }
 
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-
-        let mut items = HashMap::new();
-        items.insert(
-            "api".to_string(),
-            WatchedItem {
-                state: WatchState::Idle,
-                debounce_duration: Duration::from_millis(200),
-                debounce_deadline: None,
-                stale: false,
+        let cases = vec![
+            Case {
+                name: "a burst inside the window is one notification",
                 kind: WatchItemKind::Service,
-                patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
+                item_name: "api",
+                debounce: Duration::from_millis(200),
+                events: (0..10)
+                    .map(|_| ("src/main.rs", Duration::from_millis(10)))
+                    .collect(),
+                want: vec![("api", WatchItemKind::Service)],
             },
-        );
-
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![PathBuf::from("src/lib.rs")],
-            attrs: Default::default(),
-        };
-
-        // First event: start debouncing.
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        tokio::time::advance(Duration::from_millis(200)).await;
-        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
-        let _ = cmd_rx.try_recv().unwrap(); // consume first Rebuild
-
-        // Simulate rebuild completion.
-        let complete = RunnerEvent::RebuildComplete {
-            name: "api".to_string(),
-            success: true,
-        };
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Idle);
-
-        // Second event: should start a new cycle.
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Debouncing);
-
-        tokio::time::advance(Duration::from_millis(200)).await;
-        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::Rebuild { ref name } if name == "api"));
-    }
-
-    #[tokio::test]
-    async fn test_custom_debounce_duration() {
-        tokio::time::pause();
-
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-
-        let mut items = HashMap::new();
-        items.insert(
-            "api".to_string(),
-            WatchedItem {
-                state: WatchState::Idle,
-                debounce_duration: Duration::from_millis(500),
-                debounce_deadline: None,
-                stale: false,
+            Case {
+                name: "changes either side of the window are two",
                 kind: WatchItemKind::Service,
-                patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
+                item_name: "api",
+                debounce: Duration::from_millis(200),
+                events: vec![
+                    ("src/main.rs", Duration::from_millis(300)),
+                    ("src/main.rs", Duration::from_millis(10)),
+                ],
+                want: vec![
+                    ("api", WatchItemKind::Service),
+                    ("api", WatchItemKind::Service),
+                ],
             },
-        );
-
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![PathBuf::from("src/main.rs")],
-            attrs: Default::default(),
-        };
-
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-
-        // At 200ms: should NOT have fired yet (debounce is 500ms).
-        tokio::time::advance(Duration::from_millis(200)).await;
-        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Debouncing);
-        assert!(cmd_rx.try_recv().is_err());
-
-        // At 500ms: should fire.
-        tokio::time::advance(Duration::from_millis(300)).await;
-        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Rebuilding);
-        assert!(cmd_rx.try_recv().is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_change_during_build_triggers_second_rebuild() {
-        tokio::time::pause();
-
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-
-        let mut items = HashMap::new();
-        items.insert(
-            "api".to_string(),
-            WatchedItem {
-                state: WatchState::Rebuilding,
-                debounce_duration: Duration::from_millis(200),
-                debounce_deadline: None,
-                stale: false,
-                kind: WatchItemKind::Service,
-                patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
+            Case {
+                name: "a task's change goes to the task",
+                kind: WatchItemKind::Task,
+                item_name: "codegen",
+                debounce: Duration::from_millis(50),
+                events: vec![("src/main.rs", Duration::from_millis(10))],
+                want: vec![("codegen", WatchItemKind::Task)],
             },
-        );
-
-        // Event during build — should set stale.
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![PathBuf::from("src/main.rs")],
-            attrs: Default::default(),
-        };
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        assert!(items["api"].stale);
-        assert_eq!(items["api"].state, WatchState::Rebuilding);
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api"));
-
-        // Build completes — should trigger another Rebuild because stale.
-        let complete = RunnerEvent::RebuildComplete {
-            name: "api".to_string(),
-            success: true,
-        };
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Rebuilding);
-        assert!(!items["api"].stale);
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::Rebuild { ref name } if name == "api"));
-    }
-
-    #[tokio::test]
-    async fn test_multiple_events_during_build_one_followup() {
-        tokio::time::pause();
-
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-
-        let mut items = HashMap::new();
-        items.insert(
-            "api".to_string(),
-            WatchedItem {
-                state: WatchState::Rebuilding,
-                debounce_duration: Duration::from_millis(200),
-                debounce_deadline: None,
-                stale: false,
-                kind: WatchItemKind::Service,
-                patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
-            },
-        );
-
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![PathBuf::from("src/main.rs")],
-            attrs: Default::default(),
-        };
-
-        // 5 events during build.
-        for _ in 0..5 {
-            handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        }
-        assert!(items["api"].stale);
-        let mut stale_count = 0;
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            if matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api") {
-                stale_count += 1;
-            }
-        }
-        assert_eq!(stale_count, 5);
-
-        // Build completes — only one follow-up rebuild.
-        let complete = RunnerEvent::RebuildComplete {
-            name: "api".to_string(),
-            success: true,
-        };
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::Rebuild { ref name } if name == "api"));
-        assert!(cmd_rx.try_recv().is_err()); // No extra commands.
-    }
-
-    #[tokio::test]
-    async fn test_state_machine_full_cycle() {
-        tokio::time::pause();
-
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-
-        let mut items = HashMap::new();
-        items.insert(
-            "api".to_string(),
-            WatchedItem {
-                state: WatchState::Idle,
-                debounce_duration: Duration::from_millis(200),
-                debounce_deadline: None,
-                stale: false,
-                kind: WatchItemKind::Service,
-                patterns: vec![Pattern::new("src/**/*.rs").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
-            },
-        );
-
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![PathBuf::from("src/main.rs")],
-            attrs: Default::default(),
-        };
-
-        // Idle -> Debouncing
-        assert_eq!(items["api"].state, WatchState::Idle);
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Debouncing);
-
-        // Debouncing -> Rebuilding
-        tokio::time::advance(Duration::from_millis(200)).await;
-        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Rebuilding);
-        let _ = cmd_rx.try_recv().unwrap();
-
-        // Events during rebuild set stale.
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        assert!(items["api"].stale);
-        assert_eq!(items["api"].state, WatchState::Rebuilding);
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, RunnerCommand::RebuildStale { ref name } if name == "api"));
-
-        // Rebuild completes with stale -> immediately Rebuilding again.
-        let complete = RunnerEvent::RebuildComplete {
-            name: "api".to_string(),
-            success: true,
-        };
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Rebuilding);
-        assert!(!items["api"].stale);
-        let _ = cmd_rx.try_recv().unwrap();
-
-        // Second rebuild completes without stale -> Idle.
-        handle_runner_event_standalone(&mut items, &complete, &cmd_tx).await;
-        assert_eq!(items["api"].state, WatchState::Idle);
-        assert!(cmd_rx.try_recv().is_err());
-    }
-
-    // --- Test helpers: standalone versions of WatchManager methods ---
-
-    async fn handle_notify_event_standalone(
-        items: &mut HashMap<String, WatchedItem>,
-        event: &notify::Event,
-        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
-    ) {
-        if !matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        ) {
-            return;
-        }
-
-        let mut affected: Vec<String> = Vec::new();
-        for path in &event.paths {
-            let path_str = path.to_string_lossy();
-            for (name, item) in items.iter() {
-                if item
-                    .ignore_patterns
-                    .iter()
-                    .any(|pattern| matches_ignore(pattern, &path_str))
-                {
-                    continue;
-                }
-                if item
-                    .patterns
-                    .iter()
-                    .any(|pattern| matches_glob(pattern, &path_str))
-                    && !affected.contains(name)
-                {
-                    affected.push(name.clone());
-                }
-            }
-        }
-
-        let now = Instant::now();
-        let mut stale_services: Vec<String> = Vec::new();
-        for name in affected {
-            if let Some(item) = items.get_mut(&name) {
-                match item.state {
-                    WatchState::Idle => {
-                        item.state = WatchState::Debouncing;
-                        item.debounce_deadline = Some(now + item.debounce_duration);
-                    }
-                    WatchState::Debouncing => {
-                        item.debounce_deadline = Some(now + item.debounce_duration);
-                    }
-                    WatchState::Rebuilding => {
-                        item.stale = true;
-                        if item.kind == WatchItemKind::Service && !stale_services.contains(&name) {
-                            stale_services.push(name.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        for name in stale_services {
-            let _ = cmd_tx.send(RunnerCommand::RebuildStale { name });
-        }
-    }
-
-    async fn fire_debounce_timers_standalone(
-        items: &mut HashMap<String, WatchedItem>,
-        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
-    ) {
-        let now = Instant::now();
-        let mut to_fire: Vec<(String, WatchItemKind)> = Vec::new();
-
-        for (name, item) in items.iter() {
-            if item.state == WatchState::Debouncing
-                && let Some(deadline) = item.debounce_deadline
-                && now >= deadline
-            {
-                to_fire.push((name.clone(), item.kind));
-            }
-        }
-
-        for (name, kind) in to_fire {
-            if let Some(item) = items.get_mut(&name) {
-                item.debounce_deadline = None;
-                let cmd = match kind {
-                    WatchItemKind::Task => {
-                        item.state = WatchState::Rebuilding;
-                        RunnerCommand::TaskRerun { name }
-                    }
-                    WatchItemKind::Service => {
-                        item.state = WatchState::Rebuilding;
-                        RunnerCommand::Rebuild { name }
-                    }
-                    WatchItemKind::BuildGraph => {
-                        item.state = WatchState::Idle;
-                        let item_name = build_graph_command_name(&name);
-                        RunnerCommand::BuildGraphChanged { name: item_name }
-                    }
-                };
-                let _ = cmd_tx.send(cmd);
-            }
-        }
-    }
-
-    async fn handle_runner_event_standalone(
-        items: &mut HashMap<String, WatchedItem>,
-        event: &RunnerEvent,
-        cmd_tx: &mpsc::UnboundedSender<RunnerCommand>,
-    ) {
-        match event {
-            RunnerEvent::RebuildComplete { name, .. } => {
-                if let Some(item) = items.get_mut(name) {
-                    if item.stale {
-                        item.stale = false;
-                        item.state = WatchState::Rebuilding;
-                        let _ = cmd_tx.send(RunnerCommand::Rebuild { name: name.clone() });
-                    } else {
-                        item.state = WatchState::Idle;
-                    }
-                }
-            }
-            RunnerEvent::TaskRerunComplete { name, .. } => {
-                if let Some(item) = items.get_mut(name) {
-                    if item.stale {
-                        item.stale = false;
-                        item.state = WatchState::Rebuilding;
-                        let _ = cmd_tx.send(RunnerCommand::TaskRerun { name: name.clone() });
-                    } else {
-                        item.state = WatchState::Idle;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    #[tokio::test]
-    async fn test_build_graph_kind_sends_build_graph_changed() {
-        tokio::time::pause();
-
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-
-        let mut items = HashMap::new();
-        items.insert(
-            "api__graph".to_string(),
-            WatchedItem {
-                state: WatchState::Idle,
-                debounce_duration: Duration::from_millis(200),
-                debounce_deadline: None,
-                stale: false,
+            Case {
+                // The synthetic item speaks for the process it was derived
+                // from, so the build manager is asked about `api`.
+                name: "a build-graph item reports its process's name",
                 kind: WatchItemKind::BuildGraph,
-                patterns: vec![Pattern::new("**/BUILD.bazel").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
+                item_name: "api__graph",
+                debounce: Duration::from_millis(50),
+                events: vec![("src/main.rs", Duration::from_millis(10))],
+                want: vec![("api", WatchItemKind::BuildGraph)],
             },
-        );
-
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![PathBuf::from("services/api/BUILD.bazel")],
-            attrs: Default::default(),
-        };
-
-        // Trigger the event.
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        assert_eq!(items["api__graph"].state, WatchState::Debouncing);
-
-        // Wait for debounce.
-        tokio::time::advance(Duration::from_millis(200)).await;
-        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
-
-        // BuildGraph kind goes straight to Idle (no rebuild cycle).
-        assert_eq!(items["api__graph"].state, WatchState::Idle);
-
-        // Should receive BuildGraphChanged with the service name (not the __graph suffix).
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(
-            matches!(cmd, RunnerCommand::BuildGraphChanged { ref name } if name == "api"),
-            "expected BuildGraphChanged for 'api', got different command"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_graph_kind_no_rebuild_cycle() {
-        // Build graph changes should NOT enter the Rebuilding state.
-        // They go Idle -> Debouncing -> Idle (fire) directly.
-        tokio::time::pause();
-
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-
-        let mut items = HashMap::new();
-        items.insert(
-            "web__graph".to_string(),
-            WatchedItem {
-                state: WatchState::Idle,
-                debounce_duration: Duration::from_millis(200),
-                debounce_deadline: None,
-                stale: false,
+            Case {
+                name: "the workspace sentinel keeps its own name",
                 kind: WatchItemKind::BuildGraph,
-                patterns: vec![Pattern::new("**/package.json").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
+                item_name: WORKSPACE_GRAPH_ITEM_NAME,
+                debounce: Duration::from_millis(50),
+                events: vec![("src/main.rs", Duration::from_millis(10))],
+                want: vec![(WORKSPACE_GRAPH_ITEM_NAME, WatchItemKind::BuildGraph)],
             },
-        );
+            Case {
+                name: "a path no pattern matches goes nowhere",
+                kind: WatchItemKind::Service,
+                item_name: "api",
+                debounce: Duration::from_millis(50),
+                events: vec![("docs/readme.md", Duration::from_millis(10))],
+                want: vec![],
+            },
+        ];
 
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![PathBuf::from("apps/web/package.json")],
-            attrs: Default::default(),
-        };
-
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        tokio::time::advance(Duration::from_millis(200)).await;
-        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
-
-        // Should be back to Idle, not Rebuilding.
-        assert_eq!(items["web__graph"].state, WatchState::Idle);
-        // And stale should still be false.
-        assert!(!items["web__graph"].stale);
-    }
-
-    #[tokio::test]
-    async fn test_workspace_build_graph_kind_preserves_workspace_sentinel() {
         tokio::time::pause();
+        for case in cases {
+            let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+            let mut items = HashMap::new();
+            items.insert(
+                case.item_name.to_string(),
+                watched(case.kind, case.debounce, &["src/**/*.rs"]),
+            );
+            let mut mgr = test_manager(items, std::sync::Arc::clone(&dispatch)).await;
 
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            for (path, gap) in &case.events {
+                mgr.handle_notify_event(&modify_event(path)).await;
+                tokio::time::advance(*gap).await;
+                mgr.fire_debounce_timers().await;
+            }
+            // Let the last window close.
+            tokio::time::advance(case.debounce + Duration::from_millis(10)).await;
+            mgr.fire_debounce_timers().await;
 
-        let mut items = HashMap::new();
-        items.insert(
-            WORKSPACE_GRAPH_ITEM_NAME.to_string(),
-            WatchedItem {
-                state: WatchState::Idle,
-                debounce_duration: Duration::from_millis(200),
-                debounce_deadline: None,
-                stale: false,
-                kind: WatchItemKind::BuildGraph,
-                patterns: vec![Pattern::new("**/MODULE.bazel").unwrap()],
-                ignore_patterns: vec![],
-                last_error: None,
-            },
-        );
-
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![PathBuf::from("MODULE.bazel")],
-            attrs: Default::default(),
-        };
-
-        handle_notify_event_standalone(&mut items, &event, &cmd_tx).await;
-        tokio::time::advance(Duration::from_millis(200)).await;
-        fire_debounce_timers_standalone(&mut items, &cmd_tx).await;
-
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(
-            matches!(cmd, RunnerCommand::BuildGraphChanged { ref name } if name == WORKSPACE_GRAPH_ITEM_NAME),
-            "expected BuildGraphChanged for workspace sentinel, got different command"
-        );
+            let got = dispatch.calls.lock().unwrap().clone();
+            let want: Vec<(String, WatchItemKind)> = case
+                .want
+                .iter()
+                .map(|(n, k)| ((*n).to_string(), *k))
+                .collect();
+            assert_eq!(got, want, "{}", case.name);
+            // Nothing is left pending once a window has closed.
+            assert!(
+                mgr.nearest_debounce_deadline().is_none(),
+                "{}: a window was left open",
+                case.name
+            );
+        }
     }
 
+    /// A re-query replaces an item's patterns wholesale, so a window that
+    /// was counting changes against the old ones is dropped with them.
     #[test]
-    fn test_refresh_item_definition_resets_stuck_rebuilding_state() {
+    fn test_refresh_item_definition_drops_a_pending_window() {
         let original_patterns = vec![Pattern::new("src/**/*.rs").unwrap()];
         let replacement_patterns = vec![Pattern::new("pkg/**").unwrap()];
         let replacement_ignore = vec![Pattern::new("pkg/generated/**").unwrap()];
 
         let mut item = WatchedItem {
-            state: WatchState::Rebuilding,
             debounce_duration: Duration::from_millis(200),
             debounce_deadline: Some(Instant::now() + Duration::from_millis(50)),
-            stale: true,
             kind: WatchItemKind::Service,
             patterns: original_patterns,
             ignore_patterns: vec![],
@@ -3090,9 +2604,7 @@ bazel.target = "//services/api:api"
             replacement_ignore,
         );
 
-        assert_eq!(item.state, WatchState::Idle);
         assert_eq!(item.debounce_deadline, None);
-        assert!(!item.stale);
         assert_eq!(item.kind, WatchItemKind::Task);
         assert_eq!(item.patterns.len(), 1);
         assert_eq!(item.patterns[0].as_str(), "pkg/**");

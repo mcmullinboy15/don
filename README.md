@@ -11,12 +11,21 @@ Don reads a `don.toml` in your project root and orchestrates your entire dev sta
 ## Install
 
 ```sh
-# From source
+# From source (requires Zig 0.15.2 — see below)
 cargo install --path .
 
 # Or via Homebrew
 brew install pjtatlow/tap/don
 ```
+
+Building from source requires **Zig 0.15.2** on your `PATH` in addition to
+the Rust toolchain: don embeds ghostty's terminal-emulation core
+([`libghostty-vt`](https://crates.io/crates/libghostty-vt)) for server-side
+attach screens, and its build compiles ghostty with `zig build` — there are
+no prebuilt libraries. Ghostty pins the Zig version exactly, so a newer Zig
+will refuse to build. Grab the matching tarball from
+[ziglang.org/download](https://ziglang.org/download/). Prebuilt binaries
+(Homebrew, GitHub releases) don't need Zig.
 
 ## Quick Start
 
@@ -66,20 +75,53 @@ Don will:
 
 ### Interactive TUI
 
-When stdout is a TTY, `don start` runs a ratatui-driven interface: logs stream into native scrollback while a bordered status bar pinned to the bottom shows ready counts, running tasks, a spinner during transitions, and contextual key hints.
+When stdout is a TTY, `don start` runs a ratatui-driven full-screen interface: a
+scrollable log pane, an optional panel beside it, and a bordered bar along
+the bottom with ready counts, running tasks, a spinner during transitions and
+contextual key hints.
+
+Don keeps its own copy of every log line — the same stream, with the same line
+numbering, that `don logs` and the web UI read — so filtering only changes what
+is *shown*. Widening a filter reveals history that was there all along, and
+nothing is lost by opening an overlay.
 
 | Key | Action |
 |-----|--------|
-| `l` | Filter services/tasks — space toggles, enter commits, esc clears |
-| `s` | Full-screen service status overlay |
-| `t` | Full-screen task status overlay |
-| `Enter` | Insert a blank line separator into scrollback |
-| `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
+| `↑` `↓` `PgUp` `PgDn` `Home` | Scroll the log |
+| `End` or `Enter` | Jump back to following the live tail |
+| wheel | Scroll the log |
+| drag | Select text. Double-click takes a word, triple-click the message |
+| `y` | Copy the selection, without the `name \| ` prefix |
+| `Esc` | Clear the selection |
+| `j` `k` `g g` `G` | Vim's verticals: line down, line up, top, live tail |
+| `s` `t` `f` | Open the services, tasks or filter panel — each key also closes its own |
+| `Tab` | Move focus between the log and the panel |
+| `P` | Move the panel between right and bottom |
+| Ctrl+`←` `→` | Resize the split. Grows whichever pane has focus |
+| `l` | In a table: the highlighted service's or task's log |
+| `a` | In a table: attach to the highlighted process, in a window |
+| `enter` `r` `R` | In a table: run or start/stop, restart, hard restart |
+| Ctrl+L | Repaint, if something else has scribbled on the screen |
+| Ctrl+D | Detach, leaving the stack running (`don tui` only) |
+| Ctrl+C | Graceful shutdown (second press force-kills) |
+
+A selection is a place in the log rather than a place on the screen — a line
+and an offset into it — so it stays on the text you dragged across while you
+scroll, resize the terminal, or change the filter. Dragging holds the view
+still as well, so output arriving mid-drag doesn't pull the text out from under
+you; the log resumes following when you clear the selection. Copying is
+deliberate — `y`, never a side effect of releasing the mouse.
+
+Copying goes through OSC 52, so it reaches your system clipboard over ssh and
+inside tmux. Terminals with OSC 52 disabled ignore it silently — the status bar
+reports what was sent, which is the only acknowledgement the protocol allows.
+
+⌘ is not available to a terminal application: it has no encoding in the
+traditional input stream, and macOS terminals claim it for their own shortcuts
+before an application sees it. To use ⌘C, hold **Shift while dragging** — that
+bypasses don's mouse capture and gives you the terminal's own selection.
 
 Pipe mode (non-TTY) writes prefixed lines directly to stdout unchanged.
-Configs with active foreground terminal tasks also use plain prefixed output
-instead of the TUI so those tasks can own stdin without competing with Don's
-keyboard handler.
 
 Pass `--log-filter=<name1,name2,...>` to scope visible output to a subset of
 services or tasks — useful in pipe mode (CI, log capture) and as a way to
@@ -123,7 +165,7 @@ run.args = ["run", "dev"]
 reload = false   # no watch registration, rebuilds, or restarts for this service
 ```
 
-Bazel and Turbo services/tasks also have nested `watch` flags. These are narrower: they only disable auto-resolved build-tool watch paths while still using the build tool for startup builds. Explicit service `watch = [...]` patterns still work unless `reload = false` is set.
+Bazel services/tasks also have a nested `watch` flag. It is narrower: it only disables auto-resolved build-tool watch paths while still using Bazel for startup builds. Explicit service `watch = [...]` patterns still work unless `reload = false` is set.
 
 ```toml
 [services.api]
@@ -153,7 +195,7 @@ auto_run = false
 depends_on = ["migrate"]
 ```
 
-Run deferred tasks with `don run --all-pending` or from the TUI action palette.
+Run deferred tasks with `don run <name>`, or from the TUI's task view (`t`).
 
 Set `auto_run = "once"` to run a task automatically on startup until it has
 one successful run, then require manual triggers forever after:
@@ -165,31 +207,44 @@ auto_run = "once"
 depends_on = ["postgres"]
 ```
 
-Some tasks need the real terminal: REPLs, editors, interactive migrations, test
-watchers, or anything that expects stdin and unprefixed output. Mark those as
-foreground terminal tasks:
+Some tasks wait for a human: REPLs, editors, interactive migrations, test
+watchers, or anything that prompts on stdin. Say so:
 
 ```toml
 [tasks.console]
 cmd = "rails"
 args = ["console"]
 depends_on = ["postgres"]
-terminal = "foreground"
+interactive = true
 ```
 
-Foreground tasks run as part of normal startup and file-watch re-runs. When one
-becomes ready, Don pauses visible Don output, gives the task stdin/stdout/stderr,
-and waits for it to exit before starting other newly-ready services or tasks.
-Already-running dependencies keep running, and their output is still captured in
-ring buffers and log files.
+Every task already runs on a PTY and any task can be reached with `don attach
+<task>`, so this doesn't change how the task runs. It changes who has to do
+something about it. In the TUI, an interactive task **opens its own attach
+window** when it starts and closes it again when it succeeds — you answer the
+prompt where you were already looking. If it fails, the window stays up, dimmed
+and titled with the outcome, so its last screen is still there to read; any key
+dismisses it. Outside the TUI there is no client to attach, so Don says
+`waiting for input — run 'don attach console'` instead, because a task blocked
+on input is otherwise indistinguishable from one that has hung.
 
-`terminal = "foreground"` uses the alternate screen by default, giving the task a
-clean full-screen workspace that disappears when it exits. Use the main screen
-when you want the task's output to remain in normal scrollback:
+`terminal = "foreground"` is the older spelling of `interactive = true` and
+still works. It named a mechanism Don no longer has — a task taking the
+terminal away from everything else — but what it was *for* outlived the
+mechanism, so a config that still says it keeps working. `terminal = "muxed"`
+is the ordinary case and means `interactive = false`.
 
-```toml
-terminal = { mode = "foreground", screen = "main" }
+A process that takes the terminal's **alternate screen** — vim, htop, lazygit,
+anything full-screen — is detected regardless of how it's configured. Its
+frames can't be rendered in a multiplexed line-oriented view, so Don writes one
+line and stops:
+
 ```
+console | entered full-screen mode — run 'don attach console' to see it
+```
+
+Output resumes when the process hands the screen back. Nothing is lost: `don
+logs` and `don attach` are fed upstream of this and see every byte.
 
 Tasks can also declare parameters. Parametrized tasks are interactive: values are supplied at run time via `don run <task> --<name>=<value>` or the TUI form, then substituted into `cmd`, `args`, `env`, and `dir` via `{{name}}` placeholders.
 
@@ -363,7 +418,7 @@ run.args = ["run", "dev"]
 reload = false
 ```
 
-Bazel and Turbo have a second, narrower switch: `bazel.watch = false` or `turbo.watch = false` disables build-tool-resolved watch paths, but does not disable explicit service `watch = [...]` patterns.
+Bazel has a second, narrower switch: `bazel.watch = false` disables build-tool-resolved watch paths, but does not disable explicit service `watch = [...]` patterns.
 
 ### Docker Services
 
@@ -401,6 +456,9 @@ Built-in support for Rust and Go with automatic build commands and default watch
 [services.api]
 rust.binary = "api"
 rust.features = ["dev"]
+# `$CARGO_TARGET_DIR` is honoured. Set `rust.target_dir` to override it, or if
+# your target directory comes from `build.target-dir` in .cargo/config.toml,
+# which Don doesn't read.
 
 # Go — runs `go build -o .don/bin/api ./cmd/api`, watches **/*.go
 [services.api]
@@ -452,21 +510,6 @@ bazel.target = "//services/api:api"
 bazel.watch = false
 watch = ["services/api/**/*.py", "libs/common/**/*.py"]
 ```
-
-### Turborepo Integration
-
-For monorepos using Turborepo, Don auto-resolves the task graph:
-
-```toml
-[services.web]
-turbo.task = "dev"
-turbo.filter = "@myorg/web"
-proxy = { listen = "127.0.0.1:3000", env = "PORT" }
-```
-
-Don queries `turbo run --dry-run=json` to discover workspace dependencies and input files, then watches them for changes. At startup, a batch `turbo run build` runs for all configured packages.
-
-Set `turbo.watch = false` to keep Turbo startup builds/runs but skip Turbo-derived watch paths. Explicit service `watch = [...]` patterns still apply unless `reload = false` is also set.
 
 ### TCP Proxy
 
@@ -646,9 +689,10 @@ Edit `don.toml` while don is running. Don detects the change, diffs it, and appl
 
 ```sh
 don init                     # scaffold a starter don.toml
-don start                    # start the daemon (bare `don` prints help)
+don start                    # start this project's stack (bare `don` prints help)
 don start --profile <name>   # start a subset
 don start <name>             # start a stopped service in the running daemon
+don stop                     # stop this project's stack
 don stop <name>              # stop a running service
 don restart <name>           # restart a service
 don status                   # show all services and their states
@@ -662,33 +706,84 @@ don attach <name>            # attach stdin/stdout to a running service
 don run <name>               # run a specific task (bypasses auto_run)
 don run <name> --wait        # run a task and wait for it to finish
 don run <name> --timeout 30s # wait up to 30s without stopping the task
-don run --all-pending        # run all tasks sitting in pending_run
 don exec <cmd> [args...]     # run a command with .don/bin on PATH
 don validate                 # check config without starting
 don cleanup                  # remove stale state from a crashed run
 don cleanup --force          # kill a running daemon and clean up
 don completions <shell>      # print a completion script for bash/zsh/fish/...
+
+don ui                       # open the web UI in your browser
+don daemon                   # run the system-wide daemon in the foreground
+don daemon install           # install it as a user service (systemd/launchd)
+don daemon status            # what's running, and which projects it can see
+don daemon restart           # restart it, e.g. after upgrading don
+don daemon stop              # stop it (your projects keep running)
+don daemon uninstall         # remove the user service
 ```
 
 Completions are dynamic: service, task, and profile names from your `don.toml` tab-complete on subcommands that take them (`stop`, `restart`, `run`, `logs`, `attach`). Install with e.g. `don completions bash > ~/.local/share/bash-completion/completions/don` or `don completions zsh > "${fpath[1]}/_don"`.
 
+
+### Web UI
+
+Don can serve a browser UI over every project you have running — service and
+task states that update live, streaming logs with their colors intact, and the
+same start/stop/restart/run controls the CLI has.
+
+```sh
+don daemon install     # once: run the daemon as a user service
+don ui                 # open the UI
+```
+
+The daemon is a **broker, not an owner**. `don start` behaves exactly as it
+always has — same terminal, same TUI, same process group — and additionally
+tells the daemon where to find its socket. So:
+
+- Stopping the daemon doesn't touch a single running service; you just lose the
+  dashboard.
+- A project whose daemon isn't running starts exactly as fast. Registration is
+  best-effort and never blocks startup or Ctrl+C.
+- Nothing is written into your project. Daemon state lives in
+  `$XDG_STATE_HOME/don` (`~/Library/Application Support/don` on macOS), which is
+  the only thing don ever writes outside a project's `.don/`.
+
+Don't want a system-wide daemon? Serve a UI for one project from the process
+that's already running it:
+
+```sh
+don start --with-ui          # port 3667; the daemon owns 3666
+don start --with-ui=8100
+don start --no-daemon        # no UI, and don't register with the daemon either
+```
+
+The web UI binds loopback only and doesn't authenticate: anything that can
+reach the port is already running on your machine, and so can already do
+anything don can. It does refuse requests whose `Host` isn't a loopback name,
+which is what a DNS-rebound request from a page you merely visited looks like
+— that blocks such a page from *reading* your logs and project paths, though
+not from firing a blind request it can't see the result of. The port isn't
+checked, so the UI works behind a reverse proxy.
 
 ### Daemon API
 
 Don exposes a unix socket API at `.don/don.sock` for programmatic control:
 
 ```
+GET  /ready                  → whether the initial startup sweep has settled
 GET  /status                 → service/task states
-GET  /status?verbose=true    → states plus actual proxy/Docker addresses
+GET  /status?verbose=true    → states plus actual proxy/Docker addresses, and task params
+GET  /events                 → streaming NDJSON of state changes
 POST /start/:name            → start a stopped service
 POST /stop/:name             → stop a service
 POST /restart/:name          → restart a service
 POST /run/:name              → run a specific task (body: {"params": {...}, "wait": true})
-POST /run-pending            → run all tasks in pending_run state
 GET  /logs/:name?last=N      → ring buffer output
 GET  /logs/:name?follow=true → streaming NDJSON
 GET  /attach/:name           → raw-stream attach (stdin/stdout)
 ```
+
+The web UI is built on exactly these endpoints — it holds no logic of its own,
+so it can't drift from what the CLI does.
 
 ### Terminal Safety
 
@@ -719,7 +814,7 @@ See [`examples/`](examples/) for complete working configs.
 | `run.cmd` | string | Command to execute |
 | `run.args` | [string] | Arguments |
 | `dir` | string | Working directory |
-| `env` | {key: value} | Environment variables |
+| `env` | {key: value} | Environment variables. Values expand `${VAR}` against the inherited environment, env files, and Don-injected vars like `PORT` and `PWD` — but not against each other |
 | `env_file` | [string] | Env files to load |
 | `depends_on` | [string \| {name, blocking}] | Services/tasks to wait for. A string (or `blocking = true`) also gates on success; `blocking = false` orders startup only |
 | `watch` | [string] | Glob patterns to watch for changes; not a boolean |
@@ -736,9 +831,8 @@ See [`examples/`](examples/) for complete working configs.
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
 | `reload` | bool | Service-level master switch for Don-managed watches, rebuilds, and restarts (default: true) |
 | `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
-| `terminal` | string or table | (tasks) `"muxed"` default, or `"foreground"` for exclusive stdin/stdout/stderr ownership |
-| `terminal.mode` | string | (tasks) `"muxed"` or `"foreground"` |
-| `terminal.screen` | string | (tasks) `"alternate"` default for foreground, or `"main"` to keep output in scrollback |
+| `interactive` | bool | (tasks) `true` when the task waits for a human at its terminal; the TUI opens its attach window (default: false) |
+| `terminal` | string | (tasks) Older spelling of `interactive`: `"foreground"` = `true`, `"muxed"` = `false` |
 | `params` | [[table]] | (tasks) Declare run-time parameters for interactive tasks |
 | `params.name` | string | Parameter name, referenced as `{{name}}` and passed as `--name=value` |
 | `params.prompt` | string | Optional prompt shown in the TUI form |
@@ -767,10 +861,6 @@ See [`examples/`](examples/) for complete working configs.
 | `lazy` | bool | Delay start until first proxy connection |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
 | `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
-| `turbo.task` | string | Turborepo task name |
-| `turbo.filter` | string | Turborepo package filter |
-| `turbo.build_task` | string | Task to run during batch build (default: "build") |
-| `turbo.watch` | bool | Auto-resolve Turbo watch paths from the task graph (default: true); does not disable explicit service `watch` |
 | `download.platform.<platform>` | table | Per-platform download config |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
 | `fallback_ports` | bool | Top-level: use an OS-assigned proxy/Docker host port when the preferred port is in use |

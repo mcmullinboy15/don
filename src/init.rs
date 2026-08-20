@@ -1,7 +1,7 @@
 //! `don init` — scaffold a starter `don.toml` for a new project.
 //!
 //! Writes a commented template showing each preset (run, docker, rust, go,
-//! bazel, turbo) plus tasks and profiles. The file is meant to be edited;
+//! bazel) plus tasks and profiles. The file is meant to be edited;
 //! every section is commented out so `don validate` passes on the raw output.
 
 use std::path::Path;
@@ -56,11 +56,6 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # bazel.watch = false  # disable auto-resolved file watches, keep startup build
 # proxy = { listen = "127.0.0.1:8080", env = "PORT" }
 
-# Turborepo preset — auto-resolves watch patterns from the task graph.
-# [services.web]
-# turbo.task = "dev"
-# turbo.filter = "@myorg/web"
-
 # ── Tasks ───────────────────────────────────────────────────────────────────
 # One-shot commands. Re-run only when watched files change.
 
@@ -72,7 +67,7 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # watch = ["db/migrations/**/*.sql"]
 
 # Set auto_run = false to defer execution — when the task needs to run,
-# trigger it with `don run <name>` or `don run --all-pending`.
+# trigger it with `don run <name>`.
 # [tasks.seed]
 # cmd = "./scripts/seed-db"
 # auto_run = false

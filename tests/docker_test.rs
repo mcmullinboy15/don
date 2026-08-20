@@ -8,7 +8,7 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::ports::{manifest_path, read_manifest};
-use don::runner::{Runner, TerminalCoordinator};
+use don::runner::Runner;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
@@ -92,17 +92,22 @@ async fn make_runner(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         None,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
+
     (runner, shutdown_tx, buf)
 }
 
@@ -232,8 +237,12 @@ fn docker_service_builds_from_dockerfile_without_image() {
     skip_unless_docker!();
 
     run_with_timeout(Duration::from_secs(60), async {
-        let dir = TempDir::new("docker-build");
-        let container_name = "don-test-build";
+        // Temp dir and container name must be unique per test: TempDir paths are
+        // only namespaced by PID, and docker container names are global. Sharing
+        // either with `docker_build_and_run` means one test can delete the
+        // other's state.
+        let dir = TempDir::new("docker-build-no-image");
+        let container_name = "don-test-build-no-image";
 
         cleanup_container(container_name).await;
         // Remove any image left over from a previous run so we prove the build ran.

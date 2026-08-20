@@ -63,7 +63,7 @@ impl TaskRunInfo {
 /// Successful task runs persist a generic success marker, and watch-based
 /// tasks also persist a content hash for their watched inputs.
 #[derive(Clone)]
-pub struct TaskState {
+pub struct TaskStateStore {
     state_dir: PathBuf,
 }
 
@@ -102,14 +102,14 @@ pub(crate) enum TaskHashProgress {
     },
 }
 
-impl Default for TaskState {
+impl Default for TaskStateStore {
     fn default() -> Self {
         Self::new(PathBuf::from(".don").join("task-state"))
     }
 }
 
-impl TaskState {
-    /// Create a new `TaskState` that stores hashes in the given directory.
+impl TaskStateStore {
+    /// Create a new `TaskStateStore` that stores hashes in the given directory.
     pub fn new(state_dir: PathBuf) -> Self {
         Self { state_dir }
     }
@@ -900,7 +900,7 @@ mod tests {
         for case in &cases {
             let dir = TempDir::new(case.name);
             let state_dir = dir.path().join(".don-state");
-            let state = TaskState::new(state_dir);
+            let state = TaskStateStore::new(state_dir);
 
             (case.setup)(dir.path());
 
@@ -963,7 +963,7 @@ mod tests {
         fs::write(dir.path().join("schema.sql"), "CREATE TABLE schema;").unwrap();
         fs::write(generated.join("ignored.sql"), "CREATE TABLE ignored;").unwrap();
 
-        let state = TaskState::new(dir.path().join(".don-state"));
+        let state = TaskStateStore::new(dir.path().join(".don-state"));
         let patterns = vec!["**/*.sql".to_string()];
         let ignore_patterns = vec!["generated/**".to_string()];
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
@@ -1019,7 +1019,7 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("a.sql"), "CREATE TABLE a;").unwrap();
 
-        let state = TaskState::new(dir.path().join(".don-state"));
+        let state = TaskStateStore::new(dir.path().join(".don-state"));
         let patterns = vec!["*.sql".to_string()];
 
         // Without base_dir: glob resolves from cwd, won't find files in subdir
@@ -1054,7 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear() {
         let dir = TempDir::new("clear");
-        let state = TaskState::new(dir.path().join(".don-state"));
+        let state = TaskStateStore::new(dir.path().join(".don-state"));
 
         fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let patterns = vec![format!("{}/*.txt", dir.path().to_string_lossy())];
@@ -1087,7 +1087,7 @@ mod tests {
     #[tokio::test]
     async fn test_watchless_task_still_records_success() {
         let dir = TempDir::new("watchless-success");
-        let state = TaskState::new(dir.path().join(".don-state"));
+        let state = TaskStateStore::new(dir.path().join(".don-state"));
 
         assert!(!state.has_success("bootstrap").await.unwrap());
         state
@@ -1101,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn test_last_run_metadata() {
         let dir = TempDir::new("last-run");
-        let state = TaskState::new(dir.path().join(".don-state"));
+        let state = TaskStateStore::new(dir.path().join(".don-state"));
 
         assert!(state.last_run("build").await.unwrap().is_none());
 
@@ -1168,7 +1168,7 @@ mod tests {
         // base/a/loop -> base makes base/a/loop/a/loop/... an infinite path.
         symlink(&base, base.join("a").join("loop")).unwrap();
 
-        let state = TaskState::new(base.join(".don-state"));
+        let state = TaskStateStore::new(base.join(".don-state"));
         let watch = format!("{}/**/*.txt", base.display());
         let patterns = vec![watch.clone()];
 
@@ -1386,7 +1386,7 @@ mod tests {
     async fn test_missing_glob_root_is_an_empty_match_set() {
         let dir = TempDir::new("missing-glob-root");
         let base = dir.path().to_path_buf();
-        let state = TaskState::new(base.join(".don-state"));
+        let state = TaskStateStore::new(base.join(".don-state"));
         let watch = vec![format!("{}/generated/**/*.sql", base.display())];
 
         state.record_success("t", &watch, &[], None).await.unwrap();
@@ -1414,7 +1414,7 @@ mod tests {
             fs::write(base.join(format!("node_modules/dep/sub/f{i}.js")), "x").unwrap();
         }
 
-        let state = TaskState::new(base.join(".don-state"));
+        let state = TaskStateStore::new(base.join(".don-state"));
         let watch = vec![format!("{}/package.json", base.display())];
 
         assert!(state.needs_run("t", &watch, &[], None).await.unwrap());
@@ -1439,7 +1439,7 @@ mod tests {
         fs::write(base.join("real.json"), "{\"v\":1}").unwrap();
         symlink(base.join("real.json"), base.join("link.json")).unwrap();
 
-        let state = TaskState::new(base.join(".don-state"));
+        let state = TaskStateStore::new(base.join(".don-state"));
         // A literal watch on a symlink-to-file is tracked and its content hashed.
         let watch = vec![format!("{}/link.json", base.display())];
 
@@ -1493,7 +1493,7 @@ mod tests {
             return;
         }
 
-        let state = TaskState::new(base.join(".don-state"));
+        let state = TaskStateStore::new(base.join(".don-state"));
         let watch = vec![format!("{}/**/*.txt", base.display())];
         let result = state.compute_hash(&watch, &[], None);
         assert!(

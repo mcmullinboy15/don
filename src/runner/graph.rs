@@ -198,7 +198,7 @@ pub(in crate::runner) fn dep_name_map(
 }
 
 impl Runner {
-    /// Full dependency edges (names *and* kinds) for every active item.
+    /// Full dependency edges (names *and* kinds) for every active process.
     pub(in crate::runner) fn build_dep_map(&self) -> HashMap<String, Vec<Dependency>> {
         let mut deps = HashMap::new();
         for (name, rs) in &self.services {

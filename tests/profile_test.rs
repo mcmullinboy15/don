@@ -3,9 +3,10 @@
 
 mod helpers;
 
+use don::config::resolve_profile_processes;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
-use don::runner::{Runner, TerminalCoordinator, resolve_profile_items};
+use don::runner::Runner;
 use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -15,7 +16,7 @@ use tokio::sync::mpsc;
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
 
-// --- Unit tests for resolve_profile_items ---
+// --- Unit tests for resolve_profile_processes ---
 
 #[test]
 fn resolve_profile_transitive_deps() {
@@ -167,7 +168,7 @@ fn resolve_profile_transitive_deps() {
     for case in cases {
         let config: Config = case.toml.parse().unwrap();
         let profile = config.profiles.get(case.profile_name).unwrap();
-        let result = resolve_profile_items(&config, profile);
+        let result = resolve_profile_processes(&config, profile);
         let mut result_sorted: Vec<String> = result.into_iter().collect();
         result_sorted.sort();
         let mut expected_sorted: Vec<String> =
@@ -266,17 +267,21 @@ async fn spawn_runner_with_profile(
     let (writer, buf) = TestBuffer::new();
     let output_manager = OutputManager::new(&all_configs, writer).await.unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         config,
         PLATFORM,
         output_manager,
         base_dir.to_path_buf(),
         profile,
         shutdown_rx,
-        TerminalCoordinator::detached(),
+        true,
     )
     .await
     .unwrap();
+    // The runner no longer binds its own API socket; the binary does,
+    // and so must anything else that wants CLI/daemon access.
+    let api_shutdown = don::server::serve_for_runner(&runner).unwrap();
+    runner.set_api_shutdown(api_shutdown);
 
     let handle = tokio::spawn(async move {
         let _ = runner.run().await;
@@ -397,12 +402,12 @@ fn profile_excluded_services_absent_from_status() {
 
         // Check status via API — worker should not appear.
         let client = don::client::Client::new(dir.path());
-        let items = client.status(false, None).await.unwrap();
-        let names: Vec<String> = items
+        let statuses = client.status(false, None).await.unwrap();
+        let names: Vec<String> = statuses
             .iter()
             .map(|i| match i {
-                don::runner::ItemStatus::Service { name, .. } => name.clone(),
-                don::runner::ItemStatus::Task { name, .. } => name.clone(),
+                don::runner::ProcessStatus::Service { name, .. } => name.clone(),
+                don::runner::ProcessStatus::Task { name, .. } => name.clone(),
             })
             .collect();
         assert!(

@@ -11,19 +11,17 @@ fn default_true() -> bool {
 use super::platform::Platform;
 use super::types::{
     BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ReadyCheck,
-    ShutdownConfig, TurboConfig, deserialize_proxy, deserialize_proxy_option,
+    ShutdownConfig, deserialize_proxy, deserialize_proxy_option,
 };
 
 /// The kind of service — exactly one of these must be set.
 ///
-/// Replaces the old set of mutually-exclusive optional fields (docker, rust, go, run, bazel, turbo).
+/// Replaces the old set of mutually-exclusive optional fields (docker, rust, go, run, bazel).
 /// The compiler now enforces that a service has exactly one kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceKind {
     /// Bazel build tool integration — auto-resolve watch patterns from the build graph.
     Bazel(BazelConfig),
-    /// Turborepo build tool integration — auto-resolve watch patterns from the task graph.
-    Turbo(TurboConfig),
     /// Docker container configuration.
     Docker(DockerConfig),
     /// Rust/Cargo service configuration.
@@ -37,7 +35,7 @@ pub enum ServiceKind {
     },
 }
 
-/// A long-running service. Uses exactly one kind: bazel, turbo, docker, rust, go, or custom (run).
+/// A long-running service. Uses exactly one kind: bazel, docker, rust, go, or custom (run).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Service {
     /// Working directory for the service. Defaults to the current directory.
@@ -146,7 +144,6 @@ struct RawService {
     auto_filter_on_failure: Option<bool>,
 
     bazel: Option<BazelConfig>,
-    turbo: Option<TurboConfig>,
     docker: Option<DockerConfig>,
     rust: Option<RustConfig>,
     go: Option<GoConfig>,
@@ -156,7 +153,6 @@ struct RawService {
 
 fn raw_fields_to_kind(
     bazel: Option<BazelConfig>,
-    turbo: Option<TurboConfig>,
     docker: Option<DockerConfig>,
     rust: Option<RustConfig>,
     go: Option<GoConfig>,
@@ -164,16 +160,13 @@ fn raw_fields_to_kind(
     build: Option<Command>,
 ) -> Result<Option<ServiceKind>, String> {
     let count = bazel.is_some() as u8
-        + turbo.is_some() as u8
         + docker.is_some() as u8
         + rust.is_some() as u8
         + go.is_some() as u8
         + run.is_some() as u8;
 
     if count > 1 {
-        return Err(
-            "service must have only one of: bazel, turbo, docker, rust, go, or run".to_string(),
-        );
+        return Err("service must have only one of: bazel, docker, rust, go, or run".to_string());
     }
 
     if count == 0 {
@@ -185,8 +178,6 @@ fn raw_fields_to_kind(
 
     if let Some(bazel) = bazel {
         Ok(Some(ServiceKind::Bazel(bazel)))
-    } else if let Some(turbo) = turbo {
-        Ok(Some(ServiceKind::Turbo(turbo)))
     } else if let Some(docker) = docker {
         Ok(Some(ServiceKind::Docker(docker)))
     } else if let Some(rust) = rust {
@@ -204,9 +195,7 @@ impl TryFrom<RawService> for Service {
     type Error = String;
 
     fn try_from(raw: RawService) -> Result<Self, String> {
-        let kind = raw_fields_to_kind(
-            raw.bazel, raw.turbo, raw.docker, raw.rust, raw.go, raw.run, raw.build,
-        )?;
+        let kind = raw_fields_to_kind(raw.bazel, raw.docker, raw.rust, raw.go, raw.run, raw.build)?;
 
         Ok(Service {
             dir: raw.dir,
@@ -297,7 +286,6 @@ struct RawServiceOverride {
     auto_filter_on_failure: Option<bool>,
 
     bazel: Option<BazelConfig>,
-    turbo: Option<TurboConfig>,
     docker: Option<DockerConfig>,
     rust: Option<RustConfig>,
     go: Option<GoConfig>,
@@ -309,9 +297,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
     type Error = String;
 
     fn try_from(raw: RawServiceOverride) -> Result<Self, String> {
-        let kind = raw_fields_to_kind(
-            raw.bazel, raw.turbo, raw.docker, raw.rust, raw.go, raw.run, raw.build,
-        )?;
+        let kind = raw_fields_to_kind(raw.bazel, raw.docker, raw.rust, raw.go, raw.run, raw.build)?;
 
         Ok(ServiceOverride {
             dir: raw.dir,
@@ -485,26 +471,16 @@ pub struct GoConfig {
 }
 
 impl Service {
-    /// Resolve the service for a specific platform, applying overrides if present.
-    /// For Bazel services with a known binary path, use `resolve_with_bazel_binary` instead.
+    /// Resolve the service for a specific platform, applying overrides if
+    /// present.
+    ///
+    /// A bazel service's built-binary path is *not* set here: it is learned
+    /// from `bazel cquery` long after this runs, and is written onto the
+    /// already-resolved value by whoever asked for the build. Re-resolving
+    /// from raw config to attach it used to undo the service-group expansion
+    /// in `depends_on`.
     pub fn resolve(&self, platform: Platform) -> ResolvedService {
         self.resolve_inner(platform)
-    }
-
-    /// Resolve with a known Bazel binary path (from `bazel cquery`).
-    /// Sets the kind to `Custom` with the binary path as the run command.
-    pub fn resolve_with_bazel_binary(
-        &self,
-        platform: Platform,
-        bazel_binary: &str,
-    ) -> ResolvedService {
-        let mut resolved = self.resolve_inner(platform);
-        // Only attach the binary path for Bazel services — for any other
-        // kind this accessor is a no-op (shouldn't be called, but defensive).
-        if matches!(resolved.kind, Some(ServiceKind::Bazel(_))) {
-            resolved.resolved_binary_path = Some(bazel_binary.to_string());
-        }
-        resolved
     }
 
     fn resolve_inner(&self, platform: Platform) -> ResolvedService {
@@ -578,6 +554,19 @@ impl Service {
 }
 
 impl ResolvedService {
+    /// Whether any proxy entry forces a serial (no-overlap) restart. A fixed
+    /// `Forward` backend cannot have two processes bound to the same port at
+    /// once, so the old instance must fully exit before the new one starts.
+    ///
+    /// Mirrors `ProxyView::requires_full_exit_on_restart`, from config rather
+    /// than from bound state — the answer is the same because binding never
+    /// changes an entry's mode.
+    pub fn requires_full_exit_on_restart(&self) -> bool {
+        self.proxy
+            .iter()
+            .any(|entry| matches!(entry.mode, crate::config::ProxyMode::Forward(_)))
+    }
+
     /// Returns the `DockerConfig` if this is a Docker service.
     pub fn docker_config(&self) -> Option<&DockerConfig> {
         match &self.kind {
@@ -610,14 +599,6 @@ impl ResolvedService {
         }
     }
 
-    /// Returns the `TurboConfig` if this is a Turbo service.
-    pub fn turbo_config(&self) -> Option<&TurboConfig> {
-        match &self.kind {
-            Some(ServiceKind::Turbo(t)) => Some(t),
-            _ => None,
-        }
-    }
-
     /// Returns the run command if this is a Custom service.
     pub fn run_cmd(&self) -> Option<&Command> {
         match &self.kind {
@@ -634,12 +615,9 @@ impl ResolvedService {
         }
     }
 
-    /// Returns true if this is a Bazel or Turbo service (build-tool managed).
+    /// Returns true if this is a Bazel service (build-tool managed).
     pub fn is_build_tool_managed(&self) -> bool {
-        matches!(
-            &self.kind,
-            Some(ServiceKind::Bazel(_)) | Some(ServiceKind::Turbo(_))
-        )
+        matches!(&self.kind, Some(ServiceKind::Bazel(_)))
     }
 
     pub(crate) fn build_tool_watch_enabled(&self) -> bool {
@@ -649,7 +627,6 @@ impl ResolvedService {
 
         match &self.kind {
             Some(ServiceKind::Bazel(bazel)) => bazel.watch,
-            Some(ServiceKind::Turbo(turbo)) => turbo.watch,
             _ => false,
         }
     }
