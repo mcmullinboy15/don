@@ -76,7 +76,7 @@ Don will:
 ### Interactive TUI
 
 When stdout is a TTY, `don start` runs a ratatui-driven full-screen interface: a
-scrollable log pane, an optional status pane beside it, and a bordered bar along
+scrollable log pane, an optional panel beside it, and a bordered bar along
 the bottom with ready counts, running tasks, a spinner during transitions and
 contextual key hints.
 
@@ -90,19 +90,27 @@ nothing is lost by opening an overlay.
 | `↑` `↓` `PgUp` `PgDn` `Home` | Scroll the log |
 | `End` or `Enter` | Jump back to following the live tail |
 | wheel | Scroll the log |
-| drag | Select text. Double-click selects a word, triple-click the line |
+| drag | Select text. Double-click takes a word, triple-click the message |
 | `y` | Copy the selection, without the `name \| ` prefix |
 | `Esc` | Clear the selection |
-| `p` / `P` | Toggle the status pane / move it between right and bottom |
-| `Tab` | Move focus between panes |
-| `l` | Filter services/tasks — space toggles, enter commits, esc clears |
-| `s` | Full-screen service status |
-| `t` | Full-screen task status |
-| `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
+| `j` `k` `g g` `G` | Vim's verticals: line down, line up, top, live tail |
+| `s` `t` `f` | Open the services, tasks or filter panel — each key also closes its own |
+| `Tab` | Move focus between the log and the panel |
+| `P` | Move the panel between right and bottom |
+| Ctrl+`←` `→` | Resize the split. Grows whichever pane has focus |
+| `l` | In a table: the highlighted service's or task's log |
+| `a` | In a table: attach to the highlighted process, in a window |
+| `enter` `r` `R` | In a table: run or start/stop, restart, hard restart |
+| Ctrl+L | Repaint, if something else has scribbled on the screen |
+| Ctrl+D | Detach, leaving the stack running (`don tui` only) |
+| Ctrl+C | Graceful shutdown (second press force-kills) |
 
-Selecting holds the view still, so output arriving mid-drag doesn't pull the
-text out from under you; the log resumes following when you clear the selection.
-Copying is deliberate — `y`, never a side effect of releasing the mouse.
+A selection is a place in the log rather than a place on the screen — a line
+and an offset into it — so it stays on the text you dragged across while you
+scroll, resize the terminal, or change the filter. Dragging holds the view
+still as well, so output arriving mid-drag doesn't pull the text out from under
+you; the log resumes following when you clear the selection. Copying is
+deliberate — `y`, never a side effect of releasing the mouse.
 
 Copying goes through OSC 52, so it reaches your system clipboard over ssh and
 inside tmux. Terminals with OSC 52 disabled ignore it silently — the status bar

@@ -759,15 +759,15 @@ fn handle_key(
                 open_tasks_panel(app);
                 return Ok(());
             }
-            KeyCode::Char('l') if app.view_mode == ViewMode::Filter => {
+            KeyCode::Char('f') if app.view_mode == ViewMode::Filter => {
                 return_to_logs(app);
                 return Ok(());
             }
-            // The third panel's key, and a toggle like the other two. It used
-            // to fall through to the tables, where it opened one row's log —
-            // so reaching for the filter while reading the services list got
-            // you a popup instead, every time.
-            KeyCode::Char('l') => {
+            // The third panel's key, and a toggle like the other two. `f` for
+            // filter, which is what it is — it was `l`, for "logs", and that
+            // collided with the `l` the tables use for one row's log, so
+            // reaching for the filter while reading a table opened a popup.
+            KeyCode::Char('f') => {
                 open_filter_panel(app);
                 return Ok(());
             }
@@ -839,7 +839,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         // key is to use the thing. The toggles and switches for an
         // already-open panel live in `handle_key`, before routing, so they
         // work from either side of the split.
-        KeyCode::Char('l') => open_filter_panel(app),
+        KeyCode::Char('f') => open_filter_panel(app),
         KeyCode::Char('t') => open_tasks_panel(app),
         KeyCode::Char('s') => open_services_panel(app),
         KeyCode::Char('i') if app.has_failure_summary() => {
@@ -1563,9 +1563,7 @@ fn handle_tasks_key(
             dispatch_run_task(client, task_name.clone());
             after_task_run(&task_name, app, store)?;
         }
-    } else if key.code == KeyCode::Char('o') {
-        // `o` for output, not `l` — `l` is the filter panel's key everywhere
-        // else and reaching for it here should mean the same thing.
+    } else if key.code == KeyCode::Char('l') {
         let Some(item) = highlighted_task_item(app) else {
             return Ok(());
         };
@@ -1623,8 +1621,7 @@ fn handle_services_key(
                 dispatch_overlay_command(client, &controls.lifecycle_emitter, cmd);
             }
         }
-        // `o` for output. See the note in `handle_tasks_key`.
-        KeyCode::Char('o') => {
+        KeyCode::Char('l') => {
             let Some(item) = highlighted_service_item(app) else {
                 return Ok(());
             };
@@ -2252,8 +2249,17 @@ mod tests {
                 want_filter_open: false,
             },
             Case {
-                name: "plain l still opens the log filter",
+                // The chord and the letter are different keys now — `f` opens
+                // the filter — but the arm order still has to hold: an
+                // unguarded `l` above the Ctrl+L one would swallow the chord.
+                name: "plain l is not a repaint",
                 key: KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                want_repaint: false,
+                want_filter_open: false,
+            },
+            Case {
+                name: "f opens the filter",
+                key: KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
                 want_repaint: false,
                 want_filter_open: true,
             },
@@ -2883,11 +2889,11 @@ mod tests {
         );
     }
 
-    /// `l` is the filter panel's key, from the tables too. It used to fall
-    /// through to them and open one row's log, so reaching for the filter
-    /// while reading the services list got you a popup every time.
+    /// The filter panel answers to `f`, and the tables keep `l` for the
+    /// highlighted row's log. They collided while the filter was on `l`:
+    /// reaching for it from a table opened a popup instead.
     #[test]
-    fn l_always_means_the_filter_panel() {
+    fn the_filter_and_a_row_s_log_have_their_own_keys() {
         struct Case {
             name: &'static str,
             from: ViewMode,
@@ -2898,38 +2904,37 @@ mod tests {
 
         let cases = [
             Case {
-                name: "from the services table",
+                name: "f reaches the filter from the services table",
                 from: ViewMode::Services,
-                key: KeyCode::Char('l'),
+                key: KeyCode::Char('f'),
                 want_mode: ViewMode::Filter,
                 want_popup: false,
             },
             Case {
-                name: "from the tasks table",
+                name: "and from the tasks table",
                 from: ViewMode::Tasks,
-                key: KeyCode::Char('l'),
+                key: KeyCode::Char('f'),
                 want_mode: ViewMode::Filter,
                 want_popup: false,
             },
             Case {
-                name: "and is still its own toggle",
+                name: "and is its own toggle",
                 from: ViewMode::Filter,
-                key: KeyCode::Char('l'),
+                key: KeyCode::Char('f'),
                 want_mode: ViewMode::Normal,
                 want_popup: false,
             },
             Case {
-                // The row's own log moved to `o`, for output.
-                name: "o opens the highlighted service's output",
+                name: "l opens the highlighted service's log",
                 from: ViewMode::Services,
-                key: KeyCode::Char('o'),
+                key: KeyCode::Char('l'),
                 want_mode: ViewMode::Services,
                 want_popup: true,
             },
             Case {
                 name: "and the highlighted task's",
                 from: ViewMode::Tasks,
-                key: KeyCode::Char('o'),
+                key: KeyCode::Char('l'),
                 want_mode: ViewMode::Tasks,
                 want_popup: true,
             },

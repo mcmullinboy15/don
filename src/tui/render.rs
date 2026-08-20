@@ -575,7 +575,7 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: " tasks — [enter] run  [a] attach  [o] output  [/] filter ".to_string(),
+            title: " tasks — [enter] run  [a] attach  [l] logs  [/] filter ".to_string(),
             border_style: panel_border_style(app),
             header,
             rows,
@@ -736,8 +736,7 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: " services — [enter] start/stop  [r] restart  [a] attach  [o] output "
-                .to_string(),
+            title: " services — [enter] start/stop  [r] restart  [a] attach  [l] logs ".to_string(),
             border_style: panel_border_style(app),
             header,
             rows,
@@ -1121,7 +1120,7 @@ fn normal_bar_line(
         spans.push(dim("  [esc] clear"));
         spans.push(separator());
     }
-    spans.push(dim("[l] logs"));
+    spans.push(dim("[f] filter"));
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
         spans.push(dim("  [R] reset"));
@@ -1826,7 +1825,7 @@ mod tests {
             false,
         ));
 
-        assert!(text.contains("[l] logs (1/2)  [R] reset"));
+        assert!(text.contains("[f] filter (1/2)  [R] reset"));
     }
 
     #[test]
