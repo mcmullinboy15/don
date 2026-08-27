@@ -15,12 +15,11 @@
 
 use std::collections::HashMap;
 
-use ansi_to_tui::IntoText;
 use crossterm::style::Color as CrosstermColor;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Wrap,
 };
@@ -83,7 +82,6 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
 
     // Clamp the scroll positions the overlays own before drawing them: they are
     // bounded by geometry only this function knows.
-    app.sync_log_popup_scroll(log_popup_visible_rows(area));
     if app.view_mode == ViewMode::Failures {
         let max_scroll = failure_summary_max_scroll(area, app);
         app.sync_failure_summary_scroll(max_scroll);
@@ -118,8 +116,6 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
         ViewMode::Form => draw_form_modal(frame, app),
         _ => {}
     }
-    // The per-process log popup is a centred overlay and clears its own rect.
-    draw_log_popup(frame, app);
     // The attached process floats above everything: it owns the keyboard
     // while it is open, so it should look like it does.
     draw_attach_window(frame, app);
@@ -257,6 +253,83 @@ fn draw_attach_window(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
+/// A table's title, which depends on whether `l` has narrowed the log.
+///
+/// `l` is pressed while looking at a table, so the table is where the state it
+/// produced has to be legible — the log pane names the process it is showing,
+/// but the eye that pressed the key is over here.
+///
+/// While narrowed the way out leads, and `[l] logs` gives up its slot. Both
+/// are forced by width: the services title is already sixty-six columns
+/// against a panel half a screen wide, so whatever sits at the end is what
+/// ratatui truncates — which would have hidden this hint in exactly the state
+/// that needs it. `l` still narrows to another row while narrowed; it is the
+/// less useful of the two things to say.
+fn table_title(app: &App, table: &str, keys: &str) -> String {
+    match app.narrowed_to() {
+        Some(_) => format!(" {table} — [esc] all logs  {keys} "),
+        None => format!(" {table} — {keys}  [l] logs "),
+    }
+}
+
+/// What the log pane calls itself.
+///
+/// A pane narrowed by `l` is showing a fraction of the log, and nothing else
+/// on screen says so — the filter panel need not be open, and rows that are
+/// missing cannot advertise their absence. The title names the process being
+/// shown and the key that gives the rest back, in the same shape the tables
+/// announce their keys.
+fn log_pane_title(app: &App) -> String {
+    let base = if app.debug_view {
+        "don's log".to_string()
+    } else {
+        match app.narrowed_to() {
+            Some(name) => format!("logs — {name}  [esc] all"),
+            None => "logs".to_string(),
+        }
+    };
+    match search_hint(app) {
+        Some(hint) => format!(" {base}  {hint} "),
+        None => format!(" {base} "),
+    }
+}
+
+/// The `/` prompt, or what it left behind.
+///
+/// In the title rather than a line of its own: a prompt row would change the
+/// pane's height the moment it appeared, moving every line under it at the
+/// exact moment the reader is trying to read them.
+///
+/// While typing it carries a cursor, because a query the pane is refiltering
+/// on with every keystroke should look like something being typed. Once
+/// confirmed it stays, because the search is still in force and the pane is
+/// still hiding things — with the key that ends it, since Esc means something
+/// else once the prompt is closed.
+fn search_hint(app: &App) -> Option<String> {
+    let search = &app.log_search;
+    if !search.editing() && !search.is_active() {
+        return None;
+    }
+    let mode = match search.mode() {
+        super::search::Mode::Regex => "re",
+        super::search::Mode::Substring => "",
+    };
+    let label = if mode.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{mode}:")
+    };
+    if search.editing() {
+        return Some(match search.error() {
+            // Every second keystroke of a real pattern is invalid, so this is
+            // a normal state to be in, not an error to be alarmed by.
+            Some(why) => format!("{label}{}▌ ({why})", search.query()),
+            None => format!("{label}{}▌ [ctrl+r] regex", search.query()),
+        });
+    }
+    Some(format!("{label}{}  [esc] clear", search.query()))
+}
+
 /// Render the visible slice of the log, plus a scroll indicator when the view
 /// is not pinned to the newest line.
 fn draw_log_pane(
@@ -280,11 +353,7 @@ fn draw_log_pane(
         } else {
             Color::DarkGray
         }))
-        .title(if app.debug_view {
-            " don's log "
-        } else {
-            " logs "
-        });
+        .title(log_pane_title(app));
     let text_area = block.inner(area);
     frame.render_widget(block, area);
     if text_area.height == 0 || text_area.width == 0 {
@@ -299,7 +368,11 @@ fn draw_log_pane(
     };
     let mut index = std::mem::take(&mut app.view_index);
     index.sync(store, key, &app.blank_after, |entry| {
+        // Two narrowings, and a line has to survive both: the name filter
+        // decides whose output this is, `/` decides whether it says the thing
+        // being looked for.
         app.should_render_log(&entry.line.name, entry.line.is_lifecycle)
+            && app.log_search.admits(entry.message_text())
     });
     // The one place scroll position is decided, now that the index is current
     // and the pane's height is known.
@@ -313,6 +386,7 @@ fn draw_log_pane(
         app.log_scroll,
         area.width,
         area.height,
+        &app.log_search,
     );
     app.view_index = index;
     // Remembered for the input layer: scrolling needs to know how far it can
@@ -575,7 +649,7 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: " tasks — [enter] run  [a] attach  [l] logs  [/] filter ".to_string(),
+            title: table_title(app, "tasks", "[enter] run  [a] attach  [/] filter"),
             border_style: panel_border_style(app),
             header,
             rows,
@@ -736,7 +810,11 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: " services — [enter] start/stop  [r] restart  [a] attach  [l] logs ".to_string(),
+            title: table_title(
+                app,
+                "services",
+                "[enter] start/stop  [r] restart  [a] attach",
+            ),
             border_style: panel_border_style(app),
             header,
             rows,
@@ -756,85 +834,6 @@ fn panel_border_style(app: &App) -> Style {
     } else {
         Color::DarkGray
     })
-}
-
-fn draw_log_popup(frame: &mut Frame<'_>, app: &App) {
-    let Some(popup) = app.log_popup.as_ref() else {
-        return;
-    };
-    let area = centered_rect(frame.area(), 86, 72);
-    if area.height < 3 || area.width < 8 {
-        return;
-    }
-
-    frame.render_widget(Clear, area);
-    let title = format!(
-        " logs: {} — [esc] close  [j/k ↑↓] scroll  [home/end] top/bottom ",
-        popup.name
-    );
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 {
-        return;
-    }
-
-    if popup.lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![dim("(no logs captured yet)")])),
-            inner,
-        );
-        return;
-    }
-
-    let visible_rows = inner.height as usize;
-    let max_scroll = popup.lines.len().saturating_sub(visible_rows);
-    let scroll = popup.scroll.min(max_scroll);
-    let mut text = Text::default();
-    for bytes in popup.lines.iter().skip(scroll).take(visible_rows) {
-        let parsed = parse_ansi_text(bytes);
-        if parsed.lines.is_empty() {
-            text.lines.push(Line::default());
-        } else {
-            text.lines.extend(parsed.lines);
-        }
-    }
-
-    frame.render_widget(Paragraph::new(text), inner);
-}
-
-pub(crate) fn log_popup_visible_rows(area: Rect) -> usize {
-    let area = centered_rect(area, 86, 72);
-    if area.height < 3 || area.width < 8 {
-        return 0;
-    }
-    area.height.saturating_sub(2) as usize
-}
-
-fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1]);
-    horizontal[1]
-}
-
-fn parse_ansi_text(bytes: &[u8]) -> Text<'static> {
-    bytes
-        .into_text()
-        .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(bytes).into_owned()))
 }
 
 fn service_table_row(
@@ -1120,7 +1119,12 @@ fn normal_bar_line(
         spans.push(dim("  [esc] clear"));
         spans.push(separator());
     }
-    spans.push(dim("[f] filter"));
+    // `/` leads the group: both it and the filter narrow the log, and of the
+    // two, searching what the lines *say* is the one a reader reaches for
+    // without having been told it exists — which is the argument for spending
+    // a slot on it.
+    spans.push(dim("[/] search"));
+    spans.push(dim("  [f] filter"));
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
         spans.push(dim("  [R] reset"));
@@ -1635,6 +1639,99 @@ fn field_render_rows(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The tables say it too, because that is where `l` was pressed.
+    ///
+    /// The log pane names the process it is showing, but a reader who has just
+    /// pressed `l` is looking at the table — and `l` is advertised there, so
+    /// the key that undoes it belongs in the same line.
+    #[test]
+    fn a_table_title_offers_the_way_out_of_a_narrow() {
+        let mut app = super::super::app::App::new(super::super::app::AppInit {
+            service_names: vec!["api".to_string(), "web".to_string()],
+            task_names: Vec::new(),
+            build_tool_names: Vec::new(),
+            task_configs: std::collections::HashMap::new(),
+            task_last_runs: std::collections::HashMap::new(),
+            hidden_names: std::collections::HashSet::new(),
+            auto_filter_on_failure_names: std::collections::HashSet::new(),
+            cli_log_filter: None,
+        });
+        assert_eq!(
+            table_title(&app, "services", "[enter] start/stop"),
+            " services — [enter] start/stop  [l] logs "
+        );
+
+        assert!(app.narrow_log_to("api"));
+        let narrowed = table_title(&app, "services", "[enter] start/stop");
+        assert_eq!(narrowed, " services — [esc] all logs  [enter] start/stop ");
+        assert!(
+            narrowed.find("[esc]").unwrap() < narrowed.find("[enter]").unwrap(),
+            "the way out leads, so a truncated title still carries it: {narrowed}"
+        );
+
+        assert!(app.widen_log_from_narrow());
+        assert_eq!(
+            table_title(&app, "services", "[enter] start/stop"),
+            " services — [enter] start/stop  [l] logs ",
+            "and back again"
+        );
+    }
+
+    /// A narrowed pane says so, and says how to undo it.
+    ///
+    /// `l` hides most of the log, and the rows it hides cannot announce their
+    /// own absence — without this the pane looks like a project that has gone
+    /// quiet.
+    #[test]
+    fn the_log_pane_title_says_when_it_is_narrowed() {
+        struct Case {
+            name: &'static str,
+            narrow_to: Option<&'static str>,
+            debug_view: bool,
+            want: &'static str,
+        }
+
+        for case in [
+            Case {
+                name: "showing everything",
+                narrow_to: None,
+                debug_view: false,
+                want: " logs ",
+            },
+            Case {
+                name: "narrowed to one process",
+                narrow_to: Some("api"),
+                debug_view: false,
+                want: " logs — api  [esc] all ",
+            },
+            Case {
+                // The diagnostics record is its own store with its own
+                // filter; `l` does not narrow it and must not claim to.
+                name: "don's own log is never the narrowed one",
+                narrow_to: Some("api"),
+                debug_view: true,
+                want: " don's log ",
+            },
+        ] {
+            let mut app = super::super::app::App::new(super::super::app::AppInit {
+                service_names: vec!["api".to_string(), "web".to_string()],
+                task_names: Vec::new(),
+                build_tool_names: Vec::new(),
+                task_configs: std::collections::HashMap::new(),
+                task_last_runs: std::collections::HashMap::new(),
+                hidden_names: std::collections::HashSet::new(),
+                auto_filter_on_failure_names: std::collections::HashSet::new(),
+                cli_log_filter: None,
+            });
+            if let Some(name) = case.narrow_to {
+                assert!(app.narrow_log_to(name), "{}: narrowing", case.name);
+            }
+            app.debug_view = case.debug_view;
+            assert_eq!(log_pane_title(&app), case.want, "{}", case.name);
+        }
+    }
+
     use crate::config::ParamKind;
     use crate::tui::app::AppInit;
     use crate::tui::form::{CandidateState, Field};
@@ -1737,9 +1834,31 @@ mod tests {
     fn shutdown_bar_hides_interactive_controls() {
         let text = line_text(shutdown_bar_line(&StatusCounts::default(), 0));
         assert!(text.contains("shutting down"));
-        assert!(!text.contains("[/] logs"));
+        assert!(!text.contains("[/] search"));
         assert!(!text.contains("[t] tasks"));
         assert!(!text.contains("[s] services"));
+    }
+
+    /// `/` is worth a slot because it is the one narrowing a reader reaches
+    /// for without having been told it exists — and unadvertised, it is the
+    /// one they never find.
+    #[test]
+    fn the_bar_says_slash_searches() {
+        let text = line_text(normal_bar_line(
+            &StatusCounts::default(),
+            &FilterState::new(Vec::new(), &std::collections::HashSet::new(), None),
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+        ));
+        assert!(text.contains("[/] search"), "got: {text}");
+        assert!(
+            text.find("[/] search").unwrap() < text.find("[f] filter").unwrap(),
+            "the two narrowings sit together, search first: {text}"
+        );
     }
 
     #[test]

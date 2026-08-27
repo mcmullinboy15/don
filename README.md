@@ -98,11 +98,12 @@ nothing is lost by opening an overlay.
 | `Tab` | Move focus between the log and the panel |
 | `P` | Move the panel between right and bottom |
 | Ctrl+`←` `→` | Resize the split. Grows whichever pane has focus |
-| `l` | In a table: the highlighted service's or task's log |
+| `/` | In the log: search it. Shows only matching lines and lights up what matched. `Ctrl+R` for regex, `Enter` keeps it, `Esc` clears |
+| `l` | In a table: narrow the log to the highlighted process (`Esc` restores the filter) |
 | `a` | In a table: attach to the highlighted process, in a window |
 | `enter` `r` `R` | In a table: run or start/stop, restart, hard restart |
 | Ctrl+L | Repaint, if something else has scribbled on the screen |
-| Ctrl+D | Detach, leaving the stack running (`don tui` only) |
+| Ctrl+D | Detach, leaving the stack running (`don attach` only) |
 | Ctrl+C | Graceful shutdown (second press force-kills) |
 
 A selection is a place in the log rather than a place on the screen — a line
@@ -502,6 +503,39 @@ Don will:
 
 Multiple services sharing the same source files are batched into one `bazel build` invocation.
 
+#### Build flags: use `.bazelrc`
+
+Don passes `--curses=no` and `--color=yes` so it can read build output as
+lines, and otherwise leaves the command alone — a plain `build --flag` line in
+your workspace `.bazelrc` already applies to the builds Don runs.
+
+When you want a flag only when *Don* builds, and not when you run `bazel build`
+yourself, name a configuration and point Don at it:
+
+```
+# .bazelrc
+build:don --noshow_progress
+```
+
+```toml
+[bazel]
+config = "don"          # every Bazel build Don runs
+```
+
+Individual services and tasks may name a different one, and targets built under
+different configurations are built separately — one `bazel build` takes one
+`--config`:
+
+```toml
+[services.api]
+bazel.target = "//services/api:api"
+bazel.config = "api-dev"
+```
+
+Don passes `--config` after its own two flags, so a configuration that sets
+`--curses` or `--color` wins. Naming a configuration that no `.rc` file defines
+is a hard Bazel error, which is why there is no default.
+
 Set `bazel.watch = false` to keep Bazel startup builds/runs but skip Bazel-derived watch paths. This is useful when Bazel queries are too broad or too expensive and you want explicit watch globs instead:
 
 ```toml
@@ -702,7 +736,8 @@ don ports --json             # print the .don/ports.json manifest
 don logs <name>              # view recent output
 don logs <name> --follow     # stream output
 don logs <name> --last 50    # last N lines
-don attach <name>            # attach stdin/stdout to a running service
+don attach                   # bring up the TUI over a running stack
+don attach <name>            # attach stdin/stdout to one service
 don run <name>               # run a specific task (bypasses auto_run)
 don run <name> --wait        # run a task and wait for it to finish
 don run <name> --timeout 30s # wait up to 30s without stopping the task
@@ -861,6 +896,8 @@ See [`examples/`](examples/) for complete working configs.
 | `lazy` | bool | Delay start until first proxy connection |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
 | `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
+| `bazel.config` | string | `.bazelrc` configuration to build this target under, as `--config=<name>` |
+| `bazel.config` (top-level `[bazel]`) | string | Same, for every Bazel build Don runs; per-service/task settings override it |
 | `download.platform.<platform>` | table | Per-platform download config |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
 | `fallback_ports` | bool | Top-level: use an OS-assigned proxy/Docker host port when the preferred port is in use |

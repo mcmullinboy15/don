@@ -88,6 +88,11 @@ pub(crate) struct StoredLogLine {
     /// own column and indent what wraps underneath it. Measured from the
     /// prefix the sink sent, not recovered from the text.
     prefix_cols: usize,
+    /// The message as plain text, built once here for the same reason the
+    /// parse and the row count are: `/` asks every line in the store whether
+    /// it matches on every keystroke, and building this per question meant an
+    /// allocation per line per character typed.
+    message: String,
 }
 
 impl StoredLogLine {
@@ -107,13 +112,8 @@ impl StoredLogLine {
     /// yields are the ones the pane laid out — the raw bytes still carry the
     /// escape sequences that became styles, and counting through those would
     /// put every offset past the first colour in the wrong place.
-    pub(crate) fn message_text(&self) -> String {
-        self.parsed
-            .spans
-            .iter()
-            .flat_map(|span| span.content.chars())
-            .skip(self.prefix_cols)
-            .collect()
+    pub(crate) fn message_text(&self) -> &str {
+        &self.message
     }
 }
 
@@ -173,16 +173,6 @@ impl LogStore {
             Some(width) => super::logs::count_wrapped_rows(&parsed, prefix_cols, width),
             None => 1,
         };
-        // An id already held is a progress frame repainting itself, not a new
-        // line — see `MergedLogTap::publish_frame`. Only ever the newest line
-        // is repainted, so this looks no further back than the last entry.
-        if let Some(back) = self.entries.back_mut().filter(|back| back.id == id) {
-            back.line = line;
-            back.parsed = parsed;
-            back.wrapped_rows = wrapped_rows;
-            back.prefix_cols = prefix_cols;
-            return;
-        }
         let ceiling = self.capacity.saturating_mul(PINNED_OVERDRAFT);
         while self.entries.len() >= self.capacity {
             let holding_the_readers_place = self.entries.len() < ceiling
@@ -195,12 +185,19 @@ impl LogStore {
             }
             self.entries.pop_front();
         }
+        let message = parsed
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .skip(prefix_cols)
+            .collect();
         self.entries.push_back(StoredLogLine {
             id,
             line,
             parsed,
             wrapped_rows,
             prefix_cols,
+            message,
         });
     }
 
@@ -532,62 +529,5 @@ mod tests {
             Some(ratatui::style::Color::Red),
             "and the colour should have survived"
         );
-    }
-
-    /// A repeated id is a progress frame repainting itself, not a new line —
-    /// the store has to update in place or the pane grows a line per redraw.
-    #[test]
-    fn a_repeated_id_replaces_rather_than_appends() {
-        struct Case {
-            name: &'static str,
-            /// `(id, body)` in push order.
-            pushes: &'static [(u64, &'static str)],
-            want: &'static [&'static str],
-        }
-
-        let cases = [
-            Case {
-                name: "the same id lands once, holding the newest content",
-                pushes: &[(0, "10%"), (0, "50%"), (0, "90%")],
-                want: &["90%"],
-            },
-            Case {
-                name: "a new id still appends",
-                pushes: &[(0, "10%"), (0, "90%"), (1, "done")],
-                want: &["90%", "done"],
-            },
-            Case {
-                name: "only the newest line is replaceable",
-                pushes: &[(0, "one"), (1, "two"), (0, "not me")],
-                want: &["one", "two", "not me"],
-            },
-        ];
-
-        for case in cases {
-            let mut store = LogStore::with_capacity(10);
-            store.reflow(80);
-            for (id, body) in case.pushes {
-                store.push(LogId(*id), line("bazel", body));
-            }
-            let got: Vec<String> = store
-                .iter()
-                .map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned())
-                .collect();
-            assert_eq!(got, case.want, "{}", case.name);
-        }
-    }
-
-    /// A frame that changes height has to change the row count with it, or the
-    /// scroll arithmetic keeps using the old one.
-    #[test]
-    fn replacing_a_line_remeasures_it() {
-        let mut store = LogStore::with_capacity(10);
-        store.reflow(10);
-        store.push(LogId(0), line("bazel", "short"));
-        assert_eq!(store.get(LogId(0)).unwrap().wrapped_rows(), 1);
-
-        store.push(LogId(0), line("bazel", "a much longer frame that wraps"));
-        assert_eq!(store.len(), 1, "still one line");
-        assert_eq!(store.get(LogId(0)).unwrap().wrapped_rows(), 3);
     }
 }

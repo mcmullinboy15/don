@@ -58,6 +58,7 @@ mod log_store;
 mod logs;
 mod panes;
 mod render;
+mod search;
 mod selection;
 mod status_table;
 mod view_index;
@@ -77,7 +78,7 @@ use tokio::sync::mpsc;
 use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot};
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter};
-use app::{App, AppInit, ViewMode, line_matches_log_popup};
+use app::{App, AppInit, ViewMode};
 use events::AppEvent;
 use log_store::{DEBUG_CAPACITY, DEFAULT_CAPACITY, LogStore};
 use status_table::StatusTableKeyOutcome;
@@ -156,7 +157,7 @@ const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16)
 pub enum TuiMode {
     /// The TUI shares a process with the runner (`don start` today).
     InProcess,
-    /// The TUI attached to a running project over the socket (`don tui`).
+    /// The TUI attached to a running project over the socket (`don attach`).
     Remote,
 }
 
@@ -322,7 +323,6 @@ pub async fn run_tui(
                             if is_shutdown_start_line(&line) && !app.shutdown_started {
                                 app.begin_shutdown();
                             }
-                            app.append_log_popup_line(&line);
                             stores.route(id, line);
                         }
                         dirty = true;
@@ -615,7 +615,7 @@ fn handle_app_event(
             // anchor is a line id, so it means the same thing at any size.
         }
         AppEvent::Key(key) => handle_key(key, app, store, client, controls)?,
-        AppEvent::Mouse(mouse) => handle_mouse(mouse, app, store),
+        AppEvent::Mouse(mouse, at) => handle_mouse(mouse, at, app, store),
         // Handled by the loop, which owns the live session; by the time an
         // event reaches here the loop has already dealt with it.
         AppEvent::Attach(_) => {}
@@ -697,6 +697,9 @@ fn handle_key(
             // right-docked panel that is also "grow the pane you are in" from
             // both sides — Ctrl+Right grows a focused log and shrinks a
             // focused panel, which are the same motion.
+            // Swap the open search prompt between substring and regex. Taken
+            // here because this block answers every Ctrl chord and returns.
+            KeyCode::Char('r') if app.log_search.editing() => app.log_search.toggle_mode(),
             KeyCode::Left if app.panel_open() && app.panel.side == panes::PaneSide::Right => {
                 nudge_panel(app, RESIZE_STEP_COLUMNS);
             }
@@ -723,12 +726,13 @@ fn handle_key(
     // search box is being typed into (the filter's, or a table's `/` query),
     // every character belongs to the query, and while the filter's query is
     // up Tab already means "back to the list" there.
-    let typing = match app.view_mode {
-        ViewMode::Filter => app.filter.focus() == filter::FilterFocus::Query,
-        ViewMode::Services => app.services_table.filtering,
-        ViewMode::Tasks => app.tasks_table.filtering,
-        _ => false,
-    };
+    let typing = app.log_search.editing()
+        || match app.view_mode {
+            ViewMode::Filter => app.filter.focus() == filter::FilterFocus::Query,
+            ViewMode::Services => app.services_table.filtering,
+            ViewMode::Tasks => app.tasks_table.filtering,
+            _ => false,
+        };
     if app.panel_open() && !typing {
         match key.code {
             // Tab moves the keys between the log and the panel.
@@ -787,7 +791,7 @@ fn handle_key(
         ViewMode::Filter => handle_filter_key(key, app, store)?,
         ViewMode::Tasks => handle_tasks_key(key, app, store, client)?,
         ViewMode::Services => {
-            handle_services_key(key, app, store, client, controls)?;
+            handle_services_key(key, app, client, controls)?;
         }
         ViewMode::Failures => handle_failure_summary_key(key, app, store)?,
         ViewMode::Form => handle_form_key(key, app, store, client)?,
@@ -799,7 +803,20 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
     // The half-finished `gg` chord: taken here so any key other than the
     // second `g` clears it just by arriving.
     let awaiting_second_g = std::mem::take(&mut app.pending_g);
+    // The search prompt takes the keyboard while it is open: every printable
+    // key is part of the query, so none of them can also be a command.
+    if app.log_search.editing() {
+        handle_search_key(key, app);
+        return Ok(());
+    }
     match key.code {
+        // `/` searches the pane's contents, as it does in the tables — there
+        // by name, here by what a line says.
+        KeyCode::Char('/') => app.log_search.begin(),
+        // Esc undoes the innermost thing first, and a confirmed search is
+        // inside a narrow: it was applied last and the title is advertising
+        // this key for it. A second Esc reaches whatever is underneath.
+        KeyCode::Esc if app.log_search.is_active() => app.log_search.cancel(),
         // Held above the tail, Enter is the way back down — the gesture
         // everyone tries first. Above means *actually* above: a view merely
         // pinned at the tail (a selection does that) looks identical to
@@ -934,7 +951,7 @@ async fn dispatch_event(
         // A click inside the window would select text in the log underneath
         // it, where nobody can see it. Outside, the log is visible and the
         // mouse still belongs to it.
-        AppEvent::Mouse(mouse)
+        AppEvent::Mouse(mouse, _)
             if app
                 .attach
                 .as_ref()
@@ -1194,7 +1211,7 @@ const WHEEL_ROWS: isize = 3;
 /// Wheel scrolling works in every mode: a full-screen table on top does not
 /// mean the user has stopped caring where the log is, and moving it costs
 /// nothing while it is hidden.
-fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
+fn handle_mouse(mouse: MouseEvent, at: std::time::Instant, app: &mut App, store: &LogStore) {
     match mouse.kind {
         // The wheel works on whatever is under the pointer — scrolling the log
         // that is hidden *behind* the panel you are pointing at is the kind of
@@ -1231,7 +1248,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
             {
                 return;
             }
-            match click_count(app, mouse.column, mouse.row) {
+            match click_count(app, mouse.column, mouse.row, at) {
                 // A drag is about to start, or a plain click clearing what was
                 // selected before.
                 1 => {
@@ -1274,6 +1291,33 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
     }
 }
 
+/// Keys while the `/` prompt is open.
+///
+/// Enter leaves the search in force and Esc ends it, the same pair the tables
+/// use for their own `/`. Ctrl+R — taken with the other Ctrl chords, upstream
+/// — swaps the query between substring and regex without retyping it, which is
+/// the point of having a toggle at all.
+///
+/// Backspace on an empty query closes the prompt: there is nothing left to
+/// delete, and pressing it again should not be a dead key.
+fn handle_search_key(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Enter => app.log_search.confirm(),
+        KeyCode::Esc => app.log_search.cancel(),
+        KeyCode::Backspace => {
+            if !app.log_search.backspace() {
+                app.log_search.cancel();
+            }
+        }
+        // Ctrl-chords are commands, not text: a stray Ctrl+C while typing a
+        // query should still be the shutdown it is everywhere else.
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.log_search.push(c);
+        }
+        _ => {}
+    }
+}
+
 /// How long two clicks may be apart and still count as a double click.
 ///
 /// The usual desktop default. Long enough not to demand a fast hand, short
@@ -1288,12 +1332,16 @@ const COPY_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 ///
 /// Terminals report a double click as two ordinary presses; only the gap and
 /// the position tell them apart, so the counting has to happen here.
-fn click_count(app: &mut App, column: u16, row: u16) -> u8 {
+fn click_count(app: &mut App, column: u16, row: u16, at: std::time::Instant) -> u8 {
     let count = match app.last_click {
-        Some((last_col, last_row, at, count))
+        Some((last_col, last_row, last_at, count))
             if last_row == row
                 && last_col.abs_diff(column) <= 1
-                && at.elapsed() <= MULTI_CLICK_WINDOW =>
+                // Arrival to arrival. Measuring from when *this* loop reached
+                // the two clicks folds in however long it spent elsewhere —
+                // and on a slow link that is a full frame's write, which is
+                // enough to push a real double click outside the window.
+                && at.duration_since(last_at) <= MULTI_CLICK_WINDOW =>
         {
             // Past a triple, start over rather than inventing a quadruple
             // click nothing has a meaning for.
@@ -1301,7 +1349,7 @@ fn click_count(app: &mut App, column: u16, row: u16) -> u8 {
         }
         _ => 1,
     };
-    app.last_click = Some((column, row, std::time::Instant::now(), count));
+    app.last_click = Some((column, row, at, count));
     count
 }
 
@@ -1335,7 +1383,7 @@ fn select_word(app: &mut App, store: &LogStore, column: u16, row: u16) {
     let Some(message) = store.get(at.id).map(|entry| entry.message_text()) else {
         return;
     };
-    let Some((start, end)) = selection::word_at(&message, at.offset) else {
+    let Some((start, end)) = selection::word_at(message, at.offset) else {
         clear_selection(app);
         return;
     };
@@ -1534,8 +1582,7 @@ fn handle_tasks_key(
     client: &std::sync::Arc<Client>,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
-    if app.log_popup.is_some() {
-        handle_log_popup_key(key, app);
+    if key.code == KeyCode::Esc && app.widen_log_from_narrow() {
         return Ok(());
     }
     match app.tasks_table.handle_key(key, total) {
@@ -1567,7 +1614,7 @@ fn handle_tasks_key(
         let Some(item) = highlighted_task_item(app) else {
             return Ok(());
         };
-        open_log_popup_for_name(app, store, item.name);
+        app.narrow_log_to(&item.name);
     } else if key.code == KeyCode::Char('a') {
         // Bridge into the highlighted task's PTY — the interactive-task flow.
         if let Some(item) = highlighted_task_item(app) {
@@ -1580,13 +1627,11 @@ fn handle_tasks_key(
 fn handle_services_key(
     key: KeyEvent,
     app: &mut App,
-    store: &mut LogStore,
     client: &std::sync::Arc<Client>,
     controls: &TuiControls,
 ) -> Result<(), TuiError> {
     let total = app.service_items().len();
-    if app.log_popup.is_some() {
-        handle_log_popup_key(key, app);
+    if key.code == KeyCode::Esc && app.widen_log_from_narrow() {
         return Ok(());
     }
     match app.services_table.handle_key(key, total) {
@@ -1625,7 +1670,7 @@ fn handle_services_key(
             let Some(item) = highlighted_service_item(app) else {
                 return Ok(());
             };
-            open_log_popup_for_name(app, store, item.name);
+            app.narrow_log_to(&item.name);
         }
         KeyCode::Char('a') => {
             // Bridge into the highlighted service's PTY.
@@ -1636,28 +1681,6 @@ fn handle_services_key(
         _ => {}
     }
     Ok(())
-}
-
-fn handle_log_popup_key(key: KeyEvent, app: &mut App) {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.close_log_popup(),
-        KeyCode::Up | KeyCode::Char('k') => app.scroll_log_popup_by(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.scroll_log_popup_by(1),
-        KeyCode::PageUp => app.scroll_log_popup_by(-10),
-        KeyCode::PageDown => app.scroll_log_popup_by(10),
-        KeyCode::Home | KeyCode::Char('g') => app.scroll_log_popup_to_top(),
-        KeyCode::End | KeyCode::Char('G') => app.scroll_log_popup_to_bottom(),
-        _ => {}
-    }
-}
-
-fn open_log_popup_for_name(app: &mut App, store: &LogStore, name: String) {
-    let lines = store
-        .iter()
-        .filter(|entry| line_matches_log_popup(&name, &entry.line))
-        .map(|entry| entry.line.bytes.clone())
-        .collect();
-    app.open_log_popup(name, lines);
 }
 
 fn highlighted_task_item(app: &App) -> Option<app::TaskStatusItem> {
@@ -1696,44 +1719,42 @@ fn overlay_toggle_command(app: &App) -> Option<OverlayCommand> {
         } else {
             overlay_start_command(item.name.clone())
         }),
-        ServiceState::Pending
-        | ServiceState::Building
-        | ServiceState::Starting
-        | ServiceState::Stopping => None,
+        // Something is in flight and the reader has decided it is not
+        // arriving. Stop is the only direction that means anything: there is a
+        // live process under `Starting`, a build to abandon under `Building`,
+        // and a stop already going that this simply repeats. A key that does
+        // nothing here is the worst answer — it is exactly the state someone
+        // is staring at when they want out of it.
+        ServiceState::Starting | ServiceState::Building | ServiceState::Stopping => {
+            Some(overlay_stop_command(item.name.clone()))
+        }
+        // Waiting on dependencies, with nothing running. Start is the override
+        // for that wait — the supervisor says so itself, refusing to treat
+        // `Pending` as busy for exactly this reason.
+        ServiceState::Pending => Some(overlay_start_command(item.name.clone())),
     }
 }
 
-/// Restart command for `r` — only services in a restartable state.
+/// Restart command for `r`.
 fn highlighted_service_restart_command(app: &App) -> Option<OverlayCommand> {
     let items = app.service_items();
     let idx = app.services_table.selected_index(items.len())?;
     let item = items.get(idx)?;
-    match item.state {
-        ServiceState::Ready
-        | ServiceState::Running
-        | ServiceState::Unhealthy
-        | ServiceState::Failed
-        | ServiceState::DependencyFailed
-        | ServiceState::Stopped => Some(overlay_restart_command(item.name.clone())),
-        _ => None,
-    }
+    // Every state. Restart means "whatever you are doing, stop and come up
+    // again", which is as meaningful mid-start as it is when running — and a
+    // service wedged in `Starting` is the one people most want to say it to.
+    // Where a phase genuinely cannot take it the supervisor refuses and says
+    // why, which is an answer; a dead key is not.
+    Some(overlay_restart_command(item.name.clone()))
 }
 
-/// Hard restart command for `R` — only services in a restartable state.
+/// Hard restart command for `R`.
 fn highlighted_service_hard_restart_command(app: &App) -> Option<OverlayCommand> {
     let items = app.service_items();
     let idx = app.services_table.selected_index(items.len())?;
     let item = items.get(idx)?;
-    match item.state {
-        ServiceState::Ready
-        | ServiceState::Running
-        | ServiceState::Unhealthy
-        | ServiceState::Failed
-        | ServiceState::DependencyFailed
-        | ServiceState::Stopped
-        | ServiceState::Lazy => Some(overlay_hard_restart_command(item.name.clone())),
-        _ => None,
-    }
+    // As with `r`: no state is exempt.
+    Some(overlay_hard_restart_command(item.name.clone()))
 }
 
 /// Which control endpoint an overlay action maps to.
@@ -1840,7 +1861,6 @@ fn after_task_run(task_name: &str, app: &mut App, _store: &LogStore) -> Result<(
     // Make sure the task's own output is admitted, so pressing enter is
     // followed by seeing something happen.
     let filter_changed = app.filter.select_name(task_name);
-    app.log_popup = None;
 
     // The panel stays open. This used to close it — right when the tasks
     // table was full-screen and running something had to hand the logs back,
@@ -2193,6 +2213,48 @@ pub(crate) fn parse_ansi_line(bytes: &[u8]) -> ratatui::text::Line<'static> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Every state answers every key.
+    ///
+    /// A service wedged in `Starting` with a ready check that never settles is
+    /// the state people most need out of, and it was the one state where
+    /// enter, `r` and `R` were all dead — three keys advertised in the table's
+    /// own title doing nothing, with no way to tell that from a key that had
+    /// been missed.
+    #[test]
+    fn no_service_state_leaves_the_table_keys_dead() {
+        use crate::client::ServiceState::*;
+
+        for state in [
+            Pending,
+            Building,
+            Starting,
+            Running,
+            Ready,
+            Unhealthy,
+            Stopping,
+            Stopped,
+            Failed,
+            DependencyFailed,
+            Lazy,
+        ] {
+            let mut app = app_with_service_state(state);
+            app.services_table.highlight = 0;
+            assert!(
+                overlay_toggle_command(&app).is_some(),
+                "{state:?}: enter does nothing"
+            );
+            assert!(
+                highlighted_service_restart_command(&app).is_some(),
+                "{state:?}: r does nothing"
+            );
+            assert!(
+                highlighted_service_hard_restart_command(&app).is_some(),
+                "{state:?}: R does nothing"
+            );
+        }
+    }
+
     use std::collections::{HashMap, HashSet};
 
     /// An app that knows about one task, interactive or not.
@@ -2214,7 +2276,10 @@ mod tests {
     fn app_with_service_state(state: ServiceState) -> App {
         let mut app = App::new(AppInit {
             service_names: vec!["api".to_string()],
-            task_names: Vec::new(),
+            // Registered here and not only via `apply_task_state`: the filter
+            // takes its names at construction, and a task it has never heard
+            // of cannot be narrowed to.
+            task_names: vec!["migrate".to_string()],
             build_tool_names: Vec::new(),
             task_configs: HashMap::new(),
             task_last_runs: HashMap::new(),
@@ -2535,16 +2600,19 @@ mod tests {
             let store = LogStore::with_capacity(4);
             handle_mouse(
                 mouse(MouseEventKind::Down(MouseButton::Left), 10),
+                std::time::Instant::now(),
                 &mut app,
                 &store,
             );
             handle_mouse(
                 mouse(MouseEventKind::Drag(MouseButton::Left), 30),
+                std::time::Instant::now(),
                 &mut app,
                 &store,
             );
             handle_mouse(
                 mouse(MouseEventKind::Up(MouseButton::Left), 30),
+                std::time::Instant::now(),
                 &mut app,
                 &store,
             );
@@ -2899,7 +2967,8 @@ mod tests {
             from: ViewMode,
             key: KeyCode,
             want_mode: ViewMode,
-            want_popup: bool,
+            /// Whether `l` narrowed the log pane to the highlighted row.
+            want_narrowed: bool,
         }
 
         let cases = [
@@ -2908,35 +2977,37 @@ mod tests {
                 from: ViewMode::Services,
                 key: KeyCode::Char('f'),
                 want_mode: ViewMode::Filter,
-                want_popup: false,
+                want_narrowed: false,
             },
             Case {
                 name: "and from the tasks table",
                 from: ViewMode::Tasks,
                 key: KeyCode::Char('f'),
                 want_mode: ViewMode::Filter,
-                want_popup: false,
+                want_narrowed: false,
             },
             Case {
                 name: "and is its own toggle",
                 from: ViewMode::Filter,
                 key: KeyCode::Char('f'),
                 want_mode: ViewMode::Normal,
-                want_popup: false,
+                want_narrowed: false,
             },
             Case {
-                name: "l opens the highlighted service's log",
+                name: "l narrows the log to the highlighted service",
                 from: ViewMode::Services,
                 key: KeyCode::Char('l'),
+                // The panel stays: the pane beside it is the log, so
+                // narrowing it is showing the row's log.
                 want_mode: ViewMode::Services,
-                want_popup: true,
+                want_narrowed: true,
             },
             Case {
-                name: "and the highlighted task's",
+                name: "and to the highlighted task",
                 from: ViewMode::Tasks,
                 key: KeyCode::Char('l'),
                 want_mode: ViewMode::Tasks,
-                want_popup: true,
+                want_narrowed: true,
             },
         ];
 
@@ -2968,81 +3039,9 @@ mod tests {
 
             assert_eq!(app.view_mode, case.want_mode, "{}", case.name);
             assert_eq!(
-                app.log_popup.is_some(),
-                case.want_popup,
-                "{}: popup?",
-                case.name
-            );
-        }
-    }
-
-    /// The log popup cannot outlive the table it is a row of.
-    ///
-    /// `s` and `t` close or switch their panel from anywhere, but the only key
-    /// that dismissed the popup lived inside the table handlers — so a popup
-    /// left behind was one nothing could close.
-    #[test]
-    fn changing_the_view_takes_the_log_popup_with_it() {
-        struct Case {
-            name: &'static str,
-            from: ViewMode,
-            key: KeyCode,
-        }
-
-        let cases = [
-            Case {
-                name: "closing the panel it was opened from",
-                from: ViewMode::Services,
-                key: KeyCode::Char('s'),
-            },
-            Case {
-                name: "switching to the other panel",
-                from: ViewMode::Services,
-                key: KeyCode::Char('t'),
-            },
-            Case {
-                name: "closing the tasks panel",
-                from: ViewMode::Tasks,
-                key: KeyCode::Char('t'),
-            },
-            Case {
-                name: "switching from tasks to services",
-                from: ViewMode::Tasks,
-                key: KeyCode::Char('s'),
-            },
-        ];
-
-        for case in cases {
-            let mut app = app_with_service_state(ServiceState::Ready);
-            app.apply_task_state(
-                "migrate".to_string(),
-                crate::client::TaskState::Pending,
-                None,
-                Vec::new(),
-            );
-            app.view_mode = case.from;
-            app.focus = panes::Focus::Panel;
-            app.open_log_popup("api".to_string(), vec![b"a line".to_vec()]);
-            assert!(app.log_popup.is_some(), "{}: opened", case.name);
-
-            let mut store = LogStore::with_capacity(10);
-            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
-            let controls = TuiControls {
-                lifecycle_emitter: LifecycleEmitter::discarding(),
-                mode: TuiMode::InProcess,
-            };
-            handle_key(
-                KeyEvent::new(case.key, KeyModifiers::NONE),
-                &mut app,
-                &mut store,
-                &client,
-                &controls,
-            )
-            .unwrap();
-
-            assert!(
-                app.log_popup.is_none(),
-                "{}: the popup went with the table",
+                app.filter_narrowed_from.is_some(),
+                case.want_narrowed,
+                "{}: narrowed?",
                 case.name
             );
         }
