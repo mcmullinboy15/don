@@ -75,7 +75,7 @@ use ratatui::text::Text;
 use ratatui::{TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot};
+use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot, TaskState};
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter};
 use app::{App, AppInit, ViewMode};
@@ -171,31 +171,28 @@ struct TuiControls {
 ///
 /// A drop is rendered as a lifecycle line so it lands in the log where the
 /// missing lines would have been, rather than in a corner of the status bar.
-/// It carries the id the stream resumed at, so its position in the store is
-/// the truth about where the hole is.
-fn push_merged_event(
-    batch: &mut Vec<(crate::output::LogId, FormattedLogLine)>,
-    event: crate::output::MergedEvent,
-) {
+/// Arrival order puts it there on its own — the ids the events carry are the
+/// producing stream's, and there is more than one of those (see
+/// [`LogStores::next`]), so they are dropped here rather than carried into a
+/// store that orders by them.
+fn push_merged_event(batch: &mut Vec<FormattedLogLine>, event: crate::output::MergedEvent) {
     match event {
         crate::output::MergedEvent::Line(entry) => {
-            batch.push((entry.id, (*entry.line).clone()));
+            batch.push((*entry.line).clone());
         }
-        crate::output::MergedEvent::Dropped { count, resumed_at } => batch.push((
-            resumed_at,
-            FormattedLogLine {
-                name: crate::output::LIFECYCLE_EVENT_NAME.to_string(),
-                is_lifecycle: true,
-                is_verbose: false,
-                // The gap notice is the TUI's own, so it has no prefix from
-                // the sink to sit under.
-                prefix: Vec::new(),
-                bytes: format!(
-                    "{count} log line(s) dropped — history did not reach back far enough"
-                )
+        crate::output::MergedEvent::Dropped {
+            count,
+            resumed_at: _,
+        } => batch.push(FormattedLogLine {
+            name: crate::output::LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            is_verbose: false,
+            // The gap notice is the TUI's own, so it has no prefix from
+            // the sink to sit under.
+            prefix: Vec::new(),
+            bytes: format!("{count} log line(s) dropped — history did not reach back far enough")
                 .into_bytes(),
-            },
-        )),
+        }),
     }
 }
 
@@ -259,6 +256,7 @@ pub async fn run_tui(
     let mut stores = LogStores {
         output: LogStore::with_capacity(DEFAULT_CAPACITY),
         debug: LogStore::with_capacity(DEBUG_CAPACITY),
+        next: crate::output::LogId::ZERO,
     };
 
     let (input_tx, mut input_rx) = mpsc::channel::<AppEvent>(64);
@@ -310,7 +308,7 @@ pub async fn run_tui(
             maybe_event = log_rx.recv() => {
                 match maybe_event {
                     Some(first) => {
-                        let mut batch: Vec<(crate::output::LogId, FormattedLogLine)> =
+                        let mut batch: Vec<FormattedLogLine> =
                             Vec::with_capacity(LOG_BATCH_LIMIT);
                         push_merged_event(&mut batch, first);
                         while batch.len() < LOG_BATCH_LIMIT {
@@ -319,11 +317,11 @@ pub async fn run_tui(
                                 Err(_) => break,
                             }
                         }
-                        for (id, line) in batch {
+                        for line in batch {
                             if is_shutdown_start_line(&line) && !app.shutdown_started {
                                 app.begin_shutdown();
                             }
-                            stores.route(id, line);
+                            stores.route(line);
                         }
                         dirty = true;
                     }
@@ -486,11 +484,31 @@ struct LogStores {
     output: LogStore,
     /// What don said about them — see `LifecycleEmitter::debug_event`.
     debug: LogStore,
+    /// The id the next line is filed under — this client's own numbering, not
+    /// the ids the lines arrive carrying.
+    ///
+    /// The channel is not one stream. `don start` on a terminal, and `don
+    /// attach`, merge the runner's log stream with this client's own narration
+    /// ("restart requested", version-skew notices), and that narration comes
+    /// from a second `OutputManager` whose ids start at zero all over again.
+    /// So the first locally-narrated line arrives numbered 0 behind a stream
+    /// already in the hundreds.
+    ///
+    /// Both records binary-search by id ([`LogStore::get`],
+    /// [`LogStore::iter_from`]), so one id out of order makes those searches
+    /// answer `None` for lines that are sitting right there. The pane then
+    /// paints fewer rows than the view index counted for the same lines and
+    /// the bottom of the log goes blank — healing only when the offending
+    /// entry ages out. Numbering here instead makes that unrepresentable, for
+    /// however many sources the channel grows.
+    next: crate::output::LogId,
 }
 
 impl LogStores {
     /// File a line under the record it belongs to. The tag decides, once.
-    fn route(&mut self, id: crate::output::LogId, line: FormattedLogLine) {
+    fn route(&mut self, line: FormattedLogLine) {
+        let id = self.next;
+        self.next = crate::output::LogId(id.0.saturating_add(1));
         if line.is_verbose {
             self.debug.push(id, line);
         } else {
@@ -731,6 +749,11 @@ fn handle_key(
             ViewMode::Filter => app.filter.focus() == filter::FilterFocus::Query,
             ViewMode::Services => app.services_table.filtering,
             ViewMode::Tasks => app.tasks_table.filtering,
+            // A focused form is all keyboard: `s`, `t` and `f` are characters
+            // someone is typing into a param, and Tab is the form's own
+            // next-field. Unfocused it is just another panel, so the switching
+            // keys work from the log side as they do for the tables.
+            ViewMode::Form => app.focus == panes::Focus::Panel,
             _ => false,
         };
     if app.panel_open() && !typing {
@@ -789,7 +812,7 @@ fn handle_key(
     match app.view_mode {
         ViewMode::Normal => handle_normal_key(key, app, store)?,
         ViewMode::Filter => handle_filter_key(key, app, store)?,
-        ViewMode::Tasks => handle_tasks_key(key, app, store, client)?,
+        ViewMode::Tasks => handle_tasks_key(key, app, store, client, controls)?,
         ViewMode::Services => {
             handle_services_key(key, app, client, controls)?;
         }
@@ -1242,10 +1265,8 @@ fn handle_mouse(mouse: MouseEvent, at: std::time::Instant, app: &mut App, store:
             // screen. A side panel leaves it on screen — the guard used to say
             // `view_mode != Normal` from the days when every other mode took
             // the whole frame, which made selecting dead whenever a panel was
-            // open. Only the true full-screen overlays exclude it now.
-            if focus != panes::Focus::Logs
-                || matches!(app.view_mode, ViewMode::Failures | ViewMode::Form)
-            {
+            // open. The failure summary is the only full-screen overlay left.
+            if focus != panes::Focus::Logs || app.view_mode == ViewMode::Failures {
                 return;
             }
             match click_count(app, mouse.column, mouse.row, at) {
@@ -1580,6 +1601,7 @@ fn handle_tasks_key(
     app: &mut App,
     store: &mut LogStore,
     client: &std::sync::Arc<Client>,
+    controls: &TuiControls,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
     if key.code == KeyCode::Esc && app.widen_log_from_narrow() {
@@ -1601,6 +1623,18 @@ fn handle_tasks_key(
             return Ok(());
         };
         if !item.runnable() {
+            // Enter is a toggle here, as it is in the services table: a run in
+            // flight is a process, and ending it is the only thing enter could
+            // usefully mean on that row. `Building` is the batcher's work and
+            // not this task's process, so there is nothing here to stop until
+            // the artifact lands — the key stays inert for it.
+            if item.state == TaskState::Running {
+                dispatch_overlay_command(
+                    client,
+                    &controls.lifecycle_emitter,
+                    overlay_stop_command(item.name),
+                );
+            }
             return Ok(());
         }
         if item.has_params {
@@ -2014,8 +2048,12 @@ fn handle_form_key(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => {
-            app.form = None;
-            return_to_logs(app);
+            // Back to the table, not to the log: the form is a step *inside*
+            // running a task, and cancelling one param entry usually means
+            // running something else — which is a row away, not a panel away.
+            // `set_view_mode` drops the form.
+            app.set_view_mode(ViewMode::Tasks);
+            app.focus = panes::Focus::Panel;
             return Ok(());
         }
         KeyCode::Enter if ctrl => {
@@ -2179,7 +2217,12 @@ fn try_submit_form(
         }
     };
     dispatch_run_task_with_params(client, task_name.clone(), params);
-    app.form = None;
+    // Same hand-back as Esc, and for a stronger reason: the row the reader
+    // just ran is about to change state in that table. Leaving the mode on
+    // `Form` with no form left showed an empty bordered panel that answered
+    // no key at all.
+    app.set_view_mode(ViewMode::Tasks);
+    app.focus = panes::Focus::Panel;
     after_task_run(&task_name, app, store)?;
     Ok(())
 }
@@ -2288,6 +2331,59 @@ mod tests {
             cli_log_filter: None,
         });
         app.apply_service_runtime("api".to_string(), state, None, Vec::new());
+        app
+    }
+
+    /// An app whose one task declares one free-text param, so pressing enter
+    /// on its row opens the form rather than running it.
+    fn app_with_param_task() -> App {
+        use crate::config::{LogConfig, ParamKind, Task, TaskAutoRun, TaskParam};
+
+        let task = Task {
+            cmd: "echo".into(),
+            args: vec![],
+            dir: None,
+            env: HashMap::new(),
+            depends_on: vec![],
+            watch: vec![],
+            ignore: vec![],
+            debounce: None,
+            timeout: None,
+            log: LogConfig::Stdout,
+            interactive: false,
+            headless: None,
+            auto_run: TaskAutoRun::Always,
+            download: None,
+            bazel: None,
+            params: vec![TaskParam {
+                name: "branch".into(),
+                prompt: None,
+                required: false,
+                default: None,
+                kind: ParamKind::String,
+                choices: vec![],
+                completions: None,
+                validate: None,
+            }],
+            hidden: false,
+            auto_filter_on_failure: None,
+        };
+        let mut app = App::new(AppInit {
+            service_names: Vec::new(),
+            task_names: vec!["migrate".to_string()],
+            build_tool_names: Vec::new(),
+            task_configs: HashMap::from([("migrate".to_string(), task)]),
+            task_last_runs: HashMap::new(),
+            hidden_names: HashSet::new(),
+            auto_filter_on_failure_names: HashSet::new(),
+            cli_log_filter: None,
+        });
+        app.apply_task_state(
+            "migrate".to_string(),
+            crate::client::TaskState::Pending,
+            None,
+            Vec::new(),
+        );
         app
     }
 
@@ -2566,6 +2662,11 @@ mod tests {
             Case {
                 name: "filter panel open",
                 view_mode: ViewMode::Filter,
+                want_selection: true,
+            },
+            Case {
+                name: "param form open: a panel too, so the log is still there",
+                view_mode: ViewMode::Form,
                 want_selection: true,
             },
             Case {
@@ -3118,6 +3219,211 @@ mod tests {
             }
             assert_eq!(app.view_mode, case.want_mode, "{}: mode", case.name);
             assert_eq!(app.focus, case.want_focus, "{}: focus", case.name);
+        }
+    }
+
+    /// The param form lives by the panel's rules now that it is one: opening
+    /// it focuses the panel, a focused form owns every character key (`s`,
+    /// `t` and `f` are letters someone is typing, not panel switches), and
+    /// both ways out hand the panel back to the table the run started from.
+    ///
+    /// That last part is what a full-screen form got wrong twice over.
+    /// Cancelling dropped the reader all the way back to a bare log, a panel
+    /// away from the row they were about to try instead; and submitting
+    /// cleared the form while leaving the mode on `Form`, which drew an empty
+    /// bordered box that answered no key at all.
+    #[tokio::test]
+    async fn the_param_form_is_a_panel() {
+        struct Case {
+            name: &'static str,
+            /// Pressed after the form is open, in order.
+            keys: &'static [KeyCode],
+            want_mode: ViewMode,
+            want_focus: panes::Focus,
+            /// What the form's single field holds, or `None` when the form is
+            /// gone.
+            want_value: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "opening it focuses the panel",
+                keys: &[],
+                want_mode: ViewMode::Form,
+                want_focus: panes::Focus::Panel,
+                want_value: Some(""),
+            },
+            Case {
+                name: "the panel keys are just letters while it has focus",
+                keys: &[KeyCode::Char('s'), KeyCode::Char('t'), KeyCode::Char('f')],
+                want_mode: ViewMode::Form,
+                want_focus: panes::Focus::Panel,
+                want_value: Some("stf"),
+            },
+            Case {
+                name: "and tab is the form's own next field, not the split's",
+                keys: &[KeyCode::Tab, KeyCode::Char('x')],
+                want_mode: ViewMode::Form,
+                want_focus: panes::Focus::Panel,
+                want_value: Some("x"),
+            },
+            Case {
+                name: "esc hands the panel back to the table",
+                keys: &[KeyCode::Esc],
+                want_mode: ViewMode::Tasks,
+                want_focus: panes::Focus::Panel,
+                want_value: None,
+            },
+            Case {
+                name: "so does running it from the last field",
+                keys: &[KeyCode::Char('v'), KeyCode::Enter],
+                want_mode: ViewMode::Tasks,
+                want_focus: panes::Focus::Panel,
+                want_value: None,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_param_task();
+            let mut store = LogStore::with_capacity(10);
+            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
+            let controls = TuiControls {
+                lifecycle_emitter: LifecycleEmitter::discarding(),
+                mode: TuiMode::InProcess,
+            };
+            let mut press = |app: &mut App, code: KeyCode| {
+                handle_key(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    app,
+                    &mut store,
+                    &client,
+                    &controls,
+                )
+                .unwrap();
+            };
+
+            // `t` opens the tasks table, enter on the only row opens the form.
+            press(&mut app, KeyCode::Char('t'));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.view_mode, ViewMode::Form, "{}: setup", case.name);
+
+            for code in case.keys {
+                press(&mut app, *code);
+            }
+
+            assert_eq!(app.view_mode, case.want_mode, "{}: mode", case.name);
+            assert_eq!(app.focus, case.want_focus, "{}: focus", case.name);
+            assert_eq!(
+                app.form.as_ref().map(|f| f.fields[0].value.as_str()),
+                case.want_value,
+                "{}: value",
+                case.name
+            );
+            // The panel is open in every outcome, so the log is on screen
+            // throughout — the whole point of moving the form off the
+            // full-screen overlay.
+            assert!(app.panel_open(), "{}: panel", case.name);
+        }
+    }
+
+    /// Two producers, one channel. `don start` on a terminal (and `don
+    /// attach`) merge the runner's log stream with this client's own narration
+    /// — "restart requested" and friends — and that narration comes from a
+    /// second `OutputManager` numbering from zero. So the ids arriving on the
+    /// channel are two interleaved sequences, not one.
+    ///
+    /// Filing lines under those ids put an id-0 line behind an id-120 one, and
+    /// both records binary-search by id: `get` began answering `None` for
+    /// lines that were sitting right there, the pane painted fewer rows than
+    /// the index had counted for the same lines, and the bottom of the log
+    /// went blank until the offending entry aged out. Restarting a service
+    /// from the tables was the reliable way to see it, because that is what
+    /// emits the first local line.
+    #[test]
+    fn interleaved_producers_still_file_lines_in_order() {
+        use crate::output::{LogId, MergedEvent, MergedLine};
+
+        struct Case {
+            name: &'static str,
+            /// The ids the events arrive carrying, in arrival order.
+            ids: &'static [u64],
+        }
+
+        let cases = [
+            Case {
+                name: "one well-behaved stream",
+                ids: &[0, 1, 2, 3, 4, 5],
+            },
+            Case {
+                name: "local narration restarts the numbering mid-stream",
+                ids: &[0, 1, 2, 120, 0, 121, 122],
+            },
+            Case {
+                name: "the two sequences interleave freely",
+                ids: &[7, 0, 8, 1, 9, 2, 10],
+            },
+            Case {
+                name: "and may collide outright",
+                ids: &[3, 3, 3, 3],
+            },
+        ];
+
+        for case in cases {
+            let mut stores = LogStores {
+                output: LogStore::with_capacity(64),
+                debug: LogStore::with_capacity(64),
+                next: LogId::ZERO,
+            };
+            stores.output.reflow(80);
+
+            let mut batch: Vec<FormattedLogLine> = Vec::new();
+            for (n, id) in case.ids.iter().enumerate() {
+                push_merged_event(
+                    &mut batch,
+                    MergedEvent::Line(MergedLine {
+                        id: LogId(*id),
+                        line: std::sync::Arc::new(FormattedLogLine {
+                            name: "api".to_string(),
+                            is_lifecycle: false,
+                            is_verbose: false,
+                            prefix: b"api   | ".to_vec(),
+                            bytes: format!("line {n}").into_bytes(),
+                        }),
+                    }),
+                );
+            }
+            for line in batch {
+                stores.route(line);
+            }
+
+            let store = &stores.output;
+            assert_eq!(
+                store.iter().count(),
+                case.ids.len(),
+                "{}: every line is kept",
+                case.name
+            );
+
+            // Sorted by id, which is what every search over the store assumes.
+            let ids: Vec<LogId> = store.iter().map(|entry| entry.id).collect();
+            let mut sorted = ids.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(ids, sorted, "{}: ids ascend and never repeat", case.name);
+
+            // And the searches agree with the sequence: this is the step that
+            // failed, and `build_view` drops on the floor whatever `get`
+            // cannot find.
+            for (n, id) in ids.iter().enumerate() {
+                let found = store.get(*id);
+                assert!(found.is_some(), "{}: get({id:?}) found nothing", case.name);
+                assert_eq!(
+                    found.map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned()),
+                    Some(format!("line {n}")),
+                    "{}: get({id:?}) found the wrong line",
+                    case.name
+                );
+            }
         }
     }
 
