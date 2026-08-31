@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "don"
-version = "0.8.0"
+version = "0.8.0-preview"
 dependencies = [
  "ansi-to-tui",
  "axum",
