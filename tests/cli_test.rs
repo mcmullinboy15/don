@@ -570,3 +570,81 @@ fn cli_run_timeout_after_task_name_limits_wait() {
         handle.await.unwrap();
     });
 }
+
+#[test]
+fn validate_show_prints_the_merged_config() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("cli-validate-show");
+        let config_path = dir.path().join("don.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_profile = "dev"
+
+[services.api]
+run.cmd = "api"
+env = { CONF = "dev" }
+
+[profiles.dev]
+services = ["api"]
+
+[profiles.prod]
+services = ["api"]
+
+[profiles.prod.overrides.services.api]
+env = { CONF = "prod" }
+"#,
+        )
+        .unwrap();
+
+        let path = config_path.clone();
+        let (code, stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&path, &["validate", "--profile", "prod"]))
+                .await
+                .unwrap();
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert!(
+            stderr.contains("--show"),
+            "a bare validate should point at --show. stderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("CONF"),
+            "nothing is dumped without --show. stdout: {stdout}"
+        );
+
+        let path = config_path.clone();
+        let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
+            run_cli(&path, &["validate", "--profile", "prod", "--show"])
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert!(
+            stdout.contains(r#"CONF = "prod""#),
+            "--show prints the merged result, not the base file. stdout: {stdout}"
+        );
+        assert!(
+            toml::from_str::<toml::Value>(&stdout).is_ok(),
+            "stdout is the config and nothing else, so a redirect parses. stdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("overrides"),
+            "the applied overrides block is resolved away. stdout: {stdout}"
+        );
+
+        let path = config_path.clone();
+        let (_, stdout, _) =
+            tokio::task::spawn_blocking(move || run_cli(&path, &["validate", "--show"]))
+                .await
+                .unwrap();
+        assert!(
+            stdout.contains(r#"CONF = "dev""#),
+            "the default profile has no overrides to apply. stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("overrides"),
+            "an unapplied profile keeps its block — dev is active, so prod's \
+             overrides are still pending, not resolved. stdout: {stdout}"
+        );
+    });
+}

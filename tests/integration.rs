@@ -694,9 +694,43 @@ bounded_test!(
     validate_log_filter_rejects_invalid_regex,
     validate_log_filter_rejects_invalid_regex_body
 );
+fn global_env_reaches_every_process_body() {
+    let toml = r#"
+env = { CONF_PATH = "conf.sh.dev", SHARED = "global" }
+
+[services.api]
+run.cmd = "api"
+env = { OWN = "yes", SHARED = "service" }
+
+[tasks.migrate]
+cmd = "migrate"
+"#;
+
+    let config: Config = toml.parse().unwrap();
+
+    let api = &config.services["api"];
+    assert_eq!(
+        api.env["CONF_PATH"], "conf.sh.dev",
+        "global env reaches services"
+    );
+    assert_eq!(api.env["OWN"], "yes", "a service keeps its own entries");
+    assert_eq!(
+        api.env["SHARED"], "service",
+        "the service's own value wins over the global one"
+    );
+    assert_eq!(
+        config.tasks["migrate"].env["CONF_PATH"], "conf.sh.dev",
+        "global env reaches tasks too"
+    );
+}
+
 bounded_test!(
     config_from_file_merges_local_override,
     config_from_file_merges_local_override_body
+);
+bounded_test!(
+    global_env_reaches_every_process,
+    global_env_reaches_every_process_body
 );
 bounded_test!(
     malformed_local_override_is_parse_error,

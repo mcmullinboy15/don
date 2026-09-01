@@ -1006,6 +1006,72 @@ transitive dependencies. If `api` depends on `migrate` which depends on
 
 Set `default_profile = "<name>"` at the top level to pick a profile automatically when `don start` is run without `--profile`. Leave it unset to have `don start` run everything.
 
+### Profile Overrides
+
+A profile may carry an `overrides` table: a `don.toml` fragment applied whenever
+that profile is the active one. It answers "same stack, different target" —
+pointing every service at a different database or conf without a second config
+file and without duplicating the service definitions.
+
+```toml
+[profiles.prod]
+services = ["api", "worker"]
+
+[profiles.prod.overrides.services.api]
+env = { DATABASE_URL = "postgres://prod.internal:5432/app" }
+```
+
+A header per service, or dotted keys under one header — the same table either
+way, since the merge works on the parsed value:
+
+```toml
+[profiles.prod.overrides]
+services.api.env = { DATABASE_URL = "postgres://prod.internal:5432/app" }
+```
+
+The one constraint is TOML's own: a path spelled as a header cannot also appear
+as a dotted key under a parent header, so one form per service.
+
+Overrides merge with the same recursive table merge the local file uses, and the
+three layers apply in order:
+
+1. the base file
+2. the active profile's `overrides` — the profile named by `--profile`, else
+   `default_profile`
+3. the sibling `.local.toml`
+
+The local file goes last so a developer's own overrides outrank a profile the
+repo ships; it may also extend a profile's `overrides` block, or move
+`default_profile` to select a different one. An overrides block may not itself
+set `profiles` or `default_profile` — an override that changed which overrides
+apply would be a merge that reads differently depending on where you start.
+
+A top-level `env` table pairs with this directly: it is handed to every service
+and task (a process's own `env` wins, and a platform override wins over both),
+so `[profiles.prod.overrides.env]` moves an entire stack onto a different
+database with one key rather than one block per service.
+
+The merge is the local file's: tables merge key by key, scalars and arrays
+replace. An overridden `run.args` or `watch` is the whole new list. What the
+block may contain is the file's root, so `tasks`, `service_groups`, and
+top-level keys such as `watch_ignore` merge alongside `services`.
+
+Overriding is not selecting. The profile's `services` and `tasks` lists decide
+what runs; the `overrides` block only decides what those things are. A service
+defined solely in an overrides block is a configured service the profile did not
+pick, and it stays stopped — the same state any service outside the active
+profile is in.
+
+`don validate --profile <name>` loads the config exactly as `don start
+--profile <name>` would, so the merged result can be checked before anything
+starts. Adding `--show` prints that merged config as TOML, with the active
+profile's `overrides` block removed — it has already been folded into the
+services and tasks above it, and leaving it in would read as though it were
+still pending. Every other profile keeps its block: those have not been applied,
+and hiding them would misreport what the file says. A bare `don validate`
+answers only whether the merge is legal, and says on stderr that `--show` will
+print it.
+
 ## CLI
 
 ```
@@ -1027,7 +1093,8 @@ Commands:
   exec <cmd> [args...]      Run a command with .don/bin on PATH
   attach [name]             Attach the TUI to a running project, or one service's PTY
   cleanup                   Kill orphaned processes, remove stale sockets/containers
-  validate                  Check the config for errors without running anything
+  validate [--profile] [--show]
+                            Check the config for errors, or print the merged result
   completions <shell>       Print a shell completion script (bash/zsh/fish/...)
 ```
 

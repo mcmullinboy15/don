@@ -79,6 +79,10 @@ pub struct Config {
     /// file-watch and watch-derived change detection.
     #[serde(default)]
     pub watch_ignore: Vec<String>,
+    /// Environment handed to every service and task. A process's own `env`
+    /// wins on conflict, as does a platform override's.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     /// If true, Don first tries each configured proxy listener or Docker host
     /// port, then falls back to an OS-assigned port on the same host/IP when
     /// the preferred port is already in use.
@@ -113,7 +117,9 @@ impl std::str::FromStr for Config {
         let mut value: toml::Value = toml::from_str(s)?;
         reject_removed_keys(&value).map_err(serde::de::Error::custom)?;
         apply_compat_keys(&mut value).map_err(serde::de::Error::custom)?;
-        value.try_into()
+        let mut config: Config = value.try_into()?;
+        config.apply_global_env();
+        Ok(config)
     }
 }
 
@@ -242,28 +248,94 @@ fn validate_log_filter(label: &str, filter: &LogFilterConfig, errors: &mut Vec<S
 }
 
 impl Config {
-    /// Load and parse a config from a file path, then merge a sibling
-    /// `.local.toml` override file if one exists.
+    /// Load and parse a config from a file path, applying the active profile's
+    /// `overrides` block and then a sibling `.local.toml` override file if one
+    /// exists.
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
+        Self::from_file_with_profile(path, None)
+    }
+
+    /// Load a config knowing which profile the caller is about to start.
+    ///
+    /// `profile` is the `--profile` name; `None` falls back to
+    /// `default_profile`. The named profile's `overrides` block lands between
+    /// the base file and the local file, so a repo-shipped profile can retarget
+    /// a service while a developer's own `.local.toml` still has the last word.
+    pub fn from_file_with_profile(
+        path: &std::path::Path,
+        profile: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let mut config: Self = Self::merged_toml(path, profile)?.try_into()?;
+        config.apply_global_env();
+        Ok(config)
+    }
+
+    /// Push the workspace-wide `env` down into every service and task, where a
+    /// process's own entry wins. Done once at load so every consumer —
+    /// spawning, ready checks, `don status -v` — sees one env per process.
+    fn apply_global_env(&mut self) {
+        if self.env.is_empty() {
+            return;
+        }
+        let envs = self
+            .services
+            .values_mut()
+            .map(|service| &mut service.env)
+            .chain(self.tasks.values_mut().map(|task| &mut task.env));
+        for env in envs {
+            for (key, value) in &self.env {
+                env.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+
+    /// The config as don sees it once every layer is applied: the base file,
+    /// the active profile's `overrides`, and the sibling `.local.toml`. This is
+    /// the value `from_file_with_profile` deserializes, and what
+    /// `don validate --show` prints.
+    pub fn merged_toml(
+        path: &std::path::Path,
+        profile: Option<&str>,
+    ) -> Result<toml::Value, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
             path: path.to_path_buf(),
             source,
         })?;
         let mut value: toml::Value = toml::from_str(&content)?;
+        let local = Self::read_local_override(path)?;
 
-        let local_path = Self::local_override_path(path);
-        match std::fs::read_to_string(&local_path) {
-            Ok(local_content) => {
-                let local_value: toml::Value = toml::from_str(&local_content)?;
-                merge_toml_values(&mut value, local_value);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(ConfigError::ReadFile {
-                    path: local_path,
-                    source,
-                });
-            }
+        // Which profile is active, and what it overrides, are both things the
+        // local file may have moved — so resolve them against the merged view
+        // rather than the base file alone.
+        let mut merged = value.clone();
+        if let Some(local) = &local {
+            merge_toml_values(&mut merged, local.clone());
+        }
+        validate_profile_keys(&merged).map_err(|error| ConfigError::Validation {
+            errors: vec![error],
+        })?;
+        let active = profile.map(str::to_string).or_else(|| {
+            merged
+                .get("default_profile")
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+        });
+        if let Some(name) = &active
+            && let Some(overrides) = merged
+                .get("profiles")
+                .and_then(|profiles| profiles.get(name))
+                .and_then(|profile| profile.get(PROFILE_OVERRIDES_KEY))
+                .cloned()
+        {
+            validate_profile_overrides(name, &overrides).map_err(|error| {
+                ConfigError::Validation {
+                    errors: vec![error],
+                }
+            })?;
+            merge_toml_values(&mut value, overrides);
+        }
+        if let Some(local) = local {
+            merge_toml_values(&mut value, local);
         }
 
         reject_removed_keys(&value).map_err(|error| ConfigError::Validation {
@@ -272,7 +344,29 @@ impl Config {
         apply_compat_keys(&mut value).map_err(|error| ConfigError::Validation {
             errors: vec![error],
         })?;
-        Ok(value.try_into()?)
+        // The applied block is folded in now, so leaving it would read as
+        // pending. Other profiles keep theirs — nothing of theirs was applied.
+        if let Some(name) = &active
+            && let Some(profile) = value
+                .get_mut("profiles")
+                .and_then(|profiles| profiles.get_mut(name.as_str()))
+                .and_then(toml::Value::as_table_mut)
+        {
+            profile.remove(PROFILE_OVERRIDES_KEY);
+        }
+        Ok(value)
+    }
+
+    fn read_local_override(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
+        let local_path = Self::local_override_path(path);
+        match std::fs::read_to_string(&local_path) {
+            Ok(content) => Ok(Some(toml::from_str(&content)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(ConfigError::ReadFile {
+                path: local_path,
+                source,
+            }),
+        }
     }
 
     fn local_override_path(path: &Path) -> PathBuf {
@@ -1017,6 +1111,52 @@ fn merge_toml_values(base: &mut toml::Value, override_value: toml::Value) {
         }
         (base_value, override_value) => *base_value = override_value,
     }
+}
+
+/// Key under `[profiles.<name>]` holding a config fragment merged over the base
+/// file whenever that profile is the active one.
+const PROFILE_OVERRIDES_KEY: &str = "overrides";
+
+const PROFILE_KEYS: &[&str] = &["services", "tasks", PROFILE_OVERRIDES_KEY];
+
+/// A misspelled key under `[profiles.<name>]` would otherwise be ignored in
+/// silence, and "my profile's overrides did nothing" is a miserable thing to
+/// debug.
+fn validate_profile_keys(value: &toml::Value) -> Result<(), String> {
+    let Some(profiles) = value.get("profiles").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    let known: HashSet<&str> = PROFILE_KEYS.iter().copied().collect();
+    for (name, profile) in profiles {
+        let Some(table) = profile.as_table() else {
+            continue;
+        };
+        for key in table.keys() {
+            if !known.contains(key.as_str()) {
+                let suggestion = suggest_typo(key, &known);
+                return Err(format!("profile '{name}': unknown key '{key}'{suggestion}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_profile_overrides(profile: &str, overrides: &toml::Value) -> Result<(), String> {
+    let Some(table) = overrides.as_table() else {
+        return Err(format!(
+            "profile '{profile}': '{PROFILE_OVERRIDES_KEY}' must be a table of \
+             don.toml sections, like [profiles.{profile}.{PROFILE_OVERRIDES_KEY}.services.api]"
+        ));
+    };
+    for key in ["profiles", "default_profile"] {
+        if table.contains_key(key) {
+            return Err(format!(
+                "profile '{profile}': '{PROFILE_OVERRIDES_KEY}' cannot set '{key}' — an \
+                 overrides block changes services and tasks, not which profile is active"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Errors that can occur when loading or validating a don config.
