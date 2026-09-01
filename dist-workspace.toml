@@ -23,4 +23,10 @@ tap = "pjtatlow/homebrew-tap"
 publish-jobs = ["homebrew", "./publish-crates-io"]
 # Steps injected before `dist build`. The web UI bundle is embedded in the
 # binary but isn't committed, so release builds have to produce it first.
-github-build-setup = "build-setup.yml"
+#
+# Deliberately NOT under .github/workflows/: this is a fragment of steps, not
+# a workflow, and anything ending in .yml in that directory is picked up and
+# run by Actions on every push — which failed instantly, every time, because
+# the fragment has no `on:` or `jobs:`. The path is relative to
+# .github/workflows/, hence the `..`.
+github-build-setup = "../build-setup.yml"
