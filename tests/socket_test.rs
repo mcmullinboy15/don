@@ -914,6 +914,17 @@ fn integration_lazy_defers_start_until_dependency_satisfied() {
             "expected api to start after setup completed. output: {}",
             read_buf(&buf)
         );
+        // `api: ready` only says the ready check passed, and this one is
+        // `true` — it succeeds a couple of milliseconds after the spawn, well
+        // before the service's own first line has crossed the PTY, the reader
+        // and the output actor to reach this buffer. Reading the buffer here
+        // raced that journey and lost on macOS. Wait for the line itself; what
+        // it *says* is what the test is actually about.
+        assert!(
+            wait_for_output(&buf, "API_MARKER=", Duration::from_secs(5)).await,
+            "expected api to report whether it saw the marker. output: {}",
+            read_buf(&buf)
+        );
 
         let output = read_buf(&buf);
         assert!(
