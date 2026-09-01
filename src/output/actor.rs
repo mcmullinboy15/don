@@ -26,7 +26,7 @@
 //! over. "stopped" still cannot outrun a process's last lines.
 
 use super::ring_buffer::RingBuffer;
-use super::{CompiledLogKeepFilter, MAX_FILTER_PENDING, PtyInput, SinkHandle, SinkLine};
+use super::{CompiledLineFilter, MAX_FILTER_PENDING, PtyInput, SinkHandle, SinkLine};
 use bytes::{Bytes, BytesMut};
 use tokio::sync::{mpsc, oneshot};
 
@@ -56,7 +56,7 @@ struct ServiceOutputState {
     pub(super) name: String,
     prefix: Bytes,
     ring_buffer: RingBuffer,
-    log_keep_filter: CompiledLogKeepFilter,
+    line_filter: CompiledLineFilter,
     filter_pending: BytesMut,
     /// Dynamic list of sinks this service writes to.
     sinks: Vec<SinkHandle>,
@@ -71,7 +71,7 @@ struct ServiceOutputState {
 
 impl ServiceOutputState {
     fn output_chunks(&mut self, chunk: Bytes) -> Vec<Bytes> {
-        if self.log_keep_filter.is_empty() {
+        if self.line_filter.is_empty() {
             self.ring_buffer.push_chunk(chunk.as_ref());
             return vec![chunk];
         }
@@ -80,7 +80,7 @@ impl ServiceOutputState {
     }
 
     fn flush_output(&mut self) -> Vec<Bytes> {
-        if self.log_keep_filter.is_empty() {
+        if self.line_filter.is_empty() {
             self.ring_buffer.flush_pending();
             return Vec::new();
         }
@@ -115,7 +115,7 @@ impl ServiceOutputState {
     }
 
     fn accept_line(&mut self, line: Bytes, accepted: &mut Vec<Bytes>) {
-        if !self.log_keep_filter.keeps(line.as_ref()) {
+        if !self.line_filter.keeps(line.as_ref()) {
             return;
         }
         self.ring_buffer.push_chunk(line.as_ref());
@@ -323,7 +323,7 @@ pub(super) fn spawn(
     sinks: Vec<SinkHandle>,
     stdout_sink: SinkHandle,
     mute: super::StdoutMuteControl,
-    log_keep_filter: CompiledLogKeepFilter,
+    line_filter: CompiledLineFilter,
 ) -> OutputHandle {
     let (output_tx, output_rx) = mpsc::channel(CHUNK_QUEUE_DEPTH);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -331,7 +331,7 @@ pub(super) fn spawn(
         name: name.clone(),
         prefix: prefix.clone(),
         ring_buffer: RingBuffer::new(super::DEFAULT_RING_BUFFER_CAPACITY),
-        log_keep_filter,
+        line_filter,
         filter_pending: BytesMut::new(),
         sinks,
         attach_pty: None,

@@ -142,6 +142,17 @@ type TuiTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
 /// `insert_before` model could not have, since every line was a write.
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// How long to wait for the runner's parting summary once the log stream has
+/// ended, before giving up on it and exiting anyway.
+///
+/// The summary rides the event stream and the session ends with the log
+/// stream; they are separate responses with no ordering guarantee between
+/// them, so the last word occasionally loses a photo finish to the hangup that
+/// means "we're done". Only ever paid when the summary hasn't already arrived,
+/// which is the rare case — and losing it costs the user the only line that
+/// survives the alternate screen.
+const SUMMARY_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Whether this TUI shares a process with the runner or attached over the
 /// socket. The two differ in exactly two keys:
 ///
@@ -215,7 +226,7 @@ pub async fn run_tui(
     hidden_names: std::collections::HashSet<String>,
     auto_filter_on_failure_names: std::collections::HashSet<String>,
     cli_log_filter: Option<std::collections::HashSet<String>>,
-) -> Result<(), TuiError> {
+) -> Result<Option<crate::SessionSummary>, TuiError> {
     let controls = TuiControls {
         lifecycle_emitter,
         mode,
@@ -290,6 +301,10 @@ pub async fn run_tui(
     // the TUI's cost by frame rate rather than by log rate, and what stops
     // each arm having to know what any other arm would have wanted redrawn.
     let mut dirty = true;
+    // The runner's parting summary, if the session ended with a shutdown
+    // rather than a detach. Returned rather than drawn — see the arm that
+    // sets it.
+    let mut session_summary: Option<crate::SessionSummary> = None;
     // One timer, reset after each frame — not a fresh `sleep_until` per loop
     // iteration. `select!` builds every branch's future each time round, so a
     // new sleep meant registering and cancelling a timer entry per iteration,
@@ -325,7 +340,16 @@ pub async fn run_tui(
                         }
                         dirty = true;
                     }
-                    None => break, // runner closed the log channel — shut down
+                    // The runner closed the log channel — the session is
+                    // over. Collect its last word before going, if it hasn't
+                    // landed yet; see `SUMMARY_GRACE`.
+                    None => {
+                        if session_summary.is_none() {
+                            session_summary =
+                                await_session_summary(&mut events_rx, SUMMARY_GRACE).await;
+                        }
+                        break;
+                    }
                 }
             }
             runner_result = events_rx.recv() => {
@@ -334,6 +358,12 @@ pub async fn run_tui(
                         if !app.shutdown_started {
                             app.begin_shutdown();
                         }
+                    }
+                    // The runner's last word. Kept rather than rendered: the
+                    // caller prints it once the alternate screen — and with it
+                    // every line of this session — has been handed back.
+                    Some(EventStreamItem::Event(RunnerEvent::ShutdownComplete { summary })) => {
+                        session_summary = Some(summary);
                     }
                     Some(EventStreamItem::Event(event)) => {
                         apply_runner_event(event, &mut app);
@@ -433,6 +463,9 @@ pub async fn run_tui(
                 {
                     app.copy_notice = None;
                 }
+                // A drag held at the top or bottom of the pane keeps scrolling
+                // even though no further mouse events are arriving.
+                drag_autoscroll_tick(&mut app);
                 dirty = true;
             }
             () = &mut frame, if dirty => {
@@ -452,7 +485,7 @@ pub async fn run_tui(
     let _ = draw(&mut terminal, &mut app, stores.active_mut(showing));
     input_handle.abort();
     let _ = input_handle.await;
-    Ok(())
+    Ok(session_summary)
 }
 
 /// Build the full-screen terminal.
@@ -586,6 +619,32 @@ fn is_shutdown_start_line(line: &FormattedLogLine) -> bool {
         && String::from_utf8_lossy(&line.bytes).contains("shutting down gracefully")
 }
 
+/// Drain the event stream for the runner's `ShutdownComplete`, for at most
+/// `grace`.
+///
+/// Returns `None` if the stream ends first (the runner died rather than shut
+/// down) or the wait runs out — in which case the caller has nothing truthful
+/// to report and says so.
+async fn await_session_summary(
+    events_rx: &mut mpsc::UnboundedReceiver<EventStreamItem>,
+    grace: std::time::Duration,
+) -> Option<crate::SessionSummary> {
+    let deadline = tokio::time::sleep(grace);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            () = &mut deadline => return None,
+            item = events_rx.recv() => match item {
+                Some(EventStreamItem::Event(RunnerEvent::ShutdownComplete { summary })) => {
+                    return Some(summary);
+                }
+                Some(_) => continue,
+                None => return None,
+            },
+        }
+    }
+}
+
 /// Apply one [`RunnerEvent`] to the cached state on [`App`].
 fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
     match event {
@@ -611,9 +670,10 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
         // The TUI already shows per-item states, so it learns nothing extra
         // from the sweep finishing — that signal is for API clients deciding
         // whether it's meaningful to ask the runner to run something.
+        // `ShutdownComplete` is taken by the loop before it reaches here.
         RunnerEvent::StartupSettled
         | RunnerEvent::ShutdownStarted
-        | RunnerEvent::ShutdownComplete => false,
+        | RunnerEvent::ShutdownComplete { .. } => false,
     }
 }
 
@@ -908,8 +968,9 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
             app.follow_paused_for_selection = false;
             app.log_scroll = logs::Scroll::Follow;
         }
-        // Ctrl+C is shutdown and cannot double as copy, so the keyboard route
-        // to the clipboard is `y` — vi's yank, over the current selection.
+        // Selecting already copies; this is the keyboard route to the same
+        // thing, for re-copying a selection that still stands. Ctrl+C is
+        // shutdown and cannot double as copy, so it is `y` — vi's yank.
         KeyCode::Char('y') => copy_selection(app, store),
         // With a panel open but the log focused, Esc means "done with the
         // panel" — it is the dismiss key every panel view already answers to,
@@ -1229,6 +1290,100 @@ fn step_table(table: &mut status_table::StatusTableState, total: usize, delta: i
 /// pane feel like the scrollback it replaced rather than like a widget.
 const WHEEL_ROWS: isize = 3;
 
+/// How deep the bands at the top and bottom of the log pane are — the region
+/// where holding a drag scrolls the view.
+///
+/// Two rows rather than one: a single row is a hard target to hold a pointer
+/// in, and the whole point is to reach text that is off screen without having
+/// to let go.
+const DRAG_SCROLL_BAND: u16 = 2;
+
+/// Rows per tick while the pointer is inside a band, and once it has left the
+/// pane altogether.
+///
+/// Dragging past the edge is the reader asking for more of the same, so it
+/// speeds up rather than stopping at whatever the last in-band row gave them.
+const DRAG_SCROLL_ROWS: isize = 1;
+const DRAG_SCROLL_ROWS_FAST: isize = 3;
+
+/// A drag holding the pointer in one of the pane's scroll bands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DragScroll {
+    /// Rows to move per tick. Negative scrolls towards older lines.
+    step: isize,
+    /// Where the pointer is, clamped into the pane so the selection can still
+    /// be extended to a row that exists once the pointer leaves the pane.
+    column: u16,
+    row: u16,
+}
+
+/// The rows the last frame actually drew log lines on.
+///
+/// Not `panes.logs`, which includes the border: a drag on the border row is
+/// not a drag on a line, and measuring the bands from it puts them one row out
+/// of step with the rows [`point_at`] resolves against.
+fn log_content_rect(app: &App) -> ratatui::layout::Rect {
+    let (x, y) = app.log_pane_origin;
+    ratatui::layout::Rect::new(
+        x,
+        y,
+        app.panes.logs.width,
+        u16::try_from(app.log_row_sources.len()).unwrap_or(u16::MAX),
+    )
+}
+
+/// The scroll a drag at `row` should be producing, if any.
+///
+/// `None` in the middle of the pane, which is the common case and the one that
+/// has to stay free.
+fn drag_scroll_at(pane: ratatui::layout::Rect, column: u16, row: u16) -> Option<DragScroll> {
+    if pane.height == 0 {
+        return None;
+    }
+    let top = pane.y;
+    let bottom = pane.y + pane.height - 1;
+    // Bands cannot overlap, or a short pane would scroll both ways at once.
+    let band = DRAG_SCROLL_BAND.min(pane.height.div_ceil(2));
+
+    let step = if row < top {
+        -DRAG_SCROLL_ROWS_FAST
+    } else if row > bottom {
+        DRAG_SCROLL_ROWS_FAST
+    } else if row < top.saturating_add(band) {
+        -DRAG_SCROLL_ROWS
+    } else if row.saturating_add(band) > bottom {
+        DRAG_SCROLL_ROWS
+    } else {
+        return None;
+    };
+
+    Some(DragScroll {
+        step,
+        column: column.clamp(pane.x, pane.x + pane.width.saturating_sub(1)),
+        row: row.clamp(top, bottom),
+    })
+}
+
+/// Move the view one tick's worth while a drag holds at the edge, taking the
+/// selection with it.
+///
+/// The extend runs against the rows the *last* frame drew — the layout the
+/// reader is looking at — and the scroll is asked for afterwards, so each tick
+/// takes in exactly the line that was under the pointer before the view moved.
+fn drag_autoscroll_tick(app: &mut App) {
+    let Some(drag) = app.drag_autoscroll else {
+        return;
+    };
+    if !app.log_selection.is_dragging() {
+        app.drag_autoscroll = None;
+        return;
+    }
+    if let Some(at) = point_at(app, drag.column, drag.row) {
+        app.log_selection.extend(at);
+    }
+    scroll_log(app, |p| p.rows += drag.step);
+}
+
 /// Apply a mouse event.
 ///
 /// Wheel scrolling works in every mode: a full-screen table on top does not
@@ -1303,10 +1458,19 @@ fn handle_mouse(mouse: MouseEvent, at: std::time::Instant, app: &mut App, store:
             if let Some(at) = point_at(app, mouse.column, mouse.row) {
                 app.log_selection.extend(at);
             }
+            // Reaching the edge means the reader wants text that is off
+            // screen. The tick does the scrolling: this only records that
+            // they are asking for it, and where from.
+            app.drag_autoscroll = if app.log_selection.is_dragging() {
+                drag_scroll_at(log_content_rect(app), mouse.column, mouse.row)
+            } else {
+                None
+            };
         }
         MouseEventKind::Up(MouseButton::Left) => {
             app.dragging_divider = false;
-            app.log_selection.finish();
+            app.drag_autoscroll = None;
+            settle_selection(app, store);
         }
         _ => {}
     }
@@ -1409,15 +1573,16 @@ fn select_word(app: &mut App, store: &LogStore, column: u16, row: u16) {
         return;
     };
     pause_following_for_selection(app);
-    app.log_selection.begin(selection::Point {
-        id: at.id,
-        offset: start,
-    });
-    app.log_selection.extend(selection::Point {
-        id: at.id,
-        offset: end,
-    });
-    app.log_selection.finish();
+    app.log_selection.begin_range(
+        selection::Point {
+            id: at.id,
+            offset: start,
+        },
+        selection::Point {
+            id: at.id,
+            offset: end,
+        },
+    );
 }
 
 /// Triple-click: the whole message, however many rows it wrapped across.
@@ -1430,25 +1595,26 @@ fn select_message(app: &mut App, row: u16) {
         return;
     };
     pause_following_for_selection(app);
-    app.log_selection.begin(selection::Point {
-        id: at.id,
-        offset: 0,
-    });
-    app.log_selection.extend(selection::Point {
-        id: at.id,
-        offset: usize::MAX,
-    });
-    app.log_selection.finish();
+    app.log_selection.begin_range(
+        selection::Point {
+            id: at.id,
+            offset: 0,
+        },
+        selection::Point {
+            id: at.id,
+            offset: usize::MAX,
+        },
+    );
 }
 
 /// Hold the view still while a selection stands.
 ///
 /// A selection is screen coordinates over the rows a frame drew. Following
 /// means those rows move, so a selection made while following would be
-/// pointing at different text a frame later — which is why copy used to have
-/// to happen on mouse-release. Freezing instead is what lets the copy be
-/// explicit: the selection stays exactly what the user dragged across until
-/// they act on it.
+/// pointing at different text a frame later. Freezing is what makes the copy
+/// match the highlight: the text stays exactly what the reader dragged across,
+/// both for the copy that fires when they let go and for as long as the
+/// selection stands afterwards.
 fn pause_following_for_selection(app: &mut App) {
     if app.log_scroll != logs::Scroll::Follow {
         return;
@@ -1463,6 +1629,8 @@ fn pause_following_for_selection(app: &mut App) {
 /// following. A reader who had scrolled up on purpose stays where they were.
 fn clear_selection(app: &mut App) {
     app.log_selection.clear();
+    // Nothing is being dragged any more, so nothing should still be scrolling.
+    app.drag_autoscroll = None;
     if app.follow_paused_for_selection {
         resume_following(app);
     }
@@ -1483,13 +1651,53 @@ fn at_tail(app: &App) -> bool {
 }
 
 /// Put the current selection on the clipboard, and say so.
+/// Settle a selection, and put it on the clipboard.
+///
+/// Copy-on-select, the way a terminal's own drag-select behaves: highlighting
+/// the text *is* the request, and asking for a second gesture to confirm it is
+/// a step the reader did not think they were taking. `y` still works for
+/// anyone who reaches for it.
+///
+/// Called from the button coming up and nowhere else, which is what keeps the
+/// copy to one per gesture: a double click picks its word on the press, but
+/// the press may yet turn into a drag, and only the release knows what was
+/// finally selected.
+///
+/// Safe on a plain click, which settles a zero-width selection:
+/// [`selection::selected_text`] has no span to return, so `copy_selection`
+/// leaves both the clipboard and the badge alone.
+fn settle_selection(app: &mut App, store: &LogStore) {
+    settle_selection_with(app, store, selection::copy_to_clipboard);
+}
+
+/// [`settle_selection`] with the clipboard write passed in, so a test can read
+/// what would have been copied without asking the real terminal for its
+/// clipboard — OSC 52 goes straight to stdout, and a test suite that hijacks
+/// the clipboard of whoever runs it is a poor neighbour.
+fn settle_selection_with(
+    app: &mut App,
+    store: &LogStore,
+    write: impl FnOnce(&str) -> std::io::Result<()>,
+) {
+    app.log_selection.finish();
+    copy_selection_with(app, store, write);
+}
+
 fn copy_selection(app: &mut App, store: &LogStore) {
+    copy_selection_with(app, store, selection::copy_to_clipboard);
+}
+
+fn copy_selection_with(
+    app: &mut App,
+    store: &LogStore,
+    write: impl FnOnce(&str) -> std::io::Result<()>,
+) {
     let Some(text) = selection::selected_text(&app.log_selection, &app.view_index, store) else {
         return;
     };
     let lines = text.lines().count();
     let now = std::time::Instant::now();
-    app.copy_notice = Some(match selection::copy_to_clipboard(&text) {
+    app.copy_notice = Some(match write(&text) {
         // OSC 52 is a request with no reply: a terminal that has it turned off
         // discards it silently. Reporting what was sent is the only honest
         // thing available — "copied" here means "asked the terminal to".
@@ -2439,6 +2647,211 @@ mod tests {
                 app.view_mode == ViewMode::Filter,
                 case.want_filter_open,
                 "{}: filter opened",
+                case.name
+            );
+        }
+    }
+
+    /// Where a drag has to be for the pane to start scrolling under it, and
+    /// how fast. The middle of the pane is the case that has to stay free.
+    #[test]
+    fn a_drag_scrolls_only_near_the_pane_edges() {
+        use ratatui::layout::Rect;
+
+        struct Case {
+            name: &'static str,
+            pane: Rect,
+            row: u16,
+            want_step: Option<isize>,
+        }
+
+        // A pane from y=4 to y=23 inclusive.
+        let pane = Rect::new(0, 4, 80, 20);
+
+        let cases = vec![
+            Case {
+                name: "the middle does not scroll",
+                pane,
+                row: 14,
+                want_step: None,
+            },
+            Case {
+                name: "the top row of the pane scrolls to older lines",
+                pane,
+                row: 4,
+                want_step: Some(-DRAG_SCROLL_ROWS),
+            },
+            Case {
+                name: "one row into the top band still scrolls",
+                pane,
+                row: 5,
+                want_step: Some(-DRAG_SCROLL_ROWS),
+            },
+            Case {
+                name: "just below the top band does not",
+                pane,
+                row: 6,
+                want_step: None,
+            },
+            Case {
+                name: "the bottom row scrolls towards newer lines",
+                pane,
+                row: 23,
+                want_step: Some(DRAG_SCROLL_ROWS),
+            },
+            Case {
+                name: "just above the bottom band does not",
+                pane,
+                row: 21,
+                want_step: None,
+            },
+            Case {
+                name: "above the pane entirely speeds up",
+                pane,
+                row: 1,
+                want_step: Some(-DRAG_SCROLL_ROWS_FAST),
+            },
+            Case {
+                name: "below the pane entirely speeds up",
+                pane,
+                row: 40,
+                want_step: Some(DRAG_SCROLL_ROWS_FAST),
+            },
+            Case {
+                name: "a pane too short for two bands still picks one direction",
+                pane: Rect::new(0, 0, 80, 2),
+                row: 1,
+                want_step: Some(DRAG_SCROLL_ROWS),
+            },
+            Case {
+                name: "a pane with no height never scrolls",
+                pane: Rect::new(0, 0, 80, 0),
+                row: 0,
+                want_step: None,
+            },
+        ];
+
+        for case in cases {
+            let got = drag_scroll_at(case.pane, 10, case.row);
+            assert_eq!(
+                got.map(|d| d.step),
+                case.want_step,
+                "{}: row {} of pane {:?}",
+                case.name,
+                case.row,
+                case.pane
+            );
+        }
+    }
+
+    /// A pointer dragged off the pane still has to name a row that exists, or
+    /// the selection would stop growing at the moment it starts scrolling.
+    #[test]
+    fn a_drag_past_the_edge_clamps_into_the_pane() {
+        use ratatui::layout::Rect;
+
+        let pane = Rect::new(3, 4, 80, 20);
+        let above = drag_scroll_at(pane, 200, 0).expect("scrolling above the pane");
+        assert_eq!(above.row, 4, "clamped to the pane's first row");
+        assert_eq!(above.column, 82, "clamped to the pane's last column");
+
+        let below = drag_scroll_at(pane, 1, 99).expect("scrolling below the pane");
+        assert_eq!(below.row, 23, "clamped to the pane's last row");
+        assert_eq!(below.column, 3, "clamped to the pane's first column");
+    }
+
+    /// Highlighting text copies it, without waiting for `y`. The badge is the
+    /// observable half — OSC 52 goes to the real stdout and never answers — so
+    /// that is what this reads: a notice means a copy was attempted, and no
+    /// notice means the clipboard was left alone.
+    #[test]
+    fn settling_a_selection_copies_it() {
+        use crate::output::LogId;
+
+        struct Case {
+            name: &'static str,
+            from: (u64, usize),
+            to: (u64, usize),
+            want_copy: bool,
+            /// What lands on the clipboard — the log text, never the
+            /// `api | ` column don itself put in front of it.
+            want_text: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a drag across part of one line",
+                from: (1, 0),
+                to: (1, 5),
+                want_copy: true,
+                want_text: Some("hello"),
+            },
+            Case {
+                name: "a drag spanning two lines",
+                from: (1, 2),
+                to: (2, 4),
+                want_copy: true,
+                want_text: Some("llo from the api\nand"),
+            },
+            Case {
+                name: "a plain click selects nothing and copies nothing",
+                from: (1, 3),
+                to: (1, 3),
+                want_copy: false,
+                want_text: None,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            let mut store = LogStore::with_capacity(10);
+            store.reflow(80);
+            for (id, body) in [(1u64, "hello from the api"), (2, "and a second line")] {
+                store.push(
+                    LogId(id),
+                    crate::output::FormattedLogLine {
+                        name: "api".to_string(),
+                        is_lifecycle: false,
+                        is_verbose: false,
+                        prefix: b"api | ".to_vec(),
+                        bytes: body.as_bytes().to_vec(),
+                    },
+                );
+            }
+            app.view_index.sync(
+                &store,
+                view_index::ViewKey {
+                    width: 80,
+                    filter: 0,
+                },
+                &HashMap::new(),
+                |_| true,
+            );
+
+            app.log_selection.begin(selection::Point {
+                id: LogId(case.from.0),
+                offset: case.from.1,
+            });
+            app.log_selection.extend(selection::Point {
+                id: LogId(case.to.0),
+                offset: case.to.1,
+            });
+            let mut copied: Option<String> = None;
+            settle_selection_with(&mut app, &store, |text| {
+                copied = Some(text.to_string());
+                Ok(())
+            });
+
+            assert_eq!(
+                app.copy_notice.is_some(),
+                case.want_copy,
+                "{}: copy attempted",
+                case.name
+            );
+            assert_eq!(
+                copied.as_deref(),
+                case.want_text,
+                "{}: copied text",
                 case.name
             );
         }

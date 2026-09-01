@@ -166,7 +166,7 @@ log_filter = ["["]
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("service 'api' log_filter") && e.contains("invalid keep regex")),
+            .any(|e| e.contains("service 'api' log_filter") && e.contains("invalid regex")),
         "errors: {errors:?}"
     );
 }

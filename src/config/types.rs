@@ -383,13 +383,15 @@ impl<'de> Deserialize<'de> for ShutdownConfig {
     }
 }
 
-/// Regex-based log filtering.
+/// A list of regexes matched against complete output lines.
 ///
-/// `patterns` contains regular expressions matched against complete service
-/// output lines. When configured, only matching lines are kept.
+/// What a match *means* comes from the field this sits on: `log_filter` keeps
+/// matching lines, `log_exclude` drops them. See [`LogFilters`] for how the
+/// two combine.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogFilterConfig {
-    /// Regex patterns for log lines to keep. In TOML this is `log_filter = ["..."]`.
+    /// Regex patterns, as written in TOML: `log_filter = ["..."]` or
+    /// `log_exclude = ["..."]`.
     pub patterns: Vec<String>,
 }
 
@@ -413,6 +415,30 @@ impl<'de> Deserialize<'de> for LogFilterConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let patterns = Vec::<String>::deserialize(deserializer)?;
         Ok(Self { patterns })
+    }
+}
+
+/// Both regex filters in force for one process's output, already merged from
+/// the global and per-item settings.
+///
+/// A line survives when it is *not* excluded and — if there are any keep
+/// patterns at all — it matches one of them. Exclude wins on a line that
+/// matches both: saying "drop anything with this in it" is a statement about
+/// noise, and a keep pattern that happens to also match should not drag it
+/// back in.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogFilters {
+    /// Lines to keep. Empty means "everything is a candidate".
+    pub keep: LogFilterConfig,
+    /// Lines to drop, whatever `keep` says.
+    pub exclude: LogFilterConfig,
+}
+
+impl LogFilters {
+    /// True when neither filter would ever reject a line, which lets the
+    /// output path skip splitting chunks into lines at all.
+    pub fn is_empty(&self) -> bool {
+        self.keep.is_empty() && self.exclude.is_empty()
     }
 }
 

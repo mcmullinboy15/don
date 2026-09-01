@@ -456,40 +456,65 @@ impl StdoutMuteControl {
     }
 }
 
+/// One process's `log_filter` and `log_exclude`, compiled once at startup.
 #[derive(Clone, Debug, Default)]
-struct CompiledLogKeepFilter {
-    patterns: Vec<regex::bytes::Regex>,
+struct CompiledLineFilter {
+    keep: Vec<regex::bytes::Regex>,
+    exclude: Vec<regex::bytes::Regex>,
 }
 
-impl CompiledLogKeepFilter {
+impl CompiledLineFilter {
     fn from_config(
         name: &str,
-        config: Option<&crate::config::LogFilterConfig>,
+        config: Option<&crate::config::LogFilters>,
     ) -> Result<Self, OutputError> {
         let Some(config) = config else {
             return Ok(Self::default());
         };
-        let mut patterns = Vec::with_capacity(config.patterns.len());
-        for pattern in &config.patterns {
-            let compiled = regex::bytes::Regex::new(pattern).map_err(|source| {
-                OutputError::InvalidLogFilter {
-                    name: name.to_string(),
-                    pattern: pattern.clone(),
-                    source,
-                }
-            })?;
-            patterns.push(compiled);
-        }
-        Ok(Self { patterns })
+        Ok(Self {
+            keep: compile(name, "log_filter", &config.keep)?,
+            exclude: compile(name, "log_exclude", &config.exclude)?,
+        })
     }
 
+    /// True when no line could ever be rejected — the caller's cue that it can
+    /// hand chunks straight through without splitting them into lines.
     fn is_empty(&self) -> bool {
-        self.patterns.is_empty()
+        self.keep.is_empty() && self.exclude.is_empty()
     }
 
+    /// Whether `line` survives both filters.
+    ///
+    /// Exclude is checked first and wins outright: `log_exclude` names noise,
+    /// and a keep pattern that happens to match the same line should not drag
+    /// it back in. With no keep patterns at all, everything not excluded is
+    /// kept — otherwise adding a lone `log_exclude` would silently hide every
+    /// other line.
     fn keeps(&self, line: &[u8]) -> bool {
-        self.patterns.iter().any(|pattern| pattern.is_match(line))
+        if self.exclude.iter().any(|pattern| pattern.is_match(line)) {
+            return false;
+        }
+        self.keep.is_empty() || self.keep.iter().any(|pattern| pattern.is_match(line))
     }
+}
+
+fn compile(
+    name: &str,
+    key: &'static str,
+    config: &crate::config::LogFilterConfig,
+) -> Result<Vec<regex::bytes::Regex>, OutputError> {
+    let mut compiled = Vec::with_capacity(config.patterns.len());
+    for pattern in &config.patterns {
+        compiled.push(regex::bytes::Regex::new(pattern).map_err(|source| {
+            OutputError::InvalidLogFilter {
+                name: name.to_string(),
+                key,
+                pattern: pattern.clone(),
+                source,
+            }
+        })?);
+    }
+    Ok(compiled)
 }
 
 /// Where the stdout sink task sends its formatted lines.
@@ -1110,10 +1135,12 @@ pub enum OutputError {
     /// I/O error reading from child output.
     #[error("error reading service output: {0}")]
     Read(#[from] std::io::Error),
-    /// Invalid regex in a log keep filter.
-    #[error("service '{name}': invalid log_filter regex '{pattern}': {source}")]
+    /// Invalid regex in a `log_filter` or `log_exclude` list.
+    #[error("service '{name}': invalid {key} regex '{pattern}': {source}")]
     InvalidLogFilter {
         name: String,
+        /// Which config key the bad pattern came from.
+        key: &'static str,
         pattern: String,
         #[source]
         source: regex::Error,
@@ -1137,7 +1164,7 @@ impl OutputManager {
     /// Create a new output manager with per-service regex keep filters.
     pub async fn new_with_log_filters<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         services: &[(&str, &crate::config::LogConfig)],
-        log_filters: &HashMap<String, crate::config::LogFilterConfig>,
+        log_filters: &HashMap<String, crate::config::LogFilters>,
         writer: W,
     ) -> Result<Self, OutputError> {
         Self::new_verbose_with_log_filters(services, log_filters, writer, false).await
@@ -1162,7 +1189,7 @@ impl OutputManager {
     /// Create a new verbose output manager with per-service regex keep filters.
     pub async fn new_verbose_with_log_filters<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         services: &[(&str, &crate::config::LogConfig)],
-        log_filters: &HashMap<String, crate::config::LogFilterConfig>,
+        log_filters: &HashMap<String, crate::config::LogFilters>,
         writer: W,
         verbose: bool,
     ) -> Result<Self, OutputError> {
@@ -1176,7 +1203,7 @@ impl OutputManager {
 
     async fn new_inner<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         services: &[(&str, &crate::config::LogConfig)],
-        log_filters: &HashMap<String, crate::config::LogFilterConfig>,
+        log_filters: &HashMap<String, crate::config::LogFilters>,
         verbose: bool,
         target: StdoutTarget<W>,
     ) -> Result<Self, OutputError> {
@@ -1256,7 +1283,7 @@ impl OutputManager {
 
             let color = color_map.get(*name).copied().unwrap_or(Color::White);
             let prefix = format_prefix(name, color, max_name_len);
-            let log_keep_filter = CompiledLogKeepFilter::from_config(
+            let line_filter = CompiledLineFilter::from_config(
                 name,
                 log_filters.get(*name).filter(|filter| !filter.is_empty()),
             )?;
@@ -1269,7 +1296,7 @@ impl OutputManager {
                     sinks,
                     stdout_sink.clone(),
                     mute.clone(),
-                    log_keep_filter,
+                    line_filter,
                 ),
             );
         }
@@ -1474,7 +1501,7 @@ impl OutputManager {
                 sinks,
                 self.stdout_sink.clone(),
                 self.mute.clone(),
-                CompiledLogKeepFilter::default(),
+                CompiledLineFilter::default(),
             ),
         );
         let _ = self.services_watch.send(Arc::new(self.services.clone()));

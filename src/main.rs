@@ -1766,7 +1766,7 @@ async fn attach_tui_inner(
         }
     });
 
-    don::run_tui(
+    let summary = don::run_tui(
         log_rx,
         client,
         don::TuiMode::Remote,
@@ -1789,12 +1789,16 @@ async fn attach_tui_inner(
 
     // Distinguish detach from shutdown for the user: after Ctrl+C the
     // runner's socket is already closing by the time the TUI exits, so this
-    // probe fails and stays quiet; after Ctrl+D it answers.
+    // probe fails; after Ctrl+D it answers. Either way the user is about to be
+    // dropped back at a prompt with the session's screen gone, so say which of
+    // the two just happened.
     let probe = Client::new(&base);
     if probe.ready().await.is_ok() {
         println!(
             "detached — the stack is still running (`don attach` to reattach, `don stop` to stop)"
         );
+    } else {
+        print_session_summary(summary.as_ref());
     }
     Ok(())
 }
@@ -2566,24 +2570,31 @@ async fn run_start(
         .chain(build_tool_configs.iter().copied())
         .collect();
 
-    let mut log_keep_filters: std::collections::HashMap<String, don::config::LogFilterConfig> =
+    // Global patterns apply everywhere; a service's own are added on top.
+    // Tasks and the synthetic build-tool streams have no per-item lists of
+    // their own, so they get the global ones as-is.
+    let mut log_keep_filters: std::collections::HashMap<String, don::config::LogFilters> =
         std::collections::HashMap::new();
     for (name, svc) in config.services.iter().filter(|(name, _)| is_active(name)) {
-        let effective = config
-            .log_filter
-            .merged_with(&svc.resolve(platform).log_filter);
+        let resolved = svc.resolve(platform);
+        let effective = don::config::LogFilters {
+            keep: config.log_filter.merged_with(&resolved.log_filter),
+            exclude: config.log_exclude.merged_with(&resolved.log_exclude),
+        };
         if !effective.is_empty() {
             log_keep_filters.insert(name.clone(), effective);
         }
     }
-    for name in config.tasks.keys().filter(|name| is_active(name)) {
-        if !config.log_filter.is_empty() {
-            log_keep_filters.insert(name.clone(), config.log_filter.clone());
+    let global = don::config::LogFilters {
+        keep: config.log_filter.clone(),
+        exclude: config.log_exclude.clone(),
+    };
+    if !global.is_empty() {
+        for name in config.tasks.keys().filter(|name| is_active(name)) {
+            log_keep_filters.insert(name.clone(), global.clone());
         }
-    }
-    for (name, _) in &build_tool_configs {
-        if !config.log_filter.is_empty() {
-            log_keep_filters.insert((*name).to_string(), config.log_filter.clone());
+        for (name, _) in &build_tool_configs {
+            log_keep_filters.insert((*name).to_string(), global.clone());
         }
     }
 
@@ -2822,7 +2833,9 @@ async fn run_start(
         // Surface any TUI error so unexpected exits are visible instead of
         // silently dropped. Runner errors take precedence.
         match tui.await {
-            Ok(Ok(())) => {}
+            // The alternate screen is back by now, so this lands on the
+            // restored one — the whole point of carrying it out of the TUI.
+            Ok(Ok(summary)) => print_session_summary(summary.as_ref()),
             Ok(Err(e)) => errln(format!("TUI error: {e}")),
             Err(join_err) if join_err.is_panic() => {
                 errln(format!("TUI task panicked: {join_err}"));
@@ -2875,7 +2888,23 @@ async fn run_start(
 
         let runner_task =
             tokio::spawn(async move { runner.run().await.map_err(|e| format!("Error: {e}")) });
+        // Pipe mode needs nothing here: the runner writes its summary to
+        // this stdout as its last lifecycle line, and nothing has taken the
+        // screen away.
         await_with_shutdown_supervision(runner_task, "waiting for runner shutdown").await
+    }
+}
+
+/// Print the runner's parting summary, once whoever owned the screen has given
+/// it back.
+///
+/// `None` means the runner's streams closed before it got the word out — an
+/// abrupt end rather than a graceful one. Say the one thing still known to be
+/// true rather than inventing counts the client never had.
+fn print_session_summary(summary: Option<&don::SessionSummary>) {
+    match summary {
+        Some(summary) => println!("[don] {summary}"),
+        None => println!("[don] stopped"),
     }
 }
 

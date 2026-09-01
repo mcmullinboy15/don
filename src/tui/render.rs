@@ -1108,8 +1108,9 @@ fn normal_bar_line(
 
     spans.push(separator());
     if has_selection {
-        // Copying is explicit now, so the key that does it has to be visible
-        // at the moment there is something to copy.
+        // Selecting has already copied by the time this shows. The key stays
+        // visible because the selection stands afterwards, and re-copying it
+        // is otherwise an unguessable gesture.
         spans.push(Span::styled(
             "[y] copy",
             Style::default()

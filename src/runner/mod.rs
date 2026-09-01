@@ -131,8 +131,13 @@ pub enum RunnerEvent {
     StartupSettled,
     /// Graceful shutdown has started.
     ShutdownStarted,
-    /// Shutdown complete.
-    ShutdownComplete,
+    /// Shutdown complete — the runner's last word before its streams close.
+    ///
+    /// Carries the session summary because the runner is the only party that
+    /// knows both halves of it: a client that attached partway through knows
+    /// when *it* connected, not when the stack came up. Clients print it after
+    /// handing the terminal back, which is the only trace a TUI session leaves.
+    ShutdownComplete { summary: crate::SessionSummary },
     /// The latest crates.io version changed, or no newer version is available.
     UpdateCheck {
         current_version: String,
@@ -167,6 +172,11 @@ pub struct Runner {
     platform: Platform,
     output_manager: OutputManager,
     base_dir: PathBuf,
+
+    /// When this run began, for the session summary on the way out. Set at
+    /// construction rather than when the first service starts: what the user
+    /// is asking is "how long was don up", and don was up from here.
+    started_at: Instant,
 
     /// Consolidated per-service runtime state.
     services: HashMap<String, RuntimeService>,
@@ -577,6 +587,7 @@ impl Runner {
             platform,
             output_manager,
             base_dir,
+            started_at: Instant::now(),
             services,
             tasks,
             report_rx,
@@ -1285,6 +1296,26 @@ impl Runner {
         self.finish_runtime_port_manifest().await;
         if self.shutting_down {
             self.output_manager.lifecycle_event("shutdown complete");
+
+            // The session summary, as a line for whoever is reading this
+            // output directly (pipe mode, `-d`'s runner.log) and as an event
+            // for attached clients, which reprint it once they have handed the
+            // terminal back and their copy of the screen is gone. Sent before
+            // the output flush and the server shutdown below, which is what
+            // gets it to those clients ahead of the stream closing.
+            let summary = crate::SessionSummary::new(
+                self.services.len(),
+                self.tasks.len(),
+                self.started_at.elapsed(),
+            );
+            // Event first. It travels a different stream than the lines below,
+            // and an attached client stops at the end of the *log* stream — so
+            // the further ahead of the flush this goes, the less often the
+            // client has to fall back on waiting for it.
+            let _ = self
+                .event_tx
+                .send(RunnerEvent::ShutdownComplete { summary });
+            self.output_manager.lifecycle_event(&summary.to_string());
         }
 
         // Shut down the output system — flush all pending messages to sinks.

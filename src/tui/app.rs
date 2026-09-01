@@ -378,6 +378,11 @@ pub(crate) struct App {
     /// row. Double- and triple-click are the same button event as a single
     /// one; only the gap between them tells them apart.
     pub(crate) last_click: Option<(u16, u16, std::time::Instant, u8)>,
+    /// Where a drag is holding the pointer while it sits in the pane's top or
+    /// bottom band, if it is. Drag events only arrive when the mouse *moves*,
+    /// so a reader holding still at the edge would otherwise scroll once and
+    /// stop; the frame tick reads this to keep going.
+    pub(crate) drag_autoscroll: Option<super::DragScroll>,
     /// Set when a selection paused following, so clearing it can resume.
     /// Without this, `esc` after selecting would strand a reader who had
     /// deliberately scrolled up before selecting.
@@ -527,6 +532,7 @@ impl App {
             log_selection: super::selection::Selection::default(),
             copy_notice: None,
             last_click: None,
+            drag_autoscroll: None,
             follow_paused_for_selection: false,
             log_visible_rows: Vec::new(),
             log_row_sources: Vec::new(),

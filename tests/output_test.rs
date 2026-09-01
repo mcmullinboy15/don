@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod helpers;
 
-use don::config::{LogConfig, LogFilterConfig};
+use don::config::{LogConfig, LogFilterConfig, LogFilters};
 use don::output::OutputManager;
 use don::sys::{SpawnConfig, spawn_process};
 use helpers::tempdir::TempDir;
@@ -225,8 +225,11 @@ fn integration_log_filter_keeps_matching_lines() {
         let config = LogConfig::Stdout;
         let filters = HashMap::from([(
             "api".to_string(),
-            LogFilterConfig {
-                patterns: vec!["keep .*".to_string()],
+            LogFilters {
+                keep: LogFilterConfig {
+                    patterns: vec!["keep .*".to_string()],
+                },
+                exclude: LogFilterConfig::default(),
             },
         )]);
         let mgr = OutputManager::new_with_log_filters(&[("api", &config)], &filters, writer)
@@ -255,6 +258,101 @@ fn integration_log_filter_keeps_matching_lines() {
         );
         assert!(!output_str.contains("drop before"), "output: {output_str}");
         assert!(!output_str.contains("drop after"), "output: {output_str}");
+    });
+}
+
+/// `log_exclude` drops lines, and beats `log_filter` on a line both match.
+///
+/// The last case is the one that decides the feature is usable: an exclude
+/// list on its own must not turn into an accidental allowlist of nothing.
+#[test]
+fn integration_log_exclude_drops_matching_lines() {
+    struct Case {
+        name: &'static str,
+        keep: &'static [&'static str],
+        exclude: &'static [&'static str],
+        want_kept: &'static [&'static str],
+        want_dropped: &'static [&'static str],
+    }
+
+    let cases = vec![
+        Case {
+            name: "exclude alone keeps everything else",
+            keep: &[],
+            exclude: &["health"],
+            want_kept: &["real work here", "an ERROR happened"],
+            want_dropped: &["GET /health 200"],
+        },
+        Case {
+            name: "exclude carves noise out of a keep list",
+            keep: &["^GET "],
+            exclude: &["/health"],
+            want_kept: &["GET /users 200"],
+            want_dropped: &["GET /health 200", "real work here"],
+        },
+        Case {
+            name: "a line matching both is dropped",
+            keep: &["ERROR"],
+            exclude: &["ERROR: benign"],
+            want_kept: &["ERROR: real one"],
+            want_dropped: &["ERROR: benign thing", "real work here"],
+        },
+        Case {
+            name: "several exclude patterns are all applied",
+            keep: &[],
+            exclude: &["health", "^debug:"],
+            want_kept: &["real work here"],
+            want_dropped: &["GET /health 200", "debug: chatter"],
+        },
+    ];
+
+    run_with_timeout(Duration::from_secs(20), async {
+        for case in cases {
+            let (writer, _buf) = TestBuffer::new();
+            let config = LogConfig::Stdout;
+            let filters = HashMap::from([(
+                "api".to_string(),
+                LogFilters {
+                    keep: LogFilterConfig {
+                        patterns: case.keep.iter().map(|p| (*p).to_string()).collect(),
+                    },
+                    exclude: LogFilterConfig {
+                        patterns: case.exclude.iter().map(|p| (*p).to_string()).collect(),
+                    },
+                },
+            )]);
+            let mgr = OutputManager::new_with_log_filters(&[("api", &config)], &filters, writer)
+                .await
+                .unwrap();
+            let svc = mgr.service_writer("api").unwrap();
+
+            let (mut tx, rx) = tokio::io::duplex(1024);
+            let mut payload = String::new();
+            for line in case.want_kept.iter().chain(case.want_dropped.iter()) {
+                payload.push_str(line);
+                payload.push('\n');
+            }
+            tx.write_all(payload.as_bytes()).await.unwrap();
+            drop(tx);
+            svc.process_stream(rx).await.unwrap();
+
+            let logs = mgr.read_logs("api", 20).await.unwrap();
+            for line in case.want_kept {
+                assert!(
+                    logs_contain(&logs, line.as_bytes()),
+                    "{}: expected to keep {line:?}, logs: {logs:?}",
+                    case.name
+                );
+            }
+            for line in case.want_dropped {
+                assert!(
+                    !logs_contain(&logs, line.as_bytes()),
+                    "{}: expected to drop {line:?}, logs: {logs:?}",
+                    case.name
+                );
+            }
+            mgr.shutdown().await;
+        }
     });
 }
 

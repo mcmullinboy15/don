@@ -90,8 +90,8 @@ nothing is lost by opening an overlay.
 | `↑` `↓` `PgUp` `PgDn` `Home` | Scroll the log |
 | `End` or `Enter` | Jump back to following the live tail |
 | wheel | Scroll the log |
-| drag | Select text. Double-click takes a word, triple-click the message |
-| `y` | Copy the selection, without the `name \| ` prefix |
+| drag | Select text, and copy it. Double-click takes a word, triple-click the message |
+| `y` | Copy the selection again, without the `name \| ` prefix |
 | `Esc` | Clear the selection |
 | `j` `k` `g g` `G` | Vim's verticals: line down, line up, top, live tail |
 | `s` `t` `f` | Open the services, tasks or filter panel — each key also closes its own |
@@ -110,8 +110,13 @@ A selection is a place in the log rather than a place on the screen — a line
 and an offset into it — so it stays on the text you dragged across while you
 scroll, resize the terminal, or change the filter. Dragging holds the view
 still as well, so output arriving mid-drag doesn't pull the text out from under
-you; the log resumes following when you clear the selection. Copying is
-deliberate — `y`, never a side effect of releasing the mouse.
+you; the log resumes following when you clear the selection.
+
+Highlighting copies, the way drag-select does in the terminal itself — letting
+go is the whole gesture, and `y` is there to copy a standing selection again.
+Dragging to the top or bottom of the pane scrolls it, so a selection can run
+past what is on screen; hold at the edge and it keeps going, and drag right off
+the pane to speed it up.
 
 Copying goes through OSC 52, so it reaches your system clipboard over ssh and
 inside tmux. Terminals with OSC 52 disabled ignore it silently — the status bar
@@ -141,6 +146,20 @@ log_filter = ["ERROR", "WARN"]
 [services.api]
 log_filter = ["request_id=abc", "^database:"]
 ```
+
+`log_exclude` is the other direction — regexes for lines to drop. It nests the
+same way, and an exclusion beats a keep on a line that matches both, so you can
+keep a broad category and carve the noise out of it.
+
+```toml
+log_exclude = ["/health", "^debug:"]
+
+[services.api]
+log_filter = ["^GET "]        # only request lines...
+log_exclude = ["/favicon"]    # ...but never these
+```
+
+With `log_exclude` and no `log_filter`, everything except the matches is kept.
 
 ### Services
 
@@ -886,6 +905,7 @@ See [`examples/`](examples/) for complete working configs.
 | `shutdown.timeout` | string | Grace period (default: "10s") |
 | `log` | string | Output routing: "stdout", "ignore", or a file path |
 | `log_filter` | [string] | Regexes for service output lines to keep before routing |
+| `log_exclude` | [string] | Regexes for service output lines to drop; beats `log_filter` |
 | `docker.image` | string | Docker image |
 | `docker.ports` | [string] | Port mappings |
 | `docker.volumes` | [string] | Volume mounts |

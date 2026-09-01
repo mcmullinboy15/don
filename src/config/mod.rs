@@ -26,8 +26,8 @@ pub use self::service::{
 };
 pub use self::task::{Task, TaskAutoRun, TaskHeadless};
 pub use self::types::{
-    BazelConfig, BazelDefaults, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry,
-    ProxyMode, ReadyCheck, ShutdownConfig,
+    BazelConfig, BazelDefaults, Command, LogConfig, LogFilterConfig, LogFilters, OnFailure,
+    ProxyEntry, ProxyMode, ReadyCheck, ShutdownConfig,
 };
 pub use profile::resolve_profile_processes;
 
@@ -91,6 +91,10 @@ pub struct Config {
     /// Global regex-based log filter. Service filters are added on top.
     #[serde(default)]
     pub log_filter: LogFilterConfig,
+    /// Global regex-based log exclusion — lines to drop from every stream.
+    /// Service exclusions are added on top, and an exclusion beats a keep.
+    #[serde(default)]
+    pub log_exclude: LogFilterConfig,
     /// Whether failed services/tasks should be added to the TUI log filter
     /// automatically. Individual services/tasks can override this with their
     /// own `auto_filter_on_failure` setting. Defaults to `true`.
@@ -232,7 +236,7 @@ fn validate_platform_download(artifact: &PlatformDownload) -> Result<(), String>
 fn validate_log_filter(label: &str, filter: &LogFilterConfig, errors: &mut Vec<String>) {
     for pattern in &filter.patterns {
         if let Err(e) = regex::bytes::Regex::new(pattern) {
-            errors.push(format!("{label}: invalid keep regex '{pattern}': {e}"));
+            errors.push(format!("{label}: invalid regex '{pattern}': {e}"));
         }
     }
 }
@@ -433,6 +437,7 @@ impl Config {
             ));
         }
         validate_log_filter("global log_filter", &self.log_filter, &mut errors);
+        validate_log_filter("global log_exclude", &self.log_exclude, &mut errors);
 
         // Check for name collisions between services and tasks
         for name in self.services.keys() {
@@ -579,6 +584,11 @@ impl Config {
             validate_log_filter(
                 &format!("service '{name}' log_filter"),
                 &resolved.log_filter,
+                &mut errors,
+            );
+            validate_log_filter(
+                &format!("service '{name}' log_exclude"),
+                &resolved.log_exclude,
                 &mut errors,
             );
             if let Some(ServiceKind::Docker(docker)) = &resolved.kind {
@@ -3839,6 +3849,105 @@ bazel.target = "//services/api:macos_arm64"
                 (Err(e), _) => panic!("case '{}': unexpected error kind {e}", case.name),
             }
         }
+    }
+
+    /// `log_exclude` parses at both levels and survives a platform override,
+    /// exactly as `log_filter` does — the two are the same shape and must not
+    /// drift apart.
+    #[test]
+    fn log_exclude_parses_globally_and_per_service() {
+        struct Case {
+            name: &'static str,
+            service: &'static str,
+            want_filter: Vec<&'static str>,
+            want_exclude: Vec<&'static str>,
+        }
+
+        let config: Config = r#"
+            log_filter = ["ERROR"]
+            log_exclude = ["/health"]
+
+            [services.api]
+            run.cmd = "true"
+            log_exclude = ["favicon"]
+
+            [services.worker]
+            run.cmd = "true"
+            log_filter = ["^job "]
+
+            [services.plain]
+            run.cmd = "true"
+        "#
+        .parse()
+        .unwrap();
+
+        assert_eq!(config.log_filter.patterns, vec!["ERROR".to_string()]);
+        assert_eq!(config.log_exclude.patterns, vec!["/health".to_string()]);
+
+        let cases = vec![
+            Case {
+                name: "a service's own exclude sits beside the global one",
+                service: "api",
+                want_filter: vec![],
+                want_exclude: vec!["favicon"],
+            },
+            Case {
+                name: "a keep list and no exclude",
+                service: "worker",
+                want_filter: vec!["^job "],
+                want_exclude: vec![],
+            },
+            Case {
+                name: "neither, so the global lists stand alone",
+                service: "plain",
+                want_filter: vec![],
+                want_exclude: vec![],
+            },
+        ];
+
+        for case in cases {
+            let resolved = config.services[case.service].resolve(Platform::LinuxX86_64);
+            assert_eq!(
+                resolved.log_filter.patterns, case.want_filter,
+                "{}: log_filter",
+                case.name
+            );
+            assert_eq!(
+                resolved.log_exclude.patterns, case.want_exclude,
+                "{}: log_exclude",
+                case.name
+            );
+        }
+
+        // The merge the runner actually applies: global first, service on top.
+        let api = config.services["api"].resolve(Platform::LinuxX86_64);
+        assert_eq!(
+            config.log_exclude.merged_with(&api.log_exclude).patterns,
+            vec!["/health".to_string(), "favicon".to_string()],
+        );
+    }
+
+    /// A bad pattern is a config error naming the key it came from, so the
+    /// message points at the line to fix rather than just "invalid regex".
+    #[test]
+    fn an_invalid_log_exclude_regex_fails_validation() {
+        let config: Config = r#"
+            [services.api]
+            run.cmd = "true"
+            log_exclude = ["("]
+        "#
+        .parse()
+        .unwrap();
+
+        let Err(ConfigError::Validation { errors }) = config.validate(Platform::LinuxX86_64) else {
+            panic!("expected a validation error");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("service 'api' log_exclude") && e.contains("invalid regex")),
+            "errors: {errors:?}"
+        );
     }
 
     #[test]

@@ -71,6 +71,9 @@ pub struct Service {
     pub log: LogConfig,
     /// Regex-based service log filter. When set, only matching output lines are kept.
     pub log_filter: LogFilterConfig,
+    /// Regex-based service log exclusion. Matching output lines are dropped,
+    /// even if `log_filter` would have kept them.
+    pub log_exclude: LogFilterConfig,
     /// Whether don should watch files and rebuild/restart this service on changes.
     /// Defaults to `true`. Set to `false` for services that handle their own
     /// hot-reloading internally (e.g. vite, webpack dev server).
@@ -130,6 +133,8 @@ struct RawService {
     log: LogConfig,
     #[serde(default)]
     log_filter: LogFilterConfig,
+    #[serde(default)]
+    log_exclude: LogFilterConfig,
     #[serde(default = "default_true")]
     reload: bool,
     #[serde(default = "default_true")]
@@ -212,6 +217,7 @@ impl TryFrom<RawService> for Service {
             shutdown: raw.shutdown,
             log: raw.log,
             log_filter: raw.log_filter,
+            log_exclude: raw.log_exclude,
             reload: raw.reload,
             tty: raw.tty,
             on_failure: raw.on_failure,
@@ -252,6 +258,7 @@ pub struct ServiceOverride {
     pub shutdown: Option<ShutdownConfig>,
     pub log: Option<LogConfig>,
     pub log_filter: Option<LogFilterConfig>,
+    pub log_exclude: Option<LogFilterConfig>,
     pub reload: Option<bool>,
     pub tty: Option<bool>,
     pub on_failure: Option<OnFailure>,
@@ -280,6 +287,7 @@ struct RawServiceOverride {
     shutdown: Option<ShutdownConfig>,
     log: Option<LogConfig>,
     log_filter: Option<LogFilterConfig>,
+    log_exclude: Option<LogFilterConfig>,
     reload: Option<bool>,
     tty: Option<bool>,
     on_failure: Option<OnFailure>,
@@ -314,6 +322,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             shutdown: raw.shutdown,
             log: raw.log,
             log_filter: raw.log_filter,
+            log_exclude: raw.log_exclude,
             reload: raw.reload,
             tty: raw.tty,
             on_failure: raw.on_failure,
@@ -350,6 +359,9 @@ pub struct ResolvedService {
     pub shutdown: Option<ShutdownConfig>,
     pub log: LogConfig,
     pub log_filter: LogFilterConfig,
+    /// Regex-based service log exclusion, dropping lines `log_filter` would
+    /// otherwise have kept.
+    pub log_exclude: LogFilterConfig,
     /// Whether don should watch files and rebuild/restart this service on changes.
     pub reload: bool,
     /// Whether to give the service a controlling PTY (vs plain pipes). `false`
@@ -500,6 +512,7 @@ impl Service {
                 shutdown: self.shutdown.clone(),
                 log: self.log.clone(),
                 log_filter: self.log_filter.clone(),
+                log_exclude: self.log_exclude.clone(),
                 reload: self.reload,
                 tty: self.tty,
                 on_failure: self.on_failure,
@@ -539,6 +552,10 @@ impl Service {
                         .log_filter
                         .clone()
                         .unwrap_or_else(|| self.log_filter.clone()),
+                    log_exclude: ov
+                        .log_exclude
+                        .clone()
+                        .unwrap_or_else(|| self.log_exclude.clone()),
                     reload: ov.reload.unwrap_or(self.reload),
                     tty: ov.tty.unwrap_or(self.tty),
                     on_failure: ov.on_failure.unwrap_or(self.on_failure),

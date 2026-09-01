@@ -26,6 +26,17 @@
 //! not addressable: the highlight and the copied text cannot disagree about
 //! where the log starts, because neither of them can point at the prefix.
 //!
+//! ## When it copies
+//!
+//! When the button comes up, whatever the gesture was — a drag, or the word or
+//! message a multi-click picked out. Highlighting text is the request, the same
+//! as it is in the terminal's own drag-select this replaces, so nothing further
+//! is asked of the reader. `y` re-copies a selection that still stands.
+//!
+//! The release is the only moment that copies, because it is the only one that
+//! knows what was selected: a double click picks a word on the press, but the
+//! reader may then drag out of it without ever letting go.
+//!
 //! ## OSC 52
 //!
 //! Copying writes `ESC ] 52 ; c ; <base64> BEL` to the terminal, which asks it
@@ -58,9 +69,17 @@ impl Point {
 }
 
 /// A drag in progress, or a finished selection.
+///
+/// The fixed end is a *range*, not a point, which is what a double-click needs:
+/// having picked out a word, dragging past either side of it has to keep the
+/// whole word in — dragging left keeps its end, dragging right keeps its start.
+/// A plain drag is the degenerate case where the range is one point wide, and
+/// falls out of the same arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Selection {
     anchor: Option<Point>,
+    /// The far side of the anchor range. Equal to `anchor` for a plain drag.
+    anchor_end: Option<Point>,
     cursor: Option<Point>,
     /// True once the button is released: the selection stands until the next
     /// drag starts, or the reader dismisses it.
@@ -70,8 +89,19 @@ pub(crate) struct Selection {
 impl Selection {
     /// Start a drag.
     pub(crate) fn begin(&mut self, at: Point) {
-        self.anchor = Some(at);
-        self.cursor = Some(at);
+        self.begin_range(at, at);
+    }
+
+    /// Start a drag from a range that is already selected — the word a double
+    /// click found, or the message a triple click did.
+    ///
+    /// The button is still down at this point, so this deliberately does *not*
+    /// settle: what follows may well be a drag, and treating it as finished is
+    /// what used to stop a double-click-drag from scrolling or copying.
+    pub(crate) fn begin_range(&mut self, start: Point, end: Point) {
+        self.anchor = Some(start);
+        self.anchor_end = Some(end);
+        self.cursor = Some(end);
         self.settled = false;
     }
 
@@ -97,21 +127,37 @@ impl Selection {
         self.span().is_none()
     }
 
+    /// Whether a drag is in flight: begun, and the button not yet up.
+    ///
+    /// Distinct from "has a span" — a drag that has not moved off its anchor
+    /// yet is still a drag, and is exactly when edge-autoscroll should be
+    /// arming rather than waiting for the reader to select a character first.
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.anchor.is_some() && !self.settled
+    }
+
     /// Normalised (start, end) in reading order, or `None` for a click that
     /// never became a drag.
+    ///
+    /// The cursor extends whichever side of the anchor range it has passed,
+    /// and the range itself is never given up: a cursor still inside it — a
+    /// double click that has not been dragged anywhere yet — leaves the word
+    /// exactly as it was found. Ids ascend with time and offsets ascend within
+    /// a line, so comparing points gives reading order for free.
     pub(crate) fn span(&self) -> Option<(Point, Point)> {
-        let (anchor, cursor) = (self.anchor?, self.cursor?);
-        if anchor == cursor {
+        let (start, end) = (self.anchor?, self.anchor_end?);
+        let cursor = self.cursor?;
+        let (start, end) = if cursor < start {
+            (cursor, end)
+        } else if cursor > end {
+            (start, cursor)
+        } else {
+            (start, end)
+        };
+        if start == end {
             return None;
         }
-        // A selection dragged up-left still runs from the earlier place to the
-        // later one. Ids ascend with time and offsets ascend within a line, so
-        // the derived ordering is reading order.
-        Some(if anchor <= cursor {
-            (anchor, cursor)
-        } else {
-            (cursor, anchor)
-        })
+        Some((start, end))
     }
 
     /// Whether a character of the log falls inside the selection. Half-open at
@@ -450,6 +496,83 @@ mod tests {
         selection.extend(to);
         selection.finish();
         selection
+    }
+
+    /// Dragging out of a double-clicked word keeps the whole word, whichever
+    /// way it goes: the fixed end is the *far side* of the word, so dragging
+    /// backwards holds its end rather than collapsing onto its start.
+    #[test]
+    fn a_drag_out_of_a_word_keeps_the_whole_word() {
+        struct Case {
+            name: &'static str,
+            cursor: Point,
+            want: Option<(Point, Point)>,
+        }
+
+        // A double click that found the word spanning offsets 6..11 on line 2.
+        let (word_start, word_end) = (at(2, 6), at(2, 11));
+
+        let cases = vec![
+            Case {
+                name: "not dragged anywhere: the word, as found",
+                cursor: word_end,
+                want: Some((word_start, word_end)),
+            },
+            Case {
+                name: "dragged back within the word: still the whole word",
+                cursor: at(2, 8),
+                want: Some((word_start, word_end)),
+            },
+            Case {
+                name: "dragged left on the same line keeps the word's end",
+                cursor: at(2, 2),
+                want: Some((at(2, 2), word_end)),
+            },
+            Case {
+                name: "dragged up a line keeps the word's end",
+                cursor: at(1, 4),
+                want: Some((at(1, 4), word_end)),
+            },
+            Case {
+                name: "dragged right keeps the word's start",
+                cursor: at(2, 20),
+                want: Some((word_start, at(2, 20))),
+            },
+            Case {
+                name: "dragged down a line keeps the word's start",
+                cursor: at(3, 3),
+                want: Some((word_start, at(3, 3))),
+            },
+        ];
+
+        for case in cases {
+            let mut selection = Selection::default();
+            selection.begin_range(word_start, word_end);
+            selection.extend(case.cursor);
+            assert_eq!(selection.span(), case.want, "{}", case.name);
+        }
+    }
+
+    /// A multi-click leaves the button down, so the selection it produces is
+    /// still a drag in flight — which is what lets it scroll at the edges and
+    /// copy when released.
+    #[test]
+    fn a_multi_click_selection_is_still_a_drag() {
+        let mut selection = Selection::default();
+        selection.begin_range(at(2, 6), at(2, 11));
+        assert!(selection.is_dragging(), "the button has not come up yet");
+
+        selection.finish();
+        assert!(!selection.is_dragging(), "released");
+
+        // And a plain drag behaves the same way through the same states.
+        let mut plain = Selection::default();
+        plain.begin(at(1, 0));
+        assert!(plain.is_dragging());
+        plain.extend(at(1, 5));
+        assert!(plain.is_dragging());
+        plain.finish();
+        assert!(!plain.is_dragging());
     }
 
     /// A drag is direction-agnostic and half-open at the far end, so dragging

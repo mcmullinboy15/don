@@ -156,6 +156,7 @@ These fields are available on all service presets:
 | `shutdown` | table | Shutdown behavior (see below) |
 | `log` | string or table | Logging output destination (see below) |
 | `log_filter` | list of regex strings | Per-service regex keep filters for log lines |
+| `log_exclude` | list of regex strings | Per-service regex drop filters for log lines; applied before `log_filter` |
 | `download` | table | Binary download configuration (see below) |
 | `on_failure` | string | `"notify"` or `"restart"`; controls service crash/unhealthy handling |
 | `platform` | map | Per-platform overrides (see below) |
@@ -323,8 +324,12 @@ log.file = "logs/myservice.log"
 # Keep only matching output lines before stdout/file/ring-buffer routing
 log_filter = ["ERROR", "WARN"]
 
+# Drop matching output lines, whatever log_filter says
+log_exclude = ["/health"]
+
 [services.api]
 log_filter = ["request_id=abc", "^database:"]
+log_exclude = ["/favicon"]
 ```
 
 Top-level `log_filter = [...]` applies to every service, task, and synthetic
@@ -333,6 +338,12 @@ keep patterns. Filters are line-based regexes; when any filter is configured
 for a stream, only matching service output reaches stdout/TUI, file sinks,
 `don logs`, and `don logs --follow`. Lifecycle events are not filtered by
 these regexes.
+
+`log_exclude = [...]` nests identically and is evaluated first: a line
+matching any exclude pattern is dropped even if a keep pattern also matches
+it. That ordering is what makes "keep this whole category, minus the noisy
+part of it" expressible. An exclude list with no keep list keeps everything
+that does not match — it is a subtraction, not an allowlist.
 
 ### Downloads
 
