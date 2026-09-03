@@ -22,7 +22,6 @@ pub use self::group::ServiceGroup;
 pub use self::param::{CompletionParse, Completions, ParamKind, ParamValidate, TaskParam};
 pub use self::platform::Platform;
 pub use self::profile::Profile;
-pub use self::secrets::{KeyCatalog, SecretGroup, SecretsConfig};
 pub use self::service::{
     DockerBuildConfig, DockerConfig, ResolvedService, RustConfig, Service, ServiceKind,
 };
@@ -31,6 +30,7 @@ pub use self::types::{
     BazelConfig, BazelDefaults, Command, LogConfig, LogFilterConfig, LogFilters, OnFailure,
     ProxyEntry, ProxyMode, ReadyCheck, ShutdownConfig,
 };
+pub use crate::secrets::{Group as SecretGroup, SecretsConfig};
 pub use profile::resolve_profile_processes;
 
 pub use self::service::{GoConfig, ServiceOverride};
@@ -110,12 +110,9 @@ pub struct Config {
     /// Bazel take their defaults from here.
     #[serde(default)]
     pub bazel: BazelDefaults,
-    /// Pointer to Key (`command`, `config`). Mapping lives in key.toml.
+    /// Same table as key.toml, nested here. Names and paths only; never values.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
-    /// Names and paths loaded from key.toml. Never deserialized from don.toml.
-    #[serde(skip)]
-    pub key_catalog: Option<KeyCatalog>,
 }
 
 impl std::str::FromStr for Config {
@@ -274,28 +271,8 @@ impl Config {
         profile: Option<&str>,
     ) -> Result<Self, ConfigError> {
         let mut config: Self = Self::merged_toml(path, profile)?.try_into()?;
-        config.load_key_catalog(path)?;
         config.apply_global_env();
         Ok(config)
-    }
-
-    /// Load `key.toml` next to `don.toml` when `[secrets]` is configured. The
-    /// mapping is a separate file so values never appear in `don.toml`.
-    fn load_key_catalog(&mut self, don_toml: &Path) -> Result<(), ConfigError> {
-        let Some(secrets) = &self.secrets else {
-            return Ok(());
-        };
-        let parent = don_toml.parent().unwrap_or_else(|| Path::new("."));
-        let path = parent.join(&secrets.config);
-        match KeyCatalog::load(&path) {
-            Ok(catalog) => {
-                self.key_catalog = Some(catalog);
-                Ok(())
-            }
-            Err(error) => Err(ConfigError::Validation {
-                errors: vec![error.to_string()],
-            }),
-        }
     }
 
     /// Push the workspace-wide `env` down into every service and task, where a
@@ -563,7 +540,6 @@ impl Config {
 
         secrets::validate_secrets(
             self.secrets.as_ref(),
-            self.key_catalog.as_ref(),
             &self.services,
             &self.tasks,
             suggest_typo,

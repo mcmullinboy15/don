@@ -46,40 +46,42 @@ fn read_buf(buf: &Arc<Mutex<Vec<u8>>>) -> String {
     String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
 }
 
-fn write_fake_key(dir: &std::path::Path) {
-    let key = dir.join("key");
+fn write_fake_aws(dir: &std::path::Path) -> std::path::PathBuf {
+    let aws = dir.join("aws");
     std::fs::write(
-        &key,
+        &aws,
         r#"#!/usr/bin/env python3
-import json
-print(json.dumps({
-    "STRIPE_SECRET_KEY": "injected-secret-value",
-    "DD_API_KEY": "dd-api-key-value",
-}))
+import json, sys
+args = sys.argv[1:]
+names = []
+if "--names" in args:
+    i = args.index("--names") + 1
+    while i < len(args) and not args[i].startswith("-"):
+        names.append(args[i])
+        i += 1
+values = {
+    "/app/StripeSecretKey": "injected-secret-value",
+    "/app/Datadog/ApiKey": "dd-api-key-value",
+}
+json.dump(
+    {
+        "Parameters": [{"Name": n, "Value": values[n]} for n in names],
+        "InvalidParameters": [],
+    },
+    sys.stdout,
+)
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&key, PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&aws, PermissionsExt::from_mode(0o755)).unwrap();
+    aws
 }
 
 #[test]
 fn integration_declared_secrets_are_injected_stripped_and_redacted() {
     run_with_timeout(Duration::from_secs(20), async {
         let dir = TempDir::new("secrets-inject");
-        let bin = dir.child("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        write_fake_key(&bin);
-
-        std::fs::write(
-            dir.child("key.toml"),
-            r#"
-provider = "aws-ssm"
-[vars]
-STRIPE_SECRET_KEY = "/app/StripeSecretKey"
-DD_API_KEY = "/app/Datadog/ApiKey"
-"#,
-        )
-        .unwrap();
+        let aws = write_fake_aws(dir.path());
 
         std::fs::write(
             dir.child("check.sh"),
@@ -98,17 +100,25 @@ exec sleep 60
         std::fs::set_permissions(dir.child("check.sh"), PermissionsExt::from_mode(0o755)).unwrap();
 
         let toml = ConfigBuilder::new()
-            .raw("[secrets]\n")
+            .raw(
+                r#"
+[secrets]
+provider = "aws-ssm"
+region = "us-east-1"
+[secrets.vars]
+STRIPE_SECRET_KEY = "/app/StripeSecretKey"
+DD_API_KEY = "/app/Datadog/ApiKey"
+"#,
+            )
             .add_custom_service("api", "./check.sh", &[])
             .secrets(&["STRIPE_SECRET_KEY"])
             .done()
             .build();
         std::fs::write(dir.child("don.toml"), &toml).unwrap();
 
-        let original_path = std::env::var("PATH").unwrap();
-        let new_path = format!("{}:{original_path}", bin.display());
+        let original_aws = std::env::var("KEY_AWS").ok();
         unsafe {
-            std::env::set_var("PATH", &new_path);
+            std::env::set_var("KEY_AWS", aws.to_string_lossy().as_ref());
             std::env::set_var("STRIPE_SECRET_KEY", "from-shell");
             std::env::set_var("DD_API_KEY", "from-shell");
         }
@@ -160,7 +170,10 @@ exec sleep 60
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
         unsafe {
-            std::env::set_var("PATH", original_path);
+            match original_aws {
+                Some(value) => std::env::set_var("KEY_AWS", value),
+                None => std::env::remove_var("KEY_AWS"),
+            }
             std::env::remove_var("STRIPE_SECRET_KEY");
             std::env::remove_var("DD_API_KEY");
         }

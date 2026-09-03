@@ -369,10 +369,9 @@ impl Runner {
         setup::prune_download_cache(&config, platform, &don_dir, &output_manager);
 
         let secrets = {
-            if let (Some(cfg), Some(catalog)) = (&config.secrets, &config.key_catalog) {
+            if let Some(cfg) = &config.secrets {
                 output_manager.lifecycle_event("fetching secrets...");
-                let store =
-                    crate::secrets::resolve(cfg, catalog, &base_dir, &mut shutdown_rx).await?;
+                let store = crate::secrets::resolve(cfg, &mut shutdown_rx).await?;
                 output_manager.set_secret_redactor(store.redactable_values());
                 output_manager.lifecycle_event(&format!("loaded {} secrets", store.len()));
                 store

@@ -1,25 +1,18 @@
-//! In-memory secret values and the Key CLI fetch that produces them.
+//! In-memory secret values and AWS SSM fetch. Extract this directory as `key`.
 
-use crate::config::{KeyCatalog, SecretGroup, SecretsConfig};
+mod aws;
+mod config;
+mod error;
+
+pub use aws::AwsSsm;
+pub use config::{Group, Provider, SecretsConfig};
+pub use error::SecretError;
+
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
-/// Errors from fetching or applying secrets. Messages must never include values.
-#[derive(Debug, thiserror::Error)]
-pub enum SecretError {
-    #[error("{0}")]
-    Message(String),
-}
-
-impl SecretError {
-    fn msg(text: impl Into<String>) -> Self {
-        Self::Message(text.into())
-    }
-}
+pub(crate) use config::expand_secret_refs;
 
 /// Pulled secret values plus the mapping needed to apply them to a process env.
 #[derive(Clone, Default)]
@@ -35,20 +28,11 @@ impl std::fmt::Debug for SecretStore {
     }
 }
 
+#[derive(Default)]
 struct SecretStoreInner {
     values: HashMap<String, String>,
     managed: HashSet<String>,
     groups: HashMap<String, Vec<String>>,
-}
-
-impl Default for SecretStoreInner {
-    fn default() -> Self {
-        Self {
-            values: HashMap::new(),
-            managed: HashSet::new(),
-            groups: HashMap::new(),
-        }
-    }
 }
 
 impl SecretStore {
@@ -58,7 +42,7 @@ impl SecretStore {
 
     pub fn from_parts(
         values: HashMap<String, String>,
-        groups: HashMap<String, SecretGroup>,
+        groups: HashMap<String, Group>,
         managed: HashSet<String>,
     ) -> Self {
         let groups = groups
@@ -72,6 +56,14 @@ impl SecretStore {
                 groups,
             }),
         }
+    }
+
+    pub fn from_config(config: &SecretsConfig, values: HashMap<String, String>) -> Self {
+        Self::from_parts(
+            values,
+            config.groups.clone(),
+            config.vars.keys().cloned().collect(),
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -132,58 +124,31 @@ impl SecretStore {
     }
 }
 
-/// Fetch via `key fetch --format json`. No-op when `[secrets]` is unset.
+async fn fetch_values(config: &SecretsConfig) -> Result<HashMap<String, String>, SecretError> {
+    config.validate()?;
+    let names = config.expand(&[])?;
+    match config.provider {
+        Provider::AwsSsm => {
+            let client = AwsSsm::new(config.region.clone(), config.profile.clone());
+            client.fetch(&config.vars, &names).await
+        }
+    }
+}
+
+/// Fetch every mapped secret. Raced against shutdown so Ctrl+C is not stuck on AWS.
 pub async fn resolve(
     config: &SecretsConfig,
-    catalog: &KeyCatalog,
-    base_dir: &Path,
     shutdown: &mut mpsc::Receiver<()>,
 ) -> Result<SecretStore, SecretError> {
-    let mapping = base_dir.join(&config.config);
-    let mut cmd = Command::new(&config.command);
-    cmd.arg("fetch")
-        .arg("--config")
-        .arg(&mapping)
-        .arg("--format")
-        .arg("json")
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let pull = cmd.output();
+    let pull = fetch_values(config);
     tokio::pin!(pull);
-    let output = tokio::select! {
-        result = &mut pull => {
-            result.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    SecretError::msg(format!(
-                        "'{}' not found on PATH; install Key to use [secrets]",
-                        config.command
-                    ))
-                } else {
-                    SecretError::msg(format!("failed to run {}: {error}", config.command))
-                }
-            })?
-        }
+    let values = tokio::select! {
+        result = &mut pull => result?,
         _ = shutdown.recv() => {
             return Err(SecretError::msg("interrupted while fetching secrets"));
         }
     };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().next().unwrap_or("key fetch failed").trim();
-        return Err(SecretError::msg(detail.to_string()));
-    }
-
-    let values: HashMap<String, String> = serde_json::from_slice(&output.stdout)
-        .map_err(|error| SecretError::msg(format!("failed to parse key fetch json: {error}")))?;
-    let managed = catalog.vars.keys().cloned().collect();
-    Ok(SecretStore::from_parts(
-        values,
-        catalog.groups.clone(),
-        managed,
-    ))
+    Ok(SecretStore::from_config(config, values))
 }
 
 #[cfg(test)]
@@ -202,7 +167,7 @@ mod tests {
             .map(|(name, keys)| {
                 (
                     (*name).to_string(),
-                    SecretGroup {
+                    Group {
                         keys: keys.iter().map(|k| (*k).to_string()).collect(),
                     },
                 )
