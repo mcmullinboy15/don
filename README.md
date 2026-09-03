@@ -730,6 +730,79 @@ don start --profile backend     # override
 
 Transitive dependencies are included automatically — if `api` depends on `postgres`, it starts too.
 
+A profile can also change the services it runs, not just pick them. Anything
+under `[profiles.<name>.overrides]` is a `don.toml` fragment merged over the base
+file whenever that profile is the active one:
+
+```toml
+[profiles.prod]
+services = ["api", "worker"]
+
+[profiles.prod.overrides.services.api]
+env = { DATABASE_URL = "postgres://prod.internal:5432/app" }
+
+[profiles.prod.overrides.services.worker]
+env = { DATABASE_URL = "postgres://prod.internal:5432/app" }
+```
+
+Dotted keys under one `[profiles.<name>.overrides]` header say the same thing,
+and read better when each service only changes a field or two:
+
+```toml
+[profiles.prod.overrides]
+services.api.env = { DATABASE_URL = "postgres://prod.internal:5432/app" }
+services.worker.env = { DATABASE_URL = "postgres://prod.internal:5432/app" }
+```
+
+Both spell the same table, and the merge runs on the parsed value — it never
+sees which form you used. TOML does forbid spelling the *same path* both ways in
+one file, so `[profiles.prod.overrides.services.api]` plus a dotted
+`services.api.…` under `[profiles.prod.overrides]` is a duplicate-key parse
+error. Pick a form per service: dotted for one or two fields, the header once a
+service changes several.
+
+```sh
+don start --profile prod            # api and worker come up against the prod database
+don validate --profile prod --show  # print the merged result without starting anything
+```
+
+`--show` prints the config don actually loaded — every layer applied and the
+active profile's `overrides` block resolved away, the way `tsc --showConfig`
+prints a resolved `tsconfig.json`. A profile that is not active keeps its block,
+since nothing has been applied from it. Without the flag, `don validate` says
+only whether the merge is legal.
+
+Tables merge field by field, the way `don.local.toml` does — `api` keeps
+everything else it declared — while scalars and arrays **replace**. Overriding
+`run.args` or `watch` swaps the whole list; there is no appending, so restate
+every element you still want. The order is base file, then the active profile's
+overrides, then `don.local.toml`, so a developer's own file still has the last
+word.
+
+The block is a fragment of the file's root, not a services-only table: `tasks`,
+`service_groups`, and top-level keys like `watch_ignore` all merge the same way.
+It cannot set `profiles` or `default_profile` — it changes what runs, not which
+profile is active.
+
+Repeating the same value per service, as above, is what the workspace-wide `env`
+is for. Set it once at the top level and every service and task inherits it, so
+one key in an overrides block retargets the whole stack:
+
+```toml
+env = { DATABASE_URL = "postgres://localhost:5432/app" }
+
+[profiles.prod.overrides.env]
+DATABASE_URL = "postgres://prod.internal:5432/app"
+```
+
+A process's own `env` wins over the global one, and a platform override wins
+over both.
+
+Overrides *define*; `services` and `tasks` still *select*. A service that
+appears only in an overrides block is configured but not started, because the
+profile's `services` list is what picks the run set. Add the name there too if
+you mean to run it.
+
 ### Config Auto-Reload
 
 Edit `don.toml` while don is running. Don detects the change, diffs it, and applies it live:
@@ -744,6 +817,7 @@ Edit `don.toml` while don is running. Don detects the change, diffs it, and appl
 don init                     # scaffold a starter don.toml
 don start                    # start this project's stack (bare `don` prints help)
 don start --profile <name>   # start a subset
+don validate --show          # print the merged config don would load
 don start <name>             # start a stopped service in the running daemon
 don stop                     # stop this project's stack
 don stop <name>              # stop a running service, or kill a task's run
@@ -919,7 +993,9 @@ See [`examples/`](examples/) for complete working configs.
 | `bazel.config` | string | `.bazelrc` configuration to build this target under, as `--config=<name>` |
 | `bazel.config` (top-level `[bazel]`) | string | Same, for every Bazel build Don runs; per-service/task settings override it |
 | `download.platform.<platform>` | table | Per-platform download config |
+| `env` (top-level) | table | Environment for every service and task; a process's own `env` wins |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
+| `profiles.<name>.overrides` | table | Config fragment merged over the base file while that profile is active |
 | `fallback_ports` | bool | Top-level: use an OS-assigned proxy/Docker host port when the preferred port is in use |
 
 ## Platform Support

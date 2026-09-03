@@ -468,3 +468,271 @@ fn profile_service_group_starts_group_members() {
         handle.await.unwrap();
     });
 }
+
+// --- Profile overrides ---
+
+/// A base file whose `prod` profile retargets the same services the `dev`
+/// profile runs — the local-prod shape: same stack, different conf.
+const OVERRIDE_CONFIG: &str = r#"
+default_profile = "dev"
+
+[services.api]
+run.cmd = "api"
+run.args = ["--dev"]
+env = { CONF = "dev", SHARED = "base" }
+
+[tasks.migrate]
+cmd = "migrate"
+
+[profiles.dev]
+services = ["api"]
+tasks = ["migrate"]
+
+[profiles.prod]
+services = ["api"]
+tasks = ["migrate"]
+
+[profiles.prod.overrides.services.api]
+run.args = ["--prod"]
+env = { CONF = "prod" }
+
+[profiles.prod.overrides.tasks.migrate]
+args = ["--prod"]
+"#;
+
+fn write_config(dir: &TempDir, base: &str, local: Option<&str>) -> std::path::PathBuf {
+    let config_path = dir.child("don.toml");
+    std::fs::write(&config_path, base).unwrap();
+    if let Some(local) = local {
+        std::fs::write(dir.child("don.local.toml"), local).unwrap();
+    }
+    config_path
+}
+
+fn api_args(config: &Config) -> Vec<String> {
+    let Some(don::config::ServiceKind::Custom { run, .. }) =
+        config.services["api"].resolve(PLATFORM).kind
+    else {
+        panic!("expected custom api service");
+    };
+    run.args
+}
+
+#[test]
+fn profile_overrides_apply_to_the_active_profile_only() {
+    struct Case {
+        name: &'static str,
+        requested: Option<&'static str>,
+        conf: &'static str,
+        args: Vec<&'static str>,
+        task_args: Vec<&'static str>,
+    }
+
+    let cases = vec![
+        Case {
+            name: "default profile, which has no overrides",
+            requested: None,
+            conf: "dev",
+            args: vec!["--dev"],
+            task_args: vec![],
+        },
+        Case {
+            name: "requested profile's overrides apply",
+            requested: Some("prod"),
+            conf: "prod",
+            args: vec!["--prod"],
+            task_args: vec!["--prod"],
+        },
+        Case {
+            name: "an inactive profile's overrides stay out",
+            requested: Some("dev"),
+            conf: "dev",
+            args: vec!["--dev"],
+            task_args: vec![],
+        },
+    ];
+
+    for case in cases {
+        let dir = TempDir::new(&format!(
+            "profile-overrides-{}",
+            case.name.replace(' ', "-").replace(',', "")
+        ));
+        let config_path = write_config(&dir, OVERRIDE_CONFIG, None);
+
+        let config = Config::from_file_with_profile(&config_path, case.requested).unwrap();
+        config.validate(PLATFORM).unwrap();
+
+        assert_eq!(
+            config.services["api"].env["CONF"], case.conf,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            config.services["api"].env["SHARED"], "base",
+            "{}: an override table merges field by field",
+            case.name
+        );
+        assert_eq!(api_args(&config), case.args, "{}", case.name);
+        assert_eq!(
+            config.tasks["migrate"].args, case.task_args,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn default_profile_overrides_apply_without_a_requested_profile() {
+    let dir = TempDir::new("profile-overrides-default");
+    let base = OVERRIDE_CONFIG.replace(r#"default_profile = "dev""#, r#"default_profile = "prod""#);
+    let config_path = write_config(&dir, &base, None);
+
+    let config = Config::from_file(&config_path).unwrap();
+
+    assert_eq!(config.services["api"].env["CONF"], "prod");
+    assert_eq!(api_args(&config), vec!["--prod"]);
+}
+
+#[test]
+fn local_file_outranks_profile_overrides_and_can_move_the_active_profile() {
+    let dir = TempDir::new("profile-overrides-local");
+    let config_path = write_config(
+        &dir,
+        OVERRIDE_CONFIG,
+        Some(
+            r#"
+default_profile = "prod"
+
+[services.api]
+env = { CONF = "mine" }
+
+[profiles.prod.overrides.services.api]
+env = { EXTRA = "from-local" }
+"#,
+        ),
+    );
+
+    let config = Config::from_file(&config_path).unwrap();
+
+    assert_eq!(
+        config.services["api"].env["CONF"], "mine",
+        "the developer's own file wins over a profile the repo ships"
+    );
+    assert_eq!(
+        config.services["api"].env["EXTRA"], "from-local",
+        "a local file can extend the active profile's overrides"
+    );
+    assert_eq!(
+        api_args(&config),
+        vec!["--prod"],
+        "local `default_profile` selects which overrides apply"
+    );
+}
+
+#[test]
+fn bad_profile_overrides_are_rejected_with_actionable_errors() {
+    struct Case {
+        name: &'static str,
+        toml: &'static str,
+        expected: &'static str,
+    }
+
+    let cases = vec![
+        Case {
+            name: "misspelled overrides key",
+            toml: r#"
+                [services.api]
+                run.cmd = "api"
+                [profiles.prod]
+                services = ["api"]
+                [profiles.prod.overides.services.api]
+                env = { CONF = "prod" }
+            "#,
+            expected: "unknown key 'overides' — did you mean 'overrides'?",
+        },
+        Case {
+            name: "overrides selecting another profile",
+            toml: r#"
+                [services.api]
+                run.cmd = "api"
+                [profiles.prod]
+                services = ["api"]
+                [profiles.prod.overrides]
+                default_profile = "dev"
+            "#,
+            expected: "cannot set 'default_profile'",
+        },
+        Case {
+            name: "overrides redefining profiles",
+            toml: r#"
+                [services.api]
+                run.cmd = "api"
+                [profiles.prod]
+                services = ["api"]
+                [profiles.prod.overrides.profiles.dev]
+                services = ["api"]
+            "#,
+            expected: "cannot set 'profiles'",
+        },
+    ];
+
+    for case in cases {
+        let dir = TempDir::new(&format!(
+            "profile-overrides-invalid-{}",
+            case.name.replace(' ', "-")
+        ));
+        let config_path = write_config(&dir, case.toml, None);
+
+        let err = Config::from_file_with_profile(&config_path, Some("prod")).unwrap_err();
+        let don::config::ConfigError::Validation { errors } = err else {
+            panic!("{}: expected a validation error", case.name);
+        };
+        assert!(
+            errors.iter().any(|e| e.contains(case.expected)),
+            "{}: errors {errors:?} should mention {}",
+            case.name,
+            case.expected
+        );
+    }
+}
+
+#[test]
+fn profile_overrides_retarget_the_global_env() {
+    let dir = TempDir::new("profile-overrides-global-env");
+    let config_path = write_config(
+        &dir,
+        r#"
+default_profile = "dev"
+env = { CONF_PATH = "conf.sh.dev" }
+
+[services.api]
+run.cmd = "api"
+
+[tasks.migrate]
+cmd = "migrate"
+
+[profiles.dev]
+services = ["api"]
+tasks = ["migrate"]
+
+[profiles.prod]
+services = ["api"]
+tasks = ["migrate"]
+
+[profiles.prod.overrides.env]
+CONF_PATH = "conf.sh.prod"
+"#,
+        None,
+    );
+
+    let dev = Config::from_file(&config_path).unwrap();
+    assert_eq!(dev.services["api"].env["CONF_PATH"], "conf.sh.dev");
+    assert_eq!(dev.tasks["migrate"].env["CONF_PATH"], "conf.sh.dev");
+
+    let prod = Config::from_file_with_profile(&config_path, Some("prod")).unwrap();
+    assert_eq!(
+        prod.services["api"].env["CONF_PATH"], "conf.sh.prod",
+        "one key in the overrides block retargets the whole stack"
+    );
+    assert_eq!(prod.tasks["migrate"].env["CONF_PATH"], "conf.sh.prod");
+}

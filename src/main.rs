@@ -211,7 +211,14 @@ enum Commands {
         raw: Vec<String>,
     },
     /// Validate the config file
-    Validate,
+    Validate {
+        /// Validate the config as the named profile would load it
+        #[arg(short, long)]
+        profile: Option<String>,
+        /// Print the merged config: base file, profile overrides, local file
+        #[arg(long)]
+        show: bool,
+    },
     /// Print the don version
     Version,
     #[command(hide = true)]
@@ -295,10 +302,32 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             println!("    — {}, {}", q.speaker, q.source);
             0
         }
-        Commands::Validate => match validate(&config_path) {
+        Commands::Validate { profile, show } => match validate(&config_path, profile.as_deref()) {
             Ok(()) => {
-                println!("Config is valid.");
-                0
+                if !show {
+                    println!("Config is valid.");
+                    errln("Pass --show to print the merged config.");
+                    return 0;
+                }
+                // stdout is the config and nothing else, so `--show > merged.toml`
+                // writes a file that parses.
+                errln("Config is valid.");
+                match don::config::Config::merged_toml(&config_path, profile.as_deref()) {
+                    Ok(merged) => match toml::to_string_pretty(&merged) {
+                        Ok(rendered) => {
+                            println!("{rendered}");
+                            0
+                        }
+                        Err(e) => {
+                            errln(format!("Error: failed to render merged config: {e}"));
+                            1
+                        }
+                    },
+                    Err(e) => {
+                        errln(format!("Error: {e}"));
+                        1
+                    }
+                }
             }
             Err(e) => {
                 errln(e);
@@ -2233,8 +2262,9 @@ async fn kill_running_daemon(pid_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate(config_path: &std::path::Path) -> Result<(), String> {
-    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+fn validate(config_path: &std::path::Path, profile: Option<&str>) -> Result<(), String> {
+    let config = don::config::Config::from_file_with_profile(config_path, profile)
+        .map_err(|e| format!("Error: {e}"))?;
 
     let platform = don::config::Platform::current().ok_or_else(|| {
         format!(
@@ -2484,7 +2514,8 @@ async fn run_start(
     // Serving a UI from this process means not depending on a daemon at all.
     let no_daemon = no_daemon || with_ui.is_some();
 
-    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+    let config = don::config::Config::from_file_with_profile(config_path, profile)
+        .map_err(|e| format!("Error: {e}"))?;
 
     let platform = don::config::Platform::current().ok_or_else(|| {
         format!(
