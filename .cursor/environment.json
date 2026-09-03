@@ -1,0 +1,15 @@
+{
+  "name": "don",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "user": "ubuntu",
+  "install": ".cursor/install.sh",
+  "terminals": [
+    {
+      "name": "don",
+      "command": "./target/debug/don start --no-tui"
+    }
+  ]
+}
