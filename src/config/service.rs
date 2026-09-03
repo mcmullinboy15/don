@@ -100,8 +100,8 @@ pub struct Service {
     /// service. When enabled, a service failure adds this service to the TUI
     /// log filter.
     pub auto_filter_on_failure: Option<bool>,
-    /// Secret names or group names this service may receive.
-    pub secrets: Vec<String>,
+    /// Secret refs this service declared. `None` inherits from service groups.
+    pub secrets: Option<Vec<String>>,
 
     /// The service kind. `None` when the base service has no preset
     /// and relies on a platform override to supply one.
@@ -149,8 +149,7 @@ struct RawService {
     hidden: bool,
     #[serde(default)]
     auto_filter_on_failure: Option<bool>,
-    #[serde(default)]
-    secrets: Vec<String>,
+    secrets: Option<Vec<String>>,
 
     bazel: Option<BazelConfig>,
     docker: Option<DockerConfig>,
@@ -528,7 +527,7 @@ impl Service {
                 tty: self.tty,
                 on_failure: self.on_failure,
                 auto_filter_on_failure: self.auto_filter_on_failure,
-                secrets: self.secrets.clone(),
+                secrets: self.secrets.clone().unwrap_or_default(),
                 kind: self.kind.clone(),
                 resolved_binary_path: None,
             },
@@ -574,7 +573,11 @@ impl Service {
                     auto_filter_on_failure: ov
                         .auto_filter_on_failure
                         .or(self.auto_filter_on_failure),
-                    secrets: ov.secrets.clone().unwrap_or_else(|| self.secrets.clone()),
+                    secrets: ov
+                        .secrets
+                        .clone()
+                        .or_else(|| self.secrets.clone())
+                        .unwrap_or_default(),
                     kind,
                     resolved_binary_path: None,
                 }

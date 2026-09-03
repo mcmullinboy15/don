@@ -127,11 +127,12 @@ fn prepare_task_command(
     let work_dir = work_dir.as_path();
 
     let mut env: HashMap<String, String> = std::env::vars().collect();
-    secrets.strip_undeclared(&mut env, &task.secrets);
+    let secret_refs = task.secrets.as_deref().unwrap_or(&[]);
+    secrets.strip_undeclared(&mut env, secret_refs);
     for (k, v) in &task.env {
         env.insert(k.clone(), render(&format!("env['{k}']"), v)?);
     }
-    secrets.inject(&mut env, &task.secrets);
+    secrets.inject(&mut env, secret_refs);
     // Expose downloaded binaries on PATH.
     crate::sys::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
     // Expose each param to the child as DON_PARAM_<NAME> so tasks can read

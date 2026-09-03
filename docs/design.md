@@ -101,6 +101,25 @@ run.cmd = "./api"
 secrets = ["app"]        # only these keys are exported to this process
 ```
 
+`[service_groups.*] secrets` is the grant for members that omit `secrets`.
+A member that sets `secrets` replaces the group list (it is not merged).
+`secrets = []` is an explicit empty grant. Processes not in the group get
+nothing.
+
+```toml
+[service_groups.application-services]
+members = ["api-server", "admin-server"]
+secrets = ["production"]
+
+[services.admin-server]
+run.cmd = "./admin"
+
+[services.api-server]
+run.cmd = "./api"
+secrets = ["production", "other-secrets-group", "STRIPE_WEBHOOK_SECRET"]
+```
+
+
 At startup Don calls `aws ssm get-parameters --with-decryption` (raced against
 Ctrl+C), injects declared keys, and strips undeclared managed keys from
 inherited env. Known secret values are replaced with `***` in process logs

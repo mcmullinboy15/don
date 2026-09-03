@@ -418,7 +418,7 @@ mod tests {
             params,
             hidden: false,
             auto_filter_on_failure: None,
-            secrets: vec![],
+            secrets: None,
         }
     }
 

@@ -144,7 +144,7 @@ mod tests {
             params: vec![],
             hidden: false,
             auto_filter_on_failure: None,
-            secrets: vec![],
+            secrets: None,
         }
     }
 

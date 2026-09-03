@@ -7,22 +7,30 @@ pub(crate) fn validate_secrets(
     secrets: Option<&SecretsConfig>,
     services: &HashMap<String, super::Service>,
     tasks: &HashMap<String, super::Task>,
+    service_groups: &HashMap<String, super::ServiceGroup>,
     suggest_typo: impl Fn(&str, &HashSet<&str>) -> String,
     errors: &mut Vec<String>,
 ) {
     let configured = secrets.is_some();
     if !configured {
         for (name, svc) in services {
-            if !svc.secrets.is_empty() {
+            if svc.secrets.is_some() {
                 errors.push(format!(
                     "service '{name}': secrets = [...] requires a [secrets] table"
                 ));
             }
         }
         for (name, task) in tasks {
-            if !task.secrets.is_empty() {
+            if task.secrets.is_some() {
                 errors.push(format!(
                     "task '{name}': secrets = [...] requires a [secrets] table"
+                ));
+            }
+        }
+        for (name, group) in service_groups {
+            if !group.secrets.is_empty() {
+                errors.push(format!(
+                    "service group '{name}': secrets = [...] requires a [secrets] table"
                 ));
             }
         }
@@ -50,7 +58,7 @@ pub(crate) fn validate_secrets(
         push_ref_errors(
             "service",
             name,
-            &svc.secrets,
+            svc.secrets.as_deref().unwrap_or(&[]),
             &var_names,
             &secrets.groups,
             &candidates,
@@ -76,7 +84,19 @@ pub(crate) fn validate_secrets(
         push_ref_errors(
             "task",
             name,
-            &task.secrets,
+            task.secrets.as_deref().unwrap_or(&[]),
+            &var_names,
+            &secrets.groups,
+            &candidates,
+            &suggest_typo,
+            errors,
+        );
+    }
+    for (name, group) in service_groups {
+        push_ref_errors(
+            "service group",
+            name,
+            &group.secrets,
             &var_names,
             &secrets.groups,
             &candidates,

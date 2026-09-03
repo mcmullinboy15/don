@@ -496,6 +496,25 @@ impl Config {
         self.expand_dependency_refs(&all)
     }
 
+    pub(crate) fn effective_secrets(&self, name: &str, own: Option<&[String]>) -> Vec<String> {
+        if let Some(refs) = own {
+            return refs.to_vec();
+        }
+        let mut all = Vec::new();
+        for (group_name, group) in &self.service_groups {
+            if group.secrets.is_empty() {
+                continue;
+            }
+            let members = self.expand_service_refs(std::slice::from_ref(group_name));
+            if members.iter().any(|m| m == name) {
+                all.extend(group.secrets.iter().cloned());
+            }
+        }
+        let mut seen = HashSet::new();
+        all.retain(|item| seen.insert(item.clone()));
+        all
+    }
+
     /// Validate the entire config for a given platform.
     ///
     /// Checks preset validity, ready check configuration, dependency references,
@@ -542,6 +561,7 @@ impl Config {
             self.secrets.as_ref(),
             &self.services,
             &self.tasks,
+            &self.service_groups,
             suggest_typo,
             &mut errors,
         );
@@ -2515,6 +2535,59 @@ mod tests {
                     let group = config.service_groups.get("frontend").unwrap();
                     assert_eq!(group.members, vec!["web"]);
                     assert_eq!(group.depends_on, vec![Dependency::blocking("api")]);
+                },
+            },
+            ConfigTestCase {
+                name: "service group secrets inherit unless the member declares its own",
+                input: r#"
+                    [secrets]
+                    provider = "aws-ssm"
+                    [secrets.vars]
+                    LAUNCH_DARKLY_SDK_KEY = "/app/Ld"
+                    STRIPE_WEBHOOK_SECRET = "/app/StripeWebhook"
+                    OTHER_KEY = "/app/Other"
+                    [secrets.groups]
+                    production = ["LAUNCH_DARKLY_SDK_KEY"]
+                    other-secrets-group = ["OTHER_KEY"]
+
+                    [services.api-server]
+                    run.cmd = "api"
+                    secrets = ["other-secrets-group", "STRIPE_WEBHOOK_SECRET"]
+
+                    [services.admin-server]
+                    run.cmd = "admin"
+
+                    [services.cockroachdb]
+                    run.cmd = "db"
+
+                    [service_groups.application-services]
+                    members = ["api-server", "admin-server"]
+                    secrets = ["production"]
+                "#,
+                expect_err: false,
+                check: |config| {
+                    assert!(config.validate(TEST_PLATFORM).is_ok());
+                    let mut got = config.effective_secrets(
+                        "api-server",
+                        config.services["api-server"].secrets.as_deref(),
+                    );
+                    got.sort();
+                    assert_eq!(got, vec!["STRIPE_WEBHOOK_SECRET", "other-secrets-group"]);
+                    assert_eq!(
+                        config.effective_secrets(
+                            "admin-server",
+                            config.services["admin-server"].secrets.as_deref(),
+                        ),
+                        vec!["production"]
+                    );
+                    assert!(
+                        config
+                            .effective_secrets(
+                                "cockroachdb",
+                                config.services["cockroachdb"].secrets.as_deref()
+                            )
+                            .is_empty()
+                    );
                 },
             },
             ConfigTestCase {
