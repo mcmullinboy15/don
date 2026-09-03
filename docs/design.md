@@ -76,6 +76,44 @@ run.args = ["scratch.js"]
 services = ["api", "scratch"]
 ```
 
+### Secrets
+
+Don is a client of [Key](https://github.com/mcmullinboy15/key). Mapping
+(names and SSM paths) lives in `key.toml`. `don.toml` only says which
+processes may receive which keys. Values never live in either file, and Don
+never writes them to disk.
+
+```toml
+# key.toml
+provider = "aws-ssm"
+region = "us-east-1"
+profile = "dev"
+
+[vars]
+STRIPE_SECRET_KEY = "/app/StripeSecretKey"
+DD_API_KEY = "/app/Datadog/ApiKey"
+
+[groups]
+app = ["STRIPE_SECRET_KEY"]
+```
+
+```toml
+# don.toml
+[secrets]
+command = "key"          # default
+config = "key.toml"      # default, next to don.toml
+
+[services.api]
+run.cmd = "./api"
+secrets = ["app"]        # only these keys are exported to this process
+```
+
+At startup Don runs `key fetch --format json` (raced against Ctrl+C), injects
+declared keys, and strips undeclared managed keys from inherited env. Known
+secret values are replaced with `***` in process logs (TUI, `GET /logs`,
+`.don/logs/runner.log`) before they hit any sink. Don does not put pulled
+values into its own environment.
+
 ### Services
 
 Services are long-running processes. Each service uses exactly one **preset** that determines how it's run:
