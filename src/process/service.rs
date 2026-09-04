@@ -197,7 +197,6 @@ pub(crate) async fn start_service(
     )?;
     secrets.strip_undeclared(&mut env, &resolved.secrets);
     secrets.inject(&mut env, &resolved.secrets);
-    env.extend(listen_fds_env.clone());
     // Expose downloaded binaries on PATH so other services/tasks can call them.
     crate::sys::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
 
