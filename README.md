@@ -392,22 +392,20 @@ paths only — Don never writes values to disk. Known values are replaced with
 `***` in the TUI, `don logs`, and the runner log.
 
 ```toml
-[secrets]
-provider = "aws-ssm"
-region = "us-east-1"
-profile = "dev"
-
-[secrets.vars]
-STRIPE_SECRET_KEY = "/app/StripeSecretKey"
-DD_API_KEY = "/app/Datadog/ApiKey"
-
-[secrets.groups]
-app = ["STRIPE_SECRET_KEY"]
+[[secrets]]
+aws-ssm = { region = "us-east-1", profile = "dev" }
+vars = { STRIPE_SECRET_KEY = "/app/StripeSecretKey", DD_API_KEY = "/app/Datadog/ApiKey" }
+groups = { app = ["STRIPE_SECRET_KEY"] }
 
 [services.api]
 run.cmd = "./api"
 secrets = ["app"]
 ```
+
+Each `[[secrets]]` entry is one source, and names its provider by key. Settings
+only that provider understands live inside it. Because it is a list, each entry
+fetches with its own credentials, so one run can read parameters from separate
+accounts; a name supplied by more than one source takes the last one's value.
 
 A process only receives the keys it lists (a group name or an individual
 var). Managed names that were in the inherited environment are stripped

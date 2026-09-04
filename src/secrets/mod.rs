@@ -5,7 +5,7 @@ mod config;
 mod error;
 
 pub use aws::AwsSsm;
-pub use config::{Group, Provider, SecretsConfig};
+pub use config::{Group, SecretKind, SecretsConfig};
 pub use error::SecretError;
 
 use std::collections::{HashMap, HashSet};
@@ -58,12 +58,16 @@ impl SecretStore {
         }
     }
 
-    pub fn from_config(config: &SecretsConfig, values: HashMap<String, String>) -> Self {
-        Self::from_parts(
-            values,
-            config.groups.clone(),
-            config.vars.keys().cloned().collect(),
-        )
+    /// Groups and managed names are the union across every source, so a
+    /// process can declare a group from one source and a key from another.
+    pub fn from_sources(sources: &[SecretsConfig], values: HashMap<String, String>) -> Self {
+        let mut groups = HashMap::new();
+        let mut managed = HashSet::new();
+        for source in sources {
+            groups.extend(source.groups.clone());
+            managed.extend(source.vars.keys().cloned());
+        }
+        Self::from_parts(values, groups, managed)
     }
 
     pub fn len(&self) -> usize {
@@ -124,23 +128,30 @@ impl SecretStore {
     }
 }
 
-async fn fetch_values(config: &SecretsConfig) -> Result<HashMap<String, String>, SecretError> {
-    config.validate()?;
-    let names = config.expand(&[])?;
-    match config.provider {
-        Provider::AwsSsm => {
-            let client = AwsSsm::new(config.region.clone(), config.profile.clone());
-            client.fetch(&config.vars, &names).await
-        }
+/// Fetch every source in order. A name defined by more than one source takes
+/// the value of the last source that supplies it.
+async fn fetch_values(sources: &[SecretsConfig]) -> Result<HashMap<String, String>, SecretError> {
+    let mut values = HashMap::new();
+    for source in sources {
+        source.validate()?;
+        let names = source.expand(&[])?;
+        let fetched = match &source.kind {
+            SecretKind::AwsSsm(aws) => {
+                let client = AwsSsm::new(aws.region.clone(), aws.profile.clone());
+                client.fetch(&source.vars, &names).await?
+            }
+        };
+        values.extend(fetched);
     }
+    Ok(values)
 }
 
 /// Fetch every mapped secret. Raced against shutdown so Ctrl+C is not stuck on AWS.
 pub async fn resolve(
-    config: &SecretsConfig,
+    sources: &[SecretsConfig],
     shutdown: &mut mpsc::Receiver<()>,
 ) -> Result<SecretStore, SecretError> {
-    let pull = fetch_values(config);
+    let pull = fetch_values(sources);
     tokio::pin!(pull);
     let values = tokio::select! {
         result = &mut pull => result?,
@@ -148,7 +159,7 @@ pub async fn resolve(
             return Err(SecretError::msg("interrupted while fetching secrets"));
         }
     };
-    Ok(SecretStore::from_config(config, values))
+    Ok(SecretStore::from_sources(sources, values))
 }
 
 #[cfg(test)]

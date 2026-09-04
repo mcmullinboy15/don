@@ -102,9 +102,8 @@ exec sleep 60
         let toml = ConfigBuilder::new()
             .raw(
                 r#"
-[secrets]
-provider = "aws-ssm"
-region = "us-east-1"
+[[secrets]]
+aws-ssm = { region = "us-east-1" }
 [secrets.vars]
 STRIPE_SECRET_KEY = "/app/StripeSecretKey"
 DD_API_KEY = "/app/Datadog/ApiKey"

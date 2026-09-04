@@ -4,14 +4,14 @@ use crate::secrets::{Group, SecretsConfig, expand_secret_refs};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) fn validate_secrets(
-    secrets: Option<&SecretsConfig>,
+    secrets: &[SecretsConfig],
     services: &HashMap<String, super::Service>,
     tasks: &HashMap<String, super::Task>,
     service_groups: &HashMap<String, super::ServiceGroup>,
     suggest_typo: impl Fn(&str, &HashSet<&str>) -> String,
     errors: &mut Vec<String>,
 ) {
-    let configured = secrets.is_some();
+    let configured = !secrets.is_empty();
     if !configured {
         for (name, svc) in services {
             if svc.secrets.is_some() {
@@ -37,18 +37,24 @@ pub(crate) fn validate_secrets(
         return;
     }
 
-    let Some(secrets) = secrets else {
-        return;
-    };
-
-    for error in secrets.mapping_errors() {
-        errors.push(format!("[secrets] {error}"));
+    for (i, source) in secrets.iter().enumerate() {
+        for error in source.mapping_errors() {
+            errors.push(format!("[[secrets]] #{}: {error}", i + 1));
+        }
     }
 
-    let var_names: HashSet<&str> = secrets.vars.keys().map(String::as_str).collect();
+    // A process may name anything any source supplies, so refs resolve against
+    // the union rather than one entry.
+    let mut var_names: HashSet<&str> = HashSet::new();
     let mut group_names: HashSet<&str> = HashSet::new();
-    for name in secrets.groups.keys() {
-        group_names.insert(name.as_str());
+    for source in secrets {
+        var_names.extend(source.vars.keys().map(String::as_str));
+        group_names.extend(source.groups.keys().map(String::as_str));
+    }
+
+    let mut all_groups: HashMap<String, Group> = HashMap::new();
+    for source in secrets {
+        all_groups.extend(source.groups.clone());
     }
 
     let mut candidates: HashSet<&str> = var_names.iter().copied().collect();
@@ -60,7 +66,7 @@ pub(crate) fn validate_secrets(
             name,
             svc.secrets.as_deref().unwrap_or(&[]),
             &var_names,
-            &secrets.groups,
+            &all_groups,
             &candidates,
             &suggest_typo,
             errors,
@@ -72,7 +78,7 @@ pub(crate) fn validate_secrets(
                     &format!("{name}.platform.{platform}"),
                     refs,
                     &var_names,
-                    &secrets.groups,
+                    &all_groups,
                     &candidates,
                     &suggest_typo,
                     errors,
@@ -86,7 +92,7 @@ pub(crate) fn validate_secrets(
             name,
             task.secrets.as_deref().unwrap_or(&[]),
             &var_names,
-            &secrets.groups,
+            &all_groups,
             &candidates,
             &suggest_typo,
             errors,
@@ -98,7 +104,7 @@ pub(crate) fn validate_secrets(
             name,
             &group.secrets,
             &var_names,
-            &secrets.groups,
+            &all_groups,
             &candidates,
             &suggest_typo,
             errors,
@@ -144,8 +150,8 @@ mod tests {
             Case {
                 name: "valid mapping and per-service list",
                 don: r#"
-                    [secrets]
-                    provider = "aws-ssm"
+                    [[secrets]]
+                    aws-ssm = {}
                     [secrets.vars]
                     STRIPE_SECRET_KEY = "/app/StripeSecretKey"
                     DD_API_KEY = "/app/Datadog/ApiKey"
@@ -162,8 +168,8 @@ mod tests {
             Case {
                 name: "unknown secret gets a suggestion",
                 don: r#"
-                    [secrets]
-                    provider = "aws-ssm"
+                    [[secrets]]
+                    aws-ssm = {}
                     [secrets.vars]
                     STRIPE_SECRET_KEY = "/app/StripeSecretKey"
                     [services.api]
@@ -184,8 +190,8 @@ mod tests {
             Case {
                 name: "ssm path must start with slash",
                 don: r#"
-                    [secrets]
-                    provider = "aws-ssm"
+                    [[secrets]]
+                    aws-ssm = {}
                     [secrets.vars]
                     STRIPE_SECRET_KEY = "app/StripeSecretKey"
                     [services.api]

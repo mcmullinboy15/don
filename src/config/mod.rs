@@ -112,7 +112,8 @@ pub struct Config {
     pub bazel: BazelDefaults,
     /// Same table as key.toml, nested here. Names and paths only; never values.
     #[serde(default)]
-    pub secrets: Option<SecretsConfig>,
+    /// `[[secrets]]` entries, in order. A later source wins a name collision.
+    pub secrets: Vec<SecretsConfig>,
 }
 
 impl std::str::FromStr for Config {
@@ -558,7 +559,7 @@ impl Config {
         validate_log_filter("global log_exclude", &self.log_exclude, &mut errors);
 
         secrets::validate_secrets(
-            self.secrets.as_ref(),
+            &self.secrets,
             &self.services,
             &self.tasks,
             &self.service_groups,
@@ -2540,8 +2541,8 @@ mod tests {
             ConfigTestCase {
                 name: "service group secrets inherit unless the member declares its own",
                 input: r#"
-                    [secrets]
-                    provider = "aws-ssm"
+                    [[secrets]]
+                    aws-ssm = {}
                     [secrets.vars]
                     LAUNCH_DARKLY_SDK_KEY = "/app/Ld"
                     STRIPE_WEBHOOK_SECRET = "/app/StripeWebhook"

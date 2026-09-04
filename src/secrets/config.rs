@@ -1,15 +1,29 @@
-//! Mapping: names and SSM paths only. Same table as key.toml, nested under [secrets].
+//! Mapping: names and paths only, one `[[secrets]]` entry per provider.
 
 use super::error::SecretError;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-/// How values are fetched. This crate currently implements AWS SSM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Provider {
+/// The kind of secret source — exactly one of these must be set.
+///
+/// Mirrors ServiceKind: the key names the variant, so settings only that
+/// provider understands live with it rather than at the top level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretKind {
     /// AWS Systems Manager Parameter Store (`aws ssm get-parameters`).
-    AwsSsm,
+    AwsSsm(AwsSsmConfig),
+}
+
+/// Settings only AWS SSM understands.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsSsmConfig {
+    #[serde(default)]
+    pub region: Option<String>,
+    /// AWS profile. Two sources may name different profiles, which is how one
+    /// run reads parameters that live in separate accounts.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// A named bundle of secret keys, referenced from `secrets = ["group"]`.
@@ -38,18 +52,40 @@ impl From<RawGroup> for Group {
     }
 }
 
-/// Body of `[secrets]` in don.toml, and of a standalone key.toml.
+/// One `[[secrets]]` entry: a provider, and the names it can supply.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawSecretsConfig")]
 pub struct SecretsConfig {
-    pub provider: Provider,
-    #[serde(default)]
-    pub region: Option<String>,
-    #[serde(default)]
-    pub profile: Option<String>,
-    #[serde(default)]
+    pub kind: SecretKind,
     pub vars: HashMap<String, String>,
-    #[serde(default)]
     pub groups: HashMap<String, Group>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSecretsConfig {
+    #[serde(rename = "aws-ssm")]
+    aws_ssm: Option<AwsSsmConfig>,
+    #[serde(default)]
+    vars: HashMap<String, String>,
+    #[serde(default)]
+    groups: HashMap<String, Group>,
+}
+
+impl TryFrom<RawSecretsConfig> for SecretsConfig {
+    type Error = String;
+
+    fn try_from(raw: RawSecretsConfig) -> Result<Self, Self::Error> {
+        let kind = match raw.aws_ssm {
+            Some(config) => SecretKind::AwsSsm(config),
+            None => return Err("[[secrets]]: needs a provider — the only one is aws-ssm".into()),
+        };
+        Ok(SecretsConfig {
+            kind,
+            vars: raw.vars,
+            groups: raw.groups,
+        })
+    }
 }
 
 impl SecretsConfig {
@@ -76,7 +112,7 @@ impl SecretsConfig {
             }
             if path.is_empty() {
                 errors.push(format!("vars.{name}: path is empty"));
-            } else if self.provider == Provider::AwsSsm && !path.starts_with('/') {
+            } else if matches!(self.kind, SecretKind::AwsSsm(_)) && !path.starts_with('/') {
                 errors.push(format!(
                     "vars.{name}: SSM parameter path '{path}' must start with '/'"
                 ));
@@ -197,7 +233,7 @@ mod tests {
     fn expand_groups_and_dedupes() {
         let file: SecretsConfig = toml::from_str(
             r#"
-            provider = "aws-ssm"
+            aws-ssm = {}
             [vars]
             A = "/app/A"
             B = "/app/B"
@@ -218,7 +254,7 @@ mod tests {
     fn ssm_path_must_start_with_slash() {
         let file: SecretsConfig = toml::from_str(
             r#"
-            provider = "aws-ssm"
+            aws-ssm = {}
             [vars]
             A = "app/A"
             "#,

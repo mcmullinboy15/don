@@ -78,28 +78,47 @@ services = ["api", "scratch"]
 
 ### Secrets
 
-Secrets are first-class in Don. The `[secrets]` table is the same mapping a
-standalone `key.toml` would hold, nested under a prefix. Values never live in
-config, and Don never writes them to disk. `src/secrets/` is shaped to extract
-later as the `key` crate; Don does not shell out to a Key binary.
+Secrets are first-class in Don. Values never live in config, and Don never
+writes them to disk. `src/secrets/` is shaped to extract later as the `key`
+crate; Don does not shell out to a Key binary.
+
+Each `[[secrets]]` entry is one source. The provider is named by its key, the
+way a service names its kind, so settings only that provider understands sit
+inside it rather than at the top level. A source that names no provider is a
+config error.
 
 ```toml
-[secrets]
-provider = "aws-ssm"
-region = "us-east-1"
-profile = "dev"
-
-[secrets.vars]
-STRIPE_SECRET_KEY = "/app/StripeSecretKey"
-DD_API_KEY = "/app/Datadog/ApiKey"
-
-[secrets.groups]
-app = ["STRIPE_SECRET_KEY"]
+[[secrets]]
+aws-ssm = { region = "us-east-1", profile = "dev" }
+vars = { STRIPE_SECRET_KEY = "/app/StripeSecretKey" }
+groups = { app = ["STRIPE_SECRET_KEY"] }
 
 [services.api]
 run.cmd = "./api"
 secrets = ["app"]        # only these keys are exported to this process
 ```
+
+Because it is a list, each entry fetches with its own credentials, so one run
+can read parameters that live in separate accounts:
+
+```toml
+[[secrets]]
+aws-ssm = { profile = "dev" }
+vars = { STRIPE_SECRET_KEY = "/RedoDevelopment/StripeSecretKey" }
+
+[[secrets]]
+aws-ssm = { profile = "prod" }
+vars = { LAUNCH_DARKLY_SDK_KEY = "/RedoProduction/LaunchDarklySdkKey" }
+```
+
+Groups and managed names are the union across sources, so a process may declare
+a group from one and a key from another. A name supplied by more than one source
+takes the value of the last source that supplies it.
+
+A profile override replaces the list rather than merging into it, so a profile
+states its sources in full. A provider named only in one profile does not exist
+in any other, which is what keeps a dev stack from needing production
+credentials.
 
 `[service_groups.*] secrets` is the grant for members that omit `secrets`.
 A member that sets `secrets` replaces the group list (it is not merged).
