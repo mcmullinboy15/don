@@ -1,5 +1,5 @@
 use crate::process::ProcessKind;
-use crate::process::paths::any_glob_path_changed_since;
+use crate::process::paths::FileChangeScan;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -747,6 +747,7 @@ pub(crate) async fn run_batch_build_chain(
     // name gets exactly one outcome — a supervisor is waiting on it and
     // silence would leave it parked forever.
     let checks_started = Instant::now();
+    let mut scan = FileChangeScan::default();
     if built_count > 0 {
         emitter.lifecycle_event("checking for files changed during build...");
     }
@@ -760,8 +761,13 @@ pub(crate) async fn run_batch_build_chain(
                 resolved_info_by_item.get(&item.name),
                 &base_dir,
                 scan_since,
+                std::mem::take(&mut scan),
             )
-            .await;
+            .await
+            .map(|(returned_scan, reason)| {
+                scan = returned_scan;
+                reason
+            });
             emitter.service_debug_event(
                 &item.name,
                 &format!(
@@ -810,20 +816,24 @@ async fn stale_since(
     info: Option<&crate::build_tool::ResolvedBuildInfo>,
     base_dir: &Path,
     scan_since: SystemTime,
-) -> Result<Option<&'static str>, tokio::task::JoinError> {
+    mut scan: FileChangeScan,
+) -> Result<(FileChangeScan, Option<&'static str>), tokio::task::JoinError> {
     if !item.watch_enabled {
-        return Ok(None);
+        return Ok((scan, None));
     }
     let Some(info) = info else {
-        return Ok(None);
+        return Ok((scan, None));
     };
     let item = item.clone();
     let info = info.clone();
     let base_dir = base_dir.to_path_buf();
     // A cancelled prepare discards this read-only result without blocking
     // the runner's shutdown or allowing a supervisor to start the artifact.
-    tokio::task::spawn_blocking(move || check_stale_since(&item, &info, &base_dir, scan_since))
-        .await
+    tokio::task::spawn_blocking(move || {
+        let reason = check_stale_since(&item, &info, &base_dir, scan_since, &mut scan);
+        (scan, reason)
+    })
+    .await
 }
 
 fn check_stale_since(
@@ -831,11 +841,12 @@ fn check_stale_since(
     info: &crate::build_tool::ResolvedBuildInfo,
     base_dir: &Path,
     scan_since: SystemTime,
+    scan: &mut FileChangeScan,
 ) -> Option<&'static str> {
     let source_changed =
-        any_glob_path_changed_since(base_dir, &info.watch_paths, &item.ignore, scan_since);
+        scan.any_changed_since(base_dir, &info.watch_paths, &item.ignore, scan_since);
     let graph_changed =
-        any_glob_path_changed_since(base_dir, &info.graph_definition_globs, &[], scan_since);
+        scan.any_changed_since(base_dir, &info.graph_definition_globs, &[], scan_since);
     match (source_changed, graph_changed, item.kind) {
         (true, true, ProcessKind::Service) => {
             Some("files changed during build — rebuilding before start")
@@ -1014,9 +1025,72 @@ mod tests {
                 graph_definition_globs: vec!["BUILD".into(), "BUILD.bazel".into()],
             };
             assert_eq!(
-                stale_since(&item, Some(&info), repo, since).await.unwrap(),
+                stale_since(&item, Some(&info), repo, since, FileChangeScan::default())
+                    .await
+                    .unwrap()
+                    .1,
                 case.want
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_freshness_checks_keep_per_service_and_graph_decisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        let since = SystemTime::now() + std::time::Duration::from_secs(60);
+        for file in ["src/app.rs", "BUILD.bazel"] {
+            std::fs::write(repo.join(file), "").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(repo.join(file))
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(since + std::time::Duration::from_secs(60)),
+                )
+                .unwrap();
+        }
+        let info = crate::build_tool::ResolvedBuildInfo {
+            watch_paths: vec!["src/**".into()],
+            graph_definition_globs: vec!["BUILD.bazel".into()],
+        };
+        let mut scan = FileChangeScan::default();
+        for (name, watch, ignore, kind, want) in [
+            ("disabled", false, false, ProcessKind::Service, None),
+            (
+                "ignored",
+                true,
+                true,
+                ProcessKind::Service,
+                Some("build graph changed during build — rebuilding before start"),
+            ),
+            (
+                "api",
+                true,
+                false,
+                ProcessKind::Service,
+                Some("files changed during build — rebuilding before start"),
+            ),
+            (
+                "worker",
+                true,
+                false,
+                ProcessKind::Task,
+                Some("files changed during build — re-running build before start"),
+            ),
+        ] {
+            let mut item = bazel_item(name, watch);
+            item.kind = kind;
+            if ignore {
+                item.ignore = vec!["src/**".into(), "BUILD.bazel".into()];
+            }
+            let reason;
+            (scan, reason) = stale_since(&item, Some(&info), repo, since, scan)
+                .await
+                .unwrap();
+            assert_eq!(reason, want, "{name}");
         }
     }
 

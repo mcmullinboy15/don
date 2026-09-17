@@ -1,7 +1,9 @@
 use crate::globwalk::{
     glob_pattern_base_dir, has_glob_metacharacters, matches_glob, matches_ignore,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 pub(crate) fn working_dir_for(base_dir: &Path, dir: Option<&Path>) -> PathBuf {
@@ -38,13 +40,55 @@ pub(crate) fn resolve_watch_ignore_patterns(
     patterns
 }
 
+/// Filesystem observations shared only within one post-build batch.
+#[derive(Default)]
+pub(crate) struct FileChangeScan {
+    metadata: HashMap<PathBuf, Option<std::fs::Metadata>>,
+    directories: HashMap<PathBuf, Arc<[PathBuf]>>,
+}
+
+impl FileChangeScan {
+    pub(crate) fn any_changed_since(
+        &mut self,
+        base_dir: &Path,
+        patterns: &[String],
+        ignore_patterns: &[String],
+        since: SystemTime,
+    ) -> bool {
+        scan_changed_paths(base_dir, patterns, ignore_patterns, since, self)
+    }
+
+    fn metadata(&mut self, path: &Path) -> Option<std::fs::Metadata> {
+        self.metadata
+            .entry(path.to_path_buf())
+            .or_insert_with(|| std::fs::symlink_metadata(path).ok())
+            .clone()
+    }
+
+    fn entries(&mut self, path: &Path) -> Arc<[PathBuf]> {
+        Arc::clone(
+            self.directories
+                .entry(path.to_path_buf())
+                .or_insert_with(|| {
+                    std::fs::read_dir(path)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .collect()
+                }),
+        )
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn any_glob_path_changed_since(
     base_dir: &Path,
     patterns: &[String],
     ignore_patterns: &[String],
     since: SystemTime,
 ) -> bool {
-    scan_changed_paths(base_dir, patterns, ignore_patterns, since, &mut |_| {})
+    FileChangeScan::default().any_changed_since(base_dir, patterns, ignore_patterns, since)
 }
 
 fn scan_changed_paths(
@@ -52,7 +96,7 @@ fn scan_changed_paths(
     patterns: &[String],
     ignore_patterns: &[String],
     since: SystemTime,
-    visit: &mut impl FnMut(&Path),
+    scan: &mut FileChangeScan,
 ) -> bool {
     let absolute_ignore: Vec<glob::Pattern> = ignore_patterns
         .iter()
@@ -69,16 +113,17 @@ fn scan_changed_paths(
             // Literal BUILD paths need no directory walk, even when they are absent.
             if resolved.parent().is_some_and(|parent| {
                 is_ignored(parent, &absolute_ignore)
-                    || std::fs::symlink_metadata(parent)
-                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                    || scan
+                        .metadata(parent)
+                        .is_some_and(|metadata| metadata.file_type().is_symlink())
             }) || is_ignored(&resolved, &absolute_ignore)
             {
                 continue;
             }
-            visit(&resolved);
-            if std::fs::symlink_metadata(&resolved)
-                .and_then(|metadata| metadata.modified())
-                .is_ok_and(|modified| modified > since)
+            if scan
+                .metadata(&resolved)
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified| modified > since)
             {
                 return true;
             }
@@ -96,7 +141,7 @@ fn scan_changed_paths(
     }
 
     walks.into_iter().any(|(root, patterns)| {
-        scan_tree_for_changes(&root, &patterns, &absolute_ignore, since, visit)
+        scan_tree_for_changes(&root, &patterns, &absolute_ignore, since, scan)
     })
 }
 
@@ -112,13 +157,12 @@ fn scan_tree_for_changes(
     patterns: &[glob::Pattern],
     ignore_patterns: &[glob::Pattern],
     since: SystemTime,
-    visit: &mut impl FnMut(&Path),
+    scan: &mut FileChangeScan,
 ) -> bool {
     if is_ignored(path, ignore_patterns) {
         return false;
     }
-    visit(path);
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+    let Some(metadata) = scan.metadata(path) else {
         return false;
     };
     let path_str = path.to_string_lossy();
@@ -138,11 +182,9 @@ fn scan_tree_for_changes(
         return false;
     }
 
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        if scan_tree_for_changes(&entry.path(), patterns, ignore_patterns, since, visit) {
+    let entries = scan.entries(path);
+    for entry in entries.iter() {
+        if scan_tree_for_changes(entry, patterns, ignore_patterns, since, scan) {
             return true;
         }
     }
@@ -221,6 +263,18 @@ mod tests {
                 want: true,
             },
             Case {
+                patterns: &["src/**/*.rs", "src/nested/*.ts", "src/**/*.rs"],
+                ignore: &[],
+                changed_file: "src/nested/deep.ts",
+                want: true,
+            },
+            Case {
+                patterns: &["src/**/*.rs", "src/nested/*.ts", "src/**/*.rs"],
+                ignore: &["src/nested/**"],
+                changed_file: "src/nested/deep.ts",
+                want: false,
+            },
+            Case {
                 patterns: &["src/**/*.rs", "src/nested/*.ts"],
                 ignore: &["src/nested"],
                 changed_file: "src/nested/deep.ts",
@@ -287,40 +341,91 @@ mod tests {
             vec!["pkg/BUILD".to_string(), "pkg/BUILD.bazel".to_string()],
         ];
         for patterns in cases {
-            let mut visited = Vec::new();
-            assert!(!scan_changed_paths(
+            let mut scan = FileChangeScan::default();
+            assert!(!scan.any_changed_since(
                 repo,
                 &patterns,
                 &[],
                 SystemTime::now() + Duration::from_secs(60),
-                &mut |path| visited.push(path.to_path_buf())
             ));
-            let expected = patterns.iter().map(|p| repo.join(p)).collect::<Vec<_>>();
-            assert_eq!(visited, expected);
+            assert!(scan.directories.is_empty(), "patterns={patterns:?}");
         }
     }
 
     #[test]
-    fn overlapping_globs_visit_each_path_once() {
+    fn shared_scan_keeps_each_services_patterns_ignores_and_cutoff() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
-        fs::create_dir_all(repo.join("src/nested")).unwrap();
+        fs::create_dir(repo.join("src")).unwrap();
         fs::write(repo.join("src/app.rs"), "").unwrap();
-        fs::write(repo.join("src/nested/deep.ts"), "").unwrap();
-        let patterns = ["src/**/*.rs", "src/nested/*.ts", "src/**/*.rs"].map(String::from);
-        let mut visited = Vec::new();
-        assert!(!scan_changed_paths(
-            repo,
-            &patterns,
-            &[],
-            SystemTime::now() + Duration::from_secs(60),
-            &mut |path| visited.push(path.to_path_buf())
-        ));
-        let mut unique = visited.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(visited.len(), unique.len());
-        assert!(visited.contains(&repo.join("src/nested/deep.ts")));
+        let since = SystemTime::now() + Duration::from_secs(60);
+        let modified = since + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(repo.join("src/app.rs"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let mut scan = FileChangeScan::default();
+        for (pattern, ignore, cutoff, want) in [
+            ("src/**/*.ts", "", since, false),
+            ("src/**/*.rs", "src/app.rs", since, false),
+            ("src/**/*.rs", "", since, true),
+            ("src/*.rs", "", modified, false),
+            ("src/app.rs", "src", since, false),
+            ("src/app.rs", "", since, true),
+        ] {
+            let ignore = if ignore.is_empty() {
+                Vec::new()
+            } else {
+                vec![ignore.into()]
+            };
+            assert_eq!(
+                scan.any_changed_since(repo, &[pattern.into()], &ignore, cutoff),
+                want,
+                "pattern={pattern}, ignore={ignore:?}, cutoff={cutoff:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_reuses_observations_until_next_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        fs::create_dir(repo.join("src")).unwrap();
+        fs::write(repo.join("src/app.rs"), "").unwrap();
+        let since = SystemTime::now() + Duration::from_secs(60);
+        let patterns = ["src/app.rs", "src/*.ts", "src/new.ts"];
+        let mut first = FileChangeScan::default();
+        for pattern in patterns {
+            assert!(!first.any_changed_since(repo, &[pattern.into()], &[], since));
+        }
+        for file in ["src/app.rs", "src/new.ts"] {
+            fs::write(repo.join(file), "changed").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(repo.join(file))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(since + Duration::from_secs(60)))
+                .unwrap();
+        }
+        for pattern in patterns {
+            assert!(!first.any_changed_since(repo, &[pattern.into()], &[], since));
+        }
+        drop(first);
+        let mut second = FileChangeScan::default();
+        for pattern in patterns {
+            assert!(second.any_changed_since(repo, &[pattern.into()], &[], since));
+        }
+        fs::remove_file(repo.join("src/new.ts")).unwrap();
+        for pattern in ["src/*.ts", "src/new.ts"] {
+            assert!(second.any_changed_since(repo, &[pattern.into()], &[], since));
+        }
+        drop(second);
+        let mut third = FileChangeScan::default();
+        for pattern in ["src/*.ts", "src/new.ts"] {
+            assert!(!third.any_changed_since(repo, &[pattern.into()], &[], since));
+        }
     }
 
     #[test]
