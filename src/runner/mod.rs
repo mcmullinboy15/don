@@ -340,14 +340,6 @@ impl Runner {
             &base_dir,
             &config.watch_ignore,
         );
-        let (batcher_tx, batcher_handle) = build_batcher::spawn(
-            state_reader,
-            output_manager.clone_lifecycle_emitter(),
-            build_batcher::WorkspaceContext {
-                base_dir: base_dir.clone(),
-                global_watch_ignore: global_watch_ignore.clone(),
-            },
-        );
         let (watch_status_tx, watch_status_reader) = crate::watch::report::status_channel();
         let completions = crate::param_completions::CompletionResolver::new(
             config.tasks.clone(),
@@ -389,6 +381,16 @@ impl Runner {
             headless,
         )
         .await;
+
+        let (batcher_tx, batcher_handle) = build_batcher::spawn(
+            state_reader,
+            output_manager.clone_lifecycle_emitter(),
+            build_batcher::WorkspaceContext {
+                base_dir: base_dir.clone(),
+                startup_tasks: tasks.keys().cloned().collect(),
+                global_watch_ignore: global_watch_ignore.clone(),
+            },
+        );
 
         // Bind every proxy before any supervisor exists, so a port conflict
         // fails startup before anything spawns — "validate everything before

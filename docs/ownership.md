@@ -352,7 +352,10 @@ The load-bearing detail:
 
 An artifact can be built before its dependencies are up — bazel does not care
 whether postgres is listening. So a supervisor requests its build **when it is
-constructed**, not when its dependencies become satisfied. Every supervisor asks at once, the
+constructed**, not when its dependencies become satisfied. Tasks first check
+whether startup will run them: manual tasks, unchanged watched inputs, and
+already-completed once tasks request no artifact. Runnable tasks queue their
+artifacts before waiting for dependencies. Every eligible supervisor asks up front, the
 debounce window coalesces them, and bazel gets one invocation for the whole
 workspace. Building only once dependencies were satisfied would serialise builds along the
 dependency chain, which is the one real regression this ordering avoids by
@@ -364,8 +367,9 @@ One request is late by construction, and it is why nothing builds the instant
 `Runner::new` returns. Watch paths are resolved *by* these builds and have to
 reach the watcher before anything spawns — but the watcher does not exist
 until the runner has set it up. The build manager parks preparation requests
-until the runner says `WatchReady`, which is also what guarantees the whole
-startup burst leaves as one batch. A supervisor then waits for its outcome
+until the runner says `WatchReady` and every task has finished its startup
+check. This keeps slow input hashing in the same initial batch. Later explicit
+task runs still request a fresh build. A supervisor then waits for its outcome
 before spawning, so the registrations are always in place first.
 
 ### Two rules that come with it
