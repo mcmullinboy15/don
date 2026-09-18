@@ -53,9 +53,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
-use std::time::SystemTime;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[cfg(test)]
@@ -128,7 +126,12 @@ pub enum RunnerEvent {
     },
     /// The initial startup sweep has decided every process — nothing is left
     /// merely being *considered*. Fires once per run.
-    StartupSettled,
+    StartupSettled {
+        /// Unix epoch milliseconds when this Don run began.
+        started_at: u64,
+        /// Monotonic elapsed milliseconds from run start to startup settlement.
+        elapsed_ms: u64,
+    },
     /// Graceful shutdown has started.
     ShutdownStarted,
     /// Shutdown complete — the runner's last word before its streams close.
@@ -179,6 +182,7 @@ pub struct Runner {
     /// construction rather than when the first service starts: what the user
     /// is asking is "how long was don up", and don was up from here.
     started_at: Instant,
+    started_at_wall_clock_ms: u64,
 
     /// Consolidated per-service runtime state.
     services: HashMap<String, RuntimeService>,
@@ -604,6 +608,10 @@ impl Runner {
             output_manager,
             base_dir,
             started_at: Instant::now(),
+            started_at_wall_clock_ms: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             services,
             tasks,
             report_rx,
@@ -1157,7 +1165,10 @@ impl Runner {
                     // issuing a command — see `StateReader::
                     // wait_for_startup_complete`.
                     self.state.set_startup_complete(true);
-                    let _ = self.event_tx.send(RunnerEvent::StartupSettled);
+                    let _ = self.event_tx.send(RunnerEvent::StartupSettled {
+                        started_at: self.started_at_wall_clock_ms,
+                        elapsed_ms: self.started_at.elapsed().as_millis() as u64,
+                    });
                     let starts = self.service_starts.registry();
                     let has_running_services = self.services.iter().any(|(name, _rs)| {
                         matches!(
