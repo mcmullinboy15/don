@@ -685,6 +685,7 @@ async fn supervise(
         evaluated: false,
         pid: None,
         last_run: startup_cfg.last_run.clone(),
+        report_pending: false,
     };
     owner.publish();
     let service_writer = output.as_ref().map(|output| output.writer());
@@ -1479,7 +1480,8 @@ async fn supervise(
                 result,
                 start.elapsed(),
                 waiter.take(),
-                |success, last_run| {
+                |success, last_run, report_pending| {
+                    owner.report_pending = report_pending;
                     if success {
                         owner.complete(last_run);
                     } else {
@@ -1527,6 +1529,7 @@ struct TaskPhaseOwner {
     evaluated: bool,
     pid: Option<i32>,
     last_run: Option<TaskRunInfo>,
+    report_pending: bool,
 }
 
 impl TaskPhaseOwner {
@@ -1561,14 +1564,16 @@ impl TaskPhaseOwner {
         } else {
             Vec::new()
         };
-        self.facts.publish(crate::facts::ProcessFacts::for_task(
+        let mut facts = crate::facts::ProcessFacts::for_task(
             &self.name,
             self.phase,
             self.satisfied(),
             self.pid,
             self.last_run.clone(),
             stranded,
-        ));
+        );
+        facts.report_pending = self.report_pending;
+        self.facts.publish(facts);
     }
 
     fn set(&mut self, phase: crate::process::TaskState) {
@@ -1884,7 +1889,9 @@ impl TaskRunOutcome {
     /// only the run info, leaving the previous input hashes stale on purpose
     /// so the task is not skipped next time.
     ///
-    /// Returns the run info so the caller can publish this task's phase
+    /// Publishes the outcome with a pending-report flag, queues the report,
+    /// then clears the flag. This keeps the root alive if it observes the
+    /// terminal phase before the report is queued. The phase still arrives
     /// *before* the report goes out. That ordering is load-bearing: the
     /// scheduler drains facts before handling any report, which only makes
     /// "the reply implies the phase is visible" true if the facts were sent
@@ -1894,7 +1901,7 @@ impl TaskRunOutcome {
         result: Result<std::process::ExitStatus, super::task::TaskError>,
         elapsed: Duration,
         reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
-        publish: impl FnOnce(bool, Option<TaskRunInfo>),
+        mut publish: impl FnMut(bool, Option<TaskRunInfo>, bool),
     ) {
         let (success, exit_code, message) = match result {
             Ok(status) if status.success() => (true, status.code(), None),
@@ -1929,8 +1936,8 @@ impl TaskRunOutcome {
             let _ = task_state.record_run(&self.name, &last_run).await;
         }
 
-        // Phase first, then the report that carries the reply.
-        publish(success, Some(last_run.clone()));
+        // Keep the root alive across the gap between these two channels.
+        publish(success, Some(last_run.clone()), true);
         let _ = self
             .report_tx
             .send(super::ProcessReport::TaskExited(TaskExit {
@@ -1938,9 +1945,10 @@ impl TaskRunOutcome {
                 success,
                 message,
                 elapsed: Some(elapsed),
-                last_run: Some(last_run),
+                last_run: Some(last_run.clone()),
                 reply,
             }));
+        publish(success, Some(last_run), false);
     }
 }
 
@@ -2528,6 +2536,7 @@ mod tests {
             evaluated: true,
             pid: None,
             last_run: None,
+            report_pending: false,
         }
     }
 
@@ -3076,7 +3085,12 @@ mod tests {
             let (report_tx, mut report_rx) = mpsc::unbounded_channel();
 
             outcome("build", temp.path(), report_tx)
-                .finish(Ok(case.status), Duration::from_millis(5), None, |_, _| {})
+                .finish(
+                    Ok(case.status),
+                    Duration::from_millis(5),
+                    None,
+                    |_, _, _| {},
+                )
                 .await;
 
             let Ok(super::super::ProcessReport::TaskExited(exit)) = report_rx.try_recv() else {
@@ -3104,7 +3118,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let (report_tx, _report_rx) = mpsc::unbounded_channel();
             outcome("build", temp.path(), report_tx)
-                .finish(Ok(status), Duration::from_millis(1), None, |_, _| {})
+                .finish(Ok(status), Duration::from_millis(1), None, |_, _, _| {})
                 .await;
 
             let state = TaskStateStore::new(temp.path().join(".don").join("task-state"));

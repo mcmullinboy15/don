@@ -204,6 +204,9 @@ not an accident:
    event**, and narrates before publishing anything that unblocks a dependent.
    Publishing is what releases the processes waiting on you; a line emitted
    afterwards lands behind the "starting..." it was meant to explain.
+   Terminal task facts carry `report_pending` until the exit report is queued,
+   so a task-only stack cannot exit in the gap between those channels. Clearing
+   it publishes another update, waking a root that already consumed the report.
 2. **The root drains facts before handling any report or command.** Both
    channels are unbounded, so by the time a report is dequeued the facts behind
    it are already queued. That is what makes "`don stop` returned" imply "no
