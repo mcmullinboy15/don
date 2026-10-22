@@ -18,14 +18,17 @@
 //! This module deliberately knows nothing about the runner — see
 //! [`signal`] for why the two vocabularies are separate.
 
+mod patterns;
 pub(crate) mod report;
 pub(crate) mod signal;
 
 pub(crate) use signal::WatchDispatch;
 
+use patterns::WatchPatterns;
+
 use crate::config::{Config, Platform};
 use crate::duration::parse_duration;
-use crate::globwalk::{matches_glob, matches_ignore};
+use crate::globwalk::matches_ignore;
 use crate::output::LifecycleEmitter;
 use glob::Pattern;
 use ignore::overrides::{Override, OverrideBuilder};
@@ -172,7 +175,7 @@ struct WatchedItem {
     /// What kind of item this is — determines who is told.
     kind: WatchItemKind,
     /// Glob patterns for matching file events.
-    patterns: Vec<Pattern>,
+    patterns: WatchPatterns,
     /// Glob patterns for ignoring file events (checked before watch patterns).
     ignore_patterns: Vec<Pattern>,
     /// What this item has seen since its debounce window opened, narrated when
@@ -568,7 +571,7 @@ impl WatchManager {
                     debounce_duration: debounce,
                     debounce_deadline: None,
                     kind: WatchItemKind::Service,
-                    patterns: compiled_patterns,
+                    patterns: WatchPatterns::new(compiled_patterns),
                     ignore_patterns: compiled_ignore,
                     window: WindowTally::default(),
                     last_error: None,
@@ -665,7 +668,7 @@ impl WatchManager {
                     debounce_duration: task_debounce,
                     debounce_deadline: None,
                     kind: WatchItemKind::Task,
-                    patterns: compiled_patterns,
+                    patterns: WatchPatterns::new(compiled_patterns),
                     ignore_patterns: compiled_ignore,
                     window: WindowTally::default(),
                     last_error: None,
@@ -774,7 +777,7 @@ impl WatchManager {
                             debounce_duration: DEFAULT_DEBOUNCE,
                             debounce_deadline: None,
                             kind: WatchItemKind::BuildGraph,
-                            patterns: compiled_patterns,
+                            patterns: WatchPatterns::new(compiled_patterns),
                             ignore_patterns: compiled_ignore,
                             window: WindowTally::default(),
                             last_error: None,
@@ -980,7 +983,7 @@ impl WatchManager {
                     debounce_duration: DEFAULT_DEBOUNCE,
                     debounce_deadline: None,
                     kind: update.kind,
-                    patterns: compiled_patterns,
+                    patterns: WatchPatterns::new(compiled_patterns),
                     ignore_patterns: compiled_ignore,
                     window: WindowTally::default(),
                     last_error: None,
@@ -1091,11 +1094,7 @@ impl WatchManager {
                     ignored_here.push(name.clone());
                     continue;
                 }
-                if let Some(pattern) = item
-                    .patterns
-                    .iter()
-                    .find(|pattern| matches_glob(pattern, &path_str))
-                {
+                if let Some(pattern) = item.patterns.find_match(&path_str) {
                     if item.window.example.is_none() {
                         item.window.example =
                             Some((path_str.to_string(), pattern.as_str().to_string()));
@@ -1172,7 +1171,11 @@ impl WatchManager {
     /// path isn't a directory, is already covered by an existing watch, or is
     /// itself ignored — so a fresh `node_modules` is never watched.
     fn register_new_directory(&mut self, path: &Path) {
-        let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+        // Not `metadata`: a symlink is never walked. Bazel's `bazel-*`
+        // symlinks lead into output trees of tens of thousands of dirs.
+        let is_dir = std::fs::symlink_metadata(path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         if !is_dir {
             return;
         }
@@ -1335,16 +1338,16 @@ fn is_covered(
     mode: RecursiveMode,
     existing: &HashMap<PathBuf, RecursiveMode>,
 ) -> bool {
-    if existing
-        .iter()
-        .any(|(dir, m)| *m == RecursiveMode::Recursive && path.starts_with(dir))
-    {
-        return true;
-    }
     if mode == RecursiveMode::NonRecursive && existing.contains_key(path) {
         return true;
     }
-    false
+    // Only ancestors can cover this path. Looking them up avoids scanning
+    // every registered directory for each request in a large workspace.
+    // An empty path is a prefix of absolute paths too, but not an ancestor.
+    existing.get(Path::new("")) == Some(&RecursiveMode::Recursive)
+        || path
+            .ancestors()
+            .any(|dir| existing.get(dir) == Some(&RecursiveMode::Recursive))
 }
 
 /// Build an `ignore` override matcher from the workspace `watch_ignore` globs,
@@ -1628,26 +1631,27 @@ fn reconcile_watches(
     desired: &[(PathBuf, RecursiveMode)],
     registered: &HashMap<PathBuf, RecursiveMode>,
 ) -> Vec<WatchAction> {
-    // Simulate the registration as we go so a recursive watch planned early in
-    // the batch covers its descendants later in the batch.
-    let mut sim = registered.clone();
+    // Track additions separately so each request needn't clone the entire
+    // registered set. Earlier additions still cover later requests in this batch.
+    let mut planned = HashMap::new();
     // Ancestors first: a recursive ancestor added early covers descendants.
     let mut ordered: Vec<&(PathBuf, RecursiveMode)> = desired.iter().collect();
     ordered.sort_by_key(|(dir, _)| dir.components().count());
 
     let mut actions = Vec::new();
     for (dir, mode) in ordered {
-        if is_covered(dir, *mode, &sim) {
+        if is_covered(dir, *mode, registered) || is_covered(dir, *mode, &planned) {
             continue;
         }
-        let replace =
-            *mode == RecursiveMode::Recursive && sim.get(dir) == Some(&RecursiveMode::NonRecursive);
+        let replace = *mode == RecursiveMode::Recursive
+            && planned.get(dir).or_else(|| registered.get(dir))
+                == Some(&RecursiveMode::NonRecursive);
         actions.push(WatchAction {
             dir: dir.clone(),
             mode: *mode,
             replace,
         });
-        sim.insert(dir.clone(), *mode);
+        planned.insert(dir.clone(), *mode);
     }
     actions
 }
@@ -1741,7 +1745,7 @@ fn refresh_item_definition(
     // patterns that no longer apply.
     item.debounce_deadline = None;
     item.kind = kind;
-    item.patterns = patterns;
+    item.patterns = WatchPatterns::new(patterns);
     item.ignore_patterns = ignore_patterns;
     item.last_error = None;
 }
@@ -1904,6 +1908,7 @@ async fn sleep_until_or_pending(deadline: Option<Instant>) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::globwalk::matches_glob;
 
     #[test]
     fn test_glob_base_dir() {
@@ -2021,6 +2026,27 @@ mod tests {
                 existing: vec![("/a/c", RecursiveMode::Recursive)],
                 expected: false,
             },
+            Case {
+                name: "shared string prefix is not an ancestor",
+                path: "/ab/c",
+                mode: RecursiveMode::NonRecursive,
+                existing: vec![("/a", RecursiveMode::Recursive)],
+                expected: false,
+            },
+            Case {
+                name: "empty recursive prefix covers an absolute path",
+                path: "/a/b",
+                mode: RecursiveMode::Recursive,
+                existing: vec![("", RecursiveMode::Recursive)],
+                expected: true,
+            },
+            Case {
+                name: "relative recursive ancestor covers its descendant",
+                path: "a/b/c",
+                mode: RecursiveMode::Recursive,
+                existing: vec![("a", RecursiveMode::Recursive)],
+                expected: true,
+            },
         ];
 
         for case in cases {
@@ -2102,6 +2128,35 @@ mod tests {
                 desired: vec![("/a/b", NonRecursive)],
                 registered: vec![("/a", Recursive)],
                 expected: vec![],
+            },
+            Case {
+                name: "duplicate new non-recursive requests register once",
+                desired: vec![("/a", NonRecursive), ("/a", NonRecursive)],
+                registered: vec![],
+                expected: vec![("/a", NonRecursive, false)],
+            },
+            Case {
+                name: "upgrade a planned watch and cover its descendants",
+                desired: vec![
+                    ("/a", NonRecursive),
+                    ("/a", Recursive),
+                    ("/a/b", NonRecursive),
+                    ("/a", Recursive),
+                ],
+                registered: vec![],
+                expected: vec![("/a", NonRecursive, false), ("/a", Recursive, true)],
+            },
+            Case {
+                name: "registered and planned watches both provide coverage",
+                desired: vec![
+                    ("/a/child", NonRecursive),
+                    ("/b/child", NonRecursive),
+                    ("/b", Recursive),
+                    ("/c", Recursive),
+                    ("/c", Recursive),
+                ],
+                registered: vec![("/a", Recursive), ("/b", NonRecursive)],
+                expected: vec![("/b", Recursive, true), ("/c", Recursive, false)],
             },
         ];
 
@@ -2532,7 +2587,9 @@ debounce = "1500ms"
             debounce_duration: debounce,
             debounce_deadline: None,
             kind,
-            patterns: patterns.iter().map(|p| Pattern::new(p).unwrap()).collect(),
+            patterns: WatchPatterns::new(
+                patterns.iter().map(|p| Pattern::new(p).unwrap()).collect(),
+            ),
             ignore_patterns: vec![],
             window: WindowTally::default(),
             last_error: None,
@@ -2583,6 +2640,85 @@ debounce = "1500ms"
             last_notify_error: None,
             global_ignore: Vec::new(),
             overrides: OverrideBuilder::new(".").build().unwrap(),
+        }
+    }
+
+    /// A directory appearing at runtime is watched and its files replayed;
+    /// a symlink to one is neither, wherever it points.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_new_directory_backstop_never_follows_symlinks() {
+        struct Case {
+            name: &'static str,
+            symlink: bool,
+            want_registered: Vec<&'static str>,
+            want_matched: usize,
+        }
+        let cases = [
+            Case {
+                name: "created directory is watched and replayed",
+                symlink: false,
+                want_registered: vec!["", "new", "new/deep"],
+                want_matched: 2,
+            },
+            Case {
+                name: "symlink to a directory is ignored",
+                symlink: true,
+                want_registered: vec![""],
+                want_matched: 0,
+            },
+        ];
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap().join("repo");
+            let outside = temp.path().join("bazel-out");
+            std::fs::create_dir_all(outside.join("deep")).unwrap();
+            std::fs::write(outside.join("a.js"), "").unwrap();
+            std::fs::write(outside.join("deep/b.js"), "").unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            let created = root.join("new");
+            if case.symlink {
+                std::os::unix::fs::symlink(&outside, &created).unwrap();
+            } else {
+                std::fs::rename(&outside, &created).unwrap();
+            }
+
+            let mut items = HashMap::new();
+            let pattern = format!("{}/**", root.display());
+            items.insert(
+                "api".to_string(),
+                watched(WatchItemKind::Service, Duration::ZERO, &[&pattern]),
+            );
+            let mut manager = test_manager(
+                items,
+                std::sync::Arc::new(signal::RecordingDispatch::default()),
+            )
+            .await;
+            manager
+                .registered_dirs
+                .insert(root.clone(), RecursiveMode::NonRecursive);
+
+            manager.register_new_directory(&created);
+
+            let mut got: Vec<PathBuf> = manager.registered_dirs.keys().cloned().collect();
+            got.sort();
+            let want: Vec<PathBuf> = case
+                .want_registered
+                .iter()
+                .map(|rel| {
+                    if rel.is_empty() {
+                        root.clone()
+                    } else {
+                        root.join(rel)
+                    }
+                })
+                .collect();
+            assert_eq!(got, want, "case: {}", case.name);
+            assert_eq!(
+                manager.items["api"].window.matched, case.want_matched,
+                "case: {}",
+                case.name
+            );
         }
     }
 
@@ -2814,7 +2950,7 @@ debounce = "1500ms"
             debounce_duration: Duration::from_millis(200),
             debounce_deadline: Some(Instant::now() + Duration::from_millis(50)),
             kind: WatchItemKind::Service,
-            patterns: original_patterns,
+            patterns: WatchPatterns::new(original_patterns),
             ignore_patterns: vec![],
             window: WindowTally::default(),
             last_error: None,
@@ -2829,8 +2965,8 @@ debounce = "1500ms"
 
         assert_eq!(item.debounce_deadline, None);
         assert_eq!(item.kind, WatchItemKind::Task);
-        assert_eq!(item.patterns.len(), 1);
-        assert_eq!(item.patterns[0].as_str(), "pkg/**");
+        assert_eq!(item.patterns.iter().count(), 1);
+        assert_eq!(item.patterns.iter().next().unwrap().as_str(), "pkg/**");
         assert_eq!(item.ignore_patterns.len(), 1);
         assert_eq!(item.ignore_patterns[0].as_str(), "pkg/generated/**");
     }
